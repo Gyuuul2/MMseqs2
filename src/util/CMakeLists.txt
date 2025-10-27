@@ -80,6 +80,7 @@ set(util_source_files
         util/unpackdb.cpp
         util/proteinaln2nucl.cpp
         util/proteomecluster.cpp
+        util/parseproteomealignments.cpp
         util/versionstring.cpp
         util/diskspaceavail.cpp
         PARENT_SCOPE
