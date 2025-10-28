@@ -1272,6 +1272,7 @@ public:
     std::vector<MMseqsParameter*> proteomecluster;
     std::vector<MMseqsParameter*> easyproteomeclusterworkflow;
     std::vector<MMseqsParameter*> parseproteomealignments;
+    std::vector<MMseqsParameter*> easyproteomesearchworkflow;
 
     std::vector<MMseqsParameter*> combineList(const std::vector<MMseqsParameter*> &par1,
                                              const std::vector<MMseqsParameter*> &par2);

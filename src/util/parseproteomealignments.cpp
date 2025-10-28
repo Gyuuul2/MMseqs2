@@ -70,7 +70,7 @@ int parseproteomealignments(int argc, const char **argv, const Command &command)
                 progress.updateProgress();
 
                 const unsigned int queryDbKey = alndbr.getDbKey(id);
-                const unsigned int qId = qdbr.getId(queryDbKey);
+                // const unsigned int qId = qdbr.getId(queryDbKey);
                 size_t qLookupId = qdbr.getLookupIdByKey(queryDbKey);
                 const unsigned int querySourceId = qdbr.getLookupFileNumber(qLookupId);
                 char *data = alndbr.getData(id, thread_idx);
@@ -79,7 +79,7 @@ int parseproteomealignments(int argc, const char **argv, const Command &command)
                 while (*data != '\0') {
                     Util::parseKey(data, buffer);
                     const unsigned int targetDbKey = (unsigned int) strtoul(buffer, NULL, 10);
-                    const unsigned int tId = tdbr.getId(targetDbKey);  
+                    // const unsigned int tId = tdbr.getId(targetDbKey);  
                     size_t tLookupId = tdbr.getLookupIdByKey(targetDbKey);
                     const unsigned int targetSourceId = tdbr.getLookupFileNumber(tLookupId);
                     if (localMatchResults[targetSourceId] == 0) {

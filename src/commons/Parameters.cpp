@@ -1413,6 +1413,9 @@ Parameters::Parameters():
     easysearchworkflow = combineList(easysearchworkflow, makepaddedseqdb);
     easysearchworkflow.push_back(&PARAM_GREEDY_BEST_HITS);
 
+    // easyproteomesearch
+    easyproteomesearchworkflow = combineList(searchworkflow, createdb);
+    easyproteomesearchworkflow = combineList(searchworkflow, parseproteomealignments);
 
     // createindex workflow
     createindex = combineList(indexdb, extractorfs);

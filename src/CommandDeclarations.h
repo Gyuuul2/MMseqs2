@@ -48,6 +48,7 @@ extern int easylinclust(int argc, const char **argv, const Command& command);
 extern int easysearch(int argc, const char **argv, const Command& command);
 extern int easylinsearch(int argc, const char **argv, const Command& command);
 extern int easyproteomecluster(int argc, const char **argv, const Command& command);
+extern int easyproteomesearch(int argc, const char **argv, const Command& command);
 extern int tsv2exprofiledb(int argc, const char **argv, const Command& command);
 extern int enrich(int argc, const char **argv, const Command& command);
 extern int expandaln(int argc, const char **argv, const Command& command);
