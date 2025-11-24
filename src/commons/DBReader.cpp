@@ -516,6 +516,10 @@ template <typename T> void DBReader<T>::close(){
         delete[] lookup;
     }
 
+    if (dataMode & USE_SOURCE || dataMode & USE_SOURCE_REV) {
+        delete[] source;
+    }
+
     if(dataMode & USE_DATA){
         unmapData();
     }
