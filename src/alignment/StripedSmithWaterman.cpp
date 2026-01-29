@@ -332,11 +332,11 @@ s_align SmithWaterman::alignScoreEndPos (
 	}
 	// 3. int
 	// Comment out int32_t now for benchmark
-	if (bests.first.score == INT16_MAX) {
-		bests = sw_sse2_int<type>(db_sequence, 0, db_length, query_length, gap_open, gap_extend,
-					profile->profile_int, USHRT_MAX, maskLen);
-		r.word = 2;
-	}
+	// if (bests.first.score == INT16_MAX) {
+	// 	bests = sw_sse2_int<type>(db_sequence, 0, db_length, query_length, gap_open, gap_extend,
+	// 				profile->profile_int, USHRT_MAX, maskLen);
+	// 	r.word = 2;
+	// }
 
 	r.score1 = bests.first.score;
     r.dbEndPos1 = bests.first.ref;
