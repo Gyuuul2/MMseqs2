@@ -11,6 +11,9 @@
 #include <regex.h>
 #include <unistd.h>
 #include <sched.h>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
 
 #include "blosum62.out.h"
 #include "PAM30.out.h"
@@ -179,6 +182,22 @@ Parameters::Parameters():
         // workflow
         PARAM_RUNNER(PARAM_RUNNER_ID, "--mpi-runner", "MPI runner", "Use MPI on compute cluster with this MPI command (e.g. \"mpirun -np 42\")", typeid(std::string), (void *) &runner, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_REUSELATEST(PARAM_REUSELATEST_ID, "--force-reuse", "Force restart with latest tmp", "Reuse tmp filse in tmp/latest folder ignoring parameters and version changes", typeid(bool), (void *) &reuseLatest, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_BACKEND(PARAM_BATCH_BACKEND_ID, "--backend", "Backend", "Batch clustering backend: single-node, multi-node, or aws-batch", typeid(std::string), (void *) &batchBackend, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_CHUNK_MAX_BYTES(PARAM_BATCH_CHUNK_MAX_BYTES_ID, "--chunk-max-bytes", "Chunk bytes", "Maximum uncompressed FASTA bytes per chunk. 0 disables the byte limit", typeid(ByteParser), (void *) &batchChunkMaxBytes, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_CHUNK_MAX_SEQS(PARAM_BATCH_CHUNK_MAX_SEQS_ID, "--chunk-max-seqs", "Chunk sequences", "Maximum sequences per chunk. 0 disables the sequence-count limit", typeid(size_t), (void *) &batchChunkMaxSeqs, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_SLURM_NODELIST(PARAM_BATCH_SLURM_NODELIST_ID, "--slurm-nodelist", "SLURM nodes", "Comma-separated SLURM node list for --backend multi-node", typeid(std::string), (void *) &batchSlurmNodelist, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_SLURM_PARTITION(PARAM_BATCH_SLURM_PARTITION_ID, "--slurm-partition", "SLURM partition", "SLURM partition for --backend multi-node", typeid(std::string), (void *) &batchSlurmPartition, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_SLURM_TIME(PARAM_BATCH_SLURM_TIME_ID, "--slurm-time", "SLURM time", "SLURM time limit for submitted jobs", typeid(std::string), (void *) &batchSlurmTime, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_SLURM_MEM(PARAM_BATCH_SLURM_MEM_ID, "--slurm-mem", "SLURM memory", "SLURM memory request per submitted chunk task", typeid(std::string), (void *) &batchSlurmMem, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_SLURM_EXTRA(PARAM_BATCH_SLURM_EXTRA_ID, "--slurm-extra", "SLURM extra", "Additional raw sbatch options for --backend multi-node", typeid(std::string), (void *) &batchSlurmExtra, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_NODE_WORK_DIR(PARAM_BATCH_NODE_WORK_DIR_ID, "--node-work-dir", "Node work dir", "Per-node LOCAL disk for chunk tasks (createdb/cluster tmp + sort spill). REQUIRED for --backend multi-node and aws-batch; on single-node defaults to a subdirectory of the shared tmp directory", typeid(std::string), (void *) &batchNodeWorkDir, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_MAX_ROUNDS(PARAM_BATCH_MAX_ROUNDS_ID, "--max-rounds", "Max rounds", "Maximum representative clustering rounds", typeid(int), (void *) &batchMaxRounds, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_MIN_REDUCTION_RATIO(PARAM_BATCH_MIN_REDUCTION_RATIO_ID, "--min-reduction-ratio", "Min reduction ratio", "A representative round is low-benefit if it removes less than this fraction of representatives", typeid(float), (void *) &batchMinReductionRatio, "^(0(\\.[0-9]+)?|1(\\.0+)?)$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_CONVERGENCE_PATIENCE(PARAM_BATCH_CONVERGENCE_PATIENCE_ID, "--convergence-patience", "Convergence patience", "Number of consecutive low-benefit rounds before stopping", typeid(int), (void *) &batchConvergencePatience, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_MIN_REDUCTION_COUNT(PARAM_BATCH_MIN_REDUCTION_COUNT_ID, "--min-reduction-count", "Min reduction count", "A representative round is low-benefit if it removes fewer representatives than this count. 0 disables this condition", typeid(size_t), (void *) &batchMinReductionCount, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_MAX_CHUNK_ATTEMPTS(PARAM_BATCH_MAX_CHUNK_ATTEMPTS_ID, "--max-chunk-attempts", "Max chunk attempts", "Maximum attempts for missing or failed chunk workers before reporting a dead-letter failure", typeid(int), (void *) &batchMaxChunkAttempts, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_COMPRESS_LEVEL(PARAM_BATCH_COMPRESS_LEVEL_ID, "--compress-level", "Compression level", "zstd compression level for chunked intermediate FASTA/TSV files", typeid(int), (void *) &batchCompressLevel, "^([1-9]|1[0-9]|2[0-2])$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_MERGE_BUCKETS(PARAM_BATCH_MERGE_BUCKETS_ID, "--merge-buckets", "Merge buckets", "Split the representative merge into this many independent hash buckets, each sorted+joined separately (smaller sorts = lower RAM/disk peak). The cluster (rep,member) mapping is identical for any value; the final-file row order matches a single global sort only for a FIXED value. 1 = one big join. Raise for very large inputs", typeid(int), (void *) &batchMergeBuckets, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         // search workflow
         PARAM_NUM_ITERATIONS(PARAM_NUM_ITERATIONS_ID, "--num-iterations", "Search iterations", "Number of iterative profile search iterations", typeid(int), (void *) &numIterations, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_PROFILE),
         PARAM_START_SENS(PARAM_START_SENS_ID, "--start-sens", "Start sensitivity", "Start sensitivity", typeid(float), (void *) &startSens, "^[0-9]*(\\.[0-9]+)?$"),
@@ -1519,6 +1538,60 @@ Parameters::Parameters():
     clusterworkflow = combineList(prefilter, align);
     clusterworkflow = combineList(clusterworkflow, rescorediagonal);
     clusterworkflow = combineList(clusterworkflow, clust);
+    // linclust-batch / cluster-batch
+    batchclustering.push_back(&PARAM_BATCH_BACKEND);
+    batchclustering.push_back(&PARAM_BATCH_CHUNK_MAX_BYTES);
+    batchclustering.push_back(&PARAM_BATCH_CHUNK_MAX_SEQS);
+    batchclustering.push_back(&PARAM_BATCH_SLURM_NODELIST);
+    batchclustering.push_back(&PARAM_BATCH_SLURM_PARTITION);
+    batchclustering.push_back(&PARAM_BATCH_SLURM_TIME);
+    batchclustering.push_back(&PARAM_BATCH_SLURM_MEM);
+    batchclustering.push_back(&PARAM_BATCH_SLURM_EXTRA);
+    batchclustering.push_back(&PARAM_BATCH_NODE_WORK_DIR);
+    batchclustering.push_back(&PARAM_BATCH_MAX_ROUNDS);
+    batchclustering.push_back(&PARAM_BATCH_MIN_REDUCTION_RATIO);
+    batchclustering.push_back(&PARAM_BATCH_CONVERGENCE_PATIENCE);
+    batchclustering.push_back(&PARAM_BATCH_MIN_REDUCTION_COUNT);
+    batchclustering.push_back(&PARAM_BATCH_MAX_CHUNK_ATTEMPTS);
+    batchclustering.push_back(&PARAM_BATCH_COMPRESS_LEVEL);
+    batchclustering.push_back(&PARAM_BATCH_MERGE_BUCKETS);
+    batchclustering.push_back(&PARAM_REMOVE_TMP_FILES);
+    batchclustering.push_back(&PARAM_REUSELATEST);
+    batchclustering.push_back(&PARAM_THREADS);
+    batchclustering.push_back(&PARAM_COMPRESSED);
+    batchclustering.push_back(&PARAM_V);
+
+    linclustbatch.push_back(&PARAM_MIN_SEQ_ID);
+    linclustbatch.push_back(&PARAM_C);
+    linclustbatch.push_back(&PARAM_COV_MODE);
+    linclustbatch.push_back(&PARAM_CLUSTER_MODE);
+    linclustbatch.push_back(&PARAM_KMER_PER_SEQ);
+    linclustbatch.push_back(&PARAM_INCLUDE_COUNTTABLE);
+    linclustbatch.push_back(&PARAM_NUM_COUNTS);
+    linclustbatch.push_back(&PARAM_NUM_ADJACENCY);
+    linclustbatch.push_back(&PARAM_CLUST_HASH);
+    linclustbatch.push_back(&PARAM_LINCLUST_VERSION);
+    linclustbatch.push_back(&PARAM_SWITCH_CONSENSUS_REP);
+    linclustbatch = combineList(linclustbatch, batchclustering);
+
+    clusterbatch.push_back(&PARAM_MIN_SEQ_ID);
+    clusterbatch.push_back(&PARAM_C);
+    clusterbatch.push_back(&PARAM_COV_MODE);
+    clusterbatch.push_back(&PARAM_CLUSTER_MODE);
+    clusterbatch.push_back(&PARAM_CASCADED);
+    clusterbatch.push_back(&PARAM_CLUSTER_STEPS);
+    clusterbatch.push_back(&PARAM_CLUSTER_REASSIGN);
+    clusterbatch.push_back(&PARAM_KMER_PER_SEQ);
+    clusterbatch.push_back(&PARAM_INCLUDE_COUNTTABLE);
+    clusterbatch.push_back(&PARAM_NUM_COUNTS);
+    clusterbatch.push_back(&PARAM_NUM_ADJACENCY);
+    clusterbatch.push_back(&PARAM_MAX_SEQS);
+    clusterbatch.push_back(&PARAM_S);
+    clusterbatch.push_back(&PARAM_CLUSTER_VERSION);
+    clusterbatch.push_back(&PARAM_LINCLUST_VERSION);
+    clusterbatch.push_back(&PARAM_SWITCH_CONSENSUS_REP);
+    clusterbatch = combineList(clusterbatch, batchclustering);
+
     clusterworkflow.push_back(&PARAM_CASCADED);
     clusterworkflow.push_back(&PARAM_CLUSTER_STEPS);
     clusterworkflow.push_back(&PARAM_CLUSTER_REASSIGN);
@@ -1837,6 +1910,18 @@ bool parseBool(const std::string &p) {
     }
 }
 
+size_t parseSizeTParameter(const char *value, const char *name) {
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' ||
+        parsed > static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+        Debug(Debug::ERROR) << "Invalid size_t value for " << name << ": " << value << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return static_cast<size_t>(parsed);
+}
+
 void Parameters::initMatrices() {
     // set up substituionMatrix
     for(size_t i = 0 ; i < substitutionMatrices.size(); i++) {
@@ -1933,7 +2018,8 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
                             Debug(Debug::ERROR) << "Error in argument " << par[parIdx]->name << "\n";
                             EXIT(EXIT_FAILURE);
                         }else{
-                            *((size_t *) par[parIdx]->value) = atoi(pargv[argIdx+1]);
+                            *((size_t *) par[parIdx]->value) =
+                                parseSizeTParameter(pargv[argIdx + 1], par[parIdx]->name);
                             par[parIdx]->wasSet = true;
                         }
                         argIdx++;
@@ -2600,6 +2686,22 @@ void Parameters::setDefaults() {
         runner = "";
     }
     reuseLatest = false;
+    batchBackend = "single-node";
+    batchChunkMaxBytes = 20ULL * 1024ULL * 1024ULL * 1024ULL;
+    batchChunkMaxSeqs = 0;
+    batchSlurmNodelist = "";
+    batchSlurmPartition = "";
+    batchSlurmTime = "";
+    batchSlurmMem = "";
+    batchSlurmExtra = "";
+    batchNodeWorkDir = "";
+    batchMaxRounds = 32;
+    batchMinReductionRatio = 0.02f;
+    batchConvergencePatience = 1;
+    batchMinReductionCount = 0;
+    batchMaxChunkAttempts = 3;
+    batchCompressLevel = 3;
+    batchMergeBuckets = 1;
     // Clustering workflow
     removeTmpFiles = false;
 

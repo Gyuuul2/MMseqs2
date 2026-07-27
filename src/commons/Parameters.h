@@ -476,6 +476,22 @@ public:
     // workflow
     std::string runner;
     bool reuseLatest;
+    std::string batchBackend;
+    size_t batchChunkMaxBytes;
+    size_t batchChunkMaxSeqs;
+    std::string batchSlurmNodelist;
+    std::string batchSlurmPartition;
+    std::string batchSlurmTime;
+    std::string batchSlurmMem;
+    std::string batchSlurmExtra;
+    std::string batchNodeWorkDir;
+    int batchMaxRounds;
+    float batchMinReductionRatio;
+    int batchConvergencePatience;
+    size_t batchMinReductionCount;
+    int batchMaxChunkAttempts;
+    int batchCompressLevel;
+    int batchMergeBuckets;
 
     // CLUSTERING
     int    clusteringMode;
@@ -967,6 +983,22 @@ public:
     // workflow
     PARAMETER(PARAM_RUNNER)
     PARAMETER(PARAM_REUSELATEST)
+    PARAMETER(PARAM_BATCH_BACKEND)
+    PARAMETER(PARAM_BATCH_CHUNK_MAX_BYTES)
+    PARAMETER(PARAM_BATCH_CHUNK_MAX_SEQS)
+    PARAMETER(PARAM_BATCH_SLURM_NODELIST)
+    PARAMETER(PARAM_BATCH_SLURM_PARTITION)
+    PARAMETER(PARAM_BATCH_SLURM_TIME)
+    PARAMETER(PARAM_BATCH_SLURM_MEM)
+    PARAMETER(PARAM_BATCH_SLURM_EXTRA)
+    PARAMETER(PARAM_BATCH_NODE_WORK_DIR)
+    PARAMETER(PARAM_BATCH_MAX_ROUNDS)
+    PARAMETER(PARAM_BATCH_MIN_REDUCTION_RATIO)
+    PARAMETER(PARAM_BATCH_CONVERGENCE_PATIENCE)
+    PARAMETER(PARAM_BATCH_MIN_REDUCTION_COUNT)
+    PARAMETER(PARAM_BATCH_MAX_CHUNK_ATTEMPTS)
+    PARAMETER(PARAM_BATCH_COMPRESS_LEVEL)
+    PARAMETER(PARAM_BATCH_MERGE_BUCKETS)
 
     // search workflow
     PARAMETER(PARAM_NUM_ITERATIONS)
@@ -1245,6 +1277,9 @@ public:
     std::vector<MMseqsParameter*> countkmer;
     std::vector<MMseqsParameter*> easylinclustworkflow;
     std::vector<MMseqsParameter*> linclustworkflow;
+    std::vector<MMseqsParameter*> linclustbatch;
+    std::vector<MMseqsParameter*> clusterbatch;
+    std::vector<MMseqsParameter*> batchclustering;
     std::vector<MMseqsParameter*> easysearchworkflow;
     std::vector<MMseqsParameter*> searchworkflow;
     std::vector<MMseqsParameter*> linsearchworkflow;
