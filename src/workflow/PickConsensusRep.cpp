@@ -12,12 +12,13 @@ int pickconsensusrep(int argc, const char **argv, const Command &command) {
     par.parseParameters(argc, argv, command, true, 0, 0);
 
     CommandCaller cmd;
-    par.allowDeletion = 1;
+    par.allowDeletion = 0;   // gap-free MSA on the center (matches pickconsensusrepfast; avoids the result2msa crash)
     par.PARAM_ALLOW_DELETION.wasSet = true;
     cmd.addVariable("RESULT2MSA_PAR", par.createParameterString(par.result2msa, true).c_str());
     par.matchMode = 1;
     par.PARAM_MATCH_MODE.wasSet = true;
     cmd.addVariable("MSA2PROFILE_PAR", par.createParameterString(par.msa2profile, true).c_str());
+    cmd.addVariable("ALIGN_PAR", par.createParameterString(par.align).c_str());
     cmd.addVariable("RENAMEDBKEYS_PAR", par.createParameterString(par.renamedbkeys).c_str());
     cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
 

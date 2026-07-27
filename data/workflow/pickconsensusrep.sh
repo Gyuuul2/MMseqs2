@@ -30,7 +30,7 @@ fi
 
 if notExists "${TMP_PATH}/aln.dbtype"; then
     # shellcheck disable=SC2086
-    "$MMSEQS" align "$TMP_PATH/profile" "$1" "$2"  "${TMP_PATH}/aln" || fail "align failed"
+    "$MMSEQS" align "$TMP_PATH/profile" "$1" "$2"  "${TMP_PATH}/aln" ${ALIGN_PAR} || fail "align failed"
 fi
 
 if notExists "${TMP_PATH}/aln.tsv"; then

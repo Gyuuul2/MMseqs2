@@ -609,7 +609,7 @@ std::vector<Command> baseCommands = {
                                                            {"DB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::allDb }}},
 
 
-        {"pickconsensusrep", pickconsensusrep,            &par.verbandcompression,            COMMAND_CLUSTER,
+        {"pickconsensusrep", pickconsensusrep,            &par.threadsandcompression,         COMMAND_CLUSTER,
                 "Select new representatives for each cluster based on consensus",
                 NULL,
                 "Martin Steinegger <martin.steinegger@snu.ac.kr> & Maria Hauser",
