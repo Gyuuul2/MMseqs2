@@ -804,8 +804,13 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
                     s_align gappedAlignment = blockAligner.bandedalign(&target, newQueryStartPos, newTargetStartPos,
                                                                        gappedBacktrace, xDrop, par.covThr, par.covMode);
+                    // bandedalign signals failure/no-coverage with evalue < 0 and an empty backtrace;
+                    // skip before computeSeqId, which would divide by alnLen == 0 in SEQ_ID_ALN_LEN mode.
+                    if (gappedAlignment.evalue < 0 || gappedBacktrace.empty()) {
+                        continue;
+                    }
                     unsigned int gappedAlnLength = gappedBacktrace.size();
-                    double gappedSeqId = Util::computeSeqId(par.seqIdMode, gappedAlignment.identicalAACnt, 
+                    double gappedSeqId = Util::computeSeqId(par.seqIdMode, gappedAlignment.identicalAACnt,
                                                            query.L, targetLength, gappedAlnLength);
                     Matcher::result_t result = Matcher::result_t(
                         targetKey, gappedAlignment.score1, gappedAlignment.qCov, gappedAlignment.tCov, 

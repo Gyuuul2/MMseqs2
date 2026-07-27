@@ -654,6 +654,7 @@ std::pair<alignment_end, alignment_end> sw_sse2_int(
 SmithWaterman::SmithWaterman(size_t maxSequenceLength, int aaSize, bool aaBiasCorrection,
                              float aaBiasCorrectionScale, SubstitutionMatrix * subMat) {
 	maxSequenceLength += 1;
+	this->maxSequenceLength = maxSequenceLength;   // buffers below are sized for this length
 	this->subMat = subMat;
     this->aaBiasCorrectionScale = aaBiasCorrectionScale;
 	this->aaBiasCorrection = aaBiasCorrection;
@@ -815,6 +816,13 @@ s_align SmithWaterman::ssw_align (
         EvalueComputation * evaluer,
         const int covMode, const float covThr, const float correlationScoreWeight,
         const int32_t maskLen) {
+    // maxColumn, the block-aligner buffers and the striped profiles are all sized for
+    // maxSequenceLength; a longer target would overflow them (query length is bounded at init).
+    if ((size_t) db_length > maxSequenceLength) {
+        Debug(Debug::ERROR) << "SmithWaterman: target length " << db_length
+                            << " exceeds maxSequenceLength " << maxSequenceLength << ".\n";
+        EXIT(EXIT_FAILURE);
+    }
     s_align alignment;
     // check if both query and target are profiles
 	if (profile->isProfile) {
@@ -870,7 +878,8 @@ s_align SmithWaterman::ssw_align_private (
 
 	bool blockAlignFailed = false;
 	s_align alignTmp = alignStartPosBacktraceBlock<type>(db_sequence, db_length, gap_open, gap_extend, backtrace, align);
-	if (align.score1 == UINT32_MAX) {
+	// The failure sentinel is set on the RETURNED alignment, not the input.
+	if (alignTmp.score1 == UINT32_MAX) {
 		blockAlignFailed = true;
 	} else {
 		align = alignTmp;
@@ -918,13 +927,14 @@ s_align SmithWaterman::alignScoreEndPos (
                     profile->profile_word, USHRT_MAX, maskLen, simdData);
         r.word = 1;
 	}
-	// 3. int
-	// Comment out int32_t now for benchmark
-	// if (bests.first.score == INT16_MAX) {
-	// 	bests = sw_sse2_int<type>(db_sequence, 0, db_length, query_length, gap_open, gap_extend,
-	// 				profile->profile_int, USHRT_MAX, maskLen, simdData);
-	// 	r.word = 2;
-	// }
+	// 3. int32 (word saturates at INT16_MAX). No overflow sentinel for int32, so terminate is
+	// UINT32_MAX (effectively "never early-terminate"); USHRT_MAX would wrongly stop a column
+	// whose max happens to equal 65535.
+	if (bests.first.score == INT16_MAX) {
+		bests = sw_sse2_int<type>(db_sequence, 0, db_length, query_length, gap_open, gap_extend,
+					profile->profile_int, UINT32_MAX, maskLen, simdData);
+		r.word = 2;
+	}
 
 	r.score1 = bests.first.score;
     r.dbEndPos1 = bests.first.ref;
@@ -1052,14 +1062,17 @@ s_align SmithWaterman::alignStartPosBacktraceBlock(
 
 	size_t cigar_len, queryPos, targetPos;
 	uint32_t aaIds;
+	Cigar* cigar = nullptr;
 
-	Cigar* cigar = block_new_cigar(res.query_idx, res.reference_idx);
-	// char ops_char[] = {' ', 'M', '=', 'X', 'I', 'D'};
+	// Validate the result BEFORE allocating the CIGAR: on a block-align failure res.query_idx /
+	// res.reference_idx are SIZE_MAX (see init above), and block_new_cigar(SIZE_MAX, SIZE_MAX)
+	// would attempt a query_len+reference_len sized (overflowing) allocation.
 	if (res.score != target_score && !(target_score == INT16_MAX && res.score >= target_score)) {
 		r.score1 = UINT32_MAX;
 		goto cleanup;
 	}
 
+	cigar = block_new_cigar(res.query_idx, res.reference_idx);
 	block_cigar_aa_trace_xdrop(block->block_trace, res.query_idx, res.reference_idx, cigar);
 	cigar_len = block_len_cigar(cigar);
 
@@ -1116,7 +1129,9 @@ s_align SmithWaterman::alignStartPosBacktraceBlock(
 
 cleanup:
 	block_free_padded_aa(target);
-	block_free_cigar(cigar);
+	if (cigar != nullptr) {
+		block_free_cigar(cigar);
+	}
 	if (type == PROFILE_SEQ) {
 		block_free_aaprofile(queryProfile);
 	} else if (type == SEQ_SEQ) {
@@ -1142,7 +1157,7 @@ s_align SmithWaterman::alignStartPosBacktrace (
     int32_t query_length = profile->query_length;
     int32_t queryOffset = query_length - r.qEndPos1 - 1;
 
-	std::pair<alignment_end, alignment_end> bests_reverse;
+	std::pair<alignment_end, alignment_end> bests_reverse = {};
 
     // Find the beginning position of the best alignment.
     if (r.word == 0) {
@@ -1173,20 +1188,21 @@ s_align SmithWaterman::alignStartPosBacktrace (
 		bests_reverse = sw_sse2_word<type>(db_sequence, 1, r.dbEndPos1 + 1, r.qEndPos1 + 1, gap_open,
 										   gap_extend, profile->profile_rev_word,
 										   r.score1, maskLen, simdData);
+	} else if (r.word == 2) {
+        if ((type == PROFILE_SEQ)) {
+			createQueryProfile<int32_t, VECSIZE_INT * 1, PROFILE>(profile->profile_rev_int, profile->query_rev_sequence, NULL, profile->mat_rev,
+																	r.qEndPos1 + 1, profile->alphabetSize, 0, queryOffset, profile->query_length);
+		}  else if (type == SEQ_SEQ) {
+			createQueryProfile<int32_t, VECSIZE_INT * 1, SUBSTITUTIONMATRIX>(profile->profile_rev_int, profile->query_rev_sequence, profile->composition_bias_rev, profile->mat,
+																	r.qEndPos1 + 1, profile->alphabetSize, 0, queryOffset, 0);
+		}
+		bests_reverse = sw_sse2_int<type>(db_sequence, 1, r.dbEndPos1 + 1, r.qEndPos1 + 1, gap_open,
+											gap_extend, profile->profile_rev_int,
+											r.score1, maskLen, simdData);
+	} else {
+		Debug(Debug::ERROR) << "alignStartPosBacktrace: unhandled precision r.word=" << r.word << "\n";
+		EXIT(EXIT_FAILURE);
 	}
-	// Comment out int32_t now for benchmark
-	// else if (r.word == 2) {
-    //     if ((type == PROFILE_SEQ)) {
-	// 		createQueryProfile<int32_t, VECSIZE_INT * 1, PROFILE>(profile->profile_rev_int, profile->query_rev_sequence, NULL, profile->mat_rev,
-	// 																r.qEndPos1 + 1, profile->alphabetSize, 0, queryOffset, profile->query_length);
-	// 	}  else if (type == SEQ_SEQ) {
-	// 		createQueryProfile<int32_t, VECSIZE_INT * 1, SUBSTITUTIONMATRIX>(profile->profile_rev_int, profile->query_rev_sequence, profile->composition_bias_rev, profile->mat,
-	// 																r.qEndPos1 + 1, profile->alphabetSize, 0, queryOffset, 0);
-	// 	}
-	// 	bests_reverse = sw_sse2_int<type>(db_sequence, 1, r.dbEndPos1 + 1, r.qEndPos1 + 1, gap_open,
-	// 										gap_extend, profile->profile_rev_int,
-	// 										r.score1, maskLen, simdData);
-	// }
 
     if(bests_reverse.first.score != r.score1){
 		Debug(Debug::ERROR) << "r.word: " << r.word << "\n";
