@@ -4,6 +4,9 @@
 #include "Util.h"
 #include "Debug.h"
 #include <unistd.h>
+#include <cerrno>
+#include <cstdlib>
+#include <zstd.h>
 
 namespace KSEQFILE {
     KSEQ_INIT(int, read)
@@ -153,6 +156,112 @@ KSeqBzip::~KSeqBzip() {
 }
 #endif
 
+
+// Wrap zstd streaming decompression into the (handle, buf, len) reader kseq expects.
+namespace KSEQZSTD {
+    struct ZstdReader {
+        FILE* fp;
+        ZSTD_DStream* dstream;
+        unsigned char* inBuf;   // compressed input staging buffer
+        size_t inBufCap;
+        ZSTD_inBuffer input;    // { src, size, pos } over inBuf
+        int eof;                // 1 once the compressed file is fully read
+    };
+
+    // Returns decompressed bytes (>0), 0 at EOF, or -1 on error, like read()/gzread().
+    static int zstdReaderRead(ZstdReader* r, char* buf, int len) {
+        if (len <= 0) {
+            return 0;
+        }
+        ZSTD_outBuffer output = { buf, (size_t) len, 0 };
+        // Loop until we produce >=1 byte or hit real EOF (returning 0 early means EOF to kseq).
+        while (output.pos == 0) {
+            if (r->input.pos == r->input.size && r->eof == 0) {
+                size_t n = fread(r->inBuf, 1, r->inBufCap, r->fp);
+                r->input.src = r->inBuf;
+                r->input.size = n;
+                r->input.pos = 0;
+                if (n == 0) {
+                    r->eof = 1;
+                }
+            }
+            if (r->input.pos == r->input.size && r->eof) {
+                break;  // no more compressed input -> genuine EOF
+            }
+            size_t code = ZSTD_decompressStream(r->dstream, &output, &r->input);
+            if (ZSTD_isError(code)) {
+                Debug(Debug::ERROR) << "ZSTD_decompressStream: " << ZSTD_getErrorName(code) << "\n";
+                return -1;
+            }
+        }
+        return (int) output.pos;
+    }
+
+    KSEQ_INIT(ZstdReader*, zstdReaderRead)
+}
+
+KSeqZstd::KSeqZstd(const char* fileName) {
+    if (FileUtil::fileExists(fileName) == false) {
+        errno = ENOENT;
+        perror(fileName);
+        EXIT(EXIT_FAILURE);
+    }
+    KSEQZSTD::ZstdReader* r = new KSEQZSTD::ZstdReader();
+    r->fp = FileUtil::openFileOrDie(fileName, "rb", true);
+    r->dstream = ZSTD_createDStream();
+    if (r->dstream == NULL) {
+        Debug(Debug::ERROR) << "ZSTD_createDStream() failed for " << fileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    ZSTD_initDStream(r->dstream);
+    r->inBufCap = ZSTD_DStreamInSize();
+    r->inBuf = (unsigned char*) malloc(r->inBufCap);
+    if (r->inBuf == NULL) {
+        Debug(Debug::ERROR) << "Cannot allocate zstd input buffer\n";
+        EXIT(EXIT_FAILURE);
+    }
+    r->input.src = r->inBuf;
+    r->input.size = 0;
+    r->input.pos = 0;
+    r->eof = 0;
+    reader = (void*) r;
+    seq = (void*) KSEQZSTD::kseq_init(r);
+    type = KSEQ_ZSTD;
+}
+
+bool KSeqZstd::ReadEntry() {
+    KSEQZSTD::kseq_t* s = (KSEQZSTD::kseq_t*) seq;
+    if (KSEQZSTD::kseq_read(s) < 0)
+        return false;
+
+    entry.name = s->name;
+    entry.comment = s->comment;
+    entry.sequence = s->seq;
+    entry.qual = s->qual;
+    entry.headerOffset = 0;
+    entry.sequenceOffset = 0;
+    entry.newlineCount = s->newlineCount;
+
+    return true;
+}
+
+KSeqZstd::~KSeqZstd() {
+    kseq_destroy((KSEQZSTD::kseq_t*)seq);
+    KSEQZSTD::ZstdReader* r = (KSEQZSTD::ZstdReader*) reader;
+    if (r != NULL) {
+        if (r->dstream != NULL) {
+            ZSTD_freeDStream(r->dstream);
+        }
+        if (r->inBuf != NULL) {
+            free(r->inBuf);
+        }
+        if (r->fp != NULL) {
+            fclose(r->fp);
+        }
+        delete r;
+    }
+}
+
 KSeqWrapper* KSeqFactory(const char* file) {
     KSeqWrapper* kseq = NULL;
     if( strcmp(file, "stdin") == 0 ){
@@ -160,7 +269,7 @@ KSeqWrapper* KSeqFactory(const char* file) {
         return kseq;
     }
 
-    if(Util::endsWith(".gz", file) == false && Util::endsWith(".bz2", file) == false ) {
+    if(Util::endsWith(".gz", file) == false && Util::endsWith(".bz2", file) == false && Util::endsWith(".zst", file) == false ) {
         kseq = new KSeqFile(file);
         return kseq;
     }
@@ -187,6 +296,10 @@ KSeqWrapper* KSeqFactory(const char* file) {
         EXIT(EXIT_FAILURE);
     }
 #endif
+    else if(Util::endsWith(".zst", file) == true) {
+        kseq = new KSeqZstd(file);
+        return kseq;
+    }
 
     return kseq;
 }
