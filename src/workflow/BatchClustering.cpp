@@ -599,6 +599,11 @@ void setBatchClusteringDescriptions(Parameters &par) {
         "CPU threads per chunk task. In multi-node mode this is the per-node CPU request",
         NULL,
         par.PARAM_THREADS.category);
+    par.overrideParameterDescription(
+        par.PARAM_CREATEDB_MODE,
+        "Batch createdb mode: 0 copies FASTA/.zst into a compact MMseqs DB, 1 soft-links plain single-line FASTA. Mode 2/GPU DB layout is not supported by batch clustering",
+        NULL,
+        par.PARAM_CREATEDB_MODE.category);
 }
 
 } // namespace
