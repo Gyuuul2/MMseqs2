@@ -155,12 +155,18 @@ round_slurm_nodelist() {
 prepare_round() {
     local round="$1"
     shift
-    (
-        CHUNK_MAX_BYTES=$(round_chunk_max_bytes "$round")
-        CHUNK_MAX_SEQS=$(round_chunk_max_seqs "$round")
-        export CHUNK_MAX_BYTES CHUNK_MAX_SEQS
-        prepare "$@"
-    )
+    local old_chunk_max_bytes="$CHUNK_MAX_BYTES"
+    local old_chunk_max_seqs="$CHUNK_MAX_SEQS"
+    local rc
+    CHUNK_MAX_BYTES=$(round_chunk_max_bytes "$round")
+    CHUNK_MAX_SEQS=$(round_chunk_max_seqs "$round")
+    set +e
+    prepare "$@"
+    rc=$?
+    set -e
+    CHUNK_MAX_BYTES="$old_chunk_max_bytes"
+    CHUNK_MAX_SEQS="$old_chunk_max_seqs"
+    return "$rc"
 }
 
 with_round_node_work_dir() {
@@ -931,7 +937,7 @@ cluster_chunk() {
     fi
 
     log "${CLUSTER_CMD} ${chunk_id}"
-    # shellcheck disable=SC2086
+    # shellcheck disable=SC2046,SC2086
     "$MMSEQS" ${CLUSTER_CMD} "$db" "$clu" "$work_dir/tmp" $(round_cluster_par "$round") || fail "${CLUSTER_CMD} failed (chunk ${chunk_id}, rc=$?)"
 
     log "createtsv ${chunk_id}"
@@ -1049,7 +1055,8 @@ merge_partition() {
 merge_join() {
     local part_dir="$1" out_dir="$2" bucket="$3" sort_tmp="$4"
     local bb; printf -v bb '%05d' "$bucket"
-    local out="$out_dir/propagated.bkt${bb}.tsv$(batch_compression_suffix)"
+    local out
+    out="$out_dir/propagated.bkt${bb}.tsv$(batch_compression_suffix)"
     if done_exists "$out"; then
         log "merge_join: reusing bucket ${bb}"
         return 0
