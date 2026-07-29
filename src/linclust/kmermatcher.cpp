@@ -21,9 +21,15 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 #include <limits>
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+#include <zstd.h>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -59,6 +65,9 @@ KmerPosition<T, includeAdjacency, IncludeSeqLen> *initKmerPositionMemory(size_t 
 // trade-off (batches the atomic reservation into the shared array); a small batch already
 // makes the atomic overhead negligible, so keep it small to bound the per-thread scratch.
 static const size_t KMER_STAGING_BUFFER_SIZE = 65536;
+
+static void removeKmerTmpFileIfExists(const std::string &fileName);
+static FILE *openKmerTmpFileForOverwriteOrDie(const std::string &fileName, const char *mode);
 
 template <typename T, bool includeAdjacency, bool IncludeSeqLen>
 static void flushKmerBuffer(KmerPosition<T, includeAdjacency, IncludeSeqLen> *kmerArray,
@@ -1065,7 +1074,8 @@ KmerPosition<T, includeAdjacency, IncludeSeqLen> *doComputation(
     }
 
     std::string splitDone = splitFile + ".done";
-    FILE *done = FileUtil::openFileOrDie(splitDone.c_str(), "w", false);
+    removeKmerTmpFileIfExists(splitDone);
+    FILE *done = openKmerTmpFileForOverwriteOrDie(splitDone, "w");
     if (fclose(done) != 0) {
         Debug(Debug::ERROR) << "Cannot close file " << splitDone << "\n";
         EXIT(EXIT_FAILURE);
@@ -1680,28 +1690,350 @@ size_t queueNextEntry(KmerPositionQueue &queue, int file, size_t offsetPos, T *e
     return offsetPos+pos;
 }
 
+static const size_t KMER_TMP_ZSTD_INPUT_BUFFER_SIZE = 65536;
+static const size_t KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE = 65536;
+static const int KMER_TMP_ZSTD_COMPRESSION_LEVEL = 3;
+
+static std::string kmerTmpFileName(const std::string &tmpFile, int iteration, int threadIdx, bool compressed) {
+    std::string fileName = tmpFile + "_iter_" + std::to_string(iteration) + "_thread_" + std::to_string(threadIdx);
+    if (compressed) {
+        fileName.append(".zst");
+    }
+    return fileName;
+}
+
+static std::string existingKmerTmpFileName(const std::string &baseName, bool preferCompressed) {
+    const std::string compressedName = baseName + ".zst";
+    if (preferCompressed && FileUtil::fileExists(compressedName.c_str())) {
+        return compressedName;
+    }
+    if (FileUtil::fileExists(baseName.c_str())) {
+        return baseName;
+    }
+    if (FileUtil::fileExists(compressedName.c_str())) {
+        return compressedName;
+    }
+    return "";
+}
+
+static void removeKmerTmpFileIfExists(const std::string &fileName) {
+    if (FileUtil::fileExists(fileName.c_str())) {
+        FileUtil::remove(fileName.c_str());
+    }
+}
+
+static FILE *openKmerTmpFileForOverwriteOrDie(const std::string &fileName, const char *mode) {
+    FILE *file = fopen(fileName.c_str(), mode);
+    if (file == NULL) {
+        perror(fileName.c_str());
+        EXIT(EXIT_FAILURE);
+    }
+    return file;
+}
+
+static void writeAllOrDie(FILE *file, const void *data, size_t dataSize, const std::string &fileName) {
+    if (dataSize == 0) {
+        return;
+    }
+    size_t written = fwrite(data, sizeof(char), dataSize, file);
+    if (written != dataSize) {
+        Debug(Debug::ERROR) << "Can not write to file " << fileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
+class ZstdKmerTmpFileWriter {
+public:
+    ZstdKmerTmpFileWriter(const std::string &fileName, int compressionLevel)
+        : fileName(fileName), file(NULL), cstream(NULL), outBuffer(NULL), closed(true) {
+        file = openKmerTmpFileForOverwriteOrDie(fileName, "wb");
+        cstream = ZSTD_createCStream();
+        if (cstream == NULL) {
+            Debug(Debug::ERROR) << "ZSTD_createCStream() failed for " << fileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        outBuffer = static_cast<char *>(malloc(KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE));
+        if (outBuffer == NULL) {
+            Debug(Debug::ERROR) << "Cannot allocate zstd output buffer for " << fileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (compressionLevel < 1) {
+            compressionLevel = 1;
+        }
+        size_t ret = ZSTD_initCStream(cstream, compressionLevel);
+        if (ZSTD_isError(ret)) {
+            Debug(Debug::ERROR) << "ZSTD_initCStream() error for " << fileName << ". Error "
+                                << ZSTD_getErrorName(ret) << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        closed = false;
+    }
+
+    ~ZstdKmerTmpFileWriter() {
+        if (closed == false) {
+            close();
+        }
+        if (outBuffer != NULL) {
+            free(outBuffer);
+        }
+        if (cstream != NULL) {
+            ZSTD_freeCStream(cstream);
+        }
+    }
+
+    void write(const void *data, size_t dataSize) {
+        ZSTD_inBuffer input = { data, dataSize, 0 };
+        while (input.pos < input.size) {
+            ZSTD_outBuffer output = { outBuffer, KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE, 0 };
+            size_t ret = ZSTD_compressStream(cstream, &output, &input);
+            if (ZSTD_isError(ret)) {
+                Debug(Debug::ERROR) << "ZSTD_compressStream() error for " << fileName << ". Error "
+                                    << ZSTD_getErrorName(ret) << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            writeAllOrDie(file, outBuffer, output.pos, fileName);
+        }
+    }
+
+    void close() {
+        if (closed) {
+            return;
+        }
+        size_t remainingToFlush = 0;
+        do {
+            ZSTD_outBuffer output = { outBuffer, KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE, 0 };
+            remainingToFlush = ZSTD_endStream(cstream, &output);
+            if (ZSTD_isError(remainingToFlush)) {
+                Debug(Debug::ERROR) << "ZSTD_endStream() error for " << fileName << ". Error "
+                                    << ZSTD_getErrorName(remainingToFlush) << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            writeAllOrDie(file, outBuffer, output.pos, fileName);
+        } while (remainingToFlush != 0);
+
+        if (fclose(file) != 0) {
+            Debug(Debug::ERROR) << "Cannot close file " << fileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        file = NULL;
+        closed = true;
+    }
+
+private:
+    std::string fileName;
+    FILE *file;
+    ZSTD_CStream *cstream;
+    char *outBuffer;
+    bool closed;
+};
+
+template <typename T>
+class KmerTmpFileReader {
+public:
+    explicit KmerTmpFileReader(const std::string &fileName)
+        : fileName(fileName), file(NULL), compressed(Util::endsWith(".zst", fileName)),
+          entries(NULL), entrySize(0), offsetPos(0), dataSize(0),
+          dstream(NULL), inBuffer(NULL), outBuffer(NULL), inBufferSize(0),
+          input(), eof(false), zstdFrameComplete(false), decodedOffset(0), closed(true) {
+        open();
+    }
+
+    ~KmerTmpFileReader() {
+        close();
+    }
+
+    bool next(T &entry) {
+        if (compressed) {
+            return nextCompressed(entry);
+        }
+        if (offsetPos >= entrySize) {
+            return false;
+        }
+        entry = entries[offsetPos];
+        offsetPos++;
+        return true;
+    }
+
+    void close() {
+        if (closed) {
+            return;
+        }
+        if (dataSize > 0 && entries != NULL && munmap((void *) entries, dataSize) < 0) {
+            Debug(Debug::ERROR) << "Failed to munmap memory dataSize=" << dataSize << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (dstream != NULL) {
+            ZSTD_freeDStream(dstream);
+            dstream = NULL;
+        }
+        if (inBuffer != NULL) {
+            free(inBuffer);
+            inBuffer = NULL;
+        }
+        if (outBuffer != NULL) {
+            free(outBuffer);
+            outBuffer = NULL;
+        }
+        if (file != NULL && fclose(file) != 0) {
+            Debug(Debug::ERROR) << "Cannot close file " << fileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        file = NULL;
+        closed = true;
+    }
+
+private:
+    void open() {
+        file = FileUtil::openFileOrDie(fileName.c_str(), "rb", true);
+        if (compressed) {
+            dstream = ZSTD_createDStream();
+            if (dstream == NULL) {
+                Debug(Debug::ERROR) << "ZSTD_createDStream() failed for " << fileName << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            size_t ret = ZSTD_initDStream(dstream);
+            if (ZSTD_isError(ret)) {
+                Debug(Debug::ERROR) << "ZSTD_initDStream() error for " << fileName << ". Error "
+                                    << ZSTD_getErrorName(ret) << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            inBufferSize = KMER_TMP_ZSTD_INPUT_BUFFER_SIZE;
+            inBuffer = static_cast<char *>(malloc(inBufferSize));
+            outBuffer = static_cast<char *>(malloc(KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE));
+            if (inBuffer == NULL || outBuffer == NULL) {
+                Debug(Debug::ERROR) << "Cannot allocate zstd buffer for " << fileName << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            input.src = inBuffer;
+            input.size = 0;
+            input.pos = 0;
+            eof = false;
+            zstdFrameComplete = false;
+        } else {
+            struct stat sb;
+            if (fstat(fileno(file), &sb) == 0 && sb.st_size > 0) {
+                entries = static_cast<T *>(FileUtil::mmapFile(file, &dataSize));
+                if (dataSize % sizeof(T) != 0) {
+                    Debug(Debug::ERROR) << "Malformed kmer temporary file " << fileName
+                                        << ": size is not a multiple of entry size\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                Util::madviseLogged(entries, dataSize, POSIX_MADV_SEQUENTIAL, fileName.c_str());
+            } else {
+                entries = NULL;
+                dataSize = 0;
+            }
+            entrySize = dataSize / sizeof(T);
+            offsetPos = 0;
+        }
+        closed = false;
+    }
+
+    bool nextCompressed(T &entry) {
+        while (decodedBytes.size() - decodedOffset < sizeof(T)) {
+            if (decompressMore() == false) {
+                if (decodedBytes.size() != decodedOffset) {
+                    Debug(Debug::ERROR) << "Malformed zstd kmer temporary file " << fileName
+                                        << ": trailing partial entry\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                return false;
+            }
+        }
+
+        memcpy(&entry, decodedBytes.data() + decodedOffset, sizeof(T));
+        decodedOffset += sizeof(T);
+        compactDecodedBuffer();
+        return true;
+    }
+
+    bool decompressMore() {
+        while (true) {
+            if (input.pos == input.size && eof == false) {
+                size_t read = fread(inBuffer, sizeof(char), inBufferSize, file);
+                if (read == 0) {
+                    if (ferror(file)) {
+                        Debug(Debug::ERROR) << "Cannot read file " << fileName << "\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    eof = true;
+                }
+                input.src = inBuffer;
+                input.size = read;
+                input.pos = 0;
+            }
+            if (input.pos == input.size && eof) {
+                if (zstdFrameComplete == false) {
+                    Debug(Debug::ERROR) << "Malformed zstd kmer temporary file " << fileName
+                                        << ": truncated zstd frame\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                return false;
+            }
+
+            ZSTD_outBuffer output = { outBuffer, KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE, 0 };
+            size_t ret = ZSTD_decompressStream(dstream, &output, &input);
+            if (ZSTD_isError(ret)) {
+                Debug(Debug::ERROR) << "ZSTD_decompressStream() error for " << fileName << ". Error "
+                                    << ZSTD_getErrorName(ret) << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            zstdFrameComplete = (ret == 0);
+            if (output.pos > 0) {
+                const size_t oldSize = decodedBytes.size();
+                decodedBytes.resize(oldSize + output.pos);
+                memcpy(decodedBytes.data() + oldSize, outBuffer, output.pos);
+                return true;
+            }
+        }
+    }
+
+    void compactDecodedBuffer() {
+        if (decodedOffset > KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE && decodedOffset * 2 > decodedBytes.size()) {
+            decodedBytes.erase(decodedBytes.begin(), decodedBytes.begin() + decodedOffset);
+            decodedOffset = 0;
+        }
+    }
+
+    std::string fileName;
+    FILE *file;
+    bool compressed;
+    T *entries;
+    size_t entrySize;
+    size_t offsetPos;
+    size_t dataSize;
+    ZSTD_DStream *dstream;
+    char *inBuffer;
+    char *outBuffer;
+    size_t inBufferSize;
+    ZSTD_inBuffer input;
+    bool eof;
+    bool zstdFrameComplete;
+    std::vector<char> decodedBytes;
+    size_t decodedOffset;
+    bool closed;
+};
+
 template <int TYPE, typename T>
-static bool queueNextEntryStreaming(KmerPositionQueue &queue, int file, size_t &offsetPos,
-                                    T *entries, size_t entrySize, DBKeyType &repSeqId) {
-    while (offsetPos < entrySize) {
-        if (entries[offsetPos].seqId == DB_KEY_INVALID) {
+static bool queueNextEntryStreaming(KmerPositionQueue &queue, int file,
+                                    KmerTmpFileReader<T> &reader, DBKeyType &repSeqId) {
+    T entry;
+    while (reader.next(entry)) {
+        if (entry.seqId == DB_KEY_INVALID) {
             repSeqId = DB_KEY_INVALID;
-            offsetPos++;
             continue;
         }
         if (repSeqId == DB_KEY_INVALID) {
-            repSeqId = entries[offsetPos].seqId;
-            offsetPos++;
+            repSeqId = entry.seqId;
             continue;
         }
         if(TYPE == Parameters::DBTYPE_NUCLEOTIDES){
-            queue.push(FileKmerPosition(repSeqId, entries[offsetPos].seqId, entries[offsetPos].diagonal,
-                                        entries[offsetPos].score, entries[offsetPos].getRev(), file));
+            queue.push(FileKmerPosition(repSeqId, entry.seqId, entry.diagonal,
+                                        entry.score, entry.getRev(), file));
         }else{
-            queue.push(FileKmerPosition(repSeqId, entries[offsetPos].seqId, entries[offsetPos].diagonal,
-                                        entries[offsetPos].score, file));
+            queue.push(FileKmerPosition(repSeqId, entry.seqId, entry.diagonal,
+                                        entry.score, file));
         }
-        offsetPos++;
         return true;
     }
     return false;
@@ -1717,54 +2049,77 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
     std::vector<std::vector<std::string>> threadedFiles;
     threadedFiles.resize(numThreads);
 
+    const bool preferCompressedTmpFiles = Parameters::getInstance().compressKmerTmpFiles;
     for (int threadIdx = 0; threadIdx < numThreads; threadIdx++) {
         for (int iter = 0; iter < maxIter; iter++) {
             for (size_t i = 0; i < tmpFiles.size(); ++i) {
-                std::string splitFileName = tmpFiles[i] + "_iter_" + std::to_string(iter) + "_thread_" + std::to_string(threadIdx);
-                if (FileUtil::fileExists(splitFileName.c_str())) {
+                std::string splitFileName = existingKmerTmpFileName(
+                    kmerTmpFileName(tmpFiles[i], iter, threadIdx, false), preferCompressedTmpFiles);
+                if (splitFileName.empty() == false) {
                     threadedFiles[threadIdx].push_back(splitFileName);
                 }
             }
         }
     }
 
-#pragma omp parallel for num_threads(numThreads)
+    int mergeThreads = numThreads;
+    if (preferCompressedTmpFiles) {
+        size_t maxFilesPerThread = 0;
+        for (int threadIdx = 0; threadIdx < numThreads; threadIdx++) {
+            maxFilesPerThread = std::max(maxFilesPerThread, threadedFiles[threadIdx].size());
+        }
+
+        if (maxFilesPerThread > 0) {
+            long openMax = sysconf(_SC_OPEN_MAX);
+            size_t fdBudget = (openMax > 128) ? static_cast<size_t>(openMax - 64) : 64;
+            if (maxFilesPerThread >= fdBudget) {
+                Debug(Debug::ERROR) << "Too many compressed k-mer temporary files for one merge lane ("
+                                    << maxFilesPerThread << ") relative to open-file limit ("
+                                    << openMax << "). Reduce kmermatcher splits or disable "
+                                    << "--compress-kmer-tmp-files.\n";
+                EXIT(EXIT_FAILURE);
+            }
+            mergeThreads = std::min(mergeThreads,
+                                    std::max(1, static_cast<int>(fdBudget / maxFilesPerThread)));
+
+            const size_t perReaderBytes =
+                KMER_TMP_ZSTD_INPUT_BUFFER_SIZE + (3 * KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE) + 4096;
+            const size_t splitMemoryLimit = Parameters::getInstance().splitMemoryLimit;
+            if (splitMemoryLimit > 0) {
+                const size_t memBudget = std::max<size_t>(1, splitMemoryLimit / 4);
+                const size_t bytesPerLane = maxFilesPerThread * perReaderBytes;
+                if (bytesPerLane > 0) {
+                    mergeThreads = std::min(mergeThreads,
+                                            std::max(1, static_cast<int>(memBudget / bytesPerLane)));
+                }
+            }
+        }
+
+        if (mergeThreads < numThreads) {
+            Debug(Debug::INFO) << "Compressed k-mer tmp merge uses " << mergeThreads
+                               << " concurrent lanes for " << numThreads
+                               << " writer lanes to stay within file descriptor/memory bounds.\n";
+        }
+    }
+
+#pragma omp parallel for num_threads(mergeThreads)
     for (int threadIdx = 0; threadIdx < numThreads; threadIdx++) {
         const int fileCnt = threadedFiles[threadIdx].size();
         if (fileCnt == 0) {
             continue;
         }
 
-        FILE **files       = new FILE *[fileCnt];
-        T **entries        = new T *[fileCnt];
-        size_t *entrySizes = new size_t[fileCnt];
-        size_t *offsetPos  = new size_t[fileCnt];
-        size_t *dataSizes  = new size_t[fileCnt];
+        KmerTmpFileReader<T> **readers = new KmerTmpFileReader<T> *[fileCnt];
         DBKeyType *repSeqIds = new DBKeyType[fileCnt];
 
         for (size_t file = 0; file < threadedFiles[threadIdx].size(); file++) {
-            files[file] = FileUtil::openFileOrDie(threadedFiles[threadIdx][file].c_str(), "r", true);
-            size_t dataSize = 0;
-            struct stat sb;
-
-            if (fstat(fileno(files[file]), &sb) == 0 && sb.st_size > 0) {
-                entries[file] = (T *)FileUtil::mmapFile(files[file], &dataSize);
-                Util::madviseLogged(entries[file], dataSize, POSIX_MADV_SEQUENTIAL,
-                                    threadedFiles[threadIdx][file].c_str());
-            } else {
-                entries[file] = nullptr;
-                dataSize = 0;
-            }
-
-            dataSizes[file]  = dataSize;
-            entrySizes[file] = dataSize / sizeof(T);
-            offsetPos[file]  = 0;
+            readers[file] = new KmerTmpFileReader<T>(threadedFiles[threadIdx][file]);
             repSeqIds[file]  = DB_KEY_INVALID;
         }
 
         KmerPositionQueue queue;
         for (int file = 0; file < fileCnt; file++) {
-            queueNextEntryStreaming<TYPE, T>(queue, file, offsetPos[file], entries[file], entrySizes[file], repSeqIds[file]);
+            queueNextEntryStreaming<TYPE, T>(queue, file, *readers[file], repSeqIds[file]);
         }
 
         std::string prefResultsOutString;
@@ -1841,8 +2196,7 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
 
             bool hitIsRepSeq = (currRepSeq == res.id);
             if (hitIsRepSeq) {
-                queueNextEntryStreaming<TYPE, T>(queue, res.file, offsetPos[res.file],
-                                                 entries[res.file], entrySizes[res.file], repSeqIds[res.file]);
+                queueNextEntryStreaming<TYPE, T>(queue, res.file, *readers[res.file], repSeqIds[res.file]);
                 continue;
             }
 
@@ -1869,8 +2223,7 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
             }
             topScore += res.score;
 
-            queueNextEntryStreaming<TYPE, T>(queue, res.file, offsetPos[res.file],
-                                             entries[res.file], entrySizes[res.file], repSeqIds[res.file]);
+            queueNextEntryStreaming<TYPE, T>(queue, res.file, *readers[res.file], repSeqIds[res.file]);
         }
 
         if(currRepSeq != DB_KEY_INVALID){
@@ -1878,22 +2231,12 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
         }
 
         for (size_t file = 0; file < threadedFiles[threadIdx].size(); file++) {
-            if (fclose(files[file]) != 0) {
-                Debug(Debug::ERROR) << "Cannot close file " << threadedFiles[threadIdx][file] << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            if (dataSizes[file] > 0 && munmap((void *)entries[file], dataSizes[file]) < 0) {
-                Debug(Debug::ERROR) << "Failed to munmap memory dataSize=" << dataSizes[file] << "\n";
-                EXIT(EXIT_FAILURE);
-            }
+            readers[file]->close();
+            delete readers[file];
         }
 
-        delete[] dataSizes;
-        delete[] offsetPos;
-        delete[] entries;
-        delete[] entrySizes;
         delete[] repSeqIds;
-        delete[] files;
+        delete[] readers;
     }
 
     for (int tid = 0; tid < numThreads; ++tid) {
@@ -1907,6 +2250,11 @@ template <int TYPE, typename T, typename seqLenType, bool includeAdjacency, bool
 void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjacency, IncludeSeqLen> *hashSeqPair, size_t totalKmers,
                       int numThreads, std::vector<size_t> *threadQueryOffsets, int iteration) {
     const size_t BUFFER_SIZE = 2048;
+    const Parameters &par = Parameters::getInstance();
+    const bool compressTmpFiles = par.compressKmerTmpFiles;
+#ifndef OPENMP
+    (void) numThreads;
+#endif
 
 #pragma omp parallel num_threads(numThreads)
     {
@@ -1924,14 +2272,33 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
             endIdx = (*threadQueryOffsets)[tid + 1];
         }
         
-        std::string tmpFileThread = tmpFile + "_iter_" + std::to_string(iteration) + "_thread_" + std::to_string(tid);
+        std::string tmpFileThread = kmerTmpFileName(tmpFile, iteration, tid, compressTmpFiles);
+        removeKmerTmpFileIfExists(tmpFileThread);
+        removeKmerTmpFileIfExists(kmerTmpFileName(tmpFile, iteration, tid, !compressTmpFiles));
 
         if (startIdx < endIdx && hashSeqPair[startIdx].kmer != SIZE_T_MAX) {
-            FILE *filePtr = fopen(tmpFileThread.c_str(), "wb");
-            if (filePtr == nullptr) {
-                perror(tmpFileThread.c_str());
-                EXIT(EXIT_FAILURE);
+            FILE *filePtr = NULL;
+            ZstdKmerTmpFileWriter *zstdWriter = NULL;
+            if (compressTmpFiles) {
+                zstdWriter = new ZstdKmerTmpFileWriter(tmpFileThread, KMER_TMP_ZSTD_COMPRESSION_LEVEL);
+            } else {
+                filePtr = openKmerTmpFileForOverwriteOrDie(tmpFileThread, "wb");
             }
+
+            const auto writeEntries = [&](const T *entries, size_t count) {
+                if (count == 0) {
+                    return;
+                }
+                if (compressTmpFiles) {
+                    zstdWriter->write(entries, sizeof(T) * count);
+                } else {
+                    size_t written = fwrite(entries, sizeof(T), count, filePtr);
+                    if (written != count) {
+                        Debug(Debug::ERROR) << "Can not write to file " << tmpFileThread << "\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                }
+            };
 
             size_t repSeqId = SIZE_T_MAX;
             size_t lastTargetId = SIZE_T_MAX;
@@ -1955,9 +2322,9 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
                 if (repSeqId != currKmer) {
                     if (writeSets > 0 && elementCnt > 0) {
                         if (bufferPos > 0) {
-                            fwrite(writeBuffer, sizeof(T), bufferPos, filePtr);
+                            writeEntries(writeBuffer, bufferPos);
                         }
-                        fwrite(&nullEntry, sizeof(T), 1, filePtr);
+                        writeEntries(&nullEntry, 1);
                     }
                     lastTargetId = SIZE_T_MAX;
                     bufferPos = 0;
@@ -1988,10 +2355,11 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
                         reverse += (isReverse == true);
                     }
                     kmerPos++;
-                } while (repSeqId == hashSeqPair[kmerPos].kmer &&
+                } while (kmerPos < endIdx &&
+                        hashSeqPair[kmerPos].kmer != SIZE_T_MAX &&
+                        repSeqId == hashSeqPair[kmerPos].kmer &&
                         targetId == hashSeqPair[kmerPos].id &&
-                        hashSeqPair[kmerPos].pos == diagonal &&
-                        kmerPos < endIdx && hashSeqPair[kmerPos].kmer != SIZE_T_MAX);
+                        hashSeqPair[kmerPos].pos == diagonal);
                 kmerPos--;
 
                 elementCnt++;
@@ -2006,7 +2374,7 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
                 bufferPos++;
 
                 if (bufferPos >= BUFFER_SIZE) {
-                    fwrite(writeBuffer, sizeof(T), bufferPos, filePtr);
+                    writeEntries(writeBuffer, bufferPos);
                     bufferPos = 0;
                 }
                 lastTargetId = targetId;
@@ -2015,20 +2383,26 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
 
             if (writeSets > 0 && elementCnt > 0) {
                 if (bufferPos > 0) {
-                    fwrite(writeBuffer, sizeof(T), bufferPos, filePtr);
+                    writeEntries(writeBuffer, bufferPos);
                 }
-                fwrite(&nullEntry, sizeof(T), 1, filePtr);
+                writeEntries(&nullEntry, 1);
             }
 
-            if (fclose(filePtr) != 0) {
-                Debug(Debug::ERROR) << "Cannot close file " << tmpFileThread << "\n";
-                EXIT(EXIT_FAILURE);
+            if (compressTmpFiles) {
+                zstdWriter->close();
+                delete zstdWriter;
+            } else {
+                if (fclose(filePtr) != 0) {
+                    Debug(Debug::ERROR) << "Cannot close file " << tmpFileThread << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
             }
         }
     }
     
     std::string fileName = tmpFile + "_iter_" + std::to_string(iteration) + ".done";
-    FILE *done = FileUtil::openFileOrDie(fileName.c_str(), "w", false);
+    removeKmerTmpFileIfExists(fileName);
+    FILE *done = openKmerTmpFileForOverwriteOrDie(fileName, "w");
     if (fclose(done) != 0) {
         Debug(Debug::ERROR) << "Cannot close file " << fileName << "\n";
         EXIT(EXIT_FAILURE);
@@ -2120,4 +2494,3 @@ template void mergeKmerFilesAndOutput<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryR
 template void mergeKmerFilesAndOutput<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry, false>(DBWriter &, std::vector<std::string>, std::vector<char> &, int, int);
 
 #undef SIZE_T_MAX
-

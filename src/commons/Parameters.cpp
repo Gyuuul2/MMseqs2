@@ -176,6 +176,7 @@ Parameters::Parameters():
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
+        PARAM_COMPRESS_KMER_TMP_FILES(PARAM_COMPRESS_KMER_TMP_FILES_ID, "--compress-kmer-tmp-files", "Compress k-mer temporary files", "Compress kmermatcher temporary files with zstd and stream them during merge", typeid(bool), (void *) &compressKmerTmpFiles, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_VERSION(PARAM_LINCLUST_VERSION_ID, "--linclust-version", "Linclust version", "Linclust version: 1: Linclust1, 2: Linclust2", typeid(int), (void *) &linclustVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUSTER_VERSION(PARAM_CLUSTER_VERSION_ID, "--cluster-version", "Cluster version", "Cluster version: 1: Cluster1, 2: Cluster2", typeid(int), (void *) &clusterVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -191,12 +192,27 @@ Parameters::Parameters():
         PARAM_BATCH_SLURM_MEM(PARAM_BATCH_SLURM_MEM_ID, "--slurm-mem", "SLURM memory", "SLURM memory request per submitted chunk task", typeid(std::string), (void *) &batchSlurmMem, "", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_SLURM_EXTRA(PARAM_BATCH_SLURM_EXTRA_ID, "--slurm-extra", "SLURM extra", "Additional raw sbatch options for --backend multi-node", typeid(std::string), (void *) &batchSlurmExtra, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_NODE_WORK_DIR(PARAM_BATCH_NODE_WORK_DIR_ID, "--node-work-dir", "Node work dir", "Per-node LOCAL disk for chunk tasks (createdb/cluster tmp + sort spill). REQUIRED for --backend multi-node and aws-batch; on single-node defaults to a subdirectory of the shared tmp directory", typeid(std::string), (void *) &batchNodeWorkDir, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES(PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES_ID, "--round0-chunk-max-bytes", "Round0 chunk bytes", "Override --chunk-max-bytes for round 0 only. If unset, round 0 uses --chunk-max-bytes", typeid(ByteParser), (void *) &batchRound0ChunkMaxBytes, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS(PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS_ID, "--round0-chunk-max-seqs", "Round0 chunk sequences", "Override --chunk-max-seqs for round 0 only. If unset, round 0 uses --chunk-max-seqs", typeid(size_t), (void *) &batchRound0ChunkMaxSeqs, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_SLURM_NODELIST(PARAM_BATCH_ROUND0_SLURM_NODELIST_ID, "--round0-slurm-nodelist", "Round0 SLURM nodes", "Override --slurm-nodelist for round 0 only", typeid(std::string), (void *) &batchRound0SlurmNodelist, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_NODE_WORK_DIR(PARAM_BATCH_ROUND0_NODE_WORK_DIR_ID, "--round0-node-work-dir", "Round0 node work dir", "Override --node-work-dir for round 0 only", typeid(std::string), (void *) &batchRound0NodeWorkDir, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_MIN_SEQ_ID(PARAM_BATCH_ROUND0_MIN_SEQ_ID_ID, "--round0-min-seq-id", "Round0 seq. id.", "Override --min-seq-id for round 0 only", typeid(float), (void *) &batchRound0SeqIdThr, "^0(\\.[0-9]+)?|1(\\.0+)?$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_C(PARAM_BATCH_ROUND0_C_ID, "--round0-c", "Round0 coverage", "Override -c for round 0 only", typeid(float), (void *) &batchRound0CovThr, "^0(\\.[0-9]+)?|^1(\\.0+)?$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_COV_MODE(PARAM_BATCH_ROUND0_COV_MODE_ID, "--round0-cov-mode", "Round0 coverage mode", "Override --cov-mode for round 0 only", typeid(int), (void *) &batchRound0CovMode, "^[0-5]{1}$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_CLUSTER_MODE(PARAM_BATCH_ROUND0_CLUSTER_MODE_ID, "--round0-cluster-mode", "Round0 cluster mode", "Override --cluster-mode for round 0 only", typeid(int), (void *) &batchRound0ClusteringMode, "[0-3]{1}$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_KMER_PER_SEQ(PARAM_BATCH_ROUND0_KMER_PER_SEQ_ID, "--round0-kmer-per-seq", "Round0 k-mers/sequence", "Override --kmer-per-seq for round 0 only", typeid(int), (void *) &batchRound0KmersPerSequence, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE(PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE_ID, "--round0-include-count-table", "Round0 count table", "Override --include-count-table for round 0 only", typeid(bool), (void *) &batchRound0IncludeCountTable, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_NUM_COUNTS(PARAM_BATCH_ROUND0_NUM_COUNTS_ID, "--round0-num-count-table", "Round0 count-table iterations", "Override --num-count-table for round 0 only", typeid(int), (void *) &batchRound0CountTableIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_NUM_ADJACENCY(PARAM_BATCH_ROUND0_NUM_ADJACENCY_ID, "--round0-num-adjacency", "Round0 adjacency iterations", "Override --num-adjacency for round 0 only", typeid(int), (void *) &batchRound0AdjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_CLUST_HASH(PARAM_BATCH_ROUND0_CLUST_HASH_ID, "--round0-clust-hash", "Round0 cluster hash", "Override --clust-hash for round 0 only", typeid(bool), (void *) &batchRound0ClustHash, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT(PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT_ID, "--round0-split-memory-limit", "Round0 split memory", "Override --split-memory-limit for round 0 only", typeid(ByteParser), (void *) &batchRound0SplitMemoryLimit, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_PRELOAD_MODE(PARAM_BATCH_ROUND0_PRELOAD_MODE_ID, "--round0-db-load-mode", "Round0 preload mode", "Override --db-load-mode for round 0 only", typeid(int), (void *) &batchRound0PreloadMode, "[0-3]{1}", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_MAX_ROUNDS(PARAM_BATCH_MAX_ROUNDS_ID, "--max-rounds", "Max rounds", "Maximum representative clustering rounds", typeid(int), (void *) &batchMaxRounds, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_MIN_REDUCTION_RATIO(PARAM_BATCH_MIN_REDUCTION_RATIO_ID, "--min-reduction-ratio", "Min reduction ratio", "A representative round is low-benefit if it removes less than this fraction of representatives", typeid(float), (void *) &batchMinReductionRatio, "^(0(\\.[0-9]+)?|1(\\.0+)?)$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_CONVERGENCE_PATIENCE(PARAM_BATCH_CONVERGENCE_PATIENCE_ID, "--convergence-patience", "Convergence patience", "Number of consecutive low-benefit rounds before stopping", typeid(int), (void *) &batchConvergencePatience, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_MIN_REDUCTION_COUNT(PARAM_BATCH_MIN_REDUCTION_COUNT_ID, "--min-reduction-count", "Min reduction count", "A representative round is low-benefit if it removes fewer representatives than this count. 0 disables this condition", typeid(size_t), (void *) &batchMinReductionCount, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_MAX_CHUNK_ATTEMPTS(PARAM_BATCH_MAX_CHUNK_ATTEMPTS_ID, "--max-chunk-attempts", "Max chunk attempts", "Maximum attempts for missing or failed chunk workers before reporting a dead-letter failure", typeid(int), (void *) &batchMaxChunkAttempts, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
-        PARAM_BATCH_COMPRESS_LEVEL(PARAM_BATCH_COMPRESS_LEVEL_ID, "--compress-level", "Compression level", "zstd compression level for chunked intermediate FASTA/TSV files", typeid(int), (void *) &batchCompressLevel, "^([1-9]|1[0-9]|2[0-2])$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_COMPRESS_OUTPUTS(PARAM_BATCH_COMPRESS_OUTPUTS_ID, "--compress-batch-outputs", "Compress batch outputs", "Store per-round and final batch FASTA/TSV outputs as zstd files", typeid(bool), (void *) &batchCompressOutputs, "^[0-1]{1}$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_MERGE_BUCKETS(PARAM_BATCH_MERGE_BUCKETS_ID, "--merge-buckets", "Merge buckets", "Split the representative merge into this many independent hash buckets, each sorted+joined separately (smaller sorts = lower RAM/disk peak). The cluster (rep,member) mapping is identical for any value; the final-file row order matches a single global sort only for a FIXED value. 1 = one big join. Raise for very large inputs", typeid(int), (void *) &batchMergeBuckets, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         // search workflow
         PARAM_NUM_ITERATIONS(PARAM_NUM_ITERATIONS_ID, "--num-iterations", "Search iterations", "Number of iterative profile search iterations", typeid(int), (void *) &numIterations, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_PROFILE),
@@ -1135,6 +1151,7 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_NUM_ADJACENCY);
     kmermatcher.push_back(&PARAM_USE_PARALLELISM);
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
+    kmermatcher.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
     kmermatcher.push_back(&PARAM_LINCLUST_VERSION);
 
     // kmermatcher
@@ -1548,17 +1565,36 @@ Parameters::Parameters():
     batchclustering.push_back(&PARAM_BATCH_SLURM_MEM);
     batchclustering.push_back(&PARAM_BATCH_SLURM_EXTRA);
     batchclustering.push_back(&PARAM_BATCH_NODE_WORK_DIR);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_SLURM_NODELIST);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_NODE_WORK_DIR);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_MIN_SEQ_ID);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_C);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_COV_MODE);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_CLUSTER_MODE);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_KMER_PER_SEQ);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_NUM_COUNTS);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_NUM_ADJACENCY);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_CLUST_HASH);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_PRELOAD_MODE);
     batchclustering.push_back(&PARAM_BATCH_MAX_ROUNDS);
     batchclustering.push_back(&PARAM_BATCH_MIN_REDUCTION_RATIO);
     batchclustering.push_back(&PARAM_BATCH_CONVERGENCE_PATIENCE);
     batchclustering.push_back(&PARAM_BATCH_MIN_REDUCTION_COUNT);
     batchclustering.push_back(&PARAM_BATCH_MAX_CHUNK_ATTEMPTS);
-    batchclustering.push_back(&PARAM_BATCH_COMPRESS_LEVEL);
+    batchclustering.push_back(&PARAM_BATCH_COMPRESS_OUTPUTS);
     batchclustering.push_back(&PARAM_BATCH_MERGE_BUCKETS);
+    batchclustering.push_back(&PARAM_CREATEDB_MODE);
     batchclustering.push_back(&PARAM_REMOVE_TMP_FILES);
     batchclustering.push_back(&PARAM_REUSELATEST);
     batchclustering.push_back(&PARAM_THREADS);
+    batchclustering.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    batchclustering.push_back(&PARAM_PRELOAD_MODE);
     batchclustering.push_back(&PARAM_COMPRESSED);
+    batchclustering.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
     batchclustering.push_back(&PARAM_V);
 
     linclustbatch.push_back(&PARAM_MIN_SEQ_ID);
@@ -1568,6 +1604,7 @@ Parameters::Parameters():
     linclustbatch.push_back(&PARAM_KMER_PER_SEQ);
     linclustbatch.push_back(&PARAM_INCLUDE_COUNTTABLE);
     linclustbatch.push_back(&PARAM_NUM_COUNTS);
+    linclustbatch.push_back(&PARAM_INCLUDE_ADJACENCY);
     linclustbatch.push_back(&PARAM_NUM_ADJACENCY);
     linclustbatch.push_back(&PARAM_CLUST_HASH);
     linclustbatch.push_back(&PARAM_LINCLUST_VERSION);
@@ -1584,6 +1621,7 @@ Parameters::Parameters():
     clusterbatch.push_back(&PARAM_KMER_PER_SEQ);
     clusterbatch.push_back(&PARAM_INCLUDE_COUNTTABLE);
     clusterbatch.push_back(&PARAM_NUM_COUNTS);
+    clusterbatch.push_back(&PARAM_INCLUDE_ADJACENCY);
     clusterbatch.push_back(&PARAM_NUM_ADJACENCY);
     clusterbatch.push_back(&PARAM_MAX_SEQS);
     clusterbatch.push_back(&PARAM_S);
@@ -2695,12 +2733,27 @@ void Parameters::setDefaults() {
     batchSlurmMem = "";
     batchSlurmExtra = "";
     batchNodeWorkDir = "";
+    batchRound0ChunkMaxBytes = 0;
+    batchRound0ChunkMaxSeqs = 0;
+    batchRound0SlurmNodelist = "";
+    batchRound0NodeWorkDir = "";
+    batchRound0SeqIdThr = 0.0f;
+    batchRound0CovThr = 0.0f;
+    batchRound0CovMode = 0;
+    batchRound0ClusteringMode = 0;
+    batchRound0KmersPerSequence = 0;
+    batchRound0IncludeCountTable = false;
+    batchRound0CountTableIteration = 0;
+    batchRound0AdjIteration = 0;
+    batchRound0ClustHash = false;
+    batchRound0SplitMemoryLimit = 0;
+    batchRound0PreloadMode = 0;
     batchMaxRounds = 32;
     batchMinReductionRatio = 0.02f;
     batchConvergencePatience = 1;
     batchMinReductionCount = 0;
     batchMaxChunkAttempts = 3;
-    batchCompressLevel = 3;
+    batchCompressOutputs = false;
     batchMergeBuckets = 1;
     // Clustering workflow
     removeTmpFiles = false;
@@ -2891,6 +2944,7 @@ void Parameters::setDefaults() {
     weightFile = "";
     useParallelism = false;
     needWriteBuffer = false;
+    compressKmerTmpFiles = false;
     includeCountTable = true;
     countTableIteration = 2;
     countTableScale = 0.1;

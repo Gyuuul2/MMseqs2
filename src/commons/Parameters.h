@@ -485,12 +485,27 @@ public:
     std::string batchSlurmMem;
     std::string batchSlurmExtra;
     std::string batchNodeWorkDir;
+    size_t batchRound0ChunkMaxBytes;
+    size_t batchRound0ChunkMaxSeqs;
+    std::string batchRound0SlurmNodelist;
+    std::string batchRound0NodeWorkDir;
+    float batchRound0SeqIdThr;
+    float batchRound0CovThr;
+    int batchRound0CovMode;
+    int batchRound0ClusteringMode;
+    int batchRound0KmersPerSequence;
+    bool batchRound0IncludeCountTable;
+    int batchRound0CountTableIteration;
+    int batchRound0AdjIteration;
+    bool batchRound0ClustHash;
+    size_t batchRound0SplitMemoryLimit;
+    int batchRound0PreloadMode;
     int batchMaxRounds;
     float batchMinReductionRatio;
     int batchConvergencePatience;
     size_t batchMinReductionCount;
     int batchMaxChunkAttempts;
-    int batchCompressLevel;
+    bool batchCompressOutputs;
     int batchMergeBuckets;
 
     // CLUSTERING
@@ -605,6 +620,7 @@ public:
     std::string weightFile;
     bool useParallelism;
     bool needWriteBuffer;
+    bool compressKmerTmpFiles;
     bool includeCountTable;
     int countTableIteration;
     float countTableScale;
@@ -976,6 +992,7 @@ public:
     PARAMETER(PARAM_NUM_ADJACENCY)
     PARAMETER(PARAM_USE_PARALLELISM)
     PARAMETER(PARAM_NEED_WRITEBUFFER)
+    PARAMETER(PARAM_COMPRESS_KMER_TMP_FILES)
     PARAMETER(PARAM_CLUST_HASH)
     PARAMETER(PARAM_LINCLUST_VERSION)
     PARAMETER(PARAM_CLUSTER_VERSION)
@@ -992,12 +1009,27 @@ public:
     PARAMETER(PARAM_BATCH_SLURM_MEM)
     PARAMETER(PARAM_BATCH_SLURM_EXTRA)
     PARAMETER(PARAM_BATCH_NODE_WORK_DIR)
+    PARAMETER(PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES)
+    PARAMETER(PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS)
+    PARAMETER(PARAM_BATCH_ROUND0_SLURM_NODELIST)
+    PARAMETER(PARAM_BATCH_ROUND0_NODE_WORK_DIR)
+    PARAMETER(PARAM_BATCH_ROUND0_MIN_SEQ_ID)
+    PARAMETER(PARAM_BATCH_ROUND0_C)
+    PARAMETER(PARAM_BATCH_ROUND0_COV_MODE)
+    PARAMETER(PARAM_BATCH_ROUND0_CLUSTER_MODE)
+    PARAMETER(PARAM_BATCH_ROUND0_KMER_PER_SEQ)
+    PARAMETER(PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE)
+    PARAMETER(PARAM_BATCH_ROUND0_NUM_COUNTS)
+    PARAMETER(PARAM_BATCH_ROUND0_NUM_ADJACENCY)
+    PARAMETER(PARAM_BATCH_ROUND0_CLUST_HASH)
+    PARAMETER(PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT)
+    PARAMETER(PARAM_BATCH_ROUND0_PRELOAD_MODE)
     PARAMETER(PARAM_BATCH_MAX_ROUNDS)
     PARAMETER(PARAM_BATCH_MIN_REDUCTION_RATIO)
     PARAMETER(PARAM_BATCH_CONVERGENCE_PATIENCE)
     PARAMETER(PARAM_BATCH_MIN_REDUCTION_COUNT)
     PARAMETER(PARAM_BATCH_MAX_CHUNK_ATTEMPTS)
-    PARAMETER(PARAM_BATCH_COMPRESS_LEVEL)
+    PARAMETER(PARAM_BATCH_COMPRESS_OUTPUTS)
     PARAMETER(PARAM_BATCH_MERGE_BUCKETS)
 
     // search workflow

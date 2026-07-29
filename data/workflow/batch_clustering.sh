@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Intentional bash (not /bin/sh like the linear step-runner peers): this is a distributed
+# orchestrator (single-node / SLURM / AWS Batch) relying on arrays, [[ ]], printf %q, process
+# substitution and traps. Do not "port" to POSIX sh -- it would drop the %q path-quoting safety.
 set -euo pipefail
 export LC_ALL=C
 
@@ -15,7 +18,7 @@ usage() {
     cat >&2 <<'EOF'
 Usage:
   batch_clustering.sh prepare <input_manifest> <chunk_dir> <chunk_manifest>
-  batch_clustering.sh cluster-chunk <chunk_uri> <result_prefix> <work_dir> [chunk_id]
+  batch_clustering.sh cluster-chunk <chunk_uri> <result_prefix> <work_dir> [chunk_id] [round] [expected_seqs]
   batch_clustering.sh propagate <child_tsv_manifest> <parent_tsv_manifest> <out_manifest> <work_dir>
   batch_clustering.sh finalize <mapping_manifest> <rep_manifest> <result_prefix> <work_dir> [mark_final]
   batch_clustering.sh run-single-node <input_manifest> <work_dir> <result_dir>
@@ -30,10 +33,10 @@ Usage:
 
 Environment:
   MMSEQS THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_BUCKETS COMPRESS_RATIO
-  CLUSTER_CMD CLUSTER_PAR CLUSTER_COV_MODE CREATEDB_PAR CREATETSV_PAR COMPRESS_LEVEL SORT_BUFFER_SIZE SORT_TMP
+  CLUSTER_CMD CLUSTER_PAR ROUND0_CLUSTER_PAR CLUSTER_COV_MODE CREATEDB_PAR CREATETSV_PAR COMPRESS_BATCH_OUTPUTS SORT_BUFFER_SIZE SORT_TMP
   MAX_ROUNDS MIN_REDUCTION_RATIO MIN_REDUCTION_COUNT CONVERGENCE_PATIENCE MAX_CHUNK_ATTEMPTS
-  REMOVE_TMP NODE_WORK_DIR
-  BATCH_SLURM_NODELIST BATCH_SLURM_PARTITION BATCH_SLURM_TIME BATCH_SLURM_MEM BATCH_SLURM_EXTRA
+  REMOVE_TMP NODE_WORK_DIR ROUND0_NODE_WORK_DIR
+  BATCH_SLURM_NODELIST ROUND0_SLURM_NODELIST BATCH_SLURM_PARTITION BATCH_SLURM_TIME BATCH_SLURM_MEM BATCH_SLURM_EXTRA
   AWS_BATCH_JOB_QUEUE AWS_BATCH_JOB_DEFINITION BATCH_AWS_JOB_PREFIX
 EOF
     exit 1
@@ -41,11 +44,37 @@ EOF
 
 MMSEQS=${MMSEQS:-mmseqs}
 THREADS=${THREADS:-$(command -v nproc >/dev/null 2>&1 && nproc || echo 1)}
-CHUNK_MAX_BYTES=${CHUNK_MAX_BYTES:-20000000000}
+CHUNK_MAX_BYTES=${CHUNK_MAX_BYTES:-21474836480}   # = 20*1024^3; must match BatchClustering.cpp/Parameters.cpp batchChunkMaxBytes so a standalone run chunks identically to the mmseqs-injected run
 CHUNK_MAX_SEQS=${CHUNK_MAX_SEQS:-0}
+ROUND0_CHUNK_MAX_BYTES=${ROUND0_CHUNK_MAX_BYTES:-}
+ROUND0_CHUNK_MAX_SEQS=${ROUND0_CHUNK_MAX_SEQS:-}
 S3_CHUNK_PREFIX=${S3_CHUNK_PREFIX:-}
-COMPRESS_LEVEL=${COMPRESS_LEVEL:-3}
-CREATEDB_PAR=${CREATEDB_PAR:---shuffle 0 --write-lookup 1 --createdb-mode 0}
+COMPRESS_BATCH_OUTPUTS=${COMPRESS_BATCH_OUTPUTS:-0}
+[[ "$COMPRESS_BATCH_OUTPUTS" =~ ^[01]$ ]] || fail "COMPRESS_BATCH_OUTPUTS must be 0 or 1 (got '$COMPRESS_BATCH_OUTPUTS')"
+# --write-lookup 0: the per-chunk .lookup is unused here. The inner clust reads .lookup only in
+# set-mode (never enabled from batch entry points); accessions come from the _h header DB, not it.
+# --createdb-mode 0: createdb reads FASTA/.zst natively and writes the compact sequence DB. Mode 1
+# is explicit opt-in only; batch must materialize plain FASTA first, which is slower for .zst chunks.
+CREATEDB_PAR=${CREATEDB_PAR:---shuffle 0 --write-lookup 0 --createdb-mode 0}
+createdb_mode_from_par() {
+    local par=" ${CREATEDB_PAR} "
+    if [[ "$par" =~ [[:space:]]--createdb-mode=([0-9]+) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    elif [[ "$par" =~ [[:space:]]--createdb-mode[[:space:]]+([0-9]+) ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    else
+        printf '0'
+    fi
+}
+validate_createdb_par() {
+    local mode
+    mode=$(createdb_mode_from_par)
+    case "$mode" in
+        0|1) ;;
+        *) fail "batch clustering supports CREATEDB_PAR --createdb-mode 0 or 1 only (got $mode). Mode 2/GPU changes DB layout and can change clustering results." ;;
+    esac
+}
+validate_createdb_par
 CLUSTER_CMD=${CLUSTER_CMD:-linclust}
 CLUSTER_COV_MODE=${CLUSTER_COV_MODE:-1}
 if [[ -z "${CLUSTER_PAR+x}" ]]; then
@@ -57,6 +86,7 @@ if [[ -z "${CLUSTER_PAR+x}" ]]; then
         CLUSTER_PAR="--linclust-version 2 -c 0.8 --cov-mode ${CLUSTER_COV_MODE} --cluster-mode 3 --num-adjacency 3 --include-count-table 0 --min-seq-id 0.9 --threads $THREADS"
     fi
 fi
+ROUND0_CLUSTER_PAR=${ROUND0_CLUSTER_PAR:-}
 CREATETSV_PAR=${CREATETSV_PAR:---threads "$THREADS"}
 MAX_ROUNDS=${MAX_ROUNDS:-32}
 MIN_REDUCTION_RATIO=${MIN_REDUCTION_RATIO:-0.02}
@@ -68,12 +98,78 @@ MERGE_BUCKETS=${MERGE_BUCKETS:-1}
 [[ "$MERGE_BUCKETS" =~ ^[1-9][0-9]*$ ]] || fail "MERGE_BUCKETS must be a positive integer (got '$MERGE_BUCKETS')"
 BATCH_BACKEND=${BATCH_BACKEND:-single-node}
 NODE_WORK_DIR=${NODE_WORK_DIR:-}
+ROUND0_NODE_WORK_DIR=${ROUND0_NODE_WORK_DIR:-}
 BATCH_SLURM_NODELIST=${BATCH_SLURM_NODELIST:-}
+ROUND0_SLURM_NODELIST=${ROUND0_SLURM_NODELIST:-}
 BATCH_SLURM_PARTITION=${BATCH_SLURM_PARTITION:-}
 BATCH_SLURM_TIME=${BATCH_SLURM_TIME:-}
 BATCH_SLURM_MEM=${BATCH_SLURM_MEM:-}
 BATCH_SLURM_EXTRA=${BATCH_SLURM_EXTRA:-}
 BATCH_SCRIPT="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)/$(basename -- "$0")"
+
+round_cluster_par() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_CLUSTER_PAR:-}" ]]; then
+        printf '%s' "$ROUND0_CLUSTER_PAR"
+    else
+        printf '%s' "$CLUSTER_PAR"
+    fi
+}
+
+round_chunk_max_bytes() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_CHUNK_MAX_BYTES:-}" ]]; then
+        printf '%s' "$ROUND0_CHUNK_MAX_BYTES"
+    else
+        printf '%s' "$CHUNK_MAX_BYTES"
+    fi
+}
+
+round_chunk_max_seqs() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_CHUNK_MAX_SEQS:-}" ]]; then
+        printf '%s' "$ROUND0_CHUNK_MAX_SEQS"
+    else
+        printf '%s' "$CHUNK_MAX_SEQS"
+    fi
+}
+
+round_node_work_dir() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_NODE_WORK_DIR:-}" ]]; then
+        printf '%s' "$ROUND0_NODE_WORK_DIR"
+    else
+        printf '%s' "${NODE_WORK_DIR:-}"
+    fi
+}
+
+round_slurm_nodelist() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_SLURM_NODELIST:-}" ]]; then
+        printf '%s' "$ROUND0_SLURM_NODELIST"
+    else
+        printf '%s' "$BATCH_SLURM_NODELIST"
+    fi
+}
+
+prepare_round() {
+    local round="$1"
+    shift
+    (
+        CHUNK_MAX_BYTES=$(round_chunk_max_bytes "$round")
+        CHUNK_MAX_SEQS=$(round_chunk_max_seqs "$round")
+        export CHUNK_MAX_BYTES CHUNK_MAX_SEQS
+        prepare "$@"
+    )
+}
+
+with_round_node_work_dir() {
+    local round="$1"
+    shift
+    local node_work_dir
+    node_work_dir=$(round_node_work_dir "$round")
+    NODE_WORK_DIR="$node_work_dir" "$@"
+}
 
 # GNU-sort acceleration for the merge: parallel workers + an in-memory buffer before spilling to -T.
 # SORT_BUFFER_SIZE is the per-sort memory target; it is NOT related to bucket count. It defaults to a
@@ -96,7 +192,7 @@ fi
 # (--node-work-dir) with a per-run component (like make_chunk_work_dir) so co-located runs never
 # collide -- otherwise one run's cleanup could rm -rf another run's scratch mid-sort. Falls back to
 # the work_dir (already node-local on single-node). Only the merge OUTPUT (shards/ for the next
-# round) and the final .zst must live on shared storage; these intermediates should not.
+# round) and the final output must live on shared storage; these intermediates should not.
 resolve_node_scratch() {
     local work_dir="$1" name="$2"
     if [[ -n "${NODE_WORK_DIR:-}" ]]; then
@@ -219,13 +315,13 @@ stream_uri() {
     if is_s3 "$uri"; then
         need_cmd aws
         case "$uri" in
-            *.zst) aws s3 cp "$uri" - --no-progress | zstd -dc ;;
+            *.zst) need_cmd zstd; aws s3 cp "$uri" - --no-progress | zstd -dc ;;
             *.gz)  aws s3 cp "$uri" - --no-progress | gzip -dc ;;
             *)     aws s3 cp "$uri" - --no-progress ;;
         esac
     else
         case "$uri" in
-            *.zst) zstd -dc "$uri" ;;
+            *.zst) need_cmd zstd; zstd -dc "$uri" ;;
             *.gz)  gzip -dc "$uri" ;;
             *)     cat "$uri" ;;
         esac
@@ -251,7 +347,170 @@ compress_to_zst() {
     local src="$1"
     local dst="$2"
     need_cmd zstd
-    zstd -q -f "-${COMPRESS_LEVEL}" -T"$THREADS" -c "$src" > "$dst"
+    zstd -q -f -3 -T"$THREADS" -c "$src" > "$dst"
+}
+
+compress_batch_outputs_enabled() {
+    [[ "${COMPRESS_BATCH_OUTPUTS:-0}" == "1" ]]
+}
+
+batch_compression_suffix() {
+    if compress_batch_outputs_enabled; then
+        printf '.zst'
+    fi
+}
+
+final_cluster_file_name() {
+    printf 'final_cluster.tsv%s' "$(batch_compression_suffix)"
+}
+
+write_batch_output() {
+    local src="$1"
+    local dst="$2"
+    if compress_batch_outputs_enabled; then
+        compress_to_zst "$src" "$dst"
+    else
+        [[ "$src" == "$dst" ]] && return 0
+        mkdir -p "$(dirname "$dst")"
+        cp "$src" "$dst"
+    fi
+}
+
+createdb_softlink_enabled() {
+    [[ " ${CREATEDB_PAR} " =~ (^|[[:space:]])--createdb-mode(=|[[:space:]]+)1($|[[:space:]]) ]]
+}
+
+append_singleline_fasta() {
+    local src="$1"
+    local dst="$2"
+    # createdb softlink mode needs plain single-line FASTA. Inspect the first record while
+    # streaming: if it is already single-line, append the input verbatim; otherwise normalize all
+    # records to one sequence line. The first-record check assumes a consistent wrapping style per
+    # file, matching the common Prodigal/MMseqs output cases.
+    stream_uri "$src" | awk '
+        function clean_line(line) {
+            gsub(/[[:space:]]/, "", line)
+            return line
+        }
+        function emit_first_raw(    i) {
+            print first_header
+            for (i = 1; i <= first_seq_n; i++) {
+                print first_seq[i]
+            }
+        }
+        function emit_norm_record() {
+            if (norm_seen) {
+                printf "\n"
+            }
+            print norm_header
+            printf "%s", norm_seq
+            norm_seen = 1
+        }
+        function enter_raw_mode() {
+            mode = "raw"
+            emit_first_raw()
+        }
+        function enter_norm_mode() {
+            mode = "norm"
+            norm_header = first_header
+            norm_seq = ""
+            for (i = 1; i <= first_seq_n; i++) {
+                norm_seq = norm_seq clean_line(first_seq[i])
+            }
+            emit_norm_record()
+            norm_header = ""
+            norm_seq = ""
+        }
+        /^>/ {
+            if (!have_first) {
+                first_header = $0
+                first_seq_n = 0
+                have_first = 1
+                next
+            }
+            if (mode == "") {
+                if (first_seq_n == 1) {
+                    enter_raw_mode()
+                } else {
+                    enter_norm_mode()
+                }
+            }
+            if (mode == "raw") {
+                print
+            } else {
+                if (norm_header != "") {
+                    emit_norm_record()
+                }
+                norm_header = $0
+                norm_seq = ""
+            }
+            next
+        }
+        {
+            if (!have_first) {
+                next
+            }
+            if (mode == "") {
+                if (length($0) > 0) {
+                    first_seq[++first_seq_n] = $0
+                }
+                next
+            }
+            if (mode == "raw") {
+                print
+            } else {
+                line = clean_line($0)
+                if (length(line) > 0) {
+                    norm_seq = norm_seq line
+                }
+            }
+        }
+        END {
+            if (!have_first) {
+                exit
+            }
+            if (mode == "") {
+                if (first_seq_n == 1) {
+                    enter_raw_mode()
+                } else {
+                    enter_norm_mode()
+                }
+            } else if (mode == "norm" && norm_header != "") {
+                emit_norm_record()
+            }
+            if (mode == "norm") {
+                printf "\n"
+            }
+        }
+    ' >> "$dst"
+}
+
+materialize_softlink_fasta() {
+    local src="$1"
+    local dst="$2"
+    local tmp="${dst}.tmp.$$"
+    mkdir -p "$(dirname "$dst")"
+    : > "$tmp"
+    append_singleline_fasta "$src" "$tmp"
+    [[ -s "$tmp" ]] || fail "materialized FASTA is empty for input: $src"
+    mv "$tmp" "$dst"
+}
+
+materialize_softlink_filelist() {
+    local filelist="$1"
+    local dst="$2"
+    local tmp="${dst}.tmp.$$"
+    local mem count=0
+    mkdir -p "$(dirname "$dst")"
+    : > "$tmp"
+    while IFS= read -r mem || [[ -n "${mem:-}" ]]; do
+        [[ -z "${mem:-}" || "$mem" =~ ^[[:space:]]*# ]] && continue
+        append_singleline_fasta "$mem" "$tmp"
+        count=$((count + 1))
+    done < <(stream_manifest "$filelist")
+    [[ "$count" -gt 0 ]] || fail "empty group filelist: $filelist"
+    [[ -s "$tmp" ]] || fail "materialized FASTA is empty for group filelist: $filelist"
+    mv "$tmp" "$dst"
 }
 
 write_chunk_manifest_line() {
@@ -311,7 +570,9 @@ prepare_group() {
     # group sizing/counting relies on these; guard so a missing tool cannot silently fall back to a
     # ratio estimate and produce different chunk boundaries (a determinism hazard) on a re-run.
     need_cmd awk
-    need_cmd zstd
+    if stream_manifest "$input_manifest" | awk 'NF && $0 !~ /^[[:space:]]*#/ && $1 ~ /\.zst([[:space:]]|$)/ { found = 1 } END { exit !found }'; then
+        need_cmd zstd
+    fi
     local s3_prefix
     s3_prefix=$(normalize_s3_prefix "$S3_CHUNK_PREFIX")
 
@@ -431,7 +692,6 @@ prepare() {
 
     need_cmd awk
     need_cmd zstd
-
     local local_manifest="${chunk_manifest}.local"
     local chunk_manifest_tmp="${chunk_manifest}.tmp"
     : > "$local_manifest"
@@ -451,26 +711,35 @@ prepare() {
         -v chunk_dir="$chunk_dir" \
         -v chunk_manifest="$local_manifest" \
         -v max_bytes="$CHUNK_MAX_BYTES" \
-        -v max_seqs="$CHUNK_MAX_SEQS" '
+        -v max_seqs="$CHUNK_MAX_SEQS" \
+        -v zthreads="$THREADS" '
             BEGIN {
                 chunk_id = -1
                 out = ""
+                cmd = ""
                 chunk_seqs = 0
                 chunk_bytes = 0
             }
             function open_chunk() {
                 chunk_id++
-                out = sprintf("%s/chunk-%08d.fa", chunk_dir, chunk_id)
+                # Stream each chunk straight into its own zstd, so NO uncompressed .fa is ever
+                # written to disk -- prepare peak = compressed chunks only, not the full input.
+                out = sprintf("%s/chunk-%08d.fa.zst", chunk_dir, chunk_id)
+                cmd = "zstd -q -3 -T" zthreads " -c > \"" out "\""
                 chunk_seqs = 0
                 chunk_bytes = 0
             }
             function close_chunk() {
-                if (out != "" && chunk_seqs > 0) {
+                if (cmd != "" && chunk_seqs > 0) {
+                    if (close(cmd) != 0) {
+                        printf "zstd failed while writing %s\n", out > "/dev/stderr"
+                        exit 2
+                    }
                     printf "chunk-%08d\t%s\t%d\t%d\n", chunk_id, out, chunk_seqs, chunk_bytes >> chunk_manifest
                     close(chunk_manifest)
-                    close(out)
                 }
                 out = ""
+                cmd = ""
                 chunk_seqs = 0
                 chunk_bytes = 0
             }
@@ -478,7 +747,7 @@ prepare() {
                 if (!have) {
                     return
                 }
-                if (out == "") {
+                if (cmd == "") {
                     open_chunk()
                 }
                 rec_bytes = length(header) + length(seq) + 2
@@ -488,8 +757,8 @@ prepare() {
                     close_chunk()
                     open_chunk()
                 }
-                print header >> out
-                print seq >> out
+                print header | cmd
+                print seq | cmd
                 chunk_seqs++
                 chunk_bytes += rec_bytes
                 have = 0
@@ -515,22 +784,19 @@ prepare() {
 
     [[ -s "$local_manifest" ]] || fail "no FASTA records found in input manifest: $input_manifest"
 
-    local chunk_id raw_chunk seqs bytes compressed uri
+    local chunk_id raw_chunk seqs bytes uri
     while IFS=$'\t' read -r chunk_id raw_chunk seqs bytes || [[ -n "${chunk_id:-}" ]]; do
         [[ -z "${chunk_id:-}" ]] && continue
-        compressed="${raw_chunk}.zst"
-        uri="$compressed"
-        compress_to_zst "$raw_chunk" "$compressed"
-        rm -f "$raw_chunk"
-
+        # raw_chunk is already a compressed chunk (chunk-*.fa.zst) from the streaming awk above --
+        # no separate compression step, and no uncompressed .fa was ever written to disk.
+        uri="$raw_chunk"
         if [[ -n "$s3_prefix" ]]; then
-            uri="${s3_prefix}$(basename "$compressed")"
-            copy_out "$compressed" "$uri"
+            uri="${s3_prefix}$(basename "$raw_chunk")"
+            copy_out "$raw_chunk" "$uri"
             if [[ -n "${REMOVE_TMP:-}" ]]; then
-                rm -f "$compressed"
+                rm -f "$raw_chunk"
             fi
         fi
-
         write_chunk_manifest_line "$chunk_manifest_tmp" "$chunk_id" "$uri" "$seqs" "$bytes"
         log "prepared ${chunk_id}: seqs=${seqs} bytes=${bytes} uri=${uri}"
     done < "$local_manifest"
@@ -540,14 +806,10 @@ prepare() {
     log "chunk manifest written: $chunk_manifest"
 }
 
-# Resolve a group filelist into a local createdb .tsv. createdb reads local FASTA/.gz/.zst directly,
-# so no member is ever decompressed/rewritten (avoids materializing the full uncompressed data on
-# scratch, ~tens of GB per member at Logan scale). Every member is exposed under a UNIQUE, order-
-# preserving basename "member-<NNN><ext>": a LOCAL member via a symlink (zero copy), an S3 member via
-# a compressed download. This matters for determinism -- createdb sorts inputs by basename with a
-# non-stable sort (createdb.cpp), so passing original paths with duplicate basenames (e.g. many
-# ".../<accession>/proteins.fa.zst") would give an implementation-defined member order and thus
-# non-reproducible DB key / representative tie-breaks. member-<NNN> sorts in filelist order.
+# Resolve a group filelist into a local createdb .tsv for hard-copy mode. Every member is exposed
+# under a UNIQUE, order-preserving basename "member-<NNN><ext>". This matters for determinism --
+# createdb sorts inputs by basename with a non-stable sort (createdb.cpp), so passing original paths
+# with duplicate basenames would give implementation-defined DB key / representative tie-breaks.
 resolve_chunk_filelist() {
     local filelist="$1" work_dir="$2" out_tsv="$3"
     local mem i=0 local_ref ext
@@ -561,9 +823,9 @@ resolve_chunk_filelist() {
         esac
         printf -v local_ref '%s/member-%08d%s' "$work_dir" "$i" "$ext"
         if is_s3 "$mem"; then
-            copy_in "$mem" "$local_ref"          # download, keep .zst/.gz compression
+            copy_in "$mem" "$local_ref"      # download, keep .zst/.gz compression
         else
-            ln -sf "$mem" "$local_ref"           # symlink: no copy, unique ordered basename
+            ln -sf "$mem" "$local_ref"       # symlink: no copy, unique ordered basename
         fi
         printf '%s\n' "$local_ref" >> "$out_tsv"
         i=$((i + 1))
@@ -580,19 +842,21 @@ scrub_chunk_workdir() {
     case "$BATCH_SCRIPT" in
         "$d"/*)
             rm -rf "$d/db" "$d/tmp" "$d/result"
-            rm -f "$d"/member-* "$d"/*.filelist.tsv 2>/dev/null || true
+            rm -f "$d"/member-* "$d"/*.filelist.tsv "$d"/*.fa "$d"/*.fa.zst "$d"/*.fa.gz "$d"/*.fa.tmp.* 2>/dev/null || true
             ;;
         *) rm -rf "${d:?}" ;;
     esac
 }
 
 cluster_chunk() {
-    [[ "$#" -ge 3 && "$#" -le 4 ]] || usage
+    [[ "$#" -ge 3 && "$#" -le 6 ]] || usage
     local chunk_uri="$1"
     local result_prefix="$2"
     local work_dir="$3"
     local chunk_id
     chunk_id="${4:-$(basename_no_compression "$chunk_uri")}"
+    local round="${5:-${BATCH_WORKER_ROUND:-0}}"
+    local expected_seqs="${6:-${BATCH_EXPECTED_SEQS:-0}}"
     local prefix
     prefix=$(normalize_s3_prefix "$result_prefix")
     local done_uri="${prefix}done/${chunk_id}.done"
@@ -614,21 +878,35 @@ cluster_chunk() {
     CLUSTER_CHUNK_WORKDIR="$work_dir"
     [[ -n "${REMOVE_TMP:-}" ]] && trap 'scrub_chunk_workdir "$CLUSTER_CHUNK_WORKDIR"' EXIT INT TERM HUP
 
-    # createdb input: a group filelist (.filelist.tsv) resolved to a local .tsv, or a single chunk
-    # file (repartition mode). createdb reads .fa/.gz/.zst natively, so a LOCAL chunk is passed
-    # straight through (no decompression to a plain .fa); an S3 chunk is downloaded still compressed.
+    # createdb input: by default mode 0 reads FASTA/.zst directly. Explicit mode 1 materializes one
+    # node-local FASTA first, avoiding multi-file softlink DBs whose header DB is not safe for
+    # createsubdb/convert2fasta.
     local createdb_input
     case "$chunk_uri" in
         *.filelist.tsv)
-            createdb_input="$work_dir/${chunk_id}.filelist.tsv"
-            resolve_chunk_filelist "$chunk_uri" "$work_dir" "$createdb_input"
-            ;;
-        s3://*)
-            createdb_input="$work_dir/$(basename "$chunk_uri")"
-            copy_in "$chunk_uri" "$createdb_input"
+            if createdb_softlink_enabled; then
+                createdb_input="$work_dir/${chunk_id}.fa"
+                materialize_softlink_filelist "$chunk_uri" "$createdb_input"
+            else
+                createdb_input="$work_dir/${chunk_id}.filelist.tsv"
+                resolve_chunk_filelist "$chunk_uri" "$work_dir" "$createdb_input"
+            fi
             ;;
         *)
-            createdb_input="$chunk_uri"
+            if createdb_softlink_enabled; then
+                createdb_input="$work_dir/${chunk_id}.fa"
+                materialize_softlink_fasta "$chunk_uri" "$createdb_input"
+            else
+                case "$chunk_uri" in
+                    s3://*)
+                        createdb_input="$work_dir/$(basename "$chunk_uri")"
+                        copy_in "$chunk_uri" "$createdb_input"
+                        ;;
+                    *)
+                        createdb_input="$chunk_uri"
+                        ;;
+                esac
+            fi
             ;;
     esac
 
@@ -642,39 +920,60 @@ cluster_chunk() {
     need_cmd "$MMSEQS"
     log "createdb ${chunk_id}"
     # shellcheck disable=SC2086
-    "$MMSEQS" createdb "$createdb_input" "$db" ${CREATEDB_PAR}
+    "$MMSEQS" createdb "$createdb_input" "$db" ${CREATEDB_PAR} || fail "createdb failed (chunk ${chunk_id}, rc=$?)"
+    local actual_seqs
+    actual_seqs=$(wc -l < "${db}.index" | tr -d ' ')
+    if [[ "${expected_seqs:-0}" =~ ^[1-9][0-9]*$ && "$actual_seqs" -ne "$expected_seqs" ]]; then
+        fail "createdb sequence-count mismatch for ${chunk_id}: manifest=${expected_seqs}, db.index=${actual_seqs}. Input may be truncated or corrupt."
+    fi
+    if createdb_softlink_enabled && [[ ! -L "$db" || ! -L "${db}_h" ]]; then
+        fail "createdb-mode 1 fell back to a copied DB for ${chunk_id}. Batch softlink mode requires plain single-line FASTA; refusing silent NVMe expansion."
+    fi
 
     log "${CLUSTER_CMD} ${chunk_id}"
     # shellcheck disable=SC2086
-    "$MMSEQS" ${CLUSTER_CMD} "$db" "$clu" "$work_dir/tmp" ${CLUSTER_PAR}
+    "$MMSEQS" ${CLUSTER_CMD} "$db" "$clu" "$work_dir/tmp" $(round_cluster_par "$round") || fail "${CLUSTER_CMD} failed (chunk ${chunk_id}, rc=$?)"
 
     log "createtsv ${chunk_id}"
     # shellcheck disable=SC2086
-    "$MMSEQS" createtsv "$db" "$db" "$clu" "$tsv" ${CREATETSV_PAR}
+    "$MMSEQS" createtsv "$db" "$db" "$clu" "$tsv" ${CREATETSV_PAR} || fail "createtsv failed (chunk ${chunk_id}, rc=$?)"
 
     log "representatives ${chunk_id}"
-    "$MMSEQS" createsubdb "$clu" "$db" "$rep" --subdb-mode 1
-    "$MMSEQS" convert2fasta "$rep" "$rep_fa"
+    "$MMSEQS" createsubdb "$clu" "$db" "$rep" --subdb-mode 1 || fail "createsubdb failed (chunk ${chunk_id}, rc=$?)"
+    "$MMSEQS" convert2fasta "$rep" "$rep_fa" || fail "convert2fasta failed (chunk ${chunk_id}, rc=$?)"
 
-    local tsv_zst="${tsv}.zst"
-    local rep_zst="${rep_fa}.zst"
-    compress_to_zst "$tsv" "$tsv_zst"
-    compress_to_zst "$rep_fa" "$rep_zst"
+    local batch_suffix tsv_out rep_out
+    batch_suffix=$(batch_compression_suffix)
+    tsv_out="${tsv}${batch_suffix}"
+    rep_out="${rep_fa}${batch_suffix}"
+    if compress_batch_outputs_enabled; then
+        write_batch_output "$tsv" "$tsv_out"
+        write_batch_output "$rep_fa" "$rep_out"
+    fi
 
     {
         printf 'chunk_id\t%s\n' "$chunk_id"
         printf 'input_uri\t%s\n' "$chunk_uri"
-        printf 'seq_count\t%s\n' "$(wc -l < "${db}.index" | tr -d ' ')"
+        printf 'seq_count\t%s\n' "$actual_seqs"
         printf 'input_bytes\t%s\n' "$(wc -c < "$db" 2>/dev/null | tr -d ' ' || echo 0)"
         printf 'rep_count\t%s\n' "$(grep -c '^>' "$rep_fa" || true)"
-        printf 'cluster_tsv\t%s\n' "$(basename "$tsv_zst")"
-        printf 'rep_fasta\t%s\n' "$(basename "$rep_zst")"
+        printf 'cluster_tsv\t%s\n' "$(basename "$tsv_out")"
+        printf 'rep_fasta\t%s\n' "$(basename "$rep_out")"
     } > "$metrics"
 
-    copy_out "$tsv_zst" "${prefix}tsv/$(basename "$tsv_zst")"
-    copy_out "$rep_zst" "${prefix}rep/$(basename "$rep_zst")"
+    copy_out "$tsv_out" "${prefix}tsv/$(basename "$tsv_out")"
+    copy_out "$rep_out" "${prefix}rep/$(basename "$rep_out")"
     copy_out "$metrics" "${prefix}metrics/$(basename "$metrics")"
     mark_done "$done_uri" "$work_dir/result/${chunk_id}.done"
+
+    # Reclaim the shared source chunk now that its result is durably out (done-marker written), so the
+    # shared chunk dir shrinks as the round progresses instead of holding every chunk to round end.
+    # Safe: later rounds cluster representatives (not this round's chunks) and the reconcile keys on
+    # done-markers, not chunk presence -- a retry past this point reuses the marker. LOCAL prepare-
+    # generated chunk only (repartition .fa.zst / group filelist); never an s3:// URI or user input.
+    if [[ -n "${REMOVE_TMP:-}" && "${BATCH_DELETE_SOURCE_CHUNK:-0}" == "1" && "$chunk_uri" != s3://* && -f "$chunk_uri" ]]; then
+        rm -f "$chunk_uri"
+    fi
 
     # Free this chunk's working set before the next chunk's createdb (gated, MMseqs style).
     # With REMOVE_TMP off the dir is kept for inspection; note it then accumulates across chunks.
@@ -745,13 +1044,13 @@ merge_partition() {
     '
 }
 
-# Join one bucket: parent.member == child.rep -> (parent.rep, child.member). One zst shard out.
+# Join one bucket: parent.member == child.rep -> (parent.rep, child.member). One shard out.
 # merge_join <part_dir> <out_dir> <bucket> <sort_tmp>  (child/parent bucket files live in part_dir)
 merge_join() {
     local part_dir="$1" out_dir="$2" bucket="$3" sort_tmp="$4"
     local bb; printf -v bb '%05d' "$bucket"
-    local out_zst="$out_dir/propagated.bkt${bb}.tsv.zst"
-    if done_exists "$out_zst"; then
+    local out="$out_dir/propagated.bkt${bb}.tsv$(batch_compression_suffix)"
+    if done_exists "$out"; then
         log "merge_join: reusing bucket ${bb}"
         return 0
     fi
@@ -776,10 +1075,10 @@ merge_join() {
     [[ "$joined_count" -eq "$child_count" ]] ||
         fail "merge_join bucket ${bb} lost cluster members: child=${child_count} joined=${joined_count}"
 
-    # Write via a temp then rename so a crash mid-compress never leaves a truncated shard that
+    # Write via a temp then rename so a crash mid-write never leaves a truncated shard that
     # the existence-based done-check would mistake for complete.
-    compress_to_zst "$joined" "${out_zst}.tmp.$$"
-    mv -f "${out_zst}.tmp.$$" "$out_zst"
+    write_batch_output "$joined" "${out}.tmp.$$"
+    mv -f "${out}.tmp.$$" "$out"
     rm -f "$child_sorted" "$parent_sorted" "$joined"
     log "merge_join bucket ${bb}: ${joined_count} members"
 }
@@ -801,7 +1100,7 @@ finalize_sort_bucket() {
 # propagate <child_manifest> <parent_manifest> <out_manifest> <work_dir>
 # Composes child.rep == parent.member on one node, sharded into MERGE_BUCKETS independent
 # sort+joins (smaller sorts, no correctness change). Writes out_manifest listing the shard
-# zsts (order is irrelevant; the next round re-partitions). B=1 is the plain single join.
+# shards (order is irrelevant; the next round re-partitions). B=1 is the plain single join.
 propagate() {
     [[ "$#" -eq 4 ]] || usage
     local child_manifest="$1"
@@ -835,7 +1134,7 @@ propagate() {
     local bkt
     : > "${out_manifest}.tmp"
     for ((b = 0; b < buckets; b++)); do
-        printf -v bkt '%s/propagated.bkt%05d.tsv.zst' "$shards" "$b"
+        printf -v bkt '%s/propagated.bkt%05d.tsv%s' "$shards" "$b" "$(batch_compression_suffix)"
         [[ -s "$bkt" ]] || fail "propagate: missing bucket output $bkt"
         printf '%s\n' "$bkt" >> "${out_manifest}.tmp"
     done
@@ -864,9 +1163,9 @@ make_manifest_from_chunk_ids() {
 }
 
 # Build the representative manifest as "path<TAB>bytes<TAB>seqs" (interleaved in chunk order) so the
-# NEXT round's prepare gets per-file sizes AND sequence counts for FREE -- no zstd rescan and, when
+# NEXT round's prepare gets per-file sizes AND sequence counts for FREE -- no FASTA rescan and, when
 # --chunk-max-seqs is used, no decompress-and-count pass (the biggest cost at Logan scale):
-#   bytes = exact decompressed size of the rep .zst (zstd -lv header; ratio fallback for S3/.gz)
+#   bytes = exact size for plain rep FASTA, or an uncompressed-size estimate for compressed input
 #   seqs  = rep_count from this chunk's metrics.tsv (== #sequences in the rep FASTA)
 # prepare_group already parses this 3-column form; finalize reads only field 1 (the path).
 make_rep_manifest_with_sizes() {
@@ -875,10 +1174,11 @@ make_rep_manifest_with_sizes() {
     local out="$3"
     local plain="${out}.plain.$$"
     : > "$plain"
-    local cid _rest repf metricsf bytes seqs
+    local cid _rest repf metricsf bytes seqs rep_suffix
+    rep_suffix=".rep.fa$(batch_compression_suffix)"
     while IFS=$'\t' read -r cid _rest || [[ -n "${cid:-}" ]]; do
         [[ -z "${cid:-}" || "$cid" =~ ^# ]] && continue
-        repf="$clustered/rep/${cid}.rep.fa.zst"
+        repf="$clustered/rep/${cid}${rep_suffix}"
         metricsf="$clustered/metrics/${cid}.metrics.tsv"
         bytes=$(uncompressed_bytes "$repf")
         seqs=$(awk -F'\t' '$1 == "rep_count" { print $2 + 0; exit }' "$metricsf" 2>/dev/null || true)
@@ -965,11 +1265,14 @@ trim_field() {
     printf '%s' "$value"
 }
 
-# Expand BATCH_SLURM_NODELIST (comma list or "super[001-005]" bracket range) into SLURM_NODE_ARRAY.
+# Expand a round-specific SLURM nodelist (comma list or "super[001-005]" bracket range)
+# into SLURM_NODE_ARRAY.
 SLURM_NODE_ARRAY=()
 build_slurm_node_array() {
+    local round="${1:-1}"
     SLURM_NODE_ARRAY=()
-    local list="$BATCH_SLURM_NODELIST"
+    local list
+    list=$(round_slurm_nodelist "$round")
     [[ -n "$list" ]] || return 0
     if [[ "$list" == *"["* ]]; then
         command -v scontrol >/dev/null 2>&1 || \
@@ -989,6 +1292,13 @@ build_slurm_node_array() {
     done
 }
 
+first_slurm_node_for_round() {
+    local round="$1"
+    build_slurm_node_array "$round"
+    [[ "${#SLURM_NODE_ARRAY[@]}" -gt 0 ]] || fail "empty node array for round ${round}"
+    printf '%s' "${SLURM_NODE_ARRAY[0]}"
+}
+
 sanitize_path() {
     printf '%s' "$1" | sed 's#[^A-Za-z0-9._-]#_#g'
 }
@@ -996,9 +1306,12 @@ sanitize_path() {
 make_chunk_work_dir() {
     local round_work_dir="$1"
     local chunk_id="$2"
+    local round="${3:-1}"
     local base
-    if [[ -n "$NODE_WORK_DIR" ]]; then
-        base="$NODE_WORK_DIR/mmseqs-batch/${USER:-user}/$(sanitize_path "$round_work_dir")"
+    local node_work_dir
+    node_work_dir=$(round_node_work_dir "$round")
+    if [[ -n "$node_work_dir" ]]; then
+        base="$node_work_dir/mmseqs-batch/${USER:-user}/$(sanitize_path "$round_work_dir")"
     else
         base="$round_work_dir/node-work"
     fi
@@ -1006,7 +1319,7 @@ make_chunk_work_dir() {
 }
 
 # finalize <mapping_manifest> <rep_manifest> <result_prefix> <work_dir> [mark_final]
-# Produces final_cluster.tsv.zst by hash-partitioning the mapping by rep into MERGE_BUCKETS
+# Produces final_cluster.tsv[.zst] by hash-partitioning the mapping by rep into MERGE_BUCKETS
 # buckets, rep-first sorting each, then concatenating the disjoint buckets. Each cluster is
 # contiguous and rep-led. With B=1 this is a global rep sort (byte-identical to the single-node
 # result); with B>1 the clusters are ordered by (bucket, rep) -- the SAME clusters and members,
@@ -1024,9 +1337,11 @@ finalize_outputs() {
     prefix=$(normalize_s3_prefix "$result_prefix")
 
     mkdir -p "$work_dir"
-    local final_cluster="${prefix}final_cluster.tsv.zst"
+    local batch_suffix
+    batch_suffix=$(batch_compression_suffix)
+    local final_cluster="${prefix}final_cluster.tsv${batch_suffix}"
     local final_cluster_manifest="${prefix}final_cluster_manifest.txt"
-    local final_rep="${prefix}final_rep_seq.fasta.zst"
+    local final_rep="${prefix}final_rep_seq.fasta${batch_suffix}"
     local final_rep_manifest="${prefix}final_rep_seq_manifest.txt"
     local final_done="${prefix}final.done"
 
@@ -1035,7 +1350,7 @@ finalize_outputs() {
         return 0
     fi
 
-    # rep-partition and rep-sorted are transient (the final .zst is copy_out'd to result_prefix), so
+    # rep-partition and rep-sorted are transient (the final output is copy_out'd to result_prefix), so
     # keep them on node-local scratch (NVMe) instead of the shared FS.
     local part; part=$(resolve_node_scratch "$work_dir" rep-partition)
     local sorted; sorted=$(resolve_node_scratch "$work_dir" rep-sorted)
@@ -1056,8 +1371,8 @@ finalize_outputs() {
         [[ -e "$bkt" ]] || fail "finalize: missing sorted bucket $bkt"
         cat "$bkt" >> "$cluster_plain"
     done
-    local cluster_tmp="$work_dir/final_cluster.tsv.zst.tmp.$$"
-    compress_to_zst "$cluster_plain" "$cluster_tmp"
+    local cluster_tmp="$work_dir/final_cluster.tsv${batch_suffix}.out.tmp.$$"
+    write_batch_output "$cluster_plain" "$cluster_tmp"
     rm -f "$cluster_plain"
     copy_out "$cluster_tmp" "$final_cluster"
     rm -f "$cluster_tmp"
@@ -1068,7 +1383,7 @@ finalize_outputs() {
     rm -f "$manifest_tmp"
 
     if [[ -n "$rep_manifest" ]]; then
-        local rep_tmp="$work_dir/final_rep_seq.fasta.zst.tmp.$$"
+        local rep_tmp="$work_dir/final_rep_seq.fasta${batch_suffix}.tmp.$$"
         : > "$rep_tmp"
         # rep_manifest may be 3-column (path<TAB>bytes<TAB>seqs, from make_rep_manifest_with_sizes)
         # or a bare path per line; take field 1 either way.
@@ -1133,20 +1448,21 @@ cluster_manifest_single() {
     local chunk_manifest="$1"
     local result_prefix="$2"
     local round_work_dir="$3"
+    local round="${4:-0}"
 
     mkdir -p "$round_work_dir"
 
     local attempt=1
     while [[ "$attempt" -le "$MAX_CHUNK_ATTEMPTS" ]]; do
         local failed=0
-        while IFS=$'\t' read -r chunk_id chunk_uri _ || [[ -n "${chunk_id:-}" ]]; do
+        while IFS=$'\t' read -r chunk_id chunk_uri seqs _ || [[ -n "${chunk_id:-}" ]]; do
             [[ -z "${chunk_id:-}" ]] && continue
             if done_exists "$(chunk_done_uri "$result_prefix" "$chunk_id")"; then
                 continue
             fi
             local task_work
-            task_work=$(make_chunk_work_dir "$round_work_dir" "$chunk_id")
-            if ! env BATCH_WORKER_DISPATCH=1 bash "$BATCH_SCRIPT" cluster-chunk "$chunk_uri" "$result_prefix" "$task_work" "$chunk_id"; then
+            task_work=$(make_chunk_work_dir "$round_work_dir" "$chunk_id" "$round")
+            if ! env BATCH_WORKER_DISPATCH=1 BATCH_DELETE_SOURCE_CHUNK=1 bash "$BATCH_SCRIPT" cluster-chunk "$chunk_uri" "$result_prefix" "$task_work" "$chunk_id" "$round" "${seqs:-0}"; then
                 failed=1
             fi
         done < "$chunk_manifest"
@@ -1177,11 +1493,12 @@ write_batch_exports() {
     local out="$1"
     local name
     for name in \
-        MMSEQS THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS S3_CHUNK_PREFIX COMPRESS_LEVEL \
-        CREATEDB_PAR CLUSTER_CMD CLUSTER_COV_MODE CLUSTER_PAR CREATETSV_PAR SORT_TMP \
+        MMSEQS THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS ROUND0_CHUNK_MAX_BYTES ROUND0_CHUNK_MAX_SEQS \
+        S3_CHUNK_PREFIX COMPRESS_BATCH_OUTPUTS \
+        CREATEDB_PAR CLUSTER_CMD CLUSTER_COV_MODE CLUSTER_PAR ROUND0_CLUSTER_PAR CREATETSV_PAR SORT_TMP \
         MAX_ROUNDS MIN_REDUCTION_RATIO CONVERGENCE_PATIENCE MIN_REDUCTION_COUNT \
         MAX_CHUNK_ATTEMPTS COMPRESS_RATIO MERGE_BUCKETS BATCH_BACKEND REMOVE_TMP \
-        NODE_WORK_DIR BATCH_SLURM_NODELIST BATCH_SLURM_PARTITION BATCH_SLURM_TIME \
+        NODE_WORK_DIR ROUND0_NODE_WORK_DIR BATCH_SLURM_NODELIST ROUND0_SLURM_NODELIST BATCH_SLURM_PARTITION BATCH_SLURM_TIME \
         BATCH_SLURM_MEM BATCH_SLURM_EXTRA SORT_BUFFER_SIZE
     do
         write_shell_export "$out" "$name" "${!name:-}"
@@ -1257,15 +1574,15 @@ slurm_worker() {
     [[ "$shard" =~ ^[0-9]+$ && "$num_shards" =~ ^[1-9][0-9]*$ ]] || fail "slurm-worker needs numeric <shard> <num_shards>"
 
     # process this shard's chunks (line index % num_shards == shard) that are not yet done
-    local idx=0 chunk_id chunk_uri rest
-    while IFS=$'\t' read -r chunk_id chunk_uri rest || [[ -n "${chunk_id:-}" ]]; do
+    local idx=0 chunk_id chunk_uri seqs rest
+    while IFS=$'\t' read -r chunk_id chunk_uri seqs rest || [[ -n "${chunk_id:-}" ]]; do
         [[ -z "${chunk_id:-}" ]] && continue
         if [[ $((idx % num_shards)) -eq "$shard" ]] && ! done_exists "$(chunk_done_uri "$result_prefix" "$chunk_id")"; then
             local task_work rc=0
-            task_work=$(make_chunk_work_dir "$round_work_dir" "$chunk_id")
+            task_work=$(make_chunk_work_dir "$round_work_dir" "$chunk_id" "$round")
             log "slurm-worker round ${round} shard ${shard}/${num_shards}: ${chunk_id}"
             set +e
-            env BATCH_WORKER_DISPATCH=1 bash "$BATCH_SCRIPT" cluster-chunk "$chunk_uri" "$result_prefix" "$task_work" "$chunk_id"
+            env BATCH_WORKER_DISPATCH=1 BATCH_DELETE_SOURCE_CHUNK=1 bash "$BATCH_SCRIPT" cluster-chunk "$chunk_uri" "$result_prefix" "$task_work" "$chunk_id" "$round" "${seqs:-0}"
             rc=$?
             set -e
             [[ "$rc" -eq 0 ]] || log "slurm-worker: chunk ${chunk_id} FAILED (rc=$rc); left no done-marker for retry/dead-letter"
@@ -1312,11 +1629,14 @@ names = [
     "THREADS",
     "CHUNK_MAX_BYTES",
     "CHUNK_MAX_SEQS",
-    "COMPRESS_LEVEL",
+    "ROUND0_CHUNK_MAX_BYTES",
+    "ROUND0_CHUNK_MAX_SEQS",
+    "COMPRESS_BATCH_OUTPUTS",
     "CREATEDB_PAR",
     "CLUSTER_CMD",
     "CLUSTER_COV_MODE",
     "CLUSTER_PAR",
+    "ROUND0_CLUSTER_PAR",
     "CREATETSV_PAR",
     "SORT_TMP",
     "SORT_BUFFER_SIZE",
@@ -1330,6 +1650,8 @@ names = [
     "BATCH_BACKEND",
     "REMOVE_TMP",
     "NODE_WORK_DIR",
+    "ROUND0_NODE_WORK_DIR",
+    "ROUND0_SLURM_NODELIST",
     "AWS_BATCH_JOB_QUEUE",
     "AWS_BATCH_JOB_DEFINITION",
     "BATCH_AWS_SCRIPT_URI",
@@ -1421,7 +1743,7 @@ aws_submit() {
     # AWS cannot cheaply detect a still-in-flight chain, so do not launch a second aws-submit
     # against the same work prefix while one is running (the chains would race S3 state).
     if done_exists "${result_prefix}final.done"; then
-        log "aws-submit: reusing completed result ${result_prefix}final_cluster.tsv.zst"
+        log "aws-submit: reusing completed result ${result_prefix}$(final_cluster_file_name)"
         return 0
     fi
     aws_require_submit_env
@@ -1469,7 +1791,9 @@ aws_driver() {
     [[ "$round" -le "$MAX_ROUNDS" ]] || fail "round $round exceeds MAX_ROUNDS=$MAX_ROUNDS"
 
     local script_uri="${BATCH_AWS_SCRIPT_URI:-${work_prefix}scripts/batch_clustering.sh}"
-    local local_root="${NODE_WORK_DIR:-${BATCH_AWS_LOCAL_DIR:-/tmp/mmseqs-batch}}/${AWS_BATCH_JOB_ID:-manual}-driver-r${round}"
+    local node_work_dir
+    node_work_dir=$(round_node_work_dir "$round")
+    local local_root="${node_work_dir:-${BATCH_AWS_LOCAL_DIR:-/tmp/mmseqs-batch}}/${AWS_BATCH_JOB_ID:-manual}-driver-r${round}"
     rm -rf "$local_root"
     mkdir -p "$local_root"
 
@@ -1484,7 +1808,7 @@ aws_driver() {
         log "aws-driver round ${round}: reusing prepared chunks $chunk_manifest_s3"
     else
         log "aws-driver round ${round}: preparing chunks"
-        S3_CHUNK_PREFIX="$chunk_s3_prefix" REMOVE_TMP=TRUE prepare "$input_manifest" "$chunk_dir" "$chunk_manifest_local"
+        S3_CHUNK_PREFIX="$chunk_s3_prefix" REMOVE_TMP=TRUE prepare_round "$round" "$input_manifest" "$chunk_dir" "$chunk_manifest_local"
         copy_out "$chunk_manifest_local" "$chunk_manifest_s3"
         copy_out "${chunk_manifest_local}.done" "${chunk_manifest_s3}.done"
     fi
@@ -1524,7 +1848,9 @@ aws_worker() {
     local result_prefix="$2"
     local round="$3"
     local index="${AWS_BATCH_JOB_ARRAY_INDEX:-0}"
-    local local_root="${NODE_WORK_DIR:-${BATCH_AWS_LOCAL_DIR:-/tmp/mmseqs-batch}}/${AWS_BATCH_JOB_ID:-manual}-worker-r${round}-${index}"
+    local node_work_dir
+    node_work_dir=$(round_node_work_dir "$round")
+    local local_root="${node_work_dir:-${BATCH_AWS_LOCAL_DIR:-/tmp/mmseqs-batch}}/${AWS_BATCH_JOB_ID:-manual}-worker-r${round}-${index}"
     rm -rf "$local_root"
     mkdir -p "$local_root"
 
@@ -1540,8 +1866,8 @@ aws_worker() {
     log "aws-worker round ${round} index ${index}: ${chunk_id} ${chunk_uri}"
     local chunk_rc=0
     set +e
-    env BATCH_WORKER_DISPATCH=1 bash "$BATCH_SCRIPT" cluster-chunk \
-        "$chunk_uri" "$result_prefix" "$local_root/work" "$chunk_id"
+    env BATCH_WORKER_DISPATCH=1 BATCH_DELETE_SOURCE_CHUNK=1 bash "$BATCH_SCRIPT" cluster-chunk \
+        "$chunk_uri" "$result_prefix" "$local_root/work" "$chunk_id" "$round" "${seqs:-0}"
     chunk_rc=$?
     set -e
     if [[ "$chunk_rc" -ne 0 ]]; then
@@ -1567,7 +1893,9 @@ aws_merge() {
     is_s3 "$result_prefix" || fail "aws-merge requires an s3:// result prefix"
 
     local script_uri="${BATCH_AWS_SCRIPT_URI:-${work_prefix}scripts/batch_clustering.sh}"
-    local local_root="${NODE_WORK_DIR:-${BATCH_AWS_LOCAL_DIR:-/tmp/mmseqs-batch}}/${AWS_BATCH_JOB_ID:-manual}-merge-r${round}"
+    local node_work_dir
+    node_work_dir=$(round_node_work_dir "$round")
+    local local_root="${node_work_dir:-${BATCH_AWS_LOCAL_DIR:-/tmp/mmseqs-batch}}/${AWS_BATCH_JOB_ID:-manual}-merge-r${round}"
     rm -rf "$local_root"
     mkdir -p "$local_root"
     # aws-merge has several early returns (retry, round-0, converged); scrub scratch on any exit.
@@ -1634,9 +1962,9 @@ aws_merge() {
     # All chunks complete -- build the manifests from chunk_ids (deterministic S3 URIs), never a
     # listing, so stale objects are never ingested. (S3 metrics are remote, so the rep manifest is
     # bare S3 paths here; the next round's prepare sizes them -- the free-size optimization is local.)
-    make_manifest_from_chunk_ids "$chunk_manifest_local" "$(join_uri "$clustered_prefix" "tsv")" ".cluster.tsv.zst" "$local_root/tsv_manifest.txt"
+    make_manifest_from_chunk_ids "$chunk_manifest_local" "$(join_uri "$clustered_prefix" "tsv")" ".cluster.tsv$(batch_compression_suffix)" "$local_root/tsv_manifest.txt"
     make_manifest_from_chunk_ids "$chunk_manifest_local" "$(join_uri "$clustered_prefix" "metrics")" ".metrics.tsv" "$local_root/metrics_manifest.txt"
-    make_manifest_from_chunk_ids "$chunk_manifest_local" "$(join_uri "$clustered_prefix" "rep")" ".rep.fa.zst" "$local_root/rep_manifest.plain.txt"
+    make_manifest_from_chunk_ids "$chunk_manifest_local" "$(join_uri "$clustered_prefix" "rep")" ".rep.fa$(batch_compression_suffix)" "$local_root/rep_manifest.plain.txt"
     interleave_manifest_file "$local_root/rep_manifest.plain.txt" "$local_root/rep_manifest.txt"
     copy_out "$local_root/tsv_manifest.txt" "$tsv_manifest"
     copy_out "$local_root/rep_manifest.txt" "$rep_manifest"
@@ -1647,7 +1975,7 @@ aws_merge() {
     if [[ "$round" -eq 0 ]]; then
         if [[ "$chunk_count" -le 1 ]]; then
             log "aws-merge round 0: input fit in one chunk; finalizing"
-            finalize_outputs "$tsv_manifest" "$rep_manifest" "$result_prefix" "$local_root/final"
+            with_round_node_work_dir "$round" finalize_outputs "$tsv_manifest" "$rep_manifest" "$result_prefix" "$local_root/final"
             return 0
         fi
 
@@ -1675,7 +2003,7 @@ aws_merge() {
     # propagate emits local bucket shards; upload each to S3 so the next round's driver
     # (a separate container) can read them, and record their S3 URIs in the manifest.
     local local_prop_manifest="$local_root/propagated_manifest.local.txt"
-    propagate "$child_manifest" "$parent_manifest" "$local_prop_manifest" "$local_root/propagate"
+    with_round_node_work_dir "$round" propagate "$child_manifest" "$parent_manifest" "$local_prop_manifest" "$local_root/propagate"
     : > "$local_root/propagated_manifest.txt"
     local shard s3shard
     while IFS= read -r shard || [[ -n "${shard:-}" ]]; do
@@ -1728,7 +2056,7 @@ aws_merge() {
     fi
 
     if [[ "$converged" -eq 1 ]]; then
-        finalize_outputs "$propagated_manifest" "$rep_manifest" "$result_prefix" "$local_root/final" "$mark_final"
+        with_round_node_work_dir "$round" finalize_outputs "$propagated_manifest" "$rep_manifest" "$result_prefix" "$local_root/final" "$mark_final"
         return 0
     fi
 
@@ -1823,11 +2151,13 @@ slurm_submit() {
     [[ "$#" -eq 3 ]] || usage
     local input_manifest="$1" work_dir="$2" result_dir="$3"
     mkdir -p "$work_dir" "$result_dir"
-    if [[ -s "$result_dir/final_cluster.tsv.zst" && -f "$result_dir/final.done" ]]; then
-        log "multi-node: reusing completed result $result_dir/final_cluster.tsv.zst"
+    local final_cluster_name
+    final_cluster_name=$(final_cluster_file_name)
+    if [[ -s "$result_dir/$final_cluster_name" && -f "$result_dir/final.done" ]]; then
+        log "multi-node: reusing completed result $result_dir/$final_cluster_name"
         return 0
     fi
-    build_slurm_node_array
+    build_slurm_node_array 0
     [[ "${#SLURM_NODE_ARRAY[@]}" -gt 0 ]] || fail "--backend multi-node requires --slurm-nodelist"
     need_cmd sbatch
     need_cmd squeue
@@ -1861,7 +2191,7 @@ slurm_driver() {
     [[ "$#" -eq 4 ]] || usage
     local input_manifest="$1" work_dir="$2" result_dir="$3" round="$4"
     [[ "$round" -le "$MAX_ROUNDS" ]] || fail "round $round exceeds MAX_ROUNDS=$MAX_ROUNDS"
-    build_slurm_node_array
+    build_slurm_node_array "$round"
     local nn="${#SLURM_NODE_ARRAY[@]}"
     [[ "$nn" -gt 0 ]] || fail "driver: empty node array"
 
@@ -1875,7 +2205,7 @@ slurm_driver() {
     if [[ -s "$chunk_manifest" ]] && done_exists "${chunk_manifest}.done"; then
         log "driver r${round}: reusing prepared chunks"
     else
-        prepare "$input_manifest" "$chunks" "$chunk_manifest"
+        prepare_round "$round" "$input_manifest" "$chunks" "$chunk_manifest"
     fi
     local chunk_count
     chunk_count=$(count_manifest_rows "$chunk_manifest")
@@ -1897,7 +2227,7 @@ slurm_driver() {
 slurm_merge() {
     [[ "$#" -eq 4 ]] || usage
     local input_manifest="$1" work_dir="$2" result_dir="$3" round="$4"
-    build_slurm_node_array
+    build_slurm_node_array "$round"
     local nn="${#SLURM_NODE_ARRAY[@]}"
     [[ "$nn" -gt 0 ]] || fail "merge: empty node array"
 
@@ -1941,7 +2271,7 @@ slurm_merge() {
     local tsv_manifest="$clustered/tsv_manifest.txt"
     local rep_manifest="$clustered/rep_manifest.txt"
     local metrics_manifest="$clustered/metrics_manifest.txt"
-    make_manifest_from_chunk_ids "$chunk_manifest" "$clustered/tsv" '.cluster.tsv.zst' "$tsv_manifest"
+    make_manifest_from_chunk_ids "$chunk_manifest" "$clustered/tsv" ".cluster.tsv$(batch_compression_suffix)" "$tsv_manifest"
     make_rep_manifest_with_sizes "$chunk_manifest" "$clustered" "$rep_manifest"
     make_manifest_from_chunk_ids "$chunk_manifest" "$clustered/metrics" '.metrics.tsv' "$metrics_manifest"
 
@@ -1952,14 +2282,15 @@ slurm_merge() {
     if [[ "$round" -eq 0 ]]; then
         if [[ "$chunk_count" -le 1 ]]; then
             log "merge r0: input fit in one chunk; finalizing"
-            finalize_outputs "$tsv_manifest" "$rep_manifest" "$result_dir" "$round_dir/final" 1
+            with_round_node_work_dir "$round" finalize_outputs "$tsv_manifest" "$rep_manifest" "$result_dir" "$round_dir/final" 1
             # final result is in result_dir; the round scratch is now safe to drop.
             [[ -n "${REMOVE_TMP:-}" ]] && rm -rf "$work_dir"/round*
             return 0
         fi
         write_state_file "$round_dir/state.env" "$cur_reps" 0
-        local nd
-        nd=$(submit_event_step "mmseqs-${CLUSTER_CMD}-${tok}-driver-r1" "$slurm_dir" "" "${SLURM_NODE_ARRAY[0]}" \
+        local nd next_driver_node
+        next_driver_node=$(first_slurm_node_for_round 1)
+        nd=$(submit_event_step "mmseqs-${CLUSTER_CMD}-${tok}-driver-r1" "$slurm_dir" "" "$next_driver_node" \
             slurm-driver "$rep_manifest" "$work_dir" "$result_dir" 1)
         log "merge r0: ${cur_reps} reps across ${chunk_count} chunks; submitted next driver ${nd}"
         return 0
@@ -1974,7 +2305,7 @@ slurm_merge() {
     parent_manifest="$tsv_manifest"
     propagated_manifest="$round_dir/propagated_manifest.txt"
 
-    propagate "$child_manifest" "$parent_manifest" "$propagated_manifest" "$round_dir/propagate"
+    with_round_node_work_dir "$round" propagate "$child_manifest" "$parent_manifest" "$propagated_manifest" "$round_dir/propagate"
 
     local prev_reps low_benefit_rounds
     # shellcheck disable=SC1090
@@ -2007,7 +2338,7 @@ slurm_merge() {
     fi
 
     if [[ "$converged" -eq 1 ]]; then
-        finalize_outputs "$propagated_manifest" "$rep_manifest" "$result_dir" "$round_dir/final" "$mark_final"
+        with_round_node_work_dir "$round" finalize_outputs "$propagated_manifest" "$rep_manifest" "$result_dir" "$round_dir/final" "$mark_final"
         # Only drop the round scratch on a final (converged) result; a partial (MAX_ROUNDS) result
         # is left intact so a re-run with a larger --max-rounds can resume.
         [[ "$mark_final" -eq 1 && -n "${REMOVE_TMP:-}" ]] && rm -rf "$work_dir"/round*
@@ -2015,8 +2346,9 @@ slurm_merge() {
     fi
 
     write_state_file "$round_dir/state.env" "$cur_reps" "$low_benefit_rounds"
-    local next_round=$((round + 1)) nd
-    nd=$(submit_event_step "mmseqs-${CLUSTER_CMD}-${tok}-driver-r${next_round}" "$slurm_dir" "" "${SLURM_NODE_ARRAY[0]}" \
+    local next_round=$((round + 1)) nd next_driver_node
+    next_driver_node=$(first_slurm_node_for_round "$next_round")
+    nd=$(submit_event_step "mmseqs-${CLUSTER_CMD}-${tok}-driver-r${next_round}" "$slurm_dir" "" "$next_driver_node" \
         slurm-driver "$rep_manifest" "$work_dir" "$result_dir" "$next_round")
     log "merge r${round}: submitted next driver ${nd}"
 }
@@ -2030,8 +2362,10 @@ run_workflow() {
     local result_dir="$3"
 
     mkdir -p "$work_dir" "$result_dir"
-    if [[ -s "$result_dir/final_cluster.tsv.zst" && -f "$result_dir/final.done" ]]; then
-        log "single-node: reusing completed result $result_dir/final_cluster.tsv.zst"
+    local final_cluster_name
+    final_cluster_name=$(final_cluster_file_name)
+    if [[ -s "$result_dir/$final_cluster_name" && -f "$result_dir/final.done" ]]; then
+        log "single-node: reusing completed result $result_dir/$final_cluster_name"
         return 0
     fi
 
@@ -2039,15 +2373,15 @@ run_workflow() {
     local chunks="$work_dir/round${round}/chunks"
     local chunk_manifest="$work_dir/round${round}/chunks.tsv"
     mkdir -p "$work_dir/round${round}"
-    prepare "$input_manifest" "$chunks" "$chunk_manifest"
+    prepare_round "$round" "$input_manifest" "$chunks" "$chunk_manifest"
 
-    cluster_manifest_single "$chunk_manifest" "$work_dir/round${round}/clustered" "$work_dir/round${round}"
+    cluster_manifest_single "$chunk_manifest" "$work_dir/round${round}/clustered" "$work_dir/round${round}" "$round"
 
     local current_mapping_manifest="$work_dir/round${round}/clustered/tsv_manifest.txt"
     local current_rep_manifest="$work_dir/round${round}/clustered/rep_manifest.txt"
     local current_metrics_manifest="$work_dir/round${round}/clustered/metrics_manifest.txt"
     validate_clustered_outputs "$chunk_manifest" "$work_dir/round${round}/clustered"
-    make_manifest_from_chunk_ids "$chunk_manifest" "$work_dir/round${round}/clustered/tsv" '.cluster.tsv.zst' "$current_mapping_manifest"
+    make_manifest_from_chunk_ids "$chunk_manifest" "$work_dir/round${round}/clustered/tsv" ".cluster.tsv$(batch_compression_suffix)" "$current_mapping_manifest"
     make_rep_manifest_with_sizes "$chunk_manifest" "$work_dir/round${round}/clustered" "$current_rep_manifest"
     make_manifest_from_chunk_ids "$chunk_manifest" "$work_dir/round${round}/clustered/metrics" '.metrics.tsv' "$current_metrics_manifest"
 
@@ -2064,29 +2398,31 @@ run_workflow() {
     log "round 0: ${prev_reps} representatives across ${initial_chunk_count} chunk(s)"
 
     local low_benefit_rounds=0
+    local current_round=0
     for ((round=1; converged == 0 && round<=MAX_ROUNDS; round++)); do
+        current_round="$round"
         log "starting representative round ${round}"
         chunks="$work_dir/round${round}/chunks"
         chunk_manifest="$work_dir/round${round}/chunks.tsv"
         mkdir -p "$work_dir/round${round}"
 
-        prepare "$current_rep_manifest" "$chunks" "$chunk_manifest"
+        prepare_round "$round" "$current_rep_manifest" "$chunks" "$chunk_manifest"
         local rep_chunk_count
         rep_chunk_count=$(count_manifest_rows "$chunk_manifest")
-        cluster_manifest_single "$chunk_manifest" "$work_dir/round${round}/clustered" "$work_dir/round${round}"
+        cluster_manifest_single "$chunk_manifest" "$work_dir/round${round}/clustered" "$work_dir/round${round}" "$round"
 
         local parent_manifest="$work_dir/round${round}/clustered/tsv_manifest.txt"
         current_rep_manifest="$work_dir/round${round}/clustered/rep_manifest.txt"
         local round_metrics_manifest="$work_dir/round${round}/clustered/metrics_manifest.txt"
         validate_clustered_outputs "$chunk_manifest" "$work_dir/round${round}/clustered"
-        make_manifest_from_chunk_ids "$chunk_manifest" "$work_dir/round${round}/clustered/tsv" '.cluster.tsv.zst' "$parent_manifest"
+        make_manifest_from_chunk_ids "$chunk_manifest" "$work_dir/round${round}/clustered/tsv" ".cluster.tsv$(batch_compression_suffix)" "$parent_manifest"
         make_rep_manifest_with_sizes "$chunk_manifest" "$work_dir/round${round}/clustered" "$current_rep_manifest"
         make_manifest_from_chunk_ids "$chunk_manifest" "$work_dir/round${round}/clustered/metrics" '.metrics.tsv' "$round_metrics_manifest"
 
         # propagate dispatches its bucket tasks per backend (single-node loop / multi-node
         # fan-out); it emits MERGE_BUCKETS mapping shards listed in propagated_manifest.
         local propagated_manifest="$work_dir/round${round}/propagated_manifest.txt"
-        propagate "$current_mapping_manifest" "$parent_manifest" "$propagated_manifest" "$work_dir/round${round}/propagate"
+        with_round_node_work_dir "$round" propagate "$current_mapping_manifest" "$parent_manifest" "$propagated_manifest" "$work_dir/round${round}/propagate"
         current_mapping_manifest="$propagated_manifest"
 
         local cur_reps
@@ -2131,7 +2467,7 @@ run_workflow() {
     [[ "$converged" -eq 1 ]] && mark_final=1
     # finalize dispatches its rep-first-sort buckets per backend and marks final.done only
     # when mark_final=1, so a partial (MAX_ROUNDS) result is never mistaken for complete.
-    finalize_outputs "$current_mapping_manifest" "$current_rep_manifest" "$result_dir" "$work_dir/finalize" "$mark_final"
+    with_round_node_work_dir "$current_round" finalize_outputs "$current_mapping_manifest" "$current_rep_manifest" "$result_dir" "$work_dir/finalize" "$mark_final"
 
     if [[ "$converged" -eq 1 ]]; then
         if [[ -n "${REMOVE_TMP:-}" ]]; then
@@ -2141,10 +2477,10 @@ run_workflow() {
                 "$work_dir"/*|/private"$work_dir"/*) rm -f "$BATCH_SCRIPT" ;;
             esac
         fi
-        log "${BATCH_BACKEND} complete: $result_dir/final_cluster.tsv.zst"
+        log "${BATCH_BACKEND} complete: $result_dir/$(final_cluster_file_name)"
     else
         log "${BATCH_BACKEND} stopped at MAX_ROUNDS=${MAX_ROUNDS} WITHOUT convergence."
-        log "Wrote a PARTIAL clustering to $result_dir/final_cluster.tsv.zst (NOT marked final)."
+        log "Wrote a PARTIAL clustering to $result_dir/$(final_cluster_file_name) (NOT marked final)."
         log "Re-run the same command with a larger --max-rounds to resume from the completed rounds kept in $work_dir."
     fi
 }

@@ -429,7 +429,7 @@ int createdb(int argc, const char **argv, const Command& command) {
 
     if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT && par.filenames[0] == "stdin") {
         Debug(Debug::WARNING) << "Stdin input cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_SOFT << "\n";
-        Debug(Debug::WARNING) << "We recompute with --createdb-mode 1\n";
+        Debug(Debug::WARNING) << "We recompute with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_HARD << "\n";
         par.createdbMode = Parameters::SEQUENCE_SPLIT_MODE_HARD;
     }
 
@@ -523,8 +523,8 @@ int createdb(int argc, const char **argv, const Command& command) {
 
         bool resetNotFile = par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT && kseq->type != KSeqWrapper::KSEQ_FILE;
         if (resetNotFile) {
-            Debug(Debug::WARNING) << "Only uncompressed fasta files can be used with --createdb-mode 0\n";
-            Debug(Debug::WARNING) << "We recompute with --createdb-mode 1\n";
+            Debug(Debug::WARNING) << "Only uncompressed fasta files can be used with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_SOFT << "\n";
+            Debug(Debug::WARNING) << "We recompute with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_HARD << "\n";
         }
 
         bool resetIncorrectNewline = false;
@@ -550,7 +550,7 @@ int createdb(int argc, const char **argv, const Command& command) {
                 EXIT(EXIT_FAILURE);
             }
             if (lastChar != '\n') {
-                Debug(Debug::WARNING) << "Last byte is not a newline. We recompute with --createdb-mode 1\n";
+                Debug(Debug::WARNING) << "Last byte is not a newline. We recompute with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_HARD << "\n";
                 resetIncorrectNewline = true;
             }
         }
@@ -609,9 +609,9 @@ int createdb(int argc, const char **argv, const Command& command) {
                     if (e.newlineCount == 0) {
                         Debug(Debug::WARNING) << "Fasta entry " << numEntriesInCurrFile << " has no newline character\n";
                     } else if (e.newlineCount > 1) {
-                        Debug(Debug::WARNING) << "Multiline fasta can not be combined with --createdb-mode 1\n";
+                        Debug(Debug::WARNING) << "Multiline fasta can not be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_SOFT << "\n";
                     }
-                    Debug(Debug::WARNING) << "We recompute with --createdb-mode 0\n";
+                    Debug(Debug::WARNING) << "We recompute with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_HARD << "\n";
                     par.createdbMode = Parameters::SEQUENCE_SPLIT_MODE_HARD;
                     progress.reset(SIZE_MAX);
                     hdrWriter.close();

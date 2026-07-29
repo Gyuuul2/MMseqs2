@@ -89,7 +89,7 @@ std::vector<Command> baseCommands = {
                 "mmseqs linclust-batch input.manifest resultDir sharedTmp --backend multi-node --slurm-nodelist super001,super002 --threads 128 --chunk-max-bytes 20G --node-work-dir /scratch/mmseqs-batch\n\n"
                 "AWS_BATCH_JOB_QUEUE=queue AWS_BATCH_JOB_DEFINITION=jobdef mmseqs linclust-batch s3://bucket/input.manifest s3://bucket/result/run1 s3://bucket/work/run1 --backend aws-batch --threads 64\n\n"
                 "# Input manifest: one FASTA/.gz/.zst or s3:// path per line\n"
-                "# Output: resultDir/final_cluster.tsv.zst and resultDir/final_rep_seq.fasta.zst\n"
+                "# Output: resultDir/final_cluster.tsv[.zst] and resultDir/final_rep_seq.fasta[.zst]\n"
                 "# Multi-node submits SLURM jobs and requires shared input/result/tmp paths\n",
                 "Gyuri Kim <gyuribio@snu.ac.kr>",
                 "<i:inputManifest> <o:resultDir> <sharedTmpDir>",
@@ -102,7 +102,7 @@ std::vector<Command> baseCommands = {
                 "mmseqs cluster-batch input.manifest resultDir sharedTmp --backend multi-node --slurm-nodelist super001,super002 --threads 128 --chunk-max-bytes 20G --node-work-dir /scratch/mmseqs-batch\n\n"
                 "AWS_BATCH_JOB_QUEUE=queue AWS_BATCH_JOB_DEFINITION=jobdef mmseqs cluster-batch s3://bucket/input.manifest s3://bucket/result/run1 s3://bucket/work/run1 --backend aws-batch --threads 64\n\n"
                 "# Input manifest: one FASTA/.gz/.zst or s3:// path per line\n"
-                "# Output: resultDir/final_cluster.tsv.zst and resultDir/final_rep_seq.fasta.zst\n"
+                "# Output: resultDir/final_cluster.tsv[.zst] and resultDir/final_rep_seq.fasta[.zst]\n"
                 "# Multi-node submits SLURM jobs and requires shared input/result/tmp paths\n",
                 "Gyuri Kim <gyuribio@snu.ac.kr>",
                 "<i:inputManifest> <o:resultDir> <sharedTmpDir>",
