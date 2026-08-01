@@ -177,7 +177,7 @@ Parameters::Parameters():
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
         PARAM_COMPRESS_KMER_TMP_FILES(PARAM_COMPRESS_KMER_TMP_FILES_ID, "--compress-kmer-tmp-files", "Compress k-mer temporary files", "Compress kmermatcher temporary files with zstd and stream them during merge", typeid(bool), (void *) &compressKmerTmpFiles, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_KMER_SPILL_TO_DISK(PARAM_KMER_SPILL_TO_DISK_ID, "--kmer-spill-to-disk", "Spill k-mers to disk", "Extract k-mers once into per-split buckets on disk, so each split reads its bucket instead of re-scanning the sequence DB (identical result; faster when splitting on fast local storage)", typeid(bool), (void *) &kmerSpillToDisk, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_KMER_WRITE_TO_DISK(PARAM_KMER_WRITE_TO_DISK_ID, "--kmer-write-to-disk", "Write k-mers to disk", "Extract k-mers once into per-split buckets on disk, so each split reads its bucket instead of re-scanning the sequence DB (identical result; faster when splitting on fast local storage)", typeid(bool), (void *) &kmerWriteToDisk, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_VERSION(PARAM_LINCLUST_VERSION_ID, "--linclust-version", "Linclust version", "Linclust version: 1: Linclust1, 2: Linclust2", typeid(int), (void *) &linclustVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUSTER_VERSION(PARAM_CLUSTER_VERSION_ID, "--cluster-version", "Cluster version", "Cluster version: 1: Cluster1, 2: Cluster2", typeid(int), (void *) &clusterVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -1166,7 +1166,7 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_USE_PARALLELISM);
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
     kmermatcher.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
-    kmermatcher.push_back(&PARAM_KMER_SPILL_TO_DISK);
+    kmermatcher.push_back(&PARAM_KMER_WRITE_TO_DISK);
     kmermatcher.push_back(&PARAM_LINCLUST_VERSION);
 
     // kmermatcher
@@ -1623,7 +1623,7 @@ Parameters::Parameters():
     batchclustering.push_back(&PARAM_PRELOAD_MODE);
     batchclustering.push_back(&PARAM_COMPRESSED);
     batchclustering.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
-    batchclustering.push_back(&PARAM_KMER_SPILL_TO_DISK);
+    batchclustering.push_back(&PARAM_KMER_WRITE_TO_DISK);
     batchclustering.push_back(&PARAM_V);
 
     linclustbatchinner.push_back(&PARAM_C);
@@ -1643,7 +1643,7 @@ Parameters::Parameters():
     linclustbatchinner.push_back(&PARAM_COMPRESSED);
     linclustbatchinner.push_back(&PARAM_V);
     linclustbatchinner.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
-    linclustbatchinner.push_back(&PARAM_KMER_SPILL_TO_DISK);
+    linclustbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
     linclustbatchinner.push_back(&PARAM_CLUST_HASH);
     linclustbatchinner.push_back(&PARAM_LINCLUST_VERSION);
     linclustbatch = combineList(linclustbatchinner, batchclustering);
@@ -1665,7 +1665,7 @@ Parameters::Parameters():
     clusterbatchinner.push_back(&PARAM_COMPRESSED);
     clusterbatchinner.push_back(&PARAM_V);
     clusterbatchinner.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
-    clusterbatchinner.push_back(&PARAM_KMER_SPILL_TO_DISK);
+    clusterbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
     clusterbatchinner.push_back(&PARAM_CLUST_HASH);
     clusterbatchinner.push_back(&PARAM_CLUSTER_VERSION);
     clusterbatchinner.push_back(&PARAM_LINCLUST_VERSION);
@@ -3004,7 +3004,7 @@ void Parameters::setDefaults() {
     useParallelism = false;
     needWriteBuffer = false;
     compressKmerTmpFiles = false;
-    kmerSpillToDisk = false;
+    kmerWriteToDisk = false;
     includeCountTable = true;
     countTableIteration = CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE;
     countTableScale = 0.1;
