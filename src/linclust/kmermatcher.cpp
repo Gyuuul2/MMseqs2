@@ -116,6 +116,9 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
         Util::checkAllocation(scoreDist, "Can not allocate scoreDist memory in fillKmerPositionArray");
         unsigned int * hierarchicalScoreDist= new(std::nothrow) unsigned int[128];
         Util::checkAllocation(hierarchicalScoreDist, "Can not allocate hierarchicalScoreDist memory in fillKmerPositionArray");
+        // Zero once; kept clean by clearing only touched bins after each sequence (below).
+        memset(scoreDist, 0, sizeof(unsigned short) * 65536);
+        memset(hierarchicalScoreDist, 0, sizeof(unsigned int) * 128);
 
         Masker *masker = NULL;
         if (par.maskMode == 1) {
@@ -152,8 +155,6 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
 #pragma omp for schedule(dynamic, 100)
             for (size_t id = start; id < (start + bucketSize); id++) {
                 progress.updateProgress();
-                memset(scoreDist, 0, sizeof(unsigned short) * 65536);
-                memset(hierarchicalScoreDist, 0, sizeof(unsigned int) * 128);
 
                 seq.mapSequence(id, seqDbr.getDbKey(id), seqDbr.getData(id, thread_idx), seqDbr.getSeqLen(id));
 
@@ -375,6 +376,13 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
                             }
                         }
                     }
+                }
+                // Restore scoreDist/hierarchicalScoreDist to all-zero for the next sequence by
+                // clearing only the bins this sequence touched (each recorded in kmers[].score),
+                // instead of a 128 KB memset per sequence.
+                for (size_t k = 0; k < seqKmerCount; k++) {
+                    scoreDist[(kmers + k)->score] = 0;
+                    hierarchicalScoreDist[(kmers + k)->score >> 9] = 0;
                 }
             }
 #pragma omp barrier
@@ -1204,7 +1212,11 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
     float kmersPerSequenceScale = (Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES)) ?
                                         par.kmersPerSequenceScale.values.nucleotide() : par.kmersPerSequenceScale.values.aminoacid();
     size_t totalKmers = computeKmerCount(seqDbr, par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
-    size_t totalSizeNeeded = computeMemoryNeededLinearfilter<T, includeAdjacency, IncludeSeqLen>(totalKmers) * (par.needWriteBuffer ? 2 : 1);
+    // The write buffer is KmerPosition<..,false,..> (no adjacency), so it is smaller than the
+    // main array when adjacency is on. Size each separately instead of doubling the larger one,
+    // matching the per-element cost used for totalKmersPerSplit below (else splits is over-counted).
+    size_t totalSizeNeeded = computeMemoryNeededLinearfilter<T, includeAdjacency, IncludeSeqLen>(totalKmers)
+                             + (par.needWriteBuffer ? computeMemoryNeededLinearfilter<T, false, IncludeSeqLen>(totalKmers) : 0);
 
     // --split-memory-limit sizes the main k-mer/write buffers (hashSeqPair [+ writeSeqPair]).
     // Reserve the tables that stay resident next to them for the whole split loop first,
