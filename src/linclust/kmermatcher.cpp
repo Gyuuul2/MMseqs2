@@ -2006,9 +2006,17 @@ private:
 };
 
 // --- bucket file IO wrappers (declared near the top, defined here after ZstdKmerTmpFileWriter) ---
+// Buckets are transient spill: favour compression speed over ratio (lower level than the
+// split-result tmp files). MMSEQS_BUCKET_ZSTD_LEVEL overrides for tuning.
+static const int KMER_BUCKET_ZSTD_LEVEL = 1;
 static void *bucketWriterOpen(const std::string &fileName, bool compress) {
     if (compress) {
-        return new ZstdKmerTmpFileWriter(fileName, KMER_TMP_ZSTD_COMPRESSION_LEVEL);
+        int level = KMER_BUCKET_ZSTD_LEVEL;
+        const char *env = getenv("MMSEQS_BUCKET_ZSTD_LEVEL");
+        if (env != NULL) {
+            level = atoi(env);
+        }
+        return new ZstdKmerTmpFileWriter(fileName, level);
     }
     return openKmerTmpFileForOverwriteOrDie(fileName, "wb");
 }

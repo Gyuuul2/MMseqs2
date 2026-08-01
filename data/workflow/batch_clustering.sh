@@ -160,10 +160,19 @@ BATCH_SCRIPT="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)/$(basename
 
 round_cluster_par() {
     local round="$1"
+    local base
     if [[ "$round" -eq 0 && -n "${ROUND0_CLUSTER_PAR:-}" ]]; then
-        printf '%s' "$ROUND0_CLUSTER_PAR"
+        base="$ROUND0_CLUSTER_PAR"
     else
-        printf '%s' "$CLUSTER_PAR"
+        base="$CLUSTER_PAR"
+    fi
+    # round0 chunks are sized to fit in memory (no split, so k-mer caching is a no-op); enable
+    # --kmer-write-to-disk only from round1+, where the growing representative set can split.
+    # Appended last so it overrides any --kmer-write-to-disk already in the base parameters.
+    if [[ "$round" -eq 0 ]]; then
+        printf '%s --kmer-write-to-disk 0' "$base"
+    else
+        printf '%s --kmer-write-to-disk 1' "$base"
     fi
 }
 
