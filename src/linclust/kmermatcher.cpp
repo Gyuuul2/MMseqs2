@@ -1870,7 +1870,7 @@ size_t queueNextEntry(KmerPositionQueue &queue, int file, size_t offsetPos, T *e
 
 static const size_t KMER_TMP_ZSTD_INPUT_BUFFER_SIZE = 65536;
 static const size_t KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE = 65536;
-static const int KMER_TMP_ZSTD_COMPRESSION_LEVEL = 3;
+static const int KMER_TMP_ZSTD_COMPRESSION_LEVEL = 2;
 
 static std::string kmerTmpFileName(const std::string &tmpFile, int iteration, int threadIdx, bool compressed) {
     std::string fileName = tmpFile + "_iter_" + std::to_string(iteration) + "_thread_" + std::to_string(threadIdx);
@@ -2008,7 +2008,7 @@ private:
 // --- bucket file IO wrappers (declared near the top, defined here after ZstdKmerTmpFileWriter) ---
 // Buckets are transient spill: favour compression speed over ratio (lower level than the
 // split-result tmp files). MMSEQS_BUCKET_ZSTD_LEVEL overrides for tuning.
-static const int KMER_BUCKET_ZSTD_LEVEL = 1;
+static const int KMER_BUCKET_ZSTD_LEVEL = 2;
 static void *bucketWriterOpen(const std::string &fileName, bool compress) {
     if (compress) {
         int level = KMER_BUCKET_ZSTD_LEVEL;
