@@ -266,10 +266,14 @@ KmerPosition<T, includeAdjacency, IncludeSeqLen> * doComputation(size_t totalKme
 template <typename T, bool includeAdjacency = false, bool IncludeSeqLen = false>
 KmerPosition<T, includeAdjacency, IncludeSeqLen> *initKmerPositionMemory(size_t size);
 
+template <typename T, bool includeAdjacency, bool IncludeSeqLen>
+struct KmerPartitionSink;
+
 template <int TYPE, typename T, bool includeAdjacency = false, bool IncludeSeqLen = false>
 std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency, IncludeSeqLen> * kmerArray, size_t kmerArraySize, DBReader<DBKeyType> &seqDbr,
                                                  Parameters & par, BaseMatrix * subMat, bool hashWholeSequence,
-                                                 size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution);
+                                                 size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution,
+                                                 KmerPartitionSink<T, includeAdjacency, IncludeSeqLen> *partitionSink = NULL);
 
 
 void maskSequence(int maskMode, int maskLowerCase,

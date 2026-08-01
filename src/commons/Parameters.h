@@ -637,6 +637,7 @@ public:
     bool useParallelism;
     bool needWriteBuffer;
     bool compressKmerTmpFiles;
+    bool kmerSpillToDisk;
     bool includeCountTable;
     int countTableIteration;
     float countTableScale;
@@ -1009,6 +1010,7 @@ public:
     PARAMETER(PARAM_USE_PARALLELISM)
     PARAMETER(PARAM_NEED_WRITEBUFFER)
     PARAMETER(PARAM_COMPRESS_KMER_TMP_FILES)
+    PARAMETER(PARAM_KMER_SPILL_TO_DISK)
     PARAMETER(PARAM_CLUST_HASH)
     PARAMETER(PARAM_LINCLUST_VERSION)
     PARAMETER(PARAM_CLUSTER_VERSION)
