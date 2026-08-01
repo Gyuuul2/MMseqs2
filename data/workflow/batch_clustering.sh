@@ -32,17 +32,26 @@ Usage:
   batch_clustering.sh aws-merge <input_manifest> <work_s3_prefix> <result_s3_prefix> <round>
 
 Environment:
-  MMSEQS THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_BUCKETS COMPRESS_RATIO
+  MMSEQS ROUND0_MMSEQS THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_BUCKETS MERGE_BUCKET_JOBS COMPRESS_RATIO
   CLUSTER_CMD CLUSTER_PAR ROUND0_CLUSTER_PAR CLUSTER_COV_MODE CREATEDB_PAR CREATETSV_PAR COMPRESS_BATCH_OUTPUTS SORT_BUFFER_SIZE SORT_TMP
   MAX_ROUNDS MIN_REDUCTION_RATIO MIN_REDUCTION_COUNT CONVERGENCE_PATIENCE MAX_CHUNK_ATTEMPTS
   REMOVE_TMP NODE_WORK_DIR ROUND0_NODE_WORK_DIR
-  BATCH_SLURM_NODELIST ROUND0_SLURM_NODELIST BATCH_SLURM_PARTITION BATCH_SLURM_TIME BATCH_SLURM_MEM BATCH_SLURM_EXTRA
-  AWS_BATCH_JOB_QUEUE AWS_BATCH_JOB_DEFINITION BATCH_AWS_JOB_PREFIX
+  BATCH_SLURM_NODELIST ROUND0_BATCH_SLURM_NODELIST BATCH_SLURM_PARTITION ROUND0_BATCH_SLURM_PARTITION
+  BATCH_SLURM_TIME ROUND0_BATCH_SLURM_TIME BATCH_SLURM_MEM ROUND0_BATCH_SLURM_MEM BATCH_SLURM_EXTRA ROUND0_BATCH_SLURM_EXTRA
+  BATCH_AWS_MACHINE ROUND0_BATCH_AWS_MACHINE BATCH_AWS_MACHINE_TAG_KEY
+  BATCH_AWS_JOB_QUEUE BATCH_AWS_JOB_DEFINITION ROUND0_BATCH_AWS_JOB_QUEUE ROUND0_BATCH_AWS_JOB_DEFINITION
+  BATCH_AWS_JOB_PREFIX BATCH_AWS_WORKER_ATTEMPTS BATCH_AWS_ALLOW_NONS3_INPUT
+  BATCH_AWS_MMSEQS ROUND0_BATCH_AWS_MMSEQS BATCH_AWS_SCRIPT_URI BATCH_AWS_LOCAL_DIR BATCH_AWS_TIMEOUT BATCH_AWS_DRY_RUN
+  (AWS env var names must NOT start with 'AWS_BATCH' -- that prefix is reserved by the AWS Batch service.)
 EOF
     exit 1
 }
 
 MMSEQS=${MMSEQS:-mmseqs}
+# Optional round0-specific mmseqs binary (multi-node): when round0 runs on a different-architecture
+# node pool than round1+ (e.g. ARM round0 / x86 round1+ on a heterogeneous SLURM cluster), a single
+# binary path cannot serve both. Empty = use $MMSEQS for every round (the common same-arch case).
+ROUND0_MMSEQS=${ROUND0_MMSEQS:-}
 THREADS=${THREADS:-$(command -v nproc >/dev/null 2>&1 && nproc || echo 1)}
 CHUNK_MAX_BYTES=${CHUNK_MAX_BYTES:-21474836480}   # = 20*1024^3; must match BatchClustering.cpp/Parameters.cpp batchChunkMaxBytes so a standalone run chunks identically to the mmseqs-injected run
 CHUNK_MAX_SEQS=${CHUNK_MAX_SEQS:-0}
@@ -92,19 +101,61 @@ MAX_ROUNDS=${MAX_ROUNDS:-32}
 MIN_REDUCTION_RATIO=${MIN_REDUCTION_RATIO:-0.02}
 CONVERGENCE_PATIENCE=${CONVERGENCE_PATIENCE:-1}
 MIN_REDUCTION_COUNT=${MIN_REDUCTION_COUNT:-0}
-MAX_CHUNK_ATTEMPTS=${MAX_CHUNK_ATTEMPTS:-3}
+MAX_CHUNK_ATTEMPTS=${MAX_CHUNK_ATTEMPTS:-2}
+[[ "$MAX_CHUNK_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || fail "MAX_CHUNK_ATTEMPTS must be a positive integer (got '$MAX_CHUNK_ATTEMPTS')"
 COMPRESS_RATIO=${COMPRESS_RATIO:-3}
-MERGE_BUCKETS=${MERGE_BUCKETS:-1}
+
+merge_default_threads() {
+    if [[ "${THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
+        printf '%s' "$THREADS"
+    else
+        printf '1'
+    fi
+}
+
+auto_merge_buckets() {
+    local buckets
+    buckets=$(merge_default_threads)   # always >= 1
+    [[ "$buckets" -gt 256 ]] && buckets=256
+    printf '%s' "$buckets"
+}
+
+auto_merge_bucket_jobs() {
+    local threads buckets jobs
+    threads=$(merge_default_threads)
+    buckets="${MERGE_BUCKETS:-1}"
+    jobs=$((threads / 8))
+    [[ "$jobs" -lt 1 ]] && jobs=1
+    [[ "$jobs" -gt 16 ]] && jobs=16
+    [[ "$jobs" -gt "$buckets" ]] && jobs="$buckets"
+    printf '%s' "$jobs"
+}
+
+if [[ -z "${MERGE_BUCKETS:-}" || "$MERGE_BUCKETS" == "0" ]]; then
+    MERGE_BUCKETS=$(auto_merge_buckets)
+fi
 [[ "$MERGE_BUCKETS" =~ ^[1-9][0-9]*$ ]] || fail "MERGE_BUCKETS must be a positive integer (got '$MERGE_BUCKETS')"
+if [[ -z "${MERGE_BUCKET_JOBS:-}" || "$MERGE_BUCKET_JOBS" == "0" ]]; then
+    MERGE_BUCKET_JOBS=$(auto_merge_bucket_jobs)
+fi
+[[ "$MERGE_BUCKET_JOBS" =~ ^[1-9][0-9]*$ ]] || fail "MERGE_BUCKET_JOBS must be a positive integer (got '$MERGE_BUCKET_JOBS')"
+[[ "$MERGE_BUCKET_JOBS" -gt "$MERGE_BUCKETS" ]] && MERGE_BUCKET_JOBS="$MERGE_BUCKETS"
 BATCH_BACKEND=${BATCH_BACKEND:-single-node}
 NODE_WORK_DIR=${NODE_WORK_DIR:-}
 ROUND0_NODE_WORK_DIR=${ROUND0_NODE_WORK_DIR:-}
 BATCH_SLURM_NODELIST=${BATCH_SLURM_NODELIST:-}
-ROUND0_SLURM_NODELIST=${ROUND0_SLURM_NODELIST:-}
+ROUND0_BATCH_SLURM_NODELIST=${ROUND0_BATCH_SLURM_NODELIST:-}
 BATCH_SLURM_PARTITION=${BATCH_SLURM_PARTITION:-}
+ROUND0_BATCH_SLURM_PARTITION=${ROUND0_BATCH_SLURM_PARTITION:-}
 BATCH_SLURM_TIME=${BATCH_SLURM_TIME:-}
+ROUND0_BATCH_SLURM_TIME=${ROUND0_BATCH_SLURM_TIME:-}
 BATCH_SLURM_MEM=${BATCH_SLURM_MEM:-}
+ROUND0_BATCH_SLURM_MEM=${ROUND0_BATCH_SLURM_MEM:-}
 BATCH_SLURM_EXTRA=${BATCH_SLURM_EXTRA:-}
+ROUND0_BATCH_SLURM_EXTRA=${ROUND0_BATCH_SLURM_EXTRA:-}
+BATCH_AWS_MACHINE=${BATCH_AWS_MACHINE:-}
+ROUND0_BATCH_AWS_MACHINE=${ROUND0_BATCH_AWS_MACHINE:-}
+BATCH_AWS_MACHINE_TAG_KEY=${BATCH_AWS_MACHINE_TAG_KEY:-mmseqs:machine}
 BATCH_SCRIPT="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)/$(basename -- "$0")"
 
 round_cluster_par() {
@@ -145,10 +196,58 @@ round_node_work_dir() {
 
 round_slurm_nodelist() {
     local round="$1"
-    if [[ "$round" -eq 0 && -n "${ROUND0_SLURM_NODELIST:-}" ]]; then
-        printf '%s' "$ROUND0_SLURM_NODELIST"
+    if [[ "$round" -eq 0 && -n "${ROUND0_BATCH_SLURM_NODELIST:-}" ]]; then
+        printf '%s' "$ROUND0_BATCH_SLURM_NODELIST"
     else
         printf '%s' "$BATCH_SLURM_NODELIST"
+    fi
+}
+
+round_slurm_partition() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_BATCH_SLURM_PARTITION:-}" ]]; then
+        printf '%s' "$ROUND0_BATCH_SLURM_PARTITION"
+    else
+        printf '%s' "$BATCH_SLURM_PARTITION"
+    fi
+}
+
+round_slurm_time() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_BATCH_SLURM_TIME:-}" ]]; then
+        printf '%s' "$ROUND0_BATCH_SLURM_TIME"
+    else
+        printf '%s' "$BATCH_SLURM_TIME"
+    fi
+}
+
+round_slurm_mem() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_BATCH_SLURM_MEM:-}" ]]; then
+        printf '%s' "$ROUND0_BATCH_SLURM_MEM"
+    else
+        printf '%s' "$BATCH_SLURM_MEM"
+    fi
+}
+
+round_slurm_extra() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_BATCH_SLURM_EXTRA:-}" ]]; then
+        printf '%s' "$ROUND0_BATCH_SLURM_EXTRA"
+    else
+        printf '%s' "$BATCH_SLURM_EXTRA"
+    fi
+}
+
+# Round0-specific mmseqs binary (see ROUND0_MMSEQS above). All mmseqs invocations happen in
+# cluster_chunk, which knows its round -- so this one helper covers every backend (single/slurm/aws).
+# On AWS the per-round binary is normally the round's container image, so ROUND0_MMSEQS stays empty.
+round_mmseqs() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_MMSEQS:-}" ]]; then
+        printf '%s' "$ROUND0_MMSEQS"
+    else
+        printf '%s' "$MMSEQS"
     fi
 }
 
@@ -185,10 +284,23 @@ with_round_node_work_dir() {
 # exceed it somewhat), but at ~25% of RAM the headroom is large enough that a single sort will not
 # realistically OOM. --merge-buckets shrinks each sort's INPUT; this only sizes its memory.
 # BSD/macOS sort lacks these flags, so they are only added when GNU sort is detected.
-SORT_BUFFER_SIZE=${SORT_BUFFER_SIZE:-25%}
+if [[ -z "${SORT_BUFFER_SIZE+x}" ]]; then
+    if [[ "$MERGE_BUCKET_JOBS" -gt 1 ]]; then
+        sort_pct=$((25 / MERGE_BUCKET_JOBS))
+        [[ "$sort_pct" -lt 1 ]] && sort_pct=1
+        SORT_BUFFER_SIZE="${sort_pct}%"
+    else
+        SORT_BUFFER_SIZE="25%"
+    fi
+fi
 SORT_PARALLEL_OPT=""
 if sort --version 2>/dev/null | grep -q GNU; then
-    SORT_PARALLEL_OPT="--parallel=$THREADS --buffer-size=$SORT_BUFFER_SIZE"
+    MERGE_SORT_THREADS="$THREADS"
+    if [[ "$MERGE_BUCKET_JOBS" -gt 1 ]]; then
+        MERGE_SORT_THREADS=$((THREADS / MERGE_BUCKET_JOBS))
+        [[ "$MERGE_SORT_THREADS" -lt 1 ]] && MERGE_SORT_THREADS=1
+    fi
+    SORT_PARALLEL_OPT="--parallel=$MERGE_SORT_THREADS --buffer-size=$SORT_BUFFER_SIZE"
 fi
 
 # Where GNU sort spills its external-sort runs (-T). Prefer node-local NVMe (--node-work-dir) so the
@@ -228,8 +340,15 @@ need_cmd() {
 uri_exists() {
     local uri="$1"
     if is_s3 "$uri"; then
+        [[ -n "${BATCH_AWS_DRY_RUN:-}" ]] && return 1
         need_cmd aws
-        aws s3 ls "$uri" >/dev/null 2>&1
+        # head-object is an EXACT-key existence test; `aws s3 ls <key>` is a prefix match that can
+        # false-positive (e.g. report chunk-1.done present because chunk-10.done exists). Existence
+        # here gates the done-marker reconcile, so an exact test is required for correctness.
+        # NOTE: head-object needs s3:GetObject on the key (workers already need it to fetch chunks);
+        # a 403 is indistinguishable from a 404 here, so a role lacking GetObject on the done/ path
+        # would see every marker as absent and resubmit endlessly.
+        aws s3api head-object --bucket "$(s3_bucket "$uri")" --key "$(s3_key_prefix "$uri")" >/dev/null 2>&1
     else
         [[ -e "$uri" ]]
     fi
@@ -345,8 +464,14 @@ s3_list_prefix() {
     local bucket key
     bucket=$(s3_bucket "$prefix")
     key=$(s3_key_prefix "$prefix")
-    aws s3 ls "s3://${bucket}/${key}" --recursive \
-        | awk -v base="s3://${bucket}/" 'NF >= 4 { print base $4 }'
+    # list-objects-v2 returns exact keys (no `aws s3 ls` column parsing, robust to any object name)
+    # and the CLI auto-paginates, so all keys under the prefix are returned. A null result prints
+    # "None" with --output text; drop it. Keys are tab- or newline-separated; normalize to one/line.
+    # stderr is NOT suppressed: this listing drives the done-marker reconcile, so a throttle/403/network
+    # failure must surface and abort the merge rather than be silently read as "no chunks done".
+    aws s3api list-objects-v2 --bucket "$bucket" --prefix "$key" \
+        --query 'Contents[].Key' --output text \
+        | tr '\t' '\n' | awk -v base="s3://${bucket}/" 'NF && $0 != "None" { print base $0 }'
 }
 
 compress_to_zst() {
@@ -367,7 +492,7 @@ batch_compression_suffix() {
 }
 
 final_cluster_file_name() {
-    printf 'final_cluster.tsv%s' "$(batch_compression_suffix)"
+    printf 'final_cluster_manifest.txt'
 }
 
 write_batch_output() {
@@ -532,7 +657,12 @@ write_chunk_manifest_line() {
 file_size_bytes() {
     local uri="$1"
     if is_s3 "$uri"; then
-        aws s3 ls "$uri" 2>/dev/null | awk 'END { print ($3 ~ /^[0-9]+$/) ? $3 : 0 }'
+        need_cmd aws
+        # `|| true`: a missing key / denied head exits non-zero and under pipefail would abort the
+        # caller (this is a best-effort size estimate, not a hard existence check). `END` always
+        # emits an integer even on empty input, preserving the "always returns a number" contract.
+        { aws s3api head-object --bucket "$(s3_bucket "$uri")" --key "$(s3_key_prefix "$uri")" \
+            --query ContentLength --output text 2>/dev/null || true; } | awk 'END { print ($1 ~ /^[0-9]+$/) ? $1 : 0 }'
     else
         stat -c %s "$uri" 2>/dev/null || stat -f %z "$uri" 2>/dev/null || echo 0
     fi
@@ -862,6 +992,9 @@ cluster_chunk() {
     local chunk_id
     chunk_id="${4:-$(basename_no_compression "$chunk_uri")}"
     local round="${5:-${BATCH_WORKER_ROUND:-0}}"
+    # round drives round_cluster_par AND round_mmseqs (binary selection); a non-numeric value would
+    # be treated as 0 by the round_* helpers' arithmetic test and silently pick round0's binary/params.
+    [[ "$round" =~ ^[0-9]+$ ]] || fail "cluster-chunk: round must be a non-negative integer (got '$round')"
     local expected_seqs="${6:-${BATCH_EXPECTED_SEQS:-0}}"
     local prefix
     prefix=$(normalize_s3_prefix "$result_prefix")
@@ -923,10 +1056,14 @@ cluster_chunk() {
     local rep_fa="$work_dir/result/${chunk_id}.rep.fa"
     local metrics="$work_dir/result/${chunk_id}.metrics.tsv"
 
-    need_cmd "$MMSEQS"
+    # Resolve the round's mmseqs binary (ROUND0_MMSEQS for round0 when set). All mmseqs calls below
+    # use it, so a round0 node pool of a different architecture runs its own binary.
+    local mmseqs_bin
+    mmseqs_bin=$(round_mmseqs "$round")
+    need_cmd "$mmseqs_bin"
     log "createdb ${chunk_id}"
     # shellcheck disable=SC2086
-    "$MMSEQS" createdb "$createdb_input" "$db" ${CREATEDB_PAR} || fail "createdb failed (chunk ${chunk_id}, rc=$?)"
+    "$mmseqs_bin" createdb "$createdb_input" "$db" ${CREATEDB_PAR} || fail "createdb failed (chunk ${chunk_id}, rc=$?)"
     local actual_seqs
     actual_seqs=$(wc -l < "${db}.index" | tr -d ' ')
     if [[ "${expected_seqs:-0}" =~ ^[1-9][0-9]*$ && "$actual_seqs" -ne "$expected_seqs" ]]; then
@@ -938,15 +1075,15 @@ cluster_chunk() {
 
     log "${CLUSTER_CMD} ${chunk_id}"
     # shellcheck disable=SC2046,SC2086
-    "$MMSEQS" ${CLUSTER_CMD} "$db" "$clu" "$work_dir/tmp" $(round_cluster_par "$round") || fail "${CLUSTER_CMD} failed (chunk ${chunk_id}, rc=$?)"
+    "$mmseqs_bin" ${CLUSTER_CMD} "$db" "$clu" "$work_dir/tmp" $(round_cluster_par "$round") || fail "${CLUSTER_CMD} failed (chunk ${chunk_id}, rc=$?)"
 
     log "createtsv ${chunk_id}"
     # shellcheck disable=SC2086
-    "$MMSEQS" createtsv "$db" "$db" "$clu" "$tsv" ${CREATETSV_PAR} || fail "createtsv failed (chunk ${chunk_id}, rc=$?)"
+    "$mmseqs_bin" createtsv "$db" "$db" "$clu" "$tsv" ${CREATETSV_PAR} || fail "createtsv failed (chunk ${chunk_id}, rc=$?)"
 
     log "representatives ${chunk_id}"
-    "$MMSEQS" createsubdb "$clu" "$db" "$rep" --subdb-mode 1 || fail "createsubdb failed (chunk ${chunk_id}, rc=$?)"
-    "$MMSEQS" convert2fasta "$rep" "$rep_fa" || fail "convert2fasta failed (chunk ${chunk_id}, rc=$?)"
+    "$mmseqs_bin" createsubdb "$clu" "$db" "$rep" --subdb-mode 1 || fail "createsubdb failed (chunk ${chunk_id}, rc=$?)"
+    "$mmseqs_bin" convert2fasta "$rep" "$rep_fa" || fail "convert2fasta failed (chunk ${chunk_id}, rc=$?)"
 
     local batch_suffix tsv_out rep_out
     batch_suffix=$(batch_compression_suffix)
@@ -963,6 +1100,7 @@ cluster_chunk() {
         printf 'seq_count\t%s\n' "$actual_seqs"
         printf 'input_bytes\t%s\n' "$(wc -c < "$db" 2>/dev/null | tr -d ' ' || echo 0)"
         printf 'rep_count\t%s\n' "$(grep -c '^>' "$rep_fa" || true)"
+        printf 'rep_bytes\t%s\n' "$(wc -c < "$rep_fa" 2>/dev/null | tr -d ' ' || echo 0)"
         printf 'cluster_tsv\t%s\n' "$(basename "$tsv_out")"
         printf 'rep_fasta\t%s\n' "$(basename "$rep_out")"
     } > "$metrics"
@@ -1031,15 +1169,19 @@ merge_partition() {
         : > "$bkt"
     done
 
-    # Stream every file in the manifest and route each line to its bucket by hash(key)%B. A
-    # manifest line is either "<uri>" or "<id>\t<uri>\t..." (chunk manifests); pick the uri.
-    local first second _ uri
+    # Stream every file in the manifest and route each line to its bucket by hash(key)%B. Manifest
+    # lines are either "<uri>", "<uri>\tbytes[\tseqs]", or "<id>\t<uri>\t..." (chunk manifests).
+    local first second third rest uri
     {
-        while IFS=$'\t ' read -r first second _ || [[ -n "${first:-}" ]]; do
+        while IFS=$'\t ' read -r first second third rest || [[ -n "${first:-}" ]]; do
             [[ -z "${first:-}" || "$first" =~ ^# ]] && continue
-            uri="$first"
-            if [[ -n "${second:-}" && "$first" != s3://* && "$first" != /* && "$first" != ./* ]]; then
+            if [[ -n "${second:-}" && "$second" =~ ^[0-9]+$ &&
+                  ( -z "${third:-}" || "$third" =~ ^[0-9]+$ ) ]]; then
+                uri="$first"
+            elif [[ -n "${second:-}" && "$first" != s3://* && "$first" != /* && "$first" != ./* ]]; then
                 uri="$second"
+            else
+                uri="$first"
             fi
             stream_uri "$uri"
         done < <(stream_manifest "$input_manifest")
@@ -1048,6 +1190,61 @@ merge_partition() {
         $kc == "" { next }
         { print > (pfx sprintf("%05d.tsv", bucket($kc))) }
     '
+}
+
+run_bucket_jobs() {
+    local label="$1" buckets="$2" jobs="$3" worker="$4"
+    shift 4
+    [[ "$jobs" -gt "$buckets" ]] && jobs="$buckets"
+    [[ "$jobs" -lt 1 ]] && jobs=1
+
+    local pids="" active=0
+    local b pid rc=0
+    for ((b = 0; b < buckets; b++)); do
+        "$worker" "$@" "$b" &
+        pids="${pids}$! "
+        active=$((active + 1))
+        if [[ "$active" -ge "$jobs" ]]; then
+            for pid in $pids; do
+                if ! wait "$pid"; then
+                    rc=1
+                fi
+            done
+            pids=""
+            active=0
+            [[ "$rc" -eq 0 ]] || fail "${label}: one or more bucket jobs failed"
+        fi
+    done
+    for pid in $pids; do
+        if ! wait "$pid"; then
+            rc=1
+        fi
+    done
+    [[ "$rc" -eq 0 ]] || fail "${label}: one or more bucket jobs failed"
+}
+
+merge_join_job() {
+    local part_dir="$1" out_dir="$2" sort_tmp="$3" bucket="$4"
+    merge_join "$part_dir" "$out_dir" "$bucket" "$sort_tmp"
+}
+
+finalize_sort_bucket_job() {
+    local part_dir="$1" out_dir="$2" sort_tmp="$3" bucket="$4"
+    finalize_sort_bucket "$part_dir" "$out_dir" "$bucket" "$sort_tmp"
+}
+
+finalize_emit_shard_job() {
+    local sorted_dir="$1" shard_prefix="$2" work_dir="$3" bucket="$4"
+    local bb batch_suffix bkt shard_out shard_tmp
+    printf -v bb '%05d' "$bucket"
+    batch_suffix=$(batch_compression_suffix)
+    printf -v bkt '%s/final.bkt%s.tsv' "$sorted_dir" "$bb"
+    [[ -e "$bkt" ]] || fail "finalize: missing sorted bucket $bkt"
+    shard_out="${shard_prefix}final.bkt${bb}.tsv${batch_suffix}"
+    shard_tmp="$work_dir/final.bkt${bb}.tsv${batch_suffix}.out.tmp.$$"
+    write_batch_output "$bkt" "$shard_tmp"
+    copy_out "$shard_tmp" "$shard_out"
+    rm -f "$shard_tmp"
 }
 
 # Join one bucket: parent.member == child.rep -> (parent.rep, child.member). One shard out.
@@ -1061,6 +1258,7 @@ merge_join() {
         log "merge_join: reusing bucket ${bb}"
         return 0
     fi
+    sort_tmp="$sort_tmp/bkt${bb}"
     mkdir -p "$out_dir" "$sort_tmp"
     local child="$part_dir/child.bkt${bb}.tsv"
     local parent="$part_dir/parent.bkt${bb}.tsv"
@@ -1096,6 +1294,7 @@ finalize_sort_bucket() {
     local part_dir="$1" out_dir="$2" bucket="$3" sort_tmp="$4"
     local bb; printf -v bb '%05d' "$bucket"
     local out="$out_dir/final.bkt${bb}.tsv"
+    sort_tmp="$sort_tmp/bkt${bb}"
     mkdir -p "$out_dir" "$sort_tmp"
     # shellcheck disable=SC2086
     awk 'BEGIN {FS=OFS="\t"} { print $1, ($1 == $2 ? 0 : 1), $2 }' "$part_dir/rep.bkt${bb}.tsv" \
@@ -1134,15 +1333,15 @@ propagate() {
     merge_partition child "$child_manifest" "$part" "$buckets"
     merge_partition parent "$parent_manifest" "$part" "$buckets"
 
-    log "propagate: joining ${buckets} bucket(s)"
+    log "propagate: joining ${buckets} bucket(s) with ${MERGE_BUCKET_JOBS} concurrent bucket job(s)"
     local b
-    for ((b = 0; b < buckets; b++)); do merge_join "$part" "$shards" "$b" "$sort_tmp"; done
+    run_bucket_jobs "propagate join" "$buckets" "$MERGE_BUCKET_JOBS" merge_join_job "$part" "$shards" "$sort_tmp"
 
     local bkt
     : > "${out_manifest}.tmp"
     for ((b = 0; b < buckets; b++)); do
         printf -v bkt '%s/propagated.bkt%05d.tsv%s' "$shards" "$b" "$(batch_compression_suffix)"
-        [[ -s "$bkt" ]] || fail "propagate: missing bucket output $bkt"
+        [[ -e "$bkt" ]] || fail "propagate: missing bucket output $bkt"
         printf '%s\n' "$bkt" >> "${out_manifest}.tmp"
     done
     mv "${out_manifest}.tmp" "$out_manifest"
@@ -1192,6 +1391,32 @@ make_rep_manifest_with_sizes() {
         [[ "$seqs" =~ ^[0-9]+$ ]] || seqs=0
         printf '%s\t%s\t%s\n' "$repf" "${bytes:-0}" "$seqs" >> "$plain"
     done < "$chunk_manifest"
+    interleave_manifest_file "$plain" "$out"
+    rm -f "$plain"
+}
+
+# Build the "rep_path<TAB>bytes<TAB>seqs" manifest (interleaved, chunk order) from the per-chunk
+# metrics files instead of stat-ing the rep FASTAs. bytes/seqs come from the metrics' EXACT
+# rep_bytes/rep_count (recorded by cluster_chunk from the uncompressed rep FASTA), so the next round's
+# chunk boundaries never depend on a COMPRESS_RATIO estimate or on --threads (compressed size), and no
+# S3 head-object per rep is needed. Reads metrics via stream_uri (URI-agnostic: local or s3://).
+# rep_dir is where the rep FASTAs live (no trailing slash, as returned by join_uri).
+make_rep_manifest_from_metrics() {
+    local metrics_manifest="$1" rep_dir="$2" out="$3"
+    local plain="${out}.plain.$$"
+    : > "$plain"
+    local uri
+    while IFS= read -r uri || [[ -n "${uri:-}" ]]; do
+        [[ -z "${uri:-}" || "$uri" =~ ^# ]] && continue
+        stream_uri "$uri" | awk -F'\t' -v dir="$rep_dir" '
+            $1 == "rep_fasta" { fa = $2 }
+            $1 == "rep_bytes" { b  = $2 }
+            $1 == "rep_count" { s  = $2 }
+            END {
+                if (fa == "") { print "batch: metrics file has no rep_fasta line" > "/dev/stderr"; exit 1 }
+                printf "%s/%s\t%s\t%s\n", dir, fa, (b == "" ? 0 : b), (s == "" ? 0 : s)
+            }' >> "$plain"
+    done < <(stream_manifest "$metrics_manifest")
     interleave_manifest_file "$plain" "$out"
     rm -f "$plain"
 }
@@ -1326,11 +1551,11 @@ make_chunk_work_dir() {
 }
 
 # finalize <mapping_manifest> <rep_manifest> <result_prefix> <work_dir> [mark_final]
-# Produces final_cluster.tsv[.zst] by hash-partitioning the mapping by rep into MERGE_BUCKETS
-# buckets, rep-first sorting each, then concatenating the disjoint buckets. Each cluster is
-# contiguous and rep-led. With B=1 this is a global rep sort (byte-identical to the single-node
-# result); with B>1 the clusters are ordered by (bucket, rep) -- the SAME clusters and members,
-# only the inter-cluster row order differs.
+# Hash-partitions the final mapping by rep into MERGE_BUCKETS buckets, rep-first sorts each,
+# and writes final_cluster_shards/final.bkt*.tsv[.zst]. final_cluster_manifest.txt lists those
+# shards and is the final cluster output. Each cluster is contiguous and rep-led. With B=1 this
+# is a global rep sort; with B>1 the clusters are ordered by (bucket, rep), so only inter-cluster
+# row order differs.
 finalize_outputs() {
     [[ "$#" -ge 4 && "$#" -le 5 ]] || usage
     local mapping_manifest="$1"
@@ -1346,14 +1571,16 @@ finalize_outputs() {
     mkdir -p "$work_dir"
     local batch_suffix
     batch_suffix=$(batch_compression_suffix)
-    local final_cluster="${prefix}final_cluster.tsv${batch_suffix}"
     local final_cluster_manifest="${prefix}final_cluster_manifest.txt"
+    local final_cluster_shard_prefix="${prefix}final_cluster_shards/"
     local final_rep="${prefix}final_rep_seq.fasta${batch_suffix}"
     local final_rep_manifest="${prefix}final_rep_seq_manifest.txt"
     local final_done="${prefix}final.done"
+    local final_result
+    final_result="${prefix}$(final_cluster_file_name)"
 
-    if [[ "$mark_final" == "1" ]] && done_exists "$final_done" && done_exists "$final_cluster"; then
-        log "finalize: reusing completed result $final_cluster"
+    if [[ "$mark_final" == "1" ]] && done_exists "$final_done" && done_exists "$final_result"; then
+        log "finalize: reusing completed result $final_result"
         return 0
     fi
 
@@ -1366,26 +1593,20 @@ finalize_outputs() {
 
     log "finalize: partitioning final mapping by rep into ${buckets} bucket(s)"
     merge_partition rep "$mapping_manifest" "$part" "$buckets"
-    log "finalize: rep-first sorting ${buckets} bucket(s)"
+    log "finalize: rep-first sorting ${buckets} bucket(s) with ${MERGE_BUCKET_JOBS} concurrent bucket job(s)"
     local b
-    for ((b = 0; b < buckets; b++)); do finalize_sort_bucket "$part" "$sorted" "$b" "$sort_tmp"; done
-
-    local cluster_plain="$work_dir/final_cluster.tsv.tmp.$$"
-    : > "$cluster_plain"
-    local bkt
-    for ((b = 0; b < buckets; b++)); do
-        printf -v bkt '%s/final.bkt%05d.tsv' "$sorted" "$b"
-        [[ -e "$bkt" ]] || fail "finalize: missing sorted bucket $bkt"
-        cat "$bkt" >> "$cluster_plain"
-    done
-    local cluster_tmp="$work_dir/final_cluster.tsv${batch_suffix}.out.tmp.$$"
-    write_batch_output "$cluster_plain" "$cluster_tmp"
-    rm -f "$cluster_plain"
-    copy_out "$cluster_tmp" "$final_cluster"
-    rm -f "$cluster_tmp"
+    run_bucket_jobs "finalize sort" "$buckets" "$MERGE_BUCKET_JOBS" finalize_sort_bucket_job "$part" "$sorted" "$sort_tmp"
 
     local manifest_tmp="$work_dir/final_cluster_manifest.txt.tmp.$$"
-    printf '%s\n' "$final_cluster" > "$manifest_tmp"
+    : > "$manifest_tmp"
+    log "finalize: writing ${buckets} final shard(s) with ${MERGE_BUCKET_JOBS} concurrent bucket job(s)"
+    run_bucket_jobs "finalize shard write" "$buckets" "$MERGE_BUCKET_JOBS" finalize_emit_shard_job "$sorted" "$final_cluster_shard_prefix" "$work_dir"
+    local shard_out bb
+    for ((b = 0; b < buckets; b++)); do
+        printf -v bb '%05d' "$b"
+        shard_out="${final_cluster_shard_prefix}final.bkt${bb}.tsv${batch_suffix}"
+        printf '%s\n' "$shard_out" >> "$manifest_tmp"
+    done
     copy_out "$manifest_tmp" "$final_cluster_manifest"
     rm -f "$manifest_tmp"
 
@@ -1413,9 +1634,9 @@ finalize_outputs() {
 
     if [[ "$mark_final" == "1" ]]; then
         mark_done "$final_done" "$work_dir/final.done"
-        log "final clusters written: $final_cluster"
+        log "final clusters written: $final_result"
     else
-        log "partial clusters written without final marker: $final_cluster"
+        log "partial clusters written without final marker: $final_result"
     fi
 }
 
@@ -1431,7 +1652,7 @@ list_missing_chunks() {
     local chunk_manifest="$1"
     local result_prefix="$2"
     while IFS=$'\t' read -r chunk_id _ || [[ -n "${chunk_id:-}" ]]; do
-        [[ -z "${chunk_id:-}" ]] && continue
+        [[ -z "${chunk_id:-}" || "$chunk_id" =~ ^[[:space:]]*# ]] && continue
         if ! done_exists "$(chunk_done_uri "$result_prefix" "$chunk_id")"; then
             printf '%s\n' "$chunk_id"
         fi
@@ -1446,7 +1667,7 @@ s3_missing_chunks() {
     s3_list_prefix "$done_prefix" | awk -F/ '{ print $NF }' > "$present"
     awk -F'\t' -v pf="$present" '
         BEGIN { while ((getline l < pf) > 0) { seen[l] = 1 } }
-        /^#/ || NF == 0 { next }
+        /^[[:space:]]*(#|$)/ { next }
         { if (!seen[$1 ".done"]) print $1 }
     ' "$chunk_manifest"
 }
@@ -1463,7 +1684,7 @@ cluster_manifest_single() {
     while [[ "$attempt" -le "$MAX_CHUNK_ATTEMPTS" ]]; do
         local failed=0
         while IFS=$'\t' read -r chunk_id chunk_uri seqs _ || [[ -n "${chunk_id:-}" ]]; do
-            [[ -z "${chunk_id:-}" ]] && continue
+            [[ -z "${chunk_id:-}" || "$chunk_id" =~ ^[[:space:]]*# ]] && continue
             if done_exists "$(chunk_done_uri "$result_prefix" "$chunk_id")"; then
                 continue
             fi
@@ -1500,13 +1721,18 @@ write_batch_exports() {
     local out="$1"
     local name
     for name in \
-        MMSEQS THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS ROUND0_CHUNK_MAX_BYTES ROUND0_CHUNK_MAX_SEQS \
+        MMSEQS ROUND0_MMSEQS THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS ROUND0_CHUNK_MAX_BYTES ROUND0_CHUNK_MAX_SEQS \
         S3_CHUNK_PREFIX COMPRESS_BATCH_OUTPUTS \
         CREATEDB_PAR CLUSTER_CMD CLUSTER_COV_MODE CLUSTER_PAR ROUND0_CLUSTER_PAR CREATETSV_PAR SORT_TMP \
         MAX_ROUNDS MIN_REDUCTION_RATIO CONVERGENCE_PATIENCE MIN_REDUCTION_COUNT \
-        MAX_CHUNK_ATTEMPTS COMPRESS_RATIO MERGE_BUCKETS BATCH_BACKEND REMOVE_TMP \
-        NODE_WORK_DIR ROUND0_NODE_WORK_DIR BATCH_SLURM_NODELIST ROUND0_SLURM_NODELIST BATCH_SLURM_PARTITION BATCH_SLURM_TIME \
-        BATCH_SLURM_MEM BATCH_SLURM_EXTRA SORT_BUFFER_SIZE
+        MAX_CHUNK_ATTEMPTS COMPRESS_RATIO MERGE_BUCKETS MERGE_BUCKET_JOBS BATCH_BACKEND REMOVE_TMP \
+        NODE_WORK_DIR ROUND0_NODE_WORK_DIR BATCH_SLURM_NODELIST ROUND0_BATCH_SLURM_NODELIST \
+        BATCH_SLURM_PARTITION ROUND0_BATCH_SLURM_PARTITION BATCH_SLURM_TIME ROUND0_BATCH_SLURM_TIME \
+        BATCH_SLURM_MEM ROUND0_BATCH_SLURM_MEM BATCH_SLURM_EXTRA ROUND0_BATCH_SLURM_EXTRA SORT_BUFFER_SIZE \
+        BATCH_AWS_JOB_QUEUE BATCH_AWS_JOB_DEFINITION ROUND0_BATCH_AWS_JOB_QUEUE ROUND0_BATCH_AWS_JOB_DEFINITION \
+        BATCH_AWS_MACHINE ROUND0_BATCH_AWS_MACHINE BATCH_AWS_MACHINE_TAG_KEY BATCH_AWS_SCRIPT_URI \
+        BATCH_AWS_JOB_PREFIX BATCH_AWS_LOCAL_DIR BATCH_AWS_MMSEQS ROUND0_BATCH_AWS_MMSEQS \
+        BATCH_AWS_TIMEOUT BATCH_AWS_WORKER_ATTEMPTS BATCH_AWS_DRY_RUN AWS_RETRY_MODE AWS_MAX_ATTEMPTS
     do
         write_shell_export "$out" "$name" "${!name:-}"
     done
@@ -1525,17 +1751,24 @@ write_slurm_wrapper() {
     chmod +x "$wrapper"
 }
 
-# Submit one job pinned to a single host. submit_slurm_job <job_name> <log_dir> <wrapper> <node>
+# Submit one job pinned to a single host. submit_slurm_job <job_name> <log_dir> <wrapper> <node> <round> [depends]
 # (pin to one node, never the whole nodelist, or --nodes 1 would grab every listed host).
 submit_slurm_job() {
     local job_name="$1"
     local log_dir="$2"
     local wrapper="$3"
     local node="$4"
-    local depends_on="${5:-}"
+    local round="$5"
+    local depends_on="${6:-}"
 
     need_cmd sbatch
     mkdir -p "$log_dir"
+
+    local slurm_partition slurm_time slurm_mem slurm_extra
+    slurm_partition=$(round_slurm_partition "$round")
+    slurm_time=$(round_slurm_time "$round")
+    slurm_mem=$(round_slurm_mem "$round")
+    slurm_extra=$(round_slurm_extra "$round")
 
     local -a cmd=(
         sbatch
@@ -1551,12 +1784,12 @@ submit_slurm_job() {
     # afterany (not afterok): the dependent runs even if a predecessor failed, so the merge/driver
     # can reconcile and retry -- the same self-healing the AWS backend relies on.
     [[ -n "$depends_on" ]] && cmd+=(--dependency "afterany:${depends_on}" --kill-on-invalid-dep=yes)
-    [[ -n "$BATCH_SLURM_PARTITION" ]] && cmd+=(--partition "$BATCH_SLURM_PARTITION")
-    [[ -n "$BATCH_SLURM_TIME" ]] && cmd+=(--time "$BATCH_SLURM_TIME")
-    [[ -n "$BATCH_SLURM_MEM" ]] && cmd+=(--mem "$BATCH_SLURM_MEM")
-    if [[ -n "$BATCH_SLURM_EXTRA" ]]; then
+    [[ -n "$slurm_partition" ]] && cmd+=(--partition "$slurm_partition")
+    [[ -n "$slurm_time" ]] && cmd+=(--time "$slurm_time")
+    [[ -n "$slurm_mem" ]] && cmd+=(--mem "$slurm_mem")
+    if [[ -n "$slurm_extra" ]]; then
         local -a extra
-        read -r -a extra <<< "$BATCH_SLURM_EXTRA"
+        read -r -a extra <<< "$slurm_extra"
         cmd+=("${extra[@]}")
     fi
     cmd+=("$wrapper")
@@ -1598,13 +1831,158 @@ slurm_worker() {
     done < "$chunk_manifest"
 }
 
+aws_resolve_batch_resource_by_tag() {
+    local kind="$1"
+    local tag_key="$2"
+    local tag_value="$3"
+    # Resolve the AWS Batch job queue / job definition tagged tag_key=tag_value in ONE Resource Groups
+    # Tagging API call (tags ARE the query -- no per-resource ListTags N+1 scan, and no throttle that
+    # could mask an ambiguous match). An API error is FATAL (no `|| true`): the caller's $(...) then
+    # fails under set -e instead of silently mis-resolving. Prints the single match to stdout; none /
+    # multiple / bad-kind -> stderr + non-zero. IAM: tag:GetResources (+ batch:DescribeJobQueues for
+    # the queue ENABLED/VALID check). bash-3.2 safe: no associative arrays (awk does the reduction).
+    local label rtype arns matches
+    case "$kind" in
+        queue)          label="job queue";      rtype="batch:job-queue" ;;
+        job-definition) label="job definition"; rtype="batch:job-definition" ;;
+        *) printf 'unsupported AWS Batch resource kind: %s\n' "$kind" >&2; return 2 ;;
+    esac
+
+    arns=$(aws resourcegroupstaggingapi get-resources \
+        --resource-type-filters "$rtype" \
+        --tag-filters "Key=${tag_key},Values=${tag_value}" \
+        --query 'ResourceTagMappingList[].ResourceARN' --output text) || return 1
+    arns=$(printf '%s' "$arns" | tr '[:space:]' '\n' | sed '/^$/d')
+
+    if [[ "$kind" == "queue" ]]; then
+        # ARNs are .../job-queue/NAME; keep only ENABLED+VALID queues (never route to a disabled one)
+        if [[ -n "$arns" ]]; then
+            # shellcheck disable=SC2086  # $arns is a space-separated list of ARNs -- intentional split
+            matches=$(aws batch describe-job-queues --job-queues $arns \
+                --query 'jobQueues[?state==`ENABLED`&&status==`VALID`].jobQueueName' \
+                --output text) || return 1
+            matches=$(printf '%s' "$matches" | tr '[:space:]' '\n' | sed '/^$/d')
+        else
+            matches=""
+        fi
+    else
+        # ARNs are .../job-definition/NAME:REVISION; keep the max revision per name
+        matches=$(printf '%s\n' "$arns" | sed 's#.*/##' \
+            | awk -F: 'NF==2 { if ($2+0 > m[$1]+0) m[$1]=$2 } END { for (k in m) print k ":" m[k] }')
+    fi
+
+    matches=$(printf '%s\n' "$matches" | LC_ALL=C sort -u | sed '/^$/d')
+    local count
+    count=$(printf '%s' "$matches" | grep -c . || true)
+    if [[ "$count" -eq 1 ]]; then
+        printf '%s' "$matches"
+        return 0
+    fi
+    if [[ "$count" -eq 0 ]]; then
+        if [[ "$kind" == "queue" && -n "$arns" ]]; then
+            printf 'AWS Batch job queue(s) tagged %s=%s exist but none are ENABLED/VALID\n' "$tag_key" "$tag_value" >&2
+        else
+            printf 'no AWS Batch %s tagged %s=%s\n' "$label" "$tag_key" "$tag_value" >&2
+        fi
+        return 1
+    fi
+    printf 'multiple AWS Batch %ss tagged %s=%s: %s\n' \
+        "$label" "$tag_key" "$tag_value" "$(printf '%s' "$matches" | tr '\n' ' ')" >&2
+    return 1
+}
+
+aws_resolve_machine_env() {
+    local tag_key="${BATCH_AWS_MACHINE_TAG_KEY:-mmseqs:machine}"
+    local needs_lookup=0
+    if [[ -n "${BATCH_AWS_MACHINE:-}" ]]; then
+        [[ -n "${BATCH_AWS_JOB_QUEUE:-}" && -n "${BATCH_AWS_JOB_DEFINITION:-}" ]] || needs_lookup=1
+    fi
+    if [[ -n "${ROUND0_BATCH_AWS_MACHINE:-}" ]]; then
+        [[ -n "${ROUND0_BATCH_AWS_JOB_QUEUE:-}" && -n "${ROUND0_BATCH_AWS_JOB_DEFINITION:-}" ]] || needs_lookup=1
+    fi
+    if [[ "$needs_lookup" -eq 1 ]]; then
+        need_cmd aws
+    fi
+
+    if [[ -n "${BATCH_AWS_MACHINE:-}" ]]; then
+        if [[ -z "${BATCH_AWS_JOB_QUEUE:-}" ]]; then
+            BATCH_AWS_JOB_QUEUE=$(aws_resolve_batch_resource_by_tag queue "$tag_key" "$BATCH_AWS_MACHINE")
+            log "aws-resolve: resolved --aws-machine ${BATCH_AWS_MACHINE} to queue ${BATCH_AWS_JOB_QUEUE}"
+        fi
+        if [[ -z "${BATCH_AWS_JOB_DEFINITION:-}" ]]; then
+            BATCH_AWS_JOB_DEFINITION=$(aws_resolve_batch_resource_by_tag job-definition "$tag_key" "$BATCH_AWS_MACHINE")
+            log "aws-resolve: resolved --aws-machine ${BATCH_AWS_MACHINE} to job definition ${BATCH_AWS_JOB_DEFINITION}"
+        fi
+    fi
+
+    if [[ -n "${ROUND0_BATCH_AWS_MACHINE:-}" ]]; then
+        if [[ -z "${ROUND0_BATCH_AWS_JOB_QUEUE:-}" ]]; then
+            ROUND0_BATCH_AWS_JOB_QUEUE=$(aws_resolve_batch_resource_by_tag queue "$tag_key" "$ROUND0_BATCH_AWS_MACHINE")
+            log "aws-resolve: resolved --round0-aws-machine ${ROUND0_BATCH_AWS_MACHINE} to queue ${ROUND0_BATCH_AWS_JOB_QUEUE}"
+        fi
+        if [[ -z "${ROUND0_BATCH_AWS_JOB_DEFINITION:-}" ]]; then
+            ROUND0_BATCH_AWS_JOB_DEFINITION=$(aws_resolve_batch_resource_by_tag job-definition "$tag_key" "$ROUND0_BATCH_AWS_MACHINE")
+            log "aws-resolve: resolved --round0-aws-machine ${ROUND0_BATCH_AWS_MACHINE} to job definition ${ROUND0_BATCH_AWS_JOB_DEFINITION}"
+        fi
+    fi
+
+    export BATCH_AWS_MACHINE ROUND0_BATCH_AWS_MACHINE BATCH_AWS_MACHINE_TAG_KEY
+    export BATCH_AWS_JOB_QUEUE BATCH_AWS_JOB_DEFINITION
+    export ROUND0_BATCH_AWS_JOB_QUEUE ROUND0_BATCH_AWS_JOB_DEFINITION
+}
+
 aws_require_submit_env() {
-    [[ -n "${AWS_BATCH_JOB_QUEUE:-}" ]] || fail "AWS_BATCH_JOB_QUEUE is required for AWS Batch mode"
-    [[ -n "${AWS_BATCH_JOB_DEFINITION:-}" ]] || fail "AWS_BATCH_JOB_DEFINITION is required for AWS Batch mode"
-    need_cmd python3
+    aws_resolve_machine_env
+    [[ -n "${BATCH_AWS_JOB_QUEUE:-}" ]] || fail "BATCH_AWS_JOB_QUEUE is required for AWS Batch mode (or pass --aws-machine to resolve it by tag)"
+    [[ -n "${BATCH_AWS_JOB_DEFINITION:-}" ]] || fail "BATCH_AWS_JOB_DEFINITION is required for AWS Batch mode (or pass --aws-machine to resolve it by tag)"
+    if [[ -n "${BATCH_AWS_WORKER_ATTEMPTS:-}" ]]; then
+        [[ "$BATCH_AWS_WORKER_ATTEMPTS" =~ ^([1-9]|10)$ ]] || fail "BATCH_AWS_WORKER_ATTEMPTS must be 1-10 (got '$BATCH_AWS_WORKER_ATTEMPTS')"
+    fi
     if [[ -z "${BATCH_AWS_DRY_RUN:-}" ]]; then
         need_cmd aws
     fi
+    # Let the aws CLI itself retry throttled API calls (SubmitJob is rate-limited, and a chain fans out
+    # submit-job + s3 cp across many containers). Adaptive retry avoids a half-built chain from a single
+    # throttle under set -e. Exported (and forwarded via the names list) so the containers inherit it.
+    export AWS_RETRY_MODE="${AWS_RETRY_MODE:-adaptive}"
+    export AWS_MAX_ATTEMPTS="${AWS_MAX_ATTEMPTS:-10}"
+}
+
+# Round0-specific AWS Batch queue/definition (multi-machine plan: e.g. x2gd round0 / i4i round1+).
+# The QUEUE selects the compute environment (instance type); the DEFINITION selects the container
+# image (and thus the architecture, ARM vs x86). Empty ROUND0_* => base queue/definition for all
+# rounds. Round1+ always uses the base BATCH_AWS_JOB_QUEUE / BATCH_AWS_JOB_DEFINITION.
+aws_queue_for_round() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_BATCH_AWS_JOB_QUEUE:-}" ]]; then
+        printf '%s' "$ROUND0_BATCH_AWS_JOB_QUEUE"
+    else
+        printf '%s' "$BATCH_AWS_JOB_QUEUE"
+    fi
+}
+
+# else-branch derefs the base vars without :- ; safe because aws_require_submit_env (which asserts
+# they are set) always runs before aws_submit_batch_job builds the command.
+aws_definition_for_round() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_BATCH_AWS_JOB_DEFINITION:-}" ]]; then
+        printf '%s' "$ROUND0_BATCH_AWS_JOB_DEFINITION"
+    else
+        printf '%s' "$BATCH_AWS_JOB_DEFINITION"
+    fi
+}
+
+# Mirror of SLURM's `rm -rf "$work_dir"/round*` on a final result: drop the S3 work prefix (chunks,
+# per-round clustered/tsv/rep/metrics, propagated shards, the uploaded script). The final result lives
+# under result_prefix and a re-run short-circuits via ${result_prefix}final.done, so this is safe.
+# Guarded by REMOVE_TMP; non-fatal (the result is already written). Only called on a FINAL result.
+aws_cleanup_work_prefix() {
+    local work_prefix="$1"
+    [[ -n "${REMOVE_TMP:-}" ]] || return 0
+    is_s3 "$work_prefix" || return 0
+    need_cmd aws
+    log "aws-merge: removing S3 work prefix $work_prefix (REMOVE_TMP set)"
+    aws s3 rm --recursive "$work_prefix" >/dev/null 2>&1 || log "aws-merge: warning: cleanup of $work_prefix failed (non-fatal; result is already written)"
 }
 
 shell_join() {
@@ -1620,65 +1998,24 @@ shell_join() {
 aws_bootstrap_command() {
     local script_uri="$1"
     shift
+    # The run config lives next to the script; each container downloads and sources it (%q-quoted
+    # `export` lines from write_batch_exports) instead of receiving ~40 vars via container-overrides.
+    local config_uri="${script_uri%/*}/config.env"
     local args
     args=$(shell_join "$@")
-    printf 'aws s3 cp %q /tmp/mmseqs-batch.sh --no-progress && chmod +x /tmp/mmseqs-batch.sh && /tmp/mmseqs-batch.sh %s' "$script_uri" "$args"
+    printf 'aws s3 cp %q /tmp/mmseqs-batch.sh --no-progress && aws s3 cp %q /tmp/mmseqs-batch.env --no-progress && chmod +x /tmp/mmseqs-batch.sh && . /tmp/mmseqs-batch.env && /tmp/mmseqs-batch.sh %s' "$script_uri" "$config_uri" "$args"
 }
 
 aws_container_overrides() {
     local bootstrap="$1"
-    BATCH_AWS_BOOTSTRAP="$bootstrap" python3 - <<'PY'
-import json
-import os
-
-names = [
-    "MMSEQS",
-    "THREADS",
-    "CHUNK_MAX_BYTES",
-    "CHUNK_MAX_SEQS",
-    "ROUND0_CHUNK_MAX_BYTES",
-    "ROUND0_CHUNK_MAX_SEQS",
-    "COMPRESS_BATCH_OUTPUTS",
-    "CREATEDB_PAR",
-    "CLUSTER_CMD",
-    "CLUSTER_COV_MODE",
-    "CLUSTER_PAR",
-    "ROUND0_CLUSTER_PAR",
-    "CREATETSV_PAR",
-    "SORT_TMP",
-    "SORT_BUFFER_SIZE",
-    "MAX_ROUNDS",
-    "MIN_REDUCTION_RATIO",
-    "CONVERGENCE_PATIENCE",
-    "MIN_REDUCTION_COUNT",
-    "MAX_CHUNK_ATTEMPTS",
-    "COMPRESS_RATIO",
-    "MERGE_BUCKETS",
-    "BATCH_BACKEND",
-    "REMOVE_TMP",
-    "NODE_WORK_DIR",
-    "ROUND0_NODE_WORK_DIR",
-    "ROUND0_SLURM_NODELIST",
-    "AWS_BATCH_JOB_QUEUE",
-    "AWS_BATCH_JOB_DEFINITION",
-    "BATCH_AWS_SCRIPT_URI",
-    "BATCH_AWS_JOB_PREFIX",
-    "BATCH_AWS_LOCAL_DIR",
-    "BATCH_AWS_MMSEQS",
-    "BATCH_AWS_TIMEOUT",
-    "BATCH_AWS_DRY_RUN",
-]
-
-env = []
-for name in names:
-    if name in os.environ:
-        env.append({"name": name, "value": os.environ[name]})
-
-print(json.dumps({
-    "command": ["bash", "-lc", os.environ["BATCH_AWS_BOOTSTRAP"]],
-    "environment": env,
-}, separators=(",", ":")))
-PY
+    # containerOverrides carries ONLY the command; every config var is sourced from config.env inside
+    # the container (see aws_bootstrap_command + write_batch_exports), so there is no per-value JSON
+    # escaping and no reserved-name hazard. The bootstrap is a single line, so escaping \ and " (via
+    # bash parameter expansion -- deterministic across shells, unlike awk gsub) yields valid JSON.
+    local esc="$bootstrap"
+    esc="${esc//\\/\\\\}"
+    esc="${esc//\"/\\\"}"
+    printf '{"command":["bash","-lc","%s"]}' "$esc"
 }
 
 aws_submit_batch_job() {
@@ -1688,6 +2025,11 @@ aws_submit_batch_job() {
     local depends_on="$3"
     local script_uri="$4"
     shift 4
+    local subcommand="${1:-}"   # first script arg = aws-driver | aws-worker | aws-merge
+    # The target round is ALWAYS the last script arg -- aws-driver/worker/merge all end with <round>.
+    # It picks the round-specific queue/definition. Default to round1 (base queue) if not numeric.
+    local target_round="${@: -1}"
+    [[ "$target_round" =~ ^[0-9]+$ ]] || target_round=1
 
     aws_require_submit_env
 
@@ -1699,8 +2041,8 @@ aws_submit_batch_job() {
     local cmd=(
         aws batch submit-job
         --job-name "$job_name"
-        --job-queue "$AWS_BATCH_JOB_QUEUE"
-        --job-definition "$AWS_BATCH_JOB_DEFINITION"
+        --job-queue "$(aws_queue_for_round "$target_round")"
+        --job-definition "$(aws_definition_for_round "$target_round")"
         --container-overrides "$overrides"
         --timeout "attemptDurationSeconds=${timeout}"
         --query jobId
@@ -1713,6 +2055,24 @@ aws_submit_batch_job() {
         cmd+=(--depends-on "jobId=${depends_on}")
     fi
 
+    # Worker arrays get an AWS-native retry so an infra kill (spot reclaim / OOM / attempt timeout)
+    # that exits a child non-zero is retried on a fresh instance -- the array then still reaches
+    # SUCCEEDED, so the merge dependency fires and reconciles. This is the closest AWS Batch has to
+    # SLURM's `afterany`. Application failures already exit 0 (reconciled by the merge), so they never
+    # consume a retry. Only workers get this: retrying a driver/merge would double-submit its
+    # downstream jobs. A chunk that hard-kills on every attempt still fails the array (there is no
+    # native afterany); fully closing that residual gap would require an EventBridge trigger.
+    #
+    # This is a SEPARATE layer from MAX_CHUNK_ATTEMPTS (the merge-level reconcile that re-drives
+    # missing chunks): BATCH_AWS_WORKER_ATTEMPTS is per-container infra placement, MAX_CHUNK_ATTEMPTS
+    # is logical clustering attempts. They compound, so a chunk can run up to attempts x
+    # MAX_CHUNK_ATTEMPTS times, and each attempt gets its own attemptDurationSeconds (a hung chunk
+    # burns attempts x BATCH_AWS_TIMEOUT before the merge reconciles). Keep both small (default 2).
+    if [[ "$subcommand" == "aws-worker" ]]; then
+        local worker_attempts="${BATCH_AWS_WORKER_ATTEMPTS:-2}"   # value already validated in aws_require_submit_env
+        cmd+=(--retry-strategy "attempts=${worker_attempts}")
+    fi
+
     if [[ -n "${BATCH_AWS_DRY_RUN:-}" ]]; then
         printf 'DRY-RUN:' >&2
         printf ' %q' "${cmd[@]}" >&2
@@ -1722,6 +2082,38 @@ aws_submit_batch_job() {
     fi
 
     "${cmd[@]}"
+}
+
+# Idempotent submit: record the submitted job id at marker_uri and, if that marker already exists,
+# ADOPT the recorded id instead of submitting again. This makes re-invoking a driver/merge (a manual
+# recovery of a stalled chain, or an EventBridge rule you add) safe -- it cannot fork a second chain or
+# a duplicate downstream job. The marker write is best-effort (non-fatal): if it fails the job is still
+# submitted, we just lose the dedup guarantee for that one step (the pre-marker behavior). Note we do
+# NOT give drivers/merges AWS-native `--retry-strategy attempts>1`: a retried MERGE would re-read the
+# incremented chunk_attempts counter and could dead-letter prematurely, so unattended auto-recovery
+# still needs an external (EventBridge) trigger -- but that trigger is now safe because of this marker.
+aws_submit_batch_job_once() {
+    local marker_uri="$1"; shift
+    if done_exists "$marker_uri"; then
+        local existing
+        existing=$(stream_uri "$marker_uri" | awk 'NR == 1 { print $1; exit }')
+        if [[ -n "$existing" ]]; then
+            log "adopting already-submitted job ${existing} (${marker_uri})"
+            printf '%s\n' "$existing"
+            return 0
+        fi
+    fi
+    local jid
+    jid=$(aws_submit_batch_job "$@") || return 1
+    if [[ -z "${BATCH_AWS_DRY_RUN:-}" ]]; then
+        local marker_local
+        marker_local=$(mktemp)
+        printf '%s\n' "$jid" > "$marker_local"
+        copy_out "$marker_local" "$marker_uri" 2>/dev/null \
+            || log "warning: could not write submit marker ${marker_uri} (a re-invocation could double-submit this step)"
+        rm -f "$marker_local"
+    fi
+    printf '%s\n' "$jid"
 }
 
 aws_round_prefix() {
@@ -1755,6 +2147,32 @@ aws_submit() {
     fi
     aws_require_submit_env
 
+    # Round0 machine override is a pair: queue (instance type) + definition (container image = arch).
+    # Setting only one is almost always a mistake -- e.g. round0 on an ARM queue with the base x86
+    # image gives "exec format error" only after the instance provisions. Warn, don't fail (a same-arch
+    # different-instance-type setup legitimately sets only the queue).
+    if [[ -n "${ROUND0_BATCH_AWS_JOB_QUEUE:-}" && -z "${ROUND0_BATCH_AWS_JOB_DEFINITION:-}" ]]; then
+        log "warning: ROUND0_BATCH_AWS_JOB_QUEUE set without ROUND0_BATCH_AWS_JOB_DEFINITION; round0 runs the BASE container image on the round0 queue (arch mismatch if the queue is a different CPU arch)"
+    fi
+    if [[ -z "${ROUND0_BATCH_AWS_JOB_QUEUE:-}" && -n "${ROUND0_BATCH_AWS_JOB_DEFINITION:-}" ]]; then
+        log "warning: ROUND0_BATCH_AWS_JOB_DEFINITION set without ROUND0_BATCH_AWS_JOB_QUEUE; round0 runs the round0 image on the BASE queue"
+    fi
+
+    # Workers run in separate containers with no view of the submit host's filesystem, so every FASTA
+    # path in the manifest must be reachable from a worker -- i.e. s3:// (or a shared mount visible to
+    # every worker, e.g. EFS, opted in via BATCH_AWS_ALLOW_NONS3_INPUT=1). Validate at submit so a bad
+    # path fails now, not after every worker dies hours later on an unreadable local path.
+    # (BATCH_AWS_ALLOW_NONS3_INPUT is used only here on the submit host; it is deliberately NOT written
+    # into config.env, so workers never re-validate.)
+    if [[ "${BATCH_AWS_ALLOW_NONS3_INPUT:-0}" != "1" ]]; then
+        local nons3_paths
+        nons3_paths=$(stream_manifest "$input_manifest" | awk 'NF && $1 !~ /^#/ && $1 !~ /^s3:\/\// { if (++n <= 5) print $1 }')
+        if [[ -n "$nons3_paths" ]]; then
+            log "aws-submit: input manifest has non-s3:// FASTA path(s) worker containers cannot read: $(printf '%s' "$nons3_paths" | tr '\n' ' ')"
+            fail "aws-batch input manifest must use s3:// paths (or set BATCH_AWS_ALLOW_NONS3_INPUT=1 for a shared mount visible to every worker)"
+        fi
+    fi
+
     local script_uri="${BATCH_AWS_SCRIPT_URI:-${work_prefix}scripts/batch_clustering.sh}"
     if [[ -n "${BATCH_AWS_DRY_RUN:-}" ]]; then
         log "dry-run: would upload $0 to $script_uri"
@@ -1762,7 +2180,28 @@ aws_submit() {
         copy_out "$0" "$script_uri"
     fi
     export BATCH_AWS_SCRIPT_URI="$script_uri"
+    # In the container the mmseqs binary comes from the image, not the submit host's PATH.
     export MMSEQS="${BATCH_AWS_MMSEQS:-mmseqs}"
+    export ROUND0_MMSEQS="${ROUND0_BATCH_AWS_MMSEQS:-}"   # round0-image binary path (not the submit host's)
+
+    # Serialize the run config to S3 as %q-quoted `export` lines; every driver/worker/merge container
+    # downloads and sources it (write_batch_exports -- shared with the SLURM wrapper, the single source
+    # of truth for the config var list). This replaces forwarding ~40 vars through the submit-job
+    # container-overrides JSON: overrides now carry only the command, so there is no per-value JSON
+    # escaping, no reserved-name hazard, and no 8 KiB override ceiling. The config also lands in S3
+    # beside the run, which is what the reproducibility requirement actually wants.
+    local config_uri="${script_uri%/*}/config.env"
+    if [[ -n "${BATCH_AWS_DRY_RUN:-}" ]]; then
+        log "dry-run: would upload run config to $config_uri"
+    else
+        local config_local
+        config_local=$(mktemp)
+        printf 'export LC_ALL=C\n' > "$config_local"
+        write_batch_exports "$config_local"
+        copy_out "$config_local" "$config_uri"
+        rm -f "$config_local"
+        log "uploaded run config to $config_uri"
+    fi
 
     local remote_manifest="$input_manifest"
     if ! is_s3 "$input_manifest"; then
@@ -1773,7 +2212,6 @@ aws_submit() {
             copy_out "$input_manifest" "$remote_manifest"
             log "uploaded local input manifest to $remote_manifest"
         fi
-        log "manifest entries must be readable by AWS workers, typically s3:// FASTA paths"
     fi
 
     local job_prefix="${BATCH_AWS_JOB_PREFIX:-mmseqs-batch}"
@@ -1836,11 +2274,11 @@ aws_driver() {
     local job_prefix="${BATCH_AWS_JOB_PREFIX:-mmseqs-batch}"
     local clustered_prefix worker_job merge_job
     clustered_prefix=$(aws_clustered_prefix "$work_prefix" "$round")
-    worker_job=$(aws_submit_batch_job "${job_prefix}-worker-r${round}" "$chunk_count" "" "$script_uri" \
+    worker_job=$(aws_submit_batch_job_once "$(join_uri "$round_prefix" "submitted_workers.txt")" "${job_prefix}-worker-r${round}" "$chunk_count" "" "$script_uri" \
         aws-worker "$chunk_manifest_s3" "$clustered_prefix" "$round")
     log "aws-driver round ${round}: submitted worker array $worker_job (${chunk_count} chunks)"
 
-    merge_job=$(aws_submit_batch_job "${job_prefix}-merge-r${round}" 1 "$worker_job" "$script_uri" \
+    merge_job=$(aws_submit_batch_job_once "$(join_uri "$round_prefix" "submitted_merge.txt")" "${job_prefix}-merge-r${round}" 1 "$worker_job" "$script_uri" \
         aws-merge "$input_manifest" "$work_prefix" "$result_prefix" "$round")
     log "aws-driver round ${round}: submitted merge job $merge_job depending on $worker_job"
 
@@ -1861,11 +2299,24 @@ aws_worker() {
     rm -rf "$local_root"
     mkdir -p "$local_root"
 
+    # A worker must NEVER fail its array child: the merge's dependsOn fires only when the array reaches
+    # SUCCEEDED, and reconcile/retry is driven by the chunk's done-marker (not the child exit code).
+    # copy_in / manifest parsing / fail() run under `set -e`, so a transient S3 error would otherwise
+    # fail the child -> array FAILED -> merge never runs -> chain dies silently. Force exit 0 on ANY
+    # exit (an untrappable SIGKILL from spot/OOM still exits non-zero -> the --retry-strategy handles
+    # that at the AWS level).
+    AWS_WORKER_LOCAL_ROOT="$local_root"
+    trap 'rc=$?; [[ "$rc" -eq 0 ]] || log "aws-worker soft-fail (rc=$rc): left no done-marker; merge reconcile will retry/dead-letter"; [[ -n "${REMOVE_TMP:-}" ]] && rm -rf "${AWS_WORKER_LOCAL_ROOT:-}"; exit 0' EXIT
+
     local manifest_local="$local_root/chunks.tsv"
     copy_in "$chunk_manifest_s3" "$manifest_local"
 
     local line chunk_id chunk_uri seqs bytes
-    line=$(sed -n "$((index + 1))p" "$manifest_local")
+    # Select the (index+1)-th DATA row with the SAME predicate count_manifest_rows uses to size the
+    # array (skip blank / '#'-comment lines), so row selection and array sizing can never disagree; a
+    # plain `sed -n Np` on the physical line would silently shift every worker onto the wrong chunk if
+    # a comment/blank line ever appeared in chunks.tsv.
+    line=$(awk -v want="$((index + 1))" 'NF && $1 !~ /^#/ { if (++c == want) { print; exit } }' "$manifest_local")
     [[ -n "$line" ]] || fail "array index $index not present in $chunk_manifest_s3"
     IFS=$'\t' read -r chunk_id chunk_uri seqs bytes <<< "$line"
     [[ -n "$chunk_id" && -n "$chunk_uri" ]] || fail "malformed chunk manifest line for array index $index: $line"
@@ -1880,11 +2331,7 @@ aws_worker() {
     if [[ "$chunk_rc" -ne 0 ]]; then
         log "aws-worker round ${round} index ${index}: chunk ${chunk_id} FAILED (rc=${chunk_rc}); left no done-marker for the merge reconcile to retry/dead-letter"
     fi
-
-    if [[ -n "${REMOVE_TMP:-}" ]]; then
-        rm -rf "$local_root"
-    fi
-    exit 0
+    # cleanup + exit 0 are handled by the EXIT trap above (so they also run on an early set -e failure).
 }
 
 aws_merge() {
@@ -1906,7 +2353,12 @@ aws_merge() {
     rm -rf "$local_root"
     mkdir -p "$local_root"
     # aws-merge has several early returns (retry, round-0, converged); scrub scratch on any exit.
-    [[ -n "${REMOVE_TMP:-}" ]] && trap 'rm -rf "$local_root"' EXIT
+    # The trap fires AFTER aws_merge returns, when the local $local_root is out of scope -- under
+    # `set -u` that would abort the trap and make the whole merge process exit non-zero (AWS Batch
+    # then marks every merge, including the final one, FAILED). Pass the path via a global, mirroring
+    # cluster_chunk's CLUSTER_CHUNK_WORKDIR.
+    AWS_MERGE_LOCAL_ROOT="$local_root"
+    [[ -n "${REMOVE_TMP:-}" ]] && trap 'rm -rf "${AWS_MERGE_LOCAL_ROOT:-}"' EXIT
 
     local round_prefix clustered_prefix chunk_manifest_s3 tsv_manifest rep_manifest metrics_manifest
     round_prefix=$(aws_round_prefix "$work_prefix" "$round")
@@ -1957,32 +2409,47 @@ aws_merge() {
         copy_out "$attempt_local" "$attempt_uri"
         copy_out "$missing_file" "$(join_uri "$round_prefix" "missing_chunks_attempt${attempts}.txt")"
 
+        # Retry ONLY the missing chunks: submit an array of size n_missing over a manifest of just the
+        # missing rows, not size=chunk_count over the full manifest (which would boot chunk_count
+        # containers -- e.g. 10000 for 3 stragglers -- each only to skip its already-done chunk).
+        local missing_manifest_local missing_manifest_s3
+        missing_manifest_local="$local_root/missing_chunks.manifest.tsv"
+        awk -F'\t' 'NR==FNR { want[$1]=1; next } ($1 in want)' "$missing_file" "$chunk_manifest_local" > "$missing_manifest_local"
+        missing_manifest_s3=$(join_uri "$round_prefix" "missing_chunks_attempt${attempts}.manifest.tsv")
+        copy_out "$missing_manifest_local" "$missing_manifest_s3"
+
         job_prefix="${BATCH_AWS_JOB_PREFIX:-mmseqs-batch}"
-        retry_job=$(aws_submit_batch_job "${job_prefix}-worker-r${round}-retry${attempts}" "$chunk_count" "" "$script_uri" \
-            aws-worker "$chunk_manifest_s3" "$clustered_prefix" "$round")
+        # NOTE: these two are NOT wrapped in aws_submit_batch_job_once. The retry counter is a
+        # read-modify-write on S3, so a re-invoked merge cannot be made idempotent by a marker keyed on
+        # it (it would re-read the bumped counter). Re-invocation safety here would need the counter
+        # decoupled from this function; for now let a retry finish rather than re-invoking mid-retry.
+        retry_job=$(aws_submit_batch_job "${job_prefix}-worker-r${round}-retry${attempts}" "$n_missing" "" "$script_uri" \
+            aws-worker "$missing_manifest_s3" "$clustered_prefix" "$round")
         retry_merge=$(aws_submit_batch_job "${job_prefix}-merge-r${round}-retry${attempts}" 1 "$retry_job" "$script_uri" \
             aws-merge "$input_manifest" "$work_prefix" "$result_prefix" "$round")
-        log "aws-merge round ${round}: ${n_missing}/${chunk_count} chunk(s) missing; submitted retry worker $retry_job and merge $retry_merge"
+        log "aws-merge round ${round}: ${n_missing}/${chunk_count} chunk(s) missing; retrying only those (array size ${n_missing}); worker $retry_job merge $retry_merge"
         return 0
     fi
 
     # All chunks complete -- build the manifests from chunk_ids (deterministic S3 URIs), never a
-    # listing, so stale objects are never ingested. (S3 metrics are remote, so the rep manifest is
-    # bare S3 paths here; the next round's prepare sizes them -- the free-size optimization is local.)
+    # listing, so stale objects are never ingested. The rep manifest is the 3-column sized form
+    # (path<TAB>bytes<TAB>seqs) built from the per-chunk metrics' EXACT rep_bytes/rep_count, so the
+    # next round's chunk boundaries do not depend on a COMPRESS_RATIO size estimate and need no S3
+    # head-object per rep; the same metrics pass also yields cur_reps (sum of the seqs column).
     make_manifest_from_chunk_ids "$chunk_manifest_local" "$(join_uri "$clustered_prefix" "tsv")" ".cluster.tsv$(batch_compression_suffix)" "$local_root/tsv_manifest.txt"
     make_manifest_from_chunk_ids "$chunk_manifest_local" "$(join_uri "$clustered_prefix" "metrics")" ".metrics.tsv" "$local_root/metrics_manifest.txt"
-    make_manifest_from_chunk_ids "$chunk_manifest_local" "$(join_uri "$clustered_prefix" "rep")" ".rep.fa$(batch_compression_suffix)" "$local_root/rep_manifest.plain.txt"
-    interleave_manifest_file "$local_root/rep_manifest.plain.txt" "$local_root/rep_manifest.txt"
+    make_rep_manifest_from_metrics "$local_root/metrics_manifest.txt" "$(join_uri "$clustered_prefix" "rep")" "$local_root/rep_manifest.txt"
     copy_out "$local_root/tsv_manifest.txt" "$tsv_manifest"
     copy_out "$local_root/rep_manifest.txt" "$rep_manifest"
     copy_out "$local_root/metrics_manifest.txt" "$metrics_manifest"
 
-    cur_reps=$(count_reps_from_metrics_manifest "$metrics_manifest")
+    cur_reps=$(awk -F'\t' '{ s += $3 } END { print s + 0 }' "$local_root/rep_manifest.txt")
     log "aws-merge round ${round}: ${cur_reps} representatives across ${chunk_count} chunk(s)"
     if [[ "$round" -eq 0 ]]; then
         if [[ "$chunk_count" -le 1 ]]; then
             log "aws-merge round 0: input fit in one chunk; finalizing"
             with_round_node_work_dir "$round" finalize_outputs "$tsv_manifest" "$rep_manifest" "$result_prefix" "$local_root/final"
+            aws_cleanup_work_prefix "$work_prefix"
             return 0
         fi
 
@@ -1992,7 +2459,7 @@ aws_merge() {
         local next_round=1
         local job_prefix="${BATCH_AWS_JOB_PREFIX:-mmseqs-batch}"
         local next_driver
-        next_driver=$(aws_submit_batch_job "${job_prefix}-driver-r${next_round}" 1 "" "$script_uri" \
+        next_driver=$(aws_submit_batch_job_once "$(join_uri "$round_prefix" "submitted_next_driver.txt")" "${job_prefix}-driver-r${next_round}" 1 "" "$script_uri" \
             aws-driver "$rep_manifest" "$work_prefix" "$result_prefix" "$next_round")
         log "aws-merge round 0: submitted next driver $next_driver"
         return 0
@@ -2009,17 +2476,23 @@ aws_merge() {
 
     # propagate emits local bucket shards; upload each to S3 so the next round's driver
     # (a separate container) can read them, and record their S3 URIs in the manifest.
-    local local_prop_manifest="$local_root/propagated_manifest.local.txt"
-    with_round_node_work_dir "$round" propagate "$child_manifest" "$parent_manifest" "$local_prop_manifest" "$local_root/propagate"
-    : > "$local_root/propagated_manifest.txt"
-    local shard s3shard
-    while IFS= read -r shard || [[ -n "${shard:-}" ]]; do
-        [[ -z "${shard:-}" || "$shard" =~ ^# ]] && continue
-        s3shard=$(join_uri "$round_prefix" "propagated/$(basename "$shard")")
-        copy_out "$shard" "$s3shard"
-        printf '%s\n' "$s3shard" >> "$local_root/propagated_manifest.txt"
-    done < "$local_prop_manifest"
-    copy_out "$local_root/propagated_manifest.txt" "$propagated_manifest"
+    # Idempotency: a re-driven merge (retry, or an infra-killed merge re-run) must not redo the whole
+    # hash-bucket join. If a previous attempt already uploaded the S3 propagated_manifest, reuse it.
+    if done_exists "$propagated_manifest"; then
+        log "aws-merge round ${round}: reusing propagated manifest $propagated_manifest"
+    else
+        local local_prop_manifest="$local_root/propagated_manifest.local.txt"
+        with_round_node_work_dir "$round" propagate "$child_manifest" "$parent_manifest" "$local_prop_manifest" "$local_root/propagate"
+        : > "$local_root/propagated_manifest.txt"
+        local shard s3shard
+        while IFS= read -r shard || [[ -n "${shard:-}" ]]; do
+            [[ -z "${shard:-}" || "$shard" =~ ^# ]] && continue
+            s3shard=$(join_uri "$round_prefix" "propagated/$(basename "$shard")")
+            copy_out "$shard" "$s3shard"
+            printf '%s\n' "$s3shard" >> "$local_root/propagated_manifest.txt"
+        done < "$local_prop_manifest"
+        copy_out "$local_root/propagated_manifest.txt" "$propagated_manifest"
+    fi
 
     prev_state="$local_root/prev_state.env"
     copy_in "$(join_uri "$(aws_round_prefix "$work_prefix" "$((round - 1))")" "state.env")" "$prev_state"
@@ -2064,6 +2537,9 @@ aws_merge() {
 
     if [[ "$converged" -eq 1 ]]; then
         with_round_node_work_dir "$round" finalize_outputs "$propagated_manifest" "$rep_manifest" "$result_prefix" "$local_root/final" "$mark_final"
+        # Only clean on a FINAL (mark_final) result; a partial MAX_ROUNDS result keeps the work prefix
+        # so a re-run with a larger --max-rounds can resume (matches slurm_merge).
+        [[ "$mark_final" -eq 1 ]] && aws_cleanup_work_prefix "$work_prefix"
         return 0
     fi
 
@@ -2073,7 +2549,7 @@ aws_merge() {
     local next_round=$((round + 1))
     local job_prefix="${BATCH_AWS_JOB_PREFIX:-mmseqs-batch}"
     local next_driver
-    next_driver=$(aws_submit_batch_job "${job_prefix}-driver-r${next_round}" 1 "" "$script_uri" \
+    next_driver=$(aws_submit_batch_job_once "$(join_uri "$round_prefix" "submitted_next_driver.txt")" "${job_prefix}-driver-r${next_round}" 1 "" "$script_uri" \
         aws-driver "$rep_manifest" "$work_prefix" "$result_prefix" "$next_round")
     log "aws-merge round ${round}: submitted next driver $next_driver"
 
@@ -2100,9 +2576,11 @@ submit_event_step() {
     mkdir -p "$slurm_dir"
     local wrapper="$slurm_dir/${job_name}.sh"
     write_slurm_wrapper "$wrapper" "$@"
+    local target_round="${@: -1}"
+    [[ "$target_round" =~ ^[0-9]+$ ]] || target_round=1
     local jid rc
     set +e
-    jid=$(submit_slurm_job "$job_name" "$slurm_dir" "$wrapper" "$pin_node" "$depends_on")
+    jid=$(submit_slurm_job "$job_name" "$slurm_dir" "$wrapper" "$pin_node" "$target_round" "$depends_on")
     rc=$?
     set -e
     [[ "$rc" -eq 0 && -n "$jid" ]] || fail "failed to submit SLURM job ${job_name}"
@@ -2141,7 +2619,7 @@ submit_round_workers() {
         wrapper="$slurm_dir/mmseqs-${CLUSTER_CMD}-${tok}-r${round}-w${s}.sh"
         write_slurm_wrapper "$wrapper" slurm-worker "$chunk_manifest" "$clustered" "$round_dir" "$round" "$s" "$nn"
         set +e
-        jid=$(submit_slurm_job "mmseqs-${CLUSTER_CMD}-${tok}-r${round}-w${s}" "$slurm_dir" "$wrapper" "${SLURM_NODE_ARRAY[$s]}")
+        jid=$(submit_slurm_job "mmseqs-${CLUSTER_CMD}-${tok}-r${round}-w${s}" "$slurm_dir" "$wrapper" "${SLURM_NODE_ARRAY[$s]}" "$round")
         rc=$?
         set -e
         if [[ "$rc" -eq 0 && -n "$jid" ]]; then

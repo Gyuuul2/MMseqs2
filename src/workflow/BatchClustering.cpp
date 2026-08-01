@@ -44,6 +44,51 @@ void restoreRequestedThreads(Parameters &par, int requestedThreads) {
     }
 }
 
+int mergeDefaultThreads(const Parameters &par) {
+    return (par.threads > 0) ? par.threads : 1;
+}
+
+int automaticMergeBuckets(const Parameters &par) {
+    int buckets = mergeDefaultThreads(par);   // always >= 1
+    if (buckets > 256) {
+        buckets = 256;
+    }
+    return buckets;
+}
+
+int automaticMergeBucketJobs(const Parameters &par, int buckets) {
+    int jobs = mergeDefaultThreads(par) / 8;
+    if (jobs < 1) {
+        jobs = 1;
+    }
+    if (jobs > 16) {
+        jobs = 16;
+    }
+    if (jobs > buckets) {
+        jobs = buckets;
+    }
+    return jobs;
+}
+
+void resolveBatchMergeParallelism(Parameters &par) {
+    // default is 0, so "== 0" already covers "unset"; 0 means auto (explicit or defaulted)
+    const bool autoBuckets = (par.batchMergeBuckets == 0);
+    const bool autoJobs = (par.batchMergeBucketJobs == 0);
+
+    if (autoBuckets) {
+        par.batchMergeBuckets = automaticMergeBuckets(par);
+        if (autoJobs == false && par.batchMergeBuckets < par.batchMergeBucketJobs) {
+            par.batchMergeBuckets = par.batchMergeBucketJobs;
+        }
+    }
+    if (autoJobs) {
+        par.batchMergeBucketJobs = automaticMergeBucketJobs(par, par.batchMergeBuckets);
+    }
+    if (par.batchMergeBucketJobs > par.batchMergeBuckets) {
+        par.batchMergeBucketJobs = par.batchMergeBuckets;
+    }
+}
+
 void setBatchClusterDefaults(Parameters *p) {
     p->spacedKmer = true;
     p->covThr = 0.8f;
@@ -98,6 +143,29 @@ size_t getSlurmNodeCount(const Parameters &par) {
     return nodes.size();
 }
 
+bool hasSlurmParameters(const Parameters &par) {
+    return par.PARAM_BATCH_SLURM_NODELIST.wasSet ||
+           par.PARAM_BATCH_SLURM_PARTITION.wasSet ||
+           par.PARAM_BATCH_SLURM_TIME.wasSet ||
+           par.PARAM_BATCH_SLURM_MEM.wasSet ||
+           par.PARAM_BATCH_SLURM_EXTRA.wasSet ||
+           par.PARAM_BATCH_ROUND0_SLURM_NODELIST.wasSet ||
+           par.PARAM_BATCH_ROUND0_SLURM_PARTITION.wasSet ||
+           par.PARAM_BATCH_ROUND0_SLURM_TIME.wasSet ||
+           par.PARAM_BATCH_ROUND0_SLURM_MEM.wasSet ||
+           par.PARAM_BATCH_ROUND0_SLURM_EXTRA.wasSet;
+}
+
+bool hasAwsParameters(const Parameters &par) {
+    return par.PARAM_BATCH_AWS_MACHINE.wasSet ||
+           par.PARAM_BATCH_AWS_JOB_QUEUE.wasSet ||
+           par.PARAM_BATCH_AWS_JOB_DEFINITION.wasSet ||
+           par.PARAM_BATCH_ROUND0_AWS_MACHINE.wasSet ||
+           par.PARAM_BATCH_ROUND0_AWS_JOB_QUEUE.wasSet ||
+           par.PARAM_BATCH_ROUND0_AWS_JOB_DEFINITION.wasSet ||
+           par.PARAM_BATCH_AWS_MACHINE_TAG_KEY.wasSet;
+}
+
 bool isS3Uri(const std::string &path) {
     return path.compare(0, 5, "s3://") == 0;
 }
@@ -133,11 +201,17 @@ void applyBatchLinclustAutomagic(Parameters &par) {
             par.includeCountTable = true;
         }
     }
+    Util::resolveIncludeIterationPair(par.PARAM_INCLUDE_COUNTTABLE.wasSet, par.includeCountTable,
+                                par.PARAM_NUM_COUNTS.wasSet, par.countTableIteration,
+                                "--include-count-table", "--num-count-table");
 
-    if (par.PARAM_NUM_ADJACENCY.wasSet && par.adjIteration == 0 &&
-        par.PARAM_INCLUDE_ADJACENCY.wasSet == false) {
-        par.includeAdjacency = false;
+    if ((par.PARAM_INCLUDE_ADJACENCY.wasSet || par.PARAM_NUM_ADJACENCY.wasSet) == false) {
+        par.adjIteration = nonSymmetric ? Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY
+                                        : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
     }
+    Util::resolveIncludeIterationPair(par.PARAM_INCLUDE_ADJACENCY.wasSet, par.includeAdjacency,
+                                par.PARAM_NUM_ADJACENCY.wasSet, par.adjIteration,
+                                "--include-adjacency", "--num-adjacency");
 }
 
 void applyBatchClusterAutomagic(Parameters &par) {
@@ -152,12 +226,17 @@ void applyBatchClusterAutomagic(Parameters &par) {
 
     if (par.PARAM_INCLUDE_COUNTTABLE.wasSet == false) {
         par.includeCountTable = (nonSymmetric == false);
+        if (par.includeCountTable == false) {
+            par.countTableIteration = 0;
+        }
     }
+    Util::resolveIncludeIterationPair(par.PARAM_INCLUDE_COUNTTABLE.wasSet, par.includeCountTable,
+                                par.PARAM_NUM_COUNTS.wasSet, par.countTableIteration,
+                                "--include-count-table", "--num-count-table");
 
-    if (par.PARAM_NUM_ADJACENCY.wasSet && par.adjIteration == 0 &&
-        par.PARAM_INCLUDE_ADJACENCY.wasSet == false) {
-        par.includeAdjacency = false;
-    }
+    Util::resolveIncludeIterationPair(par.PARAM_INCLUDE_ADJACENCY.wasSet, par.includeAdjacency,
+                                par.PARAM_NUM_ADJACENCY.wasSet, par.adjIteration,
+                                "--include-adjacency", "--num-adjacency");
 
     if (par.PARAM_CLUSTER_STEPS.wasSet == false) {
         par.clusterSteps = batchClusterAutomaticIterations(par.sensitivity);
@@ -178,10 +257,12 @@ void validateBatchBackend(Parameters &par) {
             Debug(Debug::ERROR) << "--backend single-node requires local <resultDir> and <tmpDir>. Use --backend aws-batch for S3 paths.\n";
             EXIT(EXIT_FAILURE);
         }
-        if (par.PARAM_BATCH_SLURM_NODELIST.wasSet || par.PARAM_BATCH_SLURM_PARTITION.wasSet ||
-            par.PARAM_BATCH_SLURM_TIME.wasSet || par.PARAM_BATCH_SLURM_MEM.wasSet ||
-            par.PARAM_BATCH_SLURM_EXTRA.wasSet) {
+        if (hasSlurmParameters(par)) {
             Debug(Debug::ERROR) << "--slurm-* parameters are only valid with --backend multi-node.\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (hasAwsParameters(par)) {
+            Debug(Debug::ERROR) << "--aws-* parameters are only valid with --backend aws-batch.\n";
             EXIT(EXIT_FAILURE);
         }
         return;
@@ -190,6 +271,10 @@ void validateBatchBackend(Parameters &par) {
     if (par.batchBackend == "multi-node") {
         if (isS3Uri(par.db2) || isS3Uri(par.db3)) {
             Debug(Debug::ERROR) << "--backend multi-node requires shared local <resultDir> and <tmpDir>. Use --backend aws-batch for S3 paths.\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (hasAwsParameters(par)) {
+            Debug(Debug::ERROR) << "--aws-* parameters are only valid with --backend aws-batch.\n";
             EXIT(EXIT_FAILURE);
         }
         size_t nodeCount = getSlurmNodeCount(par);
@@ -218,9 +303,7 @@ void validateBatchBackend(Parameters &par) {
     }
 
     if (par.batchBackend == "aws-batch") {
-        if (par.PARAM_BATCH_SLURM_NODELIST.wasSet || par.PARAM_BATCH_SLURM_PARTITION.wasSet ||
-            par.PARAM_BATCH_SLURM_TIME.wasSet || par.PARAM_BATCH_SLURM_MEM.wasSet ||
-            par.PARAM_BATCH_SLURM_EXTRA.wasSet) {
+        if (hasSlurmParameters(par)) {
             Debug(Debug::ERROR) << "--slurm-* parameters are only valid with --backend multi-node.\n";
             EXIT(EXIT_FAILURE);
         }
@@ -285,45 +368,13 @@ std::string buildCreatetsvPar(const Parameters &par) {
     return "--threads " + SSTR(par.threads) + " -v " + SSTR(par.verbosity);
 }
 
-std::vector<MMseqsParameter*> innerClusterParameters(Parameters &par, const std::string &clusterCmd) {
-    std::vector<MMseqsParameter*> inner;
-    inner.push_back(&par.PARAM_C);
-    inner.push_back(&par.PARAM_COV_MODE);
-    inner.push_back(&par.PARAM_MIN_SEQ_ID);
-    inner.push_back(&par.PARAM_CLUSTER_MODE);
-    inner.push_back(&par.PARAM_KMER_PER_SEQ);
-    inner.push_back(&par.PARAM_INCLUDE_COUNTTABLE);
-    inner.push_back(&par.PARAM_NUM_COUNTS);
-    inner.push_back(&par.PARAM_INCLUDE_ADJACENCY);
-    inner.push_back(&par.PARAM_NUM_ADJACENCY);
-    inner.push_back(&par.PARAM_SWITCH_CONSENSUS_REP);
-    inner.push_back(&par.PARAM_REMOVE_TMP_FILES);
-    inner.push_back(&par.PARAM_THREADS);
-    inner.push_back(&par.PARAM_SPLIT_MEMORY_LIMIT);
-    inner.push_back(&par.PARAM_PRELOAD_MODE);
-    inner.push_back(&par.PARAM_COMPRESSED);
-    inner.push_back(&par.PARAM_V);
-
-    if (clusterCmd == "linclust") {
-        inner.push_back(&par.PARAM_COMPRESS_KMER_TMP_FILES);
-        inner.push_back(&par.PARAM_CLUST_HASH);
-        inner.push_back(&par.PARAM_LINCLUST_VERSION);
-    } else {
-        inner.push_back(&par.PARAM_CLUSTER_VERSION);
-        inner.push_back(&par.PARAM_LINCLUST_VERSION);
-        inner.push_back(&par.PARAM_CASCADED);
-        inner.push_back(&par.PARAM_CLUSTER_STEPS);
-        inner.push_back(&par.PARAM_CLUSTER_REASSIGN);
-        inner.push_back(&par.PARAM_MAX_SEQS);
-        inner.push_back(&par.PARAM_S);
-    }
-
-    return inner;
+const std::vector<MMseqsParameter*>& innerClusterParameters(Parameters &par,
+                                                           const std::string &clusterCmd) {
+    return (clusterCmd == "linclust") ? par.linclustbatchinner : par.clusterbatchinner;
 }
 
 std::string buildInnerClusterParFromCurrent(Parameters &par, const std::string &clusterCmd) {
-    std::vector<MMseqsParameter*> inner = innerClusterParameters(par, clusterCmd);
-    return par.createParameterString(inner);
+    return par.createParameterString(innerClusterParameters(par, clusterCmd));
 }
 
 std::string buildInnerClusterPar(Parameters &par, const std::string &clusterCmd) {
@@ -335,18 +386,48 @@ std::string buildInnerClusterPar(Parameters &par, const std::string &clusterCmd)
     return buildInnerClusterParFromCurrent(par, clusterCmd);
 }
 
-bool hasRound0ClusterOverride(const Parameters &par) {
-    return par.PARAM_BATCH_ROUND0_MIN_SEQ_ID.wasSet ||
-           par.PARAM_BATCH_ROUND0_C.wasSet ||
-           par.PARAM_BATCH_ROUND0_COV_MODE.wasSet ||
-           par.PARAM_BATCH_ROUND0_CLUSTER_MODE.wasSet ||
-           par.PARAM_BATCH_ROUND0_KMER_PER_SEQ.wasSet ||
-           par.PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE.wasSet ||
-           par.PARAM_BATCH_ROUND0_NUM_COUNTS.wasSet ||
-           par.PARAM_BATCH_ROUND0_NUM_ADJACENCY.wasSet ||
-           par.PARAM_BATCH_ROUND0_CLUST_HASH.wasSet ||
-           par.PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT.wasSet ||
-           par.PARAM_BATCH_ROUND0_PRELOAD_MODE.wasSet;
+void applyRound0ClusterDefaults(Parameters &par, const std::string &clusterCmd) {
+    // Round0 is a cheap redundancy-reduction pass before the heavier representative rounds.
+    // Keep it intentionally light unless the user opts into round0-specific overrides.
+    par.kmersPerSequence = 21;
+    par.includeCountTable = false;
+    par.countTableIteration = 0;
+    par.includeAdjacency = false;
+    par.adjIteration = 0;
+    if (clusterCmd == "linclust") {
+        par.clustHash = false;
+    }
+}
+
+// Resolve round0 include/iteration from EXPLICIT --round0-* flags only (ignore automagic state).
+// contradictory 1+0 or 0+>0 -> error; include-only -> default count; num-only -> derive toggle.
+void resolveRound0InclNum(bool includeSet, bool includeValue, bool numSet, int numValue,
+                          int parameterDefault, const std::string &what,
+                          bool &includeOut, int &iterationOut) {
+    if (includeSet && numSet) {
+        if (includeValue && numValue == 0) {
+            Debug(Debug::ERROR) << "--round0-include-" << what << " 1 conflicts with --round0-num-"
+                                << what << " 0. Enable with a positive count, or disable both.\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (includeValue == false && numValue > 0) {
+            Debug(Debug::ERROR) << "--round0-include-" << what << " 0 conflicts with --round0-num-"
+                                << what << " " << numValue << ". Disable with count 0, or enable both.\n";
+            EXIT(EXIT_FAILURE);
+        }
+        includeOut = includeValue;
+        iterationOut = numValue;
+        return;
+    }
+    if (includeSet) {
+        includeOut = includeValue;
+        iterationOut = includeValue ? parameterDefault : 0;
+        return;
+    }
+    if (numSet) {
+        iterationOut = numValue;
+        includeOut = (numValue > 0);
+    }
 }
 
 void applyRound0ClusterOverrides(Parameters &par) {
@@ -365,16 +446,16 @@ void applyRound0ClusterOverrides(Parameters &par) {
     if (par.PARAM_BATCH_ROUND0_KMER_PER_SEQ.wasSet) {
         par.kmersPerSequence = par.batchRound0KmersPerSequence;
     }
-    if (par.PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE.wasSet) {
-        par.includeCountTable = par.batchRound0IncludeCountTable;
-    }
-    if (par.PARAM_BATCH_ROUND0_NUM_COUNTS.wasSet) {
-        par.countTableIteration = par.batchRound0CountTableIteration;
-    }
-    if (par.PARAM_BATCH_ROUND0_NUM_ADJACENCY.wasSet) {
-        par.adjIteration = par.batchRound0AdjIteration;
-        par.includeAdjacency = (par.batchRound0AdjIteration > 0);
-    }
+    const bool nonSymmetric = isNonSymmetricCovMode(par);
+    resolveRound0InclNum(par.PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE.wasSet, par.batchRound0IncludeCountTable,
+                         par.PARAM_BATCH_ROUND0_NUM_COUNTS.wasSet, par.batchRound0CountTableIteration,
+                         Parameters::CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE, "count-table",
+                         par.includeCountTable, par.countTableIteration);
+    resolveRound0InclNum(par.PARAM_BATCH_ROUND0_INCLUDE_ADJACENCY.wasSet, par.batchRound0IncludeAdjacency,
+                         par.PARAM_BATCH_ROUND0_NUM_ADJACENCY.wasSet, par.batchRound0AdjIteration,
+                         nonSymmetric ? Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY
+                                      : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY,
+                         "adjacency", par.includeAdjacency, par.adjIteration);
     if (par.PARAM_BATCH_ROUND0_CLUST_HASH.wasSet) {
         par.clustHash = par.batchRound0ClustHash;
     }
@@ -395,10 +476,6 @@ void applyBatchClusterAutomagic(Parameters &par, const std::string &clusterCmd) 
 }
 
 std::string buildRound0ClusterPar(Parameters &par, const std::string &clusterCmd) {
-    if (hasRound0ClusterOverride(par) == false) {
-        return "";
-    }
-
     const float prevSeqIdThr = par.seqIdThr;
     const float prevCovThr = par.covThr;
     const int prevCovMode = par.covMode;
@@ -414,10 +491,12 @@ std::string buildRound0ClusterPar(Parameters &par, const std::string &clusterCmd
     const float prevSensitivity = par.sensitivity;
     const int prevClusterSteps = par.clusterSteps;
 
-    // Apply round0 values before automagic so derived settings (e.g. cov-mode -> cluster-mode)
-    // are recomputed for round0, then apply explicit round0 overrides once more so they win.
+    // Apply explicit round0 values before automagic so derived settings (e.g. cov-mode ->
+    // cluster-mode) are recomputed for round0. Then apply the lightweight round0 defaults
+    // and explicit overrides once more so round0 stays cheap while user overrides still win.
     applyRound0ClusterOverrides(par);
     applyBatchClusterAutomagic(par, clusterCmd);
+    applyRound0ClusterDefaults(par, clusterCmd);
     applyRound0ClusterOverrides(par);
 
     std::string round0Par = buildInnerClusterParFromCurrent(par, clusterCmd);
@@ -456,6 +535,7 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
     const std::string maxChunkAttempts = SSTR(par.batchMaxChunkAttempts);
     const std::string compressBatchOutputs = par.batchCompressOutputs ? "1" : "0";
     const std::string mergeBuckets = SSTR(par.batchMergeBuckets);
+    const std::string mergeBucketJobs = SSTR(par.batchMergeBucketJobs);
     const std::string createdbPar = buildCreatedbPar(par);
     const std::string createtsvPar = buildCreatetsvPar(par);
 
@@ -470,6 +550,7 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
     cmd.addVariable("ROUND0_CHUNK_MAX_BYTES", par.PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES.wasSet ? round0ChunkMaxBytes.c_str() : NULL);
     cmd.addVariable("ROUND0_CHUNK_MAX_SEQS", par.PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS.wasSet ? round0ChunkMaxSeqs.c_str() : NULL);
     cmd.addVariable("MERGE_BUCKETS", mergeBuckets.c_str());
+    cmd.addVariable("MERGE_BUCKET_JOBS", mergeBucketJobs.c_str());
     cmd.addVariable("MAX_ROUNDS", maxRounds.c_str());
     cmd.addVariable("MIN_REDUCTION_RATIO", minReductionRatio.c_str());
     cmd.addVariable("CONVERGENCE_PATIENCE", convergencePatience.c_str());
@@ -484,14 +565,40 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
     cmd.addVariable("BATCH_SLURM_MEM", par.batchSlurmMem.empty() ? NULL : par.batchSlurmMem.c_str());
     cmd.addVariable("BATCH_SLURM_EXTRA", par.batchSlurmExtra.empty() ? NULL : par.batchSlurmExtra.c_str());
     cmd.addVariable("NODE_WORK_DIR", par.batchNodeWorkDir.empty() ? NULL : par.batchNodeWorkDir.c_str());
-    cmd.addVariable("ROUND0_SLURM_NODELIST", par.batchRound0SlurmNodelist.empty() ? NULL : par.batchRound0SlurmNodelist.c_str());
+    cmd.addVariable("ROUND0_BATCH_SLURM_NODELIST", par.batchRound0SlurmNodelist.empty() ? NULL : par.batchRound0SlurmNodelist.c_str());
+    cmd.addVariable("ROUND0_BATCH_SLURM_PARTITION", par.batchRound0SlurmPartition.empty() ? NULL : par.batchRound0SlurmPartition.c_str());
+    cmd.addVariable("ROUND0_BATCH_SLURM_TIME", par.batchRound0SlurmTime.empty() ? NULL : par.batchRound0SlurmTime.c_str());
+    cmd.addVariable("ROUND0_BATCH_SLURM_MEM", par.batchRound0SlurmMem.empty() ? NULL : par.batchRound0SlurmMem.c_str());
+    cmd.addVariable("ROUND0_BATCH_SLURM_EXTRA", par.batchRound0SlurmExtra.empty() ? NULL : par.batchRound0SlurmExtra.c_str());
     cmd.addVariable("ROUND0_NODE_WORK_DIR", par.batchRound0NodeWorkDir.empty() ? NULL : par.batchRound0NodeWorkDir.c_str());
+    if (par.PARAM_BATCH_AWS_MACHINE.wasSet) {
+        cmd.addVariable("BATCH_AWS_MACHINE", par.batchAwsMachine.c_str());
+    }
+    if (par.PARAM_BATCH_AWS_JOB_QUEUE.wasSet) {
+        cmd.addVariable("BATCH_AWS_JOB_QUEUE", par.batchAwsJobQueue.c_str());
+    }
+    if (par.PARAM_BATCH_AWS_JOB_DEFINITION.wasSet) {
+        cmd.addVariable("BATCH_AWS_JOB_DEFINITION", par.batchAwsJobDefinition.c_str());
+    }
+    if (par.PARAM_BATCH_ROUND0_AWS_MACHINE.wasSet) {
+        cmd.addVariable("ROUND0_BATCH_AWS_MACHINE", par.batchRound0AwsMachine.c_str());
+    }
+    if (par.PARAM_BATCH_ROUND0_AWS_JOB_QUEUE.wasSet) {
+        cmd.addVariable("ROUND0_BATCH_AWS_JOB_QUEUE", par.batchRound0AwsJobQueue.c_str());
+    }
+    if (par.PARAM_BATCH_ROUND0_AWS_JOB_DEFINITION.wasSet) {
+        cmd.addVariable("ROUND0_BATCH_AWS_JOB_DEFINITION", par.batchRound0AwsJobDefinition.c_str());
+    }
+    if (par.PARAM_BATCH_AWS_MACHINE_TAG_KEY.wasSet) {
+        cmd.addVariable("BATCH_AWS_MACHINE_TAG_KEY", par.batchAwsMachineTagKey.c_str());
+    }
 }
 
 int execBatchEngine(Parameters &par, const std::string &programDir,
                     const std::string &mode, const std::vector<std::string> &modeArgs,
                     const std::string &clusterCmd, const std::string &clusterPar,
                     const std::string &round0ClusterPar) {
+    resolveBatchMergeParallelism(par);
     CommandCaller cmd;
     addBatchEngineVariables(cmd, par, clusterCmd, clusterPar, round0ClusterPar);
     if (mode == "cluster-chunk") {
@@ -604,6 +711,21 @@ void setBatchClusteringDescriptions(Parameters &par) {
         "Batch createdb mode: 0 copies FASTA/.zst into a compact MMseqs DB, 1 soft-links plain single-line FASTA. Mode 2/GPU DB layout is not supported by batch clustering",
         NULL,
         par.PARAM_CREATEDB_MODE.category);
+    par.overrideParameterDescription(
+        par.PARAM_COMPRESSED,
+        "Forward --compressed to inner linclust/cluster result DBs. Batch createdb remains uncompressed for I/O speed",
+        NULL,
+        par.PARAM_COMPRESSED.category);
+    par.overrideParameterDescription(
+        par.PARAM_COMPRESS_KMER_TMP_FILES,
+        "Compress kmermatcher spill files during inner linclust/cluster. Separate from --compressed and from --compress-batch-outputs",
+        NULL,
+        par.PARAM_COMPRESS_KMER_TMP_FILES.category);
+    par.overrideParameterDescription(
+        par.PARAM_BATCH_COMPRESS_OUTPUTS,
+        "Compress per-round and final batch FASTA/TSV shard files as .zst. This does not compress createdb sequence DBs",
+        NULL,
+        par.PARAM_BATCH_COMPRESS_OUTPUTS.category);
 }
 
 } // namespace
@@ -615,6 +737,7 @@ int linclustbatch(int argc, const char **argv, const Command &command) {
     setBatchClusteringDescriptions(par);
     par.parseParameters(argc, argv, command, false, 0, 0);
     restoreRequestedThreads(par, requestedThreads);
+    resolveBatchMergeParallelism(par);
     validateBatchBackend(par);
     std::string round0ClusterPar = buildRound0ClusterPar(par, "linclust");
     std::string clusterPar = buildInnerClusterPar(par, "linclust");
@@ -629,6 +752,7 @@ int clusterbatch(int argc, const char **argv, const Command &command) {
     setBatchClusteringDescriptions(par);
     par.parseParameters(argc, argv, command, false, 0, 0);
     restoreRequestedThreads(par, requestedThreads);
+    resolveBatchMergeParallelism(par);
     validateBatchBackend(par);
     std::string round0ClusterPar = buildRound0ClusterPar(par, "cluster");
     std::string clusterPar = buildInnerClusterPar(par, "cluster");
@@ -642,6 +766,7 @@ int linclustbatchworker(int argc, const char **argv, const Command &command) {
     setBatchLinclustDefaults(&par);
     par.parseParameters(argc, argv, command, false, 0, 0);
     restoreRequestedThreads(par, requestedThreads);
+    resolveBatchMergeParallelism(par);
     std::string round0ClusterPar = buildRound0ClusterPar(par, "linclust");
     std::string clusterPar = buildInnerClusterPar(par, "linclust");
     par.printParameters(command.cmd, argc, argv, *command.params);
@@ -659,6 +784,7 @@ int clusterbatchworker(int argc, const char **argv, const Command &command) {
     setBatchClusterDefaults(&par);
     par.parseParameters(argc, argv, command, false, 0, 0);
     restoreRequestedThreads(par, requestedThreads);
+    resolveBatchMergeParallelism(par);
     std::string round0ClusterPar = buildRound0ClusterPar(par, "cluster");
     std::string clusterPar = buildInnerClusterPar(par, "cluster");
     par.printParameters(command.cmd, argc, argv, *command.params);
@@ -676,6 +802,7 @@ int batchclusteringprepare(int argc, const char **argv, const Command &command) 
     setBatchLinclustDefaults(&par);
     par.parseParameters(argc, argv, command, false, 0, 0);
     restoreRequestedThreads(par, requestedThreads);
+    resolveBatchMergeParallelism(par);
     par.printParameters(command.cmd, argc, argv, *command.params);
 
     std::vector<std::string> args;
@@ -691,6 +818,7 @@ int batchclusteringmerge(int argc, const char **argv, const Command &command) {
     setBatchLinclustDefaults(&par);
     par.parseParameters(argc, argv, command, false, 0, 0);
     restoreRequestedThreads(par, requestedThreads);
+    resolveBatchMergeParallelism(par);
     par.printParameters(command.cmd, argc, argv, *command.params);
 
     std::vector<std::string> args;

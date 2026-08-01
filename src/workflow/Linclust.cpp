@@ -69,6 +69,7 @@ int linclust(int argc, const char **argv, const Command& command) {
     bool alphabetSizeWasSet = false;
     bool clusterModeSet = false;
     bool includeCountTableSet = false;
+    bool includeAdjacencySet = false;
     for (size_t i = 0; i < par.linclustworkflow.size(); i++) {
         if (par.linclustworkflow[i]->uniqid == par.PARAM_K.uniqid && par.linclustworkflow[i]->wasSet) {
             kmerSizeWasSet = true;
@@ -84,6 +85,12 @@ int linclust(int argc, const char **argv, const Command& command) {
         }
         if (par.linclustworkflow[i]->uniqid == par.PARAM_NUM_COUNTS.uniqid && par.linclustworkflow[i]->wasSet) {
             includeCountTableSet = true;
+        }
+        if (par.linclustworkflow[i]->uniqid == par.PARAM_INCLUDE_ADJACENCY.uniqid && par.linclustworkflow[i]->wasSet) {
+            includeAdjacencySet = true;
+        }
+        if (par.linclustworkflow[i]->uniqid == par.PARAM_NUM_ADJACENCY.uniqid && par.linclustworkflow[i]->wasSet) {
+            includeAdjacencySet = true;
         }
         
     }
@@ -107,6 +114,17 @@ int linclust(int argc, const char **argv, const Command& command) {
             par.includeCountTable = true;
         }
     }
+    Util::resolveIncludeIterationPair(par.PARAM_INCLUDE_COUNTTABLE.wasSet, par.includeCountTable,
+                                par.PARAM_NUM_COUNTS.wasSet, par.countTableIteration,
+                                "--include-count-table", "--num-count-table");
+
+    if (includeAdjacencySet == false) {
+        par.adjIteration = nonSymetric ? Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY
+                                       : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
+    }
+    Util::resolveIncludeIterationPair(par.PARAM_INCLUDE_ADJACENCY.wasSet, par.includeAdjacency,
+                                par.PARAM_NUM_ADJACENCY.wasSet, par.adjIteration,
+                                "--include-adjacency", "--num-adjacency");
 
     if (kmerSizeWasSet == false) {
         par.kmerSize = Parameters::CLUST_LINEAR_DEFAULT_K;

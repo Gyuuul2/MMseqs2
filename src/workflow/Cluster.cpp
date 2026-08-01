@@ -78,6 +78,11 @@ void setClusterAutomagicParameters(Parameters& par) {
         Debug(Debug::INFO) << "Set cluster sensitivity to -s " << par.sensitivity << "\n";
     }
 
+    const bool includeCountTableWasSet = par.PARAM_INCLUDE_COUNTTABLE.wasSet;
+    const bool numCountTableWasSet = par.PARAM_NUM_COUNTS.wasSet;
+    const bool includeAdjacencyWasSet = par.PARAM_INCLUDE_ADJACENCY.wasSet;
+    const bool numAdjacencyWasSet = par.PARAM_NUM_ADJACENCY.wasSet;
+
     const bool nonsymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
     if (par.PARAM_CLUSTER_MODE.wasSet == false) {
         if (nonsymetric) {
@@ -91,11 +96,18 @@ void setClusterAutomagicParameters(Parameters& par) {
     if (par.PARAM_INCLUDE_COUNTTABLE.wasSet == false) {
         if (nonsymetric) {
             par.includeCountTable = false;
+            par.countTableIteration = 0;
         } else {
             par.includeCountTable = true;
         }
         par.PARAM_INCLUDE_COUNTTABLE.wasSet = true;
     }
+    Util::resolveIncludeIterationPair(includeCountTableWasSet, par.includeCountTable,
+                                       numCountTableWasSet, par.countTableIteration,
+                                       "--include-count-table", "--num-count-table");
+    Util::resolveIncludeIterationPair(includeAdjacencyWasSet, par.includeAdjacency,
+                                       numAdjacencyWasSet, par.adjIteration,
+                                       "--include-adjacency", "--num-adjacency");
     if (nonsymetric && par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
         Debug(Debug::WARNING) << "Combining cluster mode " << par.clusteringMode
                               << " in combination with coverage mode " << par.covMode << " can produce wrong results.\n"
