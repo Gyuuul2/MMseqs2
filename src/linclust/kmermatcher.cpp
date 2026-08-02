@@ -1871,6 +1871,9 @@ size_t queueNextEntry(KmerPositionQueue &queue, int file, size_t offsetPos, T *e
 static const size_t KMER_TMP_ZSTD_INPUT_BUFFER_SIZE = 65536;
 static const size_t KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE = 65536;
 static const int KMER_TMP_ZSTD_COMPRESSION_LEVEL = 2;
+static const size_t KMER_MERGE_RESULT_BUFFER_RESERVE = 1024 * 1024;
+static const size_t KMER_MERGE_RESULT_BUFFER_MAX_KEEP = 16 * 1024 * 1024;
+static const size_t KMER_MERGE_MIN_MEMORY_HEADROOM = 1024ull * 1024ull * 1024ull;
 
 static std::string kmerTmpFileName(const std::string &tmpFile, int iteration, int threadIdx, bool compressed) {
     std::string fileName = tmpFile + "_iter_" + std::to_string(iteration) + "_thread_" + std::to_string(threadIdx);
@@ -2345,7 +2348,9 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
 
         if (maxFilesPerThread > 0) {
             long openMax = sysconf(_SC_OPEN_MAX);
-            size_t fdBudget = (openMax > 128) ? static_cast<size_t>(openMax - 64) : 64;
+            size_t fdReserve = 2 * static_cast<size_t>(numThreads) + 64;
+            size_t fdBudget = (openMax > 0 && static_cast<size_t>(openMax) > fdReserve)
+                                  ? (static_cast<size_t>(openMax) - fdReserve) : 1;
             if (maxFilesPerThread >= fdBudget) {
                 Debug(Debug::ERROR) << "Too many compressed k-mer temporary files for one merge lane ("
                                     << maxFilesPerThread << ") relative to open-file limit ("
@@ -2358,14 +2363,20 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
 
             const size_t perReaderBytes =
                 KMER_TMP_ZSTD_INPUT_BUFFER_SIZE + (3 * KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE) + 4096;
-            const size_t splitMemoryLimit = Parameters::getInstance().splitMemoryLimit;
-            if (splitMemoryLimit > 0) {
-                const size_t memBudget = std::max<size_t>(1, splitMemoryLimit / 4);
-                const size_t bytesPerLane = maxFilesPerThread * perReaderBytes;
-                if (bytesPerLane > 0) {
-                    mergeThreads = std::min(mergeThreads,
-                                            std::max(1, static_cast<int>(memBudget / bytesPerLane)));
+            const size_t memoryLimit = Util::computeMemory(Parameters::getInstance().splitMemoryLimit);
+            size_t mergeHeadroom = std::max(KMER_MERGE_MIN_MEMORY_HEADROOM, memoryLimit / 10);
+            const char *mergeHeadroomEnv = getenv("MMSEQS_KMER_MERGE_MEMORY_HEADROOM");
+            if (mergeHeadroomEnv != NULL) {
+                long value = atol(mergeHeadroomEnv);
+                if (value > 0) {
+                    mergeHeadroom = static_cast<size_t>(value);
                 }
+            }
+            const size_t memBudget = (memoryLimit > mergeHeadroom) ? (memoryLimit - mergeHeadroom) : memoryLimit / 2;
+            const size_t bytesPerLane = maxFilesPerThread * perReaderBytes;
+            if (bytesPerLane > 0) {
+                mergeThreads = std::min(mergeThreads,
+                                        std::max(1, static_cast<int>(memBudget / bytesPerLane)));
             }
         }
 
@@ -2397,7 +2408,7 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
         }
 
         std::string prefResultsOutString;
-        prefResultsOutString.reserve(100000000);
+        prefResultsOutString.reserve(KMER_MERGE_RESULT_BUFFER_RESERVE);
         char buffer[1024];
         bool hasRepSeq = (repSequence.size() > 0);
         DBKeyType currRepSeq = DB_KEY_INVALID;
@@ -2445,6 +2456,11 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
                 repSequence[currRepSeq] = true;
             }
             prefResultsOutString.clear();
+            if (prefResultsOutString.capacity() > KMER_MERGE_RESULT_BUFFER_MAX_KEEP) {
+                std::string tmp;
+                tmp.reserve(KMER_MERGE_RESULT_BUFFER_RESERVE);
+                prefResultsOutString.swap(tmp);
+            }
         };
 
         const auto startRepSeq = [&](DBKeyType repSeq) {
