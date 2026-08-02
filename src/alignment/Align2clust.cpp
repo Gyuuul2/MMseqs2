@@ -115,6 +115,9 @@ static void appendAlignmentResult(std::string &alnResultBuffer, char *lineBuffer
 // Compact setCoverMemberPool when over half is dead. Only offsets change, so heap order holds.
 static const size_t ALIGN2CLUST_MIN_COMPACTION_DEAD_MEMBERS = 16 * 1024 * 1024 / sizeof(DBLocalId);
 
+// per-thread prefilter hit buffer is shrunk back once it grew past this
+static const size_t ALIGN2CLUST_MAX_TARGET_CAPACITY = 1024 * 1024;
+
 static void compactSetCoverMemberPool() {
     const size_t deadMemberCount = setCoverMemberPool.size() - setCoverLiveMemberCount;
     if (setCoverMemberPool.empty() ||
@@ -228,38 +231,44 @@ static float parsePrecisionLib(const std::string &scoreFile, double targetSeqid,
     return 0;
 }
 
-static void writeClustering(DBWriter *dbWriter, const std::pair<DBKeyType, DBKeyType> * results, size_t dbSize) {
-    std::string resultString;
-    resultString.reserve(1024 * 1024 * 1024);
+// Clusters are written as soon as they are final, so the (representative, member) pair
+// array for the whole database (16 byte per entry) is never materialized. The cluster
+// thread is the only writer while workers run; the singleton pass runs after it joined.
+static DBReader<DBKeyType> *clusterSeqDbr = nullptr;
+static DBWriter *clusterResultWriter = nullptr;
+static std::string clusterResultBuffer;
+static std::vector<DBKeyType> clusterMemberKeys;
+// one bit per local id, set once the id was written as a representative. A representative
+// missing from its own prefilter list stays unassigned, so without this the singleton
+// pass would write its key a second time.
+static std::vector<unsigned char> writtenRepresentative;
+static size_t clusterCount = 0;
+
+static void writeCluster(DBLocalId representativeId, const DBLocalId *memberIds, size_t memberCount) {
+    const DBKeyType representativeKey = clusterSeqDbr->getDbKey(representativeId);
+    clusterMemberKeys.clear();
+    for (size_t i = 0; i < memberCount; i++) {
+        const DBKeyType memberKey = clusterSeqDbr->getDbKey(memberIds[i]);
+        if (memberKey != representativeKey) {
+            clusterMemberKeys.push_back(memberKey);
+        }
+    }
+    // keeps every entry byte identical to grouping a globally sorted pair array
+    SORT_SERIAL(clusterMemberKeys.begin(), clusterMemberKeys.end());
+
     char buffer[32];
-    DBKeyType previousRepresentativeKey = DB_KEY_INVALID;
-    
-    for (size_t i = 0; i < dbSize; i++) {
-        DBKeyType currentRepresentativeKey = results[i].first;
-        
-        if (previousRepresentativeKey != currentRepresentativeKey) {
-            if (previousRepresentativeKey != DB_KEY_INVALID) {
-                dbWriter->writeData(resultString.c_str(), resultString.length(), previousRepresentativeKey);
-            }
-            resultString.clear();
-            char *outPos = Itoa::u64toa_sse2(static_cast<uint64_t>(currentRepresentativeKey), buffer);
-            resultString.append(buffer, (outPos - buffer - 1));
-            resultString.push_back('\n');
-        }
-        
-        DBKeyType memberKey = results[i].second;
-        if (memberKey != currentRepresentativeKey) {
-            char *outPos = Itoa::u64toa_sse2(static_cast<uint64_t>(memberKey), buffer);
-            resultString.append(buffer, (outPos - buffer - 1));
-            resultString.push_back('\n');
-        }
-        
-        previousRepresentativeKey = currentRepresentativeKey;
+    clusterResultBuffer.clear();
+    char *outPos = Itoa::u64toa_sse2(static_cast<uint64_t>(representativeKey), buffer);
+    clusterResultBuffer.append(buffer, (outPos - buffer - 1));
+    clusterResultBuffer.push_back('\n');
+    for (size_t i = 0; i < clusterMemberKeys.size(); i++) {
+        outPos = Itoa::u64toa_sse2(static_cast<uint64_t>(clusterMemberKeys[i]), buffer);
+        clusterResultBuffer.append(buffer, (outPos - buffer - 1));
+        clusterResultBuffer.push_back('\n');
     }
-    
-    if (previousRepresentativeKey != DB_KEY_INVALID) {
-        dbWriter->writeData(resultString.c_str(), resultString.length(), previousRepresentativeKey);
-    }
+    clusterResultWriter->writeData(clusterResultBuffer.c_str(), clusterResultBuffer.length(), representativeKey);
+    writtenRepresentative[representativeId >> 3] |= static_cast<unsigned char>(1u << (representativeId & 7));
+    clusterCount++;
 }
 
 static void (*clusterThreadFunc)(ClusterAssignment*) = nullptr;
@@ -335,6 +344,12 @@ void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
             for (size_t i = 0; i < candidate.memberCount; i++) {
                 storeAssignedCluster(assignedCluster, members[i], candidate.representativeId);
             }
+
+            // copy the members out of the shared pool, then write without the mutex
+            std::vector<DBLocalId> writtenMembers(members, members + candidate.memberCount);
+            lock.unlock();
+            writeCluster(candidate.representativeId, writtenMembers.data(), writtenMembers.size());
+            lock.lock();
         }
 
         // Compaction only touches consumer-private structures (setCoverCandidates,
@@ -392,6 +407,12 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
             for (DBLocalId memberId : validMemberIds) {
                 storeAssignedCluster(assignedCluster, memberId, result.representativeId);
             }
+
+            // result is already detached from the ring buffer, so release the mutex for
+            // the write and let worker threads keep pushing results
+            lock.unlock();
+            writeCluster(result.representativeId, validMemberIds.data(), validMemberIds.size());
+            lock.lock();
         }
     }
 }
@@ -488,6 +509,14 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         currentProcessPosition = 0;
         currentPrefSize = 0;
         allCalculationsDone = false;
+
+        clusterSeqDbr = seqDbr;
+        clusterResultWriter = &resultWriter;
+        clusterResultBuffer.clear();
+        clusterMemberKeys.clear();
+        clusterCount = 0;
+        // one bit per sequence, allocated instead of the 16 byte per sequence pair array
+        writtenRepresentative.assign((dbSize + 7) / 8, 0);
     }
 
     std::thread clusterThread(clusterThreadFunc, assignedCluster);
@@ -561,6 +590,12 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             ClusterResult clusterResult;
             clusterResult.sequenceIdx = i;
             targetsWithDiagonal.clear();
+            // clear() keeps the capacity, so one huge hit list would pin it for the whole
+            // run in every thread that saw one
+            if (targetsWithDiagonal.capacity() > ALIGN2CLUST_MAX_TARGET_CAPACITY) {
+                targetsWithDiagonal.shrink_to_fit();
+                targetsWithDiagonal.reserve(1000);
+            }
             if (includeAlignFiles) {
                 alnResultBuffer.clear();
             }
@@ -922,44 +957,31 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         clusterThread.join(); 
     }
 
+    // every id the cluster thread left unassigned is a cluster of its own. Ids already
+    // written as a representative are skipped, their entry carries them as the first line.
     for (size_t i = 0; i < dbSize; ++i) {
-        if (loadAssignedCluster(assignedCluster, i) == DB_LOCAL_ID_INVALID) {
-            storeAssignedCluster(assignedCluster, i, i);
+        if (loadAssignedCluster(assignedCluster, i) != DB_LOCAL_ID_INVALID) {
+            continue;
         }
-    }
-
-    std::pair<DBKeyType, DBKeyType> *assignment = new std::pair<DBKeyType, DBKeyType>[dbSize];
-    
-#pragma omp parallel
-    {
-#pragma omp for schedule(static)
-        for (size_t i = 0; i < dbSize; i++) {
-            const DBLocalId representativeId = loadAssignedCluster(assignedCluster, i);
-            if (representativeId == DB_LOCAL_ID_INVALID) {
-                Debug(Debug::ERROR) << "There must be an error: " << i 
-                                    << " is not assigned to a cluster\n";
-                continue;
-            }
-
-            assignment[i].first = seqDbr->getDbKey(representativeId);
-            assignment[i].second = seqDbr->getDbKey(i);
+        if ((writtenRepresentative[i >> 3] & static_cast<unsigned char>(1u << (i & 7))) != 0) {
+            continue;
         }
-    }
-    
-    SORT_PARALLEL(assignment, assignment + dbSize);
-
-    size_t clusterCount = (dbSize > 0) ? 1 : 0;
-    for (size_t i = 1; i < dbSize; i++) {
-        clusterCount += (assignment[i].first != assignment[i - 1].first);
+        const DBLocalId singletonId = static_cast<DBLocalId>(i);
+        writeCluster(singletonId, &singletonId, 1);
     }
 
     Debug(Debug::INFO) << "Size of the alignment database: " << dbSize << "\n";
     Debug(Debug::INFO) << "Number of clusters: " << clusterCount << "\n";
-    
-    writeClustering(&resultWriter, assignment, dbSize);
-    
+
     delete[] assignedCluster;
-    delete[] assignment;
+    writtenRepresentative.clear();
+    writtenRepresentative.shrink_to_fit();
+    clusterResultBuffer.clear();
+    clusterResultBuffer.shrink_to_fit();
+    clusterMemberKeys.clear();
+    clusterMemberKeys.shrink_to_fit();
+    clusterSeqDbr = nullptr;
+    clusterResultWriter = nullptr;
     if (prefRepSizePair != nullptr) {
         delete[] prefRepSizePair;
     }
