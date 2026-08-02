@@ -1110,7 +1110,7 @@ cluster_chunk() {
     mmseqs_bin=$(round_mmseqs "$round")
     need_cmd "$mmseqs_bin"
     log "createdb ${chunk_id}"
-    # shellcheck disable=SC2086
+    # shellcheck disable=SC2046,SC2086
     "$mmseqs_bin" createdb "$createdb_input" "$db" $(round_createdb_par "$round") || fail "createdb failed (chunk ${chunk_id}, rc=$?)"
     local actual_seqs
     actual_seqs=$(wc -l < "${db}.index" | tr -d ' ')
@@ -1905,7 +1905,7 @@ aws_resolve_batch_resource_by_tag() {
     if [[ "$kind" == "queue" ]]; then
         # ARNs are .../job-queue/NAME; keep only ENABLED+VALID queues (never route to a disabled one)
         if [[ -n "$arns" ]]; then
-            # shellcheck disable=SC2086  # $arns is a space-separated list of ARNs -- intentional split
+            # shellcheck disable=SC2016,SC2086  # $arns splits intentionally; backticks are JMESPath literals
             matches=$(aws batch describe-job-queues --job-queues $arns \
                 --query 'jobQueues[?state==`ENABLED`&&status==`VALID`].jobQueueName' \
                 --output text) || return 1
@@ -2076,7 +2076,7 @@ aws_submit_batch_job() {
     local subcommand="${1:-}"   # first script arg = aws-driver | aws-worker | aws-merge
     # The target round is ALWAYS the last script arg -- aws-driver/worker/merge all end with <round>.
     # It picks the round-specific queue/definition. Default to round1 (base queue) if not numeric.
-    local target_round="${@: -1}"
+    local target_round="${*: -1}"
     [[ "$target_round" =~ ^[0-9]+$ ]] || target_round=1
 
     aws_require_submit_env
@@ -2624,7 +2624,7 @@ submit_event_step() {
     mkdir -p "$slurm_dir"
     local wrapper="$slurm_dir/${job_name}.sh"
     write_slurm_wrapper "$wrapper" "$@"
-    local target_round="${@: -1}"
+    local target_round="${*: -1}"
     [[ "$target_round" =~ ^[0-9]+$ ]] || target_round=1
     local jid rc
     set +e
