@@ -158,6 +158,14 @@ ROUND0_BATCH_AWS_MACHINE=${ROUND0_BATCH_AWS_MACHINE:-}
 BATCH_AWS_MACHINE_TAG_KEY=${BATCH_AWS_MACHINE_TAG_KEY:-mmseqs:machine}
 BATCH_SCRIPT="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)/$(basename -- "$0")"
 
+# mmseqs rejects a repeated flag ("Duplicate parameter --x") instead of taking the last one, so a
+# round-dependent override has to drop the flag from the base parameters before appending its own.
+par_without_flag() {
+    local par="$1" flag="$2"
+    printf '%s' "$par" \
+        | sed -E "s/(^|[[:space:]])${flag}([[:space:]]+[^[:space:]]+|=[^[:space:]]+)/\1/g"
+}
+
 round_cluster_par() {
     local round="$1"
     local base
@@ -168,12 +176,9 @@ round_cluster_par() {
     fi
     # round0 chunks are sized to fit in memory (no split, so k-mer caching is a no-op); enable
     # --kmer-write-to-disk only from round1+, where the growing representative set can split.
-    # Appended last so it overrides any --kmer-write-to-disk already in the base parameters.
-    if [[ "$round" -eq 0 ]]; then
-        printf '%s --kmer-write-to-disk 0' "$base"
-    else
-        printf '%s --kmer-write-to-disk 1' "$base"
-    fi
+    local spill=1
+    [[ "$round" -eq 0 ]] && spill=0
+    printf '%s --kmer-write-to-disk %s' "$(par_without_flag "$base" --kmer-write-to-disk)" "$spill"
 }
 
 round_chunk_max_bytes() {
@@ -536,12 +541,9 @@ round_createdb_softlink() {
 
 round_createdb_par() {
     local round="$1"
-    # Append the round's --createdb-mode last so it overrides the one already in CREATEDB_PAR.
-    if round_createdb_softlink "$round"; then
-        printf '%s --createdb-mode 1' "$CREATEDB_PAR"
-    else
-        printf '%s --createdb-mode 0' "$CREATEDB_PAR"
-    fi
+    local mode=0
+    round_createdb_softlink "$round" && mode=1
+    printf '%s --createdb-mode %s' "$(par_without_flag "$CREATEDB_PAR" --createdb-mode)" "$mode"
 }
 
 append_singleline_fasta() {
