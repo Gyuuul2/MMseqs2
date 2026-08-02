@@ -360,8 +360,14 @@ std::string buildCreatedbPar(const Parameters &par) {
     // --createdb-mode 1 (soft-link) is the batch default: the batch materializes one node-local
     // single-line FASTA per chunk (append_singleline_fasta) and createdb soft-links it, skipping the
     // compact-DB data copy. Set --createdb-mode 0 to fall back to copying (reads FASTA/.zst natively).
-    return "--shuffle 0 --write-lookup 0 --createdb-mode " + SSTR(par.createdbMode) + " --threads " +
-           SSTR(par.threads) + " -v " + SSTR(par.verbosity);
+    // --sort-by-length 1: hand out keys by decreasing sequence length so the sequence DB readers
+    // opened with SORT_BY_LENGTH (align2clust, clust) take the identity fast path and never allocate
+    // id2local/local2id, 2 * sizeof(DBLocalId) per sequence (54 GB at 3.4 billion in the 64-bit
+    // build). Only the index is rewritten, so soft-linked chunks keep their symlink, and the
+    // representative sub-databases of later rounds inherit the order for free, being a subsequence
+    // of a non-increasing run. Clustering results are unchanged.
+    return "--shuffle 0 --write-lookup 0 --sort-by-length 1 --createdb-mode " + SSTR(par.createdbMode) +
+           " --threads " + SSTR(par.threads) + " -v " + SSTR(par.verbosity);
 }
 
 std::string buildCreatetsvPar(const Parameters &par) {
