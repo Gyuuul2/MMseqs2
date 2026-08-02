@@ -927,14 +927,11 @@ s_align SmithWaterman::alignScoreEndPos (
                     profile->profile_word, USHRT_MAX, maskLen, simdData);
         r.word = 1;
 	}
-	// 3. int32 (word saturates at INT16_MAX). No overflow sentinel for int32, so terminate is
-	// UINT32_MAX (effectively "never early-terminate"); USHRT_MAX would wrongly stop a column
-	// whose max happens to equal 65535.
-	if (bests.first.score == INT16_MAX) {
-		bests = sw_sse2_int<type>(db_sequence, 0, db_length, query_length, gap_open, gap_extend,
-					profile->profile_int, UINT32_MAX, maskLen, simdData);
-		r.word = 2;
-	}
+	// if (bests.first.score == INT16_MAX) {
+	// 	bests = sw_sse2_int<type>(db_sequence, 0, db_length, query_length, gap_open, gap_extend,
+	// 				profile->profile_int, UINT32_MAX, maskLen, simdData);
+	// 	r.word = 2;
+	// }
 
 	r.score1 = bests.first.score;
     r.dbEndPos1 = bests.first.ref;
