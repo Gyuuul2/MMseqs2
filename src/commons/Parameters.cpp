@@ -199,6 +199,22 @@ Parameters::Parameters():
         PARAM_BATCH_ROUND0_AWS_MACHINE(PARAM_BATCH_ROUND0_AWS_MACHINE_ID, "--round0-aws-machine", "Round0 AWS machine", "AWS Batch machine tag value for round 0 only; resolves tagged job queue and job definition", typeid(std::string), (void *) &batchRound0AwsMachine, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_ROUND0_AWS_JOB_QUEUE(PARAM_BATCH_ROUND0_AWS_JOB_QUEUE_ID, "--round0-aws-job-queue", "Round0 AWS queue", "Explicit AWS Batch job queue for round 0 only; overrides --round0-aws-machine queue lookup", typeid(std::string), (void *) &batchRound0AwsJobQueue, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_ROUND0_AWS_JOB_DEFINITION(PARAM_BATCH_ROUND0_AWS_JOB_DEFINITION_ID, "--round0-aws-job-definition", "Round0 AWS job def", "Explicit AWS Batch job definition for round 0 only; overrides --round0-aws-machine job-definition lookup", typeid(std::string), (void *) &batchRound0AwsJobDefinition, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_MMSEQS(PARAM_BATCH_ROUND0_MMSEQS_ID, "--round0-mmseqs", "Round0 mmseqs binary", "mmseqs binary to run for round 0 only, e.g. a different architecture. Empty uses the same binary as the later rounds", typeid(std::string), (void *) &batchRound0Mmseqs, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_CREATEDB_MODE(PARAM_BATCH_ROUND0_CREATEDB_MODE_ID, "--round0-createdb-mode", "Round0 createdb mode", "Override --createdb-mode for round 0 only (0: copy data, 1: soft link data)", typeid(int), (void *) &batchRound0CreatedbMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_COMPRESS_RATIO(PARAM_BATCH_COMPRESS_RATIO_ID, "--compress-ratio", "Compression ratio estimate", "Assumed uncompressed/compressed size ratio for compressed inputs whose exact size cannot be read. Feeds chunk grouping, so changing it changes chunk boundaries", typeid(int), (void *) &batchCompressRatio, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_DELETE_SOURCE_CHUNK(PARAM_BATCH_DELETE_SOURCE_CHUNK_ID, "--delete-source-chunk", "Delete source chunk", "Delete the node-local compressed chunk right after the plain FASTA was materialized", typeid(bool), (void *) &batchDeleteSourceChunk, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_SORT_TMP_DIR(PARAM_BATCH_SORT_TMP_DIR_ID, "--sort-tmp-dir", "Sort tmp directory", "Spill directory for the merge sorts. Empty derives it from the node work directory", typeid(std::string), (void *) &batchSortTmpDir, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_SORT_BUFFER_SIZE(PARAM_BATCH_SORT_BUFFER_SIZE_ID, "--sort-buffer-size", "Sort buffer size", "Per-sort memory target passed to sort --buffer-size, e.g. 200G or 25%. Empty derives it from available memory", typeid(std::string), (void *) &batchSortBufferSize, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_MMSEQS(PARAM_BATCH_AWS_MMSEQS_ID, "--aws-mmseqs", "AWS mmseqs binary", "mmseqs binary inside the AWS Batch container image", typeid(std::string), (void *) &batchAwsMmseqs, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_AWS_MMSEQS(PARAM_BATCH_ROUND0_AWS_MMSEQS_ID, "--round0-aws-mmseqs", "Round0 AWS mmseqs binary", "Override --aws-mmseqs for round 0 only", typeid(std::string), (void *) &batchRound0AwsMmseqs, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_JOB_PREFIX(PARAM_BATCH_AWS_JOB_PREFIX_ID, "--aws-job-prefix", "AWS job name prefix", "Prefix for the submitted AWS Batch job names", typeid(std::string), (void *) &batchAwsJobPrefix, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_LOCAL_DIR(PARAM_BATCH_AWS_LOCAL_DIR_ID, "--aws-local-dir", "AWS local directory", "Container-local scratch directory used by AWS Batch jobs", typeid(std::string), (void *) &batchAwsLocalDir, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_SCRIPT_URI(PARAM_BATCH_AWS_SCRIPT_URI_ID, "--aws-script-uri", "AWS script URI", "S3 URI the workflow script is staged to and fetched from. Empty derives it from the work prefix", typeid(std::string), (void *) &batchAwsScriptUri, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_CHUNK_PREFIX(PARAM_BATCH_AWS_CHUNK_PREFIX_ID, "--aws-chunk-prefix", "AWS chunk prefix", "S3 prefix the round chunks are written to. Empty derives it from the work prefix", typeid(std::string), (void *) &batchAwsChunkPrefix, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_TIMEOUT(PARAM_BATCH_AWS_TIMEOUT_ID, "--aws-timeout", "AWS job timeout", "attemptDurationSeconds for submitted AWS Batch jobs", typeid(int), (void *) &batchAwsTimeout, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_WORKER_ATTEMPTS(PARAM_BATCH_AWS_WORKER_ATTEMPTS_ID, "--aws-worker-attempts", "AWS worker attempts", "AWS Batch retry attempts for chunk worker jobs. 0 uses the job definition's setting", typeid(int), (void *) &batchAwsWorkerAttempts, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_DRY_RUN(PARAM_BATCH_AWS_DRY_RUN_ID, "--aws-dry-run", "AWS dry run", "Print the AWS Batch submissions instead of running them", typeid(bool), (void *) &batchAwsDryRun, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_ALLOW_NONS3_INPUT(PARAM_BATCH_AWS_ALLOW_NONS3_INPUT_ID, "--aws-allow-nons3-input", "AWS allow non-S3 input", "Allow local input paths with the aws-batch backend. They must already exist inside the container", typeid(bool), (void *) &batchAwsAllowNonS3Input, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_AWS_MACHINE_TAG_KEY(PARAM_BATCH_AWS_MACHINE_TAG_KEY_ID, "--aws-machine-tag-key", "AWS machine tag", "AWS tag key used by --aws-machine lookup on Batch job queues and job definitions", typeid(std::string), (void *) &batchAwsMachineTagKey, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES(PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES_ID, "--round0-chunk-max-bytes", "Round0 chunk bytes", "Override --chunk-max-bytes for round 0 only. If unset, round 0 uses --chunk-max-bytes", typeid(ByteParser), (void *) &batchRound0ChunkMaxBytes, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS(PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS_ID, "--round0-chunk-max-seqs", "Round0 chunk sequences", "Override --chunk-max-seqs for round 0 only. If unset, round 0 uses --chunk-max-seqs", typeid(size_t), (void *) &batchRound0ChunkMaxSeqs, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
@@ -1617,6 +1633,23 @@ Parameters::Parameters():
     batchclustering.push_back(&PARAM_BATCH_COMPRESS_OUTPUTS);
     batchclustering.push_back(&PARAM_BATCH_MERGE_BUCKETS);
     batchclustering.push_back(&PARAM_BATCH_MERGE_BUCKET_JOBS);
+    batchclustering.push_back(&PARAM_SORT_BY_LENGTH);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_MMSEQS);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_CREATEDB_MODE);
+    batchclustering.push_back(&PARAM_BATCH_COMPRESS_RATIO);
+    batchclustering.push_back(&PARAM_BATCH_DELETE_SOURCE_CHUNK);
+    batchclustering.push_back(&PARAM_BATCH_SORT_TMP_DIR);
+    batchclustering.push_back(&PARAM_BATCH_SORT_BUFFER_SIZE);
+    batchclustering.push_back(&PARAM_BATCH_AWS_MMSEQS);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_AWS_MMSEQS);
+    batchclustering.push_back(&PARAM_BATCH_AWS_JOB_PREFIX);
+    batchclustering.push_back(&PARAM_BATCH_AWS_LOCAL_DIR);
+    batchclustering.push_back(&PARAM_BATCH_AWS_SCRIPT_URI);
+    batchclustering.push_back(&PARAM_BATCH_AWS_CHUNK_PREFIX);
+    batchclustering.push_back(&PARAM_BATCH_AWS_TIMEOUT);
+    batchclustering.push_back(&PARAM_BATCH_AWS_WORKER_ATTEMPTS);
+    batchclustering.push_back(&PARAM_BATCH_AWS_DRY_RUN);
+    batchclustering.push_back(&PARAM_BATCH_AWS_ALLOW_NONS3_INPUT);
     batchclustering.push_back(&PARAM_CREATEDB_MODE);
     batchclustering.push_back(&PARAM_REMOVE_TMP_FILES);
     batchclustering.push_back(&PARAM_REUSELATEST);
@@ -2816,6 +2849,22 @@ void Parameters::setDefaults() {
     batchCompressOutputs = false;
     batchMergeBuckets = 0;
     batchMergeBucketJobs = 0;
+    batchRound0Mmseqs = "";
+    batchRound0CreatedbMode = 0;
+    batchCompressRatio = 3;
+    batchDeleteSourceChunk = false;
+    batchSortTmpDir = "";
+    batchSortBufferSize = "";
+    batchAwsMmseqs = "mmseqs";
+    batchRound0AwsMmseqs = "";
+    batchAwsJobPrefix = "mmseqs-batch";
+    batchAwsLocalDir = "/tmp/mmseqs-batch";
+    batchAwsScriptUri = "";
+    batchAwsChunkPrefix = "";
+    batchAwsTimeout = 43200;
+    batchAwsWorkerAttempts = 0;
+    batchAwsDryRun = false;
+    batchAwsAllowNonS3Input = false;
     // Clustering workflow
     removeTmpFiles = false;
 

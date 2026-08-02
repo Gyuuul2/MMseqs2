@@ -31,7 +31,8 @@ Usage:
   batch_clustering.sh aws-worker <chunk_manifest_s3> <result_s3_prefix> <round>
   batch_clustering.sh aws-merge <input_manifest> <work_s3_prefix> <result_s3_prefix> <round>
 
-Environment:
+Environment (normally exported by mmseqs from the linclust-batch/cluster-batch command line;
+set them directly only when running this script standalone):
   MMSEQS ROUND0_MMSEQS THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_BUCKETS MERGE_BUCKET_JOBS COMPRESS_RATIO
   CLUSTER_CMD CLUSTER_PAR ROUND0_CLUSTER_PAR CLUSTER_COV_MODE CREATEDB_PAR CREATETSV_PAR COMPRESS_BATCH_OUTPUTS SORT_BUFFER_SIZE SORT_TMP
   MAX_ROUNDS MIN_REDUCTION_RATIO MIN_REDUCTION_COUNT CONVERGENCE_PATIENCE MAX_CHUNK_ATTEMPTS
@@ -42,11 +43,23 @@ Environment:
   BATCH_AWS_JOB_QUEUE BATCH_AWS_JOB_DEFINITION ROUND0_BATCH_AWS_JOB_QUEUE ROUND0_BATCH_AWS_JOB_DEFINITION
   BATCH_AWS_JOB_PREFIX BATCH_AWS_WORKER_ATTEMPTS BATCH_AWS_ALLOW_NONS3_INPUT
   BATCH_AWS_MMSEQS ROUND0_BATCH_AWS_MMSEQS BATCH_AWS_SCRIPT_URI BATCH_AWS_LOCAL_DIR BATCH_AWS_TIMEOUT BATCH_AWS_DRY_RUN
+  BATCH_DELETE_SOURCE_CHUNK ROUND0_CREATEDB_MODE S3_CHUNK_PREFIX BATCH_AWS_ALLOW_NONS3_INPUT
   (AWS env var names must NOT start with 'AWS_BATCH' -- that prefix is reserved by the AWS Batch service.)
+  All of the above are also reachable as command line parameters, e.g. --round0-mmseqs, --compress-ratio,
+  --delete-source-chunk, --sort-tmp-dir, --sort-buffer-size, --aws-mmseqs, --aws-job-prefix,
+  --aws-local-dir, --aws-script-uri, --aws-chunk-prefix, --aws-timeout, --aws-worker-attempts,
+  --aws-dry-run, --aws-allow-nons3-input, --round0-createdb-mode.
 EOF
     exit 1
 }
 
+# INVARIANT for every ${VAR:-default} below: the default has to match the corresponding default in
+# src/commons/Parameters.cpp (Parameters::setDefaults) / src/workflow/BatchClustering.cpp
+# (addBatchEngineVariables, buildCreatedbPar). mmseqs always exports these, so the fallbacks here are
+# only reached when the script is run directly -- they exist so that a standalone run chunks and
+# clusters identically to an mmseqs-driven one. Change one side and you have to change the other.
+# Variables that mmseqs exports only when the user set them (SLURM/AWS targets, round0 overrides,
+# --sort-buffer-size, ...) are the exception: for those the fallback here IS the default.
 MMSEQS=${MMSEQS:-mmseqs}
 # Optional round0-specific mmseqs binary (multi-node): when round0 runs on a different-architecture
 # node pool than round1+ (e.g. ARM round0 / x86 round1+ on a heterogeneous SLURM cluster), a single

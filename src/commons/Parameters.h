@@ -523,6 +523,24 @@ public:
     bool batchCompressOutputs;
     int batchMergeBuckets;
     int batchMergeBucketJobs;
+    // knobs that used to be readable only from the environment. They change chunk boundaries, which
+    // binary runs, or whether inputs are deleted, so they have to appear on the command line.
+    std::string batchRound0Mmseqs;
+    int batchRound0CreatedbMode;
+    int batchCompressRatio;
+    bool batchDeleteSourceChunk;
+    std::string batchSortTmpDir;
+    std::string batchSortBufferSize;
+    std::string batchAwsMmseqs;
+    std::string batchRound0AwsMmseqs;
+    std::string batchAwsJobPrefix;
+    std::string batchAwsLocalDir;
+    std::string batchAwsScriptUri;
+    std::string batchAwsChunkPrefix;
+    int batchAwsTimeout;
+    int batchAwsWorkerAttempts;
+    bool batchAwsDryRun;
+    bool batchAwsAllowNonS3Input;
 
     // CLUSTERING
     int    clusteringMode;
@@ -1063,6 +1081,22 @@ public:
     PARAMETER(PARAM_BATCH_COMPRESS_OUTPUTS)
     PARAMETER(PARAM_BATCH_MERGE_BUCKETS)
     PARAMETER(PARAM_BATCH_MERGE_BUCKET_JOBS)
+    PARAMETER(PARAM_BATCH_ROUND0_MMSEQS)
+    PARAMETER(PARAM_BATCH_ROUND0_CREATEDB_MODE)
+    PARAMETER(PARAM_BATCH_COMPRESS_RATIO)
+    PARAMETER(PARAM_BATCH_DELETE_SOURCE_CHUNK)
+    PARAMETER(PARAM_BATCH_SORT_TMP_DIR)
+    PARAMETER(PARAM_BATCH_SORT_BUFFER_SIZE)
+    PARAMETER(PARAM_BATCH_AWS_MMSEQS)
+    PARAMETER(PARAM_BATCH_ROUND0_AWS_MMSEQS)
+    PARAMETER(PARAM_BATCH_AWS_JOB_PREFIX)
+    PARAMETER(PARAM_BATCH_AWS_LOCAL_DIR)
+    PARAMETER(PARAM_BATCH_AWS_SCRIPT_URI)
+    PARAMETER(PARAM_BATCH_AWS_CHUNK_PREFIX)
+    PARAMETER(PARAM_BATCH_AWS_TIMEOUT)
+    PARAMETER(PARAM_BATCH_AWS_WORKER_ATTEMPTS)
+    PARAMETER(PARAM_BATCH_AWS_DRY_RUN)
+    PARAMETER(PARAM_BATCH_AWS_ALLOW_NONS3_INPUT)
 
     // search workflow
     PARAMETER(PARAM_NUM_ITERATIONS)

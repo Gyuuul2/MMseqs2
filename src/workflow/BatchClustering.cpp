@@ -27,6 +27,7 @@ void setBatchLinclustDefaults(Parameters *p) {
     p->clustHash = false;
     p->createdbMode = Parameters::SEQUENCE_SPLIT_MODE_SOFT;   // soft-link: skip DB data copy; batch materializes single-line FASTA first
     p->removeTmpFiles = true;   // batch scale accumulates per-chunk tmp; clean by default
+    p->sortBySeqLength = true;  // lets align2clust skip the SORT_BY_LENGTH id mapping (2*8 byte/seq)
 }
 
 int parseRequestedThreads(int argc, const char **argv) {
@@ -98,6 +99,7 @@ void setBatchClusterDefaults(Parameters *p) {
     p->clusterVersion = Parameters::CLUSTER_VERSION1;
     p->createdbMode = Parameters::SEQUENCE_SPLIT_MODE_SOFT;   // soft-link: skip DB data copy; batch materializes single-line FASTA first
     p->removeTmpFiles = true;   // batch scale accumulates per-chunk tmp; clean by default
+    p->sortBySeqLength = true;  // lets align2clust skip the SORT_BY_LENGTH id mapping (2*8 byte/seq)
 }
 
 bool isNonSymmetricCovMode(const Parameters &par) {
@@ -366,7 +368,9 @@ std::string buildCreatedbPar(const Parameters &par) {
     // build). Only the index is rewritten, so soft-linked chunks keep their symlink, and the
     // representative sub-databases of later rounds inherit the order for free, being a subsequence
     // of a non-increasing run. Clustering results are unchanged.
-    return "--shuffle 0 --write-lookup 0 --sort-by-length 1 --createdb-mode " + SSTR(par.createdbMode) +
+    // --sort-by-length defaults to 1 for batch (setBatch*Defaults); --sort-by-length 0 turns it off
+    return "--shuffle 0 --write-lookup 0 --sort-by-length " + std::string(par.sortBySeqLength ? "1" : "0") +
+           " --createdb-mode " + SSTR(par.createdbMode) +
            " --threads " + SSTR(par.threads) + " -v " + SSTR(par.verbosity);
 }
 
@@ -598,6 +602,35 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
     if (par.PARAM_BATCH_AWS_MACHINE_TAG_KEY.wasSet) {
         cmd.addVariable("BATCH_AWS_MACHINE_TAG_KEY", par.batchAwsMachineTagKey.c_str());
     }
+
+    // Knobs that used to be environment-only. Exported unconditionally so the run is fully
+    // described by the command line; the empty string keeps the shell's "derive it" behaviour.
+    cmd.addVariable("ROUND0_MMSEQS", par.batchRound0Mmseqs.c_str());
+    cmd.addVariable("ROUND0_CREATEDB_MODE", SSTR(par.batchRound0CreatedbMode).c_str());
+    cmd.addVariable("COMPRESS_RATIO", SSTR(par.batchCompressRatio).c_str());
+    cmd.addVariable("BATCH_DELETE_SOURCE_CHUNK", par.batchDeleteSourceChunk ? "1" : "0");
+    cmd.addVariable("SORT_TMP", par.batchSortTmpDir.c_str());
+    // SORT_BUFFER_SIZE is only exported when asked for: the shell tests for an *unset* variable to
+    // decide whether to derive it from available memory, so an empty export would pin it to "".
+    if (par.batchSortBufferSize.empty() == false) {
+        cmd.addVariable("SORT_BUFFER_SIZE", par.batchSortBufferSize.c_str());
+    }
+    cmd.addVariable("BATCH_AWS_MMSEQS", par.batchAwsMmseqs.c_str());
+    cmd.addVariable("ROUND0_BATCH_AWS_MMSEQS", par.batchRound0AwsMmseqs.c_str());
+    cmd.addVariable("BATCH_AWS_JOB_PREFIX", par.batchAwsJobPrefix.c_str());
+    cmd.addVariable("BATCH_AWS_LOCAL_DIR", par.batchAwsLocalDir.c_str());
+    cmd.addVariable("BATCH_AWS_TIMEOUT", SSTR(par.batchAwsTimeout).c_str());
+    cmd.addVariable("BATCH_AWS_ALLOW_NONS3_INPUT", par.batchAwsAllowNonS3Input ? "1" : "0");
+    cmd.addVariable("BATCH_AWS_DRY_RUN", par.batchAwsDryRun ? "1" : NULL);
+    // both derive from the work prefix when left empty, so only export a real override
+    if (par.batchAwsScriptUri.empty() == false) {
+        cmd.addVariable("BATCH_AWS_SCRIPT_URI", par.batchAwsScriptUri.c_str());
+    }
+    if (par.batchAwsChunkPrefix.empty() == false) {
+        cmd.addVariable("S3_CHUNK_PREFIX", par.batchAwsChunkPrefix.c_str());
+    }
+    cmd.addVariable("BATCH_AWS_WORKER_ATTEMPTS",
+                    par.batchAwsWorkerAttempts > 0 ? SSTR(par.batchAwsWorkerAttempts).c_str() : NULL);
 }
 
 int execBatchEngine(Parameters &par, const std::string &programDir,
