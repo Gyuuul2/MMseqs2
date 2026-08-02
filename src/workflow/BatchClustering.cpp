@@ -25,7 +25,7 @@ void setBatchLinclustDefaults(Parameters *p) {
     p->alignmentMode = Parameters::ALIGNMENT_MODE_SCORE_COV_SEQID;
     p->linclustVersion = Parameters::LINCLUST_VERSION2;
     p->clustHash = false;
-    p->createdbMode = Parameters::SEQUENCE_SPLIT_MODE_HARD;
+    p->createdbMode = Parameters::SEQUENCE_SPLIT_MODE_SOFT;   // soft-link: skip DB data copy; batch materializes single-line FASTA first
     p->removeTmpFiles = true;   // batch scale accumulates per-chunk tmp; clean by default
 }
 
@@ -96,7 +96,7 @@ void setBatchClusterDefaults(Parameters *p) {
     p->alignmentMode = Parameters::ALIGNMENT_MODE_SCORE_COV_SEQID;
     p->maxResListLen = 20;
     p->clusterVersion = Parameters::CLUSTER_VERSION1;
-    p->createdbMode = Parameters::SEQUENCE_SPLIT_MODE_HARD;
+    p->createdbMode = Parameters::SEQUENCE_SPLIT_MODE_SOFT;   // soft-link: skip DB data copy; batch materializes single-line FASTA first
     p->removeTmpFiles = true;   // batch scale accumulates per-chunk tmp; clean by default
 }
 
@@ -357,9 +357,9 @@ std::string buildCreatedbPar(const Parameters &par) {
     // --write-lookup 0: the per-chunk .lookup is unused here. The inner clust reads .lookup only
     // in set-mode (clusteringSetMode), which the batch entry points never enable; accessions come
     // from the _h header DB (createtsv/convert2fasta), so the .lookup only costs time and disk.
-    // --createdb-mode 0: let createdb read FASTA/.zst natively and write the compact sequence DB.
-    // Mode 1 is left as an explicit opt-in only; in batch it requires materializing a plain FASTA
-    // first, which is slower and does not reduce node-local peak disk for compressed chunks.
+    // --createdb-mode 1 (soft-link) is the batch default: the batch materializes one node-local
+    // single-line FASTA per chunk (append_singleline_fasta) and createdb soft-links it, skipping the
+    // compact-DB data copy. Set --createdb-mode 0 to fall back to copying (reads FASTA/.zst natively).
     return "--shuffle 0 --write-lookup 0 --createdb-mode " + SSTR(par.createdbMode) + " --threads " +
            SSTR(par.threads) + " -v " + SSTR(par.verbosity);
 }

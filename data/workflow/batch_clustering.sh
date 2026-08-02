@@ -64,7 +64,7 @@ COMPRESS_BATCH_OUTPUTS=${COMPRESS_BATCH_OUTPUTS:-0}
 # set-mode (never enabled from batch entry points); accessions come from the _h header DB, not it.
 # --createdb-mode 0: createdb reads FASTA/.zst natively and writes the compact sequence DB. Mode 1
 # is explicit opt-in only; batch must materialize plain FASTA first, which is slower for .zst chunks.
-CREATEDB_PAR=${CREATEDB_PAR:---shuffle 0 --write-lookup 0 --createdb-mode 0}
+CREATEDB_PAR=${CREATEDB_PAR:---shuffle 0 --write-lookup 0 --createdb-mode 1}
 createdb_mode_from_par() {
     local par=" ${CREATEDB_PAR} "
     if [[ "$par" =~ [[:space:]]--createdb-mode=([0-9]+) ]]; then
@@ -449,13 +449,13 @@ stream_uri() {
     if is_s3 "$uri"; then
         need_cmd aws
         case "$uri" in
-            *.zst) need_cmd zstd; aws s3 cp "$uri" - --no-progress | zstd -dc ;;
+            *.zst) need_cmd pzstd; aws s3 cp "$uri" - --no-progress | pzstd -dc ;;
             *.gz)  aws s3 cp "$uri" - --no-progress | gzip -dc ;;
             *)     aws s3 cp "$uri" - --no-progress ;;
         esac
     else
         case "$uri" in
-            *.zst) need_cmd zstd; zstd -dc "$uri" ;;
+            *.zst) need_cmd pzstd; pzstd -dc "$uri" ;;
             *.gz)  gzip -dc "$uri" ;;
             *)     cat "$uri" ;;
         esac
@@ -486,8 +486,9 @@ s3_list_prefix() {
 compress_to_zst() {
     local src="$1"
     local dst="$2"
-    need_cmd zstd
-    zstd -q -f -3 -T"$THREADS" -c "$src" > "$dst"
+    need_cmd pzstd
+    # pzstd writes a multi-frame .zst so it can later be decompressed in parallel (pzstd -dc).
+    pzstd -p "$THREADS" -3 -c "$src" > "$dst"
 }
 
 compress_batch_outputs_enabled() {
@@ -518,6 +519,29 @@ write_batch_output() {
 
 createdb_softlink_enabled() {
     [[ " ${CREATEDB_PAR} " =~ (^|[[:space:]])--createdb-mode(=|[[:space:]]+)1($|[[:space:]]) ]]
+}
+
+# createdb mode is round-dependent. round0 chunks are single-frame zstd (no parallel pzstd -dc), so
+# soft-link mode 1 only adds materialize + reindex I/O -> use native mode 0. Set ROUND0_CREATEDB_MODE=1
+# once round0 chunks are multi-frame. round1+ representatives are pzstd multi-frame, so mode 1 (soft-link
+# + parallel decompress) pays off; it follows CREATEDB_PAR's mode (default 1).
+round_createdb_softlink() {
+    local round="$1"
+    if [[ "$round" -eq 0 ]]; then
+        [[ "${ROUND0_CREATEDB_MODE:-0}" == "1" ]]
+    else
+        createdb_softlink_enabled
+    fi
+}
+
+round_createdb_par() {
+    local round="$1"
+    # Append the round's --createdb-mode last so it overrides the one already in CREATEDB_PAR.
+    if round_createdb_softlink "$round"; then
+        printf '%s --createdb-mode 1' "$CREATEDB_PAR"
+    else
+        printf '%s --createdb-mode 0' "$CREATEDB_PAR"
+    fi
 }
 
 append_singleline_fasta() {
@@ -1032,7 +1056,7 @@ cluster_chunk() {
     local createdb_input
     case "$chunk_uri" in
         *.filelist.tsv)
-            if createdb_softlink_enabled; then
+            if round_createdb_softlink "$round"; then
                 createdb_input="$work_dir/${chunk_id}.fa"
                 materialize_softlink_filelist "$chunk_uri" "$createdb_input"
             else
@@ -1041,9 +1065,15 @@ cluster_chunk() {
             fi
             ;;
         *)
-            if createdb_softlink_enabled; then
+            if round_createdb_softlink "$round"; then
                 createdb_input="$work_dir/${chunk_id}.fa"
                 materialize_softlink_fasta "$chunk_uri" "$createdb_input"
+                # Disk is the bottleneck: once the single-line FASTA exists, clustering reads the
+                # soft-linked FASTA, not the source .zst -- free the local source chunk now, not at
+                # chunk end. (Only local chunks we own; skips S3/originals. Retry then re-fetches.)
+                if [[ -n "${REMOVE_TMP:-}" && "${BATCH_DELETE_SOURCE_CHUNK:-0}" == "1" && "$chunk_uri" != s3://* && -f "$chunk_uri" ]]; then
+                    rm -f "$chunk_uri"
+                fi
             else
                 case "$chunk_uri" in
                     s3://*)
@@ -1072,13 +1102,13 @@ cluster_chunk() {
     need_cmd "$mmseqs_bin"
     log "createdb ${chunk_id}"
     # shellcheck disable=SC2086
-    "$mmseqs_bin" createdb "$createdb_input" "$db" ${CREATEDB_PAR} || fail "createdb failed (chunk ${chunk_id}, rc=$?)"
+    "$mmseqs_bin" createdb "$createdb_input" "$db" $(round_createdb_par "$round") || fail "createdb failed (chunk ${chunk_id}, rc=$?)"
     local actual_seqs
     actual_seqs=$(wc -l < "${db}.index" | tr -d ' ')
     if [[ "${expected_seqs:-0}" =~ ^[1-9][0-9]*$ && "$actual_seqs" -ne "$expected_seqs" ]]; then
         fail "createdb sequence-count mismatch for ${chunk_id}: manifest=${expected_seqs}, db.index=${actual_seqs}. Input may be truncated or corrupt."
     fi
-    if createdb_softlink_enabled && [[ ! -L "$db" || ! -L "${db}_h" ]]; then
+    if round_createdb_softlink "$round" && [[ ! -L "$db" || ! -L "${db}_h" ]]; then
         fail "createdb-mode 1 fell back to a copied DB for ${chunk_id}. Batch softlink mode requires plain single-line FASTA; refusing silent NVMe expansion."
     fi
 
