@@ -303,9 +303,7 @@ int mergeSequentialByJointIndex(
     return 0;
 }
 
-// same order DBReader::SORT_BY_LENGTH produces: length descending, ties by key ascending.
-// Do not use Index::compareByLength reversed, it breaks ties the other way round and would
-// give a database a later SORT_BY_LENGTH reader does not reproduce.
+// SORT_BY_LENGTH order: length descending, ties by key ascending (not compareByLength reversed)
 struct compareIndexBySeqLength {
     bool operator() (const DBReader<DBKeyType>::Index &lhs, const DBReader<DBKeyType>::Index &rhs) const {
         if (lhs.length > rhs.length)
@@ -320,15 +318,12 @@ struct compareIndexBySeqLength {
     }
 };
 
-// renumber the sequence and header db so that key i is the i-th longest sequence.
-// Only the indexes are rewritten, like DBWriter::createRenumberedDB, but the header
-// order follows the sequence order instead of the header's own length.
+// renumber both dbs so key i is the i-th longest sequence; index only, header follows sequence order
 static void renumberDbBySeqLength(const std::string &seqDataFile, const std::string &seqIndexFile,
                                   const std::string &hdrDataFile, const std::string &hdrIndexFile,
                                   const std::string &lookupFile, const std::vector<unsigned int> &sourceLookup,
                                   DBKeyType identifierOffset, bool writeLookup) {
-    // HARDNOSORT and sorting the index in place, so the two DBLocalId mapping arrays
-    // SORT_BY_LENGTH would allocate (2 * 8 byte per entry) are never needed here
+    // in-place sort under HARDNOSORT avoids the SORT_BY_LENGTH mapping arrays
     DBReader<DBKeyType> seqReader(seqDataFile.c_str(), seqIndexFile.c_str(), 1, DBReader<DBKeyType>::USE_INDEX);
     seqReader.open(DBReader<DBKeyType>::HARDNOSORT);
     SORT_PARALLEL(seqReader.getIndex(), seqReader.getIndex() + seqReader.getSize(), compareIndexBySeqLength());
@@ -354,8 +349,7 @@ static void renumberDbBySeqLength(const std::string &seqDataFile, const std::str
         lookupOut = FileUtil::openAndDelete(lookupTmp.c_str(), "w");
     }
 
-    // NOSORT leaves the header index id sorted and createdb hands out keys sequentially,
-    // so a key sits at the position it was written at. getId() covers non-dense keys.
+    // keys are sequential, so a key sits at its write position; getId() covers gaps
     const DBKeyType firstHdrKey = (hdrReader.getSize() > 0) ? hdrReader.getIndex(0)->id : 0;
 
     char buffer[1024];
@@ -393,8 +387,7 @@ static void renumberDbBySeqLength(const std::string &seqDataFile, const std::str
             if (entry.entryName.empty()) {
                 Debug(Debug::WARNING) << "Cannot extract identifier from entry " << oldKey << "\n";
             }
-            // sourceLookup was filled in write order, which is the id sorted position
-            // of the entry, so index it the same way the unsorted lookup pass does
+            // sourceLookup is in write order = id sorted position
             if (hdrId >= sourceLookup.size()) {
                 Debug(Debug::ERROR) << "Cannot find source file for key " << oldKey << "\n";
                 EXIT(EXIT_FAILURE);

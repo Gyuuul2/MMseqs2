@@ -523,8 +523,7 @@ public:
     bool batchCompressOutputs;
     int batchMergeBuckets;
     int batchMergeBucketJobs;
-    // knobs that used to be readable only from the environment. They change chunk boundaries, which
-    // binary runs, or whether inputs are deleted, so they have to appear on the command line.
+    // former environment-only knobs; they affect results, so they belong on the command line
     std::string batchRound0Mmseqs;
     int batchRound0CreatedbMode;
     int batchCompressRatio;

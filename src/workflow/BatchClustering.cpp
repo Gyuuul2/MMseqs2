@@ -27,7 +27,8 @@ void setBatchLinclustDefaults(Parameters *p) {
     p->clustHash = false;
     p->createdbMode = Parameters::SEQUENCE_SPLIT_MODE_SOFT;   // soft-link: skip DB data copy; batch materializes single-line FASTA first
     p->removeTmpFiles = true;   // batch scale accumulates per-chunk tmp; clean by default
-    p->sortBySeqLength = true;  // lets align2clust skip the SORT_BY_LENGTH id mapping (2*8 byte/seq)
+    p->sortBySeqLength = true;  // align2clust then skips the SORT_BY_LENGTH id mapping
+    p->batchDeleteSourceChunk = true;  // reclaim each chunk as it is consumed; disk is the bottleneck
 }
 
 int parseRequestedThreads(int argc, const char **argv) {
@@ -99,7 +100,8 @@ void setBatchClusterDefaults(Parameters *p) {
     p->clusterVersion = Parameters::CLUSTER_VERSION1;
     p->createdbMode = Parameters::SEQUENCE_SPLIT_MODE_SOFT;   // soft-link: skip DB data copy; batch materializes single-line FASTA first
     p->removeTmpFiles = true;   // batch scale accumulates per-chunk tmp; clean by default
-    p->sortBySeqLength = true;  // lets align2clust skip the SORT_BY_LENGTH id mapping (2*8 byte/seq)
+    p->sortBySeqLength = true;  // align2clust then skips the SORT_BY_LENGTH id mapping
+    p->batchDeleteSourceChunk = true;  // reclaim each chunk as it is consumed; disk is the bottleneck
 }
 
 bool isNonSymmetricCovMode(const Parameters &par) {
@@ -362,13 +364,7 @@ std::string buildCreatedbPar(const Parameters &par) {
     // --createdb-mode 1 (soft-link) is the batch default: the batch materializes one node-local
     // single-line FASTA per chunk (append_singleline_fasta) and createdb soft-links it, skipping the
     // compact-DB data copy. Set --createdb-mode 0 to fall back to copying (reads FASTA/.zst natively).
-    // --sort-by-length 1: hand out keys by decreasing sequence length so the sequence DB readers
-    // opened with SORT_BY_LENGTH (align2clust, clust) take the identity fast path and never allocate
-    // id2local/local2id, 2 * sizeof(DBLocalId) per sequence (54 GB at 3.4 billion in the 64-bit
-    // build). Only the index is rewritten, so soft-linked chunks keep their symlink, and the
-    // representative sub-databases of later rounds inherit the order for free, being a subsequence
-    // of a non-increasing run. Clustering results are unchanged.
-    // --sort-by-length defaults to 1 for batch (setBatch*Defaults); --sort-by-length 0 turns it off
+    // --sort-by-length (batch default 1): keys by decreasing length, align2clust skips the id mapping
     return "--shuffle 0 --write-lookup 0 --sort-by-length " + std::string(par.sortBySeqLength ? "1" : "0") +
            " --createdb-mode " + SSTR(par.createdbMode) +
            " --threads " + SSTR(par.threads) + " -v " + SSTR(par.verbosity);
@@ -603,15 +599,13 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
         cmd.addVariable("BATCH_AWS_MACHINE_TAG_KEY", par.batchAwsMachineTagKey.c_str());
     }
 
-    // Knobs that used to be environment-only. Exported unconditionally so the run is fully
-    // described by the command line; the empty string keeps the shell's "derive it" behaviour.
+    // former environment-only knobs; empty keeps the shell's derive-it path
     cmd.addVariable("ROUND0_MMSEQS", par.batchRound0Mmseqs.c_str());
     cmd.addVariable("ROUND0_CREATEDB_MODE", SSTR(par.batchRound0CreatedbMode).c_str());
     cmd.addVariable("COMPRESS_RATIO", SSTR(par.batchCompressRatio).c_str());
     cmd.addVariable("BATCH_DELETE_SOURCE_CHUNK", par.batchDeleteSourceChunk ? "1" : "0");
     cmd.addVariable("SORT_TMP", par.batchSortTmpDir.c_str());
-    // SORT_BUFFER_SIZE is only exported when asked for: the shell tests for an *unset* variable to
-    // decide whether to derive it from available memory, so an empty export would pin it to "".
+    // the shell tests for unset to derive it, so only export a real override
     if (par.batchSortBufferSize.empty() == false) {
         cmd.addVariable("SORT_BUFFER_SIZE", par.batchSortBufferSize.c_str());
     }
@@ -622,7 +616,7 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
     cmd.addVariable("BATCH_AWS_TIMEOUT", SSTR(par.batchAwsTimeout).c_str());
     cmd.addVariable("BATCH_AWS_ALLOW_NONS3_INPUT", par.batchAwsAllowNonS3Input ? "1" : "0");
     cmd.addVariable("BATCH_AWS_DRY_RUN", par.batchAwsDryRun ? "1" : NULL);
-    // both derive from the work prefix when left empty, so only export a real override
+    // derived from the work prefix when empty
     if (par.batchAwsScriptUri.empty() == false) {
         cmd.addVariable("BATCH_AWS_SCRIPT_URI", par.batchAwsScriptUri.c_str());
     }

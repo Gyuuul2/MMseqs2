@@ -45,21 +45,12 @@ set them directly only when running this script standalone):
   BATCH_AWS_MMSEQS ROUND0_BATCH_AWS_MMSEQS BATCH_AWS_SCRIPT_URI BATCH_AWS_LOCAL_DIR BATCH_AWS_TIMEOUT BATCH_AWS_DRY_RUN
   BATCH_DELETE_SOURCE_CHUNK ROUND0_CREATEDB_MODE S3_CHUNK_PREFIX BATCH_AWS_ALLOW_NONS3_INPUT
   (AWS env var names must NOT start with 'AWS_BATCH' -- that prefix is reserved by the AWS Batch service.)
-  All of the above are also reachable as command line parameters, e.g. --round0-mmseqs, --compress-ratio,
-  --delete-source-chunk, --sort-tmp-dir, --sort-buffer-size, --aws-mmseqs, --aws-job-prefix,
-  --aws-local-dir, --aws-script-uri, --aws-chunk-prefix, --aws-timeout, --aws-worker-attempts,
-  --aws-dry-run, --aws-allow-nons3-input, --round0-createdb-mode.
+  All of the above also exist as command line parameters (see 'mmseqs linclust-batch -h').
 EOF
     exit 1
 }
 
-# INVARIANT for every ${VAR:-default} below: the default has to match the corresponding default in
-# src/commons/Parameters.cpp (Parameters::setDefaults) / src/workflow/BatchClustering.cpp
-# (addBatchEngineVariables, buildCreatedbPar). mmseqs always exports these, so the fallbacks here are
-# only reached when the script is run directly -- they exist so that a standalone run chunks and
-# clusters identically to an mmseqs-driven one. Change one side and you have to change the other.
-# Variables that mmseqs exports only when the user set them (SLURM/AWS targets, round0 overrides,
-# --sort-buffer-size, ...) are the exception: for those the fallback here IS the default.
+# INVARIANT: every ${VAR:-default} below must match Parameters::setDefaults / addBatchEngineVariables.
 MMSEQS=${MMSEQS:-mmseqs}
 # Optional round0-specific mmseqs binary (multi-node): when round0 runs on a different-architecture
 # node pool than round1+ (e.g. ARM round0 / x86 round1+ on a heterogeneous SLURM cluster), a single
@@ -171,8 +162,7 @@ ROUND0_BATCH_AWS_MACHINE=${ROUND0_BATCH_AWS_MACHINE:-}
 BATCH_AWS_MACHINE_TAG_KEY=${BATCH_AWS_MACHINE_TAG_KEY:-mmseqs:machine}
 BATCH_SCRIPT="$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd -P)/$(basename -- "$0")"
 
-# mmseqs rejects a repeated flag ("Duplicate parameter --x") instead of taking the last one, so a
-# round-dependent override has to drop the flag from the base parameters before appending its own.
+# mmseqs rejects a repeated flag, so drop it from the base before appending the round's value.
 par_without_flag() {
     local par="$1" flag="$2"
     printf '%s' "$par" \
@@ -668,6 +658,8 @@ materialize_softlink_fasta() {
     local src="$1"
     local dst="$2"
     local tmp="${dst}.tmp.$$"
+    # left by a previous attempt; mv below is atomic, so an existing dst is complete
+    [[ -s "$dst" ]] && return 0
     mkdir -p "$(dirname "$dst")"
     : > "$tmp"
     append_singleline_fasta "$src" "$tmp"
@@ -679,6 +671,7 @@ materialize_softlink_filelist() {
     local filelist="$1"
     local dst="$2"
     local tmp="${dst}.tmp.$$"
+    [[ -s "$dst" ]] && return 0
     local mem count=0
     mkdir -p "$(dirname "$dst")"
     : > "$tmp"
@@ -1020,16 +1013,19 @@ resolve_chunk_filelist() {
 # Remove a chunk's scratch. Normally the whole dedicated work dir goes; but the hidden
 # linclust-batch-worker / cluster-batch-worker entry points exec the workflow script from INSIDE
 # their work dir (programDir == work_dir), so there keep the script and scrub only what it created.
+# Keeps *.fa: after the source chunk is reclaimed it is the only input a retry can rebuild from.
 scrub_chunk_workdir() {
-    local d="$1"
-    [[ -n "$d" ]] || return 0
-    case "$BATCH_SCRIPT" in
-        "$d"/*)
-            rm -rf "$d/db" "$d/tmp" "$d/result"
-            rm -f "$d"/member-* "$d"/*.filelist.tsv "$d"/*.fa "$d"/*.fa.zst "$d"/*.fa.gz "$d"/*.fa.tmp.* 2>/dev/null || true
-            ;;
-        *) rm -rf "${d:?}" ;;
-    esac
+    local d="$1" f
+    [[ -n "$d" && -d "$d" ]] || return 0
+    rm -rf "$d/db" "$d/tmp" "$d/result"
+    for f in "$d"/*; do
+        [[ -e "$f" ]] || continue
+        case "$f" in
+            *.fa | "$BATCH_SCRIPT") continue ;;
+        esac
+        rm -rf "$f"
+    done
+    rmdir "$d" 2>/dev/null || true
 }
 
 cluster_chunk() {
@@ -1083,9 +1079,7 @@ cluster_chunk() {
             if round_createdb_softlink "$round"; then
                 createdb_input="$work_dir/${chunk_id}.fa"
                 materialize_softlink_fasta "$chunk_uri" "$createdb_input"
-                # Disk is the bottleneck: once the single-line FASTA exists, clustering reads the
-                # soft-linked FASTA, not the source .zst -- free the local source chunk now, not at
-                # chunk end. (Only local chunks we own; skips S3/originals. Retry then re-fetches.)
+                # free the local source chunk now; a retry rebuilds from the materialized FASTA
                 if [[ -n "${REMOVE_TMP:-}" && "${BATCH_DELETE_SOURCE_CHUNK:-0}" == "1" && "$chunk_uri" != s3://* && -f "$chunk_uri" ]]; then
                     rm -f "$chunk_uri"
                 fi
@@ -1744,7 +1738,7 @@ cluster_manifest_single() {
             fi
             local task_work
             task_work=$(make_chunk_work_dir "$round_work_dir" "$chunk_id" "$round")
-            if ! env BATCH_WORKER_DISPATCH=1 BATCH_DELETE_SOURCE_CHUNK=1 bash "$BATCH_SCRIPT" cluster-chunk "$chunk_uri" "$result_prefix" "$task_work" "$chunk_id" "$round" "${seqs:-0}"; then
+            if ! env BATCH_WORKER_DISPATCH=1 bash "$BATCH_SCRIPT" cluster-chunk "$chunk_uri" "$result_prefix" "$task_work" "$chunk_id" "$round" "${seqs:-0}"; then
                 failed=1
             fi
         done < "$chunk_manifest"
@@ -1876,7 +1870,7 @@ slurm_worker() {
             task_work=$(make_chunk_work_dir "$round_work_dir" "$chunk_id" "$round")
             log "slurm-worker round ${round} shard ${shard}/${num_shards}: ${chunk_id}"
             set +e
-            env BATCH_WORKER_DISPATCH=1 BATCH_DELETE_SOURCE_CHUNK=1 bash "$BATCH_SCRIPT" cluster-chunk "$chunk_uri" "$result_prefix" "$task_work" "$chunk_id" "$round" "${seqs:-0}"
+            env BATCH_WORKER_DISPATCH=1 bash "$BATCH_SCRIPT" cluster-chunk "$chunk_uri" "$result_prefix" "$task_work" "$chunk_id" "$round" "${seqs:-0}"
             rc=$?
             set -e
             [[ "$rc" -eq 0 ]] || log "slurm-worker: chunk ${chunk_id} FAILED (rc=$rc); left no done-marker for retry/dead-letter"
@@ -2378,7 +2372,7 @@ aws_worker() {
     log "aws-worker round ${round} index ${index}: ${chunk_id} ${chunk_uri}"
     local chunk_rc=0
     set +e
-    env BATCH_WORKER_DISPATCH=1 BATCH_DELETE_SOURCE_CHUNK=1 bash "$BATCH_SCRIPT" cluster-chunk \
+    env BATCH_WORKER_DISPATCH=1 bash "$BATCH_SCRIPT" cluster-chunk \
         "$chunk_uri" "$result_prefix" "$local_root/work" "$chunk_id" "$round" "${seqs:-0}"
     chunk_rc=$?
     set -e

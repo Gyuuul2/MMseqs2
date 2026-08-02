@@ -346,9 +346,7 @@ void DBReader<DBKeyType>::sortIndex(bool isSortedById) {
         }
     }
     if (accessType == SORT_BY_LENGTH) {
-        // do not sort if its already in correct order
-        // comparePairBySeqLength breaks ties by the id sorted position, so a non-increasing
-        // length run already is the identity permutation and needs no mapping
+        // do not sort if its already in correct order (identity permutation, no mapping)
         bool isSortedByLength = true;
         for (size_t i = 1; i < size; i++) {
             if (index[i - 1].length < index[i].length) {

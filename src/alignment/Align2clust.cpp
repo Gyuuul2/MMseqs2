@@ -137,7 +137,10 @@ static void compactSetCoverMemberPool() {
     setCoverMemberPool.swap(compactedPool);
 }
 
-// Env override for the reorder-buffer size; 0 (unset/invalid) means size from memory.
+// memory-derived capacity holds 100Ms of pending member vectors and buys no throughput over this
+static const size_t ALIGN2CLUST_DEFAULT_REORDER_LIMIT = 5 * 1000 * 1000;
+
+// Env override for the reorder-buffer size; 0 (unset/invalid) means the default cap above.
 static size_t getReorderBufferLimitFromEnv() {
     const char *envValue = getenv("MMSEQS_ALIGN2CLUST_REORDER_LIMIT");
     if (envValue == nullptr || *envValue == '\0') {
@@ -171,10 +174,8 @@ static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int m
     const size_t bytesPerResult = sizeof(ClusterResult) + (par.maxResListLen + 1) * sizeof(DBLocalId);
 
     size_t capacity = std::min(resultCount, std::max<size_t>(1, budget / bytesPerResult));
-    const size_t userCap = getReorderBufferLimitFromEnv();  // 0 == auto
-    if (userCap != 0) {
-        capacity = std::min(capacity, userCap);
-    }
+    const size_t userCap = getReorderBufferLimitFromEnv();  // 0 == use the default cap
+    capacity = std::min(capacity, userCap != 0 ? userCap : ALIGN2CLUST_DEFAULT_REORDER_LIMIT);
     capacity = std::max<size_t>(1, capacity);
 
     Debug(Debug::INFO) << "Reorder buffer sizing: memory limit " << memoryLimit << " byte, reserved (fixed) "
@@ -231,16 +232,12 @@ static float parsePrecisionLib(const std::string &scoreFile, double targetSeqid,
     return 0;
 }
 
-// Clusters are written as soon as they are final, so the (representative, member) pair
-// array for the whole database (16 byte per entry) is never materialized. The cluster
-// thread is the only writer while workers run; the singleton pass runs after it joined.
+// Written as clusters become final, so the whole-database (rep, member) pair array is never built.
 static DBReader<DBKeyType> *clusterSeqDbr = nullptr;
 static DBWriter *clusterResultWriter = nullptr;
 static std::string clusterResultBuffer;
 static std::vector<DBKeyType> clusterMemberKeys;
-// one bit per local id, set once the id was written as a representative. A representative
-// missing from its own prefilter list stays unassigned, so without this the singleton
-// pass would write its key a second time.
+// set when an id was written as a rep; a rep absent from its own prefilter list would be written twice
 static std::vector<unsigned char> writtenRepresentative;
 static size_t clusterCount = 0;
 
@@ -269,6 +266,29 @@ static void writeCluster(DBLocalId representativeId, const DBLocalId *memberIds,
     clusterResultWriter->writeData(clusterResultBuffer.c_str(), clusterResultBuffer.length(), representativeKey);
     writtenRepresentative[representativeId >> 3] |= static_cast<unsigned char>(1u << (representativeId & 7));
     clusterCount++;
+}
+
+// length-only gate over a cluster's members: index reads only, no sequence data touched
+static bool clusterMembersCanBeCovered(DBReader<DBKeyType> *cluSeqDbr, const Parameters &par,
+                                       char *cluData, DBKeyType targetKey, int queryLen) {
+    char buffer[1024];
+    char *scan = cluData;
+    while (*scan != '\0') {
+        Util::parseKey(scan, buffer);
+        const DBKeyType memberKey = Util::fast_atoi<DBKeyType>(buffer);
+        if (memberKey != targetKey) {
+            const size_t memberId = cluSeqDbr->getId(memberKey);
+            if (memberId == DB_ENTRY_NOT_FOUND) {
+                Debug(Debug::ERROR) << "Filter sequence DB has no entry for key " << memberKey << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            if (Util::canBeCovered(par.covThr, par.covMode, queryLen, cluSeqDbr->getSeqLen(memberId)) == false) {
+                return false;
+            }
+        }
+        scan = Util::skipLine(scan);
+    }
+    return true;
 }
 
 static void (*clusterThreadFunc)(ClusterAssignment*) = nullptr;
@@ -408,8 +428,7 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
                 storeAssignedCluster(assignedCluster, memberId, result.representativeId);
             }
 
-            // result is already detached from the ring buffer, so release the mutex for
-            // the write and let worker threads keep pushing results
+            // detached from the ring, so write without the mutex
             lock.unlock();
             writeCluster(result.representativeId, validMemberIds.data(), validMemberIds.size());
             lock.lock();
@@ -432,7 +451,8 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             par.filterCluDBFile.c_str(), cluIndex.c_str(), par.threads, 
             DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
         );
-        cluDbr->open(DBReader<DBKeyType>::LINEAR_ACCCESS);
+        // NOSORT: only ever read by key lookup, so the LINEAR_ACCCESS id mapping is dead weight
+        cluDbr->open(DBReader<DBKeyType>::NOSORT);
 
         std::string cluSeqIndex = par.filterSeqDBFile + ".index";
         cluSeqDbr = new DBReader<DBKeyType>(
@@ -440,7 +460,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
         );
             
-        cluSeqDbr->open(DBReader<DBKeyType>::LINEAR_ACCCESS);
+        cluSeqDbr->open(DBReader<DBKeyType>::NOSORT);
     } else if (par.filterCluDBFile.empty() != par.filterSeqDBFile.empty()) {
         Debug(Debug::ERROR)<< "Error: Both filterCluDBFile and filterSeqDBFile should be provided together.\n";
         EXIT(EXIT_FAILURE);
@@ -590,8 +610,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             ClusterResult clusterResult;
             clusterResult.sequenceIdx = i;
             targetsWithDiagonal.clear();
-            // clear() keeps the capacity, so one huge hit list would pin it for the whole
-            // run in every thread that saw one
+            // clear() keeps capacity, so one huge hit list would pin it
             if (targetsWithDiagonal.capacity() > ALIGN2CLUST_MAX_TARGET_CAPACITY) {
                 targetsWithDiagonal.shrink_to_fit();
                 targetsWithDiagonal.reserve(1000);
@@ -717,6 +736,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     if (par.filterCluDBFile.empty()== false && par.filterSeqDBFile.empty()== false){
                         // check all the member from filtering file
                         const size_t cluId = cluDbr->getId(targetKey);
+                        if (cluId == DB_ENTRY_NOT_FOUND) {
+                            Debug(Debug::ERROR) << "Filter cluster DB has no entry for key " << targetKey << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
                         char *cluData = cluDbr->getData(cluId, threadIdx);
                         const size_t cluDataSize = cluDbr->getEntryLen(cluId);
                         size_t numClu = Util::countLines(cluData, cluDataSize);
@@ -725,7 +748,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                         if (includeAlignFiles) {
                             pendingMemberAln.clear();
                         }
-                        if (numClu > 1) { // if not singleton
+                        if (numClu > 1) {
+                            allpass = clusterMembersCanBeCovered(cluSeqDbr, par, cluData, targetKey, query.L);
+                        }
+                        if (allpass && numClu > 1) { // if not singleton
                             while (*cluData != '\0') {
                                 Util::parseKey(cluData, buffer);
 
@@ -735,6 +761,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                     continue;
                                 }
                                 const size_t elementId = cluSeqDbr->getId(elementKey);
+                                if (elementId == DB_ENTRY_NOT_FOUND) {
+                                    Debug(Debug::ERROR) << "Filter sequence DB has no entry for key " << elementKey << "\n";
+                                    EXIT(EXIT_FAILURE);
+                                }
                                 char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
                                 size_t elementLength = cluSeqDbr->getSeqLen(elementId);
                                 short elementDiagonal = diagonal;
@@ -859,6 +889,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                         if (par.filterCluDBFile.empty()== false && par.filterSeqDBFile.empty()== false){
                             // check all the member from filtering file
                             const size_t cluId = cluDbr->getId(targetKey);
+                            if (cluId == DB_ENTRY_NOT_FOUND) {
+                                Debug(Debug::ERROR) << "Filter cluster DB has no entry for key " << targetKey << "\n";
+                                EXIT(EXIT_FAILURE);
+                            }
                             char *cluData = cluDbr->getData(cluId, threadIdx);
                             const size_t cluDataSize = cluDbr->getEntryLen(cluId);
                             size_t numClu = Util::countLines(cluData, cluDataSize);
@@ -867,7 +901,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                             if (includeAlignFiles) {
                                 pendingMemberAln.clear();
                             }
-                            if (numClu > 1) { // if not singleton
+                            if (numClu > 1) {
+                                allpass = clusterMembersCanBeCovered(cluSeqDbr, par, cluData, targetKey, query.L);
+                            }
+                            if (allpass && numClu > 1) { // if not singleton
                                 while (*cluData != '\0') {
                                     Util::parseKey(cluData, buffer);
                                     const DBKeyType elementKey = Util::fast_atoi<DBKeyType>(buffer);
@@ -876,6 +913,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                         continue;
                                     }
                                     const size_t elementId = cluSeqDbr->getId(elementKey);
+                                    if (elementId == DB_ENTRY_NOT_FOUND) {
+                                        Debug(Debug::ERROR) << "Filter sequence DB has no entry for key " << elementKey << "\n";
+                                        EXIT(EXIT_FAILURE);
+                                    }
                                     char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
                                     size_t elementLength = cluSeqDbr->getSeqLen(elementId);
                                     short elementDiagonal = 0;
@@ -957,8 +998,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         clusterThread.join(); 
     }
 
-    // every id the cluster thread left unassigned is a cluster of its own. Ids already
-    // written as a representative are skipped, their entry carries them as the first line.
+    // ids left unassigned are their own cluster; skip ones already written as a rep
     for (size_t i = 0; i < dbSize; ++i) {
         if (loadAssignedCluster(assignedCluster, i) != DB_LOCAL_ID_INVALID) {
             continue;
