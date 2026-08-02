@@ -549,7 +549,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 const size_t alnId = requireId(alnDbr.getId(clusterId), "Alignment DB", clusterId);
                 const char *data = alnDbr.getData(alnId, thread_idx);
                 const size_t dataSize = alnDbr.getEntryLen(alnId);
-                prefRepSizePair[i].id = requireId(seqDbr->getId(clusterId), "Sequence DB", clusterId);
+                prefRepSizePair[i].id = i;
                 prefRepSizePair[i].size = (*data == '\0') ? 1 : Util::countLines(data, dataSize);
             }
         }
@@ -580,7 +580,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         BlockAligner blockAligner(Parameters::DBTYPE_AMINO_ACIDS, db_maxseqlen, subMat, &fastMatrix, 
                                  &evaluer, par.compBiasCorrection, par.compBiasCorrectionScale, 
                                  -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
-        std::vector<std::pair<DBKeyType, unsigned short>> targetsWithDiagonal;
+        std::vector<std::pair<size_t, unsigned short>> targetsWithDiagonal;
         targetsWithDiagonal.reserve(1000);
 
         const bool includeAlignFiles = (alnWriter != nullptr);
@@ -611,7 +611,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 clusterResult.prefSize = prefRepSizePair[i].size;   // precomputed in the prefix pass
             } else { // GREEDY || GREEDY_MEM
                 queryKey = seqDbr->getDbKey(i);
-                representativeId = requireId(seqDbr->getId(queryKey), "Sequence DB", queryKey);
+                representativeId = i;
                 clusterResult.prefSize = 0;                         // greedy has no currentPrefSize gate
             }
             clusterResult.representativeId = representativeId;
@@ -637,12 +637,12 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             size_t prefSize = 0;
             while (*alignmentData != '\0') {
                 hit_t hit = QueryMatcher::parsePrefilterHit(alignmentData);
+                const size_t targetId = requireId(seqDbr->getId(hit.seqId), "Sequence DB", hit.seqId);
                 if (mode == Parameters::SET_COVER) {
-                    targetsWithDiagonal.push_back(std::make_pair(hit.seqId, hit.diagonal));
+                    targetsWithDiagonal.push_back(std::make_pair(targetId, hit.diagonal));
                 } else {
-                    const size_t targetId = requireId(seqDbr->getId(hit.seqId), "Sequence DB", hit.seqId);
                     if (loadAssignedCluster(assignedCluster, targetId) == DB_LOCAL_ID_INVALID) {
-                            targetsWithDiagonal.push_back(std::make_pair(hit.seqId, hit.diagonal));
+                        targetsWithDiagonal.push_back(std::make_pair(targetId, hit.diagonal));
                     }
                 }
                 alignmentData = Util::skipLine(alignmentData);
@@ -660,9 +660,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     break;
                 }
 
-                const DBKeyType targetKey = targetsWithDiagonal[targetIdx].first;
+                const size_t targetId = targetsWithDiagonal[targetIdx].first;
                 const unsigned short diagonal = targetsWithDiagonal[targetIdx].second;
-                const size_t targetId = requireId(seqDbr->getId(targetKey), "Sequence DB", targetKey);
+                const DBKeyType targetKey = seqDbr->getDbKey(targetId);
 
                 const bool isIdentity = (queryKey == targetKey);
                 if (isIdentity) {
