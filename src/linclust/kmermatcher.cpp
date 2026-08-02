@@ -102,6 +102,10 @@ static void flushKmerBuffer(KmerPosition<T, includeAdjacency, IncludeSeqLen> *km
 // bucket b holds exactly the k-mers fillKmerPositionArray(range_b) would emit, and the
 // per-split sort removes any order dependence (the same invariant that makes the split count
 // not affect the result). Per-thread files keep the write lock-free, like writeKmersToDisk.
+static std::string kmerBucketCountFileName(const std::string &base, size_t bucket) {
+    return base + "_" + SSTR(bucket) + ".cnt";
+}
+
 static std::string kmerBucketFileName(const std::string &base, size_t bucket, int tid, bool compressed) {
     std::string name = base + "_" + SSTR(bucket) + "_" + SSTR(tid);
     if (compressed) {
@@ -131,17 +135,20 @@ struct KmerPartitionSink {
     size_t numBuckets;
     bool compress;
     const unsigned int *hashToBucket;   // [USHRT_MAX+1]
+    std::string base;
     std::vector<void *> writers;        // indexed [tid * numBuckets + bucket]: FILE* or zstd writer
     std::vector<KP *> buffers;
     std::vector<size_t> bufPos;
+    std::vector<size_t> recordsWritten;
 
     KmerPartitionSink(const std::string &base, int numThreads, size_t numBuckets,
                       const unsigned int *hashToBucket, bool compress)
-        : numThreads(numThreads), numBuckets(numBuckets), compress(compress), hashToBucket(hashToBucket) {
+        : numThreads(numThreads), numBuckets(numBuckets), compress(compress), hashToBucket(hashToBucket), base(base) {
         size_t slots = static_cast<size_t>(numThreads) * numBuckets;
         writers.assign(slots, NULL);
         buffers.assign(slots, NULL);
         bufPos.assign(slots, 0);
+        recordsWritten.assign(slots, 0);
         for (int tid = 0; tid < numThreads; tid++) {
             for (size_t b = 0; b < numBuckets; b++) {
                 size_t k = static_cast<size_t>(tid) * numBuckets + b;
@@ -157,6 +164,7 @@ struct KmerPartitionSink {
             return;
         }
         bucketWriterAppend(writers[k], compress, buffers[k], sizeof(KP) * bufPos[k]);
+        recordsWritten[k] += bufPos[k];
         bufPos[k] = 0;
     }
 
@@ -170,13 +178,30 @@ struct KmerPartitionSink {
         }
     }
 
-    // Single-threaded, after the fill region: flush leftovers and close.
+    // slots share no state, so closing them in parallel keeps this off the threads x buckets path
     void finish() {
         size_t slots = static_cast<size_t>(numThreads) * numBuckets;
+#pragma omp parallel for schedule(static)
         for (size_t k = 0; k < slots; k++) {
             flushSlot(k);
             bucketWriterClose(writers[k], compress);
             delete[] buffers[k];
+        }
+        // per-thread record counts let loadKmerBucket place each file without decompressing first
+        for (size_t b = 0; b < numBuckets; b++) {
+            std::string countFile = kmerBucketCountFileName(base, b);
+            FILE *cf = fopen(countFile.c_str(), "w");
+            if (cf == NULL) {
+                Debug(Debug::ERROR) << "Can not open " << countFile << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            for (int tid = 0; tid < numThreads; tid++) {
+                fprintf(cf, "%zu\n", recordsWritten[static_cast<size_t>(tid) * numBuckets + b]);
+            }
+            if (fclose(cf) != 0) {
+                Debug(Debug::ERROR) << "Can not write " << countFile << "\n";
+                EXIT(EXIT_FAILURE);
+            }
         }
     }
 };
@@ -187,6 +212,49 @@ template <typename T, bool includeAdjacency, bool IncludeSeqLen>
 size_t loadKmerBucket(const std::string &base, size_t bucket, int numThreads,
                       KmerPosition<T, includeAdjacency, IncludeSeqLen> *arr, size_t cap, bool compress) {
     typedef KmerPosition<T, includeAdjacency, IncludeSeqLen> KP;
+    // the partition pass recorded per-thread counts, so every file has a fixed slot and reads run in parallel
+    std::vector<size_t> counts;
+    std::string countFile = kmerBucketCountFileName(base, bucket);
+    FILE *cf = fopen(countFile.c_str(), "r");
+    if (cf != NULL) {
+        size_t v;
+        while (fscanf(cf, "%zu", &v) == 1) {
+            counts.push_back(v);
+        }
+        fclose(cf);
+    }
+    if (counts.size() == static_cast<size_t>(numThreads)) {
+        std::vector<size_t> offset(static_cast<size_t>(numThreads) + 1, 0);
+        for (int tid = 0; tid < numThreads; tid++) {
+            offset[tid + 1] = offset[tid] + counts[tid];
+        }
+        if (offset[numThreads] > cap) {
+            Debug(Debug::ERROR) << "k-mer bucket " << bucket << " exceeds the allocated split array\n";
+            EXIT(EXIT_FAILURE);
+        }
+        bool failed = false;
+#pragma omp parallel for schedule(dynamic, 1)
+        for (int tid = 0; tid < numThreads; tid++) {
+            std::string fileName = kmerBucketFileName(base, bucket, tid, compress);
+            if (counts[tid] == 0 || FileUtil::fileExists(fileName.c_str()) == false) {
+                removeKmerTmpFileIfExists(fileName);
+                continue;
+            }
+            bool overflow = false;
+            size_t want = counts[tid] * sizeof(KP);
+            size_t bytes = bucketReadFile(fileName, compress, arr + offset[tid], want, overflow);
+            if (overflow || bytes != want) {
+                failed = true;
+            }
+            removeKmerTmpFileIfExists(fileName);
+        }
+        if (failed) {
+            Debug(Debug::ERROR) << "k-mer bucket " << bucket << " does not match its recorded record count\n";
+            EXIT(EXIT_FAILURE);
+        }
+        removeKmerTmpFileIfExists(countFile);
+        return offset[numThreads];
+    }
     size_t count = 0;
     for (int tid = 0; tid < numThreads; tid++) {
         std::string fileName = kmerBucketFileName(base, bucket, tid, compress);
