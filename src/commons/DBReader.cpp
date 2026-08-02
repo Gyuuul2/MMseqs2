@@ -346,6 +346,21 @@ void DBReader<DBKeyType>::sortIndex(bool isSortedById) {
         }
     }
     if (accessType == SORT_BY_LENGTH) {
+        // do not sort if its already in correct order
+        // comparePairBySeqLength breaks ties by the id sorted position, so a non-increasing
+        // length run already is the identity permutation and needs no mapping
+        bool isSortedByLength = true;
+        for (size_t i = 1; i < size; i++) {
+            if (index[i - 1].length < index[i].length) {
+                isSortedByLength = false;
+                break;
+            }
+        }
+        if (isSortedByLength == true) {
+            accessType = NOSORT;
+            return;
+        }
+
         // sort the entries by the length of the sequences
         std::pair<size_t, unsigned int> *sortForMapping = new std::pair<size_t, unsigned int>[size];
         id2local = new DBLocalId[size];

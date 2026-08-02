@@ -303,6 +303,134 @@ int mergeSequentialByJointIndex(
     return 0;
 }
 
+// same order DBReader::SORT_BY_LENGTH produces: length descending, ties by key ascending.
+// Do not use Index::compareByLength reversed, it breaks ties the other way round and would
+// give a database a later SORT_BY_LENGTH reader does not reproduce.
+struct compareIndexBySeqLength {
+    bool operator() (const DBReader<DBKeyType>::Index &lhs, const DBReader<DBKeyType>::Index &rhs) const {
+        if (lhs.length > rhs.length)
+            return true;
+        if (rhs.length > lhs.length)
+            return false;
+        if (lhs.id < rhs.id)
+            return true;
+        if (rhs.id < lhs.id)
+            return false;
+        return false;
+    }
+};
+
+// renumber the sequence and header db so that key i is the i-th longest sequence.
+// Only the indexes are rewritten, like DBWriter::createRenumberedDB, but the header
+// order follows the sequence order instead of the header's own length.
+static void renumberDbBySeqLength(const std::string &seqDataFile, const std::string &seqIndexFile,
+                                  const std::string &hdrDataFile, const std::string &hdrIndexFile,
+                                  const std::string &lookupFile, const std::vector<unsigned int> &sourceLookup,
+                                  DBKeyType identifierOffset, bool writeLookup) {
+    // HARDNOSORT and sorting the index in place, so the two DBLocalId mapping arrays
+    // SORT_BY_LENGTH would allocate (2 * 8 byte per entry) are never needed here
+    DBReader<DBKeyType> seqReader(seqDataFile.c_str(), seqIndexFile.c_str(), 1, DBReader<DBKeyType>::USE_INDEX);
+    seqReader.open(DBReader<DBKeyType>::HARDNOSORT);
+    SORT_PARALLEL(seqReader.getIndex(), seqReader.getIndex() + seqReader.getSize(), compareIndexBySeqLength());
+
+    DBReader<DBKeyType> hdrReader(hdrDataFile.c_str(), hdrIndexFile.c_str(), 1,
+                                  writeLookup ? (DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX)
+                                              : DBReader<DBKeyType>::USE_INDEX);
+    hdrReader.open(DBReader<DBKeyType>::NOSORT);
+
+    if (seqReader.getSize() != hdrReader.getSize()) {
+        Debug(Debug::ERROR) << "Sequence db has " << seqReader.getSize() << " entries but header db has "
+                            << hdrReader.getSize() << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+
+    std::string seqIndexTmp = seqIndexFile + "_tmp";
+    std::string hdrIndexTmp = hdrIndexFile + "_tmp";
+    std::string lookupTmp = lookupFile + "_tmp";
+    FILE *seqIndexOut = FileUtil::openAndDelete(seqIndexTmp.c_str(), "w");
+    FILE *hdrIndexOut = FileUtil::openAndDelete(hdrIndexTmp.c_str(), "w");
+    FILE *lookupOut = NULL;
+    if (writeLookup == true) {
+        lookupOut = FileUtil::openAndDelete(lookupTmp.c_str(), "w");
+    }
+
+    // NOSORT leaves the header index id sorted and createdb hands out keys sequentially,
+    // so a key sits at the position it was written at. getId() covers non-dense keys.
+    const DBKeyType firstHdrKey = (hdrReader.getSize() > 0) ? hdrReader.getIndex(0)->id : 0;
+
+    char buffer[1024];
+    std::string strBuffer;
+    strBuffer.reserve(1024);
+    DBReader<DBKeyType>::LookupEntry entry;
+    for (size_t i = 0; i < seqReader.getSize(); i++) {
+        DBReader<DBKeyType>::Index *seqIdx = seqReader.getIndex(i);
+        const DBKeyType oldKey = seqIdx->id;
+        const DBKeyType newKey = identifierOffset + static_cast<DBKeyType>(i);
+        size_t hdrId = static_cast<size_t>(oldKey - firstHdrKey);
+        if (hdrId >= hdrReader.getSize() || hdrReader.getIndex(hdrId)->id != oldKey) {
+            hdrId = hdrReader.getId(oldKey);
+        }
+        if (hdrId == DB_ENTRY_NOT_FOUND) {
+            Debug(Debug::ERROR) << "Cannot find header entry for key " << oldKey << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        DBReader<DBKeyType>::Index *hdrIdx = hdrReader.getIndex(hdrId);
+
+        size_t len = DBWriter::indexToBuffer(buffer, newKey, seqIdx->offset, seqIdx->length);
+        if (fwrite(buffer, sizeof(char), len, seqIndexOut) != len) {
+            Debug(Debug::ERROR) << "Can not write to index file " << seqIndexTmp << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        len = DBWriter::indexToBuffer(buffer, newKey, hdrIdx->offset, hdrIdx->length);
+        if (fwrite(buffer, sizeof(char), len, hdrIndexOut) != len) {
+            Debug(Debug::ERROR) << "Can not write to index file " << hdrIndexTmp << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+
+        if (writeLookup == true) {
+            entry.id = newKey;
+            entry.entryName = Util::parseFastaHeader(hdrReader.getData(hdrId, 0));
+            if (entry.entryName.empty()) {
+                Debug(Debug::WARNING) << "Cannot extract identifier from entry " << oldKey << "\n";
+            }
+            // sourceLookup was filled in write order, which is the id sorted position
+            // of the entry, so index it the same way the unsorted lookup pass does
+            if (hdrId >= sourceLookup.size()) {
+                Debug(Debug::ERROR) << "Cannot find source file for key " << oldKey << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            entry.fileNumber = sourceLookup[hdrId];
+            hdrReader.lookupEntryToBuffer(strBuffer, entry);
+            if (fwrite(strBuffer.c_str(), sizeof(char), strBuffer.size(), lookupOut) != strBuffer.size()) {
+                Debug(Debug::ERROR) << "Cannot write to lookup file " << lookupTmp << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            strBuffer.clear();
+        }
+    }
+
+    if (writeLookup == true && fclose(lookupOut) != 0) {
+        Debug(Debug::ERROR) << "Cannot close file " << lookupTmp << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fclose(seqIndexOut) != 0) {
+        Debug(Debug::ERROR) << "Cannot close index file " << seqIndexTmp << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fclose(hdrIndexOut) != 0) {
+        Debug(Debug::ERROR) << "Cannot close index file " << hdrIndexTmp << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    seqReader.close();
+    hdrReader.close();
+
+    FileUtil::move(seqIndexTmp.c_str(), seqIndexFile.c_str());
+    FileUtil::move(hdrIndexTmp.c_str(), hdrIndexFile.c_str());
+    if (writeLookup == true) {
+        FileUtil::move(lookupTmp.c_str(), lookupFile.c_str());
+    }
+}
+
 void processSeqBatch(Parameters & par, DBWriter &seqWriter, DBWriter &hdrWriter, BaseMatrix *subMat, int querySeqType,
                      Masker ** masker, Sequence ** seqs, size_t currId,
                      std::vector<std::pair<std::vector<char>, std::string>> &entries, const size_t entriesSize,
@@ -438,6 +566,18 @@ int createdb(int argc, const char **argv, const Command& command) {
         Debug(Debug::WARNING) << "We recompute with --mask 0 or --mask-n-repeat 0\n";
         par.maskMode = false;
         par.maskNrepeats = 0;
+    }
+
+    if (par.sortBySeqLength == true && par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU) {
+        Debug(Debug::WARNING) << "Sorting by sequence length cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_GPU << "\n";
+        Debug(Debug::WARNING) << "We recompute with --sort-by-length 0\n";
+        par.sortBySeqLength = false;
+    }
+
+    if (par.sortBySeqLength == true && par.shuffleDatabase == true) {
+        Debug(Debug::WARNING) << "Shuffle database cannot be combined with --sort-by-length\n";
+        Debug(Debug::WARNING) << "We recompute with --shuffle 0\n";
+        par.shuffleDatabase = false;
     }
 
     const unsigned int shuffleSplits = par.shuffleDatabase ? 32 : 1;
@@ -760,7 +900,16 @@ int createdb(int argc, const char **argv, const Command& command) {
                 }
             }
         }
-        if (par.writeLookup == true) {
+        if (par.sortBySeqLength == true) {
+            timer.reset();
+            // rewrites the .lookup as well, since renumbering invalidates the key order
+            // the generic lookup pass below relies on
+            renumberDbBySeqLength(dataFile, indexFile, hdrDataFile, hdrIndexFile,
+                                  dataFile + ".lookup", sourceLookup[0],
+                                  static_cast<DBKeyType>(par.identifierOffset), par.writeLookup);
+            Debug(Debug::INFO) << "Sort db by sequence length " << timer.lap() << "\n";
+        }
+        if (par.writeLookup == true && par.sortBySeqLength == false) {
             DBReader<DBKeyType> readerHeader(hdrDataFile.c_str(), hdrIndexFile.c_str(), 1, DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX);
             readerHeader.open(DBReader<DBKeyType>::NOSORT);
             // create lookup file
