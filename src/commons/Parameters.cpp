@@ -526,7 +526,6 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_SORT_RESULTS);
     align2clust.push_back(&PARAM_PRELOAD_MODE);
     align2clust.push_back(&PARAM_THREADS);
-    align2clust.push_back(&PARAM_COMPRESSED);
     align2clust.push_back(&PARAM_V);
     align2clust.push_back(&PARAM_CLUSTER_MODE);
     align2clust.push_back(&PARAM_FILTER_CLUDB_FILE);

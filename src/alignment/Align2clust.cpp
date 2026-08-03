@@ -584,6 +584,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         targetsWithDiagonal.reserve(1000);
 
         const bool includeAlignFiles = (alnWriter != nullptr);
+        std::string queryCopy;
         std::string alnResultBuffer;
         // Staged member alignments; flushed only if the allpass-gate fully passes.
         std::string pendingMemberAln;
@@ -628,8 +629,11 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             const size_t alignmentId = requireId(alnDbr.getId(queryKey), "Alignment DB", queryKey);
             char *alignmentData = alnDbr.getData(alignmentId, threadIdx);
             size_t queryId = representativeId;
-            char *querySequence = seqDbr->getData(queryId, threadIdx);
             size_t queryLength = seqDbr->getSeqLen(queryId);
+            // getData hands back the shared per-thread buffer on a compressed or padded db, so the
+            // query has to be copied out before the first target read overwrites it
+            queryCopy.assign(seqDbr->getData(queryId, threadIdx), queryLength);
+            const char *querySequence = queryCopy.c_str();
             query.mapSequence(queryId, queryKey, querySequence, queryLength);
             blockAligner.initQuery(&query);
             matcher.initQuery(&query);
@@ -686,13 +690,14 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     continue;
                 }
 
-                char *targetSequence = seqDbr->getData(targetId, threadIdx);
-                size_t targetLength = seqDbr->getSeqLen(targetId);
-                target.mapSequence(targetId, targetKey, targetSequence, targetLength);
-
-                if (Util::canBeCovered(par.covThr, par.covMode, query.L, target.L) == false) {
+                // the length alone decides coverage, so test it before faulting in the sequence
+                const size_t targetLength = seqDbr->getSeqLen(targetId);
+                if (Util::canBeCovered(par.covThr, par.covMode, query.L, targetLength) == false) {
                     continue;
                 }
+
+                char *targetSequence = seqDbr->getData(targetId, threadIdx);
+                target.mapSequence(targetId, targetKey, targetSequence, targetLength);
 
                 BlockAligner::UngappedAln_res ungappedAlignment = blockAligner.ungappedAlign(&target, diagonal); 
                 
@@ -751,7 +756,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                 char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
                                 size_t elementLength = cluSeqDbr->getSeqLen(elementId);
                                 short elementDiagonal = diagonal;
-                                
+
                                 // 1. ungapped alignment
                                 element.mapSequence(elementId, elementKey, elementSequence, elementLength);
                                 if (Util::canBeCovered(par.covThr, par.covMode, query.L, element.L) == false) {
@@ -903,7 +908,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                     char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
                                     size_t elementLength = cluSeqDbr->getSeqLen(elementId);
                                     short elementDiagonal = 0;
-                                    
+
                                     // 1. ungapped alignment
                                     element.mapSequence(elementId, elementKey, elementSequence, elementLength);
                                     if (Util::canBeCovered(par.covThr, par.covMode, query.L, element.L) == false) {
