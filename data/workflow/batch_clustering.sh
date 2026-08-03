@@ -711,22 +711,52 @@ file_size_bytes() {
     fi
 }
 
-# Uncompressed-size estimate for bin-packing. A local .zst carries its exact decompressed size in the
-# frame header (zstd -lv, header-only, no decompression); use it when present so representative FASTAs
-# -- which compress poorly and would be badly over-estimated by a fixed ratio, wrongly tripping the
-# oversized-file guard -- are sized correctly. Otherwise fall back to an on-disk-size x COMPRESS_RATIO
-# estimate (S3, .gz, or a stream-compressed .zst whose header lacks the content size).
+# Uncompressed size for bin-packing. This has to be EXACT, not an estimate: the aws-batch backend
+# sizes representatives from the per-chunk metrics while the single-node and slurm backends come
+# through here, so a different number on either side bin-packs round 1 differently and the run
+# produces a different clustering for the same input and parameters.
+#
+# Only a .zst written with a file argument carries its decompressed size in the frame header. Both
+# forms this workflow produces do not: compress_to_zst uses `pzstd -c` (multi-frame) and prepare's
+# chunk writer uses `zstd -c >` (streamed). Measured with zstd 1.5.5, `zstd -lv` reports a
+# Decompressed Size for neither, so the header path below never fires for our own files and every
+# representative used to fall through to size x COMPRESS_RATIO. For a local file we therefore count
+# the decompressed bytes instead; only a remote URI, which we cannot read cheaply, keeps the ratio.
 uncompressed_bytes() {
     local uri="$1" sz n
-    if [[ "$uri" == *.zst ]] && ! is_s3 "$uri" && command -v zstd >/dev/null 2>&1; then
-        # `|| true`: zstd -lv exits non-zero for a .zst without an embedded content size; under
-        # `pipefail` that would otherwise fail this assignment. On non-zero we simply fall through
-        # to the ratio estimate below.
-        n=$(zstd -lv "$uri" 2>/dev/null | awk -F'[()]' '/Decompressed Size:/ {split($2, a, " "); print a[1]; exit}' || true)
-        if [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]]; then
-            printf '%s' "$n"
-            return
-        fi
+    if ! is_s3 "$uri"; then
+        case "$uri" in
+            *.zst)
+                if command -v zstd >/dev/null 2>&1; then
+                    # `|| true`: zstd -lv exits non-zero when there is no embedded content size
+                    n=$(zstd -lv "$uri" 2>/dev/null | awk -F'[()]' '/Decompressed Size:/ {split($2, a, " "); print a[1]; exit}' || true)
+                    if [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]]; then
+                        printf '%s' "$n"
+                        return
+                    fi
+                    log "sizing $uri by decompressing it: the frame header carries no decompressed size"
+                    if command -v pzstd >/dev/null 2>&1; then
+                        n=$(pzstd -dc -p "${THREADS:-1}" "$uri" 2>/dev/null | wc -c || true)
+                    else
+                        n=$(zstd -dc "$uri" 2>/dev/null | wc -c || true)
+                    fi
+                    if [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]]; then
+                        printf '%s' "$n"
+                        return
+                    fi
+                fi
+                ;;
+            *.gz)
+                if command -v gzip >/dev/null 2>&1; then
+                    log "sizing $uri by decompressing it: gzip stores no reliable size above 4 GiB"
+                    n=$(gzip -dc "$uri" 2>/dev/null | wc -c || true)
+                    if [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]]; then
+                        printf '%s' "$n"
+                        return
+                    fi
+                fi
+                ;;
+        esac
     fi
     sz=$(file_size_bytes "$uri")
     case "$uri" in
