@@ -39,19 +39,31 @@
 #define SIZE_T_MAX ((size_t) -1)
 #endif
 
-// DBReader only advises the kernel for LINEAR_ACCCESS/SORT_BY_OFFSET, and remapData drops the advice
-// with the old mapping, so this module asks for it itself after every (re)mapping. isSortedByOffset
-// is measured on the final index array, so it only describes the read order for a reader iterated in
-// index order -- true here because kmermatcher opens NOSORT and walks id 0..size, but NOT true for
-// SORT_BY_LENGTH, which leaves the index alone and reorders through local2id instead. Advising a db
-// whose offsets are not monotone would prefetch pages the scan never reads and evict ones it will.
-static void remapWithSequentialAdvice(DBReader<DBKeyType> &reader, bool remap = true) {
-    if (remap) {
-        reader.remapData();
+// one page table of sequences per chunk, capped so every thread still gets many chunks for balance
+static size_t kmerScanChunkSize(DBReader<DBKeyType> &reader, size_t startId, size_t cnt, int threads) {
+    const size_t DEFAULT_CHUNK = 100;
+    const size_t MIN_CHUNKS_PER_THREAD = 16;
+    if (threads < 2 || cnt == 0 || reader.getDataFileCnt() != 1 || reader.isSortedByOffset() == false) {
+        return DEFAULT_CHUNK;
     }
-    if (reader.isSortedByOffset()) {
-        reader.setSequentialAdvice();
+    size_t fileSize = reader.getDataSizeForFile(0);
+    if (fileSize == 0) {
+        return DEFAULT_CHUNK;
     }
+    size_t firstOffset = reader.getIndex(startId)->offset;
+    size_t lastId = startId + cnt - 1;
+    // a soft-linked createdb-mode 1 db has no room for the entry terminator, so clamp to the file
+    size_t lastEnd = std::min(reader.getIndex(lastId)->offset + reader.getEntryLen(lastId), fileSize);
+    if (lastEnd <= firstOffset) {
+        return DEFAULT_CHUNK;
+    }
+    // one page table maps pageSize/sizeof(void*) pages, so derive its span instead of hardcoding 2 MB
+    size_t pageSize = Util::getPageSize();
+    size_t pmdSpan = pageSize * (pageSize / sizeof(void *));
+    size_t stride = std::max<size_t>((lastEnd - firstOffset) / cnt, 1);
+    size_t wanted = (pmdSpan + stride - 1) / stride;
+    size_t balanced = cnt / (static_cast<size_t>(threads) * MIN_CHUNKS_PER_THREAD);
+    return std::max(std::min(wanted, balanced), DEFAULT_CHUNK);
 }
 
 uint64_t hashUInt64(uint64_t in, uint64_t seed) {
@@ -356,7 +368,9 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
             size_t start = (i * flushSize);
             size_t bucketSize = std::min(seqDbr.getSize() - (i * flushSize), flushSize);
 
-#pragma omp for schedule(dynamic, 100)
+            size_t scanChunk = kmerScanChunkSize(seqDbr, start, bucketSize, par.threads);
+// every thread in the team computes the same chunk from shared read-only state, as the schedule needs
+#pragma omp for schedule(dynamic, scanChunk)
             for (size_t id = start; id < (start + bucketSize); id++) {
                 progress.updateProgress();
 
@@ -602,7 +616,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
             if (thread_idx == 0) {
-                remapWithSequentialAdvice(seqDbr);
+                seqDbr.remapData();
             }
 #pragma omp barrier
         }
@@ -1364,7 +1378,7 @@ std::vector<std::pair<size_t, size_t>> setupCountTable(
         fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, IncludeSeqLen>(NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
     }
 
-    remapWithSequentialAdvice(seqDbr);
+    seqDbr.remapData();
 
 
     if (splits > 1) {
@@ -1604,7 +1618,7 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
                 NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, NULL, &sink);
         }
         sink.finish();
-        remapWithSequentialAdvice(seqDbr);
+        seqDbr.remapData();
         delete[] hashToBucket;
     }
     for(size_t split = 0; split < hashRanges.size(); split++) {
@@ -1720,7 +1734,7 @@ std::vector<std::pair<size_t, size_t>> setupKmerSplits(Parameters &par, BaseMatr
         }else{
             fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, IncludeSeqLen>(NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
         }
-        remapWithSequentialAdvice(seqDbr);
+        seqDbr.remapData();
         size_t maxBucketSize = 0;
         for(size_t i = 0; i < (USHRT_MAX+1); i++) {
             if(maxBucketSize < hashDist[i]){
@@ -1761,7 +1775,6 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     seqDbr.open(DBReader<DBKeyType>::NOSORT);
     // NOSORT is key order and the index is offset monotone in it, so the whole-db scans this module
     // runs once per hash pass and once per split really are sequential
-    remapWithSequentialAdvice(seqDbr, false);
     int querySeqType = seqDbr.getDbtype();
 
     setKmerLengthAndAlphabet(par, seqDbr.getAminoAcidDBSize(), querySeqType);
