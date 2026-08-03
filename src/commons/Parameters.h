@@ -675,7 +675,6 @@ public:
     int dbType;
     int createdbMode;
     bool shuffleDatabase;
-    bool sortBySeqLength;
 
     // splitsequence
     int sequenceOverlap;
@@ -1139,7 +1138,6 @@ public:
     PARAMETER(PARAM_DB_TYPE)
     PARAMETER(PARAM_CREATEDB_MODE)
     PARAMETER(PARAM_SHUFFLE)
-    PARAMETER(PARAM_SORT_BY_LENGTH)
     PARAMETER(PARAM_WRITE_LOOKUP)
 
     // convert2fasta

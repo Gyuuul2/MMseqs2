@@ -27,7 +27,6 @@ void setBatchLinclustDefaults(Parameters *p) {
     p->clustHash = false;
     p->createdbMode = Parameters::SEQUENCE_SPLIT_MODE_SOFT;   // soft-link: skip DB data copy; batch materializes single-line FASTA first
     p->removeTmpFiles = true;   // batch scale accumulates per-chunk tmp; clean by default
-    p->sortBySeqLength = true;  // align2clust then skips the SORT_BY_LENGTH id mapping
     p->batchDeleteSourceChunk = true;  // reclaim each chunk as it is consumed; disk is the bottleneck
 }
 
@@ -100,7 +99,6 @@ void setBatchClusterDefaults(Parameters *p) {
     p->clusterVersion = Parameters::CLUSTER_VERSION1;
     p->createdbMode = Parameters::SEQUENCE_SPLIT_MODE_SOFT;   // soft-link: skip DB data copy; batch materializes single-line FASTA first
     p->removeTmpFiles = true;   // batch scale accumulates per-chunk tmp; clean by default
-    p->sortBySeqLength = true;  // align2clust then skips the SORT_BY_LENGTH id mapping
     p->batchDeleteSourceChunk = true;  // reclaim each chunk as it is consumed; disk is the bottleneck
 }
 
@@ -364,8 +362,7 @@ std::string buildCreatedbPar(const Parameters &par) {
     // --createdb-mode 1 (soft-link) is the batch default: the batch materializes one node-local
     // single-line FASTA per chunk (append_singleline_fasta) and createdb soft-links it, skipping the
     // compact-DB data copy. Set --createdb-mode 0 to fall back to copying (reads FASTA/.zst natively).
-    // --sort-by-length (batch default 1): keys by decreasing length, align2clust skips the id mapping
-    return "--shuffle 0 --write-lookup 0 --sort-by-length " + std::string(par.sortBySeqLength ? "1" : "0") +
+    return std::string("--shuffle 0 --write-lookup 0") +
            " --createdb-mode " + SSTR(par.createdbMode) +
            " --threads " + SSTR(par.threads) + " -v " + SSTR(par.verbosity);
 }

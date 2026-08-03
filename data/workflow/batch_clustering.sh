@@ -68,7 +68,7 @@ COMPRESS_BATCH_OUTPUTS=${COMPRESS_BATCH_OUTPUTS:-0}
 # set-mode (never enabled from batch entry points); accessions come from the _h header DB, not it.
 # --createdb-mode 0: createdb reads FASTA/.zst natively and writes the compact sequence DB. Mode 1
 # is explicit opt-in only; batch must materialize plain FASTA first, which is slower for .zst chunks.
-CREATEDB_PAR=${CREATEDB_PAR:---shuffle 0 --write-lookup 0 --sort-by-length 1 --createdb-mode 1}
+CREATEDB_PAR=${CREATEDB_PAR:---shuffle 0 --write-lookup 0 --createdb-mode 1}
 createdb_mode_from_par() {
     local par=" ${CREATEDB_PAR} "
     if [[ "$par" =~ [[:space:]]--createdb-mode=([0-9]+) ]]; then
