@@ -21,6 +21,11 @@
 // clusthash writes an alignment DB with one entry per sequence and needs a following clust step.
 // This writes the clustering directly, like align2clust does, which removes the N-entry alignment
 // DB, its merge, the formatted alignment columns and the clust invocation.
+//
+// The grouping is always the same greedy scan, so the cluster count never depends on
+// --cluster-mode; the mode only decides which member of a formed cluster is its representative.
+// That mirrors the old pipeline, where clusthash fixed the grouping into disjoint stars and clust
+// only relabelled them.
 namespace {
 
 // chunks are many per thread so a few huge groups cannot unbalance the fan-out
@@ -28,8 +33,8 @@ const size_t CLUSTHASH_CHUNK_RECORDS = 65536;
 // a single huge group must not leave every thread holding a giant buffer
 const size_t CLUSTHASH_MAX_RETAINED_RESULT = 4 * 1024 * 1024;
 const size_t CLUSTHASH_MAX_RETAINED_MEMBERS = 1024 * 1024;
-// set cover holds a groupSize x groupSize bit matrix, so bound it and fall back to greedy above it
-const size_t CLUSTHASH_MAX_MATRIX_GROUP = 4096;
+// set cover compares every pair of a formed cluster, so bound it and keep the greedy pick above
+const size_t CLUSTHASH_MAX_SETCOVER_CLUSTER = 4096;
 
 struct HashEntry {
     size_t hash;
@@ -46,16 +51,6 @@ struct HashEntry {
 // inside a group disappears and the groups get smaller
 inline size_t mixHashAndLength(size_t hash, size_t length) {
     return hash ^ (length + static_cast<size_t>(0x9e3779b97f4a7c15ULL) + (hash << 6) + (hash >> 2));
-}
-
-inline size_t countBits(uint64_t v) {
-#ifdef __GNUC__
-    return static_cast<size_t>(__builtin_popcountll(v));
-#else
-    size_t c = 0;
-    while (v) { v &= v - 1; c++; }
-    return c;
-#endif
 }
 
 inline void appendKey(std::string &out, DBKeyType key, char *buffer) {
@@ -81,8 +76,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     par.seqIdThr = static_cast<float>(Parameters::CLUST_HASH_DEFAULT_MIN_SEQ_ID) / 100.0f;
     par.parseParameters(argc, argv, command, true, 0, 0);
 
-    // set cover needs every neighbour counted before a representative is picked; greedy takes the
-    // first unassigned member, which is the longest sequence on a length sorted database
     if (par.clusteringMode == Parameters::CONNECTED_COMPONENT) {
         Debug(Debug::ERROR) << "clusthashfast does not implement --cluster-mode 1; use 0 or 2\n";
         EXIT(EXIT_FAILURE);
@@ -191,8 +184,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         std::string result;
         result.reserve(4096);
         std::vector<unsigned char> claimed;
-        std::vector<uint64_t> adjacency;
-        std::vector<uint64_t> claimedMask;
+        std::vector<size_t> cluster;
         std::vector<unsigned int> degree;
         char buffer[32];
 
@@ -228,112 +220,77 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     continue;
                 }
 
-                // set cover picks the member with the most neighbours, so the adjacency of the
-                // whole group is needed before any representative can be chosen
-                const size_t words = (groupSize + 63) / 64;
-                // the adjacency of a group is words x groupSize, so cap it and fall back to greedy
-                const bool needAdjacency = (wantSetCover && groupSize <= CLUSTHASH_MAX_MATRIX_GROUP);
-                if (needAdjacency) {
-                    adjacency.assign(groupSize * words, 0);
-                    degree.assign(groupSize, 0);
-                    for (size_t i = 0; i < groupSize; i++) {
-                        const DBLocalId queryId = entries[groupBegin + i].id;
-                        const unsigned int queryLength = reader.getSeqLen(queryId);
-                        const char *querySeq = NULL;
-                        for (size_t j = i + 1; j < groupSize; j++) {
-                            const DBLocalId targetId = entries[groupBegin + j].id;
-                            if (reader.getSeqLen(targetId) != queryLength) {
-                                continue;
-                            }
-                            if (querySeq == NULL) {
-                                querySeq = reader.getData(queryId, thread_idx);
-                            }
-                            const char *targetSeq = reader.getData(targetId, thread_idx);
-                            const unsigned int distance =
-                                DistanceCalculator::computeInverseHammingDistance(querySeq, targetSeq, queryLength);
-                            const float seqId = static_cast<float>(distance) / static_cast<float>(queryLength);
-                            if (seqId >= par.seqIdThr) {
-                                adjacency[i * words + (j >> 6)] |= (uint64_t(1) << (j & 63));
-                                adjacency[j * words + (i >> 6)] |= (uint64_t(1) << (i & 63));
-                                degree[i]++;
-                                degree[j]++;
-                            }
-                        }
-                    }
-                }
-
                 claimed.assign(groupSize, 0);
-                claimedMask.assign(words, 0);
-                size_t assignedCnt = 0;
-                while (assignedCnt < groupSize) {
-                    size_t center = groupSize;
-                    if (needAdjacency) {
-                        // highest remaining degree wins, ties go to the smallest id so the
-                        // representative does not depend on the thread or the group order
-                        size_t bestDegree = 0;
-                        for (size_t i = 0; i < groupSize; i++) {
-                            if (claimed[i]) {
-                                continue;
-                            }
-                            size_t remaining = 0;
-                            for (size_t w = 0; w < words; w++) {
-                                remaining += countBits(adjacency[i * words + w] & ~claimedMask[w]);
-                            }
-                            if (center == groupSize || remaining > bestDegree) {
-                                bestDegree = remaining;
-                                center = i;
-                            }
-                        }
-                    } else {
-                        for (size_t i = 0; i < groupSize; i++) {
-                            if (claimed[i] == 0) {
-                                center = i;
-                                break;
-                            }
-                        }
+                for (size_t i = 0; i < groupSize; i++) {
+                    if (claimed[i]) {
+                        continue;
                     }
-
-                    const DBLocalId queryId = entries[groupBegin + center].id;
-                    const DBKeyType queryKey = reader.getDbKey(queryId);
+                    // the grouping is mode independent, so the cluster count cannot follow the mode
+                    cluster.clear();
+                    cluster.push_back(i);
+                    claimed[i] = 1;
+                    const DBLocalId queryId = entries[groupBegin + i].id;
                     const unsigned int queryLength = reader.getSeqLen(queryId);
-                    resetResult(result);
-                    appendKey(result, queryKey, buffer);
-                    claimed[center] = 1;
-                    claimedMask[center >> 6] |= (uint64_t(1) << (center & 63));
-                    assignedCnt++;
-
                     const char *querySeq = NULL;
-                    for (size_t j = 0; j < groupSize; j++) {
+                    for (size_t j = i + 1; j < groupSize; j++) {
                         if (claimed[j]) {
                             continue;
                         }
-                        bool isNeighbour;
-                        if (needAdjacency) {
-                            isNeighbour = (adjacency[center * words + (j >> 6)] & (uint64_t(1) << (j & 63))) != 0;
-                        } else {
-                            const DBLocalId targetId = entries[groupBegin + j].id;
-                            // the length is folded into the hash, but a collision can still differ
-                            if (reader.getSeqLen(targetId) != queryLength) {
-                                continue;
-                            }
-                            if (querySeq == NULL) {
-                                querySeq = reader.getData(queryId, thread_idx);
-                            }
-                            const char *targetSeq = reader.getData(targetId, thread_idx);
-                            const unsigned int distance =
-                                DistanceCalculator::computeInverseHammingDistance(querySeq, targetSeq, queryLength);
-                            const float seqId = static_cast<float>(distance) / static_cast<float>(queryLength);
-                            isNeighbour = (seqId >= par.seqIdThr);
+                        const DBLocalId targetId = entries[groupBegin + j].id;
+                        // the length is folded into the hash, but a collision can still differ
+                        if (reader.getSeqLen(targetId) != queryLength) {
+                            continue;
                         }
-                        if (isNeighbour) {
-                            appendKey(result, reader.getDbKey(entries[groupBegin + j].id), buffer);
+                        if (querySeq == NULL) {
+                            querySeq = reader.getData(queryId, thread_idx);
+                        }
+                        const char *targetSeq = reader.getData(targetId, thread_idx);
+                        const unsigned int distance =
+                            DistanceCalculator::computeInverseHammingDistance(querySeq, targetSeq, queryLength);
+                        const float seqId = static_cast<float>(distance) / static_cast<float>(queryLength);
+                        if (seqId >= par.seqIdThr) {
+                            cluster.push_back(j);
                             claimed[j] = 1;
-                            claimedMask[j >> 6] |= (uint64_t(1) << (j & 63));
-                            assignedCnt++;
                             totalMerged++;
                         }
                     }
-                    writer.writeData(result.c_str(), result.length(), queryKey, thread_idx);
+
+                    // only the representative may follow the mode, and a two member cluster is
+                    // always a tie, so there is nothing to decide below three
+                    size_t repSlot = 0;
+                    if (wantSetCover && cluster.size() > 2 && cluster.size() <= CLUSTHASH_MAX_SETCOVER_CLUSTER) {
+                        degree.assign(cluster.size(), 0);
+                        for (size_t a = 0; a < cluster.size(); a++) {
+                            const char *aSeq = reader.getData(entries[groupBegin + cluster[a]].id, thread_idx);
+                            for (size_t b = a + 1; b < cluster.size(); b++) {
+                                const char *bSeq = reader.getData(entries[groupBegin + cluster[b]].id, thread_idx);
+                                const unsigned int distance =
+                                    DistanceCalculator::computeInverseHammingDistance(aSeq, bSeq, queryLength);
+                                const float pairSeqId = static_cast<float>(distance) / static_cast<float>(queryLength);
+                                if (pairSeqId >= par.seqIdThr) {
+                                    degree[a]++;
+                                    degree[b]++;
+                                }
+                            }
+                        }
+                        // highest degree wins, ties go to the lowest slot, which is the lowest id
+                        for (size_t a = 1; a < cluster.size(); a++) {
+                            if (degree[a] > degree[repSlot]) {
+                                repSlot = a;
+                            }
+                        }
+                    }
+
+                    resetResult(result);
+                    const DBKeyType repKey = reader.getDbKey(entries[groupBegin + cluster[repSlot]].id);
+                    appendKey(result, repKey, buffer);
+                    for (size_t s = 0; s < cluster.size(); s++) {
+                        if (s == repSlot) {
+                            continue;
+                        }
+                        appendKey(result, reader.getDbKey(entries[groupBegin + cluster[s]].id), buffer);
+                    }
+                    writer.writeData(result.c_str(), result.length(), repKey, thread_idx);
                     totalClusters++;
                 }
                 if (claimed.capacity() > CLUSTHASH_MAX_RETAINED_MEMBERS) {
