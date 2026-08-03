@@ -28,6 +28,8 @@ const size_t CLUSTHASH_CHUNK_RECORDS = 65536;
 // a single huge group must not leave every thread holding a giant buffer
 const size_t CLUSTHASH_MAX_RETAINED_RESULT = 4 * 1024 * 1024;
 const size_t CLUSTHASH_MAX_RETAINED_MEMBERS = 1024 * 1024;
+// set cover holds a groupSize x groupSize bit matrix, so bound it and fall back to greedy above it
+const size_t CLUSTHASH_MAX_MATRIX_GROUP = 4096;
 
 struct HashEntry {
     size_t hash;
@@ -44,6 +46,16 @@ struct HashEntry {
 // inside a group disappears and the groups get smaller
 inline size_t mixHashAndLength(size_t hash, size_t length) {
     return hash ^ (length + static_cast<size_t>(0x9e3779b97f4a7c15ULL) + (hash << 6) + (hash >> 2));
+}
+
+inline size_t countBits(uint64_t v) {
+#ifdef __GNUC__
+    return static_cast<size_t>(__builtin_popcountll(v));
+#else
+    size_t c = 0;
+    while (v) { v &= v - 1; c++; }
+    return c;
+#endif
 }
 
 inline void appendKey(std::string &out, DBKeyType key, char *buffer) {
@@ -68,6 +80,14 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     par.alphabetSize = MultiParam<NuclAA<int> >(NuclAA<int>(Parameters::CLUST_HASH_DEFAULT_ALPH_SIZE, 5));
     par.seqIdThr = static_cast<float>(Parameters::CLUST_HASH_DEFAULT_MIN_SEQ_ID) / 100.0f;
     par.parseParameters(argc, argv, command, true, 0, 0);
+
+    // set cover needs every neighbour counted before a representative is picked; greedy takes the
+    // first unassigned member, which is the longest sequence on a length sorted database
+    if (par.clusteringMode == Parameters::CONNECTED_COMPONENT) {
+        Debug(Debug::ERROR) << "clusthashfast does not implement --cluster-mode 1; use 0 or 2\n";
+        EXIT(EXIT_FAILURE);
+    }
+    const bool wantSetCover = (par.clusteringMode == Parameters::SET_COVER);
 
     // NOSORT keeps DBReader from building the id2local/local2id maps, which cost 2 x 8 byte per
     // sequence; nothing here needs a sorted access order.
@@ -171,6 +191,9 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         std::string result;
         result.reserve(4096);
         std::vector<unsigned char> claimed;
+        std::vector<uint64_t> adjacency;
+        std::vector<uint64_t> claimedMask;
+        std::vector<unsigned int> degree;
         char buffer[32];
 
 #pragma omp for schedule(dynamic, 1)
@@ -205,38 +228,108 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     continue;
                 }
 
-                claimed.assign(groupSize, 0);
-                for (size_t i = 0; i < groupSize; i++) {
-                    if (claimed[i]) {
-                        continue;
+                // set cover picks the member with the most neighbours, so the adjacency of the
+                // whole group is needed before any representative can be chosen
+                const size_t words = (groupSize + 63) / 64;
+                // the adjacency of a group is words x groupSize, so cap it and fall back to greedy
+                const bool needAdjacency = (wantSetCover && groupSize <= CLUSTHASH_MAX_MATRIX_GROUP);
+                if (needAdjacency) {
+                    adjacency.assign(groupSize * words, 0);
+                    degree.assign(groupSize, 0);
+                    for (size_t i = 0; i < groupSize; i++) {
+                        const DBLocalId queryId = entries[groupBegin + i].id;
+                        const unsigned int queryLength = reader.getSeqLen(queryId);
+                        const char *querySeq = NULL;
+                        for (size_t j = i + 1; j < groupSize; j++) {
+                            const DBLocalId targetId = entries[groupBegin + j].id;
+                            if (reader.getSeqLen(targetId) != queryLength) {
+                                continue;
+                            }
+                            if (querySeq == NULL) {
+                                querySeq = reader.getData(queryId, thread_idx);
+                            }
+                            const char *targetSeq = reader.getData(targetId, thread_idx);
+                            const unsigned int distance =
+                                DistanceCalculator::computeInverseHammingDistance(querySeq, targetSeq, queryLength);
+                            const float seqId = static_cast<float>(distance) / static_cast<float>(queryLength);
+                            if (seqId >= par.seqIdThr) {
+                                adjacency[i * words + (j >> 6)] |= (uint64_t(1) << (j & 63));
+                                adjacency[j * words + (i >> 6)] |= (uint64_t(1) << (i & 63));
+                                degree[i]++;
+                                degree[j]++;
+                            }
+                        }
                     }
-                    const DBLocalId queryId = entries[groupBegin + i].id;
+                }
+
+                claimed.assign(groupSize, 0);
+                claimedMask.assign(words, 0);
+                size_t assignedCnt = 0;
+                while (assignedCnt < groupSize) {
+                    size_t center = groupSize;
+                    if (needAdjacency) {
+                        // highest remaining degree wins, ties go to the smallest id so the
+                        // representative does not depend on the thread or the group order
+                        size_t bestDegree = 0;
+                        for (size_t i = 0; i < groupSize; i++) {
+                            if (claimed[i]) {
+                                continue;
+                            }
+                            size_t remaining = 0;
+                            for (size_t w = 0; w < words; w++) {
+                                remaining += countBits(adjacency[i * words + w] & ~claimedMask[w]);
+                            }
+                            if (center == groupSize || remaining > bestDegree) {
+                                bestDegree = remaining;
+                                center = i;
+                            }
+                        }
+                    } else {
+                        for (size_t i = 0; i < groupSize; i++) {
+                            if (claimed[i] == 0) {
+                                center = i;
+                                break;
+                            }
+                        }
+                    }
+
+                    const DBLocalId queryId = entries[groupBegin + center].id;
                     const DBKeyType queryKey = reader.getDbKey(queryId);
                     const unsigned int queryLength = reader.getSeqLen(queryId);
                     resetResult(result);
                     appendKey(result, queryKey, buffer);
-                    claimed[i] = 1;
+                    claimed[center] = 1;
+                    claimedMask[center >> 6] |= (uint64_t(1) << (center & 63));
+                    assignedCnt++;
 
                     const char *querySeq = NULL;
-                    for (size_t j = i + 1; j < groupSize; j++) {
+                    for (size_t j = 0; j < groupSize; j++) {
                         if (claimed[j]) {
                             continue;
                         }
-                        const DBLocalId targetId = entries[groupBegin + j].id;
-                        // the length is folded into the hash, but a collision can still differ
-                        if (reader.getSeqLen(targetId) != queryLength) {
-                            continue;
+                        bool isNeighbour;
+                        if (needAdjacency) {
+                            isNeighbour = (adjacency[center * words + (j >> 6)] & (uint64_t(1) << (j & 63))) != 0;
+                        } else {
+                            const DBLocalId targetId = entries[groupBegin + j].id;
+                            // the length is folded into the hash, but a collision can still differ
+                            if (reader.getSeqLen(targetId) != queryLength) {
+                                continue;
+                            }
+                            if (querySeq == NULL) {
+                                querySeq = reader.getData(queryId, thread_idx);
+                            }
+                            const char *targetSeq = reader.getData(targetId, thread_idx);
+                            const unsigned int distance =
+                                DistanceCalculator::computeInverseHammingDistance(querySeq, targetSeq, queryLength);
+                            const float seqId = static_cast<float>(distance) / static_cast<float>(queryLength);
+                            isNeighbour = (seqId >= par.seqIdThr);
                         }
-                        if (querySeq == NULL) {
-                            querySeq = reader.getData(queryId, thread_idx);
-                        }
-                        const char *targetSeq = reader.getData(targetId, thread_idx);
-                        const unsigned int distance =
-                            DistanceCalculator::computeInverseHammingDistance(querySeq, targetSeq, queryLength);
-                        const float seqId = static_cast<float>(distance) / static_cast<float>(queryLength);
-                        if (seqId >= par.seqIdThr) {
-                            appendKey(result, reader.getDbKey(targetId), buffer);
+                        if (isNeighbour) {
+                            appendKey(result, reader.getDbKey(entries[groupBegin + j].id), buffer);
                             claimed[j] = 1;
+                            claimedMask[j >> 6] |= (uint64_t(1) << (j & 63));
+                            assignedCnt++;
                             totalMerged++;
                         }
                     }
