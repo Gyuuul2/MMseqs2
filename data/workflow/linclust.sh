@@ -21,16 +21,11 @@ SOURCE="$INPUT"
 if [ "$LINCLUST_MODULE" = "linclust2" ]; then
     # 0. clusthash
     if [ -n "$CLUSTHASH" ]; then
-        if notExists "${TMP_PATH}/input_clusthash.dbtype"; then
-            # shellcheck disable=SC2086
-            $RUNNER "$MMSEQS" clusthash "$INPUT" "${TMP_PATH}/input_clusthash" ${CLUSTHASH_PAR} \
-                || fail "clusthash died"
-        fi
-
+        # clusthashfast writes the clustering directly, so no alignment DB and no clust step
         if notExists "${TMP_PATH}/input_clusthash_clust.dbtype"; then
             # shellcheck disable=SC2086
-            $RUNNER "$MMSEQS" clust "$INPUT" "${TMP_PATH}/input_clusthash" "${TMP_PATH}/input_clusthash_clust" ${CLUSTHASH_CLUST_PAR} \
-                || fail "clusthash-based clust died"
+            $RUNNER "$MMSEQS" clusthashfast "$INPUT" "${TMP_PATH}/input_clusthash_clust" ${CLUSTHASHFAST_PAR} \
+                || fail "clusthashfast died"
         fi
 
         awk '{print $1}' "${TMP_PATH}/input_clusthash_clust.index" \
@@ -142,16 +137,11 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
 elif [ "$LINCLUST_MODULE" = "linclust1" ]; then
     # 0. clusthash
     if [ -n "$CLUSTHASH" ]; then
-        if notExists "${TMP_PATH}/input_clusthash.dbtype"; then
-            # shellcheck disable=SC2086
-            $RUNNER "$MMSEQS" clusthash "$INPUT" "${TMP_PATH}/input_clusthash" ${CLUSTHASH_PAR} \
-                    || fail "clust hash died"
-        fi
-
+        # clusthashfast writes the clustering directly, so no alignment DB and no clust step
         if notExists "${TMP_PATH}/input_clusthash_clust.dbtype"; then
             # shellcheck disable=SC2086
-            $RUNNER "$MMSEQS" clust "$INPUT" "${TMP_PATH}/input_clusthash" "${TMP_PATH}/input_clusthash_clust" ${CLUSTHASH_CLUST_PAR} \
-                    || fail "clust hash based clust died"
+            $RUNNER "$MMSEQS" clusthashfast "$INPUT" "${TMP_PATH}/input_clusthash_clust" ${CLUSTHASHFAST_PAR} \
+                || fail "clusthashfast died"
         fi
 
         awk '{print $1}' "${TMP_PATH}/input_clusthash_clust.index" > "${TMP_PATH}/order_clusthash_redundancy"
@@ -275,7 +265,6 @@ if [ -n "$REMOVE_TMP" ]; then
         fi
         if [ -n "$CLUSTHASH" ]; then
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash" ${VERBOSITY}
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust" ${VERBOSITY}
             # shellcheck disable=SC2086
@@ -307,7 +296,6 @@ if [ -n "$REMOVE_TMP" ]; then
         fi
         if [ -n "$CLUSTHASH" ]; then
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash" ${VERBOSITY}
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust" ${VERBOSITY}
             # shellcheck disable=SC2086

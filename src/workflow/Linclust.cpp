@@ -209,6 +209,7 @@ int linclust(int argc, const char **argv, const Command& command) {
     par.alphabetSize = MultiParam<NuclAA<int>>(NuclAA<int>(Parameters::CLUST_HASH_DEFAULT_ALPH_SIZE, 5));
     cmd.addVariable("CLUSTHASH", par.clustHash ? "TRUE" : NULL);
     cmd.addVariable("CLUSTHASH_PAR", par.createParameterString(par.clusthash).c_str());
+    cmd.addVariable("CLUSTHASHFAST_PAR", par.createParameterString(par.clusthashfast).c_str());
     par.seqIdThr = prevSeqId;
     par.alphabetSize = alphabetSize;
     cmd.addVariable("CLUSTHASH_CLUST_PAR", par.createParameterString(par.clust).c_str());
