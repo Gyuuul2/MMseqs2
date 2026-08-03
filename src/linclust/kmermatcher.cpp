@@ -915,24 +915,24 @@ size_t assignGroup(KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair
                                     if (writeSeqPair != NULL) {
                                         if (queryLen < hashSeqPair[i].sl.getSeqLen(hashSeqPair[i].id) && covMode == Parameters::COV_MODE_TARGET) {
                                             writeSeqPair[localWritePos[thread]].kmer = hashSeqPair[i].id;
-                                            writeSeqPair[localWritePos[thread]].pos = -diagonal;
+                                            writeSeqPair[localWritePos[thread]].pos = static_cast<short>(-diagonal);
                                             writeSeqPair[localWritePos[thread]].sl.setSeqLen(targetLen);
                                             writeSeqPair[localWritePos[thread]].id = rId;
                                         } else {
                                             writeSeqPair[localWritePos[thread]].kmer = rId;
-                                            writeSeqPair[localWritePos[thread]].pos = diagonal;
+                                            writeSeqPair[localWritePos[thread]].pos = static_cast<short>(diagonal);
                                             writeSeqPair[localWritePos[thread]].sl.setSeqLen(targetLen);
                                             writeSeqPair[localWritePos[thread]].id = hashSeqPair[i].id;
                                         }
                                     } else {
                                         if (queryLen < hashSeqPair[i].sl.getSeqLen(hashSeqPair[i].id) && covMode == Parameters::COV_MODE_TARGET) {
                                             hashSeqPair[localWritePos[thread]].kmer = hashSeqPair[i].id;
-                                            hashSeqPair[localWritePos[thread]].pos = -diagonal;
+                                            hashSeqPair[localWritePos[thread]].pos = static_cast<short>(-diagonal);
                                             hashSeqPair[localWritePos[thread]].sl.setSeqLen(targetLen);
                                             hashSeqPair[localWritePos[thread]].id = rId;
                                         } else {
                                             hashSeqPair[localWritePos[thread]].kmer = rId;
-                                            hashSeqPair[localWritePos[thread]].pos = diagonal;
+                                            hashSeqPair[localWritePos[thread]].pos = static_cast<short>(diagonal);
                                             hashSeqPair[localWritePos[thread]].sl.setSeqLen(targetLen);
                                             hashSeqPair[localWritePos[thread]].id = hashSeqPair[i].id;
                                         }
@@ -2752,20 +2752,26 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
                 kmerPos--;
 
                 elementCnt++;
-                writeBuffer[bufferPos].seqId = targetId;
-                writeBuffer[bufferPos].score = diagonalScore;
+                // score is one byte, so a longer run is emitted as several records that the merge adds up
+                int remainingScore = diagonalScore;
                 diagonalScore = 0;
-                writeBuffer[bufferPos].diagonal = diagonal;
-                if (TYPE == Parameters::DBTYPE_NUCLEOTIDES) {
-                    bool isReverse = (reverse > forward) ? true : false;
-                    writeBuffer[bufferPos].setReverse(isReverse);
-                }
-                bufferPos++;
+                do {
+                    int chunk = (remainingScore > UCHAR_MAX) ? UCHAR_MAX : remainingScore;
+                    writeBuffer[bufferPos].seqId = targetId;
+                    writeBuffer[bufferPos].score = static_cast<unsigned char>(chunk);
+                    writeBuffer[bufferPos].diagonal = diagonal;
+                    if (TYPE == Parameters::DBTYPE_NUCLEOTIDES) {
+                        bool isReverse = (reverse > forward) ? true : false;
+                        writeBuffer[bufferPos].setReverse(isReverse);
+                    }
+                    bufferPos++;
 
-                if (bufferPos >= BUFFER_SIZE) {
-                    writeEntries(writeBuffer, bufferPos);
-                    bufferPos = 0;
-                }
+                    if (bufferPos >= BUFFER_SIZE) {
+                        writeEntries(writeBuffer, bufferPos);
+                        bufferPos = 0;
+                    }
+                    remainingScore -= chunk;
+                } while (remainingScore > 0);
                 lastTargetId = targetId;
                 writeSets++;
             }
