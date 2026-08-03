@@ -2,6 +2,7 @@
 #define XXH_INLINE_ALL
 #include "xxhash.h"
 
+
 #include "kmermatcher.h"
 #include "Debug.h"
 #include "Indexer.h"
@@ -37,6 +38,21 @@
 #ifndef SIZE_T_MAX
 #define SIZE_T_MAX ((size_t) -1)
 #endif
+
+// DBReader only advises the kernel for LINEAR_ACCCESS/SORT_BY_OFFSET, and remapData drops the advice
+// with the old mapping, so this module asks for it itself after every (re)mapping. isSortedByOffset
+// is measured on the final index array, so it only describes the read order for a reader iterated in
+// index order -- true here because kmermatcher opens NOSORT and walks id 0..size, but NOT true for
+// SORT_BY_LENGTH, which leaves the index alone and reorders through local2id instead. Advising a db
+// whose offsets are not monotone would prefetch pages the scan never reads and evict ones it will.
+static void remapWithSequentialAdvice(DBReader<DBKeyType> &reader, bool remap = true) {
+    if (remap) {
+        reader.remapData();
+    }
+    if (reader.isSortedByOffset()) {
+        reader.setSequentialAdvice();
+    }
+}
 
 uint64_t hashUInt64(uint64_t in, uint64_t seed) {
 #if SIMDE_ENDIAN_ORDER == SIMDE_ENDIAN_BIG
@@ -586,7 +602,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
             if (thread_idx == 0) {
-                seqDbr.remapData();
+                remapWithSequentialAdvice(seqDbr);
             }
 #pragma omp barrier
         }
@@ -1348,13 +1364,11 @@ std::vector<std::pair<size_t, size_t>> setupCountTable(
         fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, IncludeSeqLen>(NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
     }
 
-    seqDbr.remapData();
+    remapWithSequentialAdvice(seqDbr);
 
 
     if (splits > 1) {
         Debug(Debug::INFO) << "Not enough memory to process at once need to split for initiating count table\n";
-        
-        seqDbr.remapData();
         size_t maxBucketSize = 0;
         for(size_t i = 0; i < (USHRT_MAX+1); i++) {
             if(maxBucketSize < hashDist[i]){
@@ -1590,7 +1604,7 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
                 NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, NULL, &sink);
         }
         sink.finish();
-        seqDbr.remapData();
+        remapWithSequentialAdvice(seqDbr);
         delete[] hashToBucket;
     }
     for(size_t split = 0; split < hashRanges.size(); split++) {
@@ -1706,7 +1720,7 @@ std::vector<std::pair<size_t, size_t>> setupKmerSplits(Parameters &par, BaseMatr
         }else{
             fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, IncludeSeqLen>(NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
         }
-        seqDbr.remapData();
+        remapWithSequentialAdvice(seqDbr);
         size_t maxBucketSize = 0;
         for(size_t i = 0; i < (USHRT_MAX+1); i++) {
             if(maxBucketSize < hashDist[i]){
@@ -1745,6 +1759,9 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     DBReader<DBKeyType> seqDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads,
                                   DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
     seqDbr.open(DBReader<DBKeyType>::NOSORT);
+    // NOSORT is key order and the index is offset monotone in it, so the whole-db scans this module
+    // runs once per hash pass and once per split really are sequential
+    remapWithSequentialAdvice(seqDbr, false);
     int querySeqType = seqDbr.getDbtype();
 
     setKmerLengthAndAlphabet(par, seqDbr.getAminoAcidDBSize(), querySeqType);
@@ -2620,6 +2637,7 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
 #ifdef OPENMP
         tid = omp_get_thread_num();
 #endif
+
         size_t startIdx, endIdx;
 
         if (threadQueryOffsets == nullptr) {

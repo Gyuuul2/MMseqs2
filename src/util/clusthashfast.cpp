@@ -303,7 +303,11 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     DBReader<DBKeyType> reader(par.db1.c_str(), par.db1Index.c_str(), par.threads,
                                DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX);
     reader.open(DBReader<DBKeyType>::NOSORT);
-    if (par.preloadMode != Parameters::PRELOAD_MODE_MMAP) {
+    // touchMemory advises WILLNEED over the whole range before its own size guard, so preloading a db
+    // that cannot fit buys nothing and drives reclaim; AUTO now preloads only when the data fits
+    const bool dataFitsInMemory = reader.getDataSize() < Util::computeMemory(par.splitMemoryLimit) / 2;
+    if (par.preloadMode == Parameters::PRELOAD_MODE_MMAP_TOUCH
+        || (par.preloadMode != Parameters::PRELOAD_MODE_MMAP && dataFitsInMemory)) {
         reader.readMmapedDataInMemory();
     }
 
