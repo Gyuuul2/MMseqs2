@@ -1,4 +1,3 @@
-#include "DistanceCalculator.h"
 #include "Util.h"
 #include "Parameters.h"
 #include "Matcher.h"
@@ -6,11 +5,9 @@
 #include "DBReader.h"
 #include "DBWriter.h"
 #include "QueryMatcher.h"
-#include "IndexReader.h"
 #include "FastSort.h"
 #include "BlockAligner.h"
 #include "Alignment.h"
-#include "AlignmentSymmetry.h"
 #include <atomic>
 #include <cstdlib>
 #include <thread>
@@ -191,7 +188,7 @@ static void pushClusterResult(ClusterResult &&clusterResult) {
         // Wait for this result's slot to free up. The next-in-order slot is always
         // free, so the producer the consumer is waiting on never blocks (deadlock-free).
         reorderSpaceCondition.wait(lock, [&] {
-            return allCalculationsDone || idx < currentProcessPosition + reorderCapacity;
+            return idx < currentProcessPosition + reorderCapacity;
         });
         const size_t slot = idx % reorderCapacity;
         reorderSlots[slot] = std::move(clusterResult);   // O(1) vector move, no heap sift
@@ -285,10 +282,6 @@ static bool clusterMembersCanBeCovered(DBReader<DBKeyType> *cluSeqDbr, const Par
         const DBKeyType memberKey = Util::fast_atoi<DBKeyType>(buffer);
         if (memberKey != targetKey) {
             const size_t memberId = requireId(cluSeqDbr->getId(memberKey), "Filter sequence DB", memberKey);
-            if (memberId == DB_ENTRY_NOT_FOUND) {
-                Debug(Debug::ERROR) << "Filter sequence DB has no entry for key " << memberKey << "\n";
-                EXIT(EXIT_FAILURE);
-            }
             if (Util::canBeCovered(par.covThr, par.covMode, queryLen, cluSeqDbr->getSeqLen(memberId)) == false) {
                 return false;
             }
@@ -724,10 +717,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     if (par.filterCluDBFile.empty()== false && par.filterSeqDBFile.empty()== false){
                         // check all the member from filtering file
                         const size_t cluId = requireId(cluDbr->getId(targetKey), "Filter cluster DB", targetKey);
-                        if (cluId == DB_ENTRY_NOT_FOUND) {
-                            Debug(Debug::ERROR) << "Filter cluster DB has no entry for key " << targetKey << "\n";
-                            EXIT(EXIT_FAILURE);
-                        }
                         char *cluData = cluDbr->getData(cluId, threadIdx);
                         const size_t cluDataSize = cluDbr->getEntryLen(cluId);
                         size_t numClu = Util::countLines(cluData, cluDataSize);
@@ -749,20 +738,12 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                     continue;
                                 }
                                 const size_t elementId = requireId(cluSeqDbr->getId(elementKey), "Filter sequence DB", elementKey);
-                                if (elementId == DB_ENTRY_NOT_FOUND) {
-                                    Debug(Debug::ERROR) << "Filter sequence DB has no entry for key " << elementKey << "\n";
-                                    EXIT(EXIT_FAILURE);
-                                }
                                 char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
                                 size_t elementLength = cluSeqDbr->getSeqLen(elementId);
                                 short elementDiagonal = diagonal;
 
                                 // 1. ungapped alignment
                                 element.mapSequence(elementId, elementKey, elementSequence, elementLength);
-                                if (Util::canBeCovered(par.covThr, par.covMode, query.L, element.L) == false) {
-                                    allpass = false;
-                                    break;
-                                }
                                 BlockAligner::UngappedAln_res elementUngappedAlignment = blockAligner.ungappedAlign(&element, elementDiagonal);
                                 
                                 // 2. check the criteria
@@ -877,10 +858,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                         if (par.filterCluDBFile.empty()== false && par.filterSeqDBFile.empty()== false){
                             // check all the member from filtering file
                             const size_t cluId = requireId(cluDbr->getId(targetKey), "Filter cluster DB", targetKey);
-                            if (cluId == DB_ENTRY_NOT_FOUND) {
-                                Debug(Debug::ERROR) << "Filter cluster DB has no entry for key " << targetKey << "\n";
-                                EXIT(EXIT_FAILURE);
-                            }
                             char *cluData = cluDbr->getData(cluId, threadIdx);
                             const size_t cluDataSize = cluDbr->getEntryLen(cluId);
                             size_t numClu = Util::countLines(cluData, cluDataSize);
@@ -901,20 +878,12 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                         continue;
                                     }
                                     const size_t elementId = requireId(cluSeqDbr->getId(elementKey), "Filter sequence DB", elementKey);
-                                    if (elementId == DB_ENTRY_NOT_FOUND) {
-                                        Debug(Debug::ERROR) << "Filter sequence DB has no entry for key " << elementKey << "\n";
-                                        EXIT(EXIT_FAILURE);
-                                    }
                                     char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
                                     size_t elementLength = cluSeqDbr->getSeqLen(elementId);
                                     short elementDiagonal = 0;
 
                                     // 1. ungapped alignment
                                     element.mapSequence(elementId, elementKey, elementSequence, elementLength);
-                                    if (Util::canBeCovered(par.covThr, par.covMode, query.L, element.L) == false) {
-                                        allpass = false;
-                                        break;
-                                    }
                                     BlockAligner::UngappedAln_res elementUngappedAlignment = blockAligner.ungappedAlign(&element, elementDiagonal);
                                     
                                     // 2. check the criteria
