@@ -356,12 +356,8 @@ std::string createBatchSubmitDirectory(const std::string &hash) {
 }
 
 std::string buildCreatedbPar(const Parameters &par) {
-    // --write-lookup 0: the per-chunk .lookup is unused here. The inner clust reads .lookup only
-    // in set-mode (clusteringSetMode), which the batch entry points never enable; accessions come
-    // from the _h header DB (createtsv/convert2fasta), so the .lookup only costs time and disk.
-    // --createdb-mode 1 (soft-link) is the batch default: the batch materializes one node-local
-    // single-line FASTA per chunk (append_singleline_fasta) and createdb soft-links it, skipping the
-    // compact-DB data copy. Set --createdb-mode 0 to fall back to copying (reads FASTA/.zst natively).
+    // --write-lookup 0: the per-chunk .lookup is unused, accessions come from the _h header DB
+    // --shuffle 0: shuffling would renumber ids and change representative tie-breaks
     return std::string("--shuffle 0 --write-lookup 0") +
            " --createdb-mode " + SSTR(par.createdbMode) +
            " --threads " + SSTR(par.threads) + " -v " + SSTR(par.verbosity);
@@ -743,11 +739,6 @@ void setBatchClusteringDescriptions(Parameters &par) {
         "Batch createdb mode: 0 copies FASTA/.zst into a compact MMseqs DB, 1 soft-links plain single-line FASTA. Mode 2/GPU DB layout is not supported by batch clustering",
         NULL,
         par.PARAM_CREATEDB_MODE.category);
-    par.overrideParameterDescription(
-        par.PARAM_COMPRESSED,
-        "Forward --compressed to inner linclust/cluster result DBs. Batch createdb remains uncompressed for I/O speed",
-        NULL,
-        par.PARAM_COMPRESSED.category);
     par.overrideParameterDescription(
         par.PARAM_COMPRESS_KMER_TMP_FILES,
         "Compress kmermatcher spill files during inner linclust/cluster. Separate from --compressed and from --compress-batch-outputs",

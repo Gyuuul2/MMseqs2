@@ -64,11 +64,9 @@ ROUND0_CHUNK_MAX_SEQS=${ROUND0_CHUNK_MAX_SEQS:-}
 S3_CHUNK_PREFIX=${S3_CHUNK_PREFIX:-}
 COMPRESS_BATCH_OUTPUTS=${COMPRESS_BATCH_OUTPUTS:-0}
 [[ "$COMPRESS_BATCH_OUTPUTS" =~ ^[01]$ ]] || fail "COMPRESS_BATCH_OUTPUTS must be 0 or 1 (got '$COMPRESS_BATCH_OUTPUTS')"
-# --write-lookup 0: the per-chunk .lookup is unused here. The inner clust reads .lookup only in
-# set-mode (never enabled from batch entry points); accessions come from the _h header DB, not it.
-# --createdb-mode 0: createdb reads FASTA/.zst natively and writes the compact sequence DB. Mode 1
-# is explicit opt-in only; batch must materialize plain FASTA first, which is slower for .zst chunks.
-CREATEDB_PAR=${CREATEDB_PAR:---shuffle 0 --write-lookup 0 --createdb-mode 1}
+# --write-lookup 0: the per-chunk .lookup is unused, accessions come from the _h header DB
+# --createdb-mode 0: createdb reads FASTA/.zst natively, mode 1 needs a plain FASTA materialized first
+CREATEDB_PAR=${CREATEDB_PAR:---shuffle 0 --write-lookup 0 --createdb-mode 0}
 createdb_mode_from_par() {
     local par=" ${CREATEDB_PAR} "
     if [[ "$par" =~ [[:space:]]--createdb-mode=([0-9]+) ]]; then
@@ -295,14 +293,7 @@ with_round_node_work_dir() {
     NODE_WORK_DIR="$node_work_dir" "$@"
 }
 
-# GNU-sort acceleration for the merge: parallel workers + an in-memory buffer before spilling to -T.
-# SORT_BUFFER_SIZE is the per-sort memory target; it is NOT related to bucket count. It defaults to a
-# modest fraction of node RAM (auto-scales to the machine, no manual tuning) so that the round
-# mapping -- one row per ORIGINAL sequence, hundreds of GB and unrelated to chunk size -- stays in
-# external (disk-backed) mode. GNU sort's -S is a target, not a hard cap (the parallel merge can
-# exceed it somewhat), but at ~25% of RAM the headroom is large enough that a single sort will not
-# realistically OOM. --merge-buckets shrinks each sort's INPUT; this only sizes its memory.
-# BSD/macOS sort lacks these flags, so they are only added when GNU sort is detected.
+# per-sort memory target for the merge, GNU sort only; --merge-buckets sizes the input, this the memory
 if [[ -z "${SORT_BUFFER_SIZE+x}" ]]; then
     if [[ "$MERGE_BUCKET_JOBS" -gt 1 ]]; then
         sort_pct=$((25 / MERGE_BUCKET_JOBS))
@@ -322,14 +313,7 @@ if sort --version 2>/dev/null | grep -q GNU; then
     SORT_PARALLEL_OPT="--parallel=$MERGE_SORT_THREADS --buffer-size=$SORT_BUFFER_SIZE"
 fi
 
-# Where GNU sort spills its external-sort runs (-T). Prefer node-local NVMe (--node-work-dir) so the
-# large merge/finalize sort does not read/write the shared filesystem repeatedly; fall back to the
-# work_dir (already node-local on single-node). SORT_TMP overrides everything.
-# Node-local scratch dir for a merge/finalize step (partition files, sort spill). Prefers NVMe
-# (--node-work-dir) with a per-run component (like make_chunk_work_dir) so co-located runs never
-# collide -- otherwise one run's cleanup could rm -rf another run's scratch mid-sort. Falls back to
-# the work_dir (already node-local on single-node). Only the merge OUTPUT (shards/ for the next
-# round) and the final output must live on shared storage; these intermediates should not.
+# node-local scratch, NVMe when --node-work-dir is set, per-run so co-located runs cannot collide
 resolve_node_scratch() {
     local work_dir="$1" name="$2"
     if [[ -n "${NODE_WORK_DIR:-}" ]]; then
@@ -339,6 +323,7 @@ resolve_node_scratch() {
     fi
 }
 
+# where GNU sort spills its external-sort runs (-T); SORT_TMP overrides the node-local default
 resolve_sort_tmp() {
     local work_dir="$1"
     if [[ -n "${SORT_TMP:-}" ]]; then
@@ -531,10 +516,7 @@ createdb_softlink_enabled() {
     [[ " ${CREATEDB_PAR} " =~ (^|[[:space:]])--createdb-mode(=|[[:space:]]+)1($|[[:space:]]) ]]
 }
 
-# createdb mode is round-dependent. round0 chunks are single-frame zstd (no parallel pzstd -dc), so
-# soft-link mode 1 only adds materialize + reindex I/O -> use native mode 0. Set ROUND0_CREATEDB_MODE=1
-# once round0 chunks are multi-frame. round1+ representatives are pzstd multi-frame, so mode 1 (soft-link
-# + parallel decompress) pays off; it follows CREATEDB_PAR's mode (default 1).
+# round0 is gated on ROUND0_CREATEDB_MODE (default 0), round1+ follows CREATEDB_PAR (default 0)
 round_createdb_softlink() {
     local round="$1"
     if [[ "$round" -eq 0 ]]; then
@@ -711,17 +693,8 @@ file_size_bytes() {
     fi
 }
 
-# Uncompressed size for bin-packing. This has to be EXACT, not an estimate: the aws-batch backend
-# sizes representatives from the per-chunk metrics while the single-node and slurm backends come
-# through here, so a different number on either side bin-packs round 1 differently and the run
-# produces a different clustering for the same input and parameters.
-#
-# Only a .zst written with a file argument carries its decompressed size in the frame header. Both
-# forms this workflow produces do not: compress_to_zst uses `pzstd -c` (multi-frame) and prepare's
-# chunk writer uses `zstd -c >` (streamed). Measured with zstd 1.5.5, `zstd -lv` reports a
-# Decompressed Size for neither, so the header path below never fires for our own files and every
-# representative used to fall through to size x COMPRESS_RATIO. For a local file we therefore count
-# the decompressed bytes instead; only a remote URI, which we cannot read cheaply, keeps the ratio.
+# must be EXACT, not estimated: a different number per backend bin-packs round 1 differently
+# our own .zst carry no frame header size (pzstd -c / zstd -c >), so local files are decompressed
 uncompressed_bytes() {
     local uri="$1" sz n
     if ! is_s3 "$uri"; then
@@ -1151,6 +1124,11 @@ cluster_chunk() {
     fi
     if round_createdb_softlink "$round" && [[ ! -L "$db" || ! -L "${db}_h" ]]; then
         fail "createdb-mode 1 fell back to a copied DB for ${chunk_id}. Batch softlink mode requires plain single-line FASTA; refusing silent NVMe expansion."
+    fi
+    # mode 0 reads the chunk in place, so it can only be freed here; a retry rebuilds from the db
+    if ! round_createdb_softlink "$round" \
+       && [[ -n "${REMOVE_TMP:-}" && "${BATCH_DELETE_SOURCE_CHUNK:-0}" == "1" && "$chunk_uri" != s3://* && -f "$chunk_uri" ]]; then
+        rm -f "$chunk_uri"
     fi
 
     log "${CLUSTER_CMD} ${chunk_id}"
@@ -2135,19 +2113,8 @@ aws_submit_batch_job() {
         cmd+=(--depends-on "jobId=${depends_on}")
     fi
 
-    # Worker arrays get an AWS-native retry so an infra kill (spot reclaim / OOM / attempt timeout)
-    # that exits a child non-zero is retried on a fresh instance -- the array then still reaches
-    # SUCCEEDED, so the merge dependency fires and reconciles. This is the closest AWS Batch has to
-    # SLURM's `afterany`. Application failures already exit 0 (reconciled by the merge), so they never
-    # consume a retry. Only workers get this: retrying a driver/merge would double-submit its
-    # downstream jobs. A chunk that hard-kills on every attempt still fails the array (there is no
-    # native afterany); fully closing that residual gap would require an EventBridge trigger.
-    #
-    # This is a SEPARATE layer from MAX_CHUNK_ATTEMPTS (the merge-level reconcile that re-drives
-    # missing chunks): BATCH_AWS_WORKER_ATTEMPTS is per-container infra placement, MAX_CHUNK_ATTEMPTS
-    # is logical clustering attempts. They compound, so a chunk can run up to attempts x
-    # MAX_CHUNK_ATTEMPTS times, and each attempt gets its own attemptDurationSeconds (a hung chunk
-    # burns attempts x BATCH_AWS_TIMEOUT before the merge reconciles). Keep both small (default 2).
+    # workers only: an infra kill is retried on a fresh instance so the array still reaches SUCCEEDED
+    # this compounds with MAX_CHUNK_ATTEMPTS (infra placement vs logical attempts), so keep both small
     if [[ "$subcommand" == "aws-worker" ]]; then
         local worker_attempts="${BATCH_AWS_WORKER_ATTEMPTS:-2}"   # value already validated in aws_require_submit_env
         cmd+=(--retry-strategy "attempts=${worker_attempts}")
@@ -2164,14 +2131,8 @@ aws_submit_batch_job() {
     "${cmd[@]}"
 }
 
-# Idempotent submit: record the submitted job id at marker_uri and, if that marker already exists,
-# ADOPT the recorded id instead of submitting again. This makes re-invoking a driver/merge (a manual
-# recovery of a stalled chain, or an EventBridge rule you add) safe -- it cannot fork a second chain or
-# a duplicate downstream job. The marker write is best-effort (non-fatal): if it fails the job is still
-# submitted, we just lose the dedup guarantee for that one step (the pre-marker behavior). Note we do
-# NOT give drivers/merges AWS-native `--retry-strategy attempts>1`: a retried MERGE would re-read the
-# incremented chunk_attempts counter and could dead-letter prematurely, so unattended auto-recovery
-# still needs an external (EventBridge) trigger -- but that trigger is now safe because of this marker.
+# idempotent submit: adopt the job id recorded at marker_uri instead of forking a second chain
+# the marker write is best-effort, so a failed write only loses dedup for that one step
 aws_submit_batch_job_once() {
     local marker_uri="$1"; shift
     if done_exists "$marker_uri"; then
@@ -2639,15 +2600,9 @@ aws_merge() {
 }
 
 # ---------------------------------------------------------------------------
-# Multi-node (SLURM) event chain -- the AWS backend's driver/worker/merge model,
-# expressed with `sbatch --dependency` on a shared filesystem instead of AWS Batch.
-#
-# Nothing stays alive on the submitting host: it submits one driver job and returns.
-# Each job is short and hands off to the next via a dependency, so no job ever blocks
-# holding a node's cores while waiting for another (which would deadlock a co-located
-# worker). State between rounds is passed through round<r>/state.env on the shared FS.
-# The merge runs on a single node per round (like AWS); MERGE_BUCKETS still splits that
-# node's sort/join for RAM/disk headroom.
+# Multi-node (SLURM) event chain: driver/worker/merge via sbatch --dependency.
+# Nothing stays alive on the submitting host and no job blocks holding cores;
+# per-round state passes through round<r>/state.env on the shared filesystem.
 # ---------------------------------------------------------------------------
 
 # Submit one event-chain job. submit_event_step <job_name> <slurm_dir> <depends_on> <pin_node> <subcommand> <args...>

@@ -231,7 +231,7 @@ Parameters::Parameters():
         PARAM_BATCH_ROUND0_MMSEQS(PARAM_BATCH_ROUND0_MMSEQS_ID, "--round0-mmseqs", "Round0 mmseqs binary", "mmseqs binary to run for round 0 only, e.g. a different architecture. Empty uses the same binary as the later rounds", typeid(std::string), (void *) &batchRound0Mmseqs, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_ROUND0_CREATEDB_MODE(PARAM_BATCH_ROUND0_CREATEDB_MODE_ID, "--round0-createdb-mode", "Round0 createdb mode", "Override --createdb-mode for round 0 only (0: copy data, 1: soft link data)", typeid(int), (void *) &batchRound0CreatedbMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_COMPRESS_RATIO(PARAM_BATCH_COMPRESS_RATIO_ID, "--compress-ratio", "Compression ratio estimate", "Assumed uncompressed/compressed size ratio for compressed inputs whose exact size cannot be read. Feeds chunk grouping, so changing it changes chunk boundaries", typeid(int), (void *) &batchCompressRatio, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
-        PARAM_BATCH_DELETE_SOURCE_CHUNK(PARAM_BATCH_DELETE_SOURCE_CHUNK_ID, "--delete-source-chunk", "Delete source chunk", "Delete the node-local compressed chunk right after the plain FASTA was materialized", typeid(bool), (void *) &batchDeleteSourceChunk, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_DELETE_SOURCE_CHUNK(PARAM_BATCH_DELETE_SOURCE_CHUNK_ID, "--delete-source-chunk", "Delete source chunk", "Delete the node-local source chunk once its db is written (needs --remove-tmp)", typeid(bool), (void *) &batchDeleteSourceChunk, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_SORT_TMP_DIR(PARAM_BATCH_SORT_TMP_DIR_ID, "--sort-tmp-dir", "Sort tmp directory", "Spill directory for the merge sorts. Empty derives it from the node work directory", typeid(std::string), (void *) &batchSortTmpDir, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_SORT_BUFFER_SIZE(PARAM_BATCH_SORT_BUFFER_SIZE_ID, "--sort-buffer-size", "Sort buffer size", "Per-sort memory target passed to sort --buffer-size, e.g. 200G or 25%. Empty derives it from available memory", typeid(std::string), (void *) &batchSortBufferSize, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_AWS_MMSEQS(PARAM_BATCH_AWS_MMSEQS_ID, "--aws-mmseqs", "AWS mmseqs binary", "mmseqs binary inside the AWS Batch container image", typeid(std::string), (void *) &batchAwsMmseqs, "", MMseqsParameter::COMMAND_EXPERT),
@@ -1654,7 +1654,6 @@ Parameters::Parameters():
     batchclustering.push_back(&PARAM_THREADS);
     batchclustering.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     batchclustering.push_back(&PARAM_PRELOAD_MODE);
-    batchclustering.push_back(&PARAM_COMPRESSED);
     batchclustering.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
     batchclustering.push_back(&PARAM_KMER_WRITE_TO_DISK);
     batchclustering.push_back(&PARAM_V);
@@ -1673,7 +1672,6 @@ Parameters::Parameters():
     linclustbatchinner.push_back(&PARAM_THREADS);
     linclustbatchinner.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     linclustbatchinner.push_back(&PARAM_PRELOAD_MODE);
-    linclustbatchinner.push_back(&PARAM_COMPRESSED);
     linclustbatchinner.push_back(&PARAM_V);
     linclustbatchinner.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
     linclustbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
@@ -1695,7 +1693,6 @@ Parameters::Parameters():
     clusterbatchinner.push_back(&PARAM_THREADS);
     clusterbatchinner.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     clusterbatchinner.push_back(&PARAM_PRELOAD_MODE);
-    clusterbatchinner.push_back(&PARAM_COMPRESSED);
     clusterbatchinner.push_back(&PARAM_V);
     clusterbatchinner.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
     clusterbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
