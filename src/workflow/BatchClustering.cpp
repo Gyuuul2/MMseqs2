@@ -553,6 +553,8 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
     cmd.addVariable("THREADS", threads.c_str());
     cmd.addVariable("CHUNK_MAX_BYTES", chunkMaxBytes.c_str());
     cmd.addVariable("CHUNK_MAX_SEQS", chunkMaxSeqs.c_str());
+    // round_cluster_par picks the spill per round; an explicit --kmer-write-to-disk must win
+    cmd.addVariable("BATCH_KMER_WRITE_TO_DISK", par.PARAM_KMER_WRITE_TO_DISK.wasSet ? (par.kmerWriteToDisk ? "1" : "0") : NULL);
     cmd.addVariable("ROUND0_CHUNK_MAX_BYTES", par.PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES.wasSet ? round0ChunkMaxBytes.c_str() : NULL);
     cmd.addVariable("ROUND0_CHUNK_MAX_SEQS", par.PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS.wasSet ? round0ChunkMaxSeqs.c_str() : NULL);
     cmd.addVariable("MERGE_BUCKETS", mergeBuckets.c_str());

@@ -177,10 +177,12 @@ round_cluster_par() {
     else
         base="$CLUSTER_PAR"
     fi
-    # round0 chunks are sized to fit in memory (no split, so k-mer caching is a no-op); enable
-    # --kmer-write-to-disk only from round1+, where the growing representative set can split.
+    # round0 chunks are usually sized to fit in memory, where the spill is a no-op, so it defaults
+    # to round1+ only; an explicit --kmer-write-to-disk overrides that, because with a small
+    # --split-memory-limit round0 chunks do split and the caller may want the spill there too.
     local spill=1
     [[ "$round" -eq 0 ]] && spill=0
+    [[ -n "${BATCH_KMER_WRITE_TO_DISK:-}" ]] && spill="$BATCH_KMER_WRITE_TO_DISK"
     printf '%s --kmer-write-to-disk %s' "$(par_without_flag "$base" --kmer-write-to-disk)" "$spill"
 }
 

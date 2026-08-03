@@ -1152,7 +1152,6 @@ Parameters::Parameters():
     clusthash.push_back(&PARAM_V);
 
     clusthashfast = clusthash;
-    clusthashfast.push_back(&PARAM_CLUSTER_MODE);
 
     // kmermatcher
     kmermatcher.push_back(&PARAM_SUB_MAT);

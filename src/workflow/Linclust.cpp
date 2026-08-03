@@ -188,6 +188,7 @@ int linclust(int argc, const char **argv, const Command& command) {
         par.kmerSize = kmerSize;
         bool prevspacedKmer = par.spacedKmer;
         bool prevmaskMode = par.maskMode;
+        MultiParam<NuclAA<float>> prevKmersPerSequenceScale = par.kmersPerSequenceScale;
         par.spacedKmer = false;
         par.maskMode = false;
         cmd.addVariable("KMERMATCHER_PAR", par.createParameterString(par.kmermatcher).c_str());
@@ -202,6 +203,8 @@ int linclust(int argc, const char **argv, const Command& command) {
         
         par.spacedKmer = prevspacedKmer;
         par.maskMode = prevmaskMode;
+        // the 0.1 above is intended for KMERMATCHER_PAR2 only, so it must not leak into later strings
+        par.kmersPerSequenceScale = prevKmersPerSequenceScale;
     }
     float prevSeqId = par.seqIdThr;
     // # 0. clust hash
