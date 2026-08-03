@@ -1151,6 +1151,8 @@ Parameters::Parameters():
     clusthash.push_back(&PARAM_COMPRESSED);
     clusthash.push_back(&PARAM_V);
 
+    clusthashfast = clusthash;
+
     // kmermatcher
     kmermatcher.push_back(&PARAM_SUB_MAT);
     kmermatcher.push_back(&PARAM_ALPH_SIZE);
