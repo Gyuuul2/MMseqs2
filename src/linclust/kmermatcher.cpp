@@ -10,7 +10,6 @@
 #include "ReducedMatrix.h"
 #include "ExtendedSubstitutionMatrix.h"
 #include "NucleotideMatrix.h"
-#include "tantan.h"
 #include "QueryMatcher.h"
 #include "KmerGenerator.h"
 #include "MarkovKmerScore.h"
@@ -21,7 +20,6 @@
 
 #include <sys/stat.h>
 #include <sys/mman.h>
-#include <fcntl.h>
 #include <unistd.h>
 
 #include <limits>
@@ -89,9 +87,7 @@ KmerPosition<T, includeAdjacency, IncludeSeqLen> *initKmerPositionMemory(size_t 
     return hashSeqPair;
 }
 
-// Per-thread staging buffer size for fillKmerPositionArray. Only a contention/memory
-// trade-off (batches the atomic reservation into the shared array); a small batch already
-// makes the atomic overhead negligible, so keep it small to bound the per-thread scratch.
+// batches the atomic reservation into the shared k-mer array; a contention/memory trade-off only
 static const size_t KMER_STAGING_BUFFER_SIZE = 65536;
 
 static void removeKmerTmpFileIfExists(const std::string &fileName);
@@ -348,10 +344,6 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
             generator->setDivideStrategy(&three, &two);
         }
         Indexer idxer(subMat->alphabetSize - 1,  par.kmerSize);
-        // Thread-local staging buffer: batches the atomic reservation into the shared
-        // k-mer array. Only a contention/memory trade-off (not a correctness requirement);
-        // a small batch already makes the atomic overhead negligible, so keep it small so
-        // the per-thread scratch does not blow up at high thread counts.
         const unsigned int BUFFER_SIZE = static_cast<unsigned int>(KMER_STAGING_BUFFER_SIZE);
         size_t bufferPos = 0;
         KmerPosition<T, includeAdjacency, IncludeSeqLen> * threadKmerBuffer = NULL;
@@ -690,16 +682,6 @@ void swapCenterSequence(KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSe
     }
 }
 
-template void swapCenterSequence<0, short, true, false>(KmerPosition<short, true> *kmers, size_t splitKmerCount, SequenceWeights &seqWeights);
-template void swapCenterSequence<0, short, false, false>(KmerPosition<short, false> *kmers, size_t splitKmerCount, SequenceWeights &seqWeights);
-template void swapCenterSequence<0, int, true, false>(KmerPosition<int, true> *kmers, size_t splitKmerCount, SequenceWeights &seqWeights);
-template void swapCenterSequence<0, int, false, false>(KmerPosition<int, false> *kmers, size_t splitKmerCount, SequenceWeights &seqWeights);
-template void swapCenterSequence<1, short, true, false>(KmerPosition<short, true> *kmers, size_t splitKmerCount, SequenceWeights &seqWeights);
-template void swapCenterSequence<1, short, false, false>(KmerPosition<short, false> *kmers, size_t splitKmerCount, SequenceWeights &seqWeights);
-template void swapCenterSequence<1, int, true, false>(KmerPosition<int, true> *kmers, size_t splitKmerCount, SequenceWeights &seqWeights);
-template void swapCenterSequence<1, int, false, false>(KmerPosition<int, false> *kmers, size_t splitKmerCount, SequenceWeights &seqWeights);
-
-
 template <int TYPE, typename T, bool includeAdjacency, bool IncludeSeqLen>
 size_t assignGroup(KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair, KmerPosition<T, false, IncludeSeqLen> *writeSeqPair,
                     bool includeOnlyExtendable, int covMode, float covThr,
@@ -1017,14 +999,6 @@ size_t assignGroup(KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair
     return writePos;
 }
 
-template size_t assignGroup<0, short, false, false>(KmerPosition<short, false, false> *kmers, KmerPosition<short, false, false> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, short *countTable);
-template size_t assignGroup<0, int, false, false>(KmerPosition<int, false, false> *kmers, KmerPosition<int, false, false> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, short *countTable);
-template size_t assignGroup<1, short, false, false>(KmerPosition<short, false, false> *kmers, KmerPosition<short, false, false> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, short *countTable);
-template size_t assignGroup<1, int, false, false>(KmerPosition<int, false, false> *kmers, KmerPosition<int, false, false> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, short *countTable);
-template size_t assignGroup<0, short, true, false>(KmerPosition<short, true, false> *kmers, KmerPosition<short, false, false> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, short *countTable);
-template size_t assignGroup<0, int, true, false>(KmerPosition<int, true, false> *kmers, KmerPosition<int, false, false> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, short *countTable);
-template size_t assignGroup<1, short, true, false>(KmerPosition<short, true, false> *kmers, KmerPosition<short, false, false> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, short *countTable);
-template size_t assignGroup<1, int, true, false>(KmerPosition<int, true, false> *kmers, KmerPosition<int, false, false> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, short *countTable);
 
 template <typename T, bool includeAdjacency, bool IncludeSeqLen>
 static void runIteration(
@@ -1656,9 +1630,9 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
 
             seqDbr.unmapData();
             if (Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)) {
-                mergeKmerFilesAndOutput<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev, includeAdjacency>(dbw, splitFiles, repSequence, par.threads, maxIter);
+                mergeKmerFilesAndOutput<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev>(dbw, splitFiles, repSequence, par.threads, maxIter);
             } else {
-                mergeKmerFilesAndOutput<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry, includeAdjacency>(dbw, splitFiles, repSequence, par.threads, maxIter);
+                mergeKmerFilesAndOutput<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry>(dbw, splitFiles, repSequence, par.threads, maxIter);
             }
 
             for (int iter = 0; iter < maxIter; ++iter) {
@@ -1920,9 +1894,7 @@ void writeKmerMatcherResult(DBWriter & dbw,
                 kmerOffset++;
                 topScore++;
             }
-            if(targetId != repSeqId && lastTargetId != targetId ){
-                ;
-            }else{
+            if(targetId == repSeqId || lastTargetId == targetId){
                 lastTargetId = targetId;
                 continue;
             }
@@ -1944,26 +1916,6 @@ void writeKmerMatcherResult(DBWriter & dbw,
             }
         }
     }
-}
-
-template <int TYPE, typename T>
-size_t queueNextEntry(KmerPositionQueue &queue, int file, size_t offsetPos, T *entries, size_t entrySize) {
-    if(offsetPos + 1 >= entrySize){
-        return offsetPos;
-    }
-    DBKeyType repSeqId = entries[offsetPos].seqId;
-    size_t pos = 0;
-    while(entries[offsetPos + pos].seqId != DB_KEY_INVALID){
-        if(TYPE == Parameters::DBTYPE_NUCLEOTIDES){
-            queue.push(FileKmerPosition(repSeqId, entries[offsetPos+pos].seqId, entries[offsetPos+pos].diagonal, entries[offsetPos+pos].score, entries[offsetPos+pos].getRev(), file));
-        }else{
-            queue.push(FileKmerPosition(repSeqId, entries[offsetPos+pos].seqId, entries[offsetPos+pos].diagonal, entries[offsetPos+pos].score, file));
-        }
-        pos++;
-    }
-    queue.push(FileKmerPosition(repSeqId, DB_KEY_INVALID, 0, 0, file));
-    pos++;
-    return offsetPos+pos;
 }
 
 static const size_t KMER_TMP_ZSTD_INPUT_BUFFER_SIZE = 65536;
@@ -2414,7 +2366,7 @@ static bool queueNextEntryStreaming(KmerPositionQueue &queue, int file,
     return false;
 }
 
-template <int TYPE, typename T, bool includeAdjacency>
+template <int TYPE, typename T>
 void mergeKmerFilesAndOutput(DBWriter &dbw,
                              std::vector<std::string> tmpFiles,
                              std::vector<char> &repSequence,
@@ -2834,58 +2786,22 @@ void setKmerLengthAndAlphabet(Parameters &parameters, size_t aaDbSize, int seqTy
     }
 }
 
-// Existing explicit instantiations (IncludeSeqLen defaults to false)
-template std::pair<size_t, size_t>  fillKmerPositionArray<0, short, true>(KmerPosition<short, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<short, true, false> *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<0, short, false>(KmerPosition<short, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<short, false, false> *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<1, short, true>(KmerPosition<short, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<short, true, false> *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<1, short, false>(KmerPosition<short, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<short, false, false> *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<2, short, true>(KmerPosition<short, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<short, true, false> *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<2, short, false>(KmerPosition<short, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<short, false, false> *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<0, int, true>(KmerPosition<int, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<int, true, false> *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<0, int, false>(KmerPosition<int, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<int, false, false> *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<1, int, true>(KmerPosition<int, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<int, true, false> *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<1, int, false>(KmerPosition<int, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<int, false, false> *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<2, int, true>(KmerPosition<int, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<int, true, false> *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<2, int, false>(KmerPosition<int, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<int, false, false> *);
-
-// Linsearch explicit instantiations (IncludeSeqLen=true)
+// Only the instantiations other translation units need are explicit; the rest are implicit from use here.
+// kmersearch.cpp / kmerindexdb.cpp use the IncludeSeqLen=true (linsearch) variants.
 template std::pair<size_t, size_t>  fillKmerPositionArray<0, short, false, true>(KmerPosition<short, false, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<short, false, true> *);
 template std::pair<size_t, size_t>  fillKmerPositionArray<1, short, false, true>(KmerPosition<short, false, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<short, false, true> *);
 template std::pair<size_t, size_t>  fillKmerPositionArray<2, short, false, true>(KmerPosition<short, false, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPartitionSink<short, false, true> *);
 
-template KmerPosition<short, true> *initKmerPositionMemory(size_t size);
-template KmerPosition<short, false> *initKmerPositionMemory(size_t size);
-template KmerPosition<int, true> *initKmerPositionMemory(size_t size);
-template KmerPosition<int, false> *initKmerPositionMemory(size_t size);
 template KmerPosition<short, false, true> *initKmerPositionMemory(size_t size);
 
-template size_t computeMemoryNeededLinearfilter<short, true>(size_t totalKmer);
-template size_t computeMemoryNeededLinearfilter<short, false>(size_t totalKmer);
-template size_t computeMemoryNeededLinearfilter<int, true>(size_t totalKmer);
-template size_t computeMemoryNeededLinearfilter<int, false>(size_t totalKmer);
 template size_t computeMemoryNeededLinearfilter<short, false, true>(size_t totalKmer);
 
-template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<short, true>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t);
-template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<short, false>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t);
-template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<int, true>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t);
-template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<int, false>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t);
 template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<short, false, true>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t);
 
-template void writeKmersToDisk<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev, short, true>(std::string, KmerPosition<short, true> *, size_t, int, std::vector<size_t> *, int);
-template void writeKmersToDisk<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev, int, true>(std::string, KmerPosition<int, true> *, size_t, int, std::vector<size_t> *, int);
-template void writeKmersToDisk<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry, short, true>(std::string, KmerPosition<short, true> *, size_t, int, std::vector<size_t> *, int);
-template void writeKmersToDisk<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry, int, true>(std::string, KmerPosition<int, true> *, size_t, int, std::vector<size_t> *, int);
-template void writeKmersToDisk<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev, short, false>(std::string, KmerPosition<short, false> *, size_t, int, std::vector<size_t> *, int);
-template void writeKmersToDisk<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev, int, false>(std::string, KmerPosition<int, false> *, size_t, int, std::vector<size_t> *, int);
-template void writeKmersToDisk<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry, short, false>(std::string, KmerPosition<short, false> *, size_t, int, std::vector<size_t> *, int);
-template void writeKmersToDisk<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry, int, false>(std::string, KmerPosition<int, false> *, size_t, int, std::vector<size_t> *, int);
-// Linsearch (IncludeSeqLen=true)
 template void writeKmersToDisk<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev, short, false, true>(std::string, KmerPosition<short, false, true> *, size_t, int, std::vector<size_t> *, int);
 template void writeKmersToDisk<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry, short, false, true>(std::string, KmerPosition<short, false, true> *, size_t, int, std::vector<size_t> *, int);
 
-template void mergeKmerFilesAndOutput<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev, true>(DBWriter &, std::vector<std::string>, std::vector<char> &, int, int);
-template void mergeKmerFilesAndOutput<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry, true>(DBWriter &, std::vector<std::string>, std::vector<char> &, int, int);
-template void mergeKmerFilesAndOutput<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev, false>(DBWriter &, std::vector<std::string>, std::vector<char> &, int, int);
-template void mergeKmerFilesAndOutput<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry, false>(DBWriter &, std::vector<std::string>, std::vector<char> &, int, int);
+template void mergeKmerFilesAndOutput<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev>(DBWriter &, std::vector<std::string>, std::vector<char> &, int, int);
+template void mergeKmerFilesAndOutput<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry>(DBWriter &, std::vector<std::string>, std::vector<char> &, int, int);
 
 #undef SIZE_T_MAX

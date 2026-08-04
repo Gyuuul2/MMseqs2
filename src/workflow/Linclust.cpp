@@ -65,35 +65,12 @@ int linclust(int argc, const char **argv, const Command& command) {
     // save some values to restore them later
     MultiParam<NuclAA<int>>alphabetSize = par.alphabetSize;
     size_t kmerSize = par.kmerSize;
-    bool kmerSizeWasSet = false;
-    bool alphabetSizeWasSet = false;
-    bool clusterModeSet = false;
-    bool includeCountTableSet = false;
-    bool includeAdjacencySet = false;
-    for (size_t i = 0; i < par.linclustworkflow.size(); i++) {
-        if (par.linclustworkflow[i]->uniqid == par.PARAM_K.uniqid && par.linclustworkflow[i]->wasSet) {
-            kmerSizeWasSet = true;
-        }
-        if (par.linclustworkflow[i]->uniqid == par.PARAM_ALPH_SIZE.uniqid && par.linclustworkflow[i]->wasSet) {
-            alphabetSizeWasSet = true;
-        }
-        if (par.linclustworkflow[i]->uniqid == par.PARAM_CLUSTER_MODE.uniqid && par.linclustworkflow[i]->wasSet) {
-            clusterModeSet = true;
-        }
-        if (par.linclustworkflow[i]->uniqid == par.PARAM_INCLUDE_COUNTTABLE.uniqid && par.linclustworkflow[i]->wasSet) {
-            includeCountTableSet = true;
-        }
-        if (par.linclustworkflow[i]->uniqid == par.PARAM_NUM_COUNTS.uniqid && par.linclustworkflow[i]->wasSet) {
-            includeCountTableSet = true;
-        }
-        if (par.linclustworkflow[i]->uniqid == par.PARAM_INCLUDE_ADJACENCY.uniqid && par.linclustworkflow[i]->wasSet) {
-            includeAdjacencySet = true;
-        }
-        if (par.linclustworkflow[i]->uniqid == par.PARAM_NUM_ADJACENCY.uniqid && par.linclustworkflow[i]->wasSet) {
-            includeAdjacencySet = true;
-        }
-        
-    }
+    // each of these is in par.linclustworkflow, so wasSet is exactly what the uniqid scan computed
+    const bool kmerSizeWasSet = par.PARAM_K.wasSet;
+    const bool alphabetSizeWasSet = par.PARAM_ALPH_SIZE.wasSet;
+    const bool clusterModeSet = par.PARAM_CLUSTER_MODE.wasSet;
+    const bool includeCountTableSet = par.PARAM_INCLUDE_COUNTTABLE.wasSet || par.PARAM_NUM_COUNTS.wasSet;
+    const bool includeAdjacencySet = par.PARAM_INCLUDE_ADJACENCY.wasSet || par.PARAM_NUM_ADJACENCY.wasSet;
 
     const bool nonSymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
     if (clusterModeSet == false){
