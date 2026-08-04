@@ -430,7 +430,13 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         par.db1.c_str(), par.db1Index.c_str(), par.threads, 
         DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
     );
-    seqDbr->open(DBReader<DBKeyType>::SORT_BY_LENGTH);
+    // set cover walks prefRepSizePair by set size and breaks ties on id, so it never reads in id
+    // order and does not need the length mapping, which costs 2 x sizeof(DBLocalId) per sequence
+    if (par.clusteringMode == Parameters::SET_COVER) {
+        seqDbr->open(DBReader<DBKeyType>::NOSORT);
+    } else {
+        seqDbr->open(DBReader<DBKeyType>::SORT_BY_LENGTH);
+    }
  
     DBReader<DBKeyType> *cluDbr = nullptr;
     DBReader<DBKeyType> *cluSeqDbr = nullptr;
