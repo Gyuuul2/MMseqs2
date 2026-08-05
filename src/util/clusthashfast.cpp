@@ -1,4 +1,5 @@
 #include "DBWriter.h"
+#include "FileUtil.h"
 #include "Util.h"
 #include "Parameters.h"
 #include "Debug.h"
@@ -12,6 +13,8 @@
 
 #include <algorithm>
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <string>
 #include <vector>
 
@@ -115,6 +118,37 @@ static bool hashScanIsSequential(DBReader<DBKeyType> &reader) {
     return reader.getDataFileCnt() == 1 && reader.isSortedByOffset();
 }
 
+// The hashing pass streams the whole sequence db, and nothing reads those bytes again until the
+// members are staged. The cache it leaves behind is what makes the kernel swap the sort array out
+// instead: 400 GB of live arrays plus 634 GB of dead cache does not fit 995 GB of memory. Unmapping
+// drops our page table entries and fadvise then lets the kernel reclaim the clean pages themselves.
+static void dropDataCache(DBReader<DBKeyType> &reader) {
+    for (size_t fileIdx = 0; fileIdx < reader.getDataFileCnt(); fileIdx++) {
+        Util::madviseLogged(reader.getDataForFile(fileIdx), reader.getDataSizeForFile(fileIdx),
+                            POSIX_MADV_DONTNEED, "clusthashfast sort");
+    }
+#ifdef HAVE_POSIX_FADVISE
+    std::vector<std::string> names = reader.getDataFileNames();
+    for (size_t fileIdx = 0; fileIdx < names.size(); fileIdx++) {
+        int fd = ::open(names[fileIdx].c_str(), O_RDONLY);
+        if (fd < 0) {
+            continue;
+        }
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        close(fd);
+    }
+#endif
+}
+
+static void dropSequentialAdvice(DBReader<DBKeyType> &reader) {
+    // hash order is random to the end, and the default heuristic keeps issuing a full readahead
+    // window because 128 threads racing on the shared mmap_miss counter never let it saturate
+    for (size_t fileIdx = 0; fileIdx < reader.getDataFileCnt(); fileIdx++) {
+        Util::madviseLogged(reader.getDataForFile(fileIdx), reader.getDataSizeForFile(fileIdx),
+                            POSIX_MADV_RANDOM, "clusthashfast clustering");
+    }
+}
+
 // a block wider than any readahead window keeps neighbouring threads from allocating the same folios
 static size_t hashScanBlock(DBReader<DBKeyType> &reader, size_t dbSize, int threads) {
     const size_t DEFAULT_BLOCK = 1000;
@@ -192,6 +226,150 @@ static size_t hashRunEnd(const HashEntry *entries, size_t dbSize, size_t runBegi
     return runEnd;
 }
 
+// Only members of runs longer than one are ever read for their bytes, and in hash order those reads
+// are scattered over the whole sequence db. Copying just them out in id order gives a file small
+// enough to stay in the page cache, which turns the clustering pass back into cached reads.
+struct MemberStore {
+    static const size_t BLOCK = 64;
+
+    std::vector<uint64_t> bits;         // one bit per sequence, set when its run has other members
+    std::vector<size_t> blockOffset;    // byte offset of the first stored member of each 64 id block
+    std::string path;
+    char *data;
+    size_t dataSize;
+    int fd;
+
+    MemberStore() : data(NULL), dataSize(0), fd(-1) {}
+
+    ~MemberStore() {
+        if (data != NULL) {
+            munmap(data, dataSize);
+        }
+        if (fd >= 0) {
+            close(fd);
+        }
+        if (path.empty() == false) {
+            FileUtil::remove(path.c_str());
+        }
+    }
+
+    bool holds(DBLocalId id) const {
+        return (bits[id / BLOCK] >> (id % BLOCK)) & 1ULL;
+    }
+
+    // the offset is the block base plus the lengths of the stored members before this one, so the
+    // per sequence offsets never have to be materialised
+    const char *get(DBReader<DBKeyType> &reader, DBLocalId id) const {
+        const size_t word = id / BLOCK;
+        const size_t bit = id % BLOCK;
+        size_t offset = blockOffset[word];
+        uint64_t before = bits[word] & ((bit == 0) ? 0ULL : ((1ULL << bit) - 1ULL));
+        while (before != 0) {
+            const size_t k = static_cast<size_t>(__builtin_ctzll(before));
+            offset += reader.getSeqLen(word * BLOCK + k);
+            before &= before - 1;
+        }
+        return data + offset;
+    }
+};
+
+// runs of one never need bytes, so mark only the members of longer runs
+static size_t markRunMembers(const HashEntry *entries, size_t entryCount, size_t idSpace,
+                             std::vector<uint64_t> &bits, int threads) {
+    bits.assign((idSpace + MemberStore::BLOCK - 1) / MemberStore::BLOCK, 0);
+    size_t marked = 0;
+#pragma omp parallel for schedule(dynamic, 4096) num_threads(threads) reduction(+:marked)
+    for (size_t pos = 0; pos < entryCount; ++pos) {
+        const bool aloneBefore = (pos == 0) || (entries[pos - 1].hash != entries[pos].hash);
+        const bool aloneAfter = (pos + 1 == entryCount) || (entries[pos + 1].hash != entries[pos].hash);
+        if (aloneBefore && aloneAfter) {
+            continue;
+        }
+        const DBLocalId id = entries[pos].id;
+        __sync_fetch_and_or(&bits[id / MemberStore::BLOCK], 1ULL << (id % MemberStore::BLOCK));
+        marked++;
+    }
+    return marked;
+}
+
+// one sequential pass over the sequence db, each thread copying its own contiguous id range
+static bool buildMemberStore(DBReader<DBKeyType> &reader, MemberStore &store, const HashEntry *entries,
+                             size_t entryCount, size_t idSpace, const std::string &tmpPath, int threads) {
+    const size_t marked = markRunMembers(entries, entryCount, idSpace, store.bits, threads);
+    if (marked == 0) {
+        return false;
+    }
+    const size_t blocks = store.bits.size();
+    store.blockOffset.assign(blocks, 0);
+
+    // per block byte size first, so an exclusive prefix sum gives every block its offset
+#pragma omp parallel for schedule(static) num_threads(threads)
+    for (size_t word = 0; word < blocks; ++word) {
+        size_t sum = 0;
+        uint64_t set = store.bits[word];
+        while (set != 0) {
+            const size_t k = static_cast<size_t>(__builtin_ctzll(set));
+            sum += reader.getSeqLen(word * MemberStore::BLOCK + k);
+            set &= set - 1;
+        }
+        store.blockOffset[word] = sum;
+    }
+    size_t total = 0;
+    for (size_t word = 0; word < blocks; ++word) {
+        const size_t size = store.blockOffset[word];
+        store.blockOffset[word] = total;
+        total += size;
+    }
+
+    store.path = tmpPath;
+    store.fd = ::open(store.path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (store.fd < 0 || ftruncate(store.fd, static_cast<off_t>(total)) != 0) {
+        Debug(Debug::WARNING) << "Cannot stage " << store.path << ", clustering reads the db directly\n";
+        return false;
+    }
+    Debug(Debug::INFO) << "Staging " << marked << " run members (" << total << " byte) for clustering\n";
+
+#pragma omp parallel num_threads(threads)
+    {
+        unsigned int thread_idx = 0;
+#ifdef OPENMP
+        thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+        std::vector<char> buffer;
+#pragma omp for schedule(static)
+        for (size_t word = 0; word < blocks; ++word) {
+            uint64_t set = store.bits[word];
+            if (set == 0) {
+                continue;
+            }
+            buffer.clear();
+            while (set != 0) {
+                const size_t k = static_cast<size_t>(__builtin_ctzll(set));
+                const DBLocalId id = static_cast<DBLocalId>(word * MemberStore::BLOCK + k);
+                const size_t length = reader.getSeqLen(id);
+                const char *src = reader.getData(id, thread_idx);
+                buffer.insert(buffer.end(), src, src + length);
+                set &= set - 1;
+            }
+            if (pwrite(store.fd, buffer.data(), buffer.size(),
+                       static_cast<off_t>(store.blockOffset[word])) != static_cast<ssize_t>(buffer.size())) {
+                Debug(Debug::ERROR) << "Cannot write " << store.path << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+    }
+
+    store.data = static_cast<char *>(mmap(NULL, total, PROT_READ, MAP_SHARED, store.fd, 0));
+    if (store.data == MAP_FAILED) {
+        store.data = NULL;
+        Debug(Debug::WARNING) << "Cannot map " << store.path << ", clustering reads the db directly\n";
+        return false;
+    }
+    store.dataSize = total;
+    Util::madviseLogged(store.data, total, POSIX_MADV_RANDOM, "clusthashfast member store");
+    return true;
+}
+
 // a run is owned by the chunk that starts it, so skip the tail of the run the previous chunk owns
 static size_t firstOwnedRun(const HashEntry *entries, size_t chunkBegin, size_t chunkEnd) {
     size_t runBegin = chunkBegin;
@@ -203,7 +381,8 @@ static size_t firstOwnedRun(const HashEntry *entries, size_t chunkBegin, size_t 
 
 // the first unclaimed entry of the run represents it and claims every unclaimed entry it covers
 static void clusterHashRun(DBReader<DBKeyType> &reader, DBWriter &writer, const HashEntry *run, size_t runSize,
-                           float seqIdThr, ClusterWorker &worker, unsigned int thread_idx) {
+                           float seqIdThr, ClusterWorker &worker, unsigned int thread_idx,
+                           const MemberStore *store) {
     // the common case at scale: a run of one touches no sequence data
     if (runSize == 1) {
         const DBKeyType representativeKey = reader.getDbKey(run[0].id);
@@ -236,10 +415,13 @@ static void clusterHashRun(DBReader<DBKeyType> &reader, DBWriter &writer, const 
             }
             // getData hands back a shared per-thread buffer, so copy the query out before the target
             if (queryCopied == false) {
-                worker.querySeq.assign(reader.getData(queryId, thread_idx), queryLength);
+                const char *querySeq = (store != NULL) ? store->get(reader, queryId)
+                                                       : reader.getData(queryId, thread_idx);
+                worker.querySeq.assign(querySeq, queryLength);
                 queryCopied = true;
             }
-            const char *targetSeq = reader.getData(targetId, thread_idx);
+            const char *targetSeq = (store != NULL) ? store->get(reader, targetId)
+                                                    : reader.getData(targetId, thread_idx);
             const unsigned int distance =
                 DistanceCalculator::computeInverseHammingDistance(worker.querySeq.data(), targetSeq, queryLength);
             const float seqId = static_cast<float>(distance) / static_cast<float>(queryLength);
@@ -254,7 +436,8 @@ static void clusterHashRun(DBReader<DBKeyType> &reader, DBWriter &writer, const 
 }
 
 static ClusterCounts clusterHashRuns(DBReader<DBKeyType> &reader, DBWriter &writer, const HashEntry *entries,
-                                     size_t dbSize, size_t runCount, float seqIdThr, bool showProgress) {
+                                     size_t dbSize, size_t runCount, float seqIdThr, bool showProgress,
+                                     const MemberStore *store) {
     const size_t chunkCount = (dbSize + CLUSTHASHFAST_CHUNK_RECORDS - 1) / CLUSTHASHFAST_CHUNK_RECORDS;
     Debug::Progress progress(runCount);
     size_t totalClusters = 0;
@@ -277,7 +460,7 @@ static ClusterCounts clusterHashRuns(DBReader<DBKeyType> &reader, DBWriter &writ
                 if (showProgress) {
                     progress.updateProgress();
                 }
-                clusterHashRun(reader, writer, entries + pos, runEnd - pos, seqIdThr, worker, thread_idx);
+                clusterHashRun(reader, writer, entries + pos, runEnd - pos, seqIdThr, worker, thread_idx, store);
                 pos = runEnd;
             }
         }
@@ -291,6 +474,152 @@ static ClusterCounts clusterHashRuns(DBReader<DBKeyType> &reader, DBWriter &writ
     return counts;
 }
 
+// Sorting every hash at once needs 16 byte per sequence resident while the sort streams the whole
+// array, which at ten billion sequences competes with the reader index for memory and swaps. Runs are
+// independent and never straddle a hash, so partitioning on the high hash bits and sorting one
+// partition at a time gives the same grouping with a bounded footprint. Ascending partitions also
+// keep the runs in the same global hash order they had before, so the output order is unchanged.
+static unsigned int hashBucketCount(const Parameters &par, size_t dbSize) {
+    // an explicit count is how the partitioning is exercised on inputs small enough to need one
+    const char *env = getenv("MMSEQS_CLUSTHASHFAST_PARTITIONS");
+    if (env != NULL && *env != '\0') {
+        char *end = NULL;
+        unsigned long parsed = strtoul(env, &end, 10);
+        if (end != env && *end == '\0' && parsed >= 1 && parsed <= 4096) {
+            unsigned int buckets = 1;
+            while (buckets < parsed) {
+                buckets *= 2;
+            }
+            return buckets;
+        }
+        Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_CLUSTHASHFAST_PARTITIONS=" << env << "\n";
+    }
+    const size_t needed = dbSize * sizeof(HashEntry);
+    const size_t budget = Util::computeMemory(par.splitMemoryLimit);
+    if (budget == 0 || needed <= budget) {
+        return 1;
+    }
+    unsigned int buckets = 1;
+    while (buckets < 4096 && needed / buckets > budget) {
+        buckets *= 2;
+    }
+    return buckets;
+}
+
+struct HashBucketWriter {
+    std::vector<FILE *> files;
+    std::vector<std::string> names;
+    std::vector<size_t> counts;
+    unsigned int shift;
+
+    HashBucketWriter() : shift(0) {}
+
+    ~HashBucketWriter() {
+        close();
+        for (size_t b = 0; b < names.size(); b++) {
+            if (FileUtil::fileExists(names[b].c_str())) {
+                FileUtil::remove(names[b].c_str());
+            }
+        }
+    }
+
+    bool open(const std::string &prefix, unsigned int buckets) {
+        unsigned int bits = 0;
+        while ((1u << bits) < buckets) {
+            bits++;
+        }
+        shift = 64 - bits;
+        files.assign(buckets, NULL);
+        counts.assign(buckets, 0);
+        for (unsigned int b = 0; b < buckets; b++) {
+            names.push_back(prefix + "." + SSTR(b));
+            files[b] = fopen(names[b].c_str(), "wb");
+            if (files[b] == NULL) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void close() {
+        for (size_t b = 0; b < files.size(); b++) {
+            if (files[b] != NULL) {
+                fclose(files[b]);
+                files[b] = NULL;
+            }
+        }
+    }
+
+    unsigned int bucketOf(size_t hash) const {
+        return static_cast<unsigned int>(hash >> shift);
+    }
+};
+
+// hashes straight into the partitions, so the full array is never resident
+static bool hashIntoBuckets(DBReader<DBKeyType> &reader, HashBucketWriter &buckets, bool isNuclInput,
+                            BaseMatrix *subMat, size_t maxSeqLen, bool showProgress, int threads) {
+    const size_t dbSize = reader.getSize();
+    const size_t scanChunk = hashScanBlock(reader, dbSize, threads);
+    const size_t FLUSH = 8192;
+    const unsigned int bucketCount = static_cast<unsigned int>(buckets.files.size());
+    std::vector<std::mutex> locks(bucketCount);
+    Debug::Progress progress(dbSize);
+    bool ok = true;
+#pragma omp parallel num_threads(threads)
+    {
+        unsigned int thread_idx = 0;
+#ifdef OPENMP
+        thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+        std::vector<std::vector<HashEntry> > pending(bucketCount);
+        Sequence *seq = isNuclInput
+            ? NULL
+            : new Sequence(maxSeqLen, reader.getDbtype(), subMat, 0, false, false);
+#pragma omp for schedule(static, scanChunk)
+        for (size_t id = 0; id < dbSize; ++id) {
+            if (showProgress) {
+                progress.updateProgress();
+            }
+            const size_t length = reader.getSeqLen(id);
+            const char *data = reader.getData(id, thread_idx);
+            HashEntry entry;
+            if (isNuclInput) {
+                entry.hash = hashWithLength(hashNucleotideSequence(data, length), length);
+            } else {
+                seq->mapSequence(id, 0, data, length);
+                entry.hash = hashWithLength(Util::hash(seq->numSequence, seq->L), length);
+            }
+            entry.id = static_cast<DBLocalId>(id);
+            const unsigned int b = buckets.bucketOf(entry.hash);
+            pending[b].push_back(entry);
+            if (pending[b].size() >= FLUSH) {
+                std::lock_guard<std::mutex> lock(locks[b]);
+                if (fwrite(pending[b].data(), sizeof(HashEntry), pending[b].size(), buckets.files[b])
+                        != pending[b].size()) {
+                    ok = false;
+                }
+                buckets.counts[b] += pending[b].size();
+                pending[b].clear();
+            }
+        }
+        for (unsigned int b = 0; b < bucketCount; b++) {
+            if (pending[b].empty()) {
+                continue;
+            }
+            std::lock_guard<std::mutex> lock(locks[b]);
+            if (fwrite(pending[b].data(), sizeof(HashEntry), pending[b].size(), buckets.files[b])
+                    != pending[b].size()) {
+                ok = false;
+            }
+            buckets.counts[b] += pending[b].size();
+        }
+        if (seq != NULL) {
+            delete seq;
+        }
+    }
+    return ok;
+}
+
 static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType> &reader, DBWriter &writer,
                                       BaseMatrix *subMat, bool isNuclInput) {
     ClusterCounts counts;
@@ -299,35 +628,89 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
         return counts;
     }
 
-    HashEntry *entries = new(std::nothrow) HashEntry[dbSize];
-    Util::checkAllocation(entries, "Can not allocate hash entry memory in clusthashfast");
     const bool showProgress = (Debug::debugLevel >= Debug::INFO);
+    const std::string tmpPrefix = std::string(writer.getDataFileName());
+    const bool canStage = (reader.getDataFileCnt() == 1 && reader.isCompressed() == 0);
+    const unsigned int bucketCount = hashBucketCount(par, dbSize);
 
-    Debug(Debug::INFO) << "Hashing sequences...\n";
     const bool sequentialHashScan = hashScanIsSequential(reader);
     if (sequentialHashScan) {
         reader.setSequentialAdvice();
     }
-    hashSequences(reader, entries, isNuclInput, subMat, par.maxSeqLen, showProgress, par.threads);
-    if (sequentialHashScan) {
-        // hash order is random to the end, and the default heuristic keeps issuing a full readahead
-        // window because 128 threads racing on the shared mmap_miss counter never let it saturate
-        for (size_t fileIdx = 0; fileIdx < reader.getDataFileCnt(); fileIdx++) {
-            Util::madviseLogged(reader.getDataForFile(fileIdx), reader.getDataSizeForFile(fileIdx),
-                                POSIX_MADV_RANDOM, "clusthashfast clustering");
+
+    if (bucketCount == 1) {
+        HashEntry *entries = new(std::nothrow) HashEntry[dbSize];
+        Util::checkAllocation(entries, "Can not allocate hash entry memory in clusthashfast");
+
+        Debug(Debug::INFO) << "Hashing sequences...\n";
+        hashSequences(reader, entries, isNuclInput, subMat, par.maxSeqLen, showProgress, par.threads);
+        dropDataCache(reader);
+
+        Debug(Debug::INFO) << "Sort sequence hashes...\n";
+        SORT_PARALLEL(entries, entries + dbSize, HashEntry::compareByHashAndId);
+
+        const size_t runCount = countHashRuns(entries, dbSize);
+        Debug(Debug::INFO) << "Found " << runCount << " unique hash/length groups\n";
+
+        // staging the run members keeps the clustering reads inside a file that fits the page cache
+        MemberStore store;
+        const bool staged = canStage
+            && buildMemberStore(reader, store, entries, dbSize, dbSize, tmpPrefix + ".members", par.threads);
+        if (staged == false && sequentialHashScan) {
+            dropSequentialAdvice(reader);
         }
+
+        Debug(Debug::INFO) << "Cluster equal length sequences...\n";
+        counts = clusterHashRuns(reader, writer, entries, dbSize, runCount, par.seqIdThr, showProgress,
+                                 staged ? &store : NULL);
+        delete[] entries;
+        return counts;
     }
 
-    Debug(Debug::INFO) << "Sort sequence hashes...\n";
-    SORT_PARALLEL(entries, entries + dbSize, HashEntry::compareByHashAndId);
+    Debug(Debug::INFO) << "Hashing sequences into " << bucketCount << " partitions...\n";
+    HashBucketWriter buckets;
+    if (buckets.open(tmpPrefix + ".hashpart", bucketCount) == false) {
+        Debug(Debug::ERROR) << "Cannot open hash partitions under " << tmpPrefix << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (hashIntoBuckets(reader, buckets, isNuclInput, subMat, par.maxSeqLen, showProgress, par.threads) == false) {
+        Debug(Debug::ERROR) << "Cannot write hash partitions under " << tmpPrefix << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    buckets.close();
+    dropDataCache(reader);
 
-    const size_t runCount = countHashRuns(entries, dbSize);
-    Debug(Debug::INFO) << "Found " << runCount << " unique hash/length groups\n";
+    size_t totalRuns = 0;
+    std::vector<HashEntry> part;
+    for (unsigned int b = 0; b < bucketCount; b++) {
+        const size_t partSize = buckets.counts[b];
+        if (partSize == 0) {
+            continue;
+        }
+        part.resize(partSize);
+        FILE *in = fopen(buckets.names[b].c_str(), "rb");
+        if (in == NULL || fread(part.data(), sizeof(HashEntry), partSize, in) != partSize) {
+            Debug(Debug::ERROR) << "Cannot read hash partition " << buckets.names[b] << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        fclose(in);
+        FileUtil::remove(buckets.names[b].c_str());
 
-    Debug(Debug::INFO) << "Cluster equal length sequences...\n";
-    counts = clusterHashRuns(reader, writer, entries, dbSize, runCount, par.seqIdThr, showProgress);
+        SORT_PARALLEL(part.data(), part.data() + partSize, HashEntry::compareByHashAndId);
+        const size_t runCount = countHashRuns(part.data(), partSize);
+        totalRuns += runCount;
 
-    delete[] entries;
+        MemberStore store;
+        const bool staged = canStage
+            && buildMemberStore(reader, store, part.data(), partSize, dbSize, tmpPrefix + ".members", par.threads);
+        const ClusterCounts partCounts = clusterHashRuns(reader, writer, part.data(), partSize, runCount,
+                                                        par.seqIdThr, showProgress, staged ? &store : NULL);
+        counts.clusters += partCounts.clusters;
+        counts.merged += partCounts.merged;
+        Debug(Debug::INFO) << "Partition " << (b + 1) << "/" << bucketCount << ": " << runCount
+                           << " groups, " << partCounts.clusters << " clusters\n";
+    }
+    Debug(Debug::INFO) << "Found " << totalRuns << " unique hash/length groups\n";
     return counts;
 }
 
