@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <string>
 #include <vector>
+#include <sys/mman.h>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -109,9 +110,41 @@ static size_t hashWithLength(size_t hash, size_t length) {
     return hash ^ (length + static_cast<size_t>(0x9e3779b97f4a7c15ULL) + (hash << 6) + (hash >> 2));
 }
 
+// hashing reads in offset order and wants sequential advice; clustering reads in hash order and must not
+static bool hashScanIsSequential(DBReader<DBKeyType> &reader) {
+    return reader.getDataFileCnt() == 1 && reader.isSortedByOffset();
+}
+
+static void setDataAdvice(DBReader<DBKeyType> &reader, int advice, const char *context) {
+    for (size_t fileIdx = 0; fileIdx < reader.getDataFileCnt(); fileIdx++) {
+        Util::madviseLogged(reader.getDataForFile(fileIdx), reader.getDataSizeForFile(fileIdx),
+                            advice, context);
+    }
+}
+
+// a block wider than any readahead window keeps neighbouring threads from allocating the same folios
+static size_t hashScanBlock(DBReader<DBKeyType> &reader, size_t dbSize, int threads) {
+    const size_t DEFAULT_BLOCK = 1000;
+    const size_t MIN_BLOCKS_PER_THREAD = 16;
+    const size_t TARGET_SPAN = 64 * 1024 * 1024;
+    if (threads < 2 || dbSize == 0 || hashScanIsSequential(reader) == false) {
+        return DEFAULT_BLOCK;
+    }
+    size_t fileSize = reader.getDataSizeForFile(0);
+    size_t lastEnd = std::min(reader.getIndex(dbSize - 1)->offset + reader.getEntryLen(dbSize - 1), fileSize);
+    if (fileSize == 0 || lastEnd == 0) {
+        return DEFAULT_BLOCK;
+    }
+    size_t stride = std::max<size_t>(lastEnd / dbSize, 1);
+    size_t wanted = (TARGET_SPAN + stride - 1) / stride;
+    size_t balanced = dbSize / (static_cast<size_t>(threads) * MIN_BLOCKS_PER_THREAD);
+    return std::max(std::min(wanted, balanced), DEFAULT_BLOCK);
+}
+
 static void hashSequences(DBReader<DBKeyType> &reader, HashEntry *entries, bool isNuclInput,
-                          BaseMatrix *subMat, size_t maxSeqLen, bool showProgress) {
+                          BaseMatrix *subMat, size_t maxSeqLen, bool showProgress, int threads) {
     const size_t dbSize = reader.getSize();
+    const size_t scanChunk = hashScanBlock(reader, dbSize, threads);
     Debug::Progress progress(dbSize);
 #pragma omp parallel
     {
@@ -120,7 +153,7 @@ static void hashSequences(DBReader<DBKeyType> &reader, HashEntry *entries, bool 
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
         if (isNuclInput) {
-#pragma omp for schedule(dynamic, 1000)
+#pragma omp for schedule(static, scanChunk)
             for (size_t id = 0; id < dbSize; ++id) {
                 if (showProgress) {
                     progress.updateProgress();
@@ -132,7 +165,7 @@ static void hashSequences(DBReader<DBKeyType> &reader, HashEntry *entries, bool 
             }
         } else {
             Sequence seq(maxSeqLen, reader.getDbtype(), subMat, 0, false, false);
-#pragma omp for schedule(dynamic, 1000)
+#pragma omp for schedule(static, scanChunk)
             for (size_t id = 0; id < dbSize; ++id) {
                 if (showProgress) {
                     progress.updateProgress();
@@ -278,7 +311,15 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
     const bool showProgress = (Debug::debugLevel >= Debug::INFO);
 
     Debug(Debug::INFO) << "Hashing sequences...\n";
-    hashSequences(reader, entries, isNuclInput, subMat, par.maxSeqLen, showProgress);
+    const bool sequentialHashScan = hashScanIsSequential(reader);
+    if (sequentialHashScan) {
+        reader.setSequentialAdvice();
+    }
+    hashSequences(reader, entries, isNuclInput, subMat, par.maxSeqLen, showProgress, par.threads);
+    if (sequentialHashScan) {
+        // the clustering pass below reads in hash order, so drop the advice before it starts
+        setDataAdvice(reader, POSIX_MADV_NORMAL, "clusthashfast clustering");
+    }
 
     Debug(Debug::INFO) << "Sort sequence hashes...\n";
     SORT_PARALLEL(entries, entries + dbSize, HashEntry::compareByHashAndId);
