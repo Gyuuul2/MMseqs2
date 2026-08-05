@@ -346,6 +346,7 @@ void DBReader<DBKeyType>::sortIndex(bool isSortedById) {
         }
     }
     if (accessType == SORT_BY_LENGTH) {
+        
         // sort the entries by the length of the sequences
         std::pair<size_t, unsigned int> *sortForMapping = new std::pair<size_t, unsigned int>[size];
         id2local = new DBLocalId[size];

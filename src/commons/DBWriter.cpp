@@ -511,20 +511,70 @@ void DBWriter::writeIndexEntryToFile(FILE *outFile, char *buff1, DBReader<std::s
     fwrite(buff1, sizeof(char), (tmpBuff - buff1), outFile);
 }
 
-template <>
-void DBWriter::writeIndex(FILE *outFile, size_t indexSize, DBReader<DBKeyType>::Index *index) {
-    char buff1[1024];
-    for (size_t id = 0; id < indexSize; id++) {
-        writeIndexEntryToFile(outFile, buff1, index[id]);
+// one fwrite per entry pays a stdio lock per entry, which is what dominates a billion-entry index
+static const size_t INDEX_WRITE_BUFFER_SIZE = 8 * 1024 * 1024;
+
+static void flushIndexBuffer(FILE *outFile, const char *buffer, size_t used) {
+    if (used == 0) {
+        return;
+    }
+    if (fwrite(buffer, sizeof(char), used, outFile) != used) {
+        Debug(Debug::ERROR) << "Can not write index buffer\n";
+        EXIT(EXIT_FAILURE);
     }
 }
 
 template <>
-void DBWriter::writeIndex(FILE *outFile, size_t indexSize, DBReader<std::string>::Index *index){
-    char buff1[1024];
+void DBWriter::writeIndex(FILE *outFile, size_t indexSize, DBReader<DBKeyType>::Index *index) {
+    // three u64 as decimal plus two tabs, a newline and the terminator indexToBuffer appends
+    const size_t maxEntry = 3 * 20 + 4;
+    char *buffer = (char *) malloc(INDEX_WRITE_BUFFER_SIZE + maxEntry);
+    Util::checkAllocation(buffer, "Can not allocate index write buffer");
+    size_t used = 0;
     for (size_t id = 0; id < indexSize; id++) {
-        writeIndexEntryToFile(outFile, buff1, index[id]);
+        used += indexToBuffer(buffer + used, index[id].id, index[id].offset, index[id].length);
+        if (used >= INDEX_WRITE_BUFFER_SIZE) {
+            flushIndexBuffer(outFile, buffer, used);
+            used = 0;
+        }
     }
+    flushIndexBuffer(outFile, buffer, used);
+    free(buffer);
+}
+
+template <>
+void DBWriter::writeIndex(FILE *outFile, size_t indexSize, DBReader<std::string>::Index *index){
+    // the key is a string here, so the flush point has to account for its length
+    const size_t maxTail = 20 + 10 + 4;
+    char *buffer = (char *) malloc(INDEX_WRITE_BUFFER_SIZE + maxTail);
+    Util::checkAllocation(buffer, "Can not allocate index write buffer");
+    size_t capacity = INDEX_WRITE_BUFFER_SIZE + maxTail;
+    size_t used = 0;
+    for (size_t id = 0; id < indexSize; id++) {
+        const size_t keyLen = index[id].id.length();
+        if (used + keyLen + maxTail > capacity) {
+            flushIndexBuffer(outFile, buffer, used);
+            used = 0;
+            if (keyLen + maxTail > capacity) {
+                capacity = keyLen + maxTail;
+                free(buffer);
+                buffer = (char *) malloc(capacity);
+                Util::checkAllocation(buffer, "Can not allocate index write buffer");
+            }
+        }
+        char *tmpBuff = buffer + used;
+        memcpy(tmpBuff, index[id].id.c_str(), keyLen);
+        tmpBuff += keyLen;
+        *(tmpBuff) = '\t';
+        tmpBuff++;
+        tmpBuff = Itoa::u64toa_sse2(index[id].offset, tmpBuff);
+        *(tmpBuff-1) = '\t';
+        tmpBuff = Itoa::u32toa_sse2(static_cast<uint32_t>(index[id].length), tmpBuff);
+        *(tmpBuff-1) = '\n';
+        used = tmpBuff - buffer;
+    }
+    flushIndexBuffer(outFile, buffer, used);
+    free(buffer);
 }
 
 
