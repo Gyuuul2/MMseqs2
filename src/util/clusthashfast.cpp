@@ -168,41 +168,39 @@ static size_t hashScanBlock(DBReader<DBKeyType> &reader, size_t dbSize, int thre
     return std::max(std::min(wanted, balanced), DEFAULT_BLOCK);
 }
 
+// the single definition of the hash, so the array pass and the partitioned pass cannot drift apart
+static size_t hashOf(DBReader<DBKeyType> &reader, size_t id, Sequence *seq, unsigned int thread_idx) {
+    const size_t length = reader.getSeqLen(id);
+    const char *data = reader.getData(id, thread_idx);
+    if (seq == NULL) {
+        return hashWithLength(hashNucleotideSequence(data, length), length);
+    }
+    seq->mapSequence(id, 0, data, length);
+    return hashWithLength(Util::hash(seq->numSequence, seq->L), length);
+}
+
 static void hashSequences(DBReader<DBKeyType> &reader, HashEntry *entries, bool isNuclInput,
                           BaseMatrix *subMat, size_t maxSeqLen, bool showProgress, int threads) {
     const size_t dbSize = reader.getSize();
     const size_t scanChunk = hashScanBlock(reader, dbSize, threads);
     Debug::Progress progress(dbSize);
-#pragma omp parallel
+#pragma omp parallel num_threads(threads)
     {
         unsigned int thread_idx = 0;
 #ifdef OPENMP
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-        if (isNuclInput) {
+        Sequence *seq = isNuclInput ? NULL : new Sequence(maxSeqLen, reader.getDbtype(), subMat, 0, false, false);
 #pragma omp for schedule(static, scanChunk)
-            for (size_t id = 0; id < dbSize; ++id) {
-                if (showProgress) {
-                    progress.updateProgress();
-                }
-                const size_t length = reader.getSeqLen(id);
-                const size_t hash = hashNucleotideSequence(reader.getData(id, thread_idx), length);
-                entries[id].hash = hashWithLength(hash, length);
-                entries[id].id = static_cast<DBLocalId>(id);
+        for (size_t id = 0; id < dbSize; ++id) {
+            // an explicit position keeps 128 threads off the one shared atomic counter
+            if (showProgress) {
+                progress.updateProgress(id);
             }
-        } else {
-            Sequence seq(maxSeqLen, reader.getDbtype(), subMat, 0, false, false);
-#pragma omp for schedule(static, scanChunk)
-            for (size_t id = 0; id < dbSize; ++id) {
-                if (showProgress) {
-                    progress.updateProgress();
-                }
-                const size_t length = reader.getSeqLen(id);
-                seq.mapSequence(id, 0, reader.getData(id, thread_idx), length);
-                entries[id].hash = hashWithLength(Util::hash(seq.numSequence, seq.L), length);
-                entries[id].id = static_cast<DBLocalId>(id);
-            }
+            entries[id].hash = hashOf(reader, id, seq, thread_idx);
+            entries[id].id = static_cast<DBLocalId>(id);
         }
+        delete seq;
     }
 }
 
@@ -572,23 +570,14 @@ static bool hashIntoBuckets(DBReader<DBKeyType> &reader, HashBucketWriter &bucke
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
         std::vector<std::vector<HashEntry> > pending(bucketCount);
-        Sequence *seq = isNuclInput
-            ? NULL
-            : new Sequence(maxSeqLen, reader.getDbtype(), subMat, 0, false, false);
+        Sequence *seq = isNuclInput ? NULL : new Sequence(maxSeqLen, reader.getDbtype(), subMat, 0, false, false);
 #pragma omp for schedule(static, scanChunk)
         for (size_t id = 0; id < dbSize; ++id) {
             if (showProgress) {
                 progress.updateProgress();
             }
-            const size_t length = reader.getSeqLen(id);
-            const char *data = reader.getData(id, thread_idx);
             HashEntry entry;
-            if (isNuclInput) {
-                entry.hash = hashWithLength(hashNucleotideSequence(data, length), length);
-            } else {
-                seq->mapSequence(id, 0, data, length);
-                entry.hash = hashWithLength(Util::hash(seq->numSequence, seq->L), length);
-            }
+            entry.hash = hashOf(reader, id, seq, thread_idx);
             entry.id = static_cast<DBLocalId>(id);
             const unsigned int b = buckets.bucketOf(entry.hash);
             pending[b].push_back(entry);
@@ -613,9 +602,7 @@ static bool hashIntoBuckets(DBReader<DBKeyType> &reader, HashBucketWriter &bucke
             }
             buckets.counts[b] += pending[b].size();
         }
-        if (seq != NULL) {
-            delete seq;
-        }
+        delete seq;
     }
     return ok;
 }
