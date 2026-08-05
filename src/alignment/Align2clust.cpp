@@ -387,10 +387,13 @@ void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
 }
 
 void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
-    // consumer-private scratch, so it is reused instead of allocated once per result
+    // consumer-private scratch, so both are reused instead of allocated once per result
+    std::vector<ClusterResult> drainedResults;
     std::vector<DBLocalId> validMemberIds;
     while (true) {
         size_t drained = 0;
+        bool lastRound = false;
+        drainedResults.clear();
         {
             std::unique_lock<std::mutex> lock(clusterMutex);
 
@@ -399,42 +402,49 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
                        allCalculationsDone;
             });
 
-            if (allCalculationsDone && reorderBufferedCount == 0) {
-                break;
-            }
+            lastRound = (allCalculationsDone && reorderBufferedCount == 0);
 
+            // the mutex guards the ring, so hold it only for the moves out of it
             while (reorderFilled[currentProcessPosition % reorderCapacity] != 0) {
                 const size_t slot = currentProcessPosition % reorderCapacity;
-                ClusterResult result = std::move(reorderSlots[slot]);
+                drainedResults.push_back(std::move(reorderSlots[slot]));
                 reorderFilled[slot] = 0;
                 reorderBufferedCount--;
                 currentProcessPosition++;
                 drained++;
-
-                if (loadAssignedCluster(assignedCluster, result.representativeId) != DB_LOCAL_ID_INVALID) {
-                    continue;
-                }
-
-                validMemberIds.clear();
-                validMemberIds.reserve(result.memberIds.size());
-                for (DBLocalId memberId : result.memberIds) {
-                    if (loadAssignedCluster(assignedCluster, memberId) == DB_LOCAL_ID_INVALID) {
-                        validMemberIds.push_back(memberId);
-                    }
-                }
-
-                if (validMemberIds.size() <= 1) {
-                    continue;
-                }
-
-                for (DBLocalId memberId : validMemberIds) {
-                    storeAssignedCluster(assignedCluster, memberId, result.representativeId);
-                }
             }
         }
-        // one wake per drained round, and after the lock is gone so the producers can actually run
+
+        // one wake per drained round, issued while the lock is free
         if (drained > 0) {
             reorderSpaceCondition.notify_all();
+        }
+
+        // only this thread writes assignedCluster while the producers run, so no mutex is needed
+        for (ClusterResult &result : drainedResults) {
+            if (loadAssignedCluster(assignedCluster, result.representativeId) != DB_LOCAL_ID_INVALID) {
+                continue;
+            }
+
+            validMemberIds.clear();
+            validMemberIds.reserve(result.memberIds.size());
+            for (DBLocalId memberId : result.memberIds) {
+                if (loadAssignedCluster(assignedCluster, memberId) == DB_LOCAL_ID_INVALID) {
+                    validMemberIds.push_back(memberId);
+                }
+            }
+
+            if (validMemberIds.size() <= 1) {
+                continue;
+            }
+
+            for (DBLocalId memberId : validMemberIds) {
+                storeAssignedCluster(assignedCluster, memberId, result.representativeId);
+            }
+        }
+
+        if (lastRound) {
+            break;
         }
     }
 }
