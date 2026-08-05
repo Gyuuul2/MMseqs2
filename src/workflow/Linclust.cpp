@@ -65,28 +65,12 @@ int linclust(int argc, const char **argv, const Command& command) {
     // save some values to restore them later
     MultiParam<NuclAA<int>>alphabetSize = par.alphabetSize;
     size_t kmerSize = par.kmerSize;
-    bool kmerSizeWasSet = false;
-    bool alphabetSizeWasSet = false;
-    bool clusterModeSet = false;
-    bool includeCountTableSet = false;
-    for (size_t i = 0; i < par.linclustworkflow.size(); i++) {
-        if (par.linclustworkflow[i]->uniqid == par.PARAM_K.uniqid && par.linclustworkflow[i]->wasSet) {
-            kmerSizeWasSet = true;
-        }
-        if (par.linclustworkflow[i]->uniqid == par.PARAM_ALPH_SIZE.uniqid && par.linclustworkflow[i]->wasSet) {
-            alphabetSizeWasSet = true;
-        }
-        if (par.linclustworkflow[i]->uniqid == par.PARAM_CLUSTER_MODE.uniqid && par.linclustworkflow[i]->wasSet) {
-            clusterModeSet = true;
-        }
-        if (par.linclustworkflow[i]->uniqid == par.PARAM_INCLUDE_COUNTTABLE.uniqid && par.linclustworkflow[i]->wasSet) {
-            includeCountTableSet = true;
-        }
-        if (par.linclustworkflow[i]->uniqid == par.PARAM_NUM_COUNTS.uniqid && par.linclustworkflow[i]->wasSet) {
-            includeCountTableSet = true;
-        }
-        
-    }
+    // each of these is in par.linclustworkflow, so wasSet is exactly what the uniqid scan computed
+    const bool kmerSizeWasSet = par.PARAM_K.wasSet;
+    const bool alphabetSizeWasSet = par.PARAM_ALPH_SIZE.wasSet;
+    const bool clusterModeSet = par.PARAM_CLUSTER_MODE.wasSet;
+    const bool includeCountTableSet = par.PARAM_INCLUDE_COUNTTABLE.wasSet || par.PARAM_NUM_COUNTS.wasSet;
+    const bool includeAdjacencySet = par.PARAM_INCLUDE_ADJACENCY.wasSet || par.PARAM_NUM_ADJACENCY.wasSet;
 
     const bool nonSymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
     if (clusterModeSet == false){
@@ -107,6 +91,17 @@ int linclust(int argc, const char **argv, const Command& command) {
             par.includeCountTable = true;
         }
     }
+    Util::resolveIncludeIterationPair(par.PARAM_INCLUDE_COUNTTABLE.wasSet, par.includeCountTable,
+                                par.PARAM_NUM_COUNTS.wasSet, par.countTableIteration,
+                                "--include-count-table", "--num-count-table");
+
+    if (includeAdjacencySet == false) {
+        par.adjIteration = nonSymetric ? Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY
+                                       : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
+    }
+    Util::resolveIncludeIterationPair(par.PARAM_INCLUDE_ADJACENCY.wasSet, par.includeAdjacency,
+                                par.PARAM_NUM_ADJACENCY.wasSet, par.adjIteration,
+                                "--include-adjacency", "--num-adjacency");
 
     if (kmerSizeWasSet == false) {
         par.kmerSize = Parameters::CLUST_LINEAR_DEFAULT_K;
@@ -170,6 +165,7 @@ int linclust(int argc, const char **argv, const Command& command) {
         par.kmerSize = kmerSize;
         bool prevspacedKmer = par.spacedKmer;
         bool prevmaskMode = par.maskMode;
+        MultiParam<NuclAA<float>> prevKmersPerSequenceScale = par.kmersPerSequenceScale;
         par.spacedKmer = false;
         par.maskMode = false;
         cmd.addVariable("KMERMATCHER_PAR", par.createParameterString(par.kmermatcher).c_str());
@@ -184,16 +180,17 @@ int linclust(int argc, const char **argv, const Command& command) {
         
         par.spacedKmer = prevspacedKmer;
         par.maskMode = prevmaskMode;
+        // the 0.1 above is intended for KMERMATCHER_PAR2 only, so it must not leak into later strings
+        par.kmersPerSequenceScale = prevKmersPerSequenceScale;
     }
     float prevSeqId = par.seqIdThr;
     // # 0. clust hash
     par.seqIdThr = std::max(0.9f, par.seqIdThr);
     par.alphabetSize = MultiParam<NuclAA<int>>(NuclAA<int>(Parameters::CLUST_HASH_DEFAULT_ALPH_SIZE, 5));
     cmd.addVariable("CLUSTHASH", par.clustHash ? "TRUE" : NULL);
-    cmd.addVariable("CLUSTHASH_PAR", par.createParameterString(par.clusthash).c_str());
+    cmd.addVariable("CLUSTHASHFAST_PAR", par.createParameterString(par.clusthashfast).c_str());
     par.seqIdThr = prevSeqId;
     par.alphabetSize = alphabetSize;
-    cmd.addVariable("CLUSTHASH_CLUST_PAR", par.createParameterString(par.clust).c_str());
 
     cmd.addVariable("SWITCH_CONSENSUS_REP", par.switchConsensusRep ? "TRUE" : NULL);
     cmd.addVariable("KEEP_SWITCH_ALN", (par.switchConsensusRep && writeAlnFiles) ? "TRUE" : NULL);
