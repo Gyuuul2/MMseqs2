@@ -13,6 +13,9 @@
 #include "FastSort.h"
 #include "Masker.h"
 
+#include <cctype>
+#include <sys/resource.h>
+
 #ifdef OPENMP
 #include <omp.h>
 #endif
@@ -343,6 +346,399 @@ void processSeqBatch(Parameters & par, DBWriter &seqWriter, DBWriter &hdrWriter,
     }
 }
 
+struct CreatedbHardModePart {
+    std::string seqData;
+    std::string seqIndex;
+    std::string hdrData;
+    std::string hdrIndex;
+    std::string sourceName;
+    std::vector<char> sampleIsNucleotide;
+    DBKeyType entries;
+    bool empty;
+
+    CreatedbHardModePart() : entries(0), empty(false) {}
+};
+
+static bool sequenceLooksNucleotide(const char *sequence, size_t length) {
+    if (length == 0) {
+        return false;
+    }
+    size_t cnt = 0;
+    for (size_t i = 0; i < length; i++) {
+        switch (toupper(static_cast<unsigned char>(sequence[i]))) {
+            case 'T':
+            case 'A':
+            case 'G':
+            case 'C':
+            case 'U':
+            case 'N':
+                cnt++;
+                break;
+        }
+    }
+    const float nuclDNAFraction = static_cast<float>(cnt) / static_cast<float>(length);
+    return nuclDNAFraction > 0.9;
+}
+
+static void removeIfExists(const std::string &path) {
+    if (FileUtil::fileExists(path.c_str()) == true || FileUtil::symlinkExists(path) == true) {
+        FileUtil::remove(path.c_str());
+    }
+}
+
+// this concurrency is a storage property, not a cpu count, so it does not scale with --threads
+static const size_t CREATEDB_DEFAULT_FILE_WORKERS = 8;
+
+static unsigned int getCreatedbThreads(unsigned int requestedThreads, int requestedFileThreads,
+                                       size_t fileCount) {
+#ifndef OPENMP
+    (void) requestedThreads;
+    (void) requestedFileThreads;
+    (void) fileCount;
+    return 1;
+#else
+    const size_t threadBudget = std::max<size_t>(1, requestedThreads);
+    size_t threads = (requestedFileThreads > 0)
+        ? static_cast<size_t>(requestedFileThreads)
+        : CREATEDB_DEFAULT_FILE_WORKERS;
+    if (requestedFileThreads > 0 && static_cast<size_t>(requestedFileThreads) > threadBudget) {
+        Debug(Debug::WARNING) << "--createdb-threads " << requestedFileThreads << " exceeds --threads "
+                              << threadBudget << ", using " << threadBudget << "\n";
+    }
+    // a worker is an OpenMP thread, so --threads stays the budget a cgroup or scheduler set
+    threads = std::min(threads, threadBudget);
+    threads = std::min(threads, std::max<size_t>(1, fileCount));
+
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) == 0 && limit.rlim_cur != RLIM_INFINITY) {
+        const size_t fdSlack = 32;
+        const size_t fdPerWorker = 6;
+        size_t fdLimit = static_cast<size_t>(limit.rlim_cur);
+        size_t fdThreads = (fdLimit > fdSlack) ? ((fdLimit - fdSlack) / fdPerWorker) : 1;
+        threads = std::min(threads, std::max<size_t>(1, fdThreads));
+    }
+
+    return static_cast<unsigned int>(std::max<size_t>(1, threads));
+#endif
+}
+
+static size_t appendFileToOpenFile(const std::string &input, FILE *output, std::vector<char> &buffer) {
+    FILE *in = FileUtil::openFileOrDie(input.c_str(), "rb", true);
+    size_t total = 0;
+    while (true) {
+        size_t read = fread(buffer.data(), 1, buffer.size(), in);
+        if (read > 0) {
+            size_t written = fwrite(buffer.data(), 1, read, output);
+            if (written != read) {
+                Debug(Debug::ERROR) << "Can not write merged createdb data\n";
+                EXIT(EXIT_FAILURE);
+            }
+            total += read;
+        }
+        if (read < buffer.size()) {
+            if (ferror(in)) {
+                Debug(Debug::ERROR) << "Can not read partial createdb data " << input << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            break;
+        }
+    }
+    if (fclose(in) != 0) {
+        Debug(Debug::ERROR) << "Cannot close partial createdb data " << input << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return total;
+}
+
+static void rewritePartialIndex(const std::string &dataFile, const std::string &indexFile,
+                                FILE *outIndex, size_t mergedDataOffset, DBKeyType keyOffset) {
+    DBReader<DBKeyType> reader(dataFile.c_str(), indexFile.c_str(), 1, DBReader<DBKeyType>::USE_INDEX);
+    reader.open(DBReader<DBKeyType>::HARDNOSORT);
+    char indexBuffer[1024];
+    for (size_t i = 0; i < reader.getSize(); i++) {
+        DBReader<DBKeyType>::Index entry = *reader.getIndex(i);
+        entry.id = keyOffset + static_cast<DBKeyType>(i);
+        entry.offset += mergedDataOffset;
+        DBWriter::writeIndexEntryToFile(outIndex, indexBuffer, entry);
+    }
+    reader.close();
+}
+
+static void mergeCreatedbHardModeParts(const std::vector<CreatedbHardModePart> &parts,
+                                       const std::string &dataFile, const std::string &indexFile,
+                                       const std::string &hdrDataFile, const std::string &hdrIndexFile,
+                                       DBKeyType identifierOffset) {
+    FILE *seqOut = FileUtil::openAndDelete(dataFile.c_str(), "wb");
+    FILE *seqIndexOut = FileUtil::openAndDelete(indexFile.c_str(), "wb");
+    FILE *hdrOut = FileUtil::openAndDelete(hdrDataFile.c_str(), "wb");
+    FILE *hdrIndexOut = FileUtil::openAndDelete(hdrIndexFile.c_str(), "wb");
+    setvbuf(seqOut, NULL, _IOFBF, 1024 * 1024 * 50);
+    setvbuf(seqIndexOut, NULL, _IOFBF, 1024 * 1024 * 50);
+    setvbuf(hdrOut, NULL, _IOFBF, 1024 * 1024 * 50);
+    setvbuf(hdrIndexOut, NULL, _IOFBF, 1024 * 1024 * 50);
+
+    std::vector<char> copyBuffer(8 * 1024 * 1024);
+    size_t seqOffset = 0;
+    size_t hdrOffset = 0;
+    DBKeyType keyOffset = identifierOffset;
+    for (size_t fileIdx = 0; fileIdx < parts.size(); fileIdx++) {
+        const CreatedbHardModePart &part = parts[fileIdx];
+        rewritePartialIndex(part.seqData, part.seqIndex, seqIndexOut, seqOffset, keyOffset);
+        rewritePartialIndex(part.hdrData, part.hdrIndex, hdrIndexOut, hdrOffset, keyOffset);
+        seqOffset += appendFileToOpenFile(part.seqData, seqOut, copyBuffer);
+        hdrOffset += appendFileToOpenFile(part.hdrData, hdrOut, copyBuffer);
+        keyOffset += part.entries;
+    }
+
+    if (fclose(seqOut) != 0) {
+        Debug(Debug::ERROR) << "Cannot close data file " << dataFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fclose(seqIndexOut) != 0) {
+        Debug(Debug::ERROR) << "Cannot close index file " << indexFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fclose(hdrOut) != 0) {
+        Debug(Debug::ERROR) << "Cannot close header file " << hdrDataFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fclose(hdrIndexOut) != 0) {
+        Debug(Debug::ERROR) << "Cannot close header index file " << hdrIndexFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
+static void writeLookupForCreatedbHardModeParts(const std::vector<CreatedbHardModePart> &parts,
+                                                const std::string &dataFile,
+                                                const std::string &hdrDataFile,
+                                                const std::string &hdrIndexFile) {
+    DBReader<DBKeyType> readerHeader(hdrDataFile.c_str(), hdrIndexFile.c_str(), 1,
+                                     DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX);
+    readerHeader.open(DBReader<DBKeyType>::NOSORT);
+
+    std::string lookupFile = dataFile + ".lookup";
+    FILE *file = FileUtil::openAndDelete(lookupFile.c_str(), "w");
+    std::string buffer;
+    buffer.reserve(2048);
+    DBReader<DBKeyType>::LookupEntry entry;
+    size_t id = 0;
+    for (size_t fileIdx = 0; fileIdx < parts.size(); fileIdx++) {
+        for (DBKeyType localId = 0; localId < parts[fileIdx].entries; localId++, id++) {
+            char *header = readerHeader.getData(id, 0);
+            entry.id = static_cast<DBKeyType>(id);
+            entry.entryName = Util::parseFastaHeader(header);
+            if (entry.entryName.empty()) {
+                Debug(Debug::WARNING) << "Cannot extract identifier from entry " << id << "\n";
+            }
+            entry.fileNumber = static_cast<DBKeyType>(fileIdx);
+            DBReader<DBKeyType>::lookupEntryToBuffer(buffer, entry);
+            size_t written = fwrite(buffer.c_str(), sizeof(char), buffer.size(), file);
+            if (written != buffer.size()) {
+                Debug(Debug::ERROR) << "Cannot write to lookup file " << lookupFile << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            buffer.clear();
+        }
+    }
+    if (id != readerHeader.getSize()) {
+        Debug(Debug::ERROR) << "Parallel createdb lookup size mismatch: wrote " << id
+                            << " entries but header DB contains " << readerHeader.getSize() << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fclose(file) != 0) {
+        Debug(Debug::ERROR) << "Cannot close file " << lookupFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    readerHeader.close();
+}
+
+static void cleanupCreatedbHardModeParts(const std::vector<CreatedbHardModePart> &parts) {
+    for (size_t i = 0; i < parts.size(); i++) {
+        removeIfExists(parts[i].seqData);
+        removeIfExists(parts[i].seqIndex);
+        removeIfExists(parts[i].hdrData);
+        removeIfExists(parts[i].hdrIndex);
+        removeIfExists(parts[i].seqData + ".dbtype");
+        removeIfExists(parts[i].hdrData + ".dbtype");
+    }
+}
+
+static CreatedbHardModePart writeCreatedbHardModePart(const Parameters &par, const std::vector<std::string> &filenames,
+                                                      const std::string &dataFile, const std::string &hdrDataFile,
+                                                      size_t fileIdx, int dbType,
+                                                      Debug::Progress &progress, size_t &progressCounter) {
+    CreatedbHardModePart part;
+    part.sourceName = FileUtil::baseName(filenames[fileIdx]);
+    part.seqData = dataFile + ".parallel." + SSTR(fileIdx);
+    part.seqIndex = part.seqData + ".index";
+    part.hdrData = hdrDataFile + ".parallel." + SSTR(fileIdx);
+    part.hdrIndex = part.hdrData + ".index";
+    part.sampleIsNucleotide.reserve(10);
+
+    removeIfExists(part.seqData);
+    removeIfExists(part.seqIndex);
+    removeIfExists(part.hdrData);
+    removeIfExists(part.hdrIndex);
+    removeIfExists(part.seqData + ".dbtype");
+    removeIfExists(part.hdrData + ".dbtype");
+
+    const size_t writerBufferSize = 8 * 1024 * 1024;
+    DBWriter hdrWriter(part.hdrData.c_str(), part.hdrIndex.c_str(), 1, par.compressed, Parameters::DBTYPE_GENERIC_DB);
+    DBWriter seqWriter(part.seqData.c_str(), part.seqIndex.c_str(), 1, par.compressed,
+                       (dbType == -1) ? Parameters::DBTYPE_OMIT_FILE : dbType);
+#pragma omp critical(createdb_parallel_writer_open)
+    {
+        hdrWriter.open(writerBufferSize);
+        seqWriter.open(writerBufferSize);
+    }
+
+    KSeqWrapper *kseq = KSeqFactory(filenames[fileIdx].c_str());
+    std::string header;
+    header.reserve(1024);
+    const char newline = '\n';
+    size_t numEntriesInCurrFile = 0;
+    while (kseq->ReadEntry()) {
+        size_t done = __sync_add_and_fetch(&progressCounter, 1);
+        if ((done % 10000) == 0) {
+#pragma omp critical(createdb_parallel_progress)
+            {
+                progress.updateProgress(done);
+            }
+        }
+
+        const KSeqWrapper::KSeqEntry &e = kseq->entry;
+        if (e.name.l == 0) {
+            Debug(Debug::ERROR) << "Fasta entry " << numEntriesInCurrFile << " is invalid\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (part.sampleIsNucleotide.size() < 10) {
+            part.sampleIsNucleotide.push_back(sequenceLooksNucleotide(e.sequence.s, e.sequence.l) ? 1 : 0);
+        }
+
+        header.append(e.name.s, e.name.l);
+        if (e.comment.l > 0) {
+            header.append(" ", 1);
+            header.append(e.comment.s, e.comment.l);
+        }
+        std::string headerId = Util::parseFastaHeader(header.c_str());
+        if (headerId.empty()) {
+#pragma omp critical(createdb_parallel_warning)
+            {
+                Debug(Debug::WARNING) << "Cannot extract identifier from entry " << numEntriesInCurrFile
+                                      << " in " << part.sourceName << "\n";
+            }
+        }
+        header.push_back('\n');
+
+        DBKeyType localId = static_cast<DBKeyType>(part.entries);
+        hdrWriter.writeData(header.c_str(), header.length(), localId, 0);
+        seqWriter.writeStart(0);
+        seqWriter.writeAdd(e.sequence.s, e.sequence.l, 0);
+        seqWriter.writeAdd(&newline, 1, 0);
+        seqWriter.writeEnd(localId, 0, true);
+
+        part.entries++;
+        numEntriesInCurrFile++;
+        header.clear();
+    }
+
+    part.empty = (numEntriesInCurrFile == 0);
+    delete kseq;
+#pragma omp critical(createdb_parallel_writer_close)
+    {
+        hdrWriter.close(true, false);
+        seqWriter.close(true, false);
+    }
+    return part;
+}
+
+static int createdbHardModeParallelInputFiles(Parameters &par, const std::vector<std::string> &filenames,
+                                              const std::string &dataFile, const std::string &indexFile,
+                                              const std::string &hdrDataFile, const std::string &hdrIndexFile,
+                                              const std::string &sourceFile, int dbType) {
+    const size_t fileCount = filenames.size();
+    unsigned int parallelFiles = getCreatedbThreads(static_cast<unsigned int>(par.threads),
+                                                    par.createdbThreads, fileCount);
+    Debug(Debug::INFO) << "Parallel hard-mode createdb uses " << parallelFiles << " file workers for "
+                       << fileCount << " input files\n";
+
+    FILE *source = fopen(sourceFile.c_str(), "w");
+    if (source == NULL) {
+        Debug(Debug::ERROR) << "Cannot open " << sourceFile << " for writing\n";
+        EXIT(EXIT_FAILURE);
+    }
+    for (size_t fileIdx = 0; fileIdx < fileCount; fileIdx++) {
+        std::string sourceName = FileUtil::baseName(filenames[fileIdx]);
+        char buffer[4096];
+        size_t len = snprintf(buffer, sizeof(buffer), "%zu\t%s\n", fileIdx, sourceName.c_str());
+        size_t written = fwrite(buffer, sizeof(char), len, source);
+        if (written != len) {
+            Debug(Debug::ERROR) << "Cannot write to source file " << sourceFile << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+    if (fclose(source) != 0) {
+        Debug(Debug::ERROR) << "Cannot close file " << sourceFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+
+    Debug::Progress progress;
+    progress.updateProgress(0);
+    size_t progressCounter = 0;
+    std::vector<CreatedbHardModePart> parts(fileCount);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(parallelFiles)
+    for (size_t fileIdx = 0; fileIdx < fileCount; fileIdx++) {
+        parts[fileIdx] = writeCreatedbHardModePart(par, filenames, dataFile, hdrDataFile,
+                                                   fileIdx, dbType, progress, progressCounter);
+    }
+    Debug(Debug::INFO) << "\n";
+
+    DBKeyType entriesNum = 0;
+    size_t sampleCount = 0;
+    size_t isNuclCnt = 0;
+    for (size_t fileIdx = 0; fileIdx < fileCount; fileIdx++) {
+        if (parts[fileIdx].empty) {
+            Debug(Debug::WARNING) << "File " << parts[fileIdx].sourceName << " is empty or invalid and was ignored\n";
+        }
+        entriesNum += parts[fileIdx].entries;
+        for (size_t i = 0; i < parts[fileIdx].sampleIsNucleotide.size() && sampleCount < 10; i++) {
+            isNuclCnt += (parts[fileIdx].sampleIsNucleotide[i] != 0);
+            sampleCount++;
+        }
+    }
+
+    if (entriesNum == 0) {
+        Debug(Debug::ERROR) << "The input files have no entry: ";
+        for (size_t fileIdx = 0; fileIdx < filenames.size(); fileIdx++) {
+            Debug(Debug::ERROR) << " - " << filenames[fileIdx] << "\n";
+        }
+        Debug(Debug::ERROR) << "Please check your input files. Only files in fasta/fastq[.gz|.bz2|.zst] are supported\n";
+        cleanupCreatedbHardModeParts(parts);
+        EXIT(EXIT_FAILURE);
+    }
+
+    Timer timer;
+    mergeCreatedbHardModeParts(parts, dataFile, indexFile, hdrDataFile, hdrIndexFile,
+                               static_cast<DBKeyType>(par.identifierOffset));
+    Debug(Debug::INFO) << "Merge parallel createdb files " << timer.lap() << "\n";
+
+    if (dbType == -1) {
+        dbType = (isNuclCnt == sampleCount) ? Parameters::DBTYPE_NUCLEOTIDES : Parameters::DBTYPE_AMINO_ACIDS;
+    }
+    DBWriter::writeDbtypeFile(dataFile.c_str(), dbType, par.compressed);
+    DBWriter::writeDbtypeFile(hdrDataFile.c_str(), Parameters::DBTYPE_GENERIC_DB, par.compressed);
+    Debug(Debug::INFO) << "Database type: " << Parameters::getDbTypeName(dbType) << "\n";
+
+    if (par.writeLookup == true) {
+        timer.reset();
+        writeLookupForCreatedbHardModeParts(parts, dataFile, hdrDataFile, hdrIndexFile);
+        Debug(Debug::INFO) << "Write parallel createdb lookup " << timer.lap() << "\n";
+    }
+
+    cleanupCreatedbHardModeParts(parts);
+    return EXIT_SUCCESS;
+}
+
 
 int createdb(int argc, const char **argv, const Command& command) {
     Parameters &par = Parameters::getInstance();
@@ -459,13 +855,48 @@ int createdb(int argc, const char **argv, const Command& command) {
     const size_t testForNucSequence = 100;
     size_t isNuclCnt = 0;
     Debug::Progress progress;
-    std::vector<unsigned int>* sourceLookup = new std::vector<unsigned int>[shuffleSplits]();
-    for (size_t i = 0; i < shuffleSplits; ++i) {
-        sourceLookup[i].reserve(16384);
-    }
     Debug(Debug::INFO) << "Converting sequences\n";
 
     std::string sourceFile = dataFile + ".source";
+    bool allInputsAreFiles = true;
+    for (size_t fileIdx = 0; fileIdx < filenames.size(); fileIdx++) {
+        allInputsAreFiles = allInputsAreFiles && (filenames[fileIdx] != "stdin");
+    }
+    const bool canUseParallelInputFiles =
+        dbInput == false &&
+        par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_HARD &&
+        filenames.size() > 1 &&
+        shuffleSplits == 1 &&
+        allInputsAreFiles == true;
+    const bool requestedParallelFiles = par.createdbThreads > 1;
+    if (requestedParallelFiles && canUseParallelInputFiles == false) {
+        Debug(Debug::ERROR) << "--createdb-threads > 1 requires --createdb-mode "
+                            << Parameters::SEQUENCE_SPLIT_MODE_HARD
+                            << ", multiple file inputs, --shuffle 0, and no database/stdin input\n";
+        EXIT(EXIT_FAILURE);
+    }
+#ifndef OPENMP
+    if (requestedParallelFiles) {
+        Debug(Debug::ERROR) << "--createdb-threads > 1 requires an OpenMP build\n";
+        EXIT(EXIT_FAILURE);
+    }
+#endif
+    if (canUseParallelInputFiles) {
+        int ret = createdbHardModeParallelInputFiles(par, filenames, dataFile, indexFile,
+                                                     hdrDataFile, hdrIndexFile, sourceFile, dbType);
+        if (subMat != NULL) {
+            delete subMat;
+        }
+        return ret;
+    }
+
+    const bool needSourceLookup = par.writeLookup || par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU;
+    std::vector<unsigned int>* sourceLookup = needSourceLookup ? new std::vector<unsigned int>[shuffleSplits]() : NULL;
+    if (sourceLookup != NULL) {
+        for (size_t i = 0; i < shuffleSplits; ++i) {
+            sourceLookup[i].reserve(16384);
+        }
+    }
 
     redoComputation:
     FILE *source = fopen(sourceFile.c_str(), "w");
@@ -566,8 +997,10 @@ int createdb(int argc, const char **argv, const Command& command) {
                 Debug(Debug::ERROR) << "Cannot close file " << sourceFile << "\n";
                 EXIT(EXIT_FAILURE);
             }
-            for (size_t i = 0; i < shuffleSplits; ++i) {
-                sourceLookup[i].clear();
+            if (sourceLookup != NULL) {
+                for (size_t i = 0; i < shuffleSplits; ++i) {
+                    sourceLookup[i].clear();
+                }
             }
             goto redoComputation;
         }
@@ -584,21 +1017,7 @@ int createdb(int argc, const char **argv, const Command& command) {
                 // check for the first 10 sequences if they are nucleotide sequences
                 if (sampleCount < 10 || (sampleCount % 100) == 0) {
                     if (sampleCount < testForNucSequence) {
-                        size_t cnt = 0;
-                        for (size_t i = 0; i < e.sequence.l; i++) {
-                            switch (toupper(e.sequence.s[i])) {
-                                case 'T':
-                                case 'A':
-                                case 'G':
-                                case 'C':
-                                case 'U':
-                                case 'N':
-                                    cnt++;
-                                    break;
-                            }
-                        }
-                        const float nuclDNAFraction = static_cast<float>(cnt) / static_cast<float>(e.sequence.l);
-                        if (nuclDNAFraction > 0.9) {
+                        if (sequenceLooksNucleotide(e.sequence.s, e.sequence.l)) {
                             isNuclCnt += true;
                         }
                     }
@@ -623,8 +1042,10 @@ int createdb(int argc, const char **argv, const Command& command) {
                         Debug(Debug::ERROR) << "Cannot close file " << sourceFile << "\n";
                         EXIT(EXIT_FAILURE);
                     }
-                    for (size_t i = 0; i < shuffleSplits; ++i) {
-                        sourceLookup[i].clear();
+                    if (sourceLookup != NULL) {
+                        for (size_t i = 0; i < shuffleSplits; ++i) {
+                            sourceLookup[i].clear();
+                        }
                     }
                     goto redoComputation;
                 }
@@ -645,7 +1066,9 @@ int createdb(int argc, const char **argv, const Command& command) {
 
             // Finally write down the entry
             unsigned int splitIdx = id % shuffleSplits;
-            sourceLookup[splitIdx].emplace_back(fileIdx);
+            if (sourceLookup != NULL) {
+                sourceLookup[splitIdx].emplace_back(fileIdx);
+            }
             if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT) {
                 // +2 to emulate the \n\0
                 hdrWriter.writeIndexEntry(id, headerFileOffset + e.headerOffset, (e.sequenceOffset-e.headerOffset)+1, 0);

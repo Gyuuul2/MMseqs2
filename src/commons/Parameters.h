@@ -674,6 +674,7 @@ public:
     int identifierOffset;
     int dbType;
     int createdbMode;
+    int createdbThreads;
     bool shuffleDatabase;
 
     // splitsequence
@@ -1137,6 +1138,7 @@ public:
     PARAMETER(PARAM_ID_OFFSET)  // same
     PARAMETER(PARAM_DB_TYPE)
     PARAMETER(PARAM_CREATEDB_MODE)
+    PARAMETER(PARAM_CREATEDB_THREADS)
     PARAMETER(PARAM_SHUFFLE)
     PARAMETER(PARAM_WRITE_LOOKUP)
 
