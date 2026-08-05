@@ -14,6 +14,9 @@
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -449,6 +452,48 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
     }
 }
 
+// keyed access over a file-ordered layout, where the kernel's guess readaheads a window per miss
+static void adviseRandom(DBReader<DBKeyType> *reader) {
+    if (reader == NULL) {
+        return;
+    }
+    for (size_t fileIdx = 0; fileIdx < reader->getDataFileCnt(); fileIdx++) {
+        Util::madviseLogged(reader->getDataForFile(fileIdx), reader->getDataSizeForFile(fileIdx),
+                            POSIX_MADV_RANDOM, "align2clust");
+    }
+}
+
+// the prefilter db is read once per representative, so its cache only competes with the bodies
+static void dropCache(DBReader<DBKeyType> *reader) {
+#ifdef HAVE_POSIX_FADVISE
+    if (reader == NULL) {
+        return;
+    }
+    std::vector<std::string> names = reader->getDataFileNames();
+    for (size_t fileIdx = 0; fileIdx < names.size(); fileIdx++) {
+        int fd = ::open(names[fileIdx].c_str(), O_RDONLY);
+        if (fd < 0) {
+            continue;
+        }
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        close(fd);
+    }
+#endif
+}
+
+// one fault per scattered entry, so ask for the whole prefilter list at once and let them overlap
+static void prefetchBody(DBReader<DBKeyType> *reader, size_t id) {
+    static const size_t pageSize = Util::getPageSize();
+    char *data = reader->getDataUncompressed(id);
+    const size_t len = reader->getEntryLen(id);
+    const uintptr_t start = reinterpret_cast<uintptr_t>(data) & ~(pageSize - 1);
+    posix_madvise(reinterpret_cast<void *>(start),
+                  len + (reinterpret_cast<uintptr_t>(data) - start), POSIX_MADV_WILLNEED);
+}
+
+// each drop walks the cached extent, so bound how many the run pays for
+static const size_t ALIGN2CLUST_PREF_DROPS = 256;
+
 int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &alnDbr, DBWriter *alnWriter) {
     DBReader<DBKeyType> *seqDbr = new DBReader<DBKeyType>(
         par.db1.c_str(), par.db1Index.c_str(), par.threads, 
@@ -612,6 +657,16 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         EXIT(EXIT_FAILURE);
     }
     unsigned int swMode = Alignment::initSWMode(par.alignmentMode, par.covThr, par.seqIdThr);
+    // while the dbs still fit, readahead is free and every hint below only costs what it saves
+    const bool cacheStarved = seqDbr->getDataSize() + alnDbr.getDataSize()
+                              > Util::computeMemory(par.splitMemoryLimit);
+    const size_t prefDropInterval = std::max<size_t>(1, endRange / ALIGN2CLUST_PREF_DROPS);
+    if (cacheStarved) {
+        adviseRandom(seqDbr);
+        adviseRandom(&alnDbr);
+        adviseRandom(cluSeqDbr);
+        adviseRandom(cluDbr);
+    }
     Debug::Progress progress(endRange);
     size_t db_maxseqlen = (cluSeqDbr != nullptr)
         ? std::max(seqDbr->getMaxSeqLen(), cluSeqDbr->getMaxSeqLen())
@@ -648,6 +703,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 #pragma omp for schedule(dynamic, 1) nowait
         for (size_t i = 0; i < endRange; i++) {
             progress.updateProgress();
+            // dropping consumed prefilter pages hands the cache to the bodies
+            if (cacheStarved && i > 0 && (i % prefDropInterval) == 0) {
+                dropCache(&alnDbr);
+            }
             ClusterResult clusterResult;
             clusterResult.sequenceIdx = i;
             targetsWithDiagonal.clear();
@@ -701,6 +760,13 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 prefSize++;
             }
             clusterResult.prefSize = prefSize;   // exact parsed count for the aligned path
+
+            if (cacheStarved) {
+                prefetchBody(seqDbr, queryId);
+                for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
+                    prefetchBody(seqDbr, targetsWithDiagonal[targetIdx].first);
+                }
+            }
 
             for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
                 // Representative assigned meanwhile: the cluster thread discards clusters
