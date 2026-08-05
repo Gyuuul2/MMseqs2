@@ -11,9 +11,9 @@
 #include "itoa.h"
 
 #include <algorithm>
+#include <sys/mman.h>
 #include <string>
 #include <vector>
-#include <sys/mman.h>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -113,13 +113,6 @@ static size_t hashWithLength(size_t hash, size_t length) {
 // hashing reads in offset order and wants sequential advice; clustering reads in hash order and must not
 static bool hashScanIsSequential(DBReader<DBKeyType> &reader) {
     return reader.getDataFileCnt() == 1 && reader.isSortedByOffset();
-}
-
-static void setDataAdvice(DBReader<DBKeyType> &reader, int advice, const char *context) {
-    for (size_t fileIdx = 0; fileIdx < reader.getDataFileCnt(); fileIdx++) {
-        Util::madviseLogged(reader.getDataForFile(fileIdx), reader.getDataSizeForFile(fileIdx),
-                            advice, context);
-    }
 }
 
 // a block wider than any readahead window keeps neighbouring threads from allocating the same folios
@@ -317,8 +310,12 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
     }
     hashSequences(reader, entries, isNuclInput, subMat, par.maxSeqLen, showProgress, par.threads);
     if (sequentialHashScan) {
-        // the clustering pass below reads in hash order, so drop the advice before it starts
-        setDataAdvice(reader, POSIX_MADV_NORMAL, "clusthashfast clustering");
+        // hash order is random to the end, and the default heuristic keeps issuing a full readahead
+        // window because 128 threads racing on the shared mmap_miss counter never let it saturate
+        for (size_t fileIdx = 0; fileIdx < reader.getDataFileCnt(); fileIdx++) {
+            Util::madviseLogged(reader.getDataForFile(fileIdx), reader.getDataSizeForFile(fileIdx),
+                                POSIX_MADV_RANDOM, "clusthashfast clustering");
+        }
     }
 
     Debug(Debug::INFO) << "Sort sequence hashes...\n";
