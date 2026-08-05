@@ -461,7 +461,7 @@ void FileUtil::fixRlimitNoFile() {
             Debug(Debug::WARNING) << "Could not increase maximum number of open files (getrlimit " << errno << "). Use ulimit manually\n";
             return;
         }
-        limit.rlim_cur = std::min(std::max((rlim_t)8192, limit.rlim_cur), limit.rlim_max);
+        limit.rlim_cur = std::min(std::max((rlim_t)32768, limit.rlim_cur), limit.rlim_max);
         limit.rlim_max = std::min(RLIM_INFINITY, limit.rlim_max);
         if (setrlimit(RLIMIT_NOFILE, &limit) != 0) {
             Debug(Debug::WARNING) << "Could not increase maximum number of open files (setrlimit " << errno << "). Use ulimit manually\n";

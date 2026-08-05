@@ -240,13 +240,10 @@ public:
     }
 };
 
-template <int TYPE, typename T, bool includeAdjacency = false>
+template <int TYPE, typename T>
 void mergeKmerFilesAndOutput(DBWriter & dbw, std::vector<std::string> tmpFiles, std::vector<char> &repSequence, int numThreads = 1, int maxIter = 1);
 
 typedef std::priority_queue<FileKmerPosition, std::vector<FileKmerPosition>, CompareResultBySeqId> KmerPositionQueue;
-
-template <int TYPE, typename T>
-size_t queueNextEntry(KmerPositionQueue &queue, int file, size_t offsetPos, T *entries, size_t entrySize);
 
 void setKmerLengthAndAlphabet(Parameters &parameters, size_t aaDbSize, int seqType);
 
@@ -259,21 +256,17 @@ void writeKmerMatcherResult(DBWriter & dbw, KmerPosition<T, includeAdjacency, In
 
 
 template <typename T, bool includeAdjacency = false, bool IncludeSeqLen = false>
-KmerPosition<T, includeAdjacency, IncludeSeqLen> * doComputation(size_t totalKmers, size_t split, size_t splits, std::string splitFile,
-                                DBReader<DBKeyType> & seqDbr, Parameters & par, BaseMatrix  * subMat,
-                                size_t KMER_SIZE, size_t chooseTopKmer, float chooseTopKmerScale = 0.0);
-
-template <typename T, bool includeAdjacency = false, bool IncludeSeqLen = false>
 KmerPosition<T, includeAdjacency, IncludeSeqLen> *initKmerPositionMemory(size_t size);
+
+template <typename T, bool includeAdjacency, bool IncludeSeqLen>
+struct KmerPartitionSink;
 
 template <int TYPE, typename T, bool includeAdjacency = false, bool IncludeSeqLen = false>
 std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency, IncludeSeqLen> * kmerArray, size_t kmerArraySize, DBReader<DBKeyType> &seqDbr,
                                                  Parameters & par, BaseMatrix * subMat, bool hashWholeSequence,
-                                                 size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution);
+                                                 size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution,
+                                                 KmerPartitionSink<T, includeAdjacency, IncludeSeqLen> *partitionSink = NULL);
 
-
-void maskSequence(int maskMode, int maskLowerCase,
-                  Sequence &seq, int maskLetter, ProbabilityMatrix * probMatrix);
 
 template <typename T, bool includeAdjacency = false, bool IncludeSeqLen = false>
 size_t computeMemoryNeededLinearfilter(size_t totalKmer);
@@ -284,8 +277,6 @@ size_t computeKmerCount(DBReader<DBKeyType> &reader, size_t KMER_SIZE, size_t ch
                         float chooseTopKmerScale = 0.0);
 
 void setLinearFilterDefault(Parameters *p);
-
-size_t computeMemoryNeededLinearfilter(size_t totalKmer);
 
 
 #undef SIZE_T_MAX
