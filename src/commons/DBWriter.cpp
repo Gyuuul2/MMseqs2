@@ -1,4 +1,5 @@
 #include "DBWriter.h"
+#include "FastSort.h"
 #include "DBReader.h"
 #include "Debug.h"
 #include "Util.h"
@@ -639,7 +640,7 @@ void DBWriter::mergeResults(const char *outFileName, const char *outFileNameInde
         }
 
         // merge index
-        mergeIndex(indexFileNames, dataFilenames.size(), mergedSizes);
+        mergeIndex(indexFileNames, dataFilenames.size(), mergedSizes, fileCount);
     } else if (dataFilenames.size() == 1) {
         std::vector<std::string>& filenames = dataFilenames[0];
         if (filenames.size() == 1) {
@@ -663,7 +664,7 @@ void DBWriter::mergeResults(const char *outFileName, const char *outFileNameInde
     }
     if (dataFilenames.size() > 0) {
         if (indexNeedsToBeSorted) {
-            DBWriter::sortIndex(indexFileNames[0], outFileNameIndex, lexicographicOrder);
+            DBWriter::sortIndex(indexFileNames[0], outFileNameIndex, lexicographicOrder, fileCount);
             FileUtil::remove(indexFileNames[0]);
         } else {
             FileUtil::move(indexFileNames[0], outFileNameIndex);
@@ -672,7 +673,8 @@ void DBWriter::mergeResults(const char *outFileName, const char *outFileNameInde
     Debug(Debug::INFO) << "Time for merging to " << FileUtil::baseName(outFileName) << ": " << timer.lap() << "\n";
 }
 
-void DBWriter::mergeIndex(const char** indexFilenames, unsigned int fileCount, const std::vector<size_t> &dataSizes) {
+void DBWriter::mergeIndex(const char** indexFilenames, unsigned int fileCount, const std::vector<size_t> &dataSizes,
+                          unsigned int threads) {
     FILE *index_file = fopen(indexFilenames[0], "a");
     if (index_file == NULL) {
         perror(indexFilenames[0]);
@@ -680,7 +682,7 @@ void DBWriter::mergeIndex(const char** indexFilenames, unsigned int fileCount, c
     }
     size_t globalOffset = dataSizes[0];
     for (unsigned int fileIdx = 1; fileIdx < fileCount; fileIdx++) {
-        DBReader<DBKeyType> reader(indexFilenames[fileIdx], indexFilenames[fileIdx], 1, DBReader<DBKeyType>::USE_INDEX);
+        DBReader<DBKeyType> reader(indexFilenames[fileIdx], indexFilenames[fileIdx], threads, DBReader<DBKeyType>::USE_INDEX);
         reader.open(DBReader<DBKeyType>::HARDNOSORT);
         if (reader.getSize() > 0) {
             DBReader<DBKeyType>::Index * index = reader.getIndex();
@@ -701,12 +703,16 @@ void DBWriter::mergeIndex(const char** indexFilenames, unsigned int fileCount, c
     }
 }
 
-void DBWriter::sortIndex(const char *inFileNameIndex, const char *outFileNameIndex, const bool lexicographicOrder){
+void DBWriter::sortIndex(const char *inFileNameIndex, const char *outFileNameIndex, const bool lexicographicOrder,
+                         unsigned int threads){
     if (lexicographicOrder == false) {
         // sort the index
-        DBReader<DBKeyType> indexReader(inFileNameIndex, inFileNameIndex, 1, DBReader<DBKeyType>::USE_INDEX);
-        indexReader.open(DBReader<DBKeyType>::NOSORT);
+        // HARDNOSORT skips both the key sort and the single threaded in-place permutation that
+        // follows it; only the written order matters here, so sort the array and write it directly
+        DBReader<DBKeyType> indexReader(inFileNameIndex, inFileNameIndex, threads, DBReader<DBKeyType>::USE_INDEX);
+        indexReader.open(DBReader<DBKeyType>::HARDNOSORT);
         DBReader<DBKeyType>::Index *index = indexReader.getIndex();
+        SORT_PARALLEL(index, index + indexReader.getSize(), DBReader<DBKeyType>::Index::compareById);
         FILE *index_file  = FileUtil::openAndDelete(outFileNameIndex, "w");
         writeIndex(index_file, indexReader.getSize(), index);
         if (fclose(index_file) != 0) {
