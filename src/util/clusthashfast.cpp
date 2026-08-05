@@ -17,6 +17,7 @@
 #include <unistd.h>
 #include <string>
 #include <vector>
+#include <mutex>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -193,7 +194,6 @@ static void hashSequences(DBReader<DBKeyType> &reader, HashEntry *entries, bool 
         Sequence *seq = isNuclInput ? NULL : new Sequence(maxSeqLen, reader.getDbtype(), subMat, 0, false, false);
 #pragma omp for schedule(static, scanChunk)
         for (size_t id = 0; id < dbSize; ++id) {
-            // an explicit position keeps 128 threads off the one shared atomic counter
             if (showProgress) {
                 progress.updateProgress(id);
             }
@@ -493,8 +493,11 @@ static unsigned int hashBucketCount(const Parameters &par, size_t dbSize) {
         Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_CLUSTHASHFAST_PARTITIONS=" << env << "\n";
     }
     const size_t needed = dbSize * sizeof(HashEntry);
-    const size_t budget = Util::computeMemory(par.splitMemoryLimit);
-    if (budget == 0 || needed <= budget) {
+    // a large reader index can leave computeMemory with almost nothing, which would ask for the
+    // maximum partition count on every default run, so keep a floor it cannot fall through
+    const size_t budget = std::max(Util::computeMemory(par.splitMemoryLimit),
+                                   Util::getTotalSystemMemory() / 4);
+    if (needed <= budget) {
         return 1;
     }
     unsigned int buckets = 1;
@@ -553,18 +556,35 @@ struct HashBucketWriter {
     }
 };
 
+// per thread write buffer budget, split across the partitions
+static const size_t CLUSTHASHFAST_PENDING_BYTES = 8 * 1024 * 1024;
+
+static bool flushBucket(HashBucketWriter &buckets, std::vector<std::mutex> &locks, unsigned int bucket,
+                        std::vector<HashEntry> &pending) {
+    std::lock_guard<std::mutex> lock(locks[bucket]);
+    const bool ok = fwrite(pending.data(), sizeof(HashEntry), pending.size(), buckets.files[bucket])
+                    == pending.size();
+    buckets.counts[bucket] += pending.size();
+    pending.clear();
+    return ok;
+}
+
 // hashes straight into the partitions, so the full array is never resident
 static bool hashIntoBuckets(DBReader<DBKeyType> &reader, HashBucketWriter &buckets, bool isNuclInput,
                             BaseMatrix *subMat, size_t maxSeqLen, bool showProgress, int threads) {
     const size_t dbSize = reader.getSize();
     const size_t scanChunk = hashScanBlock(reader, dbSize, threads);
-    const size_t FLUSH = 8192;
     const unsigned int bucketCount = static_cast<unsigned int>(buckets.files.size());
+    // partitioning exists to bound memory, so the write buffers get a fixed budget rather than a
+    // fixed depth: a per bucket depth would grow the footprint by the very factor it is dividing by
+    const size_t flush = std::max<size_t>(64, CLUSTHASHFAST_PENDING_BYTES
+                                              / (bucketCount * sizeof(HashEntry)));
     std::vector<std::mutex> locks(bucketCount);
     Debug::Progress progress(dbSize);
     bool ok = true;
-#pragma omp parallel num_threads(threads)
+#pragma omp parallel num_threads(threads) reduction(&&:ok)
     {
+        bool threadOk = true;
         unsigned int thread_idx = 0;
 #ifdef OPENMP
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
@@ -574,35 +594,24 @@ static bool hashIntoBuckets(DBReader<DBKeyType> &reader, HashBucketWriter &bucke
 #pragma omp for schedule(static, scanChunk)
         for (size_t id = 0; id < dbSize; ++id) {
             if (showProgress) {
-                progress.updateProgress();
+                progress.updateProgress(id);
             }
             HashEntry entry;
             entry.hash = hashOf(reader, id, seq, thread_idx);
             entry.id = static_cast<DBLocalId>(id);
             const unsigned int b = buckets.bucketOf(entry.hash);
             pending[b].push_back(entry);
-            if (pending[b].size() >= FLUSH) {
-                std::lock_guard<std::mutex> lock(locks[b]);
-                if (fwrite(pending[b].data(), sizeof(HashEntry), pending[b].size(), buckets.files[b])
-                        != pending[b].size()) {
-                    ok = false;
-                }
-                buckets.counts[b] += pending[b].size();
-                pending[b].clear();
+            if (pending[b].size() >= flush) {
+                threadOk = flushBucket(buckets, locks, b, pending[b]) && threadOk;
             }
         }
         for (unsigned int b = 0; b < bucketCount; b++) {
-            if (pending[b].empty()) {
-                continue;
+            if (pending[b].empty() == false) {
+                threadOk = flushBucket(buckets, locks, b, pending[b]) && threadOk;
             }
-            std::lock_guard<std::mutex> lock(locks[b]);
-            if (fwrite(pending[b].data(), sizeof(HashEntry), pending[b].size(), buckets.files[b])
-                    != pending[b].size()) {
-                ok = false;
-            }
-            buckets.counts[b] += pending[b].size();
         }
         delete seq;
+        ok = ok && threadOk;
     }
     return ok;
 }
@@ -711,7 +720,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     DBReader<DBKeyType> reader(par.db1.c_str(), par.db1Index.c_str(), par.threads,
                                DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX);
     reader.open(DBReader<DBKeyType>::NOSORT);
-    // only preload what can stay resident; computeMemory returns --split-memory-limit, not a memory size
+    // only preload what can stay resident once the reader index is accounted for
     const bool dataFitsInMemory = reader.getDataSize() < Util::getTotalSystemMemory() / 2;
     if (par.preloadMode == Parameters::PRELOAD_MODE_MMAP_TOUCH
         || (par.preloadMode != Parameters::PRELOAD_MODE_MMAP && dataFitsInMemory)) {
