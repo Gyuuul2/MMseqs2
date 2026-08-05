@@ -166,6 +166,8 @@ namespace KSEQZSTD {
         size_t inBufCap;
         ZSTD_inBuffer input;    // { src, size, pos } over inBuf
         int eof;                // 1 once the compressed file is fully read
+        int frameComplete;      // set after ZSTD_decompressStream returns 0 for a complete frame
+        std::string fileName;
     };
 
     // Returns decompressed bytes (>0), 0 at EOF, or -1 on error, like read()/gzread().
@@ -178,6 +180,10 @@ namespace KSEQZSTD {
         while (output.pos == 0) {
             if (r->input.pos == r->input.size && r->eof == 0) {
                 size_t n = fread(r->inBuf, 1, r->inBufCap, r->fp);
+                if (n == 0 && ferror(r->fp)) {
+                    Debug(Debug::ERROR) << "Cannot read zstd file " << r->fileName << "\n";
+                    return -1;
+                }
                 r->input.src = r->inBuf;
                 r->input.size = n;
                 r->input.pos = 0;
@@ -186,13 +192,19 @@ namespace KSEQZSTD {
                 }
             }
             if (r->input.pos == r->input.size && r->eof) {
-                break;  // no more compressed input -> genuine EOF
+                if (r->frameComplete == 0) {
+                    Debug(Debug::ERROR) << "Truncated zstd frame in " << r->fileName << "\n";
+                    return -1;
+                }
+                break;  // no more compressed input after a completed frame -> genuine EOF
             }
             size_t code = ZSTD_decompressStream(r->dstream, &output, &r->input);
             if (ZSTD_isError(code)) {
-                Debug(Debug::ERROR) << "ZSTD_decompressStream: " << ZSTD_getErrorName(code) << "\n";
+                Debug(Debug::ERROR) << "ZSTD_decompressStream failed for " << r->fileName << ": "
+                                    << ZSTD_getErrorName(code) << "\n";
                 return -1;
             }
+            r->frameComplete = (code == 0);
         }
         return (int) output.pos;
     }
@@ -213,7 +225,12 @@ KSeqZstd::KSeqZstd(const char* fileName) {
         Debug(Debug::ERROR) << "ZSTD_createDStream() failed for " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
-    ZSTD_initDStream(r->dstream);
+    size_t initResult = ZSTD_initDStream(r->dstream);
+    if (ZSTD_isError(initResult)) {
+        Debug(Debug::ERROR) << "ZSTD_initDStream() failed for " << fileName << ": "
+                            << ZSTD_getErrorName(initResult) << "\n";
+        EXIT(EXIT_FAILURE);
+    }
     r->inBufCap = ZSTD_DStreamInSize();
     r->inBuf = (unsigned char*) malloc(r->inBufCap);
     if (r->inBuf == NULL) {
@@ -224,6 +241,8 @@ KSeqZstd::KSeqZstd(const char* fileName) {
     r->input.size = 0;
     r->input.pos = 0;
     r->eof = 0;
+    r->frameComplete = 0;
+    r->fileName = fileName;
     reader = (void*) r;
     seq = (void*) KSEQZSTD::kseq_init(r);
     type = KSEQ_ZSTD;
@@ -231,8 +250,17 @@ KSeqZstd::KSeqZstd(const char* fileName) {
 
 bool KSeqZstd::ReadEntry() {
     KSEQZSTD::kseq_t* s = (KSEQZSTD::kseq_t*) seq;
-    if (KSEQZSTD::kseq_read(s) < 0)
+    int64_t ret = KSEQZSTD::kseq_read(s);
+    if (ret == -1) {
         return false;
+    }
+    if (ret < 0) {
+        KSEQZSTD::ZstdReader* r = (KSEQZSTD::ZstdReader*) reader;
+        const std::string name = (r != NULL) ? r->fileName : "<unknown>";
+        Debug(Debug::ERROR) << "Error reading zstd FASTA " << name
+                            << " (kseq rc=" << ret << ")\n";
+        EXIT(EXIT_FAILURE);
+    }
 
     entry.name = s->name;
     entry.comment = s->comment;

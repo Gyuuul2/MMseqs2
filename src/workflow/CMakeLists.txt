@@ -7,6 +7,7 @@ set(workflow_source_files
         workflow/EasyRbh.cpp
         workflow/EasyCluster.cpp
         workflow/EasyLinclust.cpp
+        workflow/BatchClustering.cpp
         workflow/EasyProteomecluster.cpp
         workflow/EasyProteomesearch.cpp
         workflow/Enrich.cpp
