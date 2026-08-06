@@ -452,6 +452,64 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
     }
 }
 
+// Reading the random entries with pread keeps them out of the fault path: no page table entry per
+// page, no TLB shootdown across the cores that evict it, and fadvise can reclaim what nothing has
+// mapped. mmap still wins for sequential passes, so this is only used where access is by key.
+struct EntryReader {
+    std::vector<int> fds;
+    std::vector<size_t> fileBase;      // first global offset held by each data file
+    std::vector<std::string> buffers;  // one per thread, reused
+    bool enabled;
+
+    EntryReader() : enabled(false) {}
+
+    ~EntryReader() {
+        for (size_t i = 0; i < fds.size(); i++) {
+            if (fds[i] >= 0) {
+                close(fds[i]);
+            }
+        }
+    }
+
+    // compressed entries come back through the reader's own decompression buffer, so leave those alone
+    void open(DBReader<DBKeyType> *reader, unsigned int threads) {
+        if (reader == NULL || reader->isCompressed() != 0 || reader->getDataFileCnt() == 0) {
+            return;
+        }
+        std::vector<std::string> names = reader->getDataFileNames();
+        size_t offset = 0;
+        for (size_t i = 0; i < names.size(); i++) {
+            const int fd = ::open(names[i].c_str(), O_RDONLY);
+            if (fd < 0) {
+                return;
+            }
+            fds.push_back(fd);
+            fileBase.push_back(offset);
+            offset += reader->getDataSizeForFile(i);
+        }
+        buffers.resize(threads);
+        enabled = true;
+    }
+
+    char *get(DBReader<DBKeyType> *reader, size_t id, unsigned int threadIdx) {
+        if (enabled == false) {
+            return reader->getData(id, threadIdx);
+        }
+        const size_t offset = reader->getIndex()[id].offset;
+        size_t file = fileBase.size() - 1;
+        while (file > 0 && fileBase[file] > offset) {
+            file--;
+        }
+        const size_t length = reader->getEntryLen(id);
+        std::string &buffer = buffers[threadIdx];
+        buffer.resize(length + 1);
+        // a db linked from its source can be one byte short of the entry terminator, so terminate here
+        const ssize_t read = pread(fds[file], &buffer[0], length, static_cast<off_t>(offset - fileBase[file]));
+        buffer[(read > 0) ? static_cast<size_t>(read) : 0] = '\0';
+        return &buffer[0];
+    }
+};
+
 // keyed access over a file-ordered layout, where the kernel's guess readaheads a window per miss
 static void adviseRandom(DBReader<DBKeyType> *reader) {
     if (reader == NULL) {
@@ -664,6 +722,13 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     const bool cacheStarved = seqDbr->getDataSize() + alnDbr.getDataSize()
                               > Util::computeMemory(par.splitMemoryLimit);
     const size_t prefDropInterval = std::max<size_t>(1, endRange / ALIGN2CLUST_PREF_DROPS);
+    // both dbs are addressed by key here, so the fault path buys nothing for either
+    EntryReader seqReader;
+    EntryReader alnReader;
+    if (cacheStarved) {
+        seqReader.open(seqDbr, par.threads);
+        alnReader.open(&alnDbr, par.threads);
+    }
     if (cacheStarved) {
         adviseRandom(seqDbr);
         adviseRandom(&alnDbr);
@@ -741,7 +806,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             }
 
             const size_t alignmentId = requireId(alnDbr.getId(queryKey), "Alignment DB", queryKey);
-            char *alignmentData = alnDbr.getData(alignmentId, threadIdx);
+            char *alignmentData = alnReader.get(&alnDbr, alignmentId, threadIdx);
             size_t queryId = representativeId;
             // index-only, so it is known without faulting the body in; Sequence::mapSequence sets L to it
             const int queryLength = static_cast<int>(seqDbr->getSeqLen(queryId));
@@ -830,14 +895,14 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 // first target to survive filtering: now the query body is worth its random read
                 if (querySequence == nullptr) {
                     // getData may hand back a shared per-thread buffer, so copy before the first target read
-                    queryCopy.assign(seqDbr->getData(queryId, threadIdx), queryLength);
+                    queryCopy.assign(seqReader.get(seqDbr, queryId, threadIdx), queryLength);
                     querySequence = queryCopy.c_str();
                     query.mapSequence(queryId, queryKey, querySequence, queryLength);
                     blockAligner.initQuery(&query);
                     matcher.initQuery(&query);
                 }
 
-                char *targetSequence = seqDbr->getData(targetId, threadIdx);
+                char *targetSequence = seqReader.get(seqDbr, targetId, threadIdx);
                 target.mapSequence(targetId, targetKey, targetSequence, targetLength);
 
                 BlockAligner::UngappedAln_res ungappedAlignment = blockAligner.ungappedAlign(&target, diagonal); 
