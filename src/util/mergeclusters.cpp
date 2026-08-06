@@ -25,7 +25,22 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
 
     // init the structure for cluster merging
     // it has the size of all possible cluster (sequence amount)
-    std::list<size_t> *mergedClustering = new std::list<size_t>[dbr.getSize()];
+    // singly linked lists over flat arrays: a splice is still two stores, but a member costs 8 byte
+    // instead of a 32 byte heap node, and there is no per cluster constructor or destructor to walk
+    const size_t NO_MEMBER = SIZE_MAX;
+    size_t *clusterHead = new(std::nothrow) size_t[dbr.getSize()];
+    size_t *clusterTail = new(std::nothrow) size_t[dbr.getSize()];
+    size_t *nextMember = new(std::nothrow) size_t[dbr.getSize()];
+    Util::checkAllocation(clusterHead, "Cannot allocate clusterHead memory in mergeclusters");
+    Util::checkAllocation(clusterTail, "Cannot allocate clusterTail memory in mergeclusters");
+    Util::checkAllocation(nextMember, "Cannot allocate nextMember memory in mergeclusters");
+    // also the parallel first touch, so the pages are not all faulted in by one thread
+#pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < dbr.getSize(); i++) {
+        clusterHead[i] = NO_MEMBER;
+        clusterTail[i] = NO_MEMBER;
+        nextMember[i] = NO_MEMBER;
+    }
 
     // read the clustering from the first clustering step
     std::string firstClu = clusterings.front();
@@ -58,7 +73,12 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
                 Util::parseKey(data, keyBuffer);
                 DBKeyType key = Util::fast_atoi<DBKeyType>(keyBuffer);
                 size_t seqId = dbr.getId(key);
-                mergedClustering[cluId].push_back(seqId);
+                if (clusterHead[cluId] == NO_MEMBER) {
+                    clusterHead[cluId] = seqId;
+                } else {
+                    nextMember[clusterTail[cluId]] = seqId;
+                }
+                clusterTail[cluId] = seqId;
                 data = Util::skipLine(data);
             }
         }
@@ -97,8 +117,17 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
                     Util::parseKey(data, keyBuffer);
                     DBKeyType key = Util::fast_atoi<DBKeyType>(keyBuffer);
                     size_t seqId = dbr.getId(key);
-                    if (seqId != cluId) { // to avoid copies of the same cluster list
-                        mergedClustering[cluId].splice(mergedClustering[cluId].end(), mergedClustering[seqId]);
+                    // to avoid copies of the same cluster list
+                    if (seqId != cluId && clusterHead[seqId] != NO_MEMBER) {
+                        if (clusterHead[cluId] == NO_MEMBER) {
+                            clusterHead[cluId] = clusterHead[seqId];
+                        } else {
+                            nextMember[clusterTail[cluId]] = clusterHead[seqId];
+                        }
+                        clusterTail[cluId] = clusterTail[seqId];
+                        // splice leaves the source empty
+                        clusterHead[seqId] = NO_MEMBER;
+                        clusterTail[seqId] = NO_MEMBER;
                     }
                     data = Util::skipLine(data);
                 }
@@ -130,13 +159,13 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
             progress.updateProgress();
 
             // no cluster for this representative
-            if (mergedClustering[i].empty())
+            if (clusterHead[i] == NO_MEMBER)
                 continue;
 
             // representative
             DBKeyType dbKey = dbr.getDbKey(i);
-            for (std::list<size_t>::iterator it = mergedClustering[i].begin(); it != mergedClustering[i].end(); ++it) {
-                char *tmpBuff = Itoa::u64toa_sse2(static_cast<uint64_t>(dbr.getDbKey(*it)), buffer);
+            for (size_t member = clusterHead[i]; member != NO_MEMBER; member = nextMember[member]) {
+                char *tmpBuff = Itoa::u64toa_sse2(static_cast<uint64_t>(dbr.getDbKey(member)), buffer);
                 size_t length = tmpBuff - buffer - 1;
                 res.append(buffer, length);
                 res.push_back('\n');
@@ -149,7 +178,9 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
     dbw.close();
     dbr.close();
 
-    delete[] mergedClustering;
+    delete[] nextMember;
+    delete[] clusterTail;
+    delete[] clusterHead;
 
     return EXIT_SUCCESS;
 }
