@@ -89,11 +89,28 @@ Ranked by measured or arithmetic size at 10B, largest first.
 
 1. **align2clust random reads** - was hours with no bound. Fixed this session: 3.30x measured on a
    63.3M-query real input, 160,475,604 -> 250,602 major faults. See section 5.
-2. **clusthashfast clustering pass** - 16.3 TB / 3.5 h. `MemberStore` attacks the right quantity
-   (amplification, not queue depth) but as written stages all 565 GB into one file while only
-   ~495 GB can stay cached, so ~12% still misses. Slicing the sorted array at run boundaries and
-   staging one slice at a time is the fix; determinism holds because slices are contiguous ranges of
-   an already `(hash, id)` sorted array. **Not implemented - see open items.**
+2. **clusthashfast clustering pass.** The figures I first wrote here (4.07B members, 565 GB, 16.3 TB,
+   100% miss) were estimates; the live 10B run says **5,299,290,541 members and a 694.4 GB staged
+   file**, and vmstat pins the page cache at 651 GB with 6.2 GB free, so resident anon is ~407 GB and
+   the cache available during clustering is ~661 GB. Redone with those:
+
+   | | random 4 kB faults | bytes from disk |
+   |---|---|---|
+   | no staging (661 GB cache vs 1.388 TB) | 5.299e9 x 52.4% = 2.78e9 | 11.4 TB |
+   | staging as first written | 5.299e9 x 57-68% = 3.0-3.6e9 | 12.4-14.8 TB |
+   | staging + dropping consumed db pages | 5.299e9 x ~4.8% = 2.5e8 | 1.05 TB |
+
+   The middle row is the finding: **staging was a net loss.** The staging pass streams 1.388 TB of db
+   pages through the same cache and never marks them dead, and the LRU cannot tell them from the staged
+   file, so the file kept only 694/(1388+694) = 33% of the cache - more faults than reading the db
+   directly, plus a 2.08 TB pass to get there. Fixed by dropping each thread's consumed byte range as
+   it goes (committed): `schedule(static)` gives a thread one contiguous word range, so with an offset
+   sorted index its byte range is contiguous and disjoint from every other thread's.
+
+   Also visible in the same vmstat: `wa=0` with 100+ runnable threads, `cs` only 20k/s and `in`
+   0.5-1.1M/s means nobody waits on I/O - with 6.2 GB free every fault enters direct reclaim, and
+   reclaiming a *mapped* file page needs an rmap walk plus a TLB flush IPI to every CPU. That is the
+   interrupt storm, and it is why `us=0, sy=94%`.
 3. **clusthashfast sort** - 1.28 TB of traffic over 4 levels. Minutes, not hours. Not worth
    replacing ips4o.
 4. **Hamming distance** - already SIMD (`simdi8_eq` + movemask + popcount). Total work at 10B is
@@ -230,12 +247,9 @@ recovered 480 s and 28M major faults (1803 s/28.6M -> 1324 s/0.25M).
    key and different member list. Identical only when the index is already id-sorted, which is true
    for `createdb` output but false for a subdb with sparse keys. Violates invariant 1, so not applied.
 
-   The related hazard Fable raised **is** real but is about performance, not correctness:
-   `sortedByOffset` is computed in `readIndex` (DBReader.cpp:202) and never recomputed, so
-   `hashScanIsSequential()` can report true on an index that `NOSORT` has just permuted into key
-   order. The hashing pass would then request sequential advice for reads that are not sequential and
-   derive its block width from an entry that is no longer last in the file. Worth fixing inside this
-   module (recompute the offset-monotonicity after open) rather than in DBReader.
+   The related hazard Fable raised is **not** real, checked: `DBReader::open` calls
+   `sortIndex(isSortedById)` at line 199 and then recomputes `sortedByOffset` over the final array at
+   lines 201-206, after it. `hashScanIsSequential()` is accurate as written. No fix needed.
 5. **`readMmapedDataInMemory()` at startup.** Touches up to 500 GB that `dropDataCache` then
    discards, and the hashing pass is already a sequential stream with sequential advice. Belongs to
    the original commit `5a4eaa11`, so it is the author's call; worth measuring with and without.
