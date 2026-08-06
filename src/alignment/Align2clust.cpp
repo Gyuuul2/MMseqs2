@@ -1101,6 +1101,14 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     std::vector<SetCoverCandidate>().swap(setCoverCandidates);
     std::vector<DBLocalId>().swap(setCoverMemberPool);
 
+    // the visit order and the alignment db are read only inside the producer loop, so the output phase
+    // does not have to compete with 16 byte per sequence and a whole reader index for the page cache
+    if (prefRepSizePair != nullptr) {
+        delete[] prefRepSizePair;
+        prefRepSizePair = nullptr;
+    }
+    alnDbr.close();
+
     for (size_t i = 0; i < dbSize; ++i) {
         if (loadAssignedCluster(assignedCluster, i) == DB_LOCAL_ID_INVALID) {
             storeAssignedCluster(assignedCluster, i, i);
@@ -1141,9 +1149,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
     delete[] memberOrder;
     delete[] assignedCluster;
-    if (prefRepSizePair != nullptr) {
-        delete[] prefRepSizePair;
-    }
     delete[] fastMatrix.matrix;
     delete[] fastMatrix.matrixData;
     delete subMat;
@@ -1205,7 +1210,6 @@ int align2clust(int argc, const char **argv, const Command &command) {
         alnWriter->close();
         delete alnWriter;
     }
-    alnDbr.close();
 
     return status;
 }
