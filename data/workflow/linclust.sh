@@ -94,10 +94,17 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
     fi
 
     if notExists "$2.dbtype"; then
-        # shellcheck disable=SC2086
-        "$MMSEQS" mergeclusters "$SOURCE" "$2" \
-            "$CLUDB" $REFINEDB $MERGECLU_PAR \
-            || fail "mergeclusters died"
+        if [ -z "$REFINEDB" ]; then
+            # one input clustering makes mergeclusters an identity copy, so move it instead
+            # shellcheck disable=SC2086
+            "$MMSEQS" mvdb "$CLUDB" "$2" ${VERBOSITY} \
+                || fail "mvdb clustering died"
+        else
+            # shellcheck disable=SC2086
+            "$MMSEQS" mergeclusters "$SOURCE" "$2" \
+                "$CLUDB" $REFINEDB $MERGECLU_PAR \
+                || fail "mergeclusters died"
+        fi
     fi
 
     # Expose alignment results (only produced when --include-align-files is set).
