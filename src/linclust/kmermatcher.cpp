@@ -1659,13 +1659,17 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
         }
         Debug(Debug::INFO) << "Time for fill: " << timer.lap() << "\n";
 
-#pragma omp parallel num_threads(1)
+        // Sequences no k-mer grouped get a prefilter entry of their own, which is one iteration per
+        // sequence: five billion of them on one core. close(false, false) below does not promise a
+        // sorted index anyway - this back-fill is already a second ascending run in it, and the
+        // consumer sorts - so schedule(static) may hand each thread its own contiguous id range.
+#pragma omp parallel
         {
             unsigned int thread_idx = 0;
 #ifdef OPENMP
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-#pragma omp for
+#pragma omp for schedule(static)
             for (size_t id = 0; id < seqDbr.getSize(); id++) {
                 char buffer[100];
                 DBKeyType dbKey = seqDbr.getDbKey(id);
