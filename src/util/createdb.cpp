@@ -24,7 +24,8 @@
 int sortWithIndex(const char *dataFileSeq,
                   const char *indexFileSeq,
                   const char *dataFileHeader,
-                  const char *indexFileHeader)
+                  const char *indexFileHeader,
+                  unsigned int threads)
 {
     DBReader<DBKeyType> reader(dataFileSeq, indexFileSeq, 1, DBReader<DBKeyType>::USE_INDEX);
     reader.open(DBReader<DBKeyType>::HARDNOSORT);
@@ -107,13 +108,13 @@ int sortWithIndex(const char *dataFileSeq,
     {
         std::string tmpIndex = std::string(indexFileSeq) + ".tmp";
         FILE *indexout = FileUtil::openFileOrDie(tmpIndex.c_str(), "wb", false);
-        DBWriter::writeIndex(indexout, reader.getSize(), index);
+        DBWriter::writeIndex(indexout, reader.getSize(), index, threads);
         fclose(indexout);
         FileUtil::move(tmpIndex.c_str(), indexFileSeq);
 
         std::string tmpHeaderIndex = std::string(indexFileHeader) + ".tmp";
         FILE *headerIndexOut = FileUtil::openFileOrDie(tmpHeaderIndex.c_str(), "wb", false);
-        DBWriter::writeIndex(headerIndexOut, header.getSize(), headerIndex);
+        DBWriter::writeIndex(headerIndexOut, header.getSize(), headerIndex, threads);
         fclose(headerIndexOut);
         FileUtil::move(tmpHeaderIndex.c_str(), indexFileHeader);
     }
@@ -1152,7 +1153,8 @@ int createdb(int argc, const char **argv, const Command& command) {
         seqWriter.closeFiles();
         for(unsigned int i = 0; i < shuffleSplits; i++){
             sortWithIndex(seqWriter.getDataFileNames()[i], seqWriter.getIndexFileNames()[i],
-                          hdrWriter.getDataFileNames()[i], hdrWriter.getIndexFileNames()[i]);
+                          hdrWriter.getDataFileNames()[i], hdrWriter.getIndexFileNames()[i],
+                          par.threads);
         }
         Debug(Debug::INFO) << "Sort single files in " << timer.lap() << "\n";
         std::string lookupFile = dataFile + ".lookup";

@@ -62,7 +62,7 @@ public:
     }
 
     template <typename T>
-    static void writeIndex(FILE *outFile, size_t indexSize, T *index);
+    static void writeIndex(FILE *outFile, size_t indexSize, T *index, unsigned int threads = 1);
 
     template <typename T>
     static void writeIndexEntryToFile(FILE *outFile, char *buff1, T &index);

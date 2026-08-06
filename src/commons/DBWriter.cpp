@@ -525,26 +525,38 @@ static void flushIndexBuffer(FILE *outFile, const char *buffer, size_t used) {
     }
 }
 
+// Three itoa per record is about 35 ns, so a six billion entry index is 210 s on one core, and close()
+// pays it twice. Each worker formats a contiguous disjoint record range and the rounds are flushed in
+// worker order, so the file stays byte identical to the serial loop.
 template <>
-void DBWriter::writeIndex(FILE *outFile, size_t indexSize, DBReader<DBKeyType>::Index *index) {
+void DBWriter::writeIndex(FILE *outFile, size_t indexSize, DBReader<DBKeyType>::Index *index, unsigned int threads) {
     // three u64 as decimal plus two tabs, a newline and the terminator indexToBuffer appends
     const size_t maxEntry = 3 * 20 + 4;
-    char *buffer = (char *) malloc(INDEX_WRITE_BUFFER_SIZE + maxEntry);
-    Util::checkAllocation(buffer, "Can not allocate index write buffer");
-    size_t used = 0;
-    for (size_t id = 0; id < indexSize; id++) {
-        used += indexToBuffer(buffer + used, index[id].id, index[id].offset, index[id].length);
-        if (used >= INDEX_WRITE_BUFFER_SIZE) {
-            flushIndexBuffer(outFile, buffer, used);
-            used = 0;
+    const size_t stride = INDEX_WRITE_BUFFER_SIZE + maxEntry;
+    const size_t perWorker = INDEX_WRITE_BUFFER_SIZE / maxEntry;
+    const size_t workers = std::max<size_t>(1, std::min<size_t>(threads, (indexSize / perWorker) + 1));
+    std::vector<char> buffers(workers * stride);
+    std::vector<size_t> used(workers, 0);
+    for (size_t start = 0; start < indexSize; start += workers * perWorker) {
+#pragma omp parallel for schedule(static) num_threads(workers)
+        for (size_t worker = 0; worker < workers; worker++) {
+            const size_t from = std::min(indexSize, start + worker * perWorker);
+            const size_t to = std::min(indexSize, from + perWorker);
+            char *out = &buffers[worker * stride];
+            size_t pos = 0;
+            for (size_t id = from; id < to; id++) {
+                pos += indexToBuffer(out + pos, index[id].id, index[id].offset, index[id].length);
+            }
+            used[worker] = pos;
+        }
+        for (size_t worker = 0; worker < workers; worker++) {
+            flushIndexBuffer(outFile, &buffers[worker * stride], used[worker]);
         }
     }
-    flushIndexBuffer(outFile, buffer, used);
-    free(buffer);
 }
 
 template <>
-void DBWriter::writeIndex(FILE *outFile, size_t indexSize, DBReader<std::string>::Index *index){
+void DBWriter::writeIndex(FILE *outFile, size_t indexSize, DBReader<std::string>::Index *index, unsigned int){
     // the key is a string here, so the flush point has to account for its length
     const size_t maxTail = 20 + 10 + 4;
     char *buffer = (char *) malloc(INDEX_WRITE_BUFFER_SIZE + maxTail);
@@ -690,7 +702,7 @@ void DBWriter::mergeIndex(const char** indexFilenames, unsigned int fileCount, c
                 size_t currOffset = index[i].offset;
                 index[i].offset = globalOffset + currOffset;
             }
-            writeIndex(index_file, reader.getSize(), index);
+            writeIndex(index_file, reader.getSize(), index, threads);
         }
         reader.close();
         FileUtil::remove(indexFilenames[fileIdx]);
@@ -714,7 +726,7 @@ void DBWriter::sortIndex(const char *inFileNameIndex, const char *outFileNameInd
         DBReader<DBKeyType>::Index *index = indexReader.getIndex();
         SORT_PARALLEL(index, index + indexReader.getSize(), DBReader<DBKeyType>::Index::compareById);
         FILE *index_file  = FileUtil::openAndDelete(outFileNameIndex, "w");
-        writeIndex(index_file, indexReader.getSize(), index);
+        writeIndex(index_file, indexReader.getSize(), index, threads);
         if (fclose(index_file) != 0) {
             Debug(Debug::ERROR) << "Cannot close index file " << outFileNameIndex << "\n";
             EXIT(EXIT_FAILURE);
