@@ -8,6 +8,7 @@
 #include "itoa.h"
 #include "Timer.h"
 #include "Parameters.h"
+#include "MemoryMapped.h"
 
 #define SIMDE_ENABLE_NATIVE_ALIASES
 #include <simde/simde-common.h>
@@ -602,6 +603,8 @@ void DBWriter::mergeResults(const char *outFileName, const char *outFileNameInde
     }
 
     // merge results into one result file
+    DBReader<DBKeyType>::Index *mergedIndex = NULL;
+    size_t mergedIndexSize = 0;
     if (dataFilenames.size() > 1) {
         std::vector<FILE*> datafiles;
         std::vector<size_t> mergedSizes;
@@ -652,7 +655,14 @@ void DBWriter::mergeResults(const char *outFileName, const char *outFileNameInde
         }
 
         // merge index
-        mergeIndex(indexFileNames, dataFilenames.size(), mergedSizes, fileCount);
+        if (indexNeedsToBeSorted && lexicographicOrder == false) {
+            // the sort below needs every entry in memory anyway, so hand the array over rather than
+            // format 27 B rows into a temporary file and parse them straight back out of it
+            mergedIndex = mergeIndexInMemory(indexFileNames, dataFilenames.size(), mergedSizes, fileCount,
+                                             mergedIndexSize);
+        } else {
+            mergeIndex(indexFileNames, dataFilenames.size(), mergedSizes, fileCount);
+        }
     } else if (dataFilenames.size() == 1) {
         std::vector<std::string>& filenames = dataFilenames[0];
         if (filenames.size() == 1) {
@@ -675,7 +685,11 @@ void DBWriter::mergeResults(const char *outFileName, const char *outFileNameInde
         }
     }
     if (dataFilenames.size() > 0) {
-        if (indexNeedsToBeSorted) {
+        if (mergedIndex != NULL) {
+            // mergeIndexInMemory already removed every per thread index file
+            sortIndex(mergedIndex, mergedIndexSize, outFileNameIndex, fileCount);
+            delete[] mergedIndex;
+        } else if (indexNeedsToBeSorted) {
             DBWriter::sortIndex(indexFileNames[0], outFileNameIndex, lexicographicOrder, fileCount);
             FileUtil::remove(indexFileNames[0]);
         } else {
@@ -711,6 +725,71 @@ void DBWriter::mergeIndex(const char** indexFilenames, unsigned int fileCount, c
     }
     if (fclose(index_file) != 0) {
         Debug(Debug::ERROR) << "Cannot close index file " << indexFilenames[0] << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
+DBReader<DBKeyType>::Index *DBWriter::mergeIndexInMemory(const char **indexFilenames, unsigned int fileCount,
+                                                         const std::vector<size_t> &dataSizes, unsigned int threads,
+                                                         size_t &mergedSize) {
+    // one sequential scan per file to size the array, the files themselves running in parallel
+    std::vector<size_t> sizes(fileCount, 0);
+    const int countThreads = std::max(1u, std::min(threads, fileCount));
+#pragma omp parallel for schedule(dynamic, 1) num_threads(countThreads)
+    for (size_t fileIdx = 0; fileIdx < fileCount; fileIdx++) {
+        MemoryMapped indexData(indexFilenames[fileIdx], MemoryMapped::WholeFile, MemoryMapped::SequentialScan);
+        if (indexData.isValid() == false) {
+            Debug(Debug::ERROR) << "Cannot open index file " << indexFilenames[fileIdx] << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        sizes[fileIdx] = Util::countLines((char *) indexData.getData(), indexData.size());
+        indexData.close();
+    }
+
+    std::vector<size_t> prefix(fileCount + 1, 0);
+    for (unsigned int fileIdx = 0; fileIdx < fileCount; fileIdx++) {
+        prefix[fileIdx + 1] = prefix[fileIdx] + sizes[fileIdx];
+    }
+    mergedSize = prefix[fileCount];
+
+    // an empty db still has to return a pointer, so the caller can tell this route was taken
+    DBReader<DBKeyType>::Index *index = new(std::nothrow) DBReader<DBKeyType>::Index[std::max<size_t>(1, mergedSize)];
+    Util::checkAllocation(index, "Cannot allocate merged index memory in DBWriter");
+
+    size_t globalOffset = 0;
+    for (unsigned int fileIdx = 0; fileIdx < fileCount; fileIdx++) {
+        if (sizes[fileIdx] > 0) {
+            DBReader<DBKeyType> reader(indexFilenames[fileIdx], indexFilenames[fileIdx], threads,
+                                       DBReader<DBKeyType>::USE_INDEX);
+            reader.open(DBReader<DBKeyType>::HARDNOSORT);
+            if (reader.getSize() != sizes[fileIdx]) {
+                Debug(Debug::ERROR) << "Index file " << indexFilenames[fileIdx] << " changed while merging\n";
+                EXIT(EXIT_FAILURE);
+            }
+            // file fileIdx lands at prefix[fileIdx], so the order reaching the sort is the same
+            // concatenation the temporary file used to hold
+            const DBReader<DBKeyType>::Index *src = reader.getIndex();
+            DBReader<DBKeyType>::Index *dst = index + prefix[fileIdx];
+#pragma omp parallel for schedule(static) num_threads(threads)
+            for (size_t i = 0; i < sizes[fileIdx]; i++) {
+                dst[i] = src[i];
+                dst[i].offset += globalOffset;
+            }
+            reader.close();
+        }
+        FileUtil::remove(indexFilenames[fileIdx]);
+        globalOffset += dataSizes[fileIdx];
+    }
+    return index;
+}
+
+void DBWriter::sortIndex(DBReader<DBKeyType>::Index *index, size_t indexSize, const char *outFileNameIndex,
+                         unsigned int threads) {
+    SORT_PARALLEL(index, index + indexSize, DBReader<DBKeyType>::Index::compareById);
+    FILE *index_file = FileUtil::openAndDelete(outFileNameIndex, "w");
+    writeIndex(index_file, indexSize, index, threads);
+    if (fclose(index_file) != 0) {
+        Debug(Debug::ERROR) << "Cannot close index file " << outFileNameIndex << "\n";
         EXIT(EXIT_FAILURE);
     }
 }

@@ -73,6 +73,9 @@ public:
         return closed;
     }
 
+    static void sortIndex(DBReader<DBKeyType>::Index *index, size_t indexSize, const char *outFileNameIndex,
+                          unsigned int threads);
+
     static void sortIndex(const char *inFileNameIndex, const char *outFileNameIndex, const bool lexicographicOrder,
                           unsigned int threads = 1);
 private:
@@ -88,6 +91,10 @@ private:
 
     static void mergeIndex(const char** indexFilenames, unsigned int fileCount, const std::vector<size_t> &dataSizes,
                            unsigned int threads = 1);
+
+    static DBReader<DBKeyType>::Index *mergeIndexInMemory(const char** indexFilenames, unsigned int fileCount,
+                                                          const std::vector<size_t> &dataSizes, unsigned int threads,
+                                                          size_t &mergedSize);
 
     char* dataFileName;
     char* indexFileName;
