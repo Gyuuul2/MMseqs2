@@ -545,6 +545,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     
     ClusterAssignment *assignedCluster = new(std::nothrow) ClusterAssignment[dbSize];
     Util::checkAllocation(assignedCluster, "Can not allocate assignedCluster memory in Align2Clust");
+    // one thread would first-touch the whole array, which on a multi socket box also lands every page
+    // on a single node for the rest of the run
+#pragma omp parallel for schedule(static)
     for (size_t i = 0; i < dbSize; ++i) {
         storeAssignedCluster(assignedCluster, i, DB_LOCAL_ID_INVALID);
     }
