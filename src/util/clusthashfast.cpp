@@ -291,6 +291,23 @@ static size_t markRunMembers(const HashEntry *entries, size_t entryCount, size_t
     return marked;
 }
 
+// One pwrite per 64 ids is 156 million syscalls at ten billion sequences, and with 128 threads that is
+// where the whole machine ends up: all system time, no user time. schedule(static) hands each thread a
+// contiguous word range and blockOffset is a prefix sum, so a thread's blocks are contiguous on disk.
+static const size_t CLUSTHASHFAST_STAGE_BUFFER = 16 * 1024 * 1024;
+
+static void flushStageBuffer(int fd, const char *path, std::vector<char> &batch, size_t offset) {
+    if (batch.empty()) {
+        return;
+    }
+    if (pwrite(fd, batch.data(), batch.size(), static_cast<off_t>(offset))
+            != static_cast<ssize_t>(batch.size())) {
+        Debug(Debug::ERROR) << "Cannot write " << path << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    batch.clear();
+}
+
 // one sequential pass over the sequence db, each thread copying its own contiguous id range
 static bool buildMemberStore(DBReader<DBKeyType> &reader, MemberStore &store, const HashEntry *entries,
                              size_t entryCount, size_t idSpace, const std::string &tmpPath, int threads) {
@@ -334,28 +351,36 @@ static bool buildMemberStore(DBReader<DBKeyType> &reader, MemberStore &store, co
 #ifdef OPENMP
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-        std::vector<char> buffer;
+        std::vector<char> batch;
+        batch.reserve(CLUSTHASHFAST_STAGE_BUFFER + MemberStore::BLOCK * reader.getMaxSeqLen());
+        size_t batchOffset = 0;
 #pragma omp for schedule(static)
         for (size_t word = 0; word < blocks; ++word) {
             uint64_t set = store.bits[word];
             if (set == 0) {
                 continue;
             }
-            buffer.clear();
+            // a gap would mean this word does not follow the last one written, which only the loop
+            // boundary can produce, so start a new batch there
+            if (batch.empty() == false && store.blockOffset[word] != batchOffset + batch.size()) {
+                flushStageBuffer(store.fd, store.path.c_str(), batch, batchOffset);
+            }
+            if (batch.empty()) {
+                batchOffset = store.blockOffset[word];
+            }
             while (set != 0) {
                 const size_t k = static_cast<size_t>(__builtin_ctzll(set));
                 const DBLocalId id = static_cast<DBLocalId>(word * MemberStore::BLOCK + k);
                 const size_t length = reader.getSeqLen(id);
                 const char *src = reader.getData(id, thread_idx);
-                buffer.insert(buffer.end(), src, src + length);
+                batch.insert(batch.end(), src, src + length);
                 set &= set - 1;
             }
-            if (pwrite(store.fd, buffer.data(), buffer.size(),
-                       static_cast<off_t>(store.blockOffset[word])) != static_cast<ssize_t>(buffer.size())) {
-                Debug(Debug::ERROR) << "Cannot write " << store.path << "\n";
-                EXIT(EXIT_FAILURE);
+            if (batch.size() >= CLUSTHASHFAST_STAGE_BUFFER) {
+                flushStageBuffer(store.fd, store.path.c_str(), batch, batchOffset);
             }
         }
+        flushStageBuffer(store.fd, store.path.c_str(), batch, batchOffset);
     }
 
     store.data = static_cast<char *>(mmap(NULL, total, PROT_READ, MAP_SHARED, store.fd, 0));
