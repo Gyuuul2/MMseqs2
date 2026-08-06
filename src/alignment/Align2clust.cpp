@@ -765,9 +765,23 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             clusterResult.prefSize = prefSize;   // exact parsed count for the aligned path
 
             if (cacheStarved) {
-                prefetchBody(seqDbr, queryId);
+                // the loop below reads a body only past the assigned and coverage gates, so asking for
+                // the rest of the list evicts the pages that are actually wanted
+                bool anyTargetSurvives = false;
                 for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
-                    prefetchBody(seqDbr, targetsWithDiagonal[targetIdx].first);
+                    const size_t targetId = targetsWithDiagonal[targetIdx].first;
+                    if (loadAssignedCluster(assignedCluster, targetId) != DB_LOCAL_ID_INVALID) {
+                        continue;
+                    }
+                    if (Util::canBeCovered(par.covThr, par.covMode, queryLength,
+                                           seqDbr->getSeqLen(targetId)) == false) {
+                        continue;
+                    }
+                    prefetchBody(seqDbr, targetId);
+                    anyTargetSurvives = true;
+                }
+                if (anyTargetSurvives) {
+                    prefetchBody(seqDbr, queryId);
                 }
             }
 
