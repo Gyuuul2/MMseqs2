@@ -1659,10 +1659,7 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
         }
         Debug(Debug::INFO) << "Time for fill: " << timer.lap() << "\n";
 
-        // Sequences no k-mer grouped get a prefilter entry of their own, which is one iteration per
-        // sequence: five billion of them on one core. close(false, false) below does not promise a
-        // sorted index anyway - this back-fill is already a second ascending run in it, and the
-        // consumer sorts - so schedule(static) may hand each thread its own contiguous id range.
+        // one entry per ungrouped sequence, and no consumer needs write order, so static is fine
 #pragma omp parallel
         {
             unsigned int thread_idx = 0;
@@ -1683,7 +1680,7 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
                 }
             }
         }
-        dbw.close(false, false);
+        dbw.close(false, true);
     }
     delete subMat;
     if(hashSeqPair){
