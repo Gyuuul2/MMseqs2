@@ -176,6 +176,9 @@ public:
             this->totalEntries = totalEntries;
             currentPos = 0;
             prevPrintedId = 0;
+            // lapProgress does not reset, so without this every bar but the first reports the
+            // time since the Progress was built rather than the time its own phase took
+            timer.reset();
         }
 
         void updateProgress(size_t pos = SIZE_MAX){
