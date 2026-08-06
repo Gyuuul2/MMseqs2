@@ -180,6 +180,8 @@ Parameters::Parameters():
         PARAM_KMER_WRITE_TO_DISK(PARAM_KMER_WRITE_TO_DISK_ID, "--kmer-write-to-disk", "Write k-mers to disk", "Extract k-mers once into per-split buckets on disk, so each split reads its bucket instead of re-scanning the sequence DB (identical result; faster when splitting on fast local storage)", typeid(bool), (void *) &kmerWriteToDisk, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_VERSION(PARAM_LINCLUST_VERSION_ID, "--linclust-version", "Linclust version", "Linclust version: 1: Linclust1, 2: Linclust2", typeid(int), (void *) &linclustVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LINCLUST2_ITER(PARAM_LINCLUST2_ITER_ID, "--linclust2-iter", "Linclust2 iterations", "Iterations of linclust2. 2 re-clusters the representatives, 1 stops after the first iteration", typeid(int), (void *) &linclust2Iter, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_LINCLUST2_ITER(PARAM_BATCH_ROUND0_LINCLUST2_ITER_ID, "--round0-linclust2-iter", "Round0 linclust2 iterations", "Override --linclust2-iter for round 0 only. If unset, round 0 uses --linclust2-iter", typeid(int), (void *) &batchRound0Linclust2Iter, "^[1-2]$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUSTER_VERSION(PARAM_CLUSTER_VERSION_ID, "--cluster-version", "Cluster version", "Cluster version: 1: Cluster1, 2: Cluster2", typeid(int), (void *) &clusterVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         // workflow
         PARAM_RUNNER(PARAM_RUNNER_ID, "--mpi-runner", "MPI runner", "Use MPI on compute cluster with this MPI command (e.g. \"mpirun -np 42\")", typeid(std::string), (void *) &runner, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
@@ -1578,6 +1580,7 @@ Parameters::Parameters():
     linclustworkflow = combineList(linclustworkflow, rescorediagonal);
     linclustworkflow = combineList(linclustworkflow, align2clust);
     linclustworkflow = combineList(linclustworkflow, clusthash);
+    linclustworkflow.push_back(&PARAM_LINCLUST2_ITER);
     linclustworkflow.push_back(&PARAM_SWITCH_CONSENSUS_REP);
     linclustworkflow.push_back(&PARAM_CLUST_HASH);
     linclustworkflow.push_back(&PARAM_REMOVE_TMP_FILES);
@@ -1628,6 +1631,7 @@ Parameters::Parameters():
     batchclustering.push_back(&PARAM_BATCH_ROUND0_CLUST_HASH);
     batchclustering.push_back(&PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT);
     batchclustering.push_back(&PARAM_BATCH_ROUND0_PRELOAD_MODE);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_LINCLUST2_ITER);
     batchclustering.push_back(&PARAM_BATCH_MAX_ROUNDS);
     batchclustering.push_back(&PARAM_BATCH_MIN_REDUCTION_RATIO);
     batchclustering.push_back(&PARAM_BATCH_CONVERGENCE_PATIENCE);
@@ -1681,6 +1685,7 @@ Parameters::Parameters():
     linclustbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
     linclustbatchinner.push_back(&PARAM_CLUST_HASH);
     linclustbatchinner.push_back(&PARAM_LINCLUST_VERSION);
+    linclustbatchinner.push_back(&PARAM_LINCLUST2_ITER);
     linclustbatch = combineList(linclustbatchinner, batchclustering);
 
     clusterbatchinner.push_back(&PARAM_C);
@@ -3063,6 +3068,8 @@ void Parameters::setDefaults() {
     adjIteration = CLUST_LINEAR_DEFAULT_NUM_ADJACENCY;
     clustHash = false;
     linclustVersion = 2;
+    linclust2Iter = 2;
+    batchRound0Linclust2Iter = 2;
     clusterVersion = 1;
 
     // result2stats

@@ -464,6 +464,9 @@ void applyRound0ClusterOverrides(Parameters &par) {
     if (par.PARAM_BATCH_ROUND0_PRELOAD_MODE.wasSet) {
         par.preloadMode = par.batchRound0PreloadMode;
     }
+    if (par.PARAM_BATCH_ROUND0_LINCLUST2_ITER.wasSet) {
+        par.linclust2Iter = par.batchRound0Linclust2Iter;
+    }
 }
 
 void applyBatchClusterAutomagic(Parameters &par, const std::string &clusterCmd) {

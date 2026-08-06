@@ -662,6 +662,8 @@ public:
     int adjIteration;
     bool clustHash;
     int linclustVersion;
+    int linclust2Iter;
+    int batchRound0Linclust2Iter;
     int clusterVersion;
 
     // indexdb
@@ -1031,6 +1033,8 @@ public:
     PARAMETER(PARAM_KMER_WRITE_TO_DISK)
     PARAMETER(PARAM_CLUST_HASH)
     PARAMETER(PARAM_LINCLUST_VERSION)
+    PARAMETER(PARAM_LINCLUST2_ITER)
+    PARAMETER(PARAM_BATCH_ROUND0_LINCLUST2_ITER)
     PARAMETER(PARAM_CLUSTER_VERSION)
 
     // workflow

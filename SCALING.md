@@ -45,16 +45,25 @@ cache: about 17B. So 20B in one shot needs the index itself to shrink; 10B has r
 
 ### align2clust (round 0)
 
-| structure | B/seq | note |
-|---|---|---|
-| sequence db index | 24 | |
-| prefilter db index | 24 | round 0 pref has one entry per sequence |
-| `assignedCluster` | 8 | atomic per sequence |
-| `lengthOrder` | 8 | greedy modes |
-| reorder ring | capped at 5M results | not per-sequence |
+| structure | B/seq | line | live during |
+|---|---|---|---|
+| sequence db index | 24 | | whole run |
+| prefilter db index | 24 | | whole run; round 0 pref has one entry per sequence |
+| `assignedCluster` | 8 | 546 | producer + consumer |
+| `sortForLength` | 16 | 602 | length sort only (greedy) |
+| `lengthOrder` | 8 | 619 | producer loop (greedy) |
+| `prefRepSizePair` | 16 | 629 | producer loop (set-cover) |
+| `memberOrder` | 8 | 1109 | writeClustering |
+| reorder ring | 5M results, ~240 MB | 580 | producer + consumer |
 
-= **64 B/seq**, i.e. 640 GB at 10B, leaving 355 GB of cache against 2.7 TB of data (sequence bodies
-1.388 TB + prefilter 1.35 TB). That 13% cache ratio is the whole story of this module's I/O.
+The producer loop holds 64 B/seq, but **the peak is the length sort at lines 600-626**, where
+`lengthOrder` is allocated at 619 while `sortForLength` is still alive until 625:
+
+    24 + 24 + 8 + 16 + 8 = 80 B/seq = 800 GB at 10B
+
+on a 995 GB machine with 29 GB of swap. That leaves the page cache about 195 GB against 2.7 TB of
+data, and it is the most likely explanation for the 10B run appearing to make no progress after the
+banner. The producer loop's own 64 B/seq (640 GB, 355 GB of cache) is the steady state, not the peak.
 
 ## 2. Passes over the sequence db
 
@@ -104,6 +113,31 @@ Ranked by measured or arithmetic size at 10B, largest first.
   that, `MADV_HUGEPAGE` over 160 GB with 400+ GB already committed invites direct compaction stalls.
 - **`numactl --interleave=all`.** Plausible for the sort, but it is a run-time flag, not code -
   mmseqs does not link libnuma. Worth trying on the server: `numactl --interleave=all mmseqs ...`.
+- **Lowering `BlockAligner`'s `MAX_SIZE`.** Measured, and it is not a tuning constant - it decides how
+  far the adaptive band may grow, so it changes which alignments clear the threshold. On the u8 round-0
+  input at 20 threads, two reps each, every cell reproducible:
+
+  | MAX_SIZE | wall | maxRSS | clusters | digest |
+  |---|---|---|---|---|
+  | 4096 | 325.97 / 355.68 s | 17.41 GB | 24,196,835 | `eb31987eb2f2` twice |
+  | 1024 | 313.62 / 314.39 s | 17.29 GB | 24,196,837 | `93e6448e4f31` twice |
+  | 256 | 309.61 / 309.25 s | 17.24 GB | 24,196,856 | `cd530f02234a` twice |
+
+  Smaller is faster and smaller, monotonically, and the cluster count climbs monotonically with it
+  because a narrower band leaves borderline pairs unmerged. 5% of wall and 1% of memory for a changed
+  result is invariant 1, so it stays at 4096. The `//change` comment on the define was warning about
+  exactly this. Note `StripedSmithWaterman.cpp:37` has an independent `MAX_SIZE 4096` for the striped
+  path, not measured here.
+- **Replacing mmap with pread.** `getData` hands back a raw pointer into the mapping and callers parse
+  in place, so pread needs a per-thread buffer at every site. The reason not to is that it does not
+  fix the cost that matters: a 138.8 B body read at random costs one 4 kB page either way, because a
+  plain pread still populates a full page in the page cache before copying out - 29x amplification
+  before and after. `MADV_RANDOM` already removed the readahead waste on top of that (8.37 MB/fault
+  measured down to 4 kB/fault). Only `O_DIRECT` would cut the 29x, to about 3.7x on a 512 B sector,
+  and it bypasses the cache - which is wrong here, because a sequence body is the target of many
+  queries and genuinely gets reused. A pread path was written and md5-verified for clusthashfast in an
+  earlier session and measured **23% slower** locally. The structural fixes for the 29x are staging
+  bodies in visit order (which is what `MemberStore` does) or `O_DIRECT`; for reused data staging wins.
 - **Byte-balanced dynamic ranges for the hashing pass.** Measured neutral-to-2%-worse locally
   (33.42/34.63 vs 33.53/35.32 min/mean over 4 reps), and `schedule(static, chunk)` already assigns
   block i to thread i mod T, so each thread samples the whole length distribution at an 8 GB stride

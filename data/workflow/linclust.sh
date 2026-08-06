@@ -68,32 +68,36 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
         CLUDB="${TMP_PATH}/clu"
     fi
 
-    # 3. Refinement pass: re-cluster representative sequences
-    if notExists "${TMP_PATH}/input_rep.dbtype"; then
-        # shellcheck disable=SC2086
-        "$MMSEQS" createsubdb "$CLUDB" "$INPUT" "${TMP_PATH}/input_rep" ${VERBOSITY} --subdb-mode 1 \
-            || fail "createsubdb (representatives) died"
-    fi
+    # 3. Refinement pass: re-cluster representative sequences, unless --linclust2-iter 1
+    REFINEDB=""
+    if [ -n "$REFINE_ROUND" ]; then
+        if notExists "${TMP_PATH}/input_rep.dbtype"; then
+            # shellcheck disable=SC2086
+            "$MMSEQS" createsubdb "$CLUDB" "$INPUT" "${TMP_PATH}/input_rep" ${VERBOSITY} --subdb-mode 1 \
+                || fail "createsubdb (representatives) died"
+        fi
 
-    if notExists "${TMP_PATH}/pref_rep.dbtype"; then
-        # shellcheck disable=SC2086
-        $RUNNER "$MMSEQS" kmermatcher "${TMP_PATH}/input_rep" "${TMP_PATH}/pref_rep" ${KMERMATCHER_PAR2} \
-            || fail "kmermatcher (representatives) died"
-    fi
+        if notExists "${TMP_PATH}/pref_rep.dbtype"; then
+            # shellcheck disable=SC2086
+            $RUNNER "$MMSEQS" kmermatcher "${TMP_PATH}/input_rep" "${TMP_PATH}/pref_rep" ${KMERMATCHER_PAR2} \
+                || fail "kmermatcher (representatives) died"
+        fi
 
-    if notExists "${TMP_PATH}/clu_rep.dbtype"; then
-        # shellcheck disable=SC2086
-        $RUNNER "$MMSEQS" align2clust "${TMP_PATH}/input_rep" "${TMP_PATH}/pref_rep" "${TMP_PATH}/clu_rep" \
-            ${ALIGN2CLUST_PAR} \
-            --filter-cludb-file "$CLUDB" \
-            --filter-seqdb-file "$SOURCE" \
-            || fail "align2clust (representatives) died"
+        if notExists "${TMP_PATH}/clu_rep.dbtype"; then
+            # shellcheck disable=SC2086
+            $RUNNER "$MMSEQS" align2clust "${TMP_PATH}/input_rep" "${TMP_PATH}/pref_rep" "${TMP_PATH}/clu_rep" \
+                ${ALIGN2CLUST_PAR} \
+                --filter-cludb-file "$CLUDB" \
+                --filter-seqdb-file "$SOURCE" \
+                || fail "align2clust (representatives) died"
+        fi
+        REFINEDB="${TMP_PATH}/clu_rep"
     fi
 
     if notExists "$2.dbtype"; then
         # shellcheck disable=SC2086
         "$MMSEQS" mergeclusters "$SOURCE" "$2" \
-            "$CLUDB" "${TMP_PATH}/clu_rep" $MERGECLU_PAR \
+            "$CLUDB" $REFINEDB $MERGECLU_PAR \
             || fail "mergeclusters died"
     fi
 
@@ -247,13 +251,16 @@ if [ -n "$REMOVE_TMP" ]; then
         # shellcheck disable=SC2086
         "$MMSEQS" rmdb "${TMP_PATH}/clu" ${VERBOSITY}
         # shellcheck disable=SC2086
-        "$MMSEQS" rmdb "${TMP_PATH}/input_rep" ${VERBOSITY}
-        # shellcheck disable=SC2086
-        "$MMSEQS" rmdb "${TMP_PATH}/input_rep_h" ${VERBOSITY}
-        # shellcheck disable=SC2086
-        "$MMSEQS" rmdb "${TMP_PATH}/pref_rep" ${VERBOSITY}
-        # shellcheck disable=SC2086
-        "$MMSEQS" rmdb "${TMP_PATH}/clu_rep" ${VERBOSITY}
+        if [ -n "$REFINE_ROUND" ]; then
+            # shellcheck disable=SC2086
+            "$MMSEQS" rmdb "${TMP_PATH}/input_rep" ${VERBOSITY}
+            # shellcheck disable=SC2086
+            "$MMSEQS" rmdb "${TMP_PATH}/input_rep_h" ${VERBOSITY}
+            # shellcheck disable=SC2086
+            "$MMSEQS" rmdb "${TMP_PATH}/pref_rep" ${VERBOSITY}
+            # shellcheck disable=SC2086
+            "$MMSEQS" rmdb "${TMP_PATH}/clu_rep" ${VERBOSITY}
+        fi
         # align intermediates (only present with --include-align-files)
         if [ -f "${TMP_PATH}/clu_aln.dbtype" ]; then
             # shellcheck disable=SC2086
