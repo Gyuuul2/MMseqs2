@@ -451,11 +451,9 @@ char Util::touchMemory(const char *memory, size_t size) {
 size_t Util::ompCountLines(const char* data, size_t dataSize, unsigned int MAYBE_UNUSED(threads)) {
     size_t cnt = 0;
 #ifdef OPENMP
-    int threadCnt = 1;
-    const int totalThreadCnt = threads;
-    if (totalThreadCnt >= 4) {
-        threadCnt = 4;
-    }
+    // a static page partition with a plain reduction, so this is O(bytes) and scales; the same cap in
+    // DBReader::readIndex must stay, because a thread there walks the file to find its first line
+    int threadCnt = std::max(1, static_cast<int>(threads));
 #endif
 
     size_t pageSize = getPageSize();
