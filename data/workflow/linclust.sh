@@ -28,12 +28,11 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
                 || fail "clusthashfast died"
         fi
 
-        awk '{print $1}' "${TMP_PATH}/input_clusthash_clust.index" \
-            > "${TMP_PATH}/order_clusthash_redundancy"
-
         if notExists "${TMP_PATH}/input_clusthash_redundancy.dbtype"; then
+            # createsubdb reads a db's own index and parses the key column itself, so extracting it
+            # first only costs a single threaded pass and a copy of the index
             # shellcheck disable=SC2086
-            "$MMSEQS" createsubdb "${TMP_PATH}/order_clusthash_redundancy" "$SOURCE" \
+            "$MMSEQS" createsubdb "${TMP_PATH}/input_clusthash_clust" "$SOURCE" \
                 "${TMP_PATH}/input_clusthash_redundancy" ${VERBOSITY} --subdb-mode 1 \
                 || fail "createsubdb (clusthash representatives) died"
         fi
@@ -148,11 +147,10 @@ elif [ "$LINCLUST_MODULE" = "linclust1" ]; then
                 || fail "clusthashfast died"
         fi
 
-        awk '{print $1}' "${TMP_PATH}/input_clusthash_clust.index" > "${TMP_PATH}/order_clusthash_redundancy"
 
         if notExists "${TMP_PATH}/input_clusthash_redundancy.dbtype"; then
             # shellcheck disable=SC2086
-            "$MMSEQS" createsubdb "${TMP_PATH}/order_clusthash_redundancy" "$SOURCE" "${TMP_PATH}/input_clusthash_redundancy" ${VERBOSITY} --subdb-mode 1 \
+            "$MMSEQS" createsubdb "${TMP_PATH}/input_clusthash_clust" "$SOURCE" "${TMP_PATH}/input_clusthash_redundancy" ${VERBOSITY} --subdb-mode 1 \
                 || fail "Createsubdb step died"
         fi
         INPUT="${TMP_PATH}/input_clusthash_redundancy"
@@ -189,6 +187,8 @@ elif [ "$LINCLUST_MODULE" = "linclust1" ]; then
         PRECLUST="${TMP_PATH}/pre_clust_clusthash"
     fi
 
+
+    # filterdb below needs a plain key list, which is the one consumer createsubdb cannot replace
     awk '{ print $1 }' "${PRECLUST}.index" > "${TMP_PATH}/order_redundancy"
 
     if notExists "${TMP_PATH}/input_step_redundancy.dbtype"; then
@@ -278,7 +278,6 @@ if [ -n "$REMOVE_TMP" ]; then
             "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_redundancy" ${VERBOSITY}
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/clu_merged" ${VERBOSITY}
-            rm -f "${TMP_PATH}/order_clusthash_redundancy"
         fi
         rm -f "${TMP_PATH}/linclust.sh"
     elif [ "$LINCLUST_MODULE" = "linclust1" ]; then
@@ -309,7 +308,6 @@ if [ -n "$REMOVE_TMP" ]; then
             "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_redundancy" ${VERBOSITY}
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/pre_clust_clusthash" ${VERBOSITY}
-            rm -f "${TMP_PATH}/order_clusthash_redundancy"
         fi
         # shellcheck disable=SC2086
         "$MMSEQS" rmdb "${TMP_PATH}/aln" ${VERBOSITY}
