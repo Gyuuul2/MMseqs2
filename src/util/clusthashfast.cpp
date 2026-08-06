@@ -627,13 +627,14 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
 
     const bool showProgress = (Debug::debugLevel >= Debug::INFO);
     const std::string tmpPrefix = std::string(writer.getDataFileName());
-    const bool canStage = (reader.getDataFileCnt() == 1 && reader.isCompressed() == 0);
-    const unsigned int bucketCount = hashBucketCount(par, dbSize);
-
-    // dropping a cache that would have been reused only forces re-reads, so weigh the data against
-    // the sort array it would otherwise be evicting
+    // dropping or copying a cache that would have been reused only forces re-reads, so weigh the
+    // data against the sort array it would otherwise be evicting
     const bool cacheContended = reader.getDataSize() + dbSize * sizeof(HashEntry)
                                 > Util::computeMemory(par.splitMemoryLimit);
+    // staging only buys anything once the scattered reads actually miss; on a db the page cache
+    // already holds it is a second copy of the data and a wasted sweep
+    const bool canStage = (reader.getDataFileCnt() == 1 && reader.isCompressed() == 0 && cacheContended);
+    const unsigned int bucketCount = hashBucketCount(par, dbSize);
     const bool sequentialHashScan = hashScanIsSequential(reader);
     if (sequentialHashScan) {
         reader.setSequentialAdvice();
