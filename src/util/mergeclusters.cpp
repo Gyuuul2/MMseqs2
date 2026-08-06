@@ -34,7 +34,9 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
 
     Debug(Debug::INFO) << "Clustering step 1\n";
     DBReader<DBKeyType> cluDb(firstClu.c_str(), firstCluStepIndex.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
-    cluDb.open(DBReader<DBKeyType>::LINEAR_ACCCESS);
+    // cluDb is only ever read by local id, so the id maps LINEAR_ACCCESS builds are dead weight;
+    // its early-out also needs offset and key order at once, which a hash-ordered db never has
+    cluDb.open(DBReader<DBKeyType>::NOSORT);
 
     Debug::Progress progress(cluDb.getSize());
 #pragma omp parallel
@@ -73,7 +75,7 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         clusterings.pop_front();
 
         DBReader<DBKeyType> cluDb(cluStep.c_str(), cluStepIndex.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
-        cluDb.open(DBReader<DBKeyType>::LINEAR_ACCCESS);
+        cluDb.open(DBReader<DBKeyType>::NOSORT);
 
         progress.reset(cluDb.getSize());
         // go through the clusters and merge them into the clusters from the previous clustering step
