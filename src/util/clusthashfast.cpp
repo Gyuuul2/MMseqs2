@@ -685,7 +685,11 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
         MemberStore store;
         const bool staged = canStage
             && buildMemberStore(reader, store, entries, dbSize, dbSize, tmpPrefix + ".members", par.threads);
-        if (staged == false && sequentialHashScan) {
+        if (staged) {
+            // staging re-read the whole db to fill its file, and nothing reads those bytes again, so
+            // the cache they left behind is competing with the staged file the next pass does read
+            dropDataCache(reader);
+        } else if (sequentialHashScan) {
             dropSequentialAdvice(reader);
         }
 
