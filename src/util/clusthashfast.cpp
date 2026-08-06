@@ -308,11 +308,29 @@ static void flushStageBuffer(int fd, const char *path, std::vector<char> &batch,
     batch.clear();
 }
 
+// Staging streams the whole db once and nothing reads those bytes again, but the page cache cannot tell
+// them from the staged file the next pass does read, so the file only keeps its proportional share.
+// Dropping each thread's consumed range hands the whole cache to the file instead.
+static const size_t CLUSTHASHFAST_DROP_STRIDE = 1024 * 1024 * 1024;
+
+static void dropConsumedRange(char *base, size_t from, size_t to) {
+#ifdef MADV_DONTNEED
+    static const size_t pageSize = Util::getPageSize();
+    // round inwards, so a page shared with the neighbouring thread's range is never dropped
+    const size_t begin = (from + pageSize - 1) & ~(pageSize - 1);
+    const size_t end = to & ~(pageSize - 1);
+    if (end > begin) {
+        madvise(base + begin, end - begin, MADV_DONTNEED);
+    }
+#endif
+}
+
 // one sequential pass over the sequence db, each thread copying its own contiguous id range
 static bool buildMemberStore(DBReader<DBKeyType> &reader, MemberStore &store, const HashEntry *entries,
                              size_t entryCount, size_t idSpace, const std::string &tmpPath, int threads) {
     const size_t marked = markRunMembers(entries, entryCount, idSpace, store.bits, threads);
     if (marked == 0) {
+        std::vector<uint64_t>().swap(store.bits);
         return false;
     }
     const size_t blocks = store.bits.size();
@@ -337,13 +355,23 @@ static bool buildMemberStore(DBReader<DBKeyType> &reader, MemberStore &store, co
         total += size;
     }
 
+    // FileUtil::remove exits on a missing file, so the destructor must not see a path we never made
+    store.fd = ::open(tmpPath.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (store.fd < 0) {
+        Debug(Debug::WARNING) << "Cannot stage " << tmpPath << ", clustering reads the db directly\n";
+        std::vector<uint64_t>().swap(store.bits);
+        std::vector<size_t>().swap(store.blockOffset);
+        return false;
+    }
     store.path = tmpPath;
-    store.fd = ::open(store.path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0600);
-    if (store.fd < 0 || ftruncate(store.fd, static_cast<off_t>(total)) != 0) {
+    if (ftruncate(store.fd, static_cast<off_t>(total)) != 0) {
         Debug(Debug::WARNING) << "Cannot stage " << store.path << ", clustering reads the db directly\n";
+        std::vector<uint64_t>().swap(store.bits);
+        std::vector<size_t>().swap(store.blockOffset);
         return false;
     }
     Debug(Debug::INFO) << "Staging " << marked << " run members (" << total << " byte) for clustering\n";
+    const bool dropConsumed = (reader.getDataFileCnt() == 1 && reader.isSortedByOffset());
 
 #pragma omp parallel num_threads(threads)
     {
@@ -352,8 +380,13 @@ static bool buildMemberStore(DBReader<DBKeyType> &reader, MemberStore &store, co
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
         std::vector<char> batch;
-        batch.reserve(CLUSTHASHFAST_STAGE_BUFFER + MemberStore::BLOCK * reader.getMaxSeqLen());
+        batch.reserve(CLUSTHASHFAST_STAGE_BUFFER
+                      + std::min(MemberStore::BLOCK * reader.getMaxSeqLen(), CLUSTHASHFAST_STAGE_BUFFER));
         size_t batchOffset = 0;
+        // schedule(static) gives a thread one contiguous word range, so with an offset sorted index its
+        // byte range is contiguous and disjoint from every other thread's
+        size_t dropFrom = SIZE_MAX;
+        size_t consumedTo = 0;
 #pragma omp for schedule(static)
         for (size_t word = 0; word < blocks; ++word) {
             uint64_t set = store.bits[word];
@@ -374,19 +407,34 @@ static bool buildMemberStore(DBReader<DBKeyType> &reader, MemberStore &store, co
                 const size_t length = reader.getSeqLen(id);
                 const char *src = reader.getData(id, thread_idx);
                 batch.insert(batch.end(), src, src + length);
+                if (dropConsumed) {
+                    if (dropFrom == SIZE_MAX) {
+                        dropFrom = reader.getIndex(id)->offset;
+                    }
+                    consumedTo = reader.getIndex(id)->offset + reader.getEntryLen(id);
+                }
                 set &= set - 1;
             }
             if (batch.size() >= CLUSTHASHFAST_STAGE_BUFFER) {
                 flushStageBuffer(store.fd, store.path.c_str(), batch, batchOffset);
             }
+            if (dropConsumed && consumedTo - dropFrom >= CLUSTHASHFAST_DROP_STRIDE) {
+                dropConsumedRange(reader.getDataForFile(0), dropFrom, consumedTo);
+                dropFrom = consumedTo;
+            }
         }
         flushStageBuffer(store.fd, store.path.c_str(), batch, batchOffset);
+        if (dropConsumed && dropFrom != SIZE_MAX) {
+            dropConsumedRange(reader.getDataForFile(0), dropFrom, consumedTo);
+        }
     }
 
     store.data = static_cast<char *>(mmap(NULL, total, PROT_READ, MAP_SHARED, store.fd, 0));
     if (store.data == MAP_FAILED) {
         store.data = NULL;
         Debug(Debug::WARNING) << "Cannot map " << store.path << ", clustering reads the db directly\n";
+        std::vector<uint64_t>().swap(store.bits);
+        std::vector<size_t>().swap(store.blockOffset);
         return false;
     }
     store.dataSize = total;
@@ -460,10 +508,11 @@ static void clusterHashRun(DBReader<DBKeyType> &reader, DBWriter &writer, const 
 }
 
 static ClusterCounts clusterHashRuns(DBReader<DBKeyType> &reader, DBWriter &writer, const HashEntry *entries,
-                                     size_t dbSize, size_t runCount, float seqIdThr, bool showProgress,
+                                     size_t dbSize, float seqIdThr, bool showProgress,
                                      const MemberStore *store) {
     const size_t chunkCount = (dbSize + CLUSTHASHFAST_CHUNK_RECORDS - 1) / CLUSTHASHFAST_CHUNK_RECORDS;
-    Debug::Progress progress(runCount);
+    // one shared atomic per run is six billion increments on one cache line, so count chunks instead
+    Debug::Progress progress(chunkCount);
     size_t totalClusters = 0;
     size_t totalMerged = 0;
 #pragma omp parallel reduction(+:totalClusters) reduction(+:totalMerged)
@@ -478,12 +527,12 @@ static ClusterCounts clusterHashRuns(DBReader<DBKeyType> &reader, DBWriter &writ
         for (size_t chunk = 0; chunk < chunkCount; ++chunk) {
             const size_t chunkBegin = chunk * CLUSTHASHFAST_CHUNK_RECORDS;
             const size_t chunkEnd = std::min(dbSize, chunkBegin + CLUSTHASHFAST_CHUNK_RECORDS);
+            if (showProgress) {
+                progress.updateProgress(chunk);
+            }
             size_t pos = firstOwnedRun(entries, chunkBegin, chunkEnd);
             while (pos < chunkEnd) {
                 const size_t runEnd = hashRunEnd(entries, dbSize, pos);
-                if (showProgress) {
-                    progress.updateProgress();
-                }
                 clusterHashRun(reader, writer, entries + pos, runEnd - pos, seqIdThr, worker, thread_idx, store);
                 pos = runEnd;
             }
@@ -694,7 +743,7 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
         }
 
         Debug(Debug::INFO) << "Cluster equal length sequences...\n";
-        counts = clusterHashRuns(reader, writer, entries, dbSize, runCount, par.seqIdThr, showProgress,
+        counts = clusterHashRuns(reader, writer, entries, dbSize, par.seqIdThr, showProgress,
                                  staged ? &store : NULL);
         delete[] entries;
         return counts;
@@ -738,7 +787,7 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
         MemberStore store;
         const bool staged = canStage
             && buildMemberStore(reader, store, part.data(), partSize, dbSize, tmpPrefix + ".members", par.threads);
-        const ClusterCounts partCounts = clusterHashRuns(reader, writer, part.data(), partSize, runCount,
+        const ClusterCounts partCounts = clusterHashRuns(reader, writer, part.data(), partSize,
                                                         par.seqIdThr, showProgress, staged ? &store : NULL);
         counts.clusters += partCounts.clusters;
         counts.merged += partCounts.merged;
