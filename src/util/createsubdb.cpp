@@ -40,6 +40,12 @@ int createsubdb(int argc, const char **argv, const Command& command) {
     char dbKey[256];
     DBKeyType prevKey = 0;
     bool isOrdered = true;
+    // open(NOSORT) leaves the index key sorted and builds no local id map, so while the order file is
+    // also ascending a forward cursor finds each key without a binary search into an index that is far
+    // larger than any cache. The moment the order stops ascending the cursor is stale and getId takes over.
+    const DBReader<DBKeyType>::Index *index = reader.getIndex();
+    const size_t readerSize = reader.getSize();
+    size_t cursor = 0;
     while (getline(&line, &len, orderFile) != -1) {
         Util::parseKey(line, dbKey);
         DBKeyType key;
@@ -54,9 +60,18 @@ int createsubdb(int argc, const char **argv, const Command& command) {
             key = Util::fast_atoi<DBKeyType>(dbKey);
         }
 
+        const bool ascending = isOrdered && (prevKey <= key);
         isOrdered &= (prevKey <= key);
         prevKey = key;
-        const size_t id = reader.getId(key);
+        size_t id;
+        if (ascending) {
+            while (cursor < readerSize && index[cursor].id < key) {
+                cursor++;
+            }
+            id = (cursor < readerSize && index[cursor].id == key) ? cursor : SIZE_MAX;
+        } else {
+            id = reader.getId(key);
+        }
         if (id == SIZE_MAX) {
             Debug(Debug::WARNING) << "Key " << dbKey << " not found in database\n";
             continue;
