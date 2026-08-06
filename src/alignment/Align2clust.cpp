@@ -1123,6 +1123,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     }
     alnDbr.close();
 
+#pragma omp parallel for schedule(static)
     for (size_t i = 0; i < dbSize; ++i) {
         if (loadAssignedCluster(assignedCluster, i) == DB_LOCAL_ID_INVALID) {
             storeAssignedCluster(assignedCluster, i, i);
@@ -1148,12 +1149,11 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         return first < second;
     });
 
-    size_t clusterCount = 0;
-    DBLocalId previousRep = DB_LOCAL_ID_INVALID;
-    for (size_t i = 0; i < dbSize; i++) {
-        const DBLocalId rep = loadAssignedCluster(assignedCluster, memberOrder[i]);
-        clusterCount += (rep != previousRep);
-        previousRep = rep;
+    size_t clusterCount = (dbSize > 0) ? 1 : 0;
+#pragma omp parallel for schedule(static) reduction(+:clusterCount)
+    for (size_t i = 1; i < dbSize; i++) {
+        clusterCount += (loadAssignedCluster(assignedCluster, memberOrder[i])
+                         != loadAssignedCluster(assignedCluster, memberOrder[i - 1]));
     }
 
     Debug(Debug::INFO) << "Size of the alignment database: " << dbSize << "\n";
@@ -1219,7 +1219,9 @@ int align2clust(int argc, const char **argv, const Command &command) {
 
     Debug(Debug::INFO) << "Time for run Align2Clust: " << timer.lap() << " sec\n";
 
-    resultWriter.close();
+    // memberOrder is sorted by representative, and NOSORT leaves getDbKey ascending in the local id,
+    // so the entries leave here already key sorted; Clustering.cpp:232 skips the sort for the same reason
+    resultWriter.close(false, false);
     if (alnWriter != nullptr) {
         alnWriter->close();
         delete alnWriter;
