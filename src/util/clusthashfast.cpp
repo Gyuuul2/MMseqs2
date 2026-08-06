@@ -119,15 +119,16 @@ static bool hashScanIsSequential(DBReader<DBKeyType> &reader) {
     return reader.getDataFileCnt() == 1 && reader.isSortedByOffset();
 }
 
-// The hashing pass streams the whole sequence db, and nothing reads those bytes again until the
-// members are staged. The cache it leaves behind is what makes the kernel swap the sort array out
-// instead: 400 GB of live arrays plus 634 GB of dead cache does not fit 995 GB of memory. Unmapping
-// drops our page table entries and fadvise then lets the kernel reclaim the clean pages themselves.
+// Nothing reads these bytes again until the members are staged, and the cache they leave behind is
+// what makes the kernel swap the sort array out instead. glibc turns posix_madvise(DONTNEED) into a
+// no-op because POSIX forbids it from changing semantics, so drop the mappings with madvise directly;
+// while the pages stay mapped fadvise cannot reclaim them either.
 static void dropDataCache(DBReader<DBKeyType> &reader) {
+#ifdef MADV_DONTNEED
     for (size_t fileIdx = 0; fileIdx < reader.getDataFileCnt(); fileIdx++) {
-        Util::madviseLogged(reader.getDataForFile(fileIdx), reader.getDataSizeForFile(fileIdx),
-                            POSIX_MADV_DONTNEED, "clusthashfast sort");
+        madvise(reader.getDataForFile(fileIdx), reader.getDataSizeForFile(fileIdx), MADV_DONTNEED);
     }
+#endif
 #ifdef HAVE_POSIX_FADVISE
     std::vector<std::string> names = reader.getDataFileNames();
     for (size_t fileIdx = 0; fileIdx < names.size(); fileIdx++) {
@@ -629,6 +630,10 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
     const bool canStage = (reader.getDataFileCnt() == 1 && reader.isCompressed() == 0);
     const unsigned int bucketCount = hashBucketCount(par, dbSize);
 
+    // dropping a cache that would have been reused only forces re-reads, so weigh the data against
+    // the sort array it would otherwise be evicting
+    const bool cacheContended = reader.getDataSize() + dbSize * sizeof(HashEntry)
+                                > Util::computeMemory(par.splitMemoryLimit);
     const bool sequentialHashScan = hashScanIsSequential(reader);
     if (sequentialHashScan) {
         reader.setSequentialAdvice();
@@ -640,7 +645,9 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
 
         Debug(Debug::INFO) << "Hashing sequences...\n";
         hashSequences(reader, entries, isNuclInput, subMat, par.maxSeqLen, showProgress, par.threads);
-        dropDataCache(reader);
+        if (cacheContended) {
+            dropDataCache(reader);
+        }
 
         Debug(Debug::INFO) << "Sort sequence hashes...\n";
         SORT_PARALLEL(entries, entries + dbSize, HashEntry::compareByHashAndId);
@@ -674,7 +681,9 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
         EXIT(EXIT_FAILURE);
     }
     buckets.close();
-    dropDataCache(reader);
+    if (cacheContended) {
+        dropDataCache(reader);
+    }
 
     size_t totalRuns = 0;
     std::vector<HashEntry> part;
