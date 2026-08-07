@@ -43,3 +43,4 @@ NCBI_Bacteria_Orfs/
 build.old/
 .vscode/
 vsc.code-workspace
+build*/

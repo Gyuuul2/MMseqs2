@@ -280,6 +280,12 @@ else ()
     set(ZSTD_LIBRARIES libzstd_static)
 endif()
 
+# lz4, for the k-mer bucket temp files
+include_directories(lib/lz4/lib)
+add_subdirectory(lib/lz4 EXCLUDE_FROM_ALL)
+set_target_properties(liblz4_static PROPERTIES COMPILE_FLAGS "${MMSEQS_C_FLAGS}" LINK_FLAGS "${MMSEQS_C_FLAGS}")
+set(LZ4_LIBRARIES liblz4_static)
+
 # tinyexpr
 include_directories(lib/tinyexpr)
 add_subdirectory(lib/tinyexpr EXCLUDE_FROM_ALL)

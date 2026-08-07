@@ -198,6 +198,9 @@ public:
 
     bool open(int sort);
 
+    // random access over data that may not fit: mmap while it fits, pread+O_DIRECT once it does not
+    void setIoAutoDirect(bool autoDirect) { ioAutoDirect = autoDirect; }
+
     void close();
 
     const char* getDataFileName() { return dataFileName; }
@@ -364,7 +367,7 @@ public:
 
     char *mmapData(FILE *file, size_t *dataSize);
 
-    void readIndex(char *data, size_t indexDataSize, Index *index, size_t & dataSize);
+    bool readIndex(char *data, size_t indexDataSize, Index *index, size_t & dataSize);
 
     void readLookup(char *data, size_t dataSize, LookupEntry *lookup);
 
@@ -511,6 +514,8 @@ public:
 private:
     void checkClosed() const;
 
+    void resolveIoPolicy(int accessType);
+
     int openDirect(const char *fileName, size_t *dataSize);
 
     char* readDirect(size_t offset, size_t length, int thrIdx);
@@ -581,6 +586,11 @@ private:
     bool externalData;
 
     bool didMlock;
+
+    bool ioAutoDirect;
+
+    // O_DIRECT alignment resolved per data file at open time, the device can want less than 4096
+    size_t directIoAlign;
 
     // needed to prevent the compiler from optimizing away the loop
     char magicBytes;

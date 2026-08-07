@@ -12,8 +12,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-// O_DIRECT needs offset, length and buffer address block aligned, 4096 covers 512e and 4Kn devices
-static const size_t DIRECT_IO_ALIGN = 4096;
 // a per-thread bounce buffer starts here and grows on demand, so one huge entry cannot preallocate threads*maxSeqLen
 static const size_t BOUNCE_BUFFER_PREALLOC = 64 * 1024;
 // smallest room left for one ZSTD_decompressStream call, so a nearly full buffer cannot creep forward
@@ -36,7 +34,7 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), index(NULL), id2local(NULL), local2id(NULL),
-        dataMapped(false), accessType(0), externalData(false), didMlock(false)
+        dataMapped(false), accessType(0), externalData(false), didMlock(false), ioAutoDirect(false), directIoAlign(0)
 {}
 
 template <typename T>
@@ -46,7 +44,8 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         size(size), dataFiles(NULL), dataFds(NULL), directBuffers(NULL),
         dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index), sortedByOffset(true),
-        id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
+        id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false),
+        ioAutoDirect(false), directIoAlign(0)
 {}
 
 template <typename T>
@@ -125,6 +124,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
             Debug(Debug::ERROR) << "No datafile could be found for " << dataFileName << "!\n";
             EXIT(EXIT_FAILURE);
         }
+        resolveIoPolicy(accessType);
         totalDataSize = 0;
         dataFileCnt = dataFileNames.size();
         dataSizeOffset = new size_t[dataFileNames.size() + 1];
@@ -134,6 +134,8 @@ template <typename T> bool DBReader<T>::open(int accessType){
         }
         for(size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++){
             if (dataMode & USE_DIRECT_IO) {
+                // split files can sit on different filesystems, the strictest alignment serves them all
+                directIoAlign = std::max(directIoAlign, FileUtil::getDirectIoAlignment(dataFileNames[fileIdx]));
                 size_t directDataSize;
                 dataFds[fileIdx] = openDirect(dataFileNames[fileIdx].c_str(), &directDataSize);
                 dataFiles[fileIdx] = NULL;
@@ -218,20 +220,13 @@ template <typename T> bool DBReader<T>::open(int accessType){
         Util::checkAllocation(index, "Cannot allocate index memory in DBReader");
         incrementMemory(sizeof(Index) * size);
 
-        readIndex(indexDataChar, indexDataSize, index, dataSize);
+        bool isSortedById = readIndex(indexDataChar, indexDataSize, index, dataSize);
         indexData.close();
-
-        // adjacent pairs of the built array, so no batch boundary can hide a descent from every thread
-        isSortedById = true;
-#pragma omp parallel for schedule(static) reduction(&&: isSortedById) num_threads(threads)
-        for (size_t i = 1; i < size; i++) {
-            isSortedById = isSortedById && (index[i - 1].id <= index[i].id);
-        }
 
         // sortIndex also handles access modes that don't require sorting
         sortIndex(isSortedById);
 
-        // after the sort, because the sequential access fast paths read offsets in array order
+        // adjacent pairs carry no loop dependency, and index[0] alone is trivially sorted
         sortedByOffset = true;
 #pragma omp parallel for schedule(static) reduction(&&: sortedByOffset) num_threads(threads)
         for (size_t i = 1; i < size; i++) {
@@ -251,7 +246,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
         // readIndex already tracked max index[i].length here, so do not walk the index again
         const size_t maxEntryLen = maxSeqLen;
         // the entry can start one byte after an aligned boundary and end one byte before the next
-        const size_t maxRead = ((maxEntryLen + 2 * DIRECT_IO_ALIGN - 1) / DIRECT_IO_ALIGN) * DIRECT_IO_ALIGN;
+        const size_t maxRead = ((maxEntryLen + 2 * directIoAlign - 1) / directIoAlign) * directIoAlign;
         const size_t initialSize = std::min(maxRead, BOUNCE_BUFFER_PREALLOC);
         directBuffers = new DirectBuffer[threads];
         for (int i = 0; i < threads; i++) {
@@ -260,7 +255,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
             directBuffers[i].file = 0;
             directBuffers[i].offset = 0;
             directBuffers[i].length = 0;
-            growBuffer(&directBuffers[i].buffer, &directBuffers[i].size, initialSize, DIRECT_IO_ALIGN, 0);
+            growBuffer(&directBuffers[i].buffer, &directBuffers[i].size, initialSize, directIoAlign, 0);
         }
     }
 
@@ -584,6 +579,50 @@ void DBReader<T>::growBuffer(char** buffer, size_t* capacity, size_t needed, siz
     *capacity = newCapacity;
 }
 
+// a sequential scan wants kernel readahead, which O_DIRECT has no equivalent for
+static bool ioAccessIsSequential(int accessType) {
+    return accessType == DBReader<DBKeyType>::LINEAR_ACCCESS
+           || accessType == DBReader<DBKeyType>::SORT_BY_OFFSET;
+}
+
+// mmap is the default; only a reader that asked for setIoAutoDirect can be moved to O_DIRECT
+template <typename T> void DBReader<T>::resolveIoPolicy(int accessType) {
+    if ((dataMode & USE_DIRECT_IO) || ioAutoDirect == false) {
+        return;
+    }
+    // compressed, padded, writable and fread readers hand back reader-owned buffers the direct path cannot serve
+    if (isCompressed(dbtype) == COMPRESSED
+        || (getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_GPU)
+        || (dataMode & (USE_WRITABLE | USE_FREAD))) {
+        return;
+    }
+    // MMSEQS_IO_POLICY=mmap|direct pins the size rule for the readers that opted in, so it stays testable
+    const char *policyEnv = getenv("MMSEQS_IO_POLICY");
+    if (policyEnv != NULL && strcmp(policyEnv, "mmap") == 0) {
+        return;
+    }
+    if (policyEnv != NULL && strcmp(policyEnv, "direct") == 0) {
+        dataMode |= USE_DIRECT_IO;
+        return;
+    }
+    // a sequential scan already gets POSIX_MADV_SEQUENTIAL below, which is the hint it wants
+    if (ioAccessIsSequential(accessType)) {
+        return;
+    }
+    size_t bytes = 0;
+    for (size_t i = 0; i < dataFileNames.size(); i++) {
+        const size_t fileSize = FileUtil::getFileSize(dataFileNames[i]);
+        if (fileSize == static_cast<size_t>(-1)) {
+            // a vanished file cannot be sized, stay on mmap and let the open below report it
+            return;
+        }
+        bytes += fileSize;
+    }
+    if (bytes > Util::computeMemory(0)) {
+        dataMode |= USE_DIRECT_IO;
+    }
+}
+
 template <typename T> int DBReader<T>::openDirect(const char *fileName, size_t *dataSize) {
 #if defined(O_DIRECT)
     int fd = ::open(fileName, O_RDONLY | O_DIRECT);
@@ -635,11 +674,11 @@ template <typename T> char* DBReader<T>::readDirect(size_t offset, size_t length
         cnt++;
     }
     size_t fileOffset = offset - dataSizeOffset[cnt];
-    size_t alignedOffset = fileOffset & ~(DIRECT_IO_ALIGN - 1);
+    size_t alignedOffset = fileOffset & ~(directIoAlign - 1);
     size_t delta = fileOffset - alignedOffset;
-    size_t readLen = (delta + length + DIRECT_IO_ALIGN - 1) & ~(DIRECT_IO_ALIGN - 1);
+    size_t readLen = (delta + length + directIoAlign - 1) & ~(directIoAlign - 1);
     DirectBuffer &buf = directBuffers[thrIdx];
-    // a 4K aligned read holds many short entries, so offset-ordered access mostly hits here
+    // an aligned read holds many short entries, so offset-ordered access mostly hits here
     if (buf.length > 0 && buf.file == cnt && alignedOffset >= buf.offset
         && (alignedOffset - buf.offset) + delta + length <= buf.length) {
         return buf.buffer + (alignedOffset - buf.offset) + delta;
@@ -647,7 +686,7 @@ template <typename T> char* DBReader<T>::readDirect(size_t offset, size_t length
     if (readLen > buf.size) {
         // the cached block is gone with the old allocation
         buf.length = 0;
-        growBuffer(&buf.buffer, &buf.size, readLen, DIRECT_IO_ALIGN, 0);
+        growBuffer(&buf.buffer, &buf.size, readLen, directIoAlign, 0);
     }
     // reading past the end of the file returns a short count, the entry itself is still fully covered
     ssize_t read;
@@ -1097,7 +1136,7 @@ template <typename T> void DBReader<T>::checkClosed() const {
 }
 
 template<typename T>
-void DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size_t & dataSize) {
+bool DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size_t & dataSize) {
 #ifdef OPENMP
     int threadCnt = 1;
     const int totalThreadCnt = threads;
@@ -1107,18 +1146,20 @@ void DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size
 #endif
 
 
+    size_t isSortedById = true;
     size_t globalIdOffset = 0;
     unsigned int localMaxSeqLen = 0;
     size_t localDataSize = 0;
 
     DBKeyType localLastKey = 0;
     const size_t BATCH_SIZE = 1048576;
-#pragma omp parallel num_threads(threadCnt) reduction(max: localMaxSeqLen, localLastKey) reduction(+: localDataSize)
+#pragma omp parallel num_threads(threadCnt) reduction(max: localMaxSeqLen, localLastKey) reduction(+: localDataSize) reduction(min:isSortedById)
     {
         size_t currPos = 0;
         char* indexDataChar = (char *) data;
         const char * cols[3];
         size_t lineStartId = __sync_fetch_and_add(&(globalIdOffset), BATCH_SIZE);
+        T prevId=T(); // makes 0 or empty string
         size_t currLine = 0;
 
         while (currPos < indexDataSize){
@@ -1130,6 +1171,7 @@ void DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size
                 for(size_t startIndex = lineStartId; startIndex < lineStartId + BATCH_SIZE && currPos < indexDataSize; startIndex++){
                     Util::getWordsOfLine(indexDataChar, cols, 3);
                     readIndexId(&index[startIndex].id, indexDataChar, cols);
+                    isSortedById *= (index[startIndex].id >= prevId);
                     size_t offset = Util::fast_atoi<size_t>(cols[1]);
                     size_t length = Util::fast_atoi<size_t>(cols[2]);
                     localDataSize += length;
@@ -1139,6 +1181,7 @@ void DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size
                     indexDataChar = Util::skipLine(indexDataChar);
                     currPos = indexDataChar - (char *) data;
                     localLastKey = std::max(localLastKey, indexIdToNum(&index[startIndex].id));
+                    prevId = index[startIndex].id;
                     currLine++;
                 }
                 lineStartId = __sync_fetch_and_add(&(globalIdOffset), BATCH_SIZE);
@@ -1153,6 +1196,7 @@ void DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size
     dataSize = localDataSize;
     maxSeqLen = localMaxSeqLen;
     lastKey = localLastKey;
+    return isSortedById;
 }
 
 template<typename T> T DBReader<T>::getLastKey() {

@@ -47,7 +47,8 @@ struct ClusterCounts {
     }
 };
 
-struct HashEntry {
+// packed: the padding was 4 of every 16 bytes, and this array is the largest allocation at scale
+struct __attribute__((packed)) HashEntry {
     size_t hash;
     DBLocalId id;
 
@@ -175,6 +176,7 @@ struct MemberArena {
 
     std::vector<uint64_t> bits;         // one bit per sequence, set when its run has other members
     std::vector<size_t> blockOffset;    // arena offset of the first gathered member of each 64 id block
+    std::vector<size_t> touched;        // ascending indices of the blocks this window actually marked
     char *data;
 
     MemberArena() : data(NULL) {}
@@ -183,9 +185,18 @@ struct MemberArena {
         release();
     }
 
-    void release() {
+    // the two id-space arrays outlive a window, so only the gathered bytes and the block list go
+    void releaseData() {
         delete[] data;
         data = NULL;
+        for (size_t i = 0; i < touched.size(); i++) {
+            bits[touched[i]] = 0;
+        }
+        std::vector<size_t>().swap(touched);
+    }
+
+    void release() {
+        releaseData();
         std::vector<uint64_t>().swap(bits);
         std::vector<size_t>().swap(blockOffset);
     }
@@ -213,43 +224,67 @@ struct MemberArena {
 static size_t planArena(DBReader<DBKeyType> &reader, MemberArena &arena, const HashEntry *entries,
                         size_t entryCount, size_t idSpace, int threads) {
     const size_t blocks = (idSpace + MemberArena::BLOCK - 1) / MemberArena::BLOCK;
-    arena.bits.assign(blocks, 0);
-    size_t marked = 0;
-#pragma omp parallel for schedule(dynamic, 4096) num_threads(threads) reduction(+:marked)
-    for (size_t pos = 0; pos < entryCount; ++pos) {
-        const bool aloneBefore = (pos == 0) || (entries[pos - 1].hash != entries[pos].hash);
-        const bool aloneAfter = (pos + 1 == entryCount) || (entries[pos + 1].hash != entries[pos].hash);
-        if (aloneBefore && aloneAfter) {
-            continue;
+    // sized once for the whole id space, then reused: a window marks a small, scattered subset of it
+    if (arena.bits.size() != blocks) {
+        arena.bits.assign(blocks, 0);
+        arena.blockOffset.resize(blocks);
+    }
+    std::vector<std::vector<size_t> > perThread(static_cast<size_t>(threads));
+#pragma omp parallel num_threads(threads)
+    {
+        int t = 0;
+#ifdef OPENMP
+        t = omp_get_thread_num();
+#endif
+        std::vector<size_t> &mine = perThread[t];
+#pragma omp for schedule(dynamic, 4096)
+        for (size_t pos = 0; pos < entryCount; ++pos) {
+            const bool aloneBefore = (pos == 0) || (entries[pos - 1].hash != entries[pos].hash);
+            const bool aloneAfter = (pos + 1 == entryCount) || (entries[pos + 1].hash != entries[pos].hash);
+            if (aloneBefore && aloneAfter) {
+                continue;
+            }
+            const DBLocalId id = entries[pos].id;
+            const size_t word = id / MemberArena::BLOCK;
+            // exactly one thread turns a block from empty to non-empty, so this lists it without a dedup pass
+            const uint64_t was = __sync_fetch_and_or(&arena.bits[word], 1ULL << (id % MemberArena::BLOCK));
+            if (was == 0) {
+                mine.push_back(word);
+            }
         }
-        const DBLocalId id = entries[pos].id;
-        __sync_fetch_and_or(&arena.bits[id / MemberArena::BLOCK], 1ULL << (id % MemberArena::BLOCK));
-        marked++;
+    }
+    size_t marked = 0;
+    for (size_t t = 0; t < perThread.size(); t++) {
+        marked += perThread[t].size();
     }
     if (marked == 0) {
-        std::vector<uint64_t>().swap(arena.bits);
         return 0;
     }
-    arena.blockOffset.assign(blocks, 0);
-#pragma omp parallel for schedule(static) num_threads(threads)
-    for (size_t word = 0; word < blocks; ++word) {
-        size_t sum = 0;
-        uint64_t set = arena.bits[word];
-        while (set != 0) {
-            const size_t k = static_cast<size_t>(__builtin_ctzll(set));
-            sum += reader.getSeqLen(word * MemberArena::BLOCK + k);
-            set &= set - 1;
-        }
-        arena.blockOffset[word] = sum;
+    arena.touched.resize(marked);
+    size_t at = 0;
+    for (size_t t = 0; t < perThread.size(); t++) {
+        memcpy(&arena.touched[at], perThread[t].data(), perThread[t].size() * sizeof(size_t));
+        at += perThread[t].size();
+        std::vector<size_t>().swap(perThread[t]);
     }
-    // a serial scan over the whole id space would dominate once there are many partitions to plan
-    const size_t stripe = (blocks + threads - 1) / static_cast<size_t>(threads);
+    // ascending order makes the arena layout independent of how the threads split the entries
+    SORT_PARALLEL(arena.touched.begin(), arena.touched.end());
+
+    const size_t used = arena.touched.size();
+    const size_t stripe = (used + threads - 1) / static_cast<size_t>(threads);
     std::vector<size_t> stripeBase(static_cast<size_t>(threads) + 1, 0);
 #pragma omp parallel for schedule(static, 1) num_threads(threads)
     for (int t = 0; t < threads; ++t) {
         size_t sum = 0;
-        for (size_t word = t * stripe; word < std::min(blocks, (t + 1) * stripe); ++word) {
-            sum += arena.blockOffset[word];
+        for (size_t i = t * stripe; i < std::min(used, (t + 1) * stripe); ++i) {
+            const size_t word = arena.touched[i];
+            arena.blockOffset[word] = sum;   // stripe-local offset, rebased once the stripes are summed
+            uint64_t set = arena.bits[word];
+            while (set != 0) {
+                const size_t k = static_cast<size_t>(__builtin_ctzll(set));
+                sum += reader.getSeqLen(word * MemberArena::BLOCK + k);
+                set &= set - 1;
+            }
         }
         stripeBase[t + 1] = sum;
     }
@@ -258,11 +293,8 @@ static size_t planArena(DBReader<DBKeyType> &reader, MemberArena &arena, const H
     }
 #pragma omp parallel for schedule(static, 1) num_threads(threads)
     for (int t = 0; t < threads; ++t) {
-        size_t running = stripeBase[t];
-        for (size_t word = t * stripe; word < std::min(blocks, (t + 1) * stripe); ++word) {
-            const size_t size = arena.blockOffset[word];
-            arena.blockOffset[word] = running;
-            running += size;
+        for (size_t i = t * stripe; i < std::min(used, (t + 1) * stripe); ++i) {
+            arena.blockOffset[arena.touched[i]] += stripeBase[t];
         }
     }
     return stripeBase[threads];
@@ -272,7 +304,7 @@ static size_t planArena(DBReader<DBKeyType> &reader, MemberArena &arena, const H
 static void fillArena(DBReader<DBKeyType> &reader, MemberArena &arena, size_t total, int threads) {
     arena.data = new(std::nothrow) char[total];
     Util::checkAllocation(arena.data, "Can not allocate member arena in clusthashfast");
-    const size_t blocks = arena.bits.size();
+    const size_t used = arena.touched.size();
 #pragma omp parallel num_threads(threads)
     {
         unsigned int thread_idx = 0;
@@ -281,7 +313,8 @@ static void fillArena(DBReader<DBKeyType> &reader, MemberArena &arena, size_t to
 #endif
         // schedule(static) gives each thread one contiguous, disjoint word range and byte range
 #pragma omp for schedule(static)
-        for (size_t word = 0; word < blocks; ++word) {
+        for (size_t i = 0; i < used; ++i) {
+            const size_t word = arena.touched[i];
             uint64_t set = arena.bits[word];
             size_t offset = arena.blockOffset[word];
             while (set != 0) {
@@ -360,7 +393,7 @@ static void clusterHashRun(DBReader<DBKeyType> &reader, DBWriter &writer, const 
         // the seed passes the threshold against every member, so every cluster mode elects this seed
         worker.beginCluster(representativeKey);
 
-        bool queryCopied = false;
+        const char *querySeq = NULL;
         for (size_t j = i + 1; j < runSize; j++) {
             if (worker.claimed[j]) {
                 continue;
@@ -370,14 +403,18 @@ static void clusterHashRun(DBReader<DBKeyType> &reader, DBWriter &writer, const 
             if (reader.getSeqLen(targetId) != queryLength) {
                 continue;
             }
-            // getData hands back a shared per-thread buffer, so copy the query out before the target
-            if (queryCopied == false) {
-                worker.querySeq.assign(memberSeq(reader, arena, queryId, thread_idx), queryLength);
-                queryCopied = true;
+            if (querySeq == NULL) {
+                // arena bytes stay put, but getData hands back the buffer the target read reuses
+                if (arena != NULL) {
+                    querySeq = arena->at(reader, queryId);
+                } else {
+                    worker.querySeq.assign(reader.getData(queryId, thread_idx), queryLength);
+                    querySeq = worker.querySeq.data();
+                }
             }
             const char *targetSeq = memberSeq(reader, arena, targetId, thread_idx);
             const unsigned int distance =
-                DistanceCalculator::computeInverseHammingDistance(worker.querySeq.data(), targetSeq, queryLength);
+                DistanceCalculator::computeInverseHammingDistance(querySeq, targetSeq, queryLength);
             const float seqId = static_cast<float>(distance) / static_cast<float>(queryLength);
             if (seqId >= seqIdThr) {
                 worker.addMember(reader.getDbKey(targetId));
@@ -435,21 +472,22 @@ static ClusterCounts clusterHashRuns(DBReader<DBKeyType> &reader, DBWriter &writ
 // gathers the run members this partition compares, then clusters with every read coming from memory
 static ClusterCounts clusterPartition(DBReader<DBKeyType> &reader, DBWriter &writer, const HashEntry *entries,
                                       size_t entryCount, size_t idSpace, float seqIdThr, bool showProgress,
-                                      bool gather, size_t arenaBudget, int threads) {
+                                      bool gather, size_t arenaBudget, int threads, MemberArena &arena) {
     if (gather == false) {
         return clusterHashRuns(reader, writer, entries, entryCount, seqIdThr, showProgress, NULL, threads);
     }
 
-    MemberArena arena;
     const size_t total = planArena(reader, arena, entries, entryCount, idSpace, threads);
     if (total <= arenaBudget) {
         if (total > 0) {
             fillArena(reader, arena, total, threads);
         }
-        return clusterHashRuns(reader, writer, entries, entryCount, seqIdThr, showProgress,
-                               (total > 0) ? &arena : NULL, threads);
+        ClusterCounts once = clusterHashRuns(reader, writer, entries, entryCount, seqIdThr, showProgress,
+                                             (total > 0) ? &arena : NULL, threads);
+        arena.releaseData();
+        return once;
     }
-    arena.release();
+    arena.releaseData();
 
     // the members do not fit at once, so split the hash range and gather one window per pass
     std::vector<size_t> bounds;
@@ -460,15 +498,15 @@ static ClusterCounts clusterPartition(DBReader<DBKeyType> &reader, DBWriter &wri
     for (size_t window = 0; window + 1 < bounds.size(); ++window) {
         const size_t begin = bounds[window];
         const size_t size = bounds[window + 1] - begin;
-        MemberArena windowArena;
-        const size_t windowTotal = planArena(reader, windowArena, entries + begin, size, idSpace, threads);
+        const size_t windowTotal = planArena(reader, arena, entries + begin, size, idSpace, threads);
         // a single run wider than the whole budget cannot be gathered, so read that one from the db
         const bool gathered = (windowTotal > 0 && windowTotal <= arenaBudget);
         if (gathered) {
-            fillArena(reader, windowArena, windowTotal, threads);
+            fillArena(reader, arena, windowTotal, threads);
         }
         counts.add(clusterHashRuns(reader, writer, entries + begin, size, seqIdThr, showProgress,
-                                   gathered ? &windowArena : NULL, threads));
+                                   gathered ? &arena : NULL, threads));
+        arena.releaseData();
     }
     return counts;
 }
@@ -659,8 +697,9 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
         Debug(Debug::INFO) << "Sort sequence hashes...\n";
         SORT_PARALLEL(entries, entries + dbSize, HashEntry::compareByHashAndId);
         Debug(Debug::INFO) << "Cluster equal length sequences...\n";
+        MemberArena arena;
         counts = clusterPartition(reader, writer, entries, dbSize, dbSize, par.seqIdThr, showProgress,
-                                  gather, halfBudget, par.threads);
+                                  gather, halfBudget, par.threads, arena);
         delete[] entries;
         Debug(Debug::INFO) << "Found " << counts.runs << " unique hash/length groups\n";
         return counts;
@@ -680,6 +719,8 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
     parts.close();
 
     std::vector<HashEntry> part;
+    // the id-space bitmap and block offsets are sized by the db, so every partition reuses them
+    MemberArena arena;
     for (unsigned int partition = 0; partition < partitionCount; partition++) {
         const size_t partSize = parts.counts[partition];
         if (partSize == 0) {
@@ -697,7 +738,7 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
         SORT_PARALLEL(part.data(), part.data() + partSize, HashEntry::compareByHashAndId);
         const ClusterCounts partCounts = clusterPartition(reader, writer, part.data(), partSize, dbSize,
                                                           par.seqIdThr, showProgress, gather, halfBudget,
-                                                          par.threads);
+                                                          par.threads, arena);
         counts.add(partCounts);
         Debug(Debug::INFO) << "Partition " << (partition + 1) << "/" << partitionCount << ": "
                            << partCounts.runs << " groups, " << partCounts.clusters << " clusters\n";

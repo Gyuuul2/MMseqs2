@@ -3,7 +3,6 @@
 #include "Matcher.h"
 #include "Debug.h"
 #include "DBReader.h"
-#include "BatchEntryFetcher.h"
 #include "DBWriter.h"
 #include "QueryMatcher.h"
 #include "FastSort.h"
@@ -15,10 +14,6 @@
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
-#include <cstring>
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <unistd.h>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -452,68 +447,13 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
     }
 }
 
-// the original prefetch: ask the kernel to fault the whole surviving set in, no io threads needed
-static void prefetchBody(DBReader<DBKeyType> *reader, size_t id) {
-    static const size_t pageSize = Util::getPageSize();
-    char *data = reader->getDataUncompressed(id);
-    const size_t len = reader->getEntryLen(id);
-    const uintptr_t start = reinterpret_cast<uintptr_t>(data) & ~(pageSize - 1);
-    posix_madvise(reinterpret_cast<void *>(start),
-                  len + (reinterpret_cast<uintptr_t>(data) - start), POSIX_MADV_WILLNEED);
-}
-
-// MMSEQS_A2C_IO picks the random-read strategy: mmap faults, madvise prefetch, or batched O_DIRECT
-static int align2clustIoMode() {
-    const char *mode = getenv("MMSEQS_A2C_IO");
-    if (mode == NULL) {
-        return 2;
-    }
-    if (strcmp(mode, "mmap") == 0) {
-        return 0;
-    }
-    if (strcmp(mode, "willneed") == 0) {
-        return 1;
-    }
-    return 2;
-}
-
-// keyed access over a file-ordered layout, where the kernel's guess readaheads a window per miss
-static void adviseRandom(DBReader<DBKeyType> *reader) {
-    if (reader == NULL) {
-        return;
-    }
-    for (size_t fileIdx = 0; fileIdx < reader->getDataFileCnt(); fileIdx++) {
-        Util::madviseLogged(reader->getDataForFile(fileIdx), reader->getDataSizeForFile(fileIdx),
-                            POSIX_MADV_RANDOM, "align2clust");
-    }
-}
-
-// the prefilter db is read once per representative, so its cache only competes with the bodies
-static void dropCache(DBReader<DBKeyType> *reader) {
-#ifdef HAVE_POSIX_FADVISE
-    if (reader == NULL) {
-        return;
-    }
-    std::vector<std::string> names = reader->getDataFileNames();
-    for (size_t fileIdx = 0; fileIdx < names.size(); fileIdx++) {
-        int fd = ::open(names[fileIdx].c_str(), O_RDONLY);
-        if (fd < 0) {
-            continue;
-        }
-        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-        close(fd);
-    }
-#endif
-}
-
-// each drop walks the cached extent, so bound how many the run pays for
-static const size_t ALIGN2CLUST_PREF_DROPS = 256;
-
 int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &alnDbr, DBWriter *alnWriter) {
     DBReader<DBKeyType> *seqDbr = new DBReader<DBKeyType>(
         par.db1.c_str(), par.db1Index.c_str(), par.threads, 
         DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
     );
+    // the target reads are scattered, so let the reader fall back to O_DIRECT once the db outgrows ram
+    seqDbr->setIoAutoDirect(true);
     // SORT_BY_LENGTH costs id2local plus local2id; neither mode needs them once lengthOrder exists
     seqDbr->open(DBReader<DBKeyType>::NOSORT);
  
@@ -672,26 +612,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         EXIT(EXIT_FAILURE);
     }
     unsigned int swMode = Alignment::initSWMode(par.alignmentMode, par.covThr, par.seqIdThr);
-    // while the dbs still fit, readahead is free and every hint below only costs what it saves
-    const bool cacheStarved = seqDbr->getDataSize() + alnDbr.getDataSize()
-                              > Util::computeMemory(par.splitMemoryLimit);
-    const size_t prefDropInterval = std::max<size_t>(1, endRange / ALIGN2CLUST_PREF_DROPS);
-    // both dbs are addressed by key here, so the fault path buys nothing for either
-    BatchEntryFetcher seqFetcher;
-    BatchEntryFetcher alnFetcher;
-    const int ioMode = align2clustIoMode();
-    const bool useFetcher = cacheStarved && ioMode == 2;
-    const bool useWillNeed = cacheStarved && ioMode == 1;
-    // the scattered sequence bodies are the reads worth queueing, so only they get io threads
-    seqFetcher.open(seqDbr, par.threads, BatchEntryFetcher::defaultIoThreads(par.threads),
-                    BatchEntryFetcher::DEFAULT_ARENA_CAP, useFetcher, useFetcher);
-    // one prefilter entry per representative, so this one always takes the inline single-read path
-    alnFetcher.open(&alnDbr, par.threads, 0, BatchEntryFetcher::DEFAULT_ARENA_CAP, false, cacheStarved);
-    // the filter dbs are the only ones still read through the mapping, the other two go through pread
-    if (cacheStarved) {
-        adviseRandom(cluSeqDbr);
-        adviseRandom(cluDbr);
-    }
     Debug::Progress progress(endRange);
     size_t db_maxseqlen = (cluSeqDbr != nullptr)
         ? std::max(seqDbr->getMaxSeqLen(), cluSeqDbr->getMaxSeqLen())
@@ -714,9 +634,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                  -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
         std::vector<std::pair<size_t, unsigned short>> targetsWithDiagonal;
         targetsWithDiagonal.reserve(1000);
-        // slot 0 is the query body, the rest are the targets that cleared the index-only gates
-        std::vector<size_t> prefetchIds;
-        std::vector<size_t> targetSlot;
 
         const bool includeAlignFiles = (alnWriter != nullptr);
         std::string queryCopy;
@@ -731,9 +648,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 #pragma omp for schedule(dynamic, 1) nowait
         for (size_t i = 0; i < endRange; i++) {
             progress.updateProgress();
-            if (cacheStarved && i > 0 && (i % prefDropInterval) == 0) {
-                dropCache(&alnDbr);
-            }
             ClusterResult clusterResult;
             clusterResult.sequenceIdx = i;
             targetsWithDiagonal.clear();
@@ -765,9 +679,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             }
 
             const size_t alignmentId = requireId(alnDbr.getId(queryKey), "Alignment DB", queryKey);
-            alnFetcher.load(&alignmentId, 1, threadIdx);
-            // parsePrefilterHit and skipLine take char* but only read, so the cast adds no write
-            char *alignmentData = const_cast<char *>(alnFetcher.at(threadIdx, 0));
+            char *alignmentData = alnDbr.getData(alignmentId, threadIdx);
             size_t queryId = representativeId;
             // index-only, so it is known without faulting the body in; Sequence::mapSequence sets L to it
             const int queryLength = static_cast<int>(seqDbr->getSeqLen(queryId));
@@ -789,36 +701,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 prefSize++;
             }
             clusterResult.prefSize = prefSize;   // exact parsed count for the aligned path
-
-            // index-only gates, so the whole surviving set is known before the first body is read
-            prefetchIds.clear();
-            prefetchIds.push_back(queryId);
-            targetSlot.assign(targetsWithDiagonal.size(), SIZE_MAX);
-            // the align loop repeats these gates; either side dropping first only costs an io
-            for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
-                const size_t targetId = targetsWithDiagonal[targetIdx].first;
-                if (seqDbr->getDbKey(targetId) == queryKey) {
-                    continue;
-                }
-                // assignment only ever moves to assigned, so what is dropped here is not wanted below
-                if (loadAssignedCluster(assignedCluster, targetId) != DB_LOCAL_ID_INVALID) {
-                    continue;
-                }
-                if (Util::canBeCovered(par.covThr, par.covMode, queryLength,
-                                       seqDbr->getSeqLen(targetId)) == false) {
-                    continue;
-                }
-                targetSlot[targetIdx] = prefetchIds.size();
-                prefetchIds.push_back(targetId);
-            }
-            if (useWillNeed && prefetchIds.size() > 1) {
-                for (size_t k = 0; k < prefetchIds.size(); k++) {
-                    prefetchBody(seqDbr, prefetchIds[k]);
-                }
-            }
-            // the arena holds a window of the batch, and the loop below only ever moves forward
-            size_t windowStart = 0;
-            size_t windowEnd = 0;
 
             for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
                 // Representative assigned meanwhile: the cluster thread discards clusters
@@ -864,31 +746,15 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
                 // first target to survive filtering: now the query body is worth its random read
                 if (querySequence == nullptr) {
-                    // copied out at once, so the window is free to move past it afterwards
-                    windowStart = 0;
-                    windowEnd = seqFetcher.load(&prefetchIds[0], prefetchIds.size(), threadIdx);
-                    queryCopy.assign(seqFetcher.at(threadIdx, 0), queryLength);
+                    // the direct io path hands back a per-thread buffer the target reads below reuse
+                    queryCopy.assign(seqDbr->getData(queryId, threadIdx), queryLength);
                     querySequence = queryCopy.c_str();
                     query.mapSequence(queryId, queryKey, querySequence, queryLength);
                     blockAligner.initQuery(&query);
                     matcher.initQuery(&query);
                 }
 
-                const size_t slot = targetSlot[targetIdx];
-                size_t windowOffset = 0;
-                if (slot == SIZE_MAX) {
-                    // not planned into the batch, so read it on its own and drop the stale window
-                    seqFetcher.load(&targetId, 1, threadIdx);
-                    windowStart = 0;
-                    windowEnd = 0;
-                } else {
-                    if (slot < windowStart || slot >= windowEnd) {
-                        windowStart = slot;
-                        windowEnd = slot + seqFetcher.load(&prefetchIds[slot], prefetchIds.size() - slot, threadIdx);
-                    }
-                    windowOffset = slot - windowStart;
-                }
-                const char *targetSequence = seqFetcher.at(threadIdx, windowOffset);
+                const char *targetSequence = seqDbr->getData(targetId, threadIdx);
                 target.mapSequence(targetId, targetKey, targetSequence, targetLength);
 
                 BlockAligner::UngappedAln_res ungappedAlignment = blockAligner.ungappedAlign(&target, diagonal); 

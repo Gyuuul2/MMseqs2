@@ -653,7 +653,7 @@ public:
     std::string weightFile;
     bool useParallelism;
     bool needWriteBuffer;
-    bool compressKmerTmpFiles;
+    int compressKmerTmpFiles;
     bool kmerWriteToDisk;
     bool includeCountTable;
     int countTableIteration;

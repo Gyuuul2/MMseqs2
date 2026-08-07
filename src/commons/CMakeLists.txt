@@ -52,7 +52,6 @@ set(commons_source_files
         commons/A3MReader.cpp
         commons/Application.cpp
         commons/BaseMatrix.cpp
-        commons/BatchEntryFetcher.cpp
         commons/Command.cpp
         commons/CommandCaller.cpp
         commons/DBConcat.cpp
