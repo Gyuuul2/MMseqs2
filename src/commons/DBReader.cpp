@@ -218,17 +218,24 @@ template <typename T> bool DBReader<T>::open(int accessType){
         Util::checkAllocation(index, "Cannot allocate index memory in DBReader");
         incrementMemory(sizeof(Index) * size);
 
-        bool isSortedById = readIndex(indexDataChar, indexDataSize, index, dataSize);
+        readIndex(indexDataChar, indexDataSize, index, dataSize);
         indexData.close();
+
+        // adjacent pairs of the built array, so no batch boundary can hide a descent from every thread
+        isSortedById = true;
+#pragma omp parallel for schedule(static) reduction(&&: isSortedById) num_threads(threads)
+        for (size_t i = 1; i < size; i++) {
+            isSortedById = isSortedById && (index[i - 1].id <= index[i].id);
+        }
 
         // sortIndex also handles access modes that don't require sorting
         sortIndex(isSortedById);
 
-        size_t prevOffset = 0; // makes 0 or empty string
+        // after the sort, because the sequential access fast paths read offsets in array order
         sortedByOffset = true;
-        for (size_t i = 0; i < size; i++) {
-            sortedByOffset = sortedByOffset && index[i].offset >= prevOffset;
-            prevOffset = index[i].offset;
+#pragma omp parallel for schedule(static) reduction(&&: sortedByOffset) num_threads(threads)
+        for (size_t i = 1; i < size; i++) {
+            sortedByOffset = sortedByOffset && (index[i - 1].offset <= index[i].offset);
         }
     }
 
@@ -1090,7 +1097,7 @@ template <typename T> void DBReader<T>::checkClosed() const {
 }
 
 template<typename T>
-bool DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size_t & dataSize) {
+void DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size_t & dataSize) {
 #ifdef OPENMP
     int threadCnt = 1;
     const int totalThreadCnt = threads;
@@ -1100,20 +1107,18 @@ bool DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size
 #endif
 
 
-    size_t isSortedById = true;
     size_t globalIdOffset = 0;
     unsigned int localMaxSeqLen = 0;
     size_t localDataSize = 0;
 
     DBKeyType localLastKey = 0;
     const size_t BATCH_SIZE = 1048576;
-#pragma omp parallel num_threads(threadCnt) reduction(max: localMaxSeqLen, localLastKey) reduction(+: localDataSize) reduction(min:isSortedById)
+#pragma omp parallel num_threads(threadCnt) reduction(max: localMaxSeqLen, localLastKey) reduction(+: localDataSize)
     {
         size_t currPos = 0;
         char* indexDataChar = (char *) data;
         const char * cols[3];
         size_t lineStartId = __sync_fetch_and_add(&(globalIdOffset), BATCH_SIZE);
-        T prevId=T(); // makes 0 or empty string
         size_t currLine = 0;
 
         while (currPos < indexDataSize){
@@ -1125,7 +1130,6 @@ bool DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size
                 for(size_t startIndex = lineStartId; startIndex < lineStartId + BATCH_SIZE && currPos < indexDataSize; startIndex++){
                     Util::getWordsOfLine(indexDataChar, cols, 3);
                     readIndexId(&index[startIndex].id, indexDataChar, cols);
-                    isSortedById *= (index[startIndex].id >= prevId);
                     size_t offset = Util::fast_atoi<size_t>(cols[1]);
                     size_t length = Util::fast_atoi<size_t>(cols[2]);
                     localDataSize += length;
@@ -1135,7 +1139,6 @@ bool DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size
                     indexDataChar = Util::skipLine(indexDataChar);
                     currPos = indexDataChar - (char *) data;
                     localLastKey = std::max(localLastKey, indexIdToNum(&index[startIndex].id));
-                    prevId = index[startIndex].id;
                     currLine++;
                 }
                 lineStartId = __sync_fetch_and_add(&(globalIdOffset), BATCH_SIZE);
@@ -1150,7 +1153,6 @@ bool DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size
     dataSize = localDataSize;
     maxSeqLen = localMaxSeqLen;
     lastKey = localLastKey;
-    return isSortedById;
 }
 
 template<typename T> T DBReader<T>::getLastKey() {

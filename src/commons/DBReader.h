@@ -364,7 +364,7 @@ public:
 
     char *mmapData(FILE *file, size_t *dataSize);
 
-    bool readIndex(char *data, size_t indexDataSize, Index *index, size_t & dataSize);
+    void readIndex(char *data, size_t indexDataSize, Index *index, size_t & dataSize);
 
     void readLookup(char *data, size_t dataSize, LookupEntry *lookup);
 
