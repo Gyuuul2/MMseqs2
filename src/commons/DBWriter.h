@@ -51,6 +51,9 @@ public:
 
     void writeIndexEntry(DBKeyType key, size_t offset, size_t length, unsigned int thrIdx);
 
+    void writeIndexEntries(DBReader<DBKeyType>::Index *index, size_t indexSize, unsigned int thrIdx,
+                           unsigned int threads = 1);
+
     static void writeDbtypeFile(const char* path, int dbtype, bool isCompressed);
 
     size_t getStart(unsigned int threadIdx){

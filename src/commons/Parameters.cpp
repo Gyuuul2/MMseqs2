@@ -1343,6 +1343,7 @@ Parameters::Parameters():
     // createsubdb
     createsubdb.push_back(&PARAM_SUBDB_MODE);
     createsubdb.push_back(&PARAM_ID_MODE);
+    createsubdb.push_back(&PARAM_THREADS);
     createsubdb.push_back(&PARAM_V);
 
     // renamedbkeys

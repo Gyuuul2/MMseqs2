@@ -592,6 +592,12 @@ void DBWriter::writeIndex(FILE *outFile, size_t indexSize, DBReader<std::string>
 }
 
 
+// batching the rows costs one fwrite instead of one per row, and lets writeIndex format in parallel
+void DBWriter::writeIndexEntries(DBReader<DBKeyType>::Index *index, size_t indexSize, unsigned int thrIdx,
+                                 unsigned int threads) {
+    writeIndex(indexFiles[thrIdx], indexSize, index, threads);
+}
+
 void DBWriter::mergeResults(const char *outFileName, const char *outFileNameIndex,
                             const char **dataFileNames, const char **indexFileNames,
                             unsigned long fileCount, bool mergeDatafiles,
