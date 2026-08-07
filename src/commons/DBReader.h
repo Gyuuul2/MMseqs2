@@ -215,7 +215,9 @@ public:
 
     char* getUnpadded(size_t id, int thrIdx);
 
-    char* getDataUncompressed(size_t id);
+    // thrIdx selects the bounce buffer in USE_DIRECT_IO mode, -1 falls back to omp_get_thread_num()
+    // in USE_DIRECT_IO mode the returned pointer stays valid until the next call on the same thrIdx
+    char* getDataUncompressed(size_t id, int thrIdx = -1);
 
     void touchData(size_t id);
 
@@ -316,6 +318,8 @@ public:
     static const unsigned int USE_LOOKUP_REV = 16;
     static const unsigned int USE_SOURCE     = 32;
     static const unsigned int USE_SOURCE_REV = 64;
+    // per-entry pread with the page cache bypassed, for databases far larger than RAM
+    static const unsigned int USE_DIRECT_IO  = 128;
 
 
     // compressed
@@ -323,6 +327,10 @@ public:
     static const int COMPRESSED     = 1;
 
     char * getDataForFile(size_t fileIdx){
+        if (dataMode & USE_DIRECT_IO) {
+            Debug(Debug::ERROR) << "getDataForFile is not supported in USE_DIRECT_IO mode, the data file is not mapped\n";
+            EXIT(EXIT_FAILURE);
+        }
         return dataFiles[fileIdx];
     }
 
@@ -503,6 +511,13 @@ public:
 private:
     void checkClosed() const;
 
+    int openDirect(const char *fileName, size_t *dataSize);
+
+    char* readDirect(size_t offset, size_t length, int thrIdx);
+
+    // grows one thread's bounce buffer, alignment 1 means malloc, keepBytes are carried over
+    void growBuffer(char** buffer, size_t* capacity, size_t needed, size_t alignment, size_t keepBytes);
+
     int threads;
 
     int dataMode;
@@ -515,6 +530,17 @@ private:
 
     // offset for all datafiles
     char** dataFiles;
+    // USE_DIRECT_IO only: dataFiles stays NULL and entries are pread from these descriptors
+    int* dataFds;
+    // an aligned read covers whole blocks, so neighbouring entries are already in the buffer
+    struct DirectBuffer {
+        char* buffer;
+        size_t size;    // capacity, grown on demand so it never has to cover the largest entry
+        size_t file;
+        size_t offset;  // aligned file offset the buffer was filled from
+        size_t length;  // bytes valid in the buffer, 0 when empty
+    };
+    DirectBuffer* directBuffers;
     size_t * dataSizeOffset;
     size_t dataFileCnt;
     size_t totalDataSize;

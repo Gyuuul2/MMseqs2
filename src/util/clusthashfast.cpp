@@ -169,9 +169,7 @@ static size_t hashRunEnd(const HashEntry *entries, size_t entryCount, size_t run
     return runEnd;
 }
 
-// Only members of runs longer than one are ever compared, and in hash order those reads are scattered
-// over the whole db. Copying just them out in id order is one sequential pass and leaves the pairwise
-// comparison reading nothing but memory, so no pass here ever needs the page cache to cooperate.
+// only multi-member runs are ever compared, and gathering just those in id order is one sequential pass
 struct MemberArena {
     static const size_t BLOCK = 64;
 
@@ -192,8 +190,7 @@ struct MemberArena {
         std::vector<size_t>().swap(blockOffset);
     }
 
-    // the block base plus the lengths of the gathered members before this one, so per id offsets
-    // never have to be materialised
+    // the block base plus the lengths gathered before it, so per id offsets are never materialised
     size_t offsetOf(DBReader<DBKeyType> &reader, DBLocalId id) const {
         const size_t word = id / BLOCK;
         const size_t bit = id % BLOCK;
@@ -245,13 +242,30 @@ static size_t planArena(DBReader<DBKeyType> &reader, MemberArena &arena, const H
         }
         arena.blockOffset[word] = sum;
     }
-    size_t total = 0;
-    for (size_t word = 0; word < blocks; ++word) {
-        const size_t size = arena.blockOffset[word];
-        arena.blockOffset[word] = total;
-        total += size;
+    // a serial scan over the whole id space would dominate once there are many partitions to plan
+    const size_t stripe = (blocks + threads - 1) / static_cast<size_t>(threads);
+    std::vector<size_t> stripeBase(static_cast<size_t>(threads) + 1, 0);
+#pragma omp parallel for schedule(static, 1) num_threads(threads)
+    for (int t = 0; t < threads; ++t) {
+        size_t sum = 0;
+        for (size_t word = t * stripe; word < std::min(blocks, (t + 1) * stripe); ++word) {
+            sum += arena.blockOffset[word];
+        }
+        stripeBase[t + 1] = sum;
     }
-    return total;
+    for (int t = 0; t < threads; ++t) {
+        stripeBase[t + 1] += stripeBase[t];
+    }
+#pragma omp parallel for schedule(static, 1) num_threads(threads)
+    for (int t = 0; t < threads; ++t) {
+        size_t running = stripeBase[t];
+        for (size_t word = t * stripe; word < std::min(blocks, (t + 1) * stripe); ++word) {
+            const size_t size = arena.blockOffset[word];
+            arena.blockOffset[word] = running;
+            running += size;
+        }
+    }
+    return stripeBase[threads];
 }
 
 // one sequential pass over the db, each thread copying its own contiguous id range into the arena
@@ -265,8 +279,7 @@ static void fillArena(DBReader<DBKeyType> &reader, MemberArena &arena, size_t to
 #ifdef OPENMP
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-        // schedule(static) gives a thread one contiguous word range, so with an offset sorted index
-        // its byte range is contiguous and disjoint from every other thread's
+        // schedule(static) gives each thread one contiguous, disjoint word range and byte range
 #pragma omp for schedule(static)
         for (size_t word = 0; word < blocks; ++word) {
             uint64_t set = arena.bits[word];
@@ -460,11 +473,7 @@ static ClusterCounts clusterPartition(DBReader<DBKeyType> &reader, DBWriter &wri
     return counts;
 }
 
-// Sorting every hash at once needs 16 byte per sequence resident while the sort streams the whole
-// array, which at ten billion sequences competes with the reader index for memory and swaps. Runs are
-// independent and never straddle a hash, so partitioning on the high hash bits and sorting one
-// partition at a time gives the same grouping with a bounded footprint. Ascending partitions also
-// keep the runs in the same global hash order they had before, so the output order is unchanged.
+// a run never straddles a hash, so ascending high-bit partitions sort in bounded memory in hash order
 struct HashPartitions {
     std::vector<FILE *> files;
     std::vector<std::string> names;
@@ -530,8 +539,7 @@ static bool hashIntoPartitions(DBReader<DBKeyType> &reader, HashPartitions &part
     const size_t dbSize = reader.getSize();
     const size_t scanChunk = idScanBlock(reader, dbSize, threads);
     const unsigned int partitionCount = static_cast<unsigned int>(parts.files.size());
-    // partitioning exists to bound memory, so the write buffers get a fixed budget rather than a
-    // fixed depth: a per partition depth would grow the footprint by the very factor it is dividing by
+    // a fixed byte budget, not a fixed depth: per partition depth would grow what it is dividing
     const size_t flush = std::max<size_t>(64, CLUSTHASHFAST_PENDING_BYTES
                                               / (partitionCount * sizeof(HashEntry)));
     std::vector<std::mutex> locks(partitionCount);

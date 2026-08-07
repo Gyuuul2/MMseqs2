@@ -10,6 +10,14 @@
 #include <sys/stat.h>
 
 #include <fcntl.h>
+#include <unistd.h>
+
+// O_DIRECT needs offset, length and buffer address block aligned, 4096 covers 512e and 4Kn devices
+static const size_t DIRECT_IO_ALIGN = 4096;
+// a per-thread bounce buffer starts here and grows on demand, so one huge entry cannot preallocate threads*maxSeqLen
+static const size_t BOUNCE_BUFFER_PREALLOC = 64 * 1024;
+// smallest room left for one ZSTD_decompressStream call, so a nearly full buffer cannot creep forward
+static const size_t DECOMPRESS_MIN_ROOM = 4096;
 
 #include "MemoryMapped.h"
 #include "Debug.h"
@@ -24,7 +32,8 @@
 template <typename T>
 DBReader<T>::DBReader(const char* dataFileName_, const char* indexFileName_, int threads, int dataMode) :
 threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
-        indexFileName(strdup(indexFileName_)), size(0), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0),
+        indexFileName(strdup(indexFileName_)), size(0), dataFiles(NULL), dataFds(NULL), directBuffers(NULL),
+        dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), index(NULL), id2local(NULL), local2id(NULL),
         dataMapped(false), accessType(0), externalData(false), didMlock(false)
@@ -34,7 +43,8 @@ template <typename T>
 DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T lastKey,
         int dbType, unsigned int maxSeqLen, int threads) :
         threads(threads), dataMode(USE_INDEX), dataFileName(NULL), indexFileName(NULL),
-        size(size), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
+        size(size), dataFiles(NULL), dataFds(NULL), directBuffers(NULL),
+        dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index), sortedByOffset(true),
         id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
 {}
@@ -52,7 +62,7 @@ void DBReader<T>::setDataFile(const char* dataFileName_)  {
 
 template <typename T>
 void DBReader<T>::readMmapedDataInMemory(){
-    if ((dataMode & USE_DATA) && (dataMode & USE_FREAD) == 0) {
+    if ((dataMode & USE_DATA) && (dataMode & (USE_FREAD | USE_DIRECT_IO)) == 0) {
         //Debug(Debug::INFO) << "Touch data file " << dataFileName << "\n";
         for(size_t fileIdx = 0; fileIdx < dataFileCnt; fileIdx++){
             size_t dataSize = dataSizeOffset[fileIdx+1]-dataSizeOffset[fileIdx];
@@ -64,7 +74,7 @@ void DBReader<T>::readMmapedDataInMemory(){
 
 template <typename T>
 void DBReader<T>::mlock(){
-    if (dataMode & USE_DATA) {
+    if ((dataMode & USE_DATA) && (dataMode & USE_DIRECT_IO) == 0) {
         if (didMlock == false) {
             for(size_t fileIdx = 0; fileIdx < dataFileCnt; fileIdx++) {
                 size_t dataSize = dataSizeOffset[fileIdx+1]-dataSizeOffset[fileIdx];
@@ -104,6 +114,11 @@ template <typename T> bool DBReader<T>::open(int accessType){
     if (dataFileName != NULL) {
         dbtype = FileUtil::parseDbType(dataFileName);
     }
+    if ((dataMode & USE_DIRECT_IO) && (dataMode & USE_WRITABLE)) {
+        // writes would land in a bounce buffer and be dropped on the next read
+        Debug(Debug::ERROR) << "USE_WRITABLE cannot be combined with USE_DIRECT_IO\n";
+        EXIT(EXIT_FAILURE);
+    }
     if (dataMode & USE_DATA) {
         dataFileNames = FileUtil::findDatafiles(dataFileName);
         if (dataFileNames.empty()) {
@@ -114,7 +129,18 @@ template <typename T> bool DBReader<T>::open(int accessType){
         dataFileCnt = dataFileNames.size();
         dataSizeOffset = new size_t[dataFileNames.size() + 1];
         dataFiles = new char*[dataFileNames.size()];
+        if (dataMode & USE_DIRECT_IO) {
+            dataFds = new int[dataFileNames.size()];
+        }
         for(size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++){
+            if (dataMode & USE_DIRECT_IO) {
+                size_t directDataSize;
+                dataFds[fileIdx] = openDirect(dataFileNames[fileIdx].c_str(), &directDataSize);
+                dataFiles[fileIdx] = NULL;
+                dataSizeOffset[fileIdx] = totalDataSize;
+                totalDataSize += directDataSize;
+                continue;
+            }
             FILE* dataFile = fopen(dataFileNames[fileIdx].c_str(), "r");
             if (dataFile == NULL) {
                 Debug(Debug::ERROR) << "Cannot open data file " << dataFileName << "!\n";
@@ -209,19 +235,39 @@ template <typename T> bool DBReader<T>::open(int accessType){
     compression = isCompressed(dbtype);
     padded = (getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_GPU);
 
+    if ((dataMode & USE_DATA) && (dataMode & USE_DIRECT_IO)) {
+        if (compression == COMPRESSED) {
+            // a compressed index stores the decompressed length, so it cannot bound the read
+            Debug(Debug::ERROR) << "USE_DIRECT_IO cannot read the compressed database " << dataFileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        // readIndex already tracked max index[i].length here, so do not walk the index again
+        const size_t maxEntryLen = maxSeqLen;
+        // the entry can start one byte after an aligned boundary and end one byte before the next
+        const size_t maxRead = ((maxEntryLen + 2 * DIRECT_IO_ALIGN - 1) / DIRECT_IO_ALIGN) * DIRECT_IO_ALIGN;
+        const size_t initialSize = std::min(maxRead, BOUNCE_BUFFER_PREALLOC);
+        directBuffers = new DirectBuffer[threads];
+        for (int i = 0; i < threads; i++) {
+            directBuffers[i].buffer = NULL;
+            directBuffers[i].size = 0;
+            directBuffers[i].file = 0;
+            directBuffers[i].offset = 0;
+            directBuffers[i].length = 0;
+            growBuffer(&directBuffers[i].buffer, &directBuffers[i].size, initialSize, DIRECT_IO_ALIGN, 0);
+        }
+    }
+
     if(compression == COMPRESSED || padded){
         compressedBufferSizes = new size_t[threads];
         compressedBuffers = new char*[threads];
         dstream = new ZSTD_DStream*[threads];
         for(int i = 0; i < threads; i++){
-            // allocated buffer
-            compressedBufferSizes[i] = std::max(maxSeqLen+2, 1024u);
-            compressedBuffers[i] = (char*) malloc(compressedBufferSizes[i]);
-            incrementMemory(compressedBufferSizes[i]);
-            if(compressedBuffers[i]==NULL){
-                Debug(Debug::ERROR) << "Cannot allocate compressedBuffer!\n";
-                EXIT(EXIT_FAILURE);
-            }
+            // allocated buffer, grown on demand from here by getDataCompressed and getUnpadded
+            compressedBufferSizes[i] = 0;
+            compressedBuffers[i] = NULL;
+            const size_t wanted = std::max(static_cast<size_t>(maxSeqLen) + 2, (size_t) 1024);
+            growBuffer(&compressedBuffers[i], &compressedBufferSizes[i],
+                       std::min(wanted, BOUNCE_BUFFER_PREALLOC), 1, 0);
             dstream[i] = ZSTD_createDStream();
             if (dstream==NULL) {
                 Debug(Debug::ERROR) << "ZSTD_createDStream() error \n";
@@ -493,8 +539,129 @@ template <typename T> char* DBReader<T>::mmapData(FILE * file, size_t *dataSize)
     }
 }
 
+template <typename T>
+void DBReader<T>::growBuffer(char** buffer, size_t* capacity, size_t needed, size_t alignment, size_t keepBytes) {
+    if (needed <= *capacity) {
+        return;
+    }
+    // doubling bounds the number of allocations, posix_memalign is slow under contention
+    size_t newCapacity = std::max(needed, *capacity * 2);
+    if (alignment > 1) {
+        newCapacity = ((newCapacity + alignment - 1) / alignment) * alignment;
+    }
+    char* mem;
+    if (alignment > 1) {
+        void* aligned = NULL;
+        if (posix_memalign(&aligned, alignment, newCapacity) != 0) {
+            aligned = NULL;
+        }
+        mem = static_cast<char*>(aligned);
+    } else {
+        mem = static_cast<char*>(malloc(newCapacity));
+    }
+    if (mem == NULL) {
+        Debug(Debug::ERROR) << "Cannot allocate " << newCapacity << " byte buffer in DBReader!\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (keepBytes > 0) {
+        memcpy(mem, *buffer, keepBytes);
+    }
+    size_t freed = 0;
+    if (*buffer != NULL) {
+        free(*buffer);
+        freed = *capacity;
+    }
+    // threads grow their own buffers concurrently, so the shared counter needs an atomic update here
+    __sync_fetch_and_add(&totalMemorySizeInst, newCapacity - freed);
+    *buffer = mem;
+    *capacity = newCapacity;
+}
+
+template <typename T> int DBReader<T>::openDirect(const char *fileName, size_t *dataSize) {
+#if defined(O_DIRECT)
+    int fd = ::open(fileName, O_RDONLY | O_DIRECT);
+    if (fd < 0 && (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP)) {
+        // tmpfs and some network filesystems reject O_DIRECT, the reads stay correct without it
+        fd = ::open(fileName, O_RDONLY);
+    }
+#else
+    int fd = ::open(fileName, O_RDONLY);
+#endif
+    if (fd < 0) {
+        int errsv = errno;
+        Debug(Debug::ERROR) << "Cannot open data file " << fileName << " for direct IO. Error " << errsv << ".\n";
+        EXIT(EXIT_FAILURE);
+    }
+#if !defined(O_DIRECT) && defined(F_NOCACHE)
+    fcntl(fd, F_NOCACHE, 1);
+#endif
+    struct stat sb;
+    if (fstat(fd, &sb) < 0) {
+        int errsv = errno;
+        Debug(Debug::ERROR) << "Failed to fstat File=" << fileName << ". Error " << errsv << ".\n";
+        EXIT(EXIT_FAILURE);
+    }
+    *dataSize = sb.st_size;
+    return fd;
+}
+
+template <typename T> char* DBReader<T>::readDirect(size_t offset, size_t length, int thrIdx) {
+    if (thrIdx < 0) {
+#ifdef OPENMP
+        thrIdx = omp_get_thread_num();
+#else
+        thrIdx = 0;
+#endif
+    }
+    if (thrIdx >= threads) {
+        Debug(Debug::ERROR) << "readDirect: thread index (" << thrIdx << ") >= threads (" << threads << ")\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (offset >= totalDataSize) {
+        Debug(Debug::ERROR) << "Invalid database read for database data file=" << dataFileName << ", database index=" << indexFileName << "\n";
+        Debug(Debug::ERROR) << "Size of data: " << totalDataSize << "\n";
+        Debug(Debug::ERROR) << "Requested offset: " << offset << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    size_t cnt = 0;
+    while ((offset >= dataSizeOffset[cnt] && offset < dataSizeOffset[cnt+1]) == false) {
+        cnt++;
+    }
+    size_t fileOffset = offset - dataSizeOffset[cnt];
+    size_t alignedOffset = fileOffset & ~(DIRECT_IO_ALIGN - 1);
+    size_t delta = fileOffset - alignedOffset;
+    size_t readLen = (delta + length + DIRECT_IO_ALIGN - 1) & ~(DIRECT_IO_ALIGN - 1);
+    DirectBuffer &buf = directBuffers[thrIdx];
+    // a 4K aligned read holds many short entries, so offset-ordered access mostly hits here
+    if (buf.length > 0 && buf.file == cnt && alignedOffset >= buf.offset
+        && (alignedOffset - buf.offset) + delta + length <= buf.length) {
+        return buf.buffer + (alignedOffset - buf.offset) + delta;
+    }
+    if (readLen > buf.size) {
+        // the cached block is gone with the old allocation
+        buf.length = 0;
+        growBuffer(&buf.buffer, &buf.size, readLen, DIRECT_IO_ALIGN, 0);
+    }
+    // reading past the end of the file returns a short count, the entry itself is still fully covered
+    ssize_t read;
+    do {
+        read = pread(dataFds[cnt], buf.buffer, readLen, alignedOffset);
+    } while (read < 0 && errno == EINTR);
+    if (read < 0 || static_cast<size_t>(read) < delta + length) {
+        int errsv = errno;
+        buf.length = 0;
+        Debug(Debug::ERROR) << "Failed to read " << length << " bytes at offset " << offset
+                            << " from " << dataFileNames[cnt] << ". Error " << errsv << ".\n";
+        EXIT(EXIT_FAILURE);
+    }
+    buf.file = cnt;
+    buf.offset = alignedOffset;
+    buf.length = static_cast<size_t>(read);
+    return buf.buffer + delta;
+}
+
 template <typename T> void DBReader<T>::remapData(){
-    if ((dataMode & USE_DATA) && (dataMode & USE_FREAD) == 0) {
+    if ((dataMode & USE_DATA) && (dataMode & (USE_FREAD | USE_DIRECT_IO)) == 0) {
         unmapData();
         for(size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++){
             FILE* dataFile = fopen(dataFileNames[fileIdx].c_str(), "r");
@@ -531,6 +698,15 @@ template <typename T> void DBReader<T>::close(){
         decrementMemory(size*sizeof(unsigned int));
     }
 
+    if(directBuffers){
+        for(int i = 0; i < threads; i++){
+            free(directBuffers[i].buffer);
+            decrementMemory(directBuffers[i].size);
+        }
+        delete [] directBuffers;
+        directBuffers = NULL;
+    }
+
     if(compressedBuffers){
         for(int i = 0; i < threads; i++){
             ZSTD_freeDStream(dstream[i]);
@@ -540,6 +716,9 @@ template <typename T> void DBReader<T>::close(){
         delete [] compressedBuffers;
         delete [] compressedBufferSizes;
         delete [] dstream;
+        compressedBuffers = NULL;
+        compressedBufferSizes = NULL;
+        dstream = NULL;
     }
 
     if(externalData == false) {
@@ -558,7 +737,7 @@ template <typename T> size_t DBReader<T>::bsearch(const Index * index, size_t N,
 
 
 template <typename T> char* DBReader<T>::getUnpadded(size_t id, int thrIdx) {
-    char *data = getDataUncompressed(id);
+    char *data = getDataUncompressed(id, thrIdx);
     size_t seqLen = getSeqLen(id);
 
     static const char CODE_TO_CHAR[21] = {
@@ -571,6 +750,7 @@ template <typename T> char* DBReader<T>::getUnpadded(size_t id, int thrIdx) {
             'W', /* 18 */ 'Y', /* 19 */ 'X'  /* 20 */
     };
 
+    growBuffer(&compressedBuffers[thrIdx], &compressedBufferSizes[thrIdx], seqLen + 2, 1, 0);
     for(size_t i = 0; i < seqLen; i++){
         unsigned char code = static_cast<unsigned char>(data[i]);
         unsigned char baseCode = (code >= 32) ? code - 32 : code;
@@ -583,7 +763,7 @@ template <typename T> char* DBReader<T>::getUnpadded(size_t id, int thrIdx) {
 }
 
 template <typename T> char* DBReader<T>::getDataCompressed(size_t id, int thrIdx) {
-    char *data = getDataUncompressed(id);
+    char *data = getDataUncompressed(id, thrIdx);
 
     unsigned int cSize = *(reinterpret_cast<unsigned int *>(data));
 
@@ -594,7 +774,11 @@ template <typename T> char* DBReader<T>::getDataCompressed(size_t id, int thrIdx
     if(isCompressed){
         ZSTD_inBuffer input = {cBuff, cSize, 0};
         while (input.pos < input.size) {
-            ZSTD_outBuffer output = {compressedBuffers[thrIdx], compressedBufferSizes[thrIdx], 0};
+            // the decompressed size is only known once the frame is consumed, so append and grow
+            growBuffer(&compressedBuffers[thrIdx], &compressedBufferSizes[thrIdx],
+                       totalSize + 1 + DECOMPRESS_MIN_ROOM, 1, totalSize);
+            ZSTD_outBuffer output = {compressedBuffers[thrIdx] + totalSize,
+                                     compressedBufferSizes[thrIdx] - totalSize - 1, 0};
             // size of next compressed block
             size_t toRead = ZSTD_decompressStream(dstream[thrIdx], &output, &input);
             if (ZSTD_isError(toRead)) {
@@ -605,6 +789,7 @@ template <typename T> char* DBReader<T>::getDataCompressed(size_t id, int thrIdx
         }
         compressedBuffers[thrIdx][totalSize] = '\0';
     }else{
+        growBuffer(&compressedBuffers[thrIdx], &compressedBufferSizes[thrIdx], cSize + 1, 1, 0);
         memcpy(compressedBuffers[thrIdx], cBuff, cSize);
         compressedBuffers[thrIdx][cSize] = '\0';
     }
@@ -628,11 +813,11 @@ template <typename T> char* DBReader<T>::getData(size_t id, int thrIdx){
     }else if (padded) {
         return getUnpadded(id, thrIdx);
     } else {
-        return getDataUncompressed(id);
+        return getDataUncompressed(id, thrIdx);
     }
 }
 
-template <typename T> char* DBReader<T>::getDataUncompressed(size_t id){
+template <typename T> char* DBReader<T>::getDataUncompressed(size_t id, int thrIdx){
     checkClosed();
     if(!(dataMode & USE_DATA)) {
         Debug(Debug::ERROR) << "DBReader is just open in INDEXONLY mode. Call of getData is not allowed" << "\n";
@@ -645,14 +830,18 @@ template <typename T> char* DBReader<T>::getDataUncompressed(size_t id){
     }
 
 
-    if (local2id != NULL) {
-        return getDataByOffset(index[local2id[id]].offset);
-    }else{
-        return getDataByOffset(index[id].offset);
+    size_t localId = (local2id != NULL) ? local2id[id] : id;
+    if (dataMode & USE_DIRECT_IO) {
+        return readDirect(index[localId].offset, index[localId].length, thrIdx);
     }
+    return getDataByOffset(index[localId].offset);
 }
 
 template <typename T> char* DBReader<T>::getDataByOffset(size_t offset) {
+    if (dataMode & USE_DIRECT_IO) {
+        Debug(Debug::ERROR) << "getDataByOffset is not supported in USE_DIRECT_IO mode, the entry length is unknown\n";
+        EXIT(EXIT_FAILURE);
+    }
     if (offset >= totalDataSize){
         Debug(Debug::ERROR) << "Invalid database read for database data file=" << dataFileName << ", database index=" << indexFileName << "\n";
         Debug(Debug::ERROR) << "Size of data: " << totalDataSize << "\n";
@@ -669,7 +858,7 @@ template <typename T> char* DBReader<T>::getDataByOffset(size_t offset) {
 
 template <typename T>
 void DBReader<T>::touchData(size_t id) {
-    if((dataMode & USE_DATA) && (dataMode & USE_FREAD) == 0) {
+    if((dataMode & USE_DATA) && (dataMode & (USE_FREAD | USE_DIRECT_IO)) == 0) {
         char *data = getDataUncompressed(id);
         size_t currDataOffset = getOffset(id);
         size_t nextDataOffset = findNextOffsetid(id);
@@ -680,13 +869,11 @@ void DBReader<T>::touchData(size_t id) {
 
 template <typename T> char* DBReader<T>::getDataByDBKey(T dbKey, int thrIdx) {
     size_t id = getId(dbKey);
-    if(compression == COMPRESSED ){
-        return (id != DB_ENTRY_NOT_FOUND) ? getDataCompressed(id, thrIdx) : NULL;
-    } if(padded) {
-        return (id != DB_ENTRY_NOT_FOUND) ? getUnpadded(id, thrIdx) : NULL;
-    } else{
-        return (id != DB_ENTRY_NOT_FOUND) ? getDataByOffset(index[id].offset) : NULL;
+    if (id == DB_ENTRY_NOT_FOUND) {
+        return NULL;
     }
+    // getId returns a local id, so the offset lookup has to go through getData, not through index[id]
+    return getData(id, thrIdx);
 }
 
 template <typename T> size_t DBReader<T>::getLookupSize() const {
@@ -849,7 +1036,8 @@ template <typename T> size_t DBReader<T>::maxCount(char c) {
     checkClosed();
 
     size_t max = 0;
-    if (compression == COMPRESSED) {
+    // the direct io mode has no mapping to scan, so it counts per entry like the compressed mode does
+    if (compression == COMPRESSED || (dataMode & USE_DIRECT_IO)) {
         size_t entries = getSize();
 #ifdef OPENMP
         size_t localThreads = std::max(std::min(entries, static_cast<size_t>(threads)), (size_t)1);
@@ -989,7 +1177,22 @@ DBKeyType DBReader<DBKeyType>::indexIdToNum(DBKeyType * id) {
 }
 
 template <typename T> void DBReader<T>::unmapData() {
-    if (dataMapped == true) {
+    if (dataMapped == true && (dataMode & USE_DIRECT_IO)) {
+        for(size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+            if (::close(dataFds[fileIdx]) != 0) {
+                Debug(Debug::ERROR) << "Cannot close file " << dataFileNames[fileIdx] << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+        delete[] dataFds;
+        dataFds = NULL;
+        // the cached blocks belong to the descriptors that were just closed
+        if (directBuffers != NULL) {
+            for (int i = 0; i < threads; i++) {
+                directBuffers[i].length = 0;
+            }
+        }
+    } else if (dataMapped == true) {
         for(size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
             size_t fileSize = dataSizeOffset[fileIdx+1] -dataSizeOffset[fileIdx];
             if(fileSize > 0) {
@@ -1127,6 +1330,9 @@ int DBReader<T>::isCompressed(int dbtype) {
 
 template<typename T>
 void DBReader<T>::setSequentialAdvice() {
+    if (dataMode & (USE_FREAD | USE_DIRECT_IO)) {
+        return;
+    }
     for(size_t i = 0; i < dataFileCnt; i++){
         size_t dataSize = dataSizeOffset[i+1] - dataSizeOffset[i];
         Util::madviseLogged(dataFiles[i], dataSize, POSIX_MADV_SEQUENTIAL, dataFileName);

@@ -3,6 +3,7 @@
 #include "Matcher.h"
 #include "Debug.h"
 #include "DBReader.h"
+#include "BatchEntryFetcher.h"
 #include "DBWriter.h"
 #include "QueryMatcher.h"
 #include "FastSort.h"
@@ -14,6 +15,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
+#include <cstring>
 #include <sys/mman.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -298,7 +300,7 @@ static void (*clusterThreadFunc)(ClusterAssignment*) = nullptr;
 
 void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
     while (true) {
-        size_t drained = 0;
+        bool drained = false;
         std::unique_lock<std::mutex> lock(clusterMutex);
         
         clusterCondition.wait(lock, [] {
@@ -313,7 +315,7 @@ void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
             reorderFilled[slot] = 0;
             reorderBufferedCount--;
             currentProcessPosition++;
-            drained++;
+            drained = true;
             currentPrefSize = result.prefSize;
 
             if (result.memberIds.size() > 1) {
@@ -375,7 +377,7 @@ void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
         // the mutex during the copy so worker threads can keep pushing results.
         lock.unlock();
         // one wake per drained round, issued while the lock is free
-        if (drained > 0) {
+        if (drained) {
             reorderSpaceCondition.notify_all();
         }
         compactSetCoverMemberPool();
@@ -394,7 +396,6 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
     std::vector<ClusterResult> drainedResults;
     std::vector<DBLocalId> validMemberIds;
     while (true) {
-        size_t drained = 0;
         bool lastRound = false;
         drainedResults.clear();
         {
@@ -414,12 +415,11 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
                 reorderFilled[slot] = 0;
                 reorderBufferedCount--;
                 currentProcessPosition++;
-                drained++;
             }
         }
 
         // one wake per drained round, issued while the lock is free
-        if (drained > 0) {
+        if (drainedResults.empty() == false) {
             reorderSpaceCondition.notify_all();
         }
 
@@ -452,63 +452,30 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
     }
 }
 
-// Reading the random entries with pread keeps them out of the fault path: no page table entry per
-// page, no TLB shootdown across the cores that evict it, and fadvise can reclaim what nothing has
-// mapped. mmap still wins for sequential passes, so this is only used where access is by key.
-struct EntryReader {
-    std::vector<int> fds;
-    std::vector<size_t> fileBase;      // first global offset held by each data file
-    std::vector<std::string> buffers;  // one per thread, reused
-    bool enabled;
+// the original prefetch: ask the kernel to fault the whole surviving set in, no io threads needed
+static void prefetchBody(DBReader<DBKeyType> *reader, size_t id) {
+    static const size_t pageSize = Util::getPageSize();
+    char *data = reader->getDataUncompressed(id);
+    const size_t len = reader->getEntryLen(id);
+    const uintptr_t start = reinterpret_cast<uintptr_t>(data) & ~(pageSize - 1);
+    posix_madvise(reinterpret_cast<void *>(start),
+                  len + (reinterpret_cast<uintptr_t>(data) - start), POSIX_MADV_WILLNEED);
+}
 
-    EntryReader() : enabled(false) {}
-
-    ~EntryReader() {
-        for (size_t i = 0; i < fds.size(); i++) {
-            if (fds[i] >= 0) {
-                close(fds[i]);
-            }
-        }
+// MMSEQS_A2C_IO picks the random-read strategy: mmap faults, madvise prefetch, or batched O_DIRECT
+static int align2clustIoMode() {
+    const char *mode = getenv("MMSEQS_A2C_IO");
+    if (mode == NULL) {
+        return 2;
     }
-
-    // compressed entries come back through the reader's own decompression buffer, so leave those alone
-    void open(DBReader<DBKeyType> *reader, unsigned int threads) {
-        if (reader == NULL || reader->isCompressed() != 0 || reader->getDataFileCnt() == 0) {
-            return;
-        }
-        std::vector<std::string> names = reader->getDataFileNames();
-        size_t offset = 0;
-        for (size_t i = 0; i < names.size(); i++) {
-            const int fd = ::open(names[i].c_str(), O_RDONLY);
-            if (fd < 0) {
-                return;
-            }
-            fds.push_back(fd);
-            fileBase.push_back(offset);
-            offset += reader->getDataSizeForFile(i);
-        }
-        buffers.resize(threads);
-        enabled = true;
+    if (strcmp(mode, "mmap") == 0) {
+        return 0;
     }
-
-    char *get(DBReader<DBKeyType> *reader, size_t id, unsigned int threadIdx) {
-        if (enabled == false) {
-            return reader->getData(id, threadIdx);
-        }
-        const size_t offset = reader->getIndex()[id].offset;
-        size_t file = fileBase.size() - 1;
-        while (file > 0 && fileBase[file] > offset) {
-            file--;
-        }
-        const size_t length = reader->getEntryLen(id);
-        std::string &buffer = buffers[threadIdx];
-        buffer.resize(length + 1);
-        // a db linked from its source can be one byte short of the entry terminator, so terminate here
-        const ssize_t read = pread(fds[file], &buffer[0], length, static_cast<off_t>(offset - fileBase[file]));
-        buffer[(read > 0) ? static_cast<size_t>(read) : 0] = '\0';
-        return &buffer[0];
+    if (strcmp(mode, "willneed") == 0) {
+        return 1;
     }
-};
+    return 2;
+}
 
 // keyed access over a file-ordered layout, where the kernel's guess readaheads a window per miss
 static void adviseRandom(DBReader<DBKeyType> *reader) {
@@ -537,16 +504,6 @@ static void dropCache(DBReader<DBKeyType> *reader) {
         close(fd);
     }
 #endif
-}
-
-// one fault per scattered entry, so ask for the whole prefilter list at once and let them overlap
-static void prefetchBody(DBReader<DBKeyType> *reader, size_t id) {
-    static const size_t pageSize = Util::getPageSize();
-    char *data = reader->getDataUncompressed(id);
-    const size_t len = reader->getEntryLen(id);
-    const uintptr_t start = reinterpret_cast<uintptr_t>(data) & ~(pageSize - 1);
-    posix_madvise(reinterpret_cast<void *>(start),
-                  len + (reinterpret_cast<uintptr_t>(data) - start), POSIX_MADV_WILLNEED);
 }
 
 // each drop walks the cached extent, so bound how many the run pays for
@@ -603,8 +560,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     
     ClusterAssignment *assignedCluster = new(std::nothrow) ClusterAssignment[dbSize];
     Util::checkAllocation(assignedCluster, "Can not allocate assignedCluster memory in Align2Clust");
-    // one thread would first-touch the whole array, which on a multi socket box also lands every page
-    // on a single node for the rest of the run
+    // parallel first touch, so the pages are not all faulted onto one node by one thread
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < dbSize; ++i) {
         storeAssignedCluster(assignedCluster, i, DB_LOCAL_ID_INVALID);
@@ -658,7 +614,28 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     PrefInfo *prefRepSizePair = nullptr;
     DBLocalId *lengthOrder = nullptr;
 
-    if (mode != Parameters::SET_COVER) {
+    if (mode == Parameters::SET_COVER) {
+        prefRepSizePair = new(std::nothrow) PrefInfo[dbSize];
+        Util::checkAllocation(prefRepSizePair, "Can not allocate prefRepSizePair memory in ClusteringAlgorithms::execute");
+
+#pragma omp parallel
+        {
+            int thread_idx = 0;
+#ifdef OPENMP
+            thread_idx = omp_get_thread_num();
+#endif
+#pragma omp for schedule(dynamic, 1000)
+            for (size_t i = 0; i < seqDbr->getSize(); i++) {
+                const DBKeyType clusterId = seqDbr->getDbKey(i);
+                const size_t alnId = requireId(alnDbr.getId(clusterId), "Alignment DB", clusterId);
+                const char *data = alnDbr.getData(alnId, thread_idx);
+                const size_t dataSize = alnDbr.getEntryLen(alnId);
+                prefRepSizePair[i].id = i;
+                prefRepSizePair[i].size = (*data == '\0') ? 1 : Util::countLines(data, dataSize);
+            }
+        }
+        SORT_PARALLEL(prefRepSizePair, prefRepSizePair + dbSize, PrefInfo::compareBySizeAndId);
+    } else {
         // NOSORT drops the reader's length order, so materialise it from a fused (length, id) array
         std::pair<unsigned int, DBLocalId> *sortForLength =
             new(std::nothrow) std::pair<unsigned int, DBLocalId>[dbSize];
@@ -686,29 +663,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         delete[] sortForLength;
     }
 
-    if (mode == Parameters::SET_COVER) {
-        prefRepSizePair = new(std::nothrow) PrefInfo[dbSize];
-        Util::checkAllocation(prefRepSizePair, "Can not allocate prefRepSizePair memory in ClusteringAlgorithms::execute");
-        
-#pragma omp parallel
-        {
-            int thread_idx = 0;
-#ifdef OPENMP
-            thread_idx = omp_get_thread_num();
-#endif
-#pragma omp for schedule(dynamic, 1000)
-            for (size_t i = 0; i < seqDbr->getSize(); i++) {
-                const DBKeyType clusterId = seqDbr->getDbKey(i);
-                const size_t alnId = requireId(alnDbr.getId(clusterId), "Alignment DB", clusterId);
-                const char *data = alnDbr.getData(alnId, thread_idx);
-                const size_t dataSize = alnDbr.getEntryLen(alnId);
-                prefRepSizePair[i].id = i;
-                prefRepSizePair[i].size = (*data == '\0') ? 1 : Util::countLines(data, dataSize);
-            }
-        }
-        SORT_PARALLEL(prefRepSizePair, prefRepSizePair + dbSize, PrefInfo::compareBySizeAndId);
-    }
-
     timer.reset();
 
     size_t endRange = (mode == Parameters::SET_COVER) ? dbSize : alnDbr.getSize();
@@ -723,15 +677,18 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                               > Util::computeMemory(par.splitMemoryLimit);
     const size_t prefDropInterval = std::max<size_t>(1, endRange / ALIGN2CLUST_PREF_DROPS);
     // both dbs are addressed by key here, so the fault path buys nothing for either
-    EntryReader seqReader;
-    EntryReader alnReader;
+    BatchEntryFetcher seqFetcher;
+    BatchEntryFetcher alnFetcher;
+    const int ioMode = align2clustIoMode();
+    const bool useFetcher = cacheStarved && ioMode == 2;
+    const bool useWillNeed = cacheStarved && ioMode == 1;
+    // the scattered sequence bodies are the reads worth queueing, so only they get io threads
+    seqFetcher.open(seqDbr, par.threads, BatchEntryFetcher::defaultIoThreads(par.threads),
+                    BatchEntryFetcher::DEFAULT_ARENA_CAP, useFetcher, useFetcher);
+    // one prefilter entry per representative, so this one always takes the inline single-read path
+    alnFetcher.open(&alnDbr, par.threads, 0, BatchEntryFetcher::DEFAULT_ARENA_CAP, false, cacheStarved);
+    // the filter dbs are the only ones still read through the mapping, the other two go through pread
     if (cacheStarved) {
-        seqReader.open(seqDbr, par.threads);
-        alnReader.open(&alnDbr, par.threads);
-    }
-    if (cacheStarved) {
-        adviseRandom(seqDbr);
-        adviseRandom(&alnDbr);
         adviseRandom(cluSeqDbr);
         adviseRandom(cluDbr);
     }
@@ -757,6 +714,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                  -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
         std::vector<std::pair<size_t, unsigned short>> targetsWithDiagonal;
         targetsWithDiagonal.reserve(1000);
+        // slot 0 is the query body, the rest are the targets that cleared the index-only gates
+        std::vector<size_t> prefetchIds;
+        std::vector<size_t> targetSlot;
 
         const bool includeAlignFiles = (alnWriter != nullptr);
         std::string queryCopy;
@@ -771,7 +731,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 #pragma omp for schedule(dynamic, 1) nowait
         for (size_t i = 0; i < endRange; i++) {
             progress.updateProgress();
-            // dropping consumed prefilter pages hands the cache to the bodies
             if (cacheStarved && i > 0 && (i % prefDropInterval) == 0) {
                 dropCache(&alnDbr);
             }
@@ -806,7 +765,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             }
 
             const size_t alignmentId = requireId(alnDbr.getId(queryKey), "Alignment DB", queryKey);
-            char *alignmentData = alnReader.get(&alnDbr, alignmentId, threadIdx);
+            alnFetcher.load(&alignmentId, 1, threadIdx);
+            // parsePrefilterHit and skipLine take char* but only read, so the cast adds no write
+            char *alignmentData = const_cast<char *>(alnFetcher.at(threadIdx, 0));
             size_t queryId = representativeId;
             // index-only, so it is known without faulting the body in; Sequence::mapSequence sets L to it
             const int queryLength = static_cast<int>(seqDbr->getSeqLen(queryId));
@@ -829,26 +790,35 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             }
             clusterResult.prefSize = prefSize;   // exact parsed count for the aligned path
 
-            if (cacheStarved) {
-                // the loop below reads a body only past the assigned and coverage gates, so asking for
-                // the rest of the list evicts the pages that are actually wanted
-                bool anyTargetSurvives = false;
-                for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
-                    const size_t targetId = targetsWithDiagonal[targetIdx].first;
-                    if (loadAssignedCluster(assignedCluster, targetId) != DB_LOCAL_ID_INVALID) {
-                        continue;
-                    }
-                    if (Util::canBeCovered(par.covThr, par.covMode, queryLength,
-                                           seqDbr->getSeqLen(targetId)) == false) {
-                        continue;
-                    }
-                    prefetchBody(seqDbr, targetId);
-                    anyTargetSurvives = true;
+            // index-only gates, so the whole surviving set is known before the first body is read
+            prefetchIds.clear();
+            prefetchIds.push_back(queryId);
+            targetSlot.assign(targetsWithDiagonal.size(), SIZE_MAX);
+            // the align loop repeats these gates; either side dropping first only costs an io
+            for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
+                const size_t targetId = targetsWithDiagonal[targetIdx].first;
+                if (seqDbr->getDbKey(targetId) == queryKey) {
+                    continue;
                 }
-                if (anyTargetSurvives) {
-                    prefetchBody(seqDbr, queryId);
+                // assignment only ever moves to assigned, so what is dropped here is not wanted below
+                if (loadAssignedCluster(assignedCluster, targetId) != DB_LOCAL_ID_INVALID) {
+                    continue;
+                }
+                if (Util::canBeCovered(par.covThr, par.covMode, queryLength,
+                                       seqDbr->getSeqLen(targetId)) == false) {
+                    continue;
+                }
+                targetSlot[targetIdx] = prefetchIds.size();
+                prefetchIds.push_back(targetId);
+            }
+            if (useWillNeed && prefetchIds.size() > 1) {
+                for (size_t k = 0; k < prefetchIds.size(); k++) {
+                    prefetchBody(seqDbr, prefetchIds[k]);
                 }
             }
+            // the arena holds a window of the batch, and the loop below only ever moves forward
+            size_t windowStart = 0;
+            size_t windowEnd = 0;
 
             for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
                 // Representative assigned meanwhile: the cluster thread discards clusters
@@ -894,15 +864,31 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
                 // first target to survive filtering: now the query body is worth its random read
                 if (querySequence == nullptr) {
-                    // getData may hand back a shared per-thread buffer, so copy before the first target read
-                    queryCopy.assign(seqReader.get(seqDbr, queryId, threadIdx), queryLength);
+                    // copied out at once, so the window is free to move past it afterwards
+                    windowStart = 0;
+                    windowEnd = seqFetcher.load(&prefetchIds[0], prefetchIds.size(), threadIdx);
+                    queryCopy.assign(seqFetcher.at(threadIdx, 0), queryLength);
                     querySequence = queryCopy.c_str();
                     query.mapSequence(queryId, queryKey, querySequence, queryLength);
                     blockAligner.initQuery(&query);
                     matcher.initQuery(&query);
                 }
 
-                char *targetSequence = seqReader.get(seqDbr, targetId, threadIdx);
+                const size_t slot = targetSlot[targetIdx];
+                size_t windowOffset = 0;
+                if (slot == SIZE_MAX) {
+                    // not planned into the batch, so read it on its own and drop the stale window
+                    seqFetcher.load(&targetId, 1, threadIdx);
+                    windowStart = 0;
+                    windowEnd = 0;
+                } else {
+                    if (slot < windowStart || slot >= windowEnd) {
+                        windowStart = slot;
+                        windowEnd = slot + seqFetcher.load(&prefetchIds[slot], prefetchIds.size() - slot, threadIdx);
+                    }
+                    windowOffset = slot - windowStart;
+                }
+                const char *targetSequence = seqFetcher.at(threadIdx, windowOffset);
                 target.mapSequence(targetId, targetKey, targetSequence, targetLength);
 
                 BlockAligner::UngappedAln_res ungappedAlignment = blockAligner.ungappedAlign(&target, diagonal); 
@@ -1051,8 +1037,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
                     s_align gappedAlignment = blockAligner.bandedalign(&target, newQueryStartPos, newTargetStartPos,
                                                                        gappedBacktrace, xDrop, par.covThr, par.covMode);
-                    // bandedalign signals failure/no-coverage with evalue < 0 and an empty backtrace;
-                    // skip before computeSeqId, which would divide by alnLen == 0 in SEQ_ID_ALN_LEN mode.
+                    // bandedalign signals failure with evalue < 0 and an empty backtrace, which computeSeqId would divide by
                     if (gappedAlignment.evalue < 0 || gappedBacktrace.empty()) {
                         continue;
                     }
@@ -1158,10 +1143,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     }
 
     // nothing past the producer loop reads the visit order, so drop it before memberOrder is sized
-    if (lengthOrder != nullptr) {
-        delete[] lengthOrder;
-        lengthOrder = nullptr;
-    }
+    delete[] lengthOrder;
 
     {
         std::lock_guard<std::mutex> lock(clusterMutex);
@@ -1180,12 +1162,8 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     std::vector<SetCoverCandidate>().swap(setCoverCandidates);
     std::vector<DBLocalId>().swap(setCoverMemberPool);
 
-    // the visit order and the alignment db are read only inside the producer loop, so the output phase
-    // does not have to compete with 16 byte per sequence and a whole reader index for the page cache
-    if (prefRepSizePair != nullptr) {
-        delete[] prefRepSizePair;
-        prefRepSizePair = nullptr;
-    }
+    // neither is read past the producer loop, so the output phase does not compete with them for memory
+    delete[] prefRepSizePair;
     alnDbr.close();
 
 #pragma omp parallel for schedule(static)
@@ -1195,8 +1173,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         }
     }
 
-    // group members by representative through a local-id permutation: 8 byte per sequence
-    // instead of the 16 byte (representative key, member key) pair array
+    // group members by representative through a local-id permutation: 8 byte per sequence, not 16
     DBLocalId *memberOrder = new(std::nothrow) DBLocalId[dbSize];
     Util::checkAllocation(memberOrder, "Can not allocate memberOrder memory in Align2Clust");
 #pragma omp parallel for schedule(static)
@@ -1284,8 +1261,7 @@ int align2clust(int argc, const char **argv, const Command &command) {
 
     Debug(Debug::INFO) << "Time for run Align2Clust: " << timer.lap() << " sec\n";
 
-    // memberOrder is sorted by representative, and NOSORT leaves getDbKey ascending in the local id,
-    // so the entries leave here already key sorted; Clustering.cpp:232 skips the sort for the same reason
+    // memberOrder is sorted by representative and NOSORT keeps getDbKey ascending, so the entries leave key sorted
     resultWriter.close(false, false);
     if (alnWriter != nullptr) {
         alnWriter->close();
