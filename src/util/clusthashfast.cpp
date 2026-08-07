@@ -604,6 +604,31 @@ static unsigned int hashPartitionCount(size_t dbSize, size_t budget) {
     return partitions;
 }
 
+// one entry per id written in place, so a single partition needs no buffers, no locks and no file
+static void hashAllSequences(DBReader<DBKeyType> &reader, HashEntry *entries, size_t dbSize,
+                             bool isNuclInput, BaseMatrix *subMat, size_t maxSeqLen, bool showProgress,
+                             int threads) {
+    const size_t scanChunk = idScanBlock(reader, dbSize, threads);
+    Debug::Progress progress(dbSize);
+#pragma omp parallel num_threads(threads)
+    {
+        unsigned int thread_idx = 0;
+#ifdef OPENMP
+        thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+        Sequence *seq = isNuclInput ? NULL : new Sequence(maxSeqLen, reader.getDbtype(), subMat, 0, false, false);
+#pragma omp for schedule(static, scanChunk)
+        for (size_t id = 0; id < dbSize; ++id) {
+            if (showProgress) {
+                progress.updateProgress(id);
+            }
+            entries[id].hash = hashOf(reader, id, seq, thread_idx);
+            entries[id].id = static_cast<DBLocalId>(id);
+        }
+        delete seq;
+    }
+}
+
 static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType> &reader, DBWriter &writer,
                                       BaseMatrix *subMat, bool isNuclInput) {
     ClusterCounts counts;
@@ -622,6 +647,23 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
     const unsigned int partitionCount = hashPartitionCount(dbSize, halfBudget);
     if (hashScanIsSequential(reader)) {
         reader.setSequentialAdvice();
+    }
+
+    if (partitionCount == 1) {
+        Debug(Debug::INFO) << "Hashing sequences...\n";
+        // HashEntry is trivial, so this allocation is not written until the pass below touches it
+        HashEntry *entries = new(std::nothrow) HashEntry[dbSize];
+        Util::checkAllocation(entries, "Cannot allocate hash entry memory in clusthashfast");
+        hashAllSequences(reader, entries, dbSize, isNuclInput, subMat, par.maxSeqLen, showProgress,
+                         par.threads);
+        Debug(Debug::INFO) << "Sort sequence hashes...\n";
+        SORT_PARALLEL(entries, entries + dbSize, HashEntry::compareByHashAndId);
+        Debug(Debug::INFO) << "Cluster equal length sequences...\n";
+        counts = clusterPartition(reader, writer, entries, dbSize, dbSize, par.seqIdThr, showProgress,
+                                  gather, halfBudget, par.threads);
+        delete[] entries;
+        Debug(Debug::INFO) << "Found " << counts.runs << " unique hash/length groups\n";
+        return counts;
     }
 
     Debug(Debug::INFO) << "Hashing sequences into " << partitionCount << " partitions...\n";
@@ -652,22 +694,13 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
         fclose(in);
         FileUtil::remove(parts.names[partition].c_str());
 
-        if (partitionCount == 1) {
-            Debug(Debug::INFO) << "Sort sequence hashes...\n";
-        }
         SORT_PARALLEL(part.data(), part.data() + partSize, HashEntry::compareByHashAndId);
-
-        if (partitionCount == 1) {
-            Debug(Debug::INFO) << "Cluster equal length sequences...\n";
-        }
         const ClusterCounts partCounts = clusterPartition(reader, writer, part.data(), partSize, dbSize,
                                                           par.seqIdThr, showProgress, gather, halfBudget,
                                                           par.threads);
         counts.add(partCounts);
-        if (partitionCount > 1) {
-            Debug(Debug::INFO) << "Partition " << (partition + 1) << "/" << partitionCount << ": "
-                               << partCounts.runs << " groups, " << partCounts.clusters << " clusters\n";
-        }
+        Debug(Debug::INFO) << "Partition " << (partition + 1) << "/" << partitionCount << ": "
+                           << partCounts.runs << " groups, " << partCounts.clusters << " clusters\n";
     }
     Debug(Debug::INFO) << "Found " << counts.runs << " unique hash/length groups\n";
     return counts;

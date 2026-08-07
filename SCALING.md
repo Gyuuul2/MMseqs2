@@ -230,12 +230,21 @@ recovered 480 s and 28M major faults (1803 s/28.6M -> 1324 s/0.25M).
    and compression, so on a db that is already fully cached staging is pure added work - that is the
    local 11.03 s -> 19.38 s regression. The test already exists in this file at the preload site
    (`reader.getDataSize() < Util::getTotalSystemMemory() / 2`).
-3. **Delete the hash-bucket partitioning path (~135 lines).** It only engages when
-   `16n > 0.9*995e9 - 24n - 4e9`, i.e. **n > 22.3e9** - beyond even the 20B target - so it is
-   unreachable by default. It costs 320 GB of extra I/O at 10B, and `buildMemberStore` is called
-   inside the per-partition loop with `idSpace = dbSize`, so every partition re-marks the full
-   10e9-bit space and redoes a 156M-word prefix sum. Item 1 is a strict superset of what it provides.
-   Deferred only because it removes a capability rather than fixing a defect.
+3. ~~**Delete the hash-bucket partitioning path (~135 lines).**~~ **Won't do - it is reachable.**
+   `hashPartitionCount` is passed `halfBudget`, which is `computeMemory / 2`, so one partition needs
+   `56n <= 0.9*T`, not `40n <= 0.9*T`. The crossover is **n > 16.4e9**, inside the 20B target, where
+   the count becomes 2. `--split-memory-limit L` reaches it independently at `n > L/56`, so
+   `--split-memory-limit 200G` partitions a 5e9 run. It is also the oracle that validates the
+   in-memory path: identical digests across partitions 1/4/8 and threads 1/3/8 in both key builds is
+   what proves the output is partition invariant, and `MMSEQS_CLUSTHASHFAST_PARTITIONS` is the only
+   handle that exercises it. Item 1 still subsumes it, so it should not be optimised either -
+   mirroring kmermatcher's per-(thread,partition) sink would open 4096 x 128 files.
+
+   The regression this replaced: 18fa6f98 routed the single-partition case through the staged path,
+   costing 113 s of the 5B hashing phase (37.7 s -> 151 s) for an 80 GB write and read-back behind one
+   mutex and one FILE, plus a single-threaded `fread` that first-touched all 80 GB on one NUMA node
+   before a 128-thread sort ran over it. Restored in-memory; measured 4.2x on the round trip in
+   isolation at 200M entries.
 4. ~~**`open(HARDNOSORT)` instead of `NOSORT`.**~~ **Rejected - it changes the output.** Fable
    recommended this as a one-word diff on the grounds that the tool never looks anything up by key,
    which a grep confirms (`getId`/`getDataByDBKey` appear zero times; every access is
