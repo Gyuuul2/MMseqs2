@@ -40,6 +40,24 @@
 #endif
 
 // one page table of sequences per chunk, capped so every thread still gets many chunks for balance
+// MADV_SEQUENTIAL only widens the window a fault fills; this starts the read for the next chunk so
+// the fault does not wait. One mapping and offset-ordered ids, so the chunk is one contiguous span.
+static void prefetchScanChunk(DBReader<DBKeyType> &reader, size_t startId, size_t count) {
+    if (count == 0 || startId >= reader.getSize()) {
+        return;
+    }
+    if (count > reader.getSize() - startId) {
+        count = reader.getSize() - startId;
+    }
+    const size_t lastId = startId + count - 1;
+    char *begin = reader.getDataUncompressed(startId);
+    char *end = reader.getDataUncompressed(lastId) + reader.getEntryLen(lastId);
+    if (end <= begin) {
+        return;
+    }
+    posix_madvise(begin, static_cast<size_t>(end - begin), POSIX_MADV_WILLNEED);
+}
+
 static size_t kmerScanChunkSize(DBReader<DBKeyType> &reader, size_t startId, size_t cnt, int threads) {
     const size_t DEFAULT_CHUNK = 100;
     const size_t MIN_CHUNKS_PER_THREAD = 16;
@@ -405,10 +423,17 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
             size_t bucketSize = std::min(seqDbr.getSize() - (i * flushSize), flushSize);
 
             size_t scanChunk = kmerScanChunkSize(seqDbr, start, bucketSize, par.threads);
+            // the pointer arithmetic above needs one mapping, and the span needs offset-ordered ids
+            const bool canPrefetch = seqDbr.getDataFileCnt() == 1 && seqDbr.isSortedByOffset()
+                                     && seqDbr.isDirectIo() == false;
 // every thread in the team computes the same chunk from shared read-only state, as the schedule needs
 #pragma omp for schedule(dynamic, scanChunk)
             for (size_t id = start; id < (start + bucketSize); id++) {
                 progress.updateProgress();
+                // the team sweeps forward, so ask for the next chunk while this one is still hashing
+                if (canPrefetch && ((id - start) % scanChunk) == 0) {
+                    prefetchScanChunk(seqDbr, id + scanChunk, scanChunk);
+                }
 
                 seq.mapSequence(id, seqDbr.getDbKey(id), seqDbr.getData(id, thread_idx), seqDbr.getSeqLen(id));
 

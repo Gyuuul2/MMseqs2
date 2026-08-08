@@ -12,6 +12,14 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#if defined(__linux__)
+#include <sys/syscall.h>
+#if defined(__NR_io_uring_setup) && defined(__NR_io_uring_enter)
+#include <linux/io_uring.h>
+#define HAVE_IO_URING 1
+#endif
+#endif
+
 // a per-thread bounce buffer starts here and grows on demand, so one huge entry cannot preallocate threads*maxSeqLen
 static const size_t BOUNCE_BUFFER_PREALLOC = 64 * 1024;
 // smallest room left for one ZSTD_decompressStream call, so a nearly full buffer cannot creep forward
@@ -30,7 +38,7 @@ static const size_t DECOMPRESS_MIN_ROOM = 4096;
 template <typename T>
 DBReader<T>::DBReader(const char* dataFileName_, const char* indexFileName_, int threads, int dataMode) :
 threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
-        indexFileName(strdup(indexFileName_)), size(0), dataFiles(NULL), dataFds(NULL), directBuffers(NULL),
+        indexFileName(strdup(indexFileName_)), size(0), dataFiles(NULL), dataFds(NULL), directBuffers(NULL), ioBatch(NULL),
         dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), index(NULL), id2local(NULL), local2id(NULL),
@@ -41,7 +49,7 @@ template <typename T>
 DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T lastKey,
         int dbType, unsigned int maxSeqLen, int threads) :
         threads(threads), dataMode(USE_INDEX), dataFileName(NULL), indexFileName(NULL),
-        size(size), dataFiles(NULL), dataFds(NULL), directBuffers(NULL),
+        size(size), dataFiles(NULL), dataFds(NULL), directBuffers(NULL), ioBatch(NULL),
         dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index), sortedByOffset(true),
         id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false),
@@ -236,6 +244,13 @@ template <typename T> bool DBReader<T>::open(int accessType){
 
     compression = isCompressed(dbtype);
     padded = (getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_GPU);
+
+    if (dataMode & USE_DATA) {
+        // loadBatch runs inside a parallel region, so the worker vector cannot be grown lazily there
+        freeIoBatch();
+        ioBatch = new IoBatch();
+        ioBatch->workers.resize(threads);
+    }
 
     if ((dataMode & USE_DATA) && (dataMode & USE_DIRECT_IO)) {
         if (compression == COMPRESSED) {
@@ -585,9 +600,9 @@ static bool ioAccessIsSequential(int accessType) {
            || accessType == DBReader<DBKeyType>::SORT_BY_OFFSET;
 }
 
-// mmap is the default; only a reader that asked for setIoAutoDirect can be moved to O_DIRECT
+// mmap is the default; MMSEQS_IO_POLICY pins any reader, the size rule only moves opt-in ones
 template <typename T> void DBReader<T>::resolveIoPolicy(int accessType) {
-    if ((dataMode & USE_DIRECT_IO) || ioAutoDirect == false) {
+    if (dataMode & USE_DIRECT_IO) {
         return;
     }
     // compressed, padded, writable and fread readers hand back reader-owned buffers the direct path cannot serve
@@ -596,13 +611,16 @@ template <typename T> void DBReader<T>::resolveIoPolicy(int accessType) {
         || (dataMode & (USE_WRITABLE | USE_FREAD))) {
         return;
     }
-    // MMSEQS_IO_POLICY=mmap|direct pins the size rule for the readers that opted in, so it stays testable
+    // MMSEQS_IO_POLICY=mmap|direct pins every eligible reader, not just the ones that opted in, so
+    // the modules that stay on mmap by default can still be measured against the direct path
     const char *policyEnv = getenv("MMSEQS_IO_POLICY");
-    if (policyEnv != NULL && strcmp(policyEnv, "mmap") == 0) {
+    if (policyEnv != NULL) {
+        if (strcmp(policyEnv, "direct") == 0) {
+            dataMode |= USE_DIRECT_IO;
+        }
         return;
     }
-    if (policyEnv != NULL && strcmp(policyEnv, "direct") == 0) {
-        dataMode |= USE_DIRECT_IO;
+    if (ioAutoDirect == false) {
         return;
     }
     // a sequential scan already gets POSIX_MADV_SEQUENTIAL below, which is the hint it wants
@@ -649,6 +667,329 @@ template <typename T> int DBReader<T>::openDirect(const char *fileName, size_t *
     }
     *dataSize = sb.st_size;
     return fd;
+}
+
+// ---------------- io_uring batch reads ----------------
+// Raw syscalls rather than liburing, so the build gains no dependency. A ring is per thread and
+// is created on first use; if the kernel refuses one the batch api falls back to a pread loop.
+#if defined(__linux__) && defined(HAVE_IO_URING)
+struct DBReaderRing {
+    int fd;
+    unsigned *sqTail, *sqMask, *sqArray;
+    unsigned *cqHead, *cqTail, *cqMask;
+    struct io_uring_sqe *sqes;
+    struct io_uring_cqe *cqes;
+    void *sqPtr; size_t sqSize;
+    void *cqPtr; size_t cqSize;
+    void *sqePtr; size_t sqeSize;
+    unsigned entries;
+};
+
+static bool dbReaderRingInit(DBReaderRing &r, unsigned entries) {
+    struct io_uring_params p;
+    memset(&p, 0, sizeof(p));
+    const int fd = syscall(__NR_io_uring_setup, entries, &p);
+    if (fd < 0) {
+        return false;
+    }
+    size_t sqSize = p.sq_off.array + p.sq_entries * sizeof(unsigned);
+    size_t cqSize = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
+    if (p.features & IORING_FEAT_SINGLE_MMAP) {
+        sqSize = (cqSize > sqSize) ? cqSize : sqSize;
+        cqSize = sqSize;
+    }
+    void *sq = mmap(NULL, sqSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
+    if (sq == MAP_FAILED) { ::close(fd); return false; }
+    void *cq = sq;
+    if ((p.features & IORING_FEAT_SINGLE_MMAP) == 0) {
+        cq = mmap(NULL, cqSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
+        if (cq == MAP_FAILED) { munmap(sq, sqSize); ::close(fd); return false; }
+    }
+    const size_t sqeSize = p.sq_entries * sizeof(struct io_uring_sqe);
+    void *sqes = mmap(NULL, sqeSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
+    if (sqes == MAP_FAILED) {
+        if (cq != sq) { munmap(cq, cqSize); }
+        munmap(sq, sqSize);
+        ::close(fd);
+        return false;
+    }
+    r.fd = fd;
+    r.sqPtr = sq;   r.sqSize = sqSize;
+    r.cqPtr = cq;   r.cqSize = cqSize;
+    r.sqePtr = sqes; r.sqeSize = sqeSize;
+    r.entries = p.sq_entries;
+    r.sqTail  = (unsigned *) ((char *) sq + p.sq_off.tail);
+    r.sqMask  = (unsigned *) ((char *) sq + p.sq_off.ring_mask);
+    r.sqArray = (unsigned *) ((char *) sq + p.sq_off.array);
+    r.cqHead  = (unsigned *) ((char *) cq + p.cq_off.head);
+    r.cqTail  = (unsigned *) ((char *) cq + p.cq_off.tail);
+    r.cqMask  = (unsigned *) ((char *) cq + p.cq_off.ring_mask);
+    r.cqes    = (struct io_uring_cqe *) ((char *) cq + p.cq_off.cqes);
+    r.sqes    = (struct io_uring_sqe *) sqes;
+    return true;
+}
+
+static void dbReaderRingFree(DBReaderRing &r) {
+    munmap(r.sqePtr, r.sqeSize);
+    if (r.cqPtr != r.sqPtr) { munmap(r.cqPtr, r.cqSize); }
+    munmap(r.sqPtr, r.sqSize);
+    ::close(r.fd);
+}
+#endif
+
+// how many reads one thread keeps in flight; the device saturates at 4, past that only memory grows
+static const unsigned DBREADER_BATCH_DEPTH = 8;
+// one thread's arena, so a batch of a few hundred short entries never has to be split
+static const size_t DBREADER_BATCH_ARENA = 1 * 1024 * 1024;
+
+template <typename T>
+struct DBReader<T>::IoBatch {
+    struct Slot {
+        size_t arenaOffset;
+        size_t delta;
+        size_t avail;
+        size_t id;
+    };
+    struct Worker {
+        char *arena;
+        size_t capacity;
+        std::vector<Slot> slots;
+#if defined(__linux__) && defined(HAVE_IO_URING)
+        DBReaderRing ring;
+#endif
+        bool ringReady;
+        Worker() : arena(NULL), capacity(0), ringReady(false) {}
+    };
+    std::vector<Worker> workers;
+};
+
+template <typename T> void DBReader<T>::freeIoBatch() {
+    if (ioBatch == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < ioBatch->workers.size(); i++) {
+        typename IoBatch::Worker &w = ioBatch->workers[i];
+        if (w.arena != NULL) {
+            free(w.arena);
+            decrementMemory(w.capacity);
+        }
+#if defined(__linux__) && defined(HAVE_IO_URING)
+        if (w.ringReady) {
+            dbReaderRingFree(w.ring);
+        }
+#endif
+    }
+    delete ioBatch;
+    ioBatch = NULL;
+}
+
+template <typename T>
+size_t DBReader<T>::loadBatch(const size_t *ids, size_t n, unsigned int thrIdx) {
+    if (n == 0) {
+        return 0;
+    }
+    if (static_cast<int>(thrIdx) >= threads) {
+        Debug(Debug::ERROR) << "loadBatch: thread index (" << thrIdx << ") >= threads (" << threads << ")\n";
+        EXIT(EXIT_FAILURE);
+    }
+    // open() builds this, because loadBatch is called from inside a parallel region
+    typename IoBatch::Worker &worker = ioBatch->workers[thrIdx];
+    worker.slots.clear();
+    // on mmap the bytes are already addressable, so the batch is only a list of ids
+    if ((dataMode & USE_DIRECT_IO) == 0) {
+        for (size_t i = 0; i < n; i++) {
+            typename IoBatch::Slot slot;
+            slot.arenaOffset = 0;
+            slot.delta = 0;
+            slot.avail = 0;
+            slot.id = ids[i];
+            worker.slots.push_back(slot);
+        }
+        return n;
+    }
+    return loadBatchDirect(ids, n, thrIdx);
+}
+
+template <typename T>
+size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int thrIdx) {
+    typename IoBatch::Worker &worker = ioBatch->workers[thrIdx];
+    if (worker.arena == NULL) {
+        void *mem = NULL;
+        if (posix_memalign(&mem, directIoAlign, DBREADER_BATCH_ARENA) != 0 || mem == NULL) {
+            Debug(Debug::ERROR) << "Cannot allocate " << DBREADER_BATCH_ARENA << " byte batch arena\n";
+            EXIT(EXIT_FAILURE);
+        }
+        worker.arena = static_cast<char *>(mem);
+        worker.capacity = DBREADER_BATCH_ARENA;
+        incrementMemory(worker.capacity);
+    }
+
+    // plan first: an entry that no longer fits ends the batch, and the caller resumes from there
+    size_t used = 0;
+    size_t taken = 0;
+    for (; taken < n; taken++) {
+        const size_t id = ids[taken];
+        if (id >= size) {
+            Debug(Debug::ERROR) << "Invalid database read for id=" << id << ", database index=" << indexFileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        const size_t localId = (local2id != NULL) ? local2id[id] : id;
+        const size_t offset = index[localId].offset;
+        const size_t length = index[localId].length;
+        size_t file = 0;
+        while ((offset >= dataSizeOffset[file] && offset < dataSizeOffset[file + 1]) == false) {
+            file++;
+        }
+        const size_t fileOffset = offset - dataSizeOffset[file];
+        const size_t alignedOffset = fileOffset & ~(directIoAlign - 1);
+        const size_t delta = fileOffset - alignedOffset;
+        const size_t readLen = (delta + length + directIoAlign - 1) & ~(directIoAlign - 1);
+        if (used + readLen > worker.capacity) {
+            if (taken > 0) {
+                break;
+            }
+            // one entry wider than the arena still has to be read, so grow to exactly it
+            free(worker.arena);
+            decrementMemory(worker.capacity);
+            void *mem = NULL;
+            if (posix_memalign(&mem, directIoAlign, readLen) != 0 || mem == NULL) {
+                Debug(Debug::ERROR) << "Cannot allocate " << readLen << " byte batch arena\n";
+                EXIT(EXIT_FAILURE);
+            }
+            worker.arena = static_cast<char *>(mem);
+            worker.capacity = readLen;
+            incrementMemory(worker.capacity);
+        }
+        typename IoBatch::Slot slot;
+        slot.arenaOffset = used;
+        slot.delta = delta;
+        slot.avail = length;
+        slot.id = id;
+        worker.slots.push_back(slot);
+        // the plan is replayed below, so the file and the aligned offset are recomputed there
+        used += readLen;
+    }
+
+    // one entry is not worth a ring round trip, and it is the common case for a query body
+    bool submitted = false;
+#if defined(__linux__) && defined(HAVE_IO_URING)
+    if (taken > 1) {
+        if (worker.ringReady == false) {
+            // MMSEQS_NO_IO_URING=1 drops to the pread loop, so the ring can be A/B tested in place
+            static const bool ringOff = getenv("MMSEQS_NO_IO_URING") != NULL;
+            worker.ringReady = ringOff ? false : dbReaderRingInit(worker.ring, DBREADER_BATCH_DEPTH * 2);
+        }
+        if (worker.ringReady) {
+            DBReaderRing &r = worker.ring;
+            const unsigned sqMask = *r.sqMask;
+            const unsigned cqMask = *r.cqMask;
+            size_t next = 0;
+            size_t done = 0;
+            unsigned inflight = 0;
+            while (done < taken) {
+                unsigned queued = 0;
+                while (inflight + queued < DBREADER_BATCH_DEPTH && next < taken) {
+                    const typename IoBatch::Slot &slot = worker.slots[next];
+                    const size_t localId = (local2id != NULL) ? local2id[slot.id] : slot.id;
+                    const size_t offset = index[localId].offset;
+                    size_t file = 0;
+                    while ((offset >= dataSizeOffset[file] && offset < dataSizeOffset[file + 1]) == false) {
+                        file++;
+                    }
+                    const size_t alignedOffset = (offset - dataSizeOffset[file]) & ~(directIoAlign - 1);
+                    const size_t readLen = (slot.delta + slot.avail + directIoAlign - 1) & ~(directIoAlign - 1);
+                    const unsigned sqeIdx = (unsigned) (next % r.entries);
+                    struct io_uring_sqe *sqe = &r.sqes[sqeIdx];
+                    memset(sqe, 0, sizeof(*sqe));
+                    sqe->opcode = IORING_OP_READ;
+                    sqe->fd = dataFds[file];
+                    sqe->off = alignedOffset;
+                    sqe->addr = (uint64_t) (uintptr_t) (worker.arena + slot.arenaOffset);
+                    sqe->len = (unsigned) readLen;
+                    sqe->user_data = next;
+                    const unsigned tail = *r.sqTail;
+                    r.sqArray[tail & sqMask] = sqeIdx;
+                    __atomic_store_n(r.sqTail, tail + 1, __ATOMIC_RELEASE);
+                    queued++;
+                    next++;
+                }
+                // nothing left to submit means the batch can be collected in this one syscall;
+                // otherwise wake on the first completion so the freed slot is refilled at once
+                const unsigned waitFor = (next >= taken) ? (inflight + queued) : 1u;
+                long ret;
+                do {
+                    ret = syscall(__NR_io_uring_enter, r.fd, (unsigned) queued, waitFor,
+                                  IORING_ENTER_GETEVENTS, NULL, 0);
+                } while (ret < 0 && errno == EINTR);
+                if (ret < 0) {
+                    Debug(Debug::ERROR) << "io_uring_enter failed for " << dataFileName << ". Error " << errno << ".\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                inflight += queued;
+                unsigned head = *r.cqHead;
+                const unsigned cqTail = __atomic_load_n(r.cqTail, __ATOMIC_ACQUIRE);
+                while (head != cqTail) {
+                    struct io_uring_cqe *cqe = &r.cqes[head & cqMask];
+                    typename IoBatch::Slot &slot = worker.slots[cqe->res < 0 ? 0 : (size_t) cqe->user_data];
+                    if (cqe->res < 0) {
+                        Debug(Debug::ERROR) << "Failed to read from " << dataFileName << ". Error " << -cqe->res << ".\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    const size_t got = (size_t) cqe->res;
+                    if (got < slot.delta + slot.avail) {
+                        Debug(Debug::ERROR) << "Short read of " << got << " byte for id " << slot.id
+                                            << " in " << dataFileName << "\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    head++;
+                    inflight--;
+                    done++;
+                }
+                __atomic_store_n(r.cqHead, head, __ATOMIC_RELEASE);
+            }
+            submitted = true;
+        }
+    }
+#endif
+    if (submitted == false) {
+        // no ring, or a single entry: the plain pread path reads straight into the same arena
+        for (size_t i = 0; i < taken; i++) {
+            typename IoBatch::Slot &slot = worker.slots[i];
+            const size_t localId = (local2id != NULL) ? local2id[slot.id] : slot.id;
+            const size_t offset = index[localId].offset;
+            size_t file = 0;
+            while ((offset >= dataSizeOffset[file] && offset < dataSizeOffset[file + 1]) == false) {
+                file++;
+            }
+            const size_t alignedOffset = (offset - dataSizeOffset[file]) & ~(directIoAlign - 1);
+            const size_t readLen = (slot.delta + slot.avail + directIoAlign - 1) & ~(directIoAlign - 1);
+            ssize_t got;
+            do {
+                got = pread(dataFds[file], worker.arena + slot.arenaOffset, readLen, alignedOffset);
+            } while (got < 0 && errno == EINTR);
+            if (got < 0 || (size_t) got < slot.delta + slot.avail) {
+                Debug(Debug::ERROR) << "Failed to read " << slot.avail << " byte for id " << slot.id
+                                    << " from " << dataFileName << ". Error " << errno << ".\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+    }
+    return taken;
+}
+
+template <typename T>
+const char *DBReader<T>::batchAt(unsigned int thrIdx, size_t k) {
+    const typename IoBatch::Slot &slot = ioBatch->workers[thrIdx].slots[k];
+    if ((dataMode & USE_DIRECT_IO) == 0) {
+        return getData(slot.id, thrIdx);
+    }
+    return ioBatch->workers[thrIdx].arena + slot.arenaOffset + slot.delta;
+}
+
+template <typename T>
+size_t DBReader<T>::batchLengthAt(unsigned int thrIdx, size_t k) {
+    const typename IoBatch::Slot &slot = ioBatch->workers[thrIdx].slots[k];
+    return ((dataMode & USE_DIRECT_IO) == 0) ? getEntryLen(slot.id) : slot.avail;
 }
 
 template <typename T> char* DBReader<T>::readDirect(size_t offset, size_t length, int thrIdx) {
@@ -752,6 +1093,8 @@ template <typename T> void DBReader<T>::close(){
         delete [] directBuffers;
         directBuffers = NULL;
     }
+
+    freeIoBatch();
 
     if(compressedBuffers){
         for(int i = 0; i < threads; i++){

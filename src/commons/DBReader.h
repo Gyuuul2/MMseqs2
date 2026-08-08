@@ -201,6 +201,17 @@ public:
     // random access over data that may not fit: mmap while it fits, pread+O_DIRECT once it does not
     void setIoAutoDirect(bool autoDirect) { ioAutoDirect = autoDirect; }
 
+    // Reads ids[0..n) as one io_uring submission, so the device sees the whole batch at once
+    // instead of one blocking pread at a time. Returns how many were loaded, which is less than
+    // n when the arena fills up; the caller advances and calls again. On mmap the entries are
+    // already addressable, so this only records the ids. Pointers stay valid until the next
+    // loadBatch on the same thread.
+    size_t loadBatch(const size_t *ids, size_t n, unsigned int thrIdx);
+    const char *batchAt(unsigned int thrIdx, size_t k);
+    size_t batchLengthAt(unsigned int thrIdx, size_t k);
+
+    bool isDirectIo() const { return (dataMode & USE_DIRECT_IO) != 0; }
+
     void close();
 
     const char* getDataFileName() { return dataFileName; }
@@ -520,6 +531,10 @@ private:
 
     char* readDirect(size_t offset, size_t length, int thrIdx);
 
+    // falls back to a pread loop when io_uring is unavailable, so the batch api always works
+    size_t loadBatchDirect(const size_t *ids, size_t n, unsigned int thrIdx);
+    void freeIoBatch();
+
     // grows one thread's bounce buffer, alignment 1 means malloc, keepBytes are carried over
     void growBuffer(char** buffer, size_t* capacity, size_t needed, size_t alignment, size_t keepBytes);
 
@@ -546,6 +561,9 @@ private:
         size_t length;  // bytes valid in the buffer, 0 when empty
     };
     DirectBuffer* directBuffers;
+    // io_uring rings and per-thread arenas, allocated on the first loadBatch, see DBReader.cpp
+    struct IoBatch;
+    IoBatch* ioBatch;
     size_t * dataSizeOffset;
     size_t dataFileCnt;
     size_t totalDataSize;

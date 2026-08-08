@@ -634,6 +634,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                  -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
         std::vector<std::pair<size_t, unsigned short>> targetsWithDiagonal;
         targetsWithDiagonal.reserve(1000);
+        // the targets that clear the index-only gates, so one io_uring batch can cover them all
+        std::vector<size_t> batchIds;
+        std::vector<size_t> targetSlot;
 
         const bool includeAlignFiles = (alnWriter != nullptr);
         std::string queryCopy;
@@ -702,6 +705,30 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             }
             clusterResult.prefSize = prefSize;   // exact parsed count for the aligned path
 
+            // Same gates the align loop below repeats, but on index data only, so the whole set of
+            // bodies it will read is known before the first read. Assignment only ever moves to
+            // assigned, so a target dropped here is never wanted below.
+            batchIds.clear();
+            targetSlot.assign(targetsWithDiagonal.size(), SIZE_MAX);
+            for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
+                const size_t targetId = targetsWithDiagonal[targetIdx].first;
+                if (seqDbr->getDbKey(targetId) == queryKey) {
+                    continue;
+                }
+                if (loadAssignedCluster(assignedCluster, targetId) != DB_LOCAL_ID_INVALID) {
+                    continue;
+                }
+                if (Util::canBeCovered(par.covThr, par.covMode, queryLength,
+                                       seqDbr->getSeqLen(targetId)) == false) {
+                    continue;
+                }
+                targetSlot[targetIdx] = batchIds.size();
+                batchIds.push_back(targetId);
+            }
+            // the batch is read in windows, and the loop below only ever moves forward through them
+            size_t windowStart = 0;
+            size_t windowEnd = 0;
+
             for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
                 // Representative assigned meanwhile: the cluster thread discards clusters
                 // whose representative is assigned, so this result (partial or empty) is
@@ -754,7 +781,19 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     matcher.initQuery(&query);
                 }
 
-                const char *targetSequence = seqDbr->getData(targetId, threadIdx);
+                // the query lives in queryCopy and the batch arena is its own buffer, so neither
+                // path can overwrite the other
+                const size_t slot = targetSlot[targetIdx];
+                const char *targetSequence;
+                if (slot == SIZE_MAX) {
+                    targetSequence = seqDbr->getData(targetId, threadIdx);
+                } else {
+                    if (slot < windowStart || slot >= windowEnd) {
+                        windowStart = slot;
+                        windowEnd = slot + seqDbr->loadBatch(&batchIds[slot], batchIds.size() - slot, threadIdx);
+                    }
+                    targetSequence = seqDbr->batchAt(threadIdx, slot - windowStart);
+                }
                 target.mapSequence(targetId, targetKey, targetSequence, targetLength);
 
                 BlockAligner::UngappedAln_res ungappedAlignment = blockAligner.ungappedAlign(&target, diagonal); 

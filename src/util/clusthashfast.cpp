@@ -10,6 +10,7 @@
 #include "Orf.h"
 #include "FastSort.h"
 #include "itoa.h"
+#include "Timer.h"
 
 #include <algorithm>
 #include <cstring>
@@ -311,19 +312,35 @@ static void fillArena(DBReader<DBKeyType> &reader, MemberArena &arena, size_t to
 #ifdef OPENMP
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
+        // a block holds up to 64 members, and their ids are known before the first read
+        std::vector<size_t> ids;
+        std::vector<size_t> dst;
+        ids.reserve(MemberArena::BLOCK);
+        dst.reserve(MemberArena::BLOCK);
         // schedule(static) gives each thread one contiguous, disjoint word range and byte range
 #pragma omp for schedule(static)
         for (size_t i = 0; i < used; ++i) {
             const size_t word = arena.touched[i];
             uint64_t set = arena.bits[word];
             size_t offset = arena.blockOffset[word];
+            ids.clear();
+            dst.clear();
             while (set != 0) {
                 const size_t k = static_cast<size_t>(__builtin_ctzll(set));
                 const DBLocalId id = static_cast<DBLocalId>(word * MemberArena::BLOCK + k);
-                const size_t length = reader.getSeqLen(id);
-                memcpy(arena.data + offset, reader.getData(id, thread_idx), length);
-                offset += length;
+                ids.push_back(id);
+                dst.push_back(offset);
+                offset += reader.getSeqLen(id);
                 set &= set - 1;
+            }
+            size_t pos = 0;
+            while (pos < ids.size()) {
+                const size_t got = reader.loadBatch(&ids[pos], ids.size() - pos, thread_idx);
+                for (size_t slot = 0; slot < got; slot++) {
+                    memcpy(arena.data + dst[pos + slot], reader.batchAt(thread_idx, slot),
+                           reader.getSeqLen(ids[pos + slot]));
+                }
+                pos += got;
             }
         }
     }
@@ -477,11 +494,14 @@ static ClusterCounts clusterPartition(DBReader<DBKeyType> &reader, DBWriter &wri
         return clusterHashRuns(reader, writer, entries, entryCount, seqIdThr, showProgress, NULL, threads);
     }
 
+    Timer gatherTimer;
     const size_t total = planArena(reader, arena, entries, entryCount, idSpace, threads);
     if (total <= arenaBudget) {
         if (total > 0) {
             fillArena(reader, arena, total, threads);
         }
+        Debug(Debug::INFO) << "Gathered " << total << " byte of run members in one pass: "
+                           << gatherTimer.lap() << "\n";
         ClusterCounts once = clusterHashRuns(reader, writer, entries, entryCount, seqIdThr, showProgress,
                                              (total > 0) ? &arena : NULL, threads);
         arena.releaseData();
@@ -504,6 +524,8 @@ static ClusterCounts clusterPartition(DBReader<DBKeyType> &reader, DBWriter &wri
         if (gathered) {
             fillArena(reader, arena, windowTotal, threads);
         }
+        Debug(Debug::INFO) << "Pass " << (window + 1) << "/" << (bounds.size() - 1) << " gathered "
+                           << windowTotal << " byte: " << gatherTimer.lap() << "\n";
         counts.add(clusterHashRuns(reader, writer, entries + begin, size, seqIdThr, showProgress,
                                    gathered ? &arena : NULL, threads));
         arena.releaseData();
@@ -677,12 +699,21 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
 
     const bool showProgress = (Debug::debugLevel >= Debug::INFO);
     const std::string tmpPrefix = std::string(writer.getDataFileName());
-    // the sorted entries and the gathered members are live at the same time, so each gets half
-    const size_t halfBudget = std::max<size_t>(Util::computeMemory(par.splitMemoryLimit) / 2, 1);
+    const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
+    // a partition holds this much of the entry array, the rest of memory is free for the members
+    const size_t entryBudget = std::max<size_t>(memoryLimit / 2, 1);
     // gathering is a second sequential pass, so it only pays once the db stops fitting in memory
-    const bool gather = (reader.getDataSize() + dbSize * sizeof(HashEntry)
-                         > Util::computeMemory(par.splitMemoryLimit));
-    const unsigned int partitionCount = hashPartitionCount(dbSize, halfBudget);
+    const bool gather = (reader.getDataSize() + dbSize * sizeof(HashEntry) > memoryLimit);
+    const unsigned int partitionCount = hashPartitionCount(dbSize, entryBudget);
+    // Only the live entry array competes with the arena, and that is dbSize*12 byte, not half of
+    // memory. Sizing the arena at half forced a second gather pass at 10B, which re-reads every
+    // member; 10% is left as slack for the writer and the reader index.
+    const size_t liveEntryBytes = dbSize * sizeof(HashEntry) / partitionCount;
+    const size_t arenaBudget = (memoryLimit > liveEntryBytes)
+        ? std::max<size_t>(static_cast<size_t>((memoryLimit - liveEntryBytes) * 0.9), 1)
+        : 1;
+    Debug(Debug::INFO) << "Memory limit " << memoryLimit << " byte, entries " << liveEntryBytes
+                       << " byte, member arena budget " << arenaBudget << " byte\n";
     if (hashScanIsSequential(reader)) {
         reader.setSequentialAdvice();
     }
@@ -695,11 +726,13 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
         hashAllSequences(reader, entries, dbSize, isNuclInput, subMat, par.maxSeqLen, showProgress,
                          par.threads);
         Debug(Debug::INFO) << "Sort sequence hashes...\n";
+        Timer sortTimer;
         SORT_PARALLEL(entries, entries + dbSize, HashEntry::compareByHashAndId);
+        Debug(Debug::INFO) << "Time for sorting hashes: " << sortTimer.lap() << "\n";
         Debug(Debug::INFO) << "Cluster equal length sequences...\n";
         MemberArena arena;
         counts = clusterPartition(reader, writer, entries, dbSize, dbSize, par.seqIdThr, showProgress,
-                                  gather, halfBudget, par.threads, arena);
+                                  gather, arenaBudget, par.threads, arena);
         delete[] entries;
         Debug(Debug::INFO) << "Found " << counts.runs << " unique hash/length groups\n";
         return counts;
@@ -735,9 +768,12 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
         fclose(in);
         FileUtil::remove(parts.names[partition].c_str());
 
+        Timer partSortTimer;
         SORT_PARALLEL(part.data(), part.data() + partSize, HashEntry::compareByHashAndId);
+        Debug(Debug::INFO) << "Time for sorting partition " << (partition + 1) << ": "
+                           << partSortTimer.lap() << "\n";
         const ClusterCounts partCounts = clusterPartition(reader, writer, part.data(), partSize, dbSize,
-                                                          par.seqIdThr, showProgress, gather, halfBudget,
+                                                          par.seqIdThr, showProgress, gather, arenaBudget,
                                                           par.threads, arena);
         counts.add(partCounts);
         Debug(Debug::INFO) << "Partition " << (partition + 1) << "/" << partitionCount << ": "
