@@ -452,9 +452,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         par.db1.c_str(), par.db1Index.c_str(), par.threads, 
         DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
     );
-    // The target reads are scattered and reused ~11x. Batching them through io_uring on buffered
-    // descriptors keeps that reuse in the page cache and still avoids the mmap fault path; measured
-    // 7x over mmap when the working set is cacheable and 16x when it is not.
+    // Targets repeat across neighbour lists, so the page cache is worth keeping: measured 4.3x over
+    // O_DIRECT at 11x reuse, while O_DIRECT wins only 16% when there is none. Batched io_uring on
+    // buffered descriptors keeps that reuse and still avoids the mmap fault path.
     seqDbr->setIoBufferedBatch(true);
     // SORT_BY_LENGTH costs id2local plus local2id; neither mode needs them once lengthOrder exists
     seqDbr->open(DBReader<DBKeyType>::NOSORT);
@@ -626,6 +626,23 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_CHUNK=" << chunkEnv << "\n";
         }
     }
+    // Every query reads its prefilter entry exactly once, so this db's cache has no second reader
+    // and only competes with the cluster state. Drop it whole once it can no longer fit; a page
+    // holds ~16 entries belonging to unrelated queries, so nothing smaller ever frees a page.
+    const size_t ioMemoryLimit = Util::computeMemory(par.splitMemoryLimit);
+    bool dropAlnCache = ioMemoryLimit > 0 && alnDbr.getDataSize() > ioMemoryLimit / 2;
+    if (const char *dropEnv = getenv("MMSEQS_A2C_DROP_ALN")) {
+        if (strcmp(dropEnv, "1") == 0) dropAlnCache = true;
+        else if (strcmp(dropEnv, "0") == 0) dropAlnCache = false;
+        else Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_DROP_ALN=" << dropEnv << " (use 0 or 1)\n";
+    }
+    // one random entry can pull in a whole page, so bound the cache by pages, not by entry bytes
+    const size_t alnDropInterval = std::max<size_t>(ioMemoryLimit / 4 / Util::getPageSize(), 1);
+    std::atomic<size_t> alnDropCounter(0);
+    Debug(Debug::INFO) << "Prefilter cache policy: "
+                       << (dropAlnCache ? "drop in bulk every " + SSTR(alnDropInterval) + " entries"
+                                        : "keep, it fits") << "\n";
+
     Debug::Progress progress(endRange);
     size_t db_maxseqlen = (cluSeqDbr != nullptr)
         ? std::max(seqDbr->getMaxSeqLen(), cluSeqDbr->getMaxSeqLen())
@@ -665,6 +682,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 #pragma omp for schedule(dynamic, alignChunk) nowait
         for (size_t i = 0; i < endRange; i++) {
             progress.updateProgress();
+            if (dropAlnCache && (alnDropCounter.fetch_add(1, std::memory_order_relaxed) + 1) % alnDropInterval == 0) {
+                alnDbr.dropCacheAll();
+            }
             ClusterResult clusterResult;
             clusterResult.sequenceIdx = i;
             targetsWithDiagonal.clear();
@@ -1150,6 +1170,9 @@ int align2clust(int argc, const char **argv, const Command &command) {
     
     DBReader<DBKeyType> alnDbr(par.db2.c_str(), par.db2Index.c_str(), par.threads,
                                   DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
+    // Keeps a descriptor beside the mmap so the cache can be released in bulk. Entries average
+    // ~259 B, so a per-entry range never contains a whole page; only a whole-file drop frees anything.
+    alnDbr.setIoCacheAdvice(true);
     // read only by key, and LINEAR_ACCCESS would advise SEQUENTIAL on a db this pass reads out of order
     alnDbr.open(DBReader<DBKeyType>::NOSORT);
     int dbtype =  Parameters::DBTYPE_CLUSTER_RES;

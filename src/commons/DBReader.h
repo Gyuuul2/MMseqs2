@@ -206,6 +206,17 @@ public:
     // working set is anywhere near cacheable; O_DIRECT only wins ~16% once it is not.
     void setIoBufferedBatch(bool buffered) { ioBufferedBatch = buffered; }
 
+    // Keeps a descriptor open on an mmap reader so dropCacheEntries can fadvise it. Off by default,
+    // so readers that never reclaim cache do not change their fd usage.
+    void setIoCacheAdvice(bool enabled) { ioCacheAdvice = enabled; }
+
+    // Releases the page cache behind entries[0..count) once the caller knows they are final.
+    void dropCacheEntries(const size_t *ids, size_t count);
+
+    // Drops the whole file's cache. Entries average a few hundred bytes, so a per-entry range never
+    // contains a full page and frees nothing; only a whole-file range reliably does.
+    void dropCacheAll();
+
     // Reads ids[0..n) as one io_uring submission, so the device sees the whole batch at once
     // instead of one blocking pread at a time. Returns how many were loaded, which is less than
     // n when the arena fills up; the caller advances and calls again. On mmap the entries are
@@ -612,6 +623,7 @@ private:
 
     bool ioAutoDirect;
     bool ioBufferedBatch;
+    bool ioCacheAdvice;
 
     // O_DIRECT alignment resolved per data file at open time, the device can want less than 4096
     size_t directIoAlign;

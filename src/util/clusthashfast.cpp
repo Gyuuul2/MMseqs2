@@ -13,10 +13,12 @@
 #include "Timer.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 #include <mutex>
+#include <fcntl.h>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -33,6 +35,56 @@ static const size_t CLUSTHASHFAST_MAX_RETAINED_CLAIMS = 1024 * 1024;
 static const unsigned int CLUSTHASHFAST_MAX_PARTITIONS = 4096;
 // per thread write buffer budget for the hash pass, split across the partitions
 static const size_t CLUSTHASHFAST_PENDING_BYTES = 8 * 1024 * 1024;
+// page cache the gather stream needs, plus room for the writer; a fraction alone shrinks when the
+// arena grows, which is the one moment it must not
+static const size_t CLUSTHASHFAST_MIN_CACHE_RESERVE = 64ull * 1024 * 1024 * 1024;
+
+// Test-only I/O knobs. The defaults reproduce the current behavior, so one binary can A/B.
+static size_t clusthashfastEnvSize(const char *name, size_t fallback, size_t minimum) {
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        return fallback;
+    }
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || parsed < minimum) {
+        Debug(Debug::WARNING) << "Ignoring invalid " << name << "=" << value << "\n";
+        return fallback;
+    }
+    return static_cast<size_t>(parsed);
+}
+
+static bool clusthashfastEnvFlag(const char *name, bool fallback) {
+    const char *value = getenv(name);
+    if (value == NULL || *value == '\0') {
+        return fallback;
+    }
+    if (strcmp(value, "1") == 0) {
+        return true;
+    }
+    if (strcmp(value, "0") == 0) {
+        return false;
+    }
+    Debug(Debug::WARNING) << "Ignoring invalid " << name << "=" << value << "\n";
+    return fallback;
+}
+
+// a partition file is read once and deleted straight after, so its cache has no second reader
+static void clusthashfastDropFileCache(FILE *file, const std::string &name) {
+#if defined(HAVE_POSIX_FADVISE)
+    const int fd = fileno(file);
+    if (fd < 0) {
+        return;
+    }
+    const int ret = posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+    if (ret != 0) {
+        Debug(Debug::WARNING) << "POSIX_FADV_DONTNEED failed for " << name << ": " << ret << "\n";
+    }
+#else
+    (void) file;
+    (void) name;
+#endif
+}
 
 struct ClusterCounts {
     size_t clusters;
@@ -306,6 +358,8 @@ static void fillArena(DBReader<DBKeyType> &reader, MemberArena &arena, size_t to
     arena.data = new(std::nothrow) char[total];
     Util::checkAllocation(arena.data, "Can not allocate member arena in clusthashfast");
     const size_t used = arena.touched.size();
+    // 1 reproduces the one-word-at-a-time behaviour; 16/64/256 make the batches wider
+    const size_t batchWords = clusthashfastEnvSize("MMSEQS_CLUSTHASHFAST_ARENA_BATCH_WORDS", 1, 1);
 #pragma omp parallel num_threads(threads)
     {
         unsigned int thread_idx = 0;
@@ -315,16 +369,37 @@ static void fillArena(DBReader<DBKeyType> &reader, MemberArena &arena, size_t to
         // a block holds up to 64 members, and their ids are known before the first read
         std::vector<size_t> ids;
         std::vector<size_t> dst;
-        ids.reserve(MemberArena::BLOCK);
-        dst.reserve(MemberArena::BLOCK);
-        // schedule(static) gives each thread one contiguous, disjoint word range and byte range
-#pragma omp for schedule(static)
+        const size_t reserveIds = std::min<size_t>(batchWords, 4096) * MemberArena::BLOCK;
+        ids.reserve(reserveIds);
+        dst.reserve(reserveIds);
+        size_t queuedWords = 0;
+
+        const auto flushBatch = [&]() {
+            size_t pos = 0;
+            while (pos < ids.size()) {
+                const size_t got = reader.loadBatch(&ids[pos], ids.size() - pos, thread_idx);
+                if (got == 0) {
+                    Debug(Debug::ERROR) << "DBReader::loadBatch returned zero entries in clusthashfast\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                for (size_t slot = 0; slot < got; ++slot) {
+                    memcpy(arena.data + dst[pos + slot], reader.batchAt(thread_idx, slot),
+                           reader.getSeqLen(ids[pos + slot]));
+                }
+                pos += got;
+            }
+            ids.clear();
+            dst.clear();
+            queuedWords = 0;
+        };
+
+        // schedule(static) gives each thread one contiguous, disjoint word range and byte range.
+        // Queuing several words lets loadBatch coalesce a wider request before issuing io.
+#pragma omp for schedule(static) nowait
         for (size_t i = 0; i < used; ++i) {
             const size_t word = arena.touched[i];
             uint64_t set = arena.bits[word];
             size_t offset = arena.blockOffset[word];
-            ids.clear();
-            dst.clear();
             while (set != 0) {
                 const size_t k = static_cast<size_t>(__builtin_ctzll(set));
                 const DBLocalId id = static_cast<DBLocalId>(word * MemberArena::BLOCK + k);
@@ -333,24 +408,26 @@ static void fillArena(DBReader<DBKeyType> &reader, MemberArena &arena, size_t to
                 offset += reader.getSeqLen(id);
                 set &= set - 1;
             }
-            size_t pos = 0;
-            while (pos < ids.size()) {
-                const size_t got = reader.loadBatch(&ids[pos], ids.size() - pos, thread_idx);
-                for (size_t slot = 0; slot < got; slot++) {
-                    memcpy(arena.data + dst[pos + slot], reader.batchAt(thread_idx, slot),
-                           reader.getSeqLen(ids[pos + slot]));
-                }
-                pos += got;
+            ++queuedWords;
+            if (queuedWords >= batchWords) {
+                flushBatch();
             }
+        }
+        if (ids.empty() == false) {
+            flushBatch();
         }
     }
 }
 
 // a window is a maximal set of whole runs whose members fit the budget, so a run is never split
 static void planWindows(DBReader<DBKeyType> &reader, const HashEntry *entries, size_t entryCount,
-                        size_t budget, std::vector<size_t> &bounds) {
+                        size_t budget, size_t total, std::vector<size_t> &bounds) {
     bounds.clear();
     bounds.push_back(0);
+    // Filling window 1 to the brim leaves a tiny last one and makes peak anonymous memory the full
+    // budget; the same number of windows sized evenly costs the same io and a fraction of the peak.
+    const size_t windows = (budget > 0) ? std::max<size_t>((total + budget - 1) / budget, 1) : 1;
+    const size_t target = (windows > 0) ? std::max<size_t>((total + windows - 1) / windows, 1) : budget;
     size_t used = 0;
     size_t pos = 0;
     while (pos < entryCount) {
@@ -361,7 +438,7 @@ static void planWindows(DBReader<DBKeyType> &reader, const HashEntry *entries, s
                 runBytes += reader.getSeqLen(entries[k].id);
             }
         }
-        if (used > 0 && used + runBytes > budget) {
+        if (used > 0 && used + runBytes > target) {
             bounds.push_back(pos);
             used = 0;
         }
@@ -511,7 +588,7 @@ static ClusterCounts clusterPartition(DBReader<DBKeyType> &reader, DBWriter &wri
 
     // the members do not fit at once, so split the hash range and gather one window per pass
     std::vector<size_t> bounds;
-    planWindows(reader, entries, entryCount, arenaBudget, bounds);
+    planWindows(reader, entries, entryCount, arenaBudget, total, bounds);
     Debug(Debug::INFO) << "Gathering " << total << " byte of run members in " << (bounds.size() - 1)
                        << " passes\n";
     ClusterCounts counts;
@@ -600,8 +677,9 @@ static bool hashIntoPartitions(DBReader<DBKeyType> &reader, HashPartitions &part
     const size_t scanChunk = idScanBlock(reader, dbSize, threads);
     const unsigned int partitionCount = static_cast<unsigned int>(parts.files.size());
     // a fixed byte budget, not a fixed depth: per partition depth would grow what it is dividing
-    const size_t flush = std::max<size_t>(64, CLUSTHASHFAST_PENDING_BYTES
-                                              / (partitionCount * sizeof(HashEntry)));
+    const size_t pendingBytes = clusthashfastEnvSize("MMSEQS_CLUSTHASHFAST_PENDING_BYTES",
+                                                     CLUSTHASHFAST_PENDING_BYTES, sizeof(HashEntry));
+    const size_t flush = std::max<size_t>(64, pendingBytes / (partitionCount * sizeof(HashEntry)));
     std::vector<std::mutex> locks(partitionCount);
     Debug::Progress progress(dbSize);
     bool ok = true;
@@ -705,16 +783,19 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
     // gathering is a second sequential pass, so it only pays once the db stops fitting in memory
     const bool gather = (reader.getDataSize() + dbSize * sizeof(HashEntry) > memoryLimit);
     const unsigned int partitionCount = hashPartitionCount(dbSize, entryBudget);
-    // Only the live entry array competes with the arena, and that is dbSize*12 byte, not half of
-    // memory. Sizing the arena at half forced a second gather pass at 10B, which re-reads every
-    // member; 10% is left as slack for the writer and the reader index.
+    // The arena is written sequentially but read randomly during clustering, so a swapped arena is
+    // hit by random swap-ins. A multiplicative 10% slack shrinks in absolute terms exactly when the
+    // arena grows, so reserve a floor instead: the gather still streams the db through page cache,
+    // and the writer and reader index live next to it.
     const size_t liveEntryBytes = dbSize * sizeof(HashEntry) / partitionCount;
-    const size_t arenaBudget = (memoryLimit > liveEntryBytes)
-        ? std::max<size_t>(static_cast<size_t>((memoryLimit - liveEntryBytes) * 0.9), 1)
-        : 1;
+    const size_t cacheReserve = std::max<size_t>(CLUSTHASHFAST_MIN_CACHE_RESERVE, memoryLimit / 12);
+    const size_t arenaBudget = (memoryLimit > liveEntryBytes + cacheReserve)
+        ? (memoryLimit - liveEntryBytes - cacheReserve)
+        : std::max<size_t>(memoryLimit / 4, 1);
     Debug(Debug::INFO) << "Memory limit " << memoryLimit << " byte, entries " << liveEntryBytes
                        << " byte, member arena budget " << arenaBudget << " byte\n";
-    if (hashScanIsSequential(reader)) {
+    if (hashScanIsSequential(reader)
+        && clusthashfastEnvFlag("MMSEQS_CLUSTHASHFAST_SEQUENTIAL_ADVICE", true)) {
         reader.setSequentialAdvice();
     }
 
@@ -760,12 +841,16 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
             continue;
         }
         part.resize(partSize);
+        Timer partReadTimer;
         FILE *in = fopen(parts.names[partition].c_str(), "rb");
         if (in == NULL || fread(part.data(), sizeof(HashEntry), partSize, in) != partSize) {
             Debug(Debug::ERROR) << "Cannot read hash partition " << parts.names[partition] << "\n";
             EXIT(EXIT_FAILURE);
         }
+        clusthashfastDropFileCache(in, parts.names[partition]);
         fclose(in);
+        Debug(Debug::INFO) << "Time for reading partition " << (partition + 1) << ": "
+                           << partReadTimer.lap() << "\n";
         FileUtil::remove(parts.names[partition].c_str());
 
         Timer partSortTimer;

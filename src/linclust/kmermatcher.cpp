@@ -21,6 +21,8 @@
 
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include <limits>
@@ -56,7 +58,22 @@ static void prefetchScanChunk(DBReader<DBKeyType> &reader, size_t startId, size_
     if (end <= begin) {
         return;
     }
-    posix_madvise(begin, static_cast<size_t>(end - begin), POSIX_MADV_WILLNEED);
+    // madvise rejects an unaligned address with EINVAL, and an entry almost never starts on a page
+    // boundary, so widen outward: pulling in the two edge pages costs nothing for a readahead hint
+    const size_t page = Util::getPageSize();
+    const uintptr_t first = reinterpret_cast<uintptr_t>(begin) & ~(uintptr_t)(page - 1);
+    const uintptr_t last = (reinterpret_cast<uintptr_t>(end) + page - 1) & ~(uintptr_t)(page - 1);
+    if (last > first) {
+        const int rc = posix_madvise(reinterpret_cast<void *>(first),
+                                     static_cast<size_t>(last - first), POSIX_MADV_WILLNEED);
+        if (rc != 0) {
+            static bool warned = false;
+            if (warned == false) {
+                warned = true;
+                Debug(Debug::WARNING) << "posix_madvise(WILLNEED) failed: " << rc << "\n";
+            }
+        }
+    }
 }
 
 static size_t kmerScanChunkSize(DBReader<DBKeyType> &reader, size_t startId, size_t cnt, int threads) {
@@ -1660,8 +1677,12 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
         long openMax = sysconf(_SC_OPEN_MAX);
         size_t fdBudget = (openMax > 128) ? static_cast<size_t>(openMax - 64) : 64;
         if (openFiles >= fdBudget) {
+            // FileUtil::fixRlimitNoFile already raised the soft limit, so only the hard limit is actionable
+            struct rlimit lim;
+            unsigned long long hard = (getrlimit(RLIMIT_NOFILE, &lim) == 0) ? (unsigned long long) lim.rlim_max : 0;
             Debug(Debug::ERROR) << "The k-mer buckets need " << openFiles << " open bucket files (threads x splits) "
-                                << "but the open-file limit is " << openMax << ". Lower --threads or raise ulimit -n.\n";
+                                << "but the open-file limit is " << openMax << " (hard limit " << hard
+                                << "). Lower --threads or raise the hard limit (ulimit -Hn).\n";
             EXIT(EXIT_FAILURE);
         }
         unsigned int *hashToBucket = buildHashToBucketLookup(hashRanges);
@@ -1676,7 +1697,12 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
                 NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, NULL, &sink);
         }
         sink.finish();
-        seqDbr.remapData();
+        // Every k-mer now lives in a bucket file and each split below reads its bucket instead of
+        // rescanning, so this is the last use of the sequence bodies. Dropping ~3 TB of dead cache
+        // here hands it to the k-mer arrays, which are not allocated until the split loop.
+        // dropCacheAll must run while still mapped: fadvise skips pages that are mapped.
+        seqDbr.dropCacheAll();
+        seqDbr.unmapData();
         delete[] hashToBucket;
     }
     for(size_t split = 0; split < hashRanges.size(); split++) {
@@ -1831,6 +1857,9 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
 
     DBReader<DBKeyType> seqDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads,
                                   DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
+    // the partition pass is the last reader of the sequence bodies, and releasing their cache needs
+    // a descriptor that outlives the mapping
+    seqDbr.setIoCacheAdvice(true);
     // the whole-db scans below are sequential, which only NOSORT plus this hint can tell the reader
     seqDbr.open(DBReader<DBKeyType>::NOSORT);
     // NOSORT is key order and createdb writes offsets monotone in it, so ask for readahead too
@@ -2401,7 +2430,7 @@ class KmerTmpFileReader {
 public:
     KmerTmpFileReader(const std::string &fileName, size_t ioBufferBytes)
         : fileName(fileName), file(NULL), codec(codecFromFileName(fileName)),
-          entries(NULL), entrySize(0), offsetPos(0), dataSize(0),
+          entries(NULL), entrySize(0), offsetPos(0), released(0), dataSize(0),
           dstream(NULL), dctx(NULL), inBuffer(NULL), outBuffer(NULL), inBufferSize(0), outBufferSize(0),
           input(), readOffset(0), outPos(0), outLen(0),
           eof(false), frameComplete(false), closed(true), ioBufferBytes(ioBufferBytes) {
@@ -2421,6 +2450,7 @@ public:
         }
         entry = entries[offsetPos];
         offsetPos++;
+        releaseConsumed();
         return true;
     }
 
@@ -2457,6 +2487,29 @@ public:
     }
 
 private:
+    // The mapping is walked strictly forward, so everything behind offsetPos is dead. Released in
+    // 64 MB steps because a whole-page range is the only kind fadvise can act on, and because
+    // fadvise skips pages that are still mapped, madvise has to run first.
+    void releaseConsumed() {
+        static const size_t RELEASE_STEP = 64ull * 1024 * 1024;
+        const size_t consumed = offsetPos * sizeof(T);
+        if (entries == NULL || consumed < released + RELEASE_STEP) {
+            return;
+        }
+        const size_t page = Util::getPageSize();
+        const size_t end = consumed & ~(page - 1);
+        if (end <= released) {
+            return;
+        }
+        char *base = reinterpret_cast<char *>(entries);
+        ::madvise(base + released, end - released, MADV_DONTNEED);
+#if defined(HAVE_POSIX_FADVISE)
+        posix_fadvise(fileno(file), static_cast<off_t>(released),
+                      static_cast<off_t>(end - released), POSIX_FADV_DONTNEED);
+#endif
+        released = end;
+    }
+
     // the codec is not stored in the file, so the suffix the writer chose is what identifies it
     static int codecFromFileName(const std::string &fileName) {
         if (Util::endsWith(".zst", fileName)) {
@@ -2526,6 +2579,7 @@ private:
             }
             entrySize = dataSize / sizeof(T);
             offsetPos = 0;
+            released = 0;
         }
         closed = false;
     }
@@ -2623,6 +2677,7 @@ private:
     T *entries;
     size_t entrySize;
     size_t offsetPos;
+    size_t released;
     size_t dataSize;
     ZSTD_DStream *dstream;
     LZ4F_dctx *dctx;
@@ -2875,6 +2930,9 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
         for (size_t file = 0; file < threadedFiles[threadIdx].size(); file++) {
             readers[file]->close();
             delete readers[file];
+            // a lane owns its files, so unlinking here frees the disk and the last of its cache
+            // now instead of after the slowest lane finishes
+            FileUtil::remove(threadedFiles[threadIdx][file].c_str());
         }
 
         delete[] repSeqIds;
@@ -2885,7 +2943,10 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
 
     for (int tid = 0; tid < numThreads; ++tid) {
         for (std::string file : threadedFiles[tid]) {
-            FileUtil::remove(file.c_str());
+            // already unlinked by its lane unless that lane died before reaching the loop above
+            if (FileUtil::fileExists(file.c_str())) {
+                FileUtil::remove(file.c_str());
+            }
         }
     }
 }
