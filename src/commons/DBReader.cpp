@@ -42,7 +42,7 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), index(NULL), id2local(NULL), local2id(NULL),
-        dataMapped(false), accessType(0), externalData(false), didMlock(false), ioAutoDirect(false), ioBufferedBatch(false), ioCacheAdvice(false), directIoAlign(0)
+        dataMapped(false), accessType(0), externalData(false), didMlock(false), ioAutoDirect(false), ioBufferedBatch(false), ioCacheAdvice(false), ioExpectedResidentBytes(0), directIoAlign(0)
 {}
 
 template <typename T>
@@ -53,7 +53,7 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index), sortedByOffset(true),
         id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false),
-        ioAutoDirect(false), ioBufferedBatch(false), ioCacheAdvice(false), directIoAlign(0)
+        ioAutoDirect(false), ioBufferedBatch(false), ioCacheAdvice(false), ioExpectedResidentBytes(0), directIoAlign(0)
 {}
 
 template <typename T>
@@ -133,58 +133,14 @@ template <typename T> bool DBReader<T>::open(int accessType){
             EXIT(EXIT_FAILURE);
         }
         resolveIoPolicy(accessType);
-        totalDataSize = 0;
         dataFileCnt = dataFileNames.size();
         dataSizeOffset = new size_t[dataFileNames.size() + 1];
         dataFiles = new char*[dataFileNames.size()];
-        // fd-backed readers need descriptors to read. An mmap reader keeps one only when cache
-        // advice was asked for, so unrelated readers do not change their fd usage.
-        const bool keepCacheAdviceFd = ioCacheAdvice
-                                       && isCompressed(dbtype) != COMPRESSED
-                                       && (dataMode & USE_FREAD) == 0;
-        if ((dataMode & USE_DIRECT_IO) || keepCacheAdviceFd) {
-            dataFds = new int[dataFileNames.size()];
-            for (size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
-                dataFds[fileIdx] = -1;
-            }
+        if (dataMode & USE_DIRECT_IO) {
+            openDataFds();
+        } else {
+            mapDataFiles();
         }
-        for(size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++){
-            if (dataMode & USE_DIRECT_IO) {
-                // buffered descriptors have no alignment constraint, so read exactly the entry bytes
-                directIoAlign = ioBufferedBatch
-                    ? 1
-                    : std::max(directIoAlign, FileUtil::getDirectIoAlignment(dataFileNames[fileIdx]));
-                size_t directDataSize;
-                dataFds[fileIdx] = openDirect(dataFileNames[fileIdx].c_str(), &directDataSize);
-                dataFiles[fileIdx] = NULL;
-                dataSizeOffset[fileIdx] = totalDataSize;
-                totalDataSize += directDataSize;
-                continue;
-            }
-            FILE* dataFile = fopen(dataFileNames[fileIdx].c_str(), "r");
-            if (dataFile == NULL) {
-                Debug(Debug::ERROR) << "Cannot open data file " << dataFileName << "!\n";
-                EXIT(EXIT_FAILURE);
-            }
-            size_t dataSize;
-            dataFiles[fileIdx] = mmapData(dataFile, &dataSize);
-            if (keepCacheAdviceFd) {
-                dataFds[fileIdx] = ::dup(fileno(dataFile));
-                if (dataFds[fileIdx] < 0) {
-                    const int errsv = errno;
-                    Debug(Debug::ERROR) << "Cannot duplicate data fd for " << dataFileNames[fileIdx]
-                                        << ". Error " << errsv << ".\n";
-                    EXIT(EXIT_FAILURE);
-                }
-            }
-            dataSizeOffset[fileIdx]=totalDataSize;
-            totalDataSize += dataSize;
-            if (fclose(dataFile) != 0) {
-                Debug(Debug::ERROR) << "Cannot close file " << dataFileName << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-        }
-        dataSizeOffset[dataFileNames.size()]=totalDataSize;
         dataMapped = true;
         if (accessType == LINEAR_ACCCESS || accessType == SORT_BY_OFFSET) {
             setSequentialAdvice();
@@ -277,20 +233,8 @@ template <typename T> bool DBReader<T>::open(int accessType){
             Debug(Debug::ERROR) << "USE_DIRECT_IO cannot read the compressed database " << dataFileName << "\n";
             EXIT(EXIT_FAILURE);
         }
-        // readIndex already tracked max index[i].length here, so do not walk the index again
-        const size_t maxEntryLen = maxSeqLen;
-        // the entry can start one byte after an aligned boundary and end one byte before the next
-        const size_t maxRead = ((maxEntryLen + 2 * directIoAlign - 1) / directIoAlign) * directIoAlign;
-        const size_t initialSize = std::min(maxRead, BOUNCE_BUFFER_PREALLOC);
-        directBuffers = new DirectBuffer[threads];
-        for (int i = 0; i < threads; i++) {
-            directBuffers[i].buffer = NULL;
-            directBuffers[i].size = 0;
-            directBuffers[i].file = 0;
-            directBuffers[i].offset = 0;
-            directBuffers[i].length = 0;
-            growBuffer(&directBuffers[i].buffer, &directBuffers[i].size, initialSize, directIoAlign, 0);
-        }
+        // readIndex already tracked max index[i].length in maxSeqLen, so do not walk the index again
+        allocateDirectBuffers();
     }
 
     if(compression == COMPRESSED || padded){
@@ -619,6 +563,139 @@ static bool ioAccessIsSequential(int accessType) {
            || accessType == DBReader<DBKeyType>::SORT_BY_OFFSET;
 }
 
+// One descriptor per data file. totalDataSize is recomputed here so switching paths mid-run leaves
+// the same offsets the index was read against.
+template <typename T> void DBReader<T>::openDataFds() {
+    totalDataSize = 0;
+    dataFds = new int[dataFileNames.size()];
+    for (size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+        // buffered descriptors have no alignment constraint, so read exactly the entry bytes
+        directIoAlign = ioBufferedBatch
+            ? 1
+            : std::max(directIoAlign, FileUtil::getDirectIoAlignment(dataFileNames[fileIdx]));
+        size_t fileSize;
+        dataFds[fileIdx] = openDirect(dataFileNames[fileIdx].c_str(), &fileSize);
+        dataFiles[fileIdx] = NULL;
+        dataSizeOffset[fileIdx] = totalDataSize;
+        totalDataSize += fileSize;
+    }
+    dataSizeOffset[dataFileNames.size()] = totalDataSize;
+}
+
+// Maps every data file, keeping a dup'd descriptor when the caller asked for cache advice: fadvise
+// needs one, and it has to outlive the mapping because fadvise only works once the pages are unmapped.
+template <typename T> void DBReader<T>::mapDataFiles() {
+    const bool keepCacheAdviceFd = ioCacheAdvice
+                                   && isCompressed(dbtype) != COMPRESSED
+                                   && (dataMode & USE_FREAD) == 0;
+    if (keepCacheAdviceFd && dataFds == NULL) {
+        dataFds = new int[dataFileNames.size()];
+        for (size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+            dataFds[fileIdx] = -1;
+        }
+    }
+    totalDataSize = 0;
+    for (size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+        FILE *dataFile = fopen(dataFileNames[fileIdx].c_str(), "r");
+        if (dataFile == NULL) {
+            const int errsv = errno;
+            Debug(Debug::ERROR) << "Cannot open data file " << dataFileNames[fileIdx]
+                                << ". Error " << errsv << " (" << strerror(errsv) << ").\n";
+            EXIT(EXIT_FAILURE);
+        }
+        size_t fileSize;
+        dataFiles[fileIdx] = mmapData(dataFile, &fileSize);
+        if (keepCacheAdviceFd) {
+            dataFds[fileIdx] = ::dup(fileno(dataFile));
+            if (dataFds[fileIdx] < 0) {
+                const int errsv = errno;
+                Debug(Debug::ERROR) << "Cannot duplicate data fd for " << dataFileNames[fileIdx]
+                                    << ". Error " << errsv << ".\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+        dataSizeOffset[fileIdx] = totalDataSize;
+        totalDataSize += fileSize;
+        if (fclose(dataFile) != 0) {
+            Debug(Debug::ERROR) << "Cannot close file " << dataFileNames[fileIdx] << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+    dataSizeOffset[dataFileNames.size()] = totalDataSize;
+}
+
+// one bounce buffer per thread, wide enough for the widest aligned read a single entry can need
+template <typename T> void DBReader<T>::allocateDirectBuffers() {
+    if (directBuffers != NULL) {
+        return;
+    }
+    const size_t maxRead = ((static_cast<size_t>(maxSeqLen) + 2 * directIoAlign - 1) / directIoAlign) * directIoAlign;
+    const size_t initialSize = std::min(maxRead, BOUNCE_BUFFER_PREALLOC);
+    directBuffers = new DirectBuffer[threads];
+    for (int i = 0; i < threads; i++) {
+        directBuffers[i].buffer = NULL;
+        directBuffers[i].size = 0;
+        directBuffers[i].file = 0;
+        directBuffers[i].offset = 0;
+        directBuffers[i].length = 0;
+        growBuffer(&directBuffers[i].buffer, &directBuffers[i].size, initialSize, directIoAlign, 0);
+    }
+}
+
+template <typename T> void DBReader<T>::freeDirectBuffers() {
+    if (directBuffers == NULL) {
+        return;
+    }
+    for (int i = 0; i < threads; i++) {
+        free(directBuffers[i].buffer);
+        decrementMemory(directBuffers[i].size);
+    }
+    delete[] directBuffers;
+    directBuffers = NULL;
+}
+
+template <typename T> bool DBReader<T>::setIoDirect(bool direct) {
+    if ((dataMode & USE_DATA) == 0 || closed == 1 || dataMapped == false) {
+        return false;
+    }
+    if (direct == ((dataMode & USE_DIRECT_IO) != 0)) {
+        return true;
+    }
+    // these hand back reader-owned buffers, which the descriptor path has no way to serve
+    if (direct && (compression == COMPRESSED || padded || (dataMode & (USE_WRITABLE | USE_FREAD)))) {
+        return false;
+    }
+    unmapData();
+    if (direct) {
+        // unmapData leaves cache-advice descriptors alone, and openDataFds allocates its own array
+        if (dataFds != NULL) {
+            for (size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+                if (dataFds[fileIdx] >= 0) {
+                    ::close(dataFds[fileIdx]);
+                }
+            }
+            delete[] dataFds;
+            dataFds = NULL;
+        }
+        dataMode |= USE_DIRECT_IO;
+        openDataFds();
+        allocateDirectBuffers();
+    } else {
+        dataMode &= ~USE_DIRECT_IO;
+        freeDirectBuffers();
+        mapDataFiles();
+    }
+    // the batch arenas were aligned for the path that is going away
+    freeIoBatch();
+    ioBatch = new IoBatch();
+    ioBatch->workers.resize(threads);
+    dataMapped = true;
+    Debug(Debug::INFO) << "IO path for " << dataFileName << " switched to "
+                       << (direct ? (ioBufferedBatch ? "buffered descriptors" : "O_DIRECT") : "mmap")
+                       << "\n";
+    return true;
+}
+
 // mmap is the default; MMSEQS_IO_POLICY pins any reader, the size rule only moves opt-in ones
 template <typename T> void DBReader<T>::resolveIoPolicy(int accessType) {
     if (dataMode & USE_DIRECT_IO) {
@@ -645,11 +722,23 @@ template <typename T> void DBReader<T>::resolveIoPolicy(int accessType) {
         } else {
             ioBufferedBatch = false;   // mmap
         }
+        Debug(Debug::INFO) << "IO policy for " << dataFileName << " pinned by MMSEQS_IO_POLICY="
+                           << policyEnv << "\n";
         return;
     }
-    // batching beats mmap in every measured regime for random access, so this one skips the size rule
+    // batching beats mmap for random access at any size, but the page cache only earns its keep
+    // while the reused entries can still live in it. Past that it holds bytes nobody hits again
+    // and the kernel pays for them by swapping out the caller's own arrays, so drop to O_DIRECT.
     if (ioBufferedBatch) {
         dataMode |= USE_DIRECT_IO;
+        if (dataOutgrowsMemory()) {
+            ioBufferedBatch = false;
+            Debug(Debug::INFO) << "IO policy for " << dataFileName
+                               << ": O_DIRECT + batching, the data outgrows the cache\n";
+        } else {
+            Debug(Debug::INFO) << "IO policy for " << dataFileName
+                               << ": buffered + batching, the data still fits the cache\n";
+        }
         return;
     }
     if (ioAutoDirect == false) {
@@ -659,18 +748,31 @@ template <typename T> void DBReader<T>::resolveIoPolicy(int accessType) {
     if (ioAccessIsSequential(accessType)) {
         return;
     }
-    size_t bytes = 0;
+    if (dataOutgrowsMemory()) {
+        dataMode |= USE_DIRECT_IO;
+        Debug(Debug::INFO) << "IO policy for " << dataFileName
+                           << ": O_DIRECT, the data outgrows the cache\n";
+    }
+}
+
+// false when a file cannot be sized, so an unreadable path keeps the cached path and its diagnostics
+template <typename T> bool DBReader<T>::dataOutgrowsMemory() {
+    // the reader's own index is parsed only after this decision, so its file size stands in for it
+    size_t bytes = ioExpectedResidentBytes;
+    if (externalData == false && indexFileName != NULL) {
+        const size_t indexFileSize = FileUtil::getFileSize(indexFileName);
+        if (indexFileSize != static_cast<size_t>(-1)) {
+            bytes += indexFileSize;
+        }
+    }
     for (size_t i = 0; i < dataFileNames.size(); i++) {
         const size_t fileSize = FileUtil::getFileSize(dataFileNames[i]);
         if (fileSize == static_cast<size_t>(-1)) {
-            // a vanished file cannot be sized, stay on mmap and let the open below report it
-            return;
+            return false;
         }
         bytes += fileSize;
     }
-    if (bytes > Util::computeMemory(0)) {
-        dataMode |= USE_DIRECT_IO;
-    }
+    return bytes > Util::computeMemory(0);
 }
 
 template <typename T> int DBReader<T>::openDirect(const char *fileName, size_t *dataSize) {
@@ -1029,113 +1131,16 @@ const char *DBReader<T>::batchAt(unsigned int thrIdx, size_t k) {
     return ioBatch->workers[thrIdx].arena + slot.arenaOffset + slot.delta;
 }
 
-template <typename T>
-size_t DBReader<T>::batchLengthAt(unsigned int thrIdx, size_t k) {
-    const typename IoBatch::Slot &slot = ioBatch->workers[thrIdx].slots[k];
-    return ((dataMode & USE_DIRECT_IO) == 0) ? getEntryLen(slot.id) : slot.avail;
-}
 
-
-// Drops clean file-backed pages for entries whose application-level lifetime is over.
-// mmap readers first remove their PTEs with MADV_DONTNEED, which needs whole interior pages
-// because a boundary page can still hold a live neighbour; the page cache itself is then
-// released through the descriptor. O_DIRECT never populated the cache, so it returns early.
-template <typename T>
-void DBReader<T>::dropCacheEntries(const size_t *ids, size_t n) {
-#ifdef HAVE_POSIX_FADVISE
-    if (ids == NULL || n == 0 || (dataMode & USE_DATA) == 0 || index == NULL) {
-        return;
-    }
-    if ((dataMode & USE_DIRECT_IO) && ioBufferedBatch == false) {
-        return;
-    }
-    if ((dataMode & USE_FREAD) || compression == COMPRESSED) {
-        return;
-    }
-
-    struct CacheRange { size_t file; size_t begin; size_t end; };
-    std::vector<CacheRange> ranges;
-    ranges.reserve(n);
-    for (size_t i = 0; i < n; i++) {
-        const size_t id = ids[i];
-        if (id >= size) {
-            continue;
-        }
-        const size_t localId = (local2id != NULL) ? local2id[id] : id;
-        const size_t globalOffset = index[localId].offset;
-        const size_t length = index[localId].length;
-        if (length == 0 || globalOffset >= totalDataSize) {
-            continue;
-        }
-        const size_t *upper = std::upper_bound(dataSizeOffset, dataSizeOffset + dataFileCnt + 1, globalOffset);
-        if (upper == dataSizeOffset) {
-            continue;
-        }
-        const size_t file = static_cast<size_t>((upper - dataSizeOffset) - 1);
-        if (file >= dataFileCnt || globalOffset < dataSizeOffset[file]) {
-            continue;
-        }
-        const size_t fileOffset = globalOffset - dataSizeOffset[file];
-        const size_t available = (dataSizeOffset[file + 1] - dataSizeOffset[file]) - fileOffset;
-        CacheRange r;
-        r.file = file;
-        r.begin = fileOffset;
-        r.end = fileOffset + std::min(length, available);
-        if (r.end > r.begin) {
-            ranges.push_back(r);
-        }
-    }
-    if (ranges.empty()) {
-        return;
-    }
-    // sorting lets neighbours merge, which is what makes whole pages appear in the first place
-    std::sort(ranges.begin(), ranges.end(), [](const CacheRange &a, const CacheRange &b) {
-        if (a.file != b.file) { return a.file < b.file; }
-        if (a.begin != b.begin) { return a.begin < b.begin; }
-        return a.end < b.end;
-    });
-
-    const long pageSizeLong = sysconf(_SC_PAGESIZE);
-    const size_t pageSize = (pageSizeLong > 0) ? static_cast<size_t>(pageSizeLong) : 4096u;
-
-    for (size_t i = 0; i < ranges.size(); ) {
-        CacheRange merged = ranges[i];
-        size_t j = i + 1;
-        while (j < ranges.size() && ranges[j].file == merged.file && ranges[j].begin <= merged.end) {
-            merged.end = std::max(merged.end, ranges[j].end);
-            j++;
-        }
-        i = j;
-
-        // madvise needs page-aligned bounds and rounds length up, so clamp inward by hand
-        if ((dataMode & USE_DIRECT_IO) == 0 && dataFiles != NULL && dataFiles[merged.file] != NULL) {
-            size_t pageBegin = merged.begin;
-            const size_t rem = pageBegin % pageSize;
-            if (rem != 0) {
-                pageBegin += pageSize - rem;
-            }
-            const size_t pageEnd = merged.end - (merged.end % pageSize);
-            if (pageEnd > pageBegin) {
-                ::madvise(dataFiles[merged.file] + pageBegin, pageEnd - pageBegin, MADV_DONTNEED);
-            }
-        }
-        // POSIX_FADV_DONTNEED already rounds the range inward in the kernel, so pass it as is
-        const int fd = (dataFds != NULL) ? dataFds[merged.file] : -1;
-        if (fd >= 0) {
-            posix_fadvise(fd, static_cast<off_t>(merged.begin),
-                          static_cast<off_t>(merged.end - merged.begin), POSIX_FADV_DONTNEED);
-        }
-    }
-#else
-    (void) ids;
-    (void) n;
-#endif
-}
 
 template <typename T>
 void DBReader<T>::dropCacheAll() {
 #ifdef HAVE_POSIX_FADVISE
     if ((dataMode & USE_DATA) == 0 || (dataMode & USE_FREAD) || compression == COMPRESSED) {
+        return;
+    }
+    // MADV_DONTNEED on a writable MAP_PRIVATE mapping silently discards the caller's edits
+    if (dataMode & USE_WRITABLE) {
         return;
     }
     // O_DIRECT never populated the cache, so there is nothing to drop
@@ -1243,25 +1248,28 @@ template <typename T> void DBReader<T>::close(){
 
     if(dataMode & USE_DATA){
         unmapData();
+        // the cache-advice descriptors outlive unmapData on purpose, so this is where they go
+        if (dataFds != NULL) {
+            for (size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+                if (dataFds[fileIdx] >= 0) {
+                    ::close(dataFds[fileIdx]);
+                }
+            }
+            delete[] dataFds;
+            dataFds = NULL;
+        }
     }
 
     if (id2local != NULL) {
         delete[] id2local;
-        decrementMemory(size*sizeof(unsigned int));
+        decrementMemory(size*sizeof(DBLocalId));
     }
     if (local2id != NULL) {
         delete[] local2id;
-        decrementMemory(size*sizeof(unsigned int));
+        decrementMemory(size*sizeof(DBLocalId));
     }
 
-    if(directBuffers){
-        for(int i = 0; i < threads; i++){
-            free(directBuffers[i].buffer);
-            decrementMemory(directBuffers[i].size);
-        }
-        delete [] directBuffers;
-        directBuffers = NULL;
-    }
+    freeDirectBuffers();
 
     freeIoBatch();
 

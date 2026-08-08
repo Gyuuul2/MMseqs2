@@ -35,9 +35,8 @@ static const size_t CLUSTHASHFAST_MAX_RETAINED_CLAIMS = 1024 * 1024;
 static const unsigned int CLUSTHASHFAST_MAX_PARTITIONS = 4096;
 // per thread write buffer budget for the hash pass, split across the partitions
 static const size_t CLUSTHASHFAST_PENDING_BYTES = 8 * 1024 * 1024;
-// page cache the gather stream needs, plus room for the writer; a fraction alone shrinks when the
-// arena grows, which is the one moment it must not
-static const size_t CLUSTHASHFAST_MIN_CACHE_RESERVE = 64ull * 1024 * 1024 * 1024;
+// floor under the proportional cache reserve, so a tiny machine still keeps room for the stream
+static const size_t CLUSTHASHFAST_MIN_CACHE_RESERVE = 1ull * 1024 * 1024 * 1024;
 
 // Test-only I/O knobs. The defaults reproduce the current behavior, so one binary can A/B.
 static size_t clusthashfastEnvSize(const char *name, size_t fallback, size_t minimum) {
@@ -353,6 +352,20 @@ static size_t planArena(DBReader<DBKeyType> &reader, MemberArena &arena, const H
     return stripeBase[threads];
 }
 
+// The gather touches a scattered subset, so a mapping faults 4096 byte for a few hundred wanted:
+// descriptors read the entry alone and loadBatch can queue them. Falls back to the mapping silently.
+static bool clusthashfastSetGatherIo(DBReader<DBKeyType> &reader, bool direct) {
+    static bool warned = false;
+    if (reader.setIoDirect(direct) == false) {
+        if (direct && warned == false) {
+            warned = true;
+            Debug(Debug::WARNING) << "Gather stays on the mapping, this reader cannot use descriptors\n";
+        }
+        return false;
+    }
+    return true;
+}
+
 // one sequential pass over the db, each thread copying its own contiguous id range into the arena
 static void fillArena(DBReader<DBKeyType> &reader, MemberArena &arena, size_t total, int threads) {
     arena.data = new(std::nothrow) char[total];
@@ -566,14 +579,19 @@ static ClusterCounts clusterHashRuns(DBReader<DBKeyType> &reader, DBWriter &writ
 // gathers the run members this partition compares, then clusters with every read coming from memory
 static ClusterCounts clusterPartition(DBReader<DBKeyType> &reader, DBWriter &writer, const HashEntry *entries,
                                       size_t entryCount, size_t idSpace, float seqIdThr, bool showProgress,
-                                      bool gather, size_t arenaBudget, int threads, MemberArena &arena) {
+                                      bool gather, size_t arenaBudget, size_t directArenaBudget, int threads,
+                                      MemberArena &arena) {
     if (gather == false) {
         return clusterHashRuns(reader, writer, entries, entryCount, seqIdThr, showProgress, NULL, threads);
     }
 
     Timer gatherTimer;
+    // Descriptors fetch the entry and nothing else, so one more window costs no more io and the arena
+    // can stay small. A mapping rereads the whole file per window, so it needs few windows and the
+    // large budget instead.
+    const size_t budget = clusthashfastSetGatherIo(reader, true) ? directArenaBudget : arenaBudget;
     const size_t total = planArena(reader, arena, entries, entryCount, idSpace, threads);
-    if (total <= arenaBudget) {
+    if (total <= budget) {
         if (total > 0) {
             fillArena(reader, arena, total, threads);
         }
@@ -588,7 +606,7 @@ static ClusterCounts clusterPartition(DBReader<DBKeyType> &reader, DBWriter &wri
 
     // the members do not fit at once, so split the hash range and gather one window per pass
     std::vector<size_t> bounds;
-    planWindows(reader, entries, entryCount, arenaBudget, total, bounds);
+    planWindows(reader, entries, entryCount, budget, total, bounds);
     Debug(Debug::INFO) << "Gathering " << total << " byte of run members in " << (bounds.size() - 1)
                        << " passes\n";
     ClusterCounts counts;
@@ -597,7 +615,7 @@ static ClusterCounts clusterPartition(DBReader<DBKeyType> &reader, DBWriter &wri
         const size_t size = bounds[window + 1] - begin;
         const size_t windowTotal = planArena(reader, arena, entries + begin, size, idSpace, threads);
         // a single run wider than the whole budget cannot be gathered, so read that one from the db
-        const bool gathered = (windowTotal > 0 && windowTotal <= arenaBudget);
+        const bool gathered = (windowTotal > 0 && windowTotal <= budget);
         if (gathered) {
             fillArena(reader, arena, windowTotal, threads);
         }
@@ -783,17 +801,18 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
     // gathering is a second sequential pass, so it only pays once the db stops fitting in memory
     const bool gather = (reader.getDataSize() + dbSize * sizeof(HashEntry) > memoryLimit);
     const unsigned int partitionCount = hashPartitionCount(dbSize, entryBudget);
-    // The arena is written sequentially but read randomly during clustering, so a swapped arena is
-    // hit by random swap-ins. A multiplicative 10% slack shrinks in absolute terms exactly when the
-    // arena grows, so reserve a floor instead: the gather still streams the db through page cache,
-    // and the writer and reader index live next to it.
+    // the gather streams the db through page cache next to the arena, so keep a proportional slice
     const size_t liveEntryBytes = dbSize * sizeof(HashEntry) / partitionCount;
     const size_t cacheReserve = std::max<size_t>(CLUSTHASHFAST_MIN_CACHE_RESERVE, memoryLimit / 12);
-    const size_t arenaBudget = (memoryLimit > liveEntryBytes + cacheReserve)
-        ? (memoryLimit - liveEntryBytes - cacheReserve)
-        : std::max<size_t>(memoryLimit / 4, 1);
+    const size_t unreserved = (memoryLimit > liveEntryBytes + cacheReserve)
+        ? (memoryLimit - liveEntryBytes - cacheReserve) : 0;
+    // the floor keeps the arena from collapsing to nothing just above the reserve threshold
+    const size_t arenaBudget = std::max(unreserved, std::max<size_t>(memoryLimit / 4, 1));
+    // an arena this size is only reachable on the descriptor path, where windows are free
+    const size_t directArenaBudget = std::max<size_t>(memoryLimit / 16, 1);
     Debug(Debug::INFO) << "Memory limit " << memoryLimit << " byte, entries " << liveEntryBytes
-                       << " byte, member arena budget " << arenaBudget << " byte\n";
+                       << " byte, member arena budget " << arenaBudget << " byte, "
+                       << directArenaBudget << " byte on descriptors\n";
     if (hashScanIsSequential(reader)
         && clusthashfastEnvFlag("MMSEQS_CLUSTHASHFAST_SEQUENTIAL_ADVICE", true)) {
         reader.setSequentialAdvice();
@@ -813,7 +832,7 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
         Debug(Debug::INFO) << "Cluster equal length sequences...\n";
         MemberArena arena;
         counts = clusterPartition(reader, writer, entries, dbSize, dbSize, par.seqIdThr, showProgress,
-                                  gather, arenaBudget, par.threads, arena);
+                                  gather, arenaBudget, directArenaBudget, par.threads, arena);
         delete[] entries;
         Debug(Debug::INFO) << "Found " << counts.runs << " unique hash/length groups\n";
         return counts;
@@ -859,7 +878,7 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
                            << partSortTimer.lap() << "\n";
         const ClusterCounts partCounts = clusterPartition(reader, writer, part.data(), partSize, dbSize,
                                                           par.seqIdThr, showProgress, gather, arenaBudget,
-                                                          par.threads, arena);
+                                                          directArenaBudget, par.threads, arena);
         counts.add(partCounts);
         Debug(Debug::INFO) << "Partition " << (partition + 1) << "/" << partitionCount << ": "
                            << partCounts.runs << " groups, " << partCounts.clusters << " clusters\n";

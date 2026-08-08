@@ -59,7 +59,9 @@ public:
     struct Index {
         T id;
         size_t offset;
-        unsigned int length;
+        // size_t, not unsigned int: padding makes it free in both builds, and a 4 GB entry used to
+        // wrap here, which the mmap path survived and the descriptor path did not
+        size_t length;
 
         // we need a non-strict-weak ordering function here
         // so our upper_bound call works correctly
@@ -206,12 +208,12 @@ public:
     // working set is anywhere near cacheable; O_DIRECT only wins ~16% once it is not.
     void setIoBufferedBatch(bool buffered) { ioBufferedBatch = buffered; }
 
-    // Keeps a descriptor open on an mmap reader so dropCacheEntries can fadvise it. Off by default,
+    // Keeps a descriptor open on an mmap reader so dropCacheAll can fadvise it. Off by default,
     // so readers that never reclaim cache do not change their fd usage.
     void setIoCacheAdvice(bool enabled) { ioCacheAdvice = enabled; }
 
-    // Releases the page cache behind entries[0..count) once the caller knows they are final.
-    void dropCacheEntries(const size_t *ids, size_t count);
+    // anonymous bytes the caller will hold while reading; the size rule adds them before open()
+    void setIoExpectedResidentBytes(size_t bytes) { ioExpectedResidentBytes = bytes; }
 
     // Drops the whole file's cache. Entries average a few hundred bytes, so a per-entry range never
     // contains a full page and frees nothing; only a whole-file range reliably does.
@@ -223,10 +225,17 @@ public:
     // already addressable, so this only records the ids. Pointers stay valid until the next
     // loadBatch on the same thread.
     size_t loadBatch(const size_t *ids, size_t n, unsigned int thrIdx);
+
+    // the k-th entry of the batch loadBatch just returned
     const char *batchAt(unsigned int thrIdx, size_t k);
-    size_t batchLengthAt(unsigned int thrIdx, size_t k);
 
     bool isDirectIo() const { return (dataMode & USE_DIRECT_IO) != 0; }
+
+    // Moves the data path between a mapping and descriptors, for readers whose phases want opposite
+    // things: a full scan wants the readahead only a mapping gets, a scattered gather wants reads
+    // that fetch the entry and nothing around it. No thread may hold a data pointer across this
+    // call. Returns false when the reader cannot serve descriptors, so the caller keeps the mapping.
+    bool setIoDirect(bool direct);
 
     void close();
 
@@ -624,9 +633,16 @@ private:
     bool ioAutoDirect;
     bool ioBufferedBatch;
     bool ioCacheAdvice;
+    size_t ioExpectedResidentBytes;
 
     // O_DIRECT alignment resolved per data file at open time, the device can want less than 4096
     size_t directIoAlign;
+
+    bool dataOutgrowsMemory();
+    void allocateDirectBuffers();
+    void freeDirectBuffers();
+    void openDataFds();
+    void mapDataFiles();
 
     // needed to prevent the compiler from optimizing away the loop
     char magicBytes;

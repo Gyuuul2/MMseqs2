@@ -695,7 +695,10 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
             if (thread_idx == 0) {
-                seqDbr.remapData();
+                // Drops the pages of the window just scanned. remapData did this by reopening the
+                // file by name, which dies if the workflow unlinked it meanwhile, loses the
+                // sequential advice, and invalidates every pointer; this keeps the mapping.
+                seqDbr.dropCacheAll();
             }
 #pragma omp barrier
         }
@@ -1453,8 +1456,9 @@ std::vector<std::pair<size_t, size_t>> setupCountTable(
         fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, IncludeSeqLen>(NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
     }
 
-    seqDbr.remapData();
-
+    // the scan above is finished with these pages; releasing them by name would die on a db whose
+    // files the workflow has already unlinked, and the mapping itself stays valid either way
+    seqDbr.dropCacheAll();
 
     if (splits > 1) {
         Debug(Debug::INFO) << "Not enough memory to process at once need to split for initiating count table\n";
@@ -1819,7 +1823,7 @@ std::vector<std::pair<size_t, size_t>> setupKmerSplits(Parameters &par, BaseMatr
         }else{
             fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, IncludeSeqLen>(NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
         }
-        seqDbr.remapData();
+        seqDbr.dropCacheAll();
         size_t maxBucketSize = 0;
         for(size_t i = 0; i < (USHRT_MAX+1); i++) {
             if(maxBucketSize < hashDist[i]){
@@ -1952,7 +1956,8 @@ void writeKmerMatcherResult(DBWriter & dbw,
         prefResultsOutString.reserve(100000000);
         char buffer[100];
         size_t lastTargetId = SIZE_T_MAX;
-        unsigned int writeSets = 0;
+        // counts every hit line a lane writes, so a 32 bit counter can wrap back to zero at 10^10
+        size_t writeSets = 0;
         size_t kmerPos=0;
         size_t repSeqId = SIZE_T_MAX;
         for(kmerPos = threadOffsets[thread]; kmerPos < threadOffsets[thread+1] && hashSeqPair[kmerPos].kmer != SIZE_T_MAX; kmerPos++){
@@ -2752,22 +2757,22 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
         static_cast<size_t>(numThreads) * std::max<size_t>(maxFilesPerThread, 1) * 2);
 
     int mergeThreads = numThreads;
-    if (tmpFileCodec != KMER_TMP_CODEC_NONE) {
-        if (maxFilesPerThread > 0) {
-            long openMax = sysconf(_SC_OPEN_MAX);
-            size_t fdReserve = 2 * static_cast<size_t>(numThreads) + 64;
-            size_t fdBudget = (openMax > 0 && static_cast<size_t>(openMax) > fdReserve)
-                                  ? (static_cast<size_t>(openMax) - fdReserve) : 1;
-            if (maxFilesPerThread >= fdBudget) {
-                Debug(Debug::ERROR) << "Too many compressed k-mer temporary files for one merge lane ("
-                                    << maxFilesPerThread << ") relative to open-file limit ("
-                                    << openMax << "). Reduce kmermatcher splits or disable "
-                                    << "--compress-kmer-tmp-files.\n";
-                EXIT(EXIT_FAILURE);
-            }
-            mergeThreads = std::min(mergeThreads,
-                                    std::max(1, static_cast<int>(fdBudget / maxFilesPerThread)));
+    if (maxFilesPerThread > 0) {
+        // both codecs hold one descriptor per file per lane, so the fd throttle applies to both
+        long openMax = sysconf(_SC_OPEN_MAX);
+        size_t fdReserve = 2 * static_cast<size_t>(numThreads) + 64;
+        size_t fdBudget = (openMax > 0 && static_cast<size_t>(openMax) > fdReserve)
+                              ? (static_cast<size_t>(openMax) - fdReserve) : 1;
+        if (maxFilesPerThread >= fdBudget) {
+            Debug(Debug::ERROR) << "One merge lane needs " << maxFilesPerThread
+                                << " open k-mer temporary files but the open-file limit is "
+                                << openMax << ". Reduce kmermatcher splits or raise the limit (ulimit -n).\n";
+            EXIT(EXIT_FAILURE);
+        }
+        mergeThreads = std::min(mergeThreads,
+                                std::max(1, static_cast<int>(fdBudget / maxFilesPerThread)));
 
+        if (tmpFileCodec != KMER_TMP_CODEC_NONE) {
             const size_t perReaderBytes = (2 * readerBufferBytes) + 4096;
             const size_t memoryLimit = Util::computeMemory(Parameters::getInstance().splitMemoryLimit);
             size_t mergeHeadroom = std::max(KMER_MERGE_MIN_MEMORY_HEADROOM, memoryLimit / 10);
@@ -2785,12 +2790,11 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
                                         std::max(1, static_cast<int>(memBudget / bytesPerLane)));
             }
         }
+    }
 
-        if (mergeThreads < numThreads) {
-            Debug(Debug::INFO) << "Compressed k-mer tmp merge uses " << mergeThreads
-                               << " concurrent lanes for " << numThreads
-                               << " writer lanes to stay within file descriptor/memory bounds.\n";
-        }
+    if (mergeThreads < numThreads) {
+        Debug(Debug::INFO) << "K-mer tmp merge uses " << mergeThreads << " concurrent lanes for "
+                           << numThreads << " writer lanes to stay within file descriptor/memory bounds.\n";
     }
 
     Timer mergeTimer;
@@ -3021,7 +3025,8 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
             size_t lastTargetId = SIZE_T_MAX;
             seqLenType lastDiagonal = 0;
             int diagonalScore = 0;
-            unsigned int writeSets = 0;
+            // counts every hit line a lane writes, so a 32 bit counter can wrap back to zero at 10^10
+            size_t writeSets = 0;
             size_t bufferPos = 0;
             size_t elementCnt = 0;
 

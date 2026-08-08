@@ -456,6 +456,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     // O_DIRECT at 11x reuse, while O_DIRECT wins only 16% when there is none. Batched io_uring on
     // buffered descriptors keeps that reuse and still avoids the mmap fault path.
     seqDbr->setIoBufferedBatch(true);
+    // the per-sequence arrays live for the whole loop, so the size rule must not mistake them for cache
+    const size_t align2clustPerSeqBytes = sizeof(ClusterAssignment)
+        + ((par.clusteringMode == Parameters::SET_COVER) ? sizeof(PrefInfo) : sizeof(DBLocalId));
+    seqDbr->setIoExpectedResidentBytes(alnDbr.getSize() * align2clustPerSeqBytes);
     // SORT_BY_LENGTH costs id2local plus local2id; neither mode needs them once lengthOrder exists
     seqDbr->open(DBReader<DBKeyType>::NOSORT);
  
@@ -630,18 +634,23 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     // and only competes with the cluster state. Drop it whole once it can no longer fit; a page
     // holds ~16 entries belonging to unrelated queries, so nothing smaller ever frees a page.
     const size_t ioMemoryLimit = Util::computeMemory(par.splitMemoryLimit);
-    bool dropAlnCache = ioMemoryLimit > 0 && alnDbr.getDataSize() > ioMemoryLimit / 2;
+    // an O_DIRECT reader has no cache to drop, so skip the shared counter it would cost
+    bool dropAlnCache = alnDbr.isDirectIo() == false
+                        && ioMemoryLimit > 0 && alnDbr.getDataSize() > ioMemoryLimit / 2;
     if (const char *dropEnv = getenv("MMSEQS_A2C_DROP_ALN")) {
         if (strcmp(dropEnv, "1") == 0) dropAlnCache = true;
         else if (strcmp(dropEnv, "0") == 0) dropAlnCache = false;
         else Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_DROP_ALN=" << dropEnv << " (use 0 or 1)\n";
     }
     // one random entry can pull in a whole page, so bound the cache by pages, not by entry bytes
-    const size_t alnDropInterval = std::max<size_t>(ioMemoryLimit / 4 / Util::getPageSize(), 1);
-    std::atomic<size_t> alnDropCounter(0);
+    // never zero: the epoch loop advances by this, and an empty db would otherwise spin forever
+    const size_t alnEpoch = dropAlnCache
+        ? std::max<size_t>(ioMemoryLimit / 4 / Util::getPageSize(), 1)
+        : std::max<size_t>(endRange, 1);
     Debug(Debug::INFO) << "Prefilter cache policy: "
-                       << (dropAlnCache ? "drop in bulk every " + SSTR(alnDropInterval) + " entries"
-                                        : "keep, it fits") << "\n";
+                       << (dropAlnCache ? "drop at a barrier every " + SSTR(alnEpoch) + " entries"
+                                        : (alnDbr.isDirectIo() ? "O_DIRECT, nothing cached" : "keep, it fits"))
+                       << "\n";
 
     Debug::Progress progress(endRange);
     size_t db_maxseqlen = (cluSeqDbr != nullptr)
@@ -679,12 +688,12 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             alnLineBuffer.resize(1024 + 32768 * 4);
         }
 
+        // one epoch when nothing is dropped, so the single-pass shape and its nowait are unchanged
+        for (size_t epochStart = 0; epochStart < endRange || epochStart == 0; epochStart += alnEpoch) {
+            const size_t epochEnd = std::min(endRange, epochStart + alnEpoch);
 #pragma omp for schedule(dynamic, alignChunk) nowait
-        for (size_t i = 0; i < endRange; i++) {
+        for (size_t i = epochStart; i < epochEnd; i++) {
             progress.updateProgress();
-            if (dropAlnCache && (alnDropCounter.fetch_add(1, std::memory_order_relaxed) + 1) % alnDropInterval == 0) {
-                alnDbr.dropCacheAll();
-            }
             ClusterResult clusterResult;
             clusterResult.sequenceIdx = i;
             targetsWithDiagonal.clear();
@@ -1079,6 +1088,13 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             }
             pushClusterResult(std::move(clusterResult));
         }
+            if (dropAlnCache) {
+                // no worker is inside an entry here, so nothing holds a pointer into the mapping
+#pragma omp barrier
+#pragma omp single
+                alnDbr.dropCacheAll();
+            }
+        }
     }
 
     // nothing past the producer loop reads the visit order, so drop it before memberOrder is sized
@@ -1170,9 +1186,17 @@ int align2clust(int argc, const char **argv, const Command &command) {
     
     DBReader<DBKeyType> alnDbr(par.db2.c_str(), par.db2Index.c_str(), par.threads,
                                   DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
-    // Keeps a descriptor beside the mmap so the cache can be released in bulk. Entries average
-    // ~259 B, so a per-entry range never contains a whole page; only a whole-file drop frees anything.
+    // Scale decides both: below the size rule this stays on mmap and the descriptor lets the cache
+    // be released in bulk between passes; above it the cache could never hold the db anyway, so the
+    // reader drops to O_DIRECT and the release becomes a no-op. Entries average ~259 B, so a
+    // per-entry range never contains a whole page and only a whole-file drop frees anything.
+    alnDbr.setIoAutoDirect(true);
     alnDbr.setIoCacheAdvice(true);
+    // the sequence reader's index is not allocated yet, but it will sit beside this db's cache
+    const size_t seqIndexFileSize = FileUtil::getFileSize(par.db1Index);
+    if (seqIndexFileSize != static_cast<size_t>(-1)) {
+        alnDbr.setIoExpectedResidentBytes(seqIndexFileSize);
+    }
     // read only by key, and LINEAR_ACCCESS would advise SEQUENTIAL on a db this pass reads out of order
     alnDbr.open(DBReader<DBKeyType>::NOSORT);
     int dbtype =  Parameters::DBTYPE_CLUSTER_RES;

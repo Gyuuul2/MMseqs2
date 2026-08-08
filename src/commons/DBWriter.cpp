@@ -1,4 +1,8 @@
 #include "DBWriter.h"
+
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "FastSort.h"
 #include "DBReader.h"
 #include "Debug.h"
@@ -231,6 +235,30 @@ void DBWriter::closeFiles(){
     }
 }
 
+// A finished output file is dirty page cache nothing in this process reads again, and at TB scale it
+// evicts the next stage's working set. DONTNEED skips dirty pages, so the bytes have to reach disk
+// first; the writeback barrier is only worth paying once the file is large enough to matter.
+static const size_t DBWRITER_CACHE_DROP_MIN_BYTES = 1ull * 1024 * 1024 * 1024;
+
+static void releaseWrittenCache(const char *fileName) {
+#if defined(HAVE_POSIX_FADVISE)
+    const int fd = ::open(fileName, O_RDONLY);
+    if (fd < 0) {
+        return;
+    }
+    struct stat sb;
+    if (fstat(fd, &sb) == 0 && static_cast<size_t>(sb.st_size) >= DBWRITER_CACHE_DROP_MIN_BYTES) {
+        // a fresh descriptor cannot fdatasync another one's writes, so sync through the same inode
+        if (fdatasync(fd) == 0) {
+            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        }
+    }
+    ::close(fd);
+#else
+    (void) fileName;
+#endif
+}
+
 void DBWriter::close(bool merge, bool needsSort) {
     closeFiles();
 
@@ -239,6 +267,9 @@ void DBWriter::close(bool merge, bool needsSort) {
                  threads, merge, ((mode & Parameters::WRITER_LEXICOGRAPHIC_MODE) != 0), needsSort);
 
     writeDbtypeFile(dataFileName, dbtype, (mode & Parameters::WRITER_COMPRESSED_MODE) != 0);
+    // after mergeResults, so the merge still reads its inputs from cache
+    releaseWrittenCache(dataFileName);
+    releaseWrittenCache(indexFileName);
     clearMemory();
     closed = true;
 }
