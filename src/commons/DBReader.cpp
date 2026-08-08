@@ -42,7 +42,7 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), index(NULL), id2local(NULL), local2id(NULL),
-        dataMapped(false), accessType(0), externalData(false), didMlock(false), ioAutoDirect(false), directIoAlign(0)
+        dataMapped(false), accessType(0), externalData(false), didMlock(false), ioAutoDirect(false), ioBufferedBatch(false), directIoAlign(0)
 {}
 
 template <typename T>
@@ -53,7 +53,7 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index), sortedByOffset(true),
         id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false),
-        ioAutoDirect(false), directIoAlign(0)
+        ioAutoDirect(false), ioBufferedBatch(false), directIoAlign(0)
 {}
 
 template <typename T>
@@ -142,8 +142,10 @@ template <typename T> bool DBReader<T>::open(int accessType){
         }
         for(size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++){
             if (dataMode & USE_DIRECT_IO) {
-                // split files can sit on different filesystems, the strictest alignment serves them all
-                directIoAlign = std::max(directIoAlign, FileUtil::getDirectIoAlignment(dataFileNames[fileIdx]));
+                // buffered descriptors have no alignment constraint, so read exactly the entry bytes
+                directIoAlign = ioBufferedBatch
+                    ? 1
+                    : std::max(directIoAlign, FileUtil::getDirectIoAlignment(dataFileNames[fileIdx]));
                 size_t directDataSize;
                 dataFds[fileIdx] = openDirect(dataFileNames[fileIdx].c_str(), &directDataSize);
                 dataFiles[fileIdx] = NULL;
@@ -611,6 +613,11 @@ template <typename T> void DBReader<T>::resolveIoPolicy(int accessType) {
         || (dataMode & (USE_WRITABLE | USE_FREAD))) {
         return;
     }
+    // batching beats mmap in every measured regime for random access, so this one skips the size rule
+    if (ioBufferedBatch) {
+        dataMode |= USE_DIRECT_IO;
+        return;
+    }
     // MMSEQS_IO_POLICY=mmap|direct pins every eligible reader, not just the ones that opted in, so
     // the modules that stay on mmap by default can still be measured against the direct path
     const char *policyEnv = getenv("MMSEQS_IO_POLICY");
@@ -643,7 +650,7 @@ template <typename T> void DBReader<T>::resolveIoPolicy(int accessType) {
 
 template <typename T> int DBReader<T>::openDirect(const char *fileName, size_t *dataSize) {
 #if defined(O_DIRECT)
-    int fd = ::open(fileName, O_RDONLY | O_DIRECT);
+    int fd = ioBufferedBatch ? ::open(fileName, O_RDONLY) : ::open(fileName, O_RDONLY | O_DIRECT);
     if (fd < 0 && (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP)) {
         // tmpfs and some network filesystems reject O_DIRECT, the reads stay correct without it
         fd = ::open(fileName, O_RDONLY);
@@ -657,7 +664,9 @@ template <typename T> int DBReader<T>::openDirect(const char *fileName, size_t *
         EXIT(EXIT_FAILURE);
     }
 #if !defined(O_DIRECT) && defined(F_NOCACHE)
-    fcntl(fd, F_NOCACHE, 1);
+    if (ioBufferedBatch == false) {
+        fcntl(fd, F_NOCACHE, 1);
+    }
 #endif
     struct stat sb;
     if (fstat(fd, &sb) < 0) {
@@ -813,9 +822,11 @@ size_t DBReader<T>::loadBatch(const size_t *ids, size_t n, unsigned int thrIdx) 
 template <typename T>
 size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int thrIdx) {
     typename IoBatch::Worker &worker = ioBatch->workers[thrIdx];
+    // buffered descriptors need no alignment, but posix_memalign still demands a pointer-sized one
+    const size_t arenaAlign = std::max(directIoAlign, sizeof(void *));
     if (worker.arena == NULL) {
         void *mem = NULL;
-        if (posix_memalign(&mem, directIoAlign, DBREADER_BATCH_ARENA) != 0 || mem == NULL) {
+        if (posix_memalign(&mem, arenaAlign, DBREADER_BATCH_ARENA) != 0 || mem == NULL) {
             Debug(Debug::ERROR) << "Cannot allocate " << DBREADER_BATCH_ARENA << " byte batch arena\n";
             EXIT(EXIT_FAILURE);
         }
@@ -852,7 +863,7 @@ size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int th
             free(worker.arena);
             decrementMemory(worker.capacity);
             void *mem = NULL;
-            if (posix_memalign(&mem, directIoAlign, readLen) != 0 || mem == NULL) {
+            if (posix_memalign(&mem, arenaAlign, readLen) != 0 || mem == NULL) {
                 Debug(Debug::ERROR) << "Cannot allocate " << readLen << " byte batch arena\n";
                 EXIT(EXIT_FAILURE);
             }

@@ -201,6 +201,11 @@ public:
     // random access over data that may not fit: mmap while it fits, pread+O_DIRECT once it does not
     void setIoAutoDirect(bool autoDirect) { ioAutoDirect = autoDirect; }
 
+    // Same batched pread/io_uring path, but on buffered descriptors, so the page cache still serves
+    // the reuse. Measured better than mmap in both regimes and better than O_DIRECT whenever the
+    // working set is anywhere near cacheable; O_DIRECT only wins ~16% once it is not.
+    void setIoBufferedBatch(bool buffered) { ioBufferedBatch = buffered; }
+
     // Reads ids[0..n) as one io_uring submission, so the device sees the whole batch at once
     // instead of one blocking pread at a time. Returns how many were loaded, which is less than
     // n when the arena fills up; the caller advances and calls again. On mmap the entries are
@@ -606,6 +611,7 @@ private:
     bool didMlock;
 
     bool ioAutoDirect;
+    bool ioBufferedBatch;
 
     // O_DIRECT alignment resolved per data file at open time, the device can want less than 4096
     size_t directIoAlign;

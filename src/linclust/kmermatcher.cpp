@@ -15,6 +15,7 @@
 #include "MarkovKmerScore.h"
 #include "FileUtil.h"
 #include "FastSort.h"
+#include "Timer.h"
 #include "SequenceWeights.h"
 #include "Masker.h"
 
@@ -1152,6 +1153,17 @@ static void runIteration(
             }
         }
         threadQueryOffsets[par.threads] = writePos;
+        {
+            // the merge runs one lane per writer, so a skewed split here is a serial tail there
+            size_t minCnt = SIZE_T_MAX, maxCnt = 0;
+            for (int thread = 0; thread < par.threads; thread++) {
+                const size_t cnt = threadQueryOffsets[thread + 1] - threadQueryOffsets[thread];
+                minCnt = std::min(minCnt, cnt);
+                maxCnt = std::max(maxCnt, cnt);
+            }
+            Debug(Debug::INFO) << "Writer split: " << writePos << " entries over " << par.threads
+                               << " lanes, min " << minCnt << ", max " << maxCnt << "\n";
+        }
 
         timer.reset();
         if (par.needWriteBuffer) {
@@ -1997,6 +2009,8 @@ static const size_t KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE = 65536;
 static const int KMER_TMP_ZSTD_COMPRESSION_LEVEL = 2;
 // lz4 level 0 is its fast mode, the counterpart to a low zstd level rather than to LZ4HC
 static const int KMER_TMP_LZ4_COMPRESSION_LEVEL = 0;
+// matches LZ4F_max256KB so compressUpdate emits one whole block per call
+static const size_t KMER_TMP_LZ4_BLOCK_SIZE = 256 * 1024;
 static const size_t KMER_MERGE_RESULT_BUFFER_RESERVE = 1024 * 1024;
 static const size_t KMER_MERGE_RESULT_BUFFER_MAX_KEEP = 16 * 1024 * 1024;
 static const size_t KMER_MERGE_MIN_MEMORY_HEADROOM = 1024ull * 1024ull * 1024ull;
@@ -2147,9 +2161,13 @@ public:
         }
         memset(&prefs, 0, sizeof(prefs));
         prefs.compressionLevel = compressionLevel;
-        prefs.frameInfo.blockSizeID = LZ4F_max64KB;
+        // 64 KB linked blocks are the slowest frame layout lz4 has: every block depends on the
+        // previous one, so the decoder maintains a dictionary, and the small blocks maximise the
+        // number of boundaries. Independent 256 KB blocks drop both costs and compress better.
+        prefs.frameInfo.blockSizeID = LZ4F_max256KB;
+        prefs.frameInfo.blockMode = LZ4F_blockIndependent;
         // one bound for the fixed chunk plus the header, so write() never has to resize
-        outBufferSize = LZ4F_compressBound(KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE, &prefs) + LZ4F_HEADER_SIZE_MAX;
+        outBufferSize = LZ4F_compressBound(KMER_TMP_LZ4_BLOCK_SIZE, &prefs) + LZ4F_HEADER_SIZE_MAX;
         outBuffer = static_cast<char *>(malloc(outBufferSize));
         if (outBuffer == NULL) {
             Debug(Debug::ERROR) << "Cannot allocate lz4 output buffer for " << fileName << "\n";
@@ -2181,7 +2199,8 @@ public:
         const char *src = static_cast<const char *>(data);
         size_t pos = 0;
         while (pos < dataSize) {
-            const size_t chunk = std::min(dataSize - pos, KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE);
+            // feeding whole blocks keeps lz4 from buffering a partial one internally
+            const size_t chunk = std::min(dataSize - pos, KMER_TMP_LZ4_BLOCK_SIZE);
             const size_t got = LZ4F_compressUpdate(cctx, outBuffer, outBufferSize, src + pos, chunk, NULL);
             if (LZ4F_isError(got)) {
                 Debug(Debug::ERROR) << "LZ4F_compressUpdate() error for " << fileName << ". Error "
@@ -2352,6 +2371,11 @@ static size_t bucketReadFile(const std::string &fileName, int codec, void *dst, 
             if (LZ4F_isError(ret)) {
                 Debug(Debug::ERROR) << "LZ4F_decompress() error for " << fileName << ": "
                                     << LZ4F_getErrorName(ret) << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            // neither consumed nor produced with room left would spin here forever
+            if (dstSize == 0 && srcSize == 0 && written < maxBytes) {
+                Debug(Debug::ERROR) << "LZ4F_decompress() made no progress in " << fileName << "\n";
                 EXIT(EXIT_FAILURE);
             }
             written += dstSize;
@@ -2580,6 +2604,11 @@ private:
                                         << LZ4F_getErrorName(ret) << "\n";
                     EXIT(EXIT_FAILURE);
                 }
+                // this loop only exits on produced != 0, so a no-progress call has to be fatal
+                if (dstSize == 0 && srcSize == 0) {
+                    Debug(Debug::ERROR) << "LZ4F_decompress() made no progress in " << fileName << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
                 produced += dstSize;
                 input.pos += srcSize;
                 frameComplete = (ret == 0);
@@ -2709,6 +2738,7 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
         }
     }
 
+    Timer mergeTimer;
 #pragma omp parallel for num_threads(mergeThreads)
     for (int threadIdx = 0; threadIdx < numThreads; threadIdx++) {
         const int fileCnt = threadedFiles[threadIdx].size();
@@ -2850,6 +2880,8 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
         delete[] repSeqIds;
         delete[] readers;
     }
+
+    Debug(Debug::INFO) << "Time for merging k-mer splits: " << mergeTimer.lap() << "\n";
 
     for (int tid = 0; tid < numThreads; ++tid) {
         for (std::string file : threadedFiles[tid]) {

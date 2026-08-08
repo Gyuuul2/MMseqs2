@@ -222,21 +222,15 @@ struct FileKmerPosition {
 
 class CompareResultBySeqId {
 public:
-    bool operator() (FileKmerPosition & first, FileKmerPosition & second) const {
-        //return (first.eval < second.eval);
-        if(first.repSeq > second.repSeq )
-            return true;
-        if(second.repSeq > first.repSeq )
-            return false;
-        if(first.id > second.id )
-            return true;
-        if(second.id > first.id )
-            return false;
-        if(first.pos > second.pos )
-            return true;
-        if(second.pos > first.pos )
-            return false;
-        return false;
+    // same order as the six-way chain it replaces, but one compare per field instead of two
+    bool operator() (const FileKmerPosition & first, const FileKmerPosition & second) const {
+        if (first.repSeq != second.repSeq) {
+            return first.repSeq > second.repSeq;
+        }
+        if (first.id != second.id) {
+            return first.id > second.id;
+        }
+        return first.pos > second.pos;
     }
 };
 
