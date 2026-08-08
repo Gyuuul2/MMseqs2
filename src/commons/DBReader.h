@@ -212,7 +212,11 @@ public:
     // so readers that never reclaim cache do not change their fd usage.
     void setIoCacheAdvice(bool enabled) { ioCacheAdvice = enabled; }
 
-    // anonymous bytes the caller will hold while reading; the size rule adds them before open()
+    // Optional memory ceiling for the I/O policy. Zero means the machine memory reported by Util.
+    void setIoMemoryBudget(size_t bytes) { ioMemoryBudget = bytes; }
+
+    // Total non-page-cache resident bytes expected while reading. A non-zero estimate is authoritative
+    // and should include this reader's index; zero lets DBReader estimate its own index before open().
     void setIoExpectedResidentBytes(size_t bytes) { ioExpectedResidentBytes = bytes; }
 
     // Drops the whole file's cache. Entries average a few hundred bytes, so a per-entry range never
@@ -633,6 +637,7 @@ private:
     bool ioAutoDirect;
     bool ioBufferedBatch;
     bool ioCacheAdvice;
+    size_t ioMemoryBudget;
     size_t ioExpectedResidentBytes;
 
     // O_DIRECT alignment resolved per data file at open time, the device can want less than 4096

@@ -35,6 +35,10 @@ static const size_t CLUSTHASHFAST_MAX_RETAINED_CLAIMS = 1024 * 1024;
 static const unsigned int CLUSTHASHFAST_MAX_PARTITIONS = 4096;
 // per thread write buffer budget for the hash pass, split across the partitions
 static const size_t CLUSTHASHFAST_PENDING_BYTES = 8 * 1024 * 1024;
+// feed enough offset-ordered ids to DBReader that adjacent short entries can collapse into large reads
+static const size_t CLUSTHASHFAST_GATHER_BATCH_IDS = 65536;
+// progress is observability, not work: billions of atomic/progress calls can otherwise dominate scans
+static const size_t CLUSTHASHFAST_PROGRESS_STEP = 1ull << 20;
 // floor under the proportional cache reserve, so a tiny machine still keeps room for the stream
 static const size_t CLUSTHASHFAST_MIN_CACHE_RESERVE = 1ull * 1024 * 1024 * 1024;
 
@@ -124,6 +128,8 @@ struct ClusterWorker {
     std::string result;
     std::string querySeq;
     std::vector<unsigned char> claimed;
+    std::vector<unsigned int> memberLength;
+    std::vector<const char *> arenaSeq;
     char lineBuffer[32];
     ClusterCounts counts;
 
@@ -222,38 +228,68 @@ static size_t hashRunEnd(const HashEntry *entries, size_t entryCount, size_t run
     return runEnd;
 }
 
-// only multi-member runs are ever compared, and gathering just those in id order is one sequential pass
+// a run is owned by the chunk that starts it, so skip the tail of the run the previous chunk owns
+static size_t firstOwnedRun(const HashEntry *entries, size_t chunkBegin, size_t chunkEnd) {
+    size_t runBegin = chunkBegin;
+    while (runBegin < chunkEnd && runBegin > 0 && entries[runBegin - 1].hash == entries[runBegin].hash) {
+        runBegin++;
+    }
+    return runBegin;
+}
+
+// only multi-member runs are gathered. The bitmap makes the gather order ascending by id without
+// storing one extra id/offset pair per member, which is important once ids themselves are 64 bit.
 struct MemberArena {
     static const size_t BLOCK = 64;
 
-    std::vector<uint64_t> bits;         // one bit per sequence, set when its run has other members
-    std::vector<size_t> blockOffset;    // arena offset of the first gathered member of each 64 id block
-    std::vector<size_t> touched;        // ascending indices of the blocks this window actually marked
+    std::vector<uint64_t> bits;         // one bit per sequence that belongs to a multi-member run
+    std::vector<size_t> blockOffset;    // byte offset of the first gathered member in each 64-id word
+    std::vector<size_t> touched;        // ascending words marked by the current window
     char *data;
+    size_t capacity;
 
-    MemberArena() : data(NULL) {}
+    MemberArena() : data(NULL), capacity(0) {}
 
     ~MemberArena() {
         release();
     }
 
-    // the two id-space arrays outlive a window, so only the gathered bytes and the block list go
-    void releaseData() {
-        delete[] data;
-        data = NULL;
+    void clearMarks() {
         for (size_t i = 0; i < touched.size(); i++) {
             bits[touched[i]] = 0;
         }
-        std::vector<size_t>().swap(touched);
+        // keep the allocation: every gather window needs roughly the same block list again
+        touched.clear();
+    }
+
+    void ensureData(size_t bytes) {
+        if (bytes <= capacity) {
+            return;
+        }
+        char *next = new(std::nothrow) char[bytes];
+        Util::checkAllocation(next, "Can not allocate member arena in clusthashfast");
+        delete[] data;
+        data = next;
+        capacity = bytes;
+    }
+
+    // release the byte arena between hash partitions, but keep the id-space tables for reuse
+    void releaseData() {
+        delete[] data;
+        data = NULL;
+        capacity = 0;
+        clearMarks();
     }
 
     void release() {
         releaseData();
         std::vector<uint64_t>().swap(bits);
         std::vector<size_t>().swap(blockOffset);
+        std::vector<size_t>().swap(touched);
     }
 
-    // the block base plus the lengths gathered before it, so per id offsets are never materialised
+    // the block base plus the lengths gathered before it; clusterHashRun calls this once per member,
+    // then keeps the resulting pointers in thread-local scratch for the O(n^2) comparison loop.
     size_t offsetOf(DBReader<DBKeyType> &reader, DBLocalId id) const {
         const size_t word = id / BLOCK;
         const size_t bit = id % BLOCK;
@@ -272,16 +308,18 @@ struct MemberArena {
     }
 };
 
-// marks the members of multi-member runs and prefix sums the blocks, returning the bytes they need
+// Mark whole hash runs, not individual positions. Relaxed atomics are sufficient: the only shared
+// fact is the final bitmap, and exactly one successful 0->nonzero transition records each word.
 static size_t planArena(DBReader<DBKeyType> &reader, MemberArena &arena, const HashEntry *entries,
                         size_t entryCount, size_t idSpace, int threads) {
     const size_t blocks = (idSpace + MemberArena::BLOCK - 1) / MemberArena::BLOCK;
-    // sized once for the whole id space, then reused: a window marks a small, scattered subset of it
     if (arena.bits.size() != blocks) {
         arena.bits.assign(blocks, 0);
         arena.blockOffset.resize(blocks);
     }
+
     std::vector<std::vector<size_t> > perThread(static_cast<size_t>(threads));
+    const size_t chunkCount = (entryCount + CLUSTHASHFAST_CHUNK_RECORDS - 1) / CLUSTHASHFAST_CHUNK_RECORDS;
 #pragma omp parallel num_threads(threads)
     {
         int t = 0;
@@ -289,22 +327,42 @@ static size_t planArena(DBReader<DBKeyType> &reader, MemberArena &arena, const H
         t = omp_get_thread_num();
 #endif
         std::vector<size_t> &mine = perThread[t];
-#pragma omp for schedule(dynamic, 4096)
-        for (size_t pos = 0; pos < entryCount; ++pos) {
-            const bool aloneBefore = (pos == 0) || (entries[pos - 1].hash != entries[pos].hash);
-            const bool aloneAfter = (pos + 1 == entryCount) || (entries[pos + 1].hash != entries[pos].hash);
-            if (aloneBefore && aloneAfter) {
-                continue;
-            }
-            const DBLocalId id = entries[pos].id;
-            const size_t word = id / MemberArena::BLOCK;
-            // exactly one thread turns a block from empty to non-empty, so this lists it without a dedup pass
-            const uint64_t was = __sync_fetch_and_or(&arena.bits[word], 1ULL << (id % MemberArena::BLOCK));
-            if (was == 0) {
-                mine.push_back(word);
+#pragma omp for schedule(dynamic, 1)
+        for (size_t chunk = 0; chunk < chunkCount; ++chunk) {
+            const size_t chunkBegin = chunk * CLUSTHASHFAST_CHUNK_RECORDS;
+            const size_t chunkEnd = std::min(entryCount, chunkBegin + CLUSTHASHFAST_CHUNK_RECORDS);
+            size_t pos = firstOwnedRun(entries, chunkBegin, chunkEnd);
+            while (pos < chunkEnd) {
+                const size_t runEnd = hashRunEnd(entries, entryCount, pos);
+                if (runEnd - pos > 1) {
+                    // ids are ascending inside a hash run, so collapse all bits in the same 64-id
+                    // word before the atomic update. Dense duplicate runs can turn dozens of locked
+                    // operations into one without any extra storage.
+                    size_t word = static_cast<size_t>(entries[pos].id) / MemberArena::BLOCK;
+                    uint64_t mask = 0;
+                    for (size_t k = pos; k < runEnd; ++k) {
+                        const DBLocalId id = entries[k].id;
+                        const size_t nextWord = static_cast<size_t>(id) / MemberArena::BLOCK;
+                        if (nextWord != word) {
+                            const uint64_t was = __atomic_fetch_or(&arena.bits[word], mask, __ATOMIC_RELAXED);
+                            if (was == 0) {
+                                mine.push_back(word);
+                            }
+                            word = nextWord;
+                            mask = 0;
+                        }
+                        mask |= 1ULL << (static_cast<size_t>(id) % MemberArena::BLOCK);
+                    }
+                    const uint64_t was = __atomic_fetch_or(&arena.bits[word], mask, __ATOMIC_RELAXED);
+                    if (was == 0) {
+                        mine.push_back(word);
+                    }
+                }
+                pos = runEnd;
             }
         }
     }
+
     size_t marked = 0;
     for (size_t t = 0; t < perThread.size(); t++) {
         marked += perThread[t].size();
@@ -312,15 +370,54 @@ static size_t planArena(DBReader<DBKeyType> &reader, MemberArena &arena, const H
     if (marked == 0) {
         return 0;
     }
-    arena.touched.resize(marked);
-    size_t at = 0;
-    for (size_t t = 0; t < perThread.size(); t++) {
-        memcpy(&arena.touched[at], perThread[t].data(), perThread[t].size() * sizeof(size_t));
-        at += perThread[t].size();
-        std::vector<size_t>().swap(perThread[t]);
+
+    // Sorting random touched-word ids is good when sparse. Once enough of the bitmap is populated,
+    // two linear bitmap scans are cheaper than an O(n log n) sort and produce sorted words directly.
+    if (marked > blocks / 32) {
+        for (size_t t = 0; t < perThread.size(); ++t) {
+            std::vector<size_t>().swap(perThread[t]);
+        }
+        std::vector<size_t> count(static_cast<size_t>(threads) + 1, 0);
+#pragma omp parallel for schedule(static, 1) num_threads(threads)
+        for (int t = 0; t < threads; ++t) {
+            const size_t begin = (blocks / static_cast<size_t>(threads)) * static_cast<size_t>(t)
+                               + std::min(static_cast<size_t>(t), blocks % static_cast<size_t>(threads));
+            const size_t end = (blocks / static_cast<size_t>(threads)) * static_cast<size_t>(t + 1)
+                             + std::min(static_cast<size_t>(t + 1), blocks % static_cast<size_t>(threads));
+            size_t local = 0;
+            for (size_t word = begin; word < end; ++word) {
+                local += (arena.bits[word] != 0);
+            }
+            count[t + 1] = local;
+        }
+        for (int t = 0; t < threads; ++t) {
+            count[t + 1] += count[t];
+        }
+        arena.touched.resize(count[threads]);
+#pragma omp parallel for schedule(static, 1) num_threads(threads)
+        for (int t = 0; t < threads; ++t) {
+            const size_t begin = (blocks / static_cast<size_t>(threads)) * static_cast<size_t>(t)
+                               + std::min(static_cast<size_t>(t), blocks % static_cast<size_t>(threads));
+            const size_t end = (blocks / static_cast<size_t>(threads)) * static_cast<size_t>(t + 1)
+                             + std::min(static_cast<size_t>(t + 1), blocks % static_cast<size_t>(threads));
+            size_t out = count[t];
+            for (size_t word = begin; word < end; ++word) {
+                if (arena.bits[word] != 0) {
+                    arena.touched[out++] = word;
+                }
+            }
+        }
+    } else {
+        arena.touched.resize(marked);
+        size_t out = 0;
+        for (size_t t = 0; t < perThread.size(); t++) {
+            if (perThread[t].empty() == false) {
+                memcpy(&arena.touched[out], perThread[t].data(), perThread[t].size() * sizeof(size_t));
+                out += perThread[t].size();
+            }
+        }
+        SORT_PARALLEL(arena.touched.begin(), arena.touched.end());
     }
-    // ascending order makes the arena layout independent of how the threads split the entries
-    SORT_PARALLEL(arena.touched.begin(), arena.touched.end());
 
     const size_t used = arena.touched.size();
     const size_t stripe = (used + threads - 1) / static_cast<size_t>(threads);
@@ -328,9 +425,10 @@ static size_t planArena(DBReader<DBKeyType> &reader, MemberArena &arena, const H
 #pragma omp parallel for schedule(static, 1) num_threads(threads)
     for (int t = 0; t < threads; ++t) {
         size_t sum = 0;
-        for (size_t i = t * stripe; i < std::min(used, (t + 1) * stripe); ++i) {
+        for (size_t i = static_cast<size_t>(t) * stripe;
+             i < std::min(used, static_cast<size_t>(t + 1) * stripe); ++i) {
             const size_t word = arena.touched[i];
-            arena.blockOffset[word] = sum;   // stripe-local offset, rebased once the stripes are summed
+            arena.blockOffset[word] = sum;
             uint64_t set = arena.bits[word];
             while (set != 0) {
                 const size_t k = static_cast<size_t>(__builtin_ctzll(set));
@@ -345,19 +443,25 @@ static size_t planArena(DBReader<DBKeyType> &reader, MemberArena &arena, const H
     }
 #pragma omp parallel for schedule(static, 1) num_threads(threads)
     for (int t = 0; t < threads; ++t) {
-        for (size_t i = t * stripe; i < std::min(used, (t + 1) * stripe); ++i) {
+        for (size_t i = static_cast<size_t>(t) * stripe;
+             i < std::min(used, static_cast<size_t>(t + 1) * stripe); ++i) {
             arena.blockOffset[arena.touched[i]] += stripeBase[t];
         }
     }
     return stripeBase[threads];
 }
 
-// The gather touches a scattered subset, so a mapping faults 4096 byte for a few hundred wanted:
-// descriptors read the entry alone and loadBatch can queue them. Falls back to the mapping silently.
-static bool clusthashfastSetGatherIo(DBReader<DBKeyType> &reader, bool direct) {
+// The hash pass wants mmap/readahead, but the sparse gather is exactly the opposite. Once gather is
+// needed, evict the one-pass hash-scan cache and switch to O_DIRECT. DBReader coalesces neighbouring
+// aligned spans, so several short entries in the same block cost one read instead of one read each.
+static bool clusthashfastSetGatherIo(DBReader<DBKeyType> &reader) {
     static bool warned = false;
-    if (reader.setIoDirect(direct) == false) {
-        if (direct && warned == false) {
+    if (reader.isDirectIo()) {
+        return true;
+    }
+    reader.dropCacheAll();
+    if (reader.setIoDirect(true) == false) {
+        if (warned == false) {
             warned = true;
             Debug(Debug::WARNING) << "Gather stays on the mapping, this reader cannot use descriptors\n";
         }
@@ -366,26 +470,40 @@ static bool clusthashfastSetGatherIo(DBReader<DBKeyType> &reader, bool direct) {
     return true;
 }
 
-// one sequential pass over the db, each thread copying its own contiguous id range into the arena
+// Copy offset-ordered members into the arena. Threads own contiguous byte ranges rather than equal
+// block counts, which balances variable sequence lengths while preserving monotonically increasing IO.
 static void fillArena(DBReader<DBKeyType> &reader, MemberArena &arena, size_t total, int threads) {
-    arena.data = new(std::nothrow) char[total];
-    Util::checkAllocation(arena.data, "Can not allocate member arena in clusthashfast");
+    arena.ensureData(total);
     const size_t used = arena.touched.size();
-    // 1 reproduces the one-word-at-a-time behaviour; 16/64/256 make the batches wider
-    const size_t batchWords = clusthashfastEnvSize("MMSEQS_CLUSTHASHFAST_ARENA_BATCH_WORDS", 1, 1);
+    if (used == 0) {
+        return;
+    }
+
+    std::vector<size_t> split(static_cast<size_t>(threads) + 1, 0);
+    split[threads] = used;
+    for (int t = 1; t < threads; ++t) {
+        const size_t q = total / static_cast<size_t>(threads);
+        const size_t r = total % static_cast<size_t>(threads);
+        const size_t target = q * static_cast<size_t>(t)
+                            + (r * static_cast<size_t>(t)) / static_cast<size_t>(threads);
+        const std::vector<size_t>::const_iterator it = std::lower_bound(
+            arena.touched.begin(), arena.touched.end(), target,
+            [&](size_t word, size_t byteOffset) { return arena.blockOffset[word] < byteOffset; });
+        split[t] = static_cast<size_t>(it - arena.touched.begin());
+    }
+
 #pragma omp parallel num_threads(threads)
     {
         unsigned int thread_idx = 0;
 #ifdef OPENMP
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-        // a block holds up to 64 members, and their ids are known before the first read
+        const size_t begin = split[thread_idx];
+        const size_t end = split[thread_idx + 1];
         std::vector<size_t> ids;
         std::vector<size_t> dst;
-        const size_t reserveIds = std::min<size_t>(batchWords, 4096) * MemberArena::BLOCK;
-        ids.reserve(reserveIds);
-        dst.reserve(reserveIds);
-        size_t queuedWords = 0;
+        ids.reserve(CLUSTHASHFAST_GATHER_BATCH_IDS);
+        dst.reserve(CLUSTHASHFAST_GATHER_BATCH_IDS);
 
         const auto flushBatch = [&]() {
             size_t pos = 0;
@@ -403,27 +521,22 @@ static void fillArena(DBReader<DBKeyType> &reader, MemberArena &arena, size_t to
             }
             ids.clear();
             dst.clear();
-            queuedWords = 0;
         };
 
-        // schedule(static) gives each thread one contiguous, disjoint word range and byte range.
-        // Queuing several words lets loadBatch coalesce a wider request before issuing io.
-#pragma omp for schedule(static) nowait
-        for (size_t i = 0; i < used; ++i) {
+        for (size_t i = begin; i < end; ++i) {
             const size_t word = arena.touched[i];
             uint64_t set = arena.bits[word];
             size_t offset = arena.blockOffset[word];
             while (set != 0) {
                 const size_t k = static_cast<size_t>(__builtin_ctzll(set));
                 const DBLocalId id = static_cast<DBLocalId>(word * MemberArena::BLOCK + k);
-                ids.push_back(id);
+                ids.push_back(static_cast<size_t>(id));
                 dst.push_back(offset);
                 offset += reader.getSeqLen(id);
                 set &= set - 1;
-            }
-            ++queuedWords;
-            if (queuedWords >= batchWords) {
-                flushBatch();
+                if (ids.size() >= CLUSTHASHFAST_GATHER_BATCH_IDS) {
+                    flushBatch();
+                }
             }
         }
         if (ids.empty() == false) {
@@ -432,47 +545,48 @@ static void fillArena(DBReader<DBKeyType> &reader, MemberArena &arena, size_t to
     }
 }
 
-// a window is a maximal set of whole runs whose members fit the budget, so a run is never split
-static void planWindows(DBReader<DBKeyType> &reader, const HashEntry *entries, size_t entryCount,
-                        size_t budget, size_t total, std::vector<size_t> &bounds) {
+// Build approximate windows in O(number_of_windows), not by rescanning every run serially. The
+// parallel arena planner measures the real bytes later and oversized windows are split on demand.
+static void planWindows(const HashEntry *entries, size_t entryCount, size_t windowCount,
+                        std::vector<size_t> &bounds) {
     bounds.clear();
     bounds.push_back(0);
-    // Filling window 1 to the brim leaves a tiny last one and makes peak anonymous memory the full
-    // budget; the same number of windows sized evenly costs the same io and a fraction of the peak.
-    const size_t windows = (budget > 0) ? std::max<size_t>((total + budget - 1) / budget, 1) : 1;
-    const size_t target = (windows > 0) ? std::max<size_t>((total + windows - 1) / windows, 1) : budget;
-    size_t used = 0;
-    size_t pos = 0;
-    while (pos < entryCount) {
-        const size_t runEnd = hashRunEnd(entries, entryCount, pos);
-        size_t runBytes = 0;
-        if (runEnd - pos > 1) {
-            for (size_t k = pos; k < runEnd; ++k) {
-                runBytes += reader.getSeqLen(entries[k].id);
-            }
+    windowCount = std::max<size_t>(windowCount, 1);
+    const size_t q = entryCount / windowCount;
+    const size_t r = entryCount % windowCount;
+    size_t last = 0;
+    for (size_t window = 1; window < windowCount; ++window) {
+        size_t pos = q * window + std::min(window, r);
+        while (pos < entryCount && pos > 0 && entries[pos - 1].hash == entries[pos].hash) {
+            ++pos;
         }
-        if (used > 0 && used + runBytes > target) {
+        if (pos > last && pos < entryCount) {
             bounds.push_back(pos);
-            used = 0;
+            last = pos;
         }
-        used += runBytes;
-        pos = runEnd;
     }
     bounds.push_back(entryCount);
 }
 
-// a run is owned by the chunk that starts it, so skip the tail of the run the previous chunk owns
-static size_t firstOwnedRun(const HashEntry *entries, size_t chunkBegin, size_t chunkEnd) {
-    size_t runBegin = chunkBegin;
-    while (runBegin < chunkEnd && runBegin > 0 && entries[runBegin - 1].hash == entries[runBegin].hash) {
-        runBegin++;
+// Split an oversized window at a hash boundary. Returning begin/end means one hash run itself is
+// wider than the normal arena budget and the caller has to use the emergency budget or DB reads.
+static size_t splitWindowAtRunBoundary(const HashEntry *entries, size_t begin, size_t end) {
+    if (end - begin < 2) {
+        return end;
     }
-    return runBegin;
-}
-
-static const char *memberSeq(DBReader<DBKeyType> &reader, const MemberArena *arena, DBLocalId id,
-                             unsigned int thread_idx) {
-    return (arena != NULL) ? arena->at(reader, id) : reader.getData(id, thread_idx);
+    size_t mid = begin + (end - begin) / 2;
+    size_t forward = mid;
+    while (forward < end && forward > begin && entries[forward - 1].hash == entries[forward].hash) {
+        ++forward;
+    }
+    if (forward < end) {
+        return forward;
+    }
+    size_t backward = mid;
+    while (backward > begin && entries[backward - 1].hash == entries[backward].hash) {
+        --backward;
+    }
+    return (backward > begin) ? backward : end;
 }
 
 // the first unclaimed entry of the run represents it and claims every unclaimed entry it covers
@@ -480,12 +594,26 @@ static void clusterHashRun(DBReader<DBKeyType> &reader, DBWriter &writer, const 
                            float seqIdThr, ClusterWorker &worker, unsigned int thread_idx,
                            const MemberArena *arena) {
     worker.counts.runs++;
-    // the common case at scale: a run of one touches no sequence data
     if (runSize == 1) {
         const DBKeyType representativeKey = reader.getDbKey(run[0].id);
         worker.beginCluster(representativeKey);
         worker.writeCluster(writer, representativeKey, thread_idx);
         return;
+    }
+
+    // Length and arena-pointer lookup used to sit in the inner comparison loop. Resolve both once per
+    // member so a large hash collision spends its O(n^2) work only on the distance calculation.
+    worker.memberLength.resize(runSize);
+    if (arena != NULL) {
+        worker.arenaSeq.resize(runSize);
+    } else {
+        worker.arenaSeq.clear();
+    }
+    for (size_t k = 0; k < runSize; ++k) {
+        worker.memberLength[k] = static_cast<unsigned int>(reader.getSeqLen(run[k].id));
+        if (arena != NULL) {
+            worker.arenaSeq[k] = arena->at(reader, run[k].id);
+        }
     }
 
     worker.claimed.assign(runSize, 0);
@@ -495,36 +623,28 @@ static void clusterHashRun(DBReader<DBKeyType> &reader, DBWriter &writer, const 
         }
         worker.claimed[i] = 1;
         const DBLocalId queryId = run[i].id;
-        const unsigned int queryLength = reader.getSeqLen(queryId);
+        const unsigned int queryLength = worker.memberLength[i];
         const DBKeyType representativeKey = reader.getDbKey(queryId);
-        // the seed passes the threshold against every member, so every cluster mode elects this seed
         worker.beginCluster(representativeKey);
 
-        const char *querySeq = NULL;
+        const char *querySeq = (arena != NULL) ? worker.arenaSeq[i] : NULL;
         for (size_t j = i + 1; j < runSize; j++) {
-            if (worker.claimed[j]) {
-                continue;
-            }
-            const DBLocalId targetId = run[j].id;
-            // the length is folded into the hash, but a hash collision can still differ in length
-            if (reader.getSeqLen(targetId) != queryLength) {
+            if (worker.claimed[j] || worker.memberLength[j] != queryLength) {
                 continue;
             }
             if (querySeq == NULL) {
-                // arena bytes stay put, but getData hands back the buffer the target read reuses
-                if (arena != NULL) {
-                    querySeq = arena->at(reader, queryId);
-                } else {
-                    worker.querySeq.assign(reader.getData(queryId, thread_idx), queryLength);
-                    querySeq = worker.querySeq.data();
-                }
+                // descriptor reads reuse a per-thread bounce buffer, so pin the query before target IO
+                worker.querySeq.assign(reader.getData(queryId, thread_idx), queryLength);
+                querySeq = worker.querySeq.data();
             }
-            const char *targetSeq = memberSeq(reader, arena, targetId, thread_idx);
+            const char *targetSeq = (arena != NULL)
+                ? worker.arenaSeq[j]
+                : reader.getData(run[j].id, thread_idx);
             const unsigned int distance =
                 DistanceCalculator::computeInverseHammingDistance(querySeq, targetSeq, queryLength);
             const float seqId = static_cast<float>(distance) / static_cast<float>(queryLength);
             if (seqId >= seqIdThr) {
-                worker.addMember(reader.getDbKey(targetId));
+                worker.addMember(reader.getDbKey(run[j].id));
                 worker.claimed[j] = 1;
             }
         }
@@ -585,46 +705,78 @@ static ClusterCounts clusterPartition(DBReader<DBKeyType> &reader, DBWriter &wri
         return clusterHashRuns(reader, writer, entries, entryCount, seqIdThr, showProgress, NULL, threads);
     }
 
-    Timer gatherTimer;
-    // Descriptors fetch the entry and nothing else, so one more window costs no more io and the arena
-    // can stay small. A mapping rereads the whole file per window, so it needs few windows and the
-    // large budget instead.
-    const size_t budget = clusthashfastSetGatherIo(reader, true) ? directArenaBudget : arenaBudget;
+    Timer planTimer;
     const size_t total = planArena(reader, arena, entries, entryCount, idSpace, threads);
+    Debug(Debug::INFO) << "Member arena plan: " << total << " byte in " << planTimer.lap() << "\n";
+    if (total == 0) {
+        arena.clearMarks();
+        return clusterHashRuns(reader, writer, entries, entryCount, seqIdThr, showProgress, NULL, threads);
+    }
+
+    const bool descriptorGather = clusthashfastSetGatherIo(reader);
+    const size_t budget = descriptorGather ? directArenaBudget : arenaBudget;
+    Timer gatherTimer;
     if (total <= budget) {
-        if (total > 0) {
-            fillArena(reader, arena, total, threads);
-        }
+        fillArena(reader, arena, total, threads);
         Debug(Debug::INFO) << "Gathered " << total << " byte of run members in one pass: "
                            << gatherTimer.lap() << "\n";
         ClusterCounts once = clusterHashRuns(reader, writer, entries, entryCount, seqIdThr, showProgress,
-                                             (total > 0) ? &arena : NULL, threads);
+                                             &arena, threads);
         arena.releaseData();
         return once;
     }
-    arena.releaseData();
+    arena.clearMarks();
 
-    // the members do not fit at once, so split the hash range and gather one window per pass
+    // Descriptor windows do not reread unrelated file pages, so an approximate split is enough.
+    // Measure each range in parallel and bisect only the rare skewed range that exceeds the budget.
+    const size_t wantedWindows = std::max<size_t>(total / budget + ((total % budget) != 0), 1);
     std::vector<size_t> bounds;
-    planWindows(reader, entries, entryCount, budget, total, bounds);
-    Debug(Debug::INFO) << "Gathering " << total << " byte of run members in " << (bounds.size() - 1)
+    planWindows(entries, entryCount, wantedWindows, bounds);
+    struct Window { size_t begin; size_t end; };
+    std::vector<Window> windows;
+    windows.reserve(bounds.size());
+    for (size_t i = 0; i + 1 < bounds.size(); ++i) {
+        Window w = {bounds[i], bounds[i + 1]};
+        windows.push_back(w);
+    }
+    Debug(Debug::INFO) << "Gathering " << total << " byte of run members in about " << windows.size()
                        << " passes\n";
+
     ClusterCounts counts;
-    for (size_t window = 0; window + 1 < bounds.size(); ++window) {
-        const size_t begin = bounds[window];
-        const size_t size = bounds[window + 1] - begin;
+    size_t window = 0;
+    while (window < windows.size()) {
+        const size_t begin = windows[window].begin;
+        const size_t end = windows[window].end;
+        const size_t size = end - begin;
         const size_t windowTotal = planArena(reader, arena, entries + begin, size, idSpace, threads);
-        // a single run wider than the whole budget cannot be gathered, so read that one from the db
-        const bool gathered = (windowTotal > 0 && windowTotal <= budget);
+
+        if (windowTotal > budget) {
+            const size_t split = splitWindowAtRunBoundary(entries, begin, end);
+            if (split > begin && split < end) {
+                arena.clearMarks();
+                windows[window].end = split;
+                Window tail = {split, end};
+                // result order is irrelevant here, so append instead of O(n) vector insertion
+                windows.push_back(tail);
+                continue;
+            }
+        }
+
+        // A single run can be wider than the normal descriptor window. Gather it if the larger safe
+        // mapping budget can hold it; otherwise fall back to direct per-entry reads for that run only.
+        const bool gathered = windowTotal > 0
+            && (windowTotal <= budget || (descriptorGather && windowTotal <= arenaBudget));
         if (gathered) {
             fillArena(reader, arena, windowTotal, threads);
         }
-        Debug(Debug::INFO) << "Pass " << (window + 1) << "/" << (bounds.size() - 1) << " gathered "
+        Debug(Debug::INFO) << "Pass " << (window + 1) << "/" << windows.size() << " gathered "
                            << windowTotal << " byte: " << gatherTimer.lap() << "\n";
         counts.add(clusterHashRuns(reader, writer, entries + begin, size, seqIdThr, showProgress,
                                    gathered ? &arena : NULL, threads));
-        arena.releaseData();
+        arena.clearMarks();
+        ++window;
     }
+    arena.releaseData();
     return counts;
 }
 
@@ -712,7 +864,7 @@ static bool hashIntoPartitions(DBReader<DBKeyType> &reader, HashPartitions &part
         Sequence *seq = isNuclInput ? NULL : new Sequence(maxSeqLen, reader.getDbtype(), subMat, 0, false, false);
 #pragma omp for schedule(static, scanChunk)
         for (size_t id = 0; id < dbSize; ++id) {
-            if (showProgress) {
+            if (showProgress && ((id & (CLUSTHASHFAST_PROGRESS_STEP - 1)) == 0 || id + 1 == dbSize)) {
                 progress.updateProgress(id);
             }
             HashEntry entry;
@@ -775,7 +927,7 @@ static void hashAllSequences(DBReader<DBKeyType> &reader, HashEntry *entries, si
         Sequence *seq = isNuclInput ? NULL : new Sequence(maxSeqLen, reader.getDbtype(), subMat, 0, false, false);
 #pragma omp for schedule(static, scanChunk)
         for (size_t id = 0; id < dbSize; ++id) {
-            if (showProgress) {
+            if (showProgress && ((id & (CLUSTHASHFAST_PROGRESS_STEP - 1)) == 0 || id + 1 == dbSize)) {
                 progress.updateProgress(id);
             }
             entries[id].hash = hashOf(reader, id, seq, thread_idx);
@@ -896,6 +1048,9 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     // NOSORT: nothing here needs a sorted access order and it saves the two 8 byte per sequence id maps
     DBReader<DBKeyType> reader(par.db1.c_str(), par.db1Index.c_str(), par.threads,
                                DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX);
+    // The hash pass is mmap/sequential; if a huge-db gather follows, keep an fd so its cache can be
+    // dropped before switching to O_DIRECT instead of competing with the member arena.
+    reader.setIoCacheAdvice(true);
     reader.open(DBReader<DBKeyType>::NOSORT);
     // only preload what can stay resident once the reader index is accounted for
     const bool dataFitsInMemory = reader.getDataSize() < Util::getTotalSystemMemory() / 2;

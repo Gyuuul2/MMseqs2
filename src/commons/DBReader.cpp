@@ -42,7 +42,7 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), index(NULL), id2local(NULL), local2id(NULL),
-        dataMapped(false), accessType(0), externalData(false), didMlock(false), ioAutoDirect(false), ioBufferedBatch(false), ioCacheAdvice(false), ioExpectedResidentBytes(0), directIoAlign(0)
+        dataMapped(false), accessType(0), externalData(false), didMlock(false), ioAutoDirect(false), ioBufferedBatch(false), ioCacheAdvice(false), ioMemoryBudget(0), ioExpectedResidentBytes(0), directIoAlign(0)
 {}
 
 template <typename T>
@@ -53,7 +53,7 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index), sortedByOffset(true),
         id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false),
-        ioAutoDirect(false), ioBufferedBatch(false), ioCacheAdvice(false), ioExpectedResidentBytes(0), directIoAlign(0)
+        ioAutoDirect(false), ioBufferedBatch(false), ioCacheAdvice(false), ioMemoryBudget(0), ioExpectedResidentBytes(0), directIoAlign(0)
 {}
 
 template <typename T>
@@ -757,22 +757,33 @@ template <typename T> void DBReader<T>::resolveIoPolicy(int accessType) {
 
 // false when a file cannot be sized, so an unreadable path keeps the cached path and its diagnostics
 template <typename T> bool DBReader<T>::dataOutgrowsMemory() {
-    // the reader's own index is parsed only after this decision, so its file size stands in for it
+    const size_t memory = (ioMemoryBudget != 0) ? ioMemoryBudget : Util::computeMemory(0);
+    const size_t budget = memory - memory / 5;  // leave 20% for the kernel and transient allocations
+
+    // A non-zero caller estimate is authoritative and already includes reader indices.
+    // Without one, approximate this reader's index from the on-disk index before it is parsed.
     size_t bytes = ioExpectedResidentBytes;
-    if (externalData == false && indexFileName != NULL) {
+    if (bytes == 0 && externalData == false && indexFileName != NULL) {
         const size_t indexFileSize = FileUtil::getFileSize(indexFileName);
         if (indexFileSize != static_cast<size_t>(-1)) {
-            bytes += indexFileSize;
+            bytes = indexFileSize;
         }
     }
+    if (bytes >= budget) {
+        return true;
+    }
+
     for (size_t i = 0; i < dataFileNames.size(); i++) {
         const size_t fileSize = FileUtil::getFileSize(dataFileNames[i]);
         if (fileSize == static_cast<size_t>(-1)) {
             return false;
         }
+        if (fileSize > budget - bytes) {
+            return true;
+        }
         bytes += fileSize;
     }
-    return bytes > Util::computeMemory(0);
+    return false;
 }
 
 template <typename T> int DBReader<T>::openDirect(const char *fileName, size_t *dataSize) {
@@ -893,10 +904,20 @@ struct DBReader<T>::IoBatch {
         size_t avail;
         size_t id;
     };
+    // Consecutive/overlapping entry spans share one request. This matters for short sequences:
+    // without it, 20 entries in one 4 KiB block become 20 O_DIRECT reads of the same block.
+    struct Request {
+        size_t arenaOffset;
+        size_t file;
+        size_t offset;
+        size_t length;
+        size_t required;
+    };
     struct Worker {
         char *arena;
         size_t capacity;
         std::vector<Slot> slots;
+        std::vector<Request> requests;
 #if defined(__linux__) && defined(HAVE_IO_URING)
         DBReaderRing ring;
 #endif
@@ -938,6 +959,7 @@ size_t DBReader<T>::loadBatch(const size_t *ids, size_t n, unsigned int thrIdx) 
     // open() builds this, because loadBatch is called from inside a parallel region
     typename IoBatch::Worker &worker = ioBatch->workers[thrIdx];
     worker.slots.clear();
+    worker.requests.clear();
     // on mmap the bytes are already addressable, so the batch is only a list of ids
     if ((dataMode & USE_DIRECT_IO) == 0) {
         for (size_t i = 0; i < n; i++) {
@@ -969,7 +991,8 @@ size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int th
         incrementMemory(worker.capacity);
     }
 
-    // plan first: an entry that no longer fits ends the batch, and the caller resumes from there
+    // The caller normally hands us offset-ordered ids. Merge adjacent/overlapping aligned spans into
+    // one request while keeping one Slot per input id, so batchAt() preserves the caller's order.
     size_t used = 0;
     size_t taken = 0;
     for (; taken < n; taken++) {
@@ -989,6 +1012,35 @@ size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int th
         const size_t alignedOffset = fileOffset & ~(directIoAlign - 1);
         const size_t delta = fileOffset - alignedOffset;
         const size_t readLen = (delta + length + directIoAlign - 1) & ~(directIoAlign - 1);
+        const size_t readEnd = alignedOffset + readLen;
+
+        bool merged = false;
+        if (worker.requests.empty() == false) {
+            typename IoBatch::Request &request = worker.requests.back();
+            const size_t requestEnd = request.offset + request.length;
+            // Only merge forward. Arbitrary callers still work; they simply get one request per id.
+            if (request.file == file && alignedOffset >= request.offset && alignedOffset <= requestEnd) {
+                const size_t mergedEnd = std::max(requestEnd, readEnd);
+                const size_t extra = mergedEnd - requestEnd;
+                if (used + extra <= worker.capacity) {
+                    request.length += extra;
+                    request.required = std::max(request.required, fileOffset + length - request.offset);
+                    used += extra;
+
+                    typename IoBatch::Slot slot;
+                    slot.arenaOffset = request.arenaOffset;
+                    slot.delta = fileOffset - request.offset;
+                    slot.avail = length;
+                    slot.id = id;
+                    worker.slots.push_back(slot);
+                    merged = true;
+                }
+            }
+        }
+        if (merged) {
+            continue;
+        }
+
         if (used + readLen > worker.capacity) {
             if (taken > 0) {
                 break;
@@ -1005,20 +1057,28 @@ size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int th
             worker.capacity = readLen;
             incrementMemory(worker.capacity);
         }
+
+        typename IoBatch::Request request;
+        request.arenaOffset = used;
+        request.file = file;
+        request.offset = alignedOffset;
+        request.length = readLen;
+        request.required = delta + length;
+        worker.requests.push_back(request);
+
         typename IoBatch::Slot slot;
         slot.arenaOffset = used;
         slot.delta = delta;
         slot.avail = length;
         slot.id = id;
         worker.slots.push_back(slot);
-        // the plan is replayed below, so the file and the aligned offset are recomputed there
         used += readLen;
     }
 
-    // one entry is not worth a ring round trip, and it is the common case for a query body
+    const size_t requestCount = worker.requests.size();
     bool submitted = false;
 #if defined(__linux__) && defined(HAVE_IO_URING)
-    if (taken > 1) {
+    if (requestCount > 1) {
         if (worker.ringReady == false) {
             // MMSEQS_NO_IO_URING=1 drops to the pread loop, so the ring can be A/B tested in place
             static const bool ringOff = getenv("MMSEQS_NO_IO_URING") != NULL;
@@ -1031,26 +1091,18 @@ size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int th
             size_t next = 0;
             size_t done = 0;
             unsigned inflight = 0;
-            while (done < taken) {
+            while (done < requestCount) {
                 unsigned queued = 0;
-                while (inflight + queued < DBREADER_BATCH_DEPTH && next < taken) {
-                    const typename IoBatch::Slot &slot = worker.slots[next];
-                    const size_t localId = (local2id != NULL) ? local2id[slot.id] : slot.id;
-                    const size_t offset = index[localId].offset;
-                    size_t file = 0;
-                    while ((offset >= dataSizeOffset[file] && offset < dataSizeOffset[file + 1]) == false) {
-                        file++;
-                    }
-                    const size_t alignedOffset = (offset - dataSizeOffset[file]) & ~(directIoAlign - 1);
-                    const size_t readLen = (slot.delta + slot.avail + directIoAlign - 1) & ~(directIoAlign - 1);
-                    const unsigned sqeIdx = (unsigned) (next % r.entries);
+                while (inflight + queued < DBREADER_BATCH_DEPTH && next < requestCount) {
+                    const typename IoBatch::Request &request = worker.requests[next];
+                    const unsigned sqeIdx = static_cast<unsigned>(next % r.entries);
                     struct io_uring_sqe *sqe = &r.sqes[sqeIdx];
                     memset(sqe, 0, sizeof(*sqe));
                     sqe->opcode = IORING_OP_READ;
-                    sqe->fd = dataFds[file];
-                    sqe->off = alignedOffset;
-                    sqe->addr = (uint64_t) (uintptr_t) (worker.arena + slot.arenaOffset);
-                    sqe->len = (unsigned) readLen;
+                    sqe->fd = dataFds[request.file];
+                    sqe->off = request.offset;
+                    sqe->addr = (uint64_t) (uintptr_t) (worker.arena + request.arenaOffset);
+                    sqe->len = static_cast<unsigned>(request.length);
                     sqe->user_data = next;
                     const unsigned tail = *r.sqTail;
                     r.sqArray[tail & sqMask] = sqeIdx;
@@ -1058,12 +1110,10 @@ size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int th
                     queued++;
                     next++;
                 }
-                // nothing left to submit means the batch can be collected in this one syscall;
-                // otherwise wake on the first completion so the freed slot is refilled at once
-                const unsigned waitFor = (next >= taken) ? (inflight + queued) : 1u;
+                const unsigned waitFor = (next >= requestCount) ? (inflight + queued) : 1u;
                 long ret;
                 do {
-                    ret = syscall(__NR_io_uring_enter, r.fd, (unsigned) queued, waitFor,
+                    ret = syscall(__NR_io_uring_enter, r.fd, queued, waitFor,
                                   IORING_ENTER_GETEVENTS, NULL, 0);
                 } while (ret < 0 && errno == EINTR);
                 if (ret < 0) {
@@ -1075,15 +1125,15 @@ size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int th
                 const unsigned cqTail = __atomic_load_n(r.cqTail, __ATOMIC_ACQUIRE);
                 while (head != cqTail) {
                     struct io_uring_cqe *cqe = &r.cqes[head & cqMask];
-                    typename IoBatch::Slot &slot = worker.slots[cqe->res < 0 ? 0 : (size_t) cqe->user_data];
+                    const size_t requestIdx = (cqe->res < 0) ? 0 : static_cast<size_t>(cqe->user_data);
+                    const typename IoBatch::Request &request = worker.requests[requestIdx];
                     if (cqe->res < 0) {
                         Debug(Debug::ERROR) << "Failed to read from " << dataFileName << ". Error " << -cqe->res << ".\n";
                         EXIT(EXIT_FAILURE);
                     }
-                    const size_t got = (size_t) cqe->res;
-                    if (got < slot.delta + slot.avail) {
-                        Debug(Debug::ERROR) << "Short read of " << got << " byte for id " << slot.id
-                                            << " in " << dataFileName << "\n";
+                    if (static_cast<size_t>(cqe->res) < request.required) {
+                        Debug(Debug::ERROR) << "Short batch read of " << cqe->res << " byte from "
+                                            << dataFileName << " at offset " << request.offset << "\n";
                         EXIT(EXIT_FAILURE);
                     }
                     head++;
@@ -1097,24 +1147,19 @@ size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int th
     }
 #endif
     if (submitted == false) {
-        // no ring, or a single entry: the plain pread path reads straight into the same arena
-        for (size_t i = 0; i < taken; i++) {
-            typename IoBatch::Slot &slot = worker.slots[i];
-            const size_t localId = (local2id != NULL) ? local2id[slot.id] : slot.id;
-            const size_t offset = index[localId].offset;
-            size_t file = 0;
-            while ((offset >= dataSizeOffset[file] && offset < dataSizeOffset[file + 1]) == false) {
-                file++;
-            }
-            const size_t alignedOffset = (offset - dataSizeOffset[file]) & ~(directIoAlign - 1);
-            const size_t readLen = (slot.delta + slot.avail + directIoAlign - 1) & ~(directIoAlign - 1);
+        // One pread per coalesced span, not per sequence. Near EOF a short aligned read is fine as
+        // long as it still covers every slot that points into the request.
+        for (size_t i = 0; i < requestCount; i++) {
+            const typename IoBatch::Request &request = worker.requests[i];
             ssize_t got;
             do {
-                got = pread(dataFds[file], worker.arena + slot.arenaOffset, readLen, alignedOffset);
+                got = pread(dataFds[request.file], worker.arena + request.arenaOffset,
+                            request.length, request.offset);
             } while (got < 0 && errno == EINTR);
-            if (got < 0 || (size_t) got < slot.delta + slot.avail) {
-                Debug(Debug::ERROR) << "Failed to read " << slot.avail << " byte for id " << slot.id
-                                    << " from " << dataFileName << ". Error " << errno << ".\n";
+            if (got < 0 || static_cast<size_t>(got) < request.required) {
+                Debug(Debug::ERROR) << "Failed batch read of " << request.required << " byte from "
+                                    << dataFileName << " at offset " << request.offset
+                                    << ". Error " << errno << ".\n";
                 EXIT(EXIT_FAILURE);
             }
         }
