@@ -22,6 +22,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <sys/resource.h>
+#include <sys/statvfs.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -33,7 +34,6 @@
 #include <cstring>
 
 #include <zstd.h>
-#include <lz4frame.h>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -130,29 +130,26 @@ static const size_t KMER_STAGING_BUFFER_SIZE = 65536;
 
 static void removeKmerTmpFileIfExists(const std::string &fileName);
 static FILE *openKmerTmpFileForOverwriteOrDie(const std::string &fileName, const char *mode);
+static void printKmerTmpFsState(const std::string &fileName);
+static void kmerTmpIoErrorDie(const char *op, const std::string &fileName);
 
-// --compress-kmer-tmp-files selects the codec for every k-mer spill file: 0 raw, 1 zstd, 2 lz4
+// --compress-kmer-tmp-files selects the codec for every k-mer spill file: 0 raw, 1 zstd
 static const int KMER_TMP_CODEC_NONE = 0;
 static const int KMER_TMP_CODEC_ZSTD = 1;
-static const int KMER_TMP_CODEC_LZ4 = 2;
 
 // the suffix is the only on-disk marker of the codec, so readers recover it from the file name
 static const char *kmerTmpCodecSuffix(int codec) {
     if (codec == KMER_TMP_CODEC_ZSTD) {
         return ".zst";
     }
-    if (codec == KMER_TMP_CODEC_LZ4) {
-        return ".lz4";
-    }
     return "";
 }
 
-// Bucket file IO wrappers (raw, zstd or lz4). Non-template so they can be declared here and
+// Bucket file IO wrappers (raw or zstd). Non-template so they can be declared here and
 // defined after the stream writers, and used by the templated sink/loader.
 // buckets are transient spill, so they compress at a lower level than the split-result tmp files
 static const int KMER_BUCKET_ZSTD_LEVEL = 2;
-static const int KMER_BUCKET_LZ4_LEVEL = 0;
-static void *bucketWriterOpen(const std::string &fileName, int codec, int zstdLevel, int lz4Level);
+static void *bucketWriterOpen(const std::string &fileName, int codec, int zstdLevel);
 static void bucketWriterAppend(void *writer, int codec, const void *data, size_t byteSize);
 static void bucketWriterClose(void *writer, int codec);
 static size_t bucketReadFile(const std::string &fileName, int codec, void *dst, size_t maxBytes,
@@ -254,7 +251,7 @@ struct KmerPartitionSink {
             for (size_t b = 0; b < numBuckets; b++) {
                 size_t k = static_cast<size_t>(tid) * numBuckets + b;
                 writers[k] = bucketWriterOpen(kmerBucketFileName(base, b, tid, codec), codec,
-                                              KMER_BUCKET_ZSTD_LEVEL, KMER_BUCKET_LZ4_LEVEL);
+                                              KMER_BUCKET_ZSTD_LEVEL);
                 buffers[k] = new(std::nothrow) KP[bucketBuffer];
                 Util::checkAllocation(buffers[k], "Can not allocate k-mer bucket buffer");
             }
@@ -294,15 +291,15 @@ struct KmerPartitionSink {
             std::string countFile = kmerBucketCountFileName(base, b);
             FILE *cf = fopen(countFile.c_str(), "w");
             if (cf == NULL) {
-                Debug(Debug::ERROR) << "Can not open " << countFile << "\n";
-                EXIT(EXIT_FAILURE);
+                kmerTmpIoErrorDie("open", countFile);
             }
             for (int tid = 0; tid < numThreads; tid++) {
-                fprintf(cf, "%zu\n", recordsWritten[static_cast<size_t>(tid) * numBuckets + b]);
+                if (fprintf(cf, "%zu\n", recordsWritten[static_cast<size_t>(tid) * numBuckets + b]) < 0) {
+                    kmerTmpIoErrorDie("write", countFile);
+                }
             }
             if (fclose(cf) != 0) {
-                Debug(Debug::ERROR) << "Can not write " << countFile << "\n";
-                EXIT(EXIT_FAILURE);
+                kmerTmpIoErrorDie("close", countFile);
             }
         }
     }
@@ -340,8 +337,15 @@ size_t loadKmerBucket(const std::string &base, size_t bucket, int numThreads,
 #pragma omp parallel for schedule(dynamic, 1)
         for (int tid = 0; tid < numThreads; tid++) {
             std::string fileName = kmerBucketFileName(base, bucket, tid, codec);
-            if (counts[tid] == 0 || FileUtil::fileExists(fileName.c_str()) == false) {
+            if (counts[tid] == 0) {
                 removeKmerTmpFileIfExists(fileName);
+                continue;
+            }
+            // skipping here would leave sentinel records in the array, silently dropping the k-mers
+            if (FileUtil::fileExists(fileName.c_str()) == false) {
+                Debug(Debug::ERROR) << "k-mer bucket file " << fileName << " is missing but its count file records "
+                                    << counts[tid] << " entries\n";
+                failed = true;
                 continue;
             }
             bool overflow = false;
@@ -1146,7 +1150,12 @@ static void runIteration(
 
     if (hashEndRange != SIZE_T_MAX || par.needWriteBuffer) {
         std::vector<size_t> threadQueryOffsets(par.threads + 1);
-        size_t qSplitSize = seqDbr.getSize() / par.threads;
+        // .kmer holds representative db keys, so the lanes have to divide the key space. Dividing the
+        // sequence count instead sends every key above getSize() to the last lane, which is the whole
+        // db on a subdb whose keys stayed sparse. The lane still has to be a fixed function of the key:
+        // the merge collects one lane across every split and iteration, so a rep must always land in one.
+        size_t qSplitSize = std::max<size_t>(
+            (static_cast<size_t>(seqDbr.getLastKey()) + 1) / par.threads, 1);
         threadQueryOffsets[0] = 0;
 
         if (par.needWriteBuffer) {
@@ -1394,8 +1403,7 @@ KmerPosition<T, includeAdjacency, IncludeSeqLen> *doComputation(
     removeKmerTmpFileIfExists(splitDone);
     FILE *done = openKmerTmpFileForOverwriteOrDie(splitDone, "w");
     if (fclose(done) != 0) {
-        Debug(Debug::ERROR) << "Cannot close file " << splitDone << "\n";
-        EXIT(EXIT_FAILURE);
+        kmerTmpIoErrorDie("close", splitDone);
     }
 
     delete sequenceWeights;
@@ -1691,6 +1699,17 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
         }
         unsigned int *hashToBucket = buildHashToBucketLookup(hashRanges);
         Debug(Debug::INFO) << "Partition k-mers into " << hashRanges.size() << " buckets\n";
+        // all buckets coexist until their split consumes them, so this is the peak tmp usage
+        size_t bucketBytes = totalKmers * sizeof(KmerPosition<T, includeAdjacency, IncludeSeqLen>);
+        struct statvfs bucketVfs;
+        size_t bucketFsFree = (statvfs(FileUtil::dirName(kmerWriteBase).c_str(), &bucketVfs) == 0)
+                                  ? static_cast<size_t>(bucketVfs.f_bavail) * bucketVfs.f_frsize : SIZE_T_MAX;
+        Debug(Debug::INFO) << "K-mer buckets hold up to " << (bucketBytes >> 30)
+                           << " GB before compression\n";
+        if (bucketFsFree != SIZE_T_MAX && bucketBytes > bucketFsFree) {
+            Debug(Debug::WARNING) << "The tmp filesystem has " << (bucketFsFree >> 30)
+                                  << " GB free for the k-mer buckets; compression may still fit them\n";
+        }
         KmerPartitionSink<T, includeAdjacency, IncludeSeqLen> sink(kmerWriteBase, par.threads, hashRanges.size(), hashToBucket, par.compressKmerTmpFiles);
         if (Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)) {
             std::pair<size_t, size_t> ret = fillKmerPositionArray<Parameters::DBTYPE_NUCLEOTIDES, T, includeAdjacency, IncludeSeqLen>(
@@ -2041,10 +2060,6 @@ void writeKmerMatcherResult(DBWriter & dbw,
 static const size_t KMER_TMP_ZSTD_INPUT_BUFFER_SIZE = 65536;
 static const size_t KMER_TMP_ZSTD_OUTPUT_BUFFER_SIZE = 65536;
 static const int KMER_TMP_ZSTD_COMPRESSION_LEVEL = 2;
-// lz4 level 0 is its fast mode, the counterpart to a low zstd level rather than to LZ4HC
-static const int KMER_TMP_LZ4_COMPRESSION_LEVEL = 0;
-// matches LZ4F_max256KB so compressUpdate emits one whole block per call
-static const size_t KMER_TMP_LZ4_BLOCK_SIZE = 256 * 1024;
 static const size_t KMER_MERGE_RESULT_BUFFER_RESERVE = 1024 * 1024;
 static const size_t KMER_MERGE_RESULT_BUFFER_MAX_KEEP = 16 * 1024 * 1024;
 static const size_t KMER_MERGE_MIN_MEMORY_HEADROOM = 1024ull * 1024ull * 1024ull;
@@ -2056,7 +2071,7 @@ static std::string kmerTmpFileName(const std::string &tmpFile, int iteration, in
 
 // a rerun may inherit files written under a different codec, so try the requested one and then the rest
 static std::string existingKmerTmpFileName(const std::string &baseName, int preferredCodec) {
-    static const int codecs[] = { KMER_TMP_CODEC_NONE, KMER_TMP_CODEC_ZSTD, KMER_TMP_CODEC_LZ4 };
+    static const int codecs[] = { KMER_TMP_CODEC_NONE, KMER_TMP_CODEC_ZSTD };
     const std::string preferred = baseName + kmerTmpCodecSuffix(preferredCodec);
     if (FileUtil::fileExists(preferred.c_str())) {
         return preferred;
@@ -2076,11 +2091,29 @@ static void removeKmerTmpFileIfExists(const std::string &fileName) {
     }
 }
 
+// the fs counters tell a full disk, a full quota and a full inode table apart from the log alone
+static void printKmerTmpFsState(const std::string &fileName) {
+    struct statvfs vfs;
+    const std::string dir = FileUtil::dirName(fileName);
+    if (statvfs(dir.c_str(), &vfs) == 0) {
+        Debug(Debug::ERROR) << "Filesystem of " << dir << " has "
+                            << static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize << " bytes and "
+                            << static_cast<uint64_t>(vfs.f_favail) << " inodes available to this user\n";
+    }
+}
+
+static void kmerTmpIoErrorDie(const char *op, const std::string &fileName) {
+    const int errsv = errno;
+    Debug(Debug::ERROR) << "Can not " << op << " " << fileName << ". errno=" << errsv
+                        << " (" << strerror(errsv) << ")\n";
+    printKmerTmpFsState(fileName);
+    EXIT(EXIT_FAILURE);
+}
+
 static FILE *openKmerTmpFileForOverwriteOrDie(const std::string &fileName, const char *mode) {
     FILE *file = fopen(fileName.c_str(), mode);
     if (file == NULL) {
-        perror(fileName.c_str());
-        EXIT(EXIT_FAILURE);
+        kmerTmpIoErrorDie("open", fileName);
     }
     return file;
 }
@@ -2091,7 +2124,11 @@ static void writeAllOrDie(FILE *file, const void *data, size_t dataSize, const s
     }
     size_t written = fwrite(data, sizeof(char), dataSize, file);
     if (written != dataSize) {
-        Debug(Debug::ERROR) << "Can not write to file " << fileName << "\n";
+        const int errsv = errno;
+        Debug(Debug::ERROR) << "Can not write to file " << fileName << ": wrote " << written
+                            << " of " << dataSize << " bytes. errno=" << errsv
+                            << " (" << strerror(errsv) << ")\n";
+        printKmerTmpFsState(fileName);
         EXIT(EXIT_FAILURE);
     }
 }
@@ -2166,8 +2203,7 @@ public:
         } while (remainingToFlush != 0);
 
         if (fclose(file) != 0) {
-            Debug(Debug::ERROR) << "Cannot close file " << fileName << "\n";
-            EXIT(EXIT_FAILURE);
+            kmerTmpIoErrorDie("close", fileName);
         }
         file = NULL;
         closed = true;
@@ -2182,102 +2218,28 @@ private:
 };
 
 // same shape as ZstdKmerTmpFileWriter so the two codecs stay interchangeable at the call sites
-class Lz4KmerTmpFileWriter {
-public:
-    Lz4KmerTmpFileWriter(const std::string &fileName, int compressionLevel)
-        : fileName(fileName), file(NULL), cctx(NULL), outBuffer(NULL), outBufferSize(0), closed(true) {
-        file = openKmerTmpFileForOverwriteOrDie(fileName, "wb");
-        LZ4F_errorCode_t ret = LZ4F_createCompressionContext(&cctx, LZ4F_VERSION);
-        if (LZ4F_isError(ret)) {
-            Debug(Debug::ERROR) << "LZ4F_createCompressionContext() failed for " << fileName << ". Error "
-                                << LZ4F_getErrorName(ret) << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        memset(&prefs, 0, sizeof(prefs));
-        prefs.compressionLevel = compressionLevel;
-        // 64 KB linked blocks are the slowest frame layout lz4 has: every block depends on the
-        // previous one, so the decoder maintains a dictionary, and the small blocks maximise the
-        // number of boundaries. Independent 256 KB blocks drop both costs and compress better.
-        prefs.frameInfo.blockSizeID = LZ4F_max256KB;
-        prefs.frameInfo.blockMode = LZ4F_blockIndependent;
-        // one bound for the fixed chunk plus the header, so write() never has to resize
-        outBufferSize = LZ4F_compressBound(KMER_TMP_LZ4_BLOCK_SIZE, &prefs) + LZ4F_HEADER_SIZE_MAX;
-        outBuffer = static_cast<char *>(malloc(outBufferSize));
-        if (outBuffer == NULL) {
-            Debug(Debug::ERROR) << "Cannot allocate lz4 output buffer for " << fileName << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        const size_t headerSize = LZ4F_compressBegin(cctx, outBuffer, outBufferSize, &prefs);
-        if (LZ4F_isError(headerSize)) {
-            Debug(Debug::ERROR) << "LZ4F_compressBegin() error for " << fileName << ". Error "
-                                << LZ4F_getErrorName(headerSize) << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        writeAllOrDie(file, outBuffer, headerSize, fileName);
-        closed = false;
-    }
 
-    ~Lz4KmerTmpFileWriter() {
-        if (closed == false) {
-            close();
-        }
-        if (outBuffer != NULL) {
-            free(outBuffer);
-        }
-        if (cctx != NULL) {
-            LZ4F_freeCompressionContext(cctx);
-        }
-    }
-
-    void write(const void *data, size_t dataSize) {
-        const char *src = static_cast<const char *>(data);
-        size_t pos = 0;
-        while (pos < dataSize) {
-            // feeding whole blocks keeps lz4 from buffering a partial one internally
-            const size_t chunk = std::min(dataSize - pos, KMER_TMP_LZ4_BLOCK_SIZE);
-            const size_t got = LZ4F_compressUpdate(cctx, outBuffer, outBufferSize, src + pos, chunk, NULL);
-            if (LZ4F_isError(got)) {
-                Debug(Debug::ERROR) << "LZ4F_compressUpdate() error for " << fileName << ". Error "
-                                    << LZ4F_getErrorName(got) << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            writeAllOrDie(file, outBuffer, got, fileName);
-            pos += chunk;
-        }
-    }
-
-    void close() {
-        if (closed) {
-            return;
-        }
-        const size_t got = LZ4F_compressEnd(cctx, outBuffer, outBufferSize, NULL);
-        if (LZ4F_isError(got)) {
-            Debug(Debug::ERROR) << "LZ4F_compressEnd() error for " << fileName << ". Error "
-                                << LZ4F_getErrorName(got) << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        writeAllOrDie(file, outBuffer, got, fileName);
-        if (fclose(file) != 0) {
-            Debug(Debug::ERROR) << "Cannot close file " << fileName << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        file = NULL;
-        closed = true;
-    }
-
-private:
+// wraps the raw FILE* spill writer so its error paths can name the file, like the compressed writers
+struct RawKmerTmpFileWriter {
     std::string fileName;
     FILE *file;
-    LZ4F_cctx *cctx;
-    LZ4F_preferences_t prefs;
-    char *outBuffer;
-    size_t outBufferSize;
-    bool closed;
+    RawKmerTmpFileWriter(const std::string &fileName)
+        : fileName(fileName), file(openKmerTmpFileForOverwriteOrDie(fileName, "wb")) {}
+    void write(const void *data, size_t dataSize) {
+        writeAllOrDie(file, data, dataSize, fileName);
+    }
+    // an unchecked fclose here would truncate the buffered tail silently on a full filesystem
+    void close() {
+        if (file != NULL && fclose(file) != 0) {
+            kmerTmpIoErrorDie("close", fileName);
+        }
+        file = NULL;
+    }
 };
 
 // --- bucket file IO wrappers (declared near the top, defined here after the stream writers) ---
-// MMSEQS_BUCKET_ZSTD_LEVEL and MMSEQS_BUCKET_LZ4_LEVEL override the levels for tuning.
-static void *bucketWriterOpen(const std::string &fileName, int codec, int zstdLevel, int lz4Level) {
+// MMSEQS_BUCKET_ZSTD_LEVEL overrides the level for tuning.
+static void *bucketWriterOpen(const std::string &fileName, int codec, int zstdLevel) {
     if (codec == KMER_TMP_CODEC_ZSTD) {
         const char *env = getenv("MMSEQS_BUCKET_ZSTD_LEVEL");
         if (env != NULL) {
@@ -2285,14 +2247,7 @@ static void *bucketWriterOpen(const std::string &fileName, int codec, int zstdLe
         }
         return new ZstdKmerTmpFileWriter(fileName, zstdLevel);
     }
-    if (codec == KMER_TMP_CODEC_LZ4) {
-        const char *env = getenv("MMSEQS_BUCKET_LZ4_LEVEL");
-        if (env != NULL) {
-            lz4Level = atoi(env);
-        }
-        return new Lz4KmerTmpFileWriter(fileName, lz4Level);
-    }
-    return openKmerTmpFileForOverwriteOrDie(fileName, "wb");
+    return new RawKmerTmpFileWriter(fileName);
 }
 
 static void bucketWriterAppend(void *writer, int codec, const void *data, size_t byteSize) {
@@ -2301,11 +2256,8 @@ static void bucketWriterAppend(void *writer, int codec, const void *data, size_t
     }
     if (codec == KMER_TMP_CODEC_ZSTD) {
         static_cast<ZstdKmerTmpFileWriter *>(writer)->write(data, byteSize);
-    } else if (codec == KMER_TMP_CODEC_LZ4) {
-        static_cast<Lz4KmerTmpFileWriter *>(writer)->write(data, byteSize);
-    } else if (fwrite(data, 1, byteSize, static_cast<FILE *>(writer)) != byteSize) {
-        Debug(Debug::ERROR) << "Can not write k-mer bucket file\n";
-        EXIT(EXIT_FAILURE);
+        } else {
+        static_cast<RawKmerTmpFileWriter *>(writer)->write(data, byteSize);
     }
 }
 
@@ -2317,12 +2269,10 @@ static void bucketWriterClose(void *writer, int codec) {
         ZstdKmerTmpFileWriter *z = static_cast<ZstdKmerTmpFileWriter *>(writer);
         z->close();
         delete z;
-    } else if (codec == KMER_TMP_CODEC_LZ4) {
-        Lz4KmerTmpFileWriter *l = static_cast<Lz4KmerTmpFileWriter *>(writer);
-        l->close();
-        delete l;
-    } else {
-        fclose(static_cast<FILE *>(writer));
+        } else {
+        RawKmerTmpFileWriter *r = static_cast<RawKmerTmpFileWriter *>(writer);
+        r->close();
+        delete r;
     }
 }
 
@@ -2332,8 +2282,9 @@ static size_t bucketReadFile(const std::string &fileName, int codec, void *dst, 
                              size_t ioBufferBytes, bool &overflow) {
     overflow = false;
     FILE *f = fopen(fileName.c_str(), "rb");
+    // callers verified the file exists, so failing here is a real IO error, not an empty bucket
     if (f == NULL) {
-        return 0;
+        kmerTmpIoErrorDie("open", fileName);
     }
     size_t written = 0;
     if (codec == KMER_TMP_CODEC_NONE) {
@@ -2347,7 +2298,6 @@ static size_t bucketReadFile(const std::string &fileName, int codec, void *dst, 
     }
 
     ZSTD_DStream *dstream = NULL;
-    LZ4F_dctx *dctx = NULL;
     size_t inBufferSize = std::max(ioBufferBytes, KMER_TMP_ZSTD_INPUT_BUFFER_SIZE);
     if (codec == KMER_TMP_CODEC_ZSTD) {
         dstream = ZSTD_createDStream();
@@ -2357,13 +2307,6 @@ static size_t bucketReadFile(const std::string &fileName, int codec, void *dst, 
         }
         ZSTD_initDStream(dstream);
         inBufferSize = std::max(ioBufferBytes, ZSTD_DStreamInSize());
-    } else {
-        const LZ4F_errorCode_t ret = LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION);
-        if (LZ4F_isError(ret)) {
-            Debug(Debug::ERROR) << "LZ4F_createDecompressionContext() failed for " << fileName
-                                << ". Error " << LZ4F_getErrorName(ret) << "\n";
-            EXIT(EXIT_FAILURE);
-        }
     }
     // decompression already lands straight in dst, so the read size is all that is left to set
     char *inBuffer = static_cast<char *>(malloc(inBufferSize));
@@ -2376,8 +2319,7 @@ static size_t bucketReadFile(const std::string &fileName, int codec, void *dst, 
         if (inPos == inSize) {
             const ssize_t got = kmerPreadRetry(fd, inBuffer, inBufferSize, readOffset);
             if (got < 0) {
-                Debug(Debug::ERROR) << "Cannot read file " << fileName << "\n";
-                EXIT(EXIT_FAILURE);
+                kmerTmpIoErrorDie("read", fileName);
             }
             readOffset += static_cast<size_t>(got);
             inSize = static_cast<size_t>(got);
@@ -2397,23 +2339,6 @@ static size_t bucketReadFile(const std::string &fileName, int codec, void *dst, 
             }
             written = output.pos;
             inPos = input.pos;
-        } else {
-            size_t dstSize = maxBytes - written;
-            size_t srcSize = inSize - inPos;
-            const size_t ret = LZ4F_decompress(dctx, static_cast<char *>(dst) + written, &dstSize,
-                                               inBuffer + inPos, &srcSize, NULL);
-            if (LZ4F_isError(ret)) {
-                Debug(Debug::ERROR) << "LZ4F_decompress() error for " << fileName << ": "
-                                    << LZ4F_getErrorName(ret) << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            // neither consumed nor produced with room left would spin here forever
-            if (dstSize == 0 && srcSize == 0 && written < maxBytes) {
-                Debug(Debug::ERROR) << "LZ4F_decompress() made no progress in " << fileName << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            written += dstSize;
-            inPos += srcSize;
         }
         if (written == maxBytes && inPos < inSize) {
             overflow = true;  // output full but input remains
@@ -2422,9 +2347,6 @@ static size_t bucketReadFile(const std::string &fileName, int codec, void *dst, 
     free(inBuffer);
     if (dstream != NULL) {
         ZSTD_freeDStream(dstream);
-    }
-    if (dctx != NULL) {
-        LZ4F_freeDecompressionContext(dctx);
     }
     fclose(f);
     return written;
@@ -2436,7 +2358,7 @@ public:
     KmerTmpFileReader(const std::string &fileName, size_t ioBufferBytes)
         : fileName(fileName), file(NULL), codec(codecFromFileName(fileName)),
           entries(NULL), entrySize(0), offsetPos(0), released(0), dataSize(0),
-          dstream(NULL), dctx(NULL), inBuffer(NULL), outBuffer(NULL), inBufferSize(0), outBufferSize(0),
+          dstream(NULL), inBuffer(NULL), outBuffer(NULL), inBufferSize(0), outBufferSize(0),
           input(), readOffset(0), outPos(0), outLen(0),
           eof(false), frameComplete(false), closed(true), ioBufferBytes(ioBufferBytes) {
         open();
@@ -2471,10 +2393,6 @@ public:
             ZSTD_freeDStream(dstream);
             dstream = NULL;
         }
-        if (dctx != NULL) {
-            LZ4F_freeDecompressionContext(dctx);
-            dctx = NULL;
-        }
         if (inBuffer != NULL) {
             free(inBuffer);
             inBuffer = NULL;
@@ -2484,8 +2402,7 @@ public:
             outBuffer = NULL;
         }
         if (file != NULL && fclose(file) != 0) {
-            Debug(Debug::ERROR) << "Cannot close file " << fileName << "\n";
-            EXIT(EXIT_FAILURE);
+            kmerTmpIoErrorDie("close", fileName);
         }
         file = NULL;
         closed = true;
@@ -2520,9 +2437,6 @@ private:
         if (Util::endsWith(".zst", fileName)) {
             return KMER_TMP_CODEC_ZSTD;
         }
-        if (Util::endsWith(".lz4", fileName)) {
-            return KMER_TMP_CODEC_LZ4;
-        }
         return KMER_TMP_CODEC_NONE;
     }
 
@@ -2546,13 +2460,6 @@ private:
                 }
                 inBufferSize = std::max(ioBufferBytes, ZSTD_DStreamInSize());
                 outBufferSize = std::max(ioBufferBytes, ZSTD_DStreamOutSize());
-            } else {
-                const LZ4F_errorCode_t ret = LZ4F_createDecompressionContext(&dctx, LZ4F_VERSION);
-                if (LZ4F_isError(ret)) {
-                    Debug(Debug::ERROR) << "LZ4F_createDecompressionContext() failed for " << fileName
-                                        << ". Error " << LZ4F_getErrorName(ret) << "\n";
-                    EXIT(EXIT_FAILURE);
-                }
             }
             inBuffer = static_cast<char *>(malloc(inBufferSize));
             outBuffer = static_cast<char *>(malloc(outBufferSize));
@@ -2622,8 +2529,7 @@ private:
             if (input.pos == input.size && eof == false) {
                 const ssize_t got = kmerPreadRetry(fileno(file), inBuffer, inBufferSize, readOffset);
                 if (got < 0) {
-                    Debug(Debug::ERROR) << "Cannot read file " << fileName << "\n";
-                    EXIT(EXIT_FAILURE);
+                    kmerTmpIoErrorDie("read", fileName);
                 }
                 if (got == 0) {
                     eof = true;
@@ -2652,25 +2558,6 @@ private:
                 }
                 produced = output.pos;
                 frameComplete = (ret == 0);
-            } else {
-                size_t dstSize = cap - produced;
-                size_t srcSize = input.size - input.pos;
-                const size_t ret = LZ4F_decompress(dctx, dst + produced, &dstSize,
-                                                   static_cast<const char *>(input.src) + input.pos,
-                                                   &srcSize, NULL);
-                if (LZ4F_isError(ret)) {
-                    Debug(Debug::ERROR) << "LZ4F_decompress() error for " << fileName << ". Error "
-                                        << LZ4F_getErrorName(ret) << "\n";
-                    EXIT(EXIT_FAILURE);
-                }
-                // this loop only exits on produced != 0, so a no-progress call has to be fatal
-                if (dstSize == 0 && srcSize == 0) {
-                    Debug(Debug::ERROR) << "LZ4F_decompress() made no progress in " << fileName << "\n";
-                    EXIT(EXIT_FAILURE);
-                }
-                produced += dstSize;
-                input.pos += srcSize;
-                frameComplete = (ret == 0);
             }
         }
         return produced;
@@ -2685,7 +2572,6 @@ private:
     size_t released;
     size_t dataSize;
     ZSTD_DStream *dstream;
-    LZ4F_dctx *dctx;
     char *inBuffer;
     char *outBuffer;
     size_t inBufferSize;
@@ -2986,11 +2872,8 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
         // a rerun under a different codec would otherwise leave the old file for the merge to pick up
         removeKmerTmpFileIfExists(kmerTmpFileName(tmpFile, iteration, tid, KMER_TMP_CODEC_NONE));
         removeKmerTmpFileIfExists(kmerTmpFileName(tmpFile, iteration, tid, KMER_TMP_CODEC_ZSTD));
-        removeKmerTmpFileIfExists(kmerTmpFileName(tmpFile, iteration, tid, KMER_TMP_CODEC_LZ4));
-
         if (startIdx < endIdx && hashSeqPair[startIdx].kmer != SIZE_T_MAX) {
-            void *writer = bucketWriterOpen(tmpFileThread, tmpFileCodec, KMER_TMP_ZSTD_COMPRESSION_LEVEL,
-                                            KMER_TMP_LZ4_COMPRESSION_LEVEL);
+            void *writer = bucketWriterOpen(tmpFileThread, tmpFileCodec, KMER_TMP_ZSTD_COMPRESSION_LEVEL);
 
             const auto sinkEntries = [&](const T *entries, size_t count) {
                 bucketWriterAppend(writer, tmpFileCodec, entries, sizeof(T) * count);
@@ -3125,8 +3008,7 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
     removeKmerTmpFileIfExists(fileName);
     FILE *done = openKmerTmpFileForOverwriteOrDie(fileName, "w");
     if (fclose(done) != 0) {
-        Debug(Debug::ERROR) << "Cannot close file " << fileName << "\n";
-        EXIT(EXIT_FAILURE);
+        kmerTmpIoErrorDie("close", fileName);
     }
 }
 
