@@ -161,6 +161,9 @@ static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int m
     size_t fixedMemory = dbSize * sizeof(ClusterAssignment);
     if (mode == Parameters::SET_COVER) {
         fixedMemory += dbSize * sizeof(PrefInfo);
+    } else {
+        // GREEDY keeps this visit order until every producer has completed.
+        fixedMemory += dbSize * sizeof(DBLocalId);
     }
 
     const size_t budget = (memoryLimit > fixedMemory)
@@ -455,16 +458,33 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         par.db1.c_str(), par.db1Index.c_str(), par.threads, 
         DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
     );
-    // Targets repeat across neighbour lists, so the page cache is worth keeping: measured 4.3x over
-    // O_DIRECT at 11x reuse, while O_DIRECT wins only 16% when there is none. Batched io_uring on
-    // buffered descriptors keeps that reuse and still avoids the mmap fault path.
-    seqDbr->setIoBufferedBatch(true);
-    // the per-sequence arrays live for the whole loop, so the size rule must not mistake them for cache
-    const size_t align2clustPerSeqBytes = sizeof(ClusterAssignment)
-        + ((par.clusteringMode == Parameters::SET_COVER) ? sizeof(PrefInfo) : sizeof(DBLocalId));
-    seqDbr->setIoExpectedResidentBytes(alnDbr.getSize() * align2clustPerSeqBytes);
     // SORT_BY_LENGTH costs id2local plus local2id; neither mode needs them once lengthOrder exists
     seqDbr->open(DBReader<DBKeyType>::NOSORT);
+
+    // The old fast path used buffered pread once the two random-access databases no longer fit.
+    // Keep that property: O_DIRECT without loadBatch is one blocking, aligned read per prefilter
+    // entry and is much slower than buffered pread. The sequence reader still uses loadBatch below,
+    // so converting it here preserves its io_uring/coalescing benefit without admitting page faults.
+    const size_t ioMemoryLimit = Util::computeMemory(par.splitMemoryLimit);
+    const size_t seqDataSize = seqDbr->getDataSize();
+    const size_t alnDataSize = alnDbr.getDataSize();
+    const bool cacheStarved = seqDataSize > ioMemoryLimit
+                              || alnDataSize > ioMemoryLimit - seqDataSize;
+    const char *ioPolicy = getenv("MMSEQS_IO_POLICY");
+    const bool ioPolicyPinned = ioPolicy != NULL;
+    // A user-pinned O_DIRECT reader never fills the page cache.  Keep its explicit policy
+    // free of the epoch barriers that exist solely to release cached prefilter pages.
+    const bool ioPolicyIsDirect = ioPolicyPinned && strcmp(ioPolicy, "direct") == 0;
+    if (cacheStarved && ioPolicyPinned == false) {
+        seqDbr->setIoBufferedBatch(true);
+        alnDbr.setIoBufferedBatch(true);
+        const bool seqSwitched = seqDbr->setIoDirect(true);
+        const bool alnSwitched = alnDbr.setIoDirect(true);
+        if (seqSwitched == false || alnSwitched == false) {
+            Debug(Debug::WARNING) << "Could not switch every align2clust reader to buffered descriptors; "
+                                  << "keeping the supported mmap path(s)\n";
+        }
+    }
  
     DBReader<DBKeyType> *cluDbr = nullptr;
     DBReader<DBKeyType> *cluSeqDbr = nullptr;
@@ -534,31 +554,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         return EXIT_FAILURE;
     }
 
-    // Ring size = out-of-order window, sized from the memory budget (OOM-aware) and
-    // capped by the result count. sequenceIdx runs over [0, endRange); every index
-    // publishes exactly one result.
-    const size_t align2clustResultCount = (mode == Parameters::SET_COVER) ? dbSize : alnDbr.getSize();
-    const size_t reorderCapacityChosen = computeReorderCapacity(par, dbSize, mode, align2clustResultCount);
-    {
-        std::lock_guard<std::mutex> lock(clusterMutex);
-        reorderCapacity = reorderCapacityChosen;
-        reorderSlots.clear();
-        reorderSlots.resize(reorderCapacity);
-        reorderFilled.assign(reorderCapacity, 0);
-        reorderBufferedCount = 0;
-        reorderHighWater = 0;
-        setCoverCandidates.clear();
-        setCoverCandidates.shrink_to_fit();
-        setCoverMemberPool.clear();
-        setCoverMemberPool.shrink_to_fit();
-        setCoverLiveMemberCount = 0;
-        currentProcessPosition = 0;
-        currentPrefSize = 0;
-        allCalculationsDone = false;
-    }
-
-    std::thread clusterThread(clusterThreadFunc, assignedCluster);
-    
     Timer timer;
     timer.reset();
     PrefInfo *prefRepSizePair = nullptr;
@@ -621,6 +616,32 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         Debug(Debug::ERROR) << "Alignment DB has " << endRange << " entries but the sequence DB has " << dbSize << "\n";
         EXIT(EXIT_FAILURE);
     }
+
+    // Build the ring only after the length/prefilter ordering peak is gone. The order remains
+    // resident while producers run, so reserve it here as well instead of overcommitting the
+    // cache budget on a large GREEDY run.
+    const size_t align2clustResultCount = (mode == Parameters::SET_COVER) ? dbSize : alnDbr.getSize();
+    const size_t reorderCapacityChosen = computeReorderCapacity(par, dbSize, mode, align2clustResultCount);
+    {
+        std::lock_guard<std::mutex> lock(clusterMutex);
+        reorderCapacity = reorderCapacityChosen;
+        reorderSlots.clear();
+        reorderSlots.resize(reorderCapacity);
+        reorderFilled.assign(reorderCapacity, 0);
+        reorderBufferedCount = 0;
+        reorderHighWater = 0;
+        setCoverCandidates.clear();
+        setCoverCandidates.shrink_to_fit();
+        setCoverMemberPool.clear();
+        setCoverMemberPool.shrink_to_fit();
+        setCoverLiveMemberCount = 0;
+        currentProcessPosition = 0;
+        currentPrefSize = 0;
+        allCalculationsDone = false;
+    }
+
+    std::thread clusterThread(clusterThreadFunc, assignedCluster);
+
     unsigned int swMode = Alignment::initSWMode(par.alignmentMode, par.covThr, par.seqIdThr);
     // Both orders put the representatives most likely to absorb their neighbours next to each other,
     // so a chunk larger than one often finds the rest of it already assigned and skips it for free.
@@ -634,13 +655,12 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_CHUNK=" << chunkEnv << "\n";
         }
     }
-    // Every query reads its prefilter entry exactly once, so this db's cache has no second reader
-    // and only competes with the cluster state. Drop it whole once it can no longer fit; a page
-    // holds ~16 entries belonging to unrelated queries, so nothing smaller ever frees a page.
-    const size_t ioMemoryLimit = Util::computeMemory(par.splitMemoryLimit);
-    // an O_DIRECT reader has no cache to drop, so skip the shared counter it would cost
-    bool dropAlnCache = alnDbr.isDirectIo() == false
-                        && ioMemoryLimit > 0 && alnDbr.getDataSize() > ioMemoryLimit / 2;
+    // Every query reads its prefilter entry once. When the combined random-access databases are
+    // cache-starved, release the completed prefilter working set at an epoch boundary regardless
+    // of the prefilter DB's standalone size: the sequence DB is the reusable cache, not this one.
+    // dropCacheAll() is a no-op for a genuine O_DIRECT reader and releases the whole prefilter
+    // working set for mmap and buffered descriptor paths. It runs only after the epoch barrier.
+    bool dropAlnCache = cacheStarved && ioPolicyIsDirect == false;
     if (const char *dropEnv = getenv("MMSEQS_A2C_DROP_ALN")) {
         if (strcmp(dropEnv, "1") == 0) dropAlnCache = true;
         else if (strcmp(dropEnv, "0") == 0) dropAlnCache = false;
@@ -653,7 +673,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         : std::max<size_t>(endRange, 1);
     Debug(Debug::INFO) << "Prefilter cache policy: "
                        << (dropAlnCache ? "drop at a barrier every " + SSTR(alnEpoch) + " entries"
-                                        : (alnDbr.isDirectIo() ? "O_DIRECT, nothing cached" : "keep, it fits"))
+                                        : (ioPolicyIsDirect ? "O_DIRECT, nothing cached"
+                                                            : (cacheStarved ? "keep the cacheable prefilter working set"
+                                                                            : "keep, it fits")))
                        << "\n";
 
     Debug::Progress progress(endRange);
@@ -1201,17 +1223,10 @@ int align2clust(int argc, const char **argv, const Command &command) {
     
     DBReader<DBKeyType> alnDbr(par.db2.c_str(), par.db2Index.c_str(), par.threads,
                                   DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
-    // Scale decides both: below the size rule this stays on mmap and the descriptor lets the cache
-    // be released in bulk between passes; above it the cache could never hold the db anyway, so the
-    // reader drops to O_DIRECT and the release becomes a no-op. Entries average ~259 B, so a
-    // per-entry range never contains a whole page and only a whole-file drop frees anything.
-    alnDbr.setIoAutoDirect(true);
+    // The prefilter reader is not batch-loaded. It therefore starts mapped and doAlign2clust()
+    // switches it to buffered descriptors only when the combined random-access databases outgrow
+    // the configured memory budget. Do not auto-select O_DIRECT for this per-entry path.
     alnDbr.setIoCacheAdvice(true);
-    // the sequence reader's index is not allocated yet, but it will sit beside this db's cache
-    const size_t seqIndexFileSize = FileUtil::getFileSize(par.db1Index);
-    if (seqIndexFileSize != static_cast<size_t>(-1)) {
-        alnDbr.setIoExpectedResidentBytes(seqIndexFileSize);
-    }
     // read only by key, and LINEAR_ACCCESS would advise SEQUENTIAL on a db this pass reads out of order
     alnDbr.open(DBReader<DBKeyType>::NOSORT);
     int dbtype =  Parameters::DBTYPE_CLUSTER_RES;

@@ -1571,6 +1571,19 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
                                     ) + 1
                                 );
 
+    // This option extracts into one bucket per hash range and reuses those buckets in the
+    // split loop.  With one range it was a silent no-op: no buckets were written and the
+    // full k-mer working set still had to fit in memory.  An explicit disk-spill request must
+    // therefore make at least two ranges.  The cap is expressed in k-mers rather than bytes so
+    // it remains consistent with the existing allocation calculation above.
+    if (par.kmerWriteToDisk && splits == 1 && totalKmers > 2 * static_cast<size_t>(1024 + 1)) {
+        const size_t spillKmersPerSplit = std::max<size_t>(
+            static_cast<size_t>(1024 + 1), (totalKmers + 1) / 2);
+        totalKmersPerSplit = std::min(totalKmersPerSplit, spillKmersPerSplit);
+        splits = 2;
+        Debug(Debug::INFO) << "--kmer-write-to-disk requested: forcing at least two k-mer partitions\n";
+    }
+
     if (!IncludeSeqLen) {
         T * seqkey_to_len = new(std::nothrow) T[dbKeySize+1];
         Util::checkAllocation(seqkey_to_len, "Can not allocate seqkey_to_len memory");
@@ -2846,7 +2859,9 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
                       int numThreads, std::vector<size_t> *threadQueryOffsets, int iteration) {
     const size_t BUFFER_SIZE = 2048;
     const Parameters &par = Parameters::getInstance();
-    const int tmpFileCodec = par.compressKmerTmpFiles;
+    // Keep the result-file writer on the direct path: raw FILE output or a direct
+    // Zstd stream. Bucket files retain their independent codec/buffering policy.
+    const bool compressTmpFiles = par.compressKmerTmpFiles == KMER_TMP_CODEC_ZSTD;
 #ifndef OPENMP
     (void) numThreads;
 #endif
@@ -2868,40 +2883,29 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
             endIdx = (*threadQueryOffsets)[tid + 1];
         }
         
+        const int tmpFileCodec = compressTmpFiles ? KMER_TMP_CODEC_ZSTD : KMER_TMP_CODEC_NONE;
         std::string tmpFileThread = kmerTmpFileName(tmpFile, iteration, tid, tmpFileCodec);
         // a rerun under a different codec would otherwise leave the old file for the merge to pick up
         removeKmerTmpFileIfExists(kmerTmpFileName(tmpFile, iteration, tid, KMER_TMP_CODEC_NONE));
         removeKmerTmpFileIfExists(kmerTmpFileName(tmpFile, iteration, tid, KMER_TMP_CODEC_ZSTD));
         if (startIdx < endIdx && hashSeqPair[startIdx].kmer != SIZE_T_MAX) {
-            void *writer = bucketWriterOpen(tmpFileThread, tmpFileCodec, KMER_TMP_ZSTD_COMPRESSION_LEVEL);
+            FILE *filePtr = NULL;
+            ZstdKmerTmpFileWriter *zstdWriter = NULL;
+            if (compressTmpFiles) {
+                zstdWriter = new ZstdKmerTmpFileWriter(tmpFileThread, KMER_TMP_ZSTD_COMPRESSION_LEVEL);
+            } else {
+                filePtr = openKmerTmpFileForOverwriteOrDie(tmpFileThread, "wb");
+            }
 
-            const auto sinkEntries = [&](const T *entries, size_t count) {
-                bucketWriterAppend(writer, tmpFileCodec, entries, sizeof(T) * count);
-            };
-
-            // writeBuffer restarts every rep-sequence group, so batch the groups and let the file see full buffers only
-            const size_t spoolCap = std::max<size_t>(kmerSpoolBufferBytes(numThreads) / sizeof(T), BUFFER_SIZE);
-            std::vector<T> spool(spoolCap);
-            size_t spoolPos = 0;
-
-            const auto flushSpool = [&]() {
-                if (spoolPos == 0) {
-                    return;
-                }
-                sinkEntries(spool.data(), spoolPos);
-                spoolPos = 0;
-            };
-
-            // count never exceeds BUFFER_SIZE and spoolCap is at least that, so one flush suffices
             const auto writeEntries = [&](const T *entries, size_t count) {
                 if (count == 0) {
                     return;
                 }
-                if (spoolPos + count > spoolCap) {
-                    flushSpool();
+                if (compressTmpFiles) {
+                    zstdWriter->write(entries, sizeof(T) * count);
+                } else {
+                    writeAllOrDie(filePtr, entries, sizeof(T) * count, tmpFileThread);
                 }
-                memcpy(spool.data() + spoolPos, entries, sizeof(T) * count);
-                spoolPos += count;
             };
 
             size_t repSeqId = SIZE_T_MAX;
@@ -2998,9 +3002,12 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
                 }
                 writeEntries(&nullEntry, 1);
             }
-            flushSpool();
-
-            bucketWriterClose(writer, tmpFileCodec);
+            if (compressTmpFiles) {
+                zstdWriter->close();
+                delete zstdWriter;
+            } else if (fclose(filePtr) != 0) {
+                kmerTmpIoErrorDie("close", tmpFileThread);
+            }
         }
     }
     

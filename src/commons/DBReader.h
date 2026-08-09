@@ -200,9 +200,6 @@ public:
 
     bool open(int sort);
 
-    // random access over data that may not fit: mmap while it fits, pread+O_DIRECT once it does not
-    void setIoAutoDirect(bool autoDirect) { ioAutoDirect = autoDirect; }
-
     // Same batched pread/io_uring path, but on buffered descriptors, so the page cache still serves
     // the reuse. Measured better than mmap in both regimes and better than O_DIRECT whenever the
     // working set is anywhere near cacheable; O_DIRECT only wins ~16% once it is not.
@@ -211,13 +208,6 @@ public:
     // Keeps a descriptor open on an mmap reader so dropCacheAll can fadvise it. Off by default,
     // so readers that never reclaim cache do not change their fd usage.
     void setIoCacheAdvice(bool enabled) { ioCacheAdvice = enabled; }
-
-    // Optional memory ceiling for the I/O policy. Zero means the machine memory reported by Util.
-    void setIoMemoryBudget(size_t bytes) { ioMemoryBudget = bytes; }
-
-    // Total non-page-cache resident bytes expected while reading. A non-zero estimate is authoritative
-    // and should include this reader's index; zero lets DBReader estimate its own index before open().
-    void setIoExpectedResidentBytes(size_t bytes) { ioExpectedResidentBytes = bytes; }
 
     // Drops the whole file's cache. Entries average a few hundred bytes, so a per-entry range never
     // contains a full page and frees nothing; only a whole-file range reliably does.
@@ -634,16 +624,12 @@ private:
 
     bool didMlock;
 
-    bool ioAutoDirect;
     bool ioBufferedBatch;
     bool ioCacheAdvice;
-    size_t ioMemoryBudget;
-    size_t ioExpectedResidentBytes;
 
     // O_DIRECT alignment resolved per data file at open time, the device can want less than 4096
     size_t directIoAlign;
 
-    bool dataOutgrowsMemory();
     void allocateDirectBuffers();
     void freeDirectBuffers();
     void openDataFds();

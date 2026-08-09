@@ -42,7 +42,7 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), index(NULL), id2local(NULL), local2id(NULL),
-        dataMapped(false), accessType(0), externalData(false), didMlock(false), ioAutoDirect(false), ioBufferedBatch(false), ioCacheAdvice(false), ioMemoryBudget(0), ioExpectedResidentBytes(0), directIoAlign(0)
+        dataMapped(false), accessType(0), externalData(false), didMlock(false), ioBufferedBatch(false), ioCacheAdvice(false), directIoAlign(0)
 {}
 
 template <typename T>
@@ -53,7 +53,7 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index), sortedByOffset(true),
         id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false),
-        ioAutoDirect(false), ioBufferedBatch(false), ioCacheAdvice(false), ioMemoryBudget(0), ioExpectedResidentBytes(0), directIoAlign(0)
+        ioBufferedBatch(false), ioCacheAdvice(false), directIoAlign(0)
 {}
 
 template <typename T>
@@ -557,12 +557,6 @@ void DBReader<T>::growBuffer(char** buffer, size_t* capacity, size_t needed, siz
     *capacity = newCapacity;
 }
 
-// a sequential scan wants kernel readahead, which O_DIRECT has no equivalent for
-static bool ioAccessIsSequential(int accessType) {
-    return accessType == DBReader<DBKeyType>::LINEAR_ACCCESS
-           || accessType == DBReader<DBKeyType>::SORT_BY_OFFSET;
-}
-
 // One descriptor per data file. totalDataSize is recomputed here so switching paths mid-run leaves
 // the same offsets the index was read against.
 template <typename T> void DBReader<T>::openDataFds() {
@@ -696,8 +690,8 @@ template <typename T> bool DBReader<T>::setIoDirect(bool direct) {
     return true;
 }
 
-// mmap is the default; MMSEQS_IO_POLICY pins any reader, the size rule only moves opt-in ones
-template <typename T> void DBReader<T>::resolveIoPolicy(int accessType) {
+// mmap is the default; MMSEQS_IO_POLICY pins every eligible reader.
+template <typename T> void DBReader<T>::resolveIoPolicy(int) {
     if (dataMode & USE_DIRECT_IO) {
         return;
     }
@@ -707,9 +701,8 @@ template <typename T> void DBReader<T>::resolveIoPolicy(int accessType) {
         || (dataMode & (USE_WRITABLE | USE_FREAD))) {
         return;
     }
-    // MMSEQS_IO_POLICY=mmap|direct|buffered pins every eligible reader. It is checked before the
-    // opt-in below so that mmap is always reachable without a rebuild, which is the escape hatch
-    // when the batched path misbehaves on a machine we cannot reproduce.
+    // MMSEQS_IO_POLICY=mmap|direct|buffered pins every eligible reader. mmap remains the escape
+    // hatch when the descriptor path misbehaves on a machine we cannot reproduce.
     const char *policyEnv = getenv("MMSEQS_IO_POLICY");
     if (policyEnv != NULL) {
         if (strcmp(policyEnv, "direct") == 0) {
@@ -726,64 +719,6 @@ template <typename T> void DBReader<T>::resolveIoPolicy(int accessType) {
                            << policyEnv << "\n";
         return;
     }
-    // batching beats mmap for random access at any size, but the page cache only earns its keep
-    // while the reused entries can still live in it. Past that it holds bytes nobody hits again
-    // and the kernel pays for them by swapping out the caller's own arrays, so drop to O_DIRECT.
-    if (ioBufferedBatch) {
-        dataMode |= USE_DIRECT_IO;
-        if (dataOutgrowsMemory()) {
-            ioBufferedBatch = false;
-            Debug(Debug::INFO) << "IO policy for " << dataFileName
-                               << ": O_DIRECT + batching, the data outgrows the cache\n";
-        } else {
-            Debug(Debug::INFO) << "IO policy for " << dataFileName
-                               << ": buffered + batching, the data still fits the cache\n";
-        }
-        return;
-    }
-    if (ioAutoDirect == false) {
-        return;
-    }
-    // a sequential scan already gets POSIX_MADV_SEQUENTIAL below, which is the hint it wants
-    if (ioAccessIsSequential(accessType)) {
-        return;
-    }
-    if (dataOutgrowsMemory()) {
-        dataMode |= USE_DIRECT_IO;
-        Debug(Debug::INFO) << "IO policy for " << dataFileName
-                           << ": O_DIRECT, the data outgrows the cache\n";
-    }
-}
-
-// false when a file cannot be sized, so an unreadable path keeps the cached path and its diagnostics
-template <typename T> bool DBReader<T>::dataOutgrowsMemory() {
-    const size_t memory = (ioMemoryBudget != 0) ? ioMemoryBudget : Util::computeMemory(0);
-    const size_t budget = memory - memory / 5;  // leave 20% for the kernel and transient allocations
-
-    // A non-zero caller estimate is authoritative and already includes reader indices.
-    // Without one, approximate this reader's index from the on-disk index before it is parsed.
-    size_t bytes = ioExpectedResidentBytes;
-    if (bytes == 0 && externalData == false && indexFileName != NULL) {
-        const size_t indexFileSize = FileUtil::getFileSize(indexFileName);
-        if (indexFileSize != static_cast<size_t>(-1)) {
-            bytes = indexFileSize;
-        }
-    }
-    if (bytes >= budget) {
-        return true;
-    }
-
-    for (size_t i = 0; i < dataFileNames.size(); i++) {
-        const size_t fileSize = FileUtil::getFileSize(dataFileNames[i]);
-        if (fileSize == static_cast<size_t>(-1)) {
-            return false;
-        }
-        if (fileSize > budget - bytes) {
-            return true;
-        }
-        bytes += fileSize;
-    }
-    return false;
 }
 
 template <typename T> int DBReader<T>::openDirect(const char *fileName, size_t *dataSize) {
