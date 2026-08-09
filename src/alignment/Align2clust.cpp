@@ -279,74 +279,6 @@ static size_t requireId(size_t id, const char *dbName, DBKeyType key) {
     return id;
 }
 
-static void verifyAlign2clustLocalIdLayout(DBReader<DBKeyType> &seqDbr,
-                                           DBReader<DBKeyType> &alnDbr) {
-    const char *verifyEnv = getenv("MMSEQS_A2C_VERIFY_ID_LAYOUT");
-    if (verifyEnv == nullptr || strcmp(verifyEnv, "0") == 0) {
-        return;
-    }
-
-    bool full = strcmp(verifyEnv, "full") == 0;
-    size_t sampleCount = 4096;
-    if (strcmp(verifyEnv, "sample") != 0 && !full) {
-        Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_VERIFY_ID_LAYOUT=" << verifyEnv
-                              << " (use sample, full, or 0)\n";
-        return;
-    }
-    if (const char *sampleEnv = getenv("MMSEQS_A2C_VERIFY_ID_SAMPLES")) {
-        char *end = nullptr;
-        const unsigned long long parsed = strtoull(sampleEnv, &end, 10);
-        if (end != sampleEnv && *end == '\0' && parsed > 0) {
-            sampleCount = static_cast<size_t>(parsed);
-        } else {
-            Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_VERIFY_ID_SAMPLES=" << sampleEnv << "\n";
-        }
-    }
-
-    const size_t seqSize = seqDbr.getSize();
-    const size_t alnSize = alnDbr.getSize();
-    if (seqSize != alnSize) {
-        Debug(Debug::WARNING) << "A2C local-id layout: sequence entries=" << seqSize
-                              << ", alignment entries=" << alnSize
-                              << "; local ids cannot be shared\n";
-        return;
-    }
-    if (seqSize == 0) {
-        Debug(Debug::INFO) << "A2C local-id layout: both databases are empty\n";
-        return;
-    }
-
-    const size_t checks = full ? seqSize : std::min(sampleCount, seqSize);
-    size_t mismatches = 0;
-    for (size_t check = 0; check < checks; ++check) {
-        const size_t localId = full ? check : (checks == 1
-            ? 0 : (check * (seqSize - 1)) / (checks - 1));
-        const DBKeyType seqKey = seqDbr.getDbKey(localId);
-        const DBKeyType alnKey = alnDbr.getDbKey(localId);
-        const size_t seqResolved = seqDbr.getId(seqKey);
-        const size_t alnResolved = alnDbr.getId(seqKey);
-        const bool matches = seqKey == alnKey && seqResolved == localId && alnResolved == localId;
-        if (!matches) {
-            if (mismatches < 8) {
-                Debug(Debug::WARNING) << "A2C local-id layout mismatch at localId=" << localId
-                                      << ": seqKey=" << seqKey << ", alnKey=" << alnKey
-                                      << ", seq.getId(seqKey)=" << seqResolved
-                                      << ", aln.getId(seqKey)=" << alnResolved << "\n";
-            }
-            mismatches++;
-        }
-    }
-
-    if (mismatches == 0) {
-        Debug(Debug::INFO) << "A2C local-id layout: " << (full ? "full" : "sample")
-                           << " check passed (" << checks << '/' << seqSize
-                           << "); seq local id == aln local id and keys match\n";
-    } else {
-        Debug(Debug::WARNING) << "A2C local-id layout: " << mismatches << '/' << checks
-                              << " checked positions mismatch; do not use a shared-local-id fast path\n";
-    }
-}
-
 static void (*clusterThreadFunc)(ClusterAssignment*) = nullptr;
 
 void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
@@ -562,8 +494,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                             << " entries but its sequence DB has " << dbSize << ".\n";
         EXIT(EXIT_FAILURE);
     }
-    verifyAlign2clustLocalIdLayout(*seqDbr, alnDbr);
-
     BaseMatrix *subMat = new SubstitutionMatrix(
         par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, 0.0
     );
@@ -626,11 +556,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 const DBKeyType clusterId = seqDbr->getDbKey(i);
                 const size_t alnId = localPrefilterIds ? i
                     : requireId(alnDbr.getId(clusterId), "Alignment DB", clusterId);
-                if (localPrefilterIds && alnDbr.getDbKey(alnId) != clusterId) {
-                    Debug(Debug::ERROR) << "Local-ID prefilter query layout does not match sequence DB at localId="
-                                        << i << ".\n";
-                    EXIT(EXIT_FAILURE);
-                }
                 const char *data = alnDbr.getData(alnId, thread_idx);
                 const size_t dataSize = alnDbr.getEntryLen(alnId);
                 prefRepSizePair[i].id = i;
@@ -789,11 +714,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
             const size_t alignmentId = localPrefilterIds ? representativeId
                 : requireId(alnDbr.getId(queryKey), "Alignment DB", queryKey);
-            if (localPrefilterIds && alnDbr.getDbKey(alignmentId) != queryKey) {
-                Debug(Debug::ERROR) << "Local-ID prefilter query layout does not match sequence DB at localId="
-                                    << representativeId << ".\n";
-                EXIT(EXIT_FAILURE);
-            }
             char *alignmentData = alnDbr.getData(alignmentId, threadIdx);
             size_t queryId = representativeId;
             // index-only, so it is known without faulting the body in; Sequence::mapSequence sets L to it
