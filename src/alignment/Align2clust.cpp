@@ -14,6 +14,9 @@
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
+#include <limits>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -132,8 +135,7 @@ static void compactSetCoverMemberPool() {
     setCoverMemberPool.swap(compactedPool);
 }
 
-// memory-derived capacity holds 100Ms of pending member vectors and buys no throughput over this
-static const size_t ALIGN2CLUST_DEFAULT_REORDER_LIMIT = 5 * 1000 * 1000;
+static const size_t ALIGN2CLUST_DEFAULT_REORDER_LIMIT = 128 * 1024;
 
 // Env override for the reorder-buffer size; 0 (unset/invalid) means the default cap above.
 static size_t getReorderBufferLimitFromEnv() {
@@ -269,7 +271,6 @@ static void writeClustering(DBWriter *dbWriter, DBReader<DBKeyType> *seqDbr,
     }
 }
 
-// every getId here must hit: a miss returns DB_ENTRY_NOT_FOUND and the caller would index out of bounds
 static size_t requireId(size_t id, const char *dbName, DBKeyType key) {
     if (id == DB_ENTRY_NOT_FOUND) {
         Debug(Debug::ERROR) << dbName << " has no entry for key " << key << "\n";
@@ -278,23 +279,72 @@ static size_t requireId(size_t id, const char *dbName, DBKeyType key) {
     return id;
 }
 
-// length-only gate over a cluster's members: index reads only, no sequence data touched
-static bool clusterMembersCanBeCovered(DBReader<DBKeyType> *cluSeqDbr, const Parameters &par,
-                                       char *cluData, DBKeyType targetKey, int queryLen) {
-    char buffer[1024];
-    char *scan = cluData;
-    while (*scan != '\0') {
-        Util::parseKey(scan, buffer);
-        const DBKeyType memberKey = Util::fast_atoi<DBKeyType>(buffer);
-        if (memberKey != targetKey) {
-            const size_t memberId = requireId(cluSeqDbr->getId(memberKey), "Filter sequence DB", memberKey);
-            if (Util::canBeCovered(par.covThr, par.covMode, queryLen, cluSeqDbr->getSeqLen(memberId)) == false) {
-                return false;
-            }
-        }
-        scan = Util::skipLine(scan);
+static void verifyAlign2clustLocalIdLayout(DBReader<DBKeyType> &seqDbr,
+                                           DBReader<DBKeyType> &alnDbr) {
+    const char *verifyEnv = getenv("MMSEQS_A2C_VERIFY_ID_LAYOUT");
+    if (verifyEnv == nullptr || strcmp(verifyEnv, "0") == 0) {
+        return;
     }
-    return true;
+
+    bool full = strcmp(verifyEnv, "full") == 0;
+    size_t sampleCount = 4096;
+    if (strcmp(verifyEnv, "sample") != 0 && !full) {
+        Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_VERIFY_ID_LAYOUT=" << verifyEnv
+                              << " (use sample, full, or 0)\n";
+        return;
+    }
+    if (const char *sampleEnv = getenv("MMSEQS_A2C_VERIFY_ID_SAMPLES")) {
+        char *end = nullptr;
+        const unsigned long long parsed = strtoull(sampleEnv, &end, 10);
+        if (end != sampleEnv && *end == '\0' && parsed > 0) {
+            sampleCount = static_cast<size_t>(parsed);
+        } else {
+            Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_VERIFY_ID_SAMPLES=" << sampleEnv << "\n";
+        }
+    }
+
+    const size_t seqSize = seqDbr.getSize();
+    const size_t alnSize = alnDbr.getSize();
+    if (seqSize != alnSize) {
+        Debug(Debug::WARNING) << "A2C local-id layout: sequence entries=" << seqSize
+                              << ", alignment entries=" << alnSize
+                              << "; local ids cannot be shared\n";
+        return;
+    }
+    if (seqSize == 0) {
+        Debug(Debug::INFO) << "A2C local-id layout: both databases are empty\n";
+        return;
+    }
+
+    const size_t checks = full ? seqSize : std::min(sampleCount, seqSize);
+    size_t mismatches = 0;
+    for (size_t check = 0; check < checks; ++check) {
+        const size_t localId = full ? check : (checks == 1
+            ? 0 : (check * (seqSize - 1)) / (checks - 1));
+        const DBKeyType seqKey = seqDbr.getDbKey(localId);
+        const DBKeyType alnKey = alnDbr.getDbKey(localId);
+        const size_t seqResolved = seqDbr.getId(seqKey);
+        const size_t alnResolved = alnDbr.getId(seqKey);
+        const bool matches = seqKey == alnKey && seqResolved == localId && alnResolved == localId;
+        if (!matches) {
+            if (mismatches < 8) {
+                Debug(Debug::WARNING) << "A2C local-id layout mismatch at localId=" << localId
+                                      << ": seqKey=" << seqKey << ", alnKey=" << alnKey
+                                      << ", seq.getId(seqKey)=" << seqResolved
+                                      << ", aln.getId(seqKey)=" << alnResolved << "\n";
+            }
+            mismatches++;
+        }
+    }
+
+    if (mismatches == 0) {
+        Debug(Debug::INFO) << "A2C local-id layout: " << (full ? "full" : "sample")
+                           << " check passed (" << checks << '/' << seqSize
+                           << "); seq local id == aln local id and keys match\n";
+    } else {
+        Debug(Debug::WARNING) << "A2C local-id layout: " << mismatches << '/' << checks
+                              << " checked positions mismatch; do not use a shared-local-id fast path\n";
+    }
 }
 
 static void (*clusterThreadFunc)(ClusterAssignment*) = nullptr;
@@ -458,29 +508,23 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         par.db1.c_str(), par.db1Index.c_str(), par.threads, 
         DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
     );
-    // SORT_BY_LENGTH costs id2local plus local2id; neither mode needs them once lengthOrder exists
+    seqDbr->setIoBufferedBatch(true);
     seqDbr->open(DBReader<DBKeyType>::NOSORT);
 
-    // The old fast path used buffered pread once the two random-access databases no longer fit.
-    // Keep that property: O_DIRECT without loadBatch is one blocking, aligned read per prefilter
-    // entry and is much slower than buffered pread. The sequence reader still uses loadBatch below,
-    // so converting it here preserves its io_uring/coalescing benefit without admitting page faults.
     const size_t ioMemoryLimit = Util::computeMemory(par.splitMemoryLimit);
     const size_t seqDataSize = seqDbr->getDataSize();
     const size_t alnDataSize = alnDbr.getDataSize();
     const bool cacheStarved = seqDataSize > ioMemoryLimit
                               || alnDataSize > ioMemoryLimit - seqDataSize;
     const char *ioPolicy = getenv("MMSEQS_IO_POLICY");
-    const bool ioPolicyPinned = ioPolicy != NULL;
-    // A user-pinned O_DIRECT reader never fills the page cache.  Keep its explicit policy
-    // free of the epoch barriers that exist solely to release cached prefilter pages.
+    const bool ioPolicyPinned = ioPolicy != nullptr;
     const bool ioPolicyIsDirect = ioPolicyPinned && strcmp(ioPolicy, "direct") == 0;
-    if (cacheStarved && ioPolicyPinned == false) {
+    if (cacheStarved && !ioPolicyPinned) {
         seqDbr->setIoBufferedBatch(true);
         alnDbr.setIoBufferedBatch(true);
         const bool seqSwitched = seqDbr->setIoDirect(true);
         const bool alnSwitched = alnDbr.setIoDirect(true);
-        if (seqSwitched == false || alnSwitched == false) {
+        if (!seqSwitched || !alnSwitched) {
             Debug(Debug::WARNING) << "Could not switch every align2clust reader to buffered descriptors; "
                                   << "keeping the supported mmap path(s)\n";
         }
@@ -511,6 +555,14 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
 
     const size_t dbSize = seqDbr->getSize();
+    const bool localPrefilterIds = Parameters::isEqualDbtype(
+        alnDbr.getDbtype(), Parameters::DBTYPE_PREFILTER_LOCAL_RES);
+    if (localPrefilterIds && alnDbr.getSize() != dbSize) {
+        Debug(Debug::ERROR) << "Local-ID prefilter has " << alnDbr.getSize()
+                            << " entries but its sequence DB has " << dbSize << ".\n";
+        EXIT(EXIT_FAILURE);
+    }
+    verifyAlign2clustLocalIdLayout(*seqDbr, alnDbr);
 
     BaseMatrix *subMat = new SubstitutionMatrix(
         par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, 0.0
@@ -572,7 +624,13 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 #pragma omp for schedule(dynamic, 1000)
             for (size_t i = 0; i < seqDbr->getSize(); i++) {
                 const DBKeyType clusterId = seqDbr->getDbKey(i);
-                const size_t alnId = requireId(alnDbr.getId(clusterId), "Alignment DB", clusterId);
+                const size_t alnId = localPrefilterIds ? i
+                    : requireId(alnDbr.getId(clusterId), "Alignment DB", clusterId);
+                if (localPrefilterIds && alnDbr.getDbKey(alnId) != clusterId) {
+                    Debug(Debug::ERROR) << "Local-ID prefilter query layout does not match sequence DB at localId="
+                                        << i << ".\n";
+                    EXIT(EXIT_FAILURE);
+                }
                 const char *data = alnDbr.getData(alnId, thread_idx);
                 const size_t dataSize = alnDbr.getEntryLen(alnId);
                 prefRepSizePair[i].id = i;
@@ -643,31 +701,12 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     std::thread clusterThread(clusterThreadFunc, assignedCluster);
 
     unsigned int swMode = Alignment::initSWMode(par.alignmentMode, par.covThr, par.seqIdThr);
-    // Both orders put the representatives most likely to absorb their neighbours next to each other,
-    // so a chunk larger than one often finds the rest of it already assigned and skips it for free.
-    // MMSEQS_A2C_CHUNK tunes it; the tail of both orders is the cheap work, so imbalance stays small.
-    size_t alignChunk = 1;
-    if (const char *chunkEnv = getenv("MMSEQS_A2C_CHUNK")) {
-        const long parsed = strtol(chunkEnv, NULL, 10);
-        if (parsed > 0) {
-            alignChunk = static_cast<size_t>(parsed);
-        } else {
-            Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_CHUNK=" << chunkEnv << "\n";
-        }
-    }
-    // Every query reads its prefilter entry once. When the combined random-access databases are
-    // cache-starved, release the completed prefilter working set at an epoch boundary regardless
-    // of the prefilter DB's standalone size: the sequence DB is the reusable cache, not this one.
-    // dropCacheAll() is a no-op for a genuine O_DIRECT reader and releases the whole prefilter
-    // working set for mmap and buffered descriptor paths. It runs only after the epoch barrier.
-    bool dropAlnCache = cacheStarved && ioPolicyIsDirect == false;
+    bool dropAlnCache = cacheStarved && !ioPolicyIsDirect;
     if (const char *dropEnv = getenv("MMSEQS_A2C_DROP_ALN")) {
         if (strcmp(dropEnv, "1") == 0) dropAlnCache = true;
         else if (strcmp(dropEnv, "0") == 0) dropAlnCache = false;
         else Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_DROP_ALN=" << dropEnv << " (use 0 or 1)\n";
     }
-    // one random entry can pull in a whole page, so bound the cache by pages, not by entry bytes
-    // never zero: the epoch loop advances by this, and an empty db would otherwise spin forever
     const size_t alnEpoch = dropAlnCache
         ? std::max<size_t>(ioMemoryLimit / 4 / Util::getPageSize(), 1)
         : std::max<size_t>(endRange, 1);
@@ -677,7 +716,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                                             : (cacheStarved ? "keep the cacheable prefilter working set"
                                                                             : "keep, it fits")))
                        << "\n";
-
     Debug::Progress progress(endRange);
     size_t db_maxseqlen = (cluSeqDbr != nullptr)
         ? std::max(seqDbr->getMaxSeqLen(), cluSeqDbr->getMaxSeqLen())
@@ -714,10 +752,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             alnLineBuffer.resize(1024 + 32768 * 4);
         }
 
-        // one epoch when nothing is dropped, so the single-pass shape and its nowait are unchanged
         for (size_t epochStart = 0; epochStart < endRange || epochStart == 0; epochStart += alnEpoch) {
             const size_t epochEnd = std::min(endRange, epochStart + alnEpoch);
-#pragma omp for schedule(dynamic, alignChunk) nowait
+#pragma omp for schedule(dynamic, 1) nowait
         for (size_t i = epochStart; i < epochEnd; i++) {
             progress.updateProgress();
             ClusterResult clusterResult;
@@ -750,7 +787,13 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 continue;
             }
 
-            const size_t alignmentId = requireId(alnDbr.getId(queryKey), "Alignment DB", queryKey);
+            const size_t alignmentId = localPrefilterIds ? representativeId
+                : requireId(alnDbr.getId(queryKey), "Alignment DB", queryKey);
+            if (localPrefilterIds && alnDbr.getDbKey(alignmentId) != queryKey) {
+                Debug(Debug::ERROR) << "Local-ID prefilter query layout does not match sequence DB at localId="
+                                    << representativeId << ".\n";
+                EXIT(EXIT_FAILURE);
+            }
             char *alignmentData = alnDbr.getData(alignmentId, threadIdx);
             size_t queryId = representativeId;
             // index-only, so it is known without faulting the body in; Sequence::mapSequence sets L to it
@@ -758,43 +801,39 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             // the body is loaded lazily below, on the first target that actually reaches alignment
             const char *querySequence = nullptr;
 
+            batchIds.clear();
+            batchIds.push_back(queryId);
+            targetSlot.clear();
+
             size_t prefSize = 0;
             while (*alignmentData != '\0') {
                 hit_t hit = QueryMatcher::parsePrefilterHit(alignmentData);
-                const size_t targetId = requireId(seqDbr->getId(hit.seqId), "Sequence DB", hit.seqId);
-                if (mode == Parameters::SET_COVER) {
+                const size_t targetId = localPrefilterIds ? static_cast<size_t>(hit.seqId)
+                    : requireId(seqDbr->getId(hit.seqId), "Sequence DB", hit.seqId);
+                if (localPrefilterIds && targetId >= dbSize) {
+                    Debug(Debug::ERROR) << "Local-ID prefilter target " << hit.seqId
+                                        << " is outside sequence DB size " << dbSize << ".\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                const bool targetUnassigned =
+                    loadAssignedCluster(assignedCluster, targetId) == DB_LOCAL_ID_INVALID;
+
+                if (mode == Parameters::SET_COVER || targetUnassigned) {
                     targetsWithDiagonal.push_back(std::make_pair(targetId, hit.diagonal));
-                } else {
-                    if (loadAssignedCluster(assignedCluster, targetId) == DB_LOCAL_ID_INVALID) {
-                        targetsWithDiagonal.push_back(std::make_pair(targetId, hit.diagonal));
+                    size_t slot = SIZE_MAX;
+                    if (targetId != queryId && targetUnassigned &&
+                        Util::canBeCovered(par.covThr, par.covMode, queryLength,
+                                           seqDbr->getSeqLen(targetId))) {
+                        slot = batchIds.size();
+                        batchIds.push_back(targetId);
                     }
+                    targetSlot.push_back(slot);
                 }
                 alignmentData = Util::skipLine(alignmentData);
                 prefSize++;
             }
-            clusterResult.prefSize = prefSize;   // exact parsed count for the aligned path
+            clusterResult.prefSize = prefSize;
 
-            // Slot 0 is reserved for the query. The first actual sequence I/O therefore submits
-            // query + as many viable targets as fit in one io_uring batch. The query is copied out
-            // immediately, so later target windows may safely reuse the per-thread batch arena.
-            batchIds.clear();
-            batchIds.push_back(queryId);
-            targetSlot.assign(targetsWithDiagonal.size(), SIZE_MAX);
-            for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
-                const size_t targetId = targetsWithDiagonal[targetIdx].first;
-                if (seqDbr->getDbKey(targetId) == queryKey) {
-                    continue;
-                }
-                if (loadAssignedCluster(assignedCluster, targetId) != DB_LOCAL_ID_INVALID) {
-                    continue;
-                }
-                if (Util::canBeCovered(par.covThr, par.covMode, queryLength,
-                                       seqDbr->getSeqLen(targetId)) == false) {
-                    continue;
-                }
-                targetSlot[targetIdx] = batchIds.size();
-                batchIds.push_back(targetId);
-            }
             // [windowStart, windowEnd) indexes batchIds and describes the current batch arena.
             size_t windowStart = 0;
             size_t windowEnd = 0;
@@ -811,9 +850,8 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
                 const size_t targetId = targetsWithDiagonal[targetIdx].first;
                 const unsigned short diagonal = targetsWithDiagonal[targetIdx].second;
-                const DBKeyType targetKey = seqDbr->getDbKey(targetId);
 
-                const bool isIdentity = (queryKey == targetKey);
+                const bool isIdentity = (targetId == queryId);
                 if (isIdentity) {
                     clusterResult.memberIds.push_back(queryId);
                     if (includeAlignFiles) {
@@ -835,13 +873,11 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     continue;
                 }
 
-                // the length alone decides coverage, so test it before faulting in the sequence
-                const size_t targetLength = seqDbr->getSeqLen(targetId);
-                if (Util::canBeCovered(par.covThr, par.covMode, queryLength, targetLength) == false) {
+                const size_t slot = targetSlot[targetIdx];
+                if (slot == SIZE_MAX) {
                     continue;
                 }
-
-                const size_t slot = targetSlot[targetIdx];
+                const size_t targetLength = seqDbr->getSeqLen(targetId);
 
                 // First viable target: submit the query and the first target window together.
                 // batchIds[0] is always queryId. Copy the query out before another loadBatch()
@@ -860,18 +896,13 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     matcher.initQuery(&query);
                 }
 
-                const char *targetSequence;
-                if (slot == SIZE_MAX) {
-                    // This can only happen if the pre-I/O gates and the target loop diverge.
-                    // Keep the conservative fallback for correctness.
-                    targetSequence = seqDbr->getData(targetId, threadIdx);
-                } else {
-                    if (slot < windowStart || slot >= windowEnd) {
-                        windowStart = slot;
-                        windowEnd = slot + seqDbr->loadBatch(&batchIds[slot], batchIds.size() - slot, threadIdx);
-                    }
-                    targetSequence = seqDbr->batchAt(threadIdx, slot - windowStart);
+                if (slot < windowStart || slot >= windowEnd) {
+                    windowStart = slot;
+                    windowEnd = slot + seqDbr->loadBatch(&batchIds[slot], batchIds.size() - slot, threadIdx);
                 }
+                const char *targetSequence = seqDbr->batchAt(threadIdx, slot - windowStart);
+
+                const DBKeyType targetKey = seqDbr->getDbKey(targetId);
                 target.mapSequence(targetId, targetKey, targetSequence, targetLength);
 
                 BlockAligner::UngappedAln_res ungappedAlignment = blockAligner.ungappedAlign(&target, diagonal); 
@@ -908,9 +939,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                             pendingMemberAln.clear();
                         }
                         if (numClu > 1) {
-                            allpass = clusterMembersCanBeCovered(cluSeqDbr, par, cluData, targetKey, queryLength);
-                        }
-                        if (allpass && numClu > 1) { // if not singleton
                             while (*cluData != '\0') {
                                 Util::parseKey(cluData, buffer);
 
@@ -920,8 +948,12 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                     continue;
                                 }
                                 const size_t elementId = requireId(cluSeqDbr->getId(elementKey), "Filter sequence DB", elementKey);
+                                const size_t elementLength = cluSeqDbr->getSeqLen(elementId);
+                                if (Util::canBeCovered(par.covThr, par.covMode, queryLength, elementLength) == false) {
+                                    allpass = false;
+                                    break;
+                                }
                                 char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
-                                size_t elementLength = cluSeqDbr->getSeqLen(elementId);
                                 short elementDiagonal = diagonal;
 
                                 // 1. ungapped alignment
@@ -1048,9 +1080,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                 pendingMemberAln.clear();
                             }
                             if (numClu > 1) {
-                                allpass = clusterMembersCanBeCovered(cluSeqDbr, par, cluData, targetKey, queryLength);
-                            }
-                            if (allpass && numClu > 1) { // if not singleton
                                 while (*cluData != '\0') {
                                     Util::parseKey(cluData, buffer);
                                     const DBKeyType elementKey = Util::fast_atoi<DBKeyType>(buffer);
@@ -1059,8 +1088,12 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                         continue;
                                     }
                                     const size_t elementId = requireId(cluSeqDbr->getId(elementKey), "Filter sequence DB", elementKey);
+                                    const size_t elementLength = cluSeqDbr->getSeqLen(elementId);
+                                    if (Util::canBeCovered(par.covThr, par.covMode, queryLength, elementLength) == false) {
+                                        allpass = false;
+                                        break;
+                                    }
                                     char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
-                                    size_t elementLength = cluSeqDbr->getSeqLen(elementId);
                                     short elementDiagonal = 0;
 
                                     // 1. ungapped alignment
@@ -1124,7 +1157,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             pushClusterResult(std::move(clusterResult));
         }
             if (dropAlnCache) {
-                // no worker is inside an entry here, so nothing holds a pointer into the mapping
 #pragma omp barrier
 #pragma omp single
                 alnDbr.dropCacheAll();
@@ -1223,11 +1255,7 @@ int align2clust(int argc, const char **argv, const Command &command) {
     
     DBReader<DBKeyType> alnDbr(par.db2.c_str(), par.db2Index.c_str(), par.threads,
                                   DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
-    // The prefilter reader is not batch-loaded. It therefore starts mapped and doAlign2clust()
-    // switches it to buffered descriptors only when the combined random-access databases outgrow
-    // the configured memory budget. Do not auto-select O_DIRECT for this per-entry path.
     alnDbr.setIoCacheAdvice(true);
-    // read only by key, and LINEAR_ACCCESS would advise SEQUENTIAL on a db this pass reads out of order
     alnDbr.open(DBReader<DBKeyType>::NOSORT);
     int dbtype =  Parameters::DBTYPE_CLUSTER_RES;
 

@@ -53,6 +53,7 @@ struct DbValidator {
     static std::vector<int> nuclAaDb;
     static std::vector<int> alignmentDb;
     static std::vector<int> prefilterDb;
+    static std::vector<int> align2clustPrefilterDb;
     static std::vector<int> clusterDb;
     static std::vector<int> resultDb;
     static std::vector<int> ppResultDb;

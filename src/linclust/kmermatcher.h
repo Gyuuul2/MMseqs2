@@ -235,7 +235,9 @@ public:
 };
 
 template <int TYPE, typename T>
-void mergeKmerFilesAndOutput(DBWriter & dbw, std::vector<std::string> tmpFiles, std::vector<char> &repSequence, int numThreads = 1, int maxIter = 1);
+void mergeKmerFilesAndOutput(DBWriter & dbw, std::vector<std::string> tmpFiles, std::vector<char> &repSequence,
+                             int numThreads = 1, int maxIter = 1,
+                             DBReader<DBKeyType> *sequenceDbr = NULL, bool localIds = false);
 
 typedef std::priority_queue<FileKmerPosition, std::vector<FileKmerPosition>, CompareResultBySeqId> KmerPositionQueue;
 
@@ -246,7 +248,8 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
 
 template <int TYPE, typename T, bool includeAdjacency = false, bool IncludeSeqLen = false>
 void writeKmerMatcherResult(DBWriter & dbw, KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair, size_t totalKmers,
-                            std::vector<char> &repSequence, size_t threads);
+                            std::vector<char> &repSequence, size_t threads,
+                            DBReader<DBKeyType> *sequenceDbr = NULL, bool localIds = false);
 
 
 template <typename T, bool includeAdjacency = false, bool IncludeSeqLen = false>

@@ -87,6 +87,7 @@ public:
     static const int DBTYPE_SEQTAXDB = 18; // needed for verification
     static const int DBTYPE_STDIN = 19; // needed for verification
     static const int DBTYPE_URI = 20; // needed for verification
+    static const int DBTYPE_PREFILTER_LOCAL_RES = 21;
 
     static const unsigned int DBTYPE_EXTENDED_COMPRESSED = 1;
     static const unsigned int DBTYPE_EXTENDED_INDEX_NEED_SRC = 2;
@@ -98,6 +99,8 @@ public:
 
     static const int LINCLUST_VERSION1 = 1;
     static const int LINCLUST_VERSION2 = 2;
+    static const int KMERMATCHER_MODE_KEY = 1;
+    static const int KMERMATCHER_MODE_LOCAL = 2;
     static const int CLUSTER_VERSION1 = 1;
     static const int CLUSTER_VERSION2 = 2;
     static const int SEARCH_TYPE_AUTO = 0;
@@ -655,6 +658,7 @@ public:
     bool needWriteBuffer;
     int compressKmerTmpFiles;
     bool kmerWriteToDisk;
+    int kmerMatcherMode;
     bool includeCountTable;
     int countTableIteration;
     float countTableScale;
@@ -1031,6 +1035,7 @@ public:
     PARAMETER(PARAM_NEED_WRITEBUFFER)
     PARAMETER(PARAM_COMPRESS_KMER_TMP_FILES)
     PARAMETER(PARAM_KMER_WRITE_TO_DISK)
+    PARAMETER(PARAM_KMERMATCHER_MODE)
     PARAMETER(PARAM_CLUST_HASH)
     PARAMETER(PARAM_LINCLUST_VERSION)
     PARAMETER(PARAM_LINCLUST2_ITER)
@@ -1493,6 +1498,7 @@ public:
             case DBTYPE_FLATFILE: return "Flatfile";
             case DBTYPE_STDIN: return "stdin";
             case DBTYPE_URI: return "uri";
+            case DBTYPE_PREFILTER_LOCAL_RES: return "Local-ID prefilter";
 
             default: return "Unknown";
         }

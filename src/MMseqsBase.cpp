@@ -767,7 +767,7 @@ std::vector<Command> baseCommands = {
                 "Gyuri Kim <gyuribio@snu.ac.kr> & Junsu Lee <jounsu@snu.ac.kr>",
                 "<i:sequenceDB> <i:resultDB> <o:clusterDB>",
                 CITATION_MMSEQS2, {{"sequenceDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
-                                                            {"resultDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::resultDb },
+                                                            {"resultDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::align2clustPrefilterDb },
                                                             {"clusterDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::clusterDb }}},
         {"proteomecluster",             proteomecluster,             &par.proteomecluster,             COMMAND_CLUSTPROTEOME,
                 "Cluster proteomes and identify reference proteomes",

@@ -33,6 +33,13 @@ int linclust(int argc, const char **argv, const Command& command) {
     par.PARAM_INCLUDE_ONLY_EXTENDABLE.addCategory(MMseqsParameter::COMMAND_EXPERT);
 
     par.parseParameters(argc, argv, command, true, 0, 0);
+    if (par.linclustVersion != Parameters::LINCLUST_VERSION2
+        && par.kmerMatcherMode == Parameters::KMERMATCHER_MODE_LOCAL) {
+        Debug(Debug::ERROR) << "--kmermatcher-mode 2 requires --linclust-version 2; "
+                            << "linclust1 passes kmermatcher results to generic rescore/alignment commands. "
+                            << "Use --kmermatcher-mode 1 with --linclust-version 1.\n";
+        EXIT(EXIT_FAILURE);
+    }
     std::string tmpDir = par.db3;
     std::string hash = SSTR(par.hashParameter(command.databases, par.filenames, par.linclustworkflow));
     if (par.reuseLatest) {
@@ -166,6 +173,10 @@ int linclust(int argc, const char **argv, const Command& command) {
         bool prevspacedKmer = par.spacedKmer;
         bool prevmaskMode = par.maskMode;
         MultiParam<NuclAA<float>> prevKmersPerSequenceScale = par.kmersPerSequenceScale;
+        const int previousKmerMatcherMode = par.kmerMatcherMode;
+        if (par.PARAM_KMERMATCHER_MODE.wasSet == false) {
+            par.kmerMatcherMode = Parameters::KMERMATCHER_MODE_LOCAL;
+        }
         par.spacedKmer = false;
         par.maskMode = false;
         cmd.addVariable("KMERMATCHER_PAR", par.createParameterString(par.kmermatcher).c_str());
@@ -183,6 +194,7 @@ int linclust(int argc, const char **argv, const Command& command) {
         par.maskMode = prevmaskMode;
         // the 0.1 above is intended for KMERMATCHER_PAR2 only, so it must not leak into later strings
         par.kmersPerSequenceScale = prevKmersPerSequenceScale;
+        par.kmerMatcherMode = previousKmerMatcherMode;
     }
     float prevSeqId = par.seqIdThr;
     // # 0. clust hash

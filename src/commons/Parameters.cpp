@@ -178,6 +178,7 @@ Parameters::Parameters():
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
         PARAM_COMPRESS_KMER_TMP_FILES(PARAM_COMPRESS_KMER_TMP_FILES_ID, "--compress-kmer-tmp-files", "Compress k-mer temporary files", "Compress kmermatcher temporary files and stream them during merge: 0: off, 1: zstd", typeid(int), (void *) &compressKmerTmpFiles, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_KMER_WRITE_TO_DISK(PARAM_KMER_WRITE_TO_DISK_ID, "--kmer-write-to-disk", "Write k-mers to disk", "Extract k-mers once into per-split buckets on disk, so each split reads its bucket instead of re-scanning the sequence DB (identical result; faster when splitting on fast local storage)", typeid(bool), (void *) &kmerWriteToDisk, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_KMERMATCHER_MODE(PARAM_KMERMATCHER_MODE_ID, "--kmermatcher-mode", "K-mer matcher mode", "1: database-key payloads (generic prefilter format), 2: local sequence-index payloads (linclust2/align2clust only)", typeid(int), (void *) &kmerMatcherMode, "^[1-2]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_VERSION(PARAM_LINCLUST_VERSION_ID, "--linclust-version", "Linclust version", "Linclust version: 1: Linclust1, 2: Linclust2", typeid(int), (void *) &linclustVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST2_ITER(PARAM_LINCLUST2_ITER_ID, "--linclust2-iter", "Linclust2 iterations", "Iterations of linclust2. 2 re-clusters the representatives, 1 stops after the first iteration", typeid(int), (void *) &linclust2Iter, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -1190,6 +1191,7 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
     kmermatcher.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
     kmermatcher.push_back(&PARAM_KMER_WRITE_TO_DISK);
+    kmermatcher.push_back(&PARAM_KMERMATCHER_MODE);
     kmermatcher.push_back(&PARAM_LINCLUST_VERSION);
 
     // kmermatcher
@@ -1684,6 +1686,7 @@ Parameters::Parameters():
     linclustbatchinner.push_back(&PARAM_V);
     linclustbatchinner.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
     linclustbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
+    linclustbatchinner.push_back(&PARAM_KMERMATCHER_MODE);
     linclustbatchinner.push_back(&PARAM_CLUST_HASH);
     linclustbatchinner.push_back(&PARAM_LINCLUST_VERSION);
     linclustbatchinner.push_back(&PARAM_LINCLUST2_ITER);
@@ -1706,6 +1709,7 @@ Parameters::Parameters():
     clusterbatchinner.push_back(&PARAM_V);
     clusterbatchinner.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
     clusterbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
+    clusterbatchinner.push_back(&PARAM_KMERMATCHER_MODE);
     clusterbatchinner.push_back(&PARAM_CLUST_HASH);
     clusterbatchinner.push_back(&PARAM_CLUSTER_VERSION);
     clusterbatchinner.push_back(&PARAM_LINCLUST_VERSION);
@@ -3062,6 +3066,7 @@ void Parameters::setDefaults() {
     needWriteBuffer = false;
     compressKmerTmpFiles = 0;
     kmerWriteToDisk = false;
+    kmerMatcherMode = Parameters::KMERMATCHER_MODE_KEY;
     includeCountTable = true;
     countTableIteration = CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE;
     countTableScale = 0.1;

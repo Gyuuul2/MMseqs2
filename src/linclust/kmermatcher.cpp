@@ -469,7 +469,8 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
                     masker->maskSequence(seq, par.maskMode,  par.maskProb, par.maskLowerCaseMode, par.maskNrepeats);
                 }
                 size_t seqKmerCount = 0;
-                DBKeyType seqId = seq.getDbKey();
+                DBKeyType seqId = (par.kmerMatcherMode == Parameters::KMERMATCHER_MODE_LOCAL)
+                    ? static_cast<DBKeyType>(id) : seq.getDbKey();
                 while (seq.hasNextKmer()) {
                     unsigned char *kmer = (unsigned char*) seq.nextKmer();
                     if(seq.kmerContainsX()){
@@ -1509,7 +1510,13 @@ std::vector<std::pair<size_t, size_t>> setupCountTable(
 template <typename T, bool includeAdjacency, bool IncludeSeqLen>
 int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
     int querySeqType = seqDbr.getDbtype();
-    size_t dbKeySize = seqDbr.getLastKey() +1 ;
+    const bool localIds = par.kmerMatcherMode == Parameters::KMERMATCHER_MODE_LOCAL;
+    const size_t idSpaceSize = localIds ? seqDbr.getSize() : seqDbr.getLastKey() + 1;
+    if (localIds && par.weightFile.empty() == false) {
+        Debug(Debug::ERROR) << "--kmermatcher-mode 2 cannot be combined with --weights yet; "
+                            << "weights are keyed by DB key.\n";
+        EXIT(EXIT_FAILURE);
+    }
     BaseMatrix *subMat;
     if (Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES)) {
         subMat = new NucleotideMatrix(par.scoringMatrixFile.values.nucleotide().c_str(), 1.0, 0.0);
@@ -1539,14 +1546,14 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
     // then keep 5% headroom for transient allocations:
     //   seqLenTable : per-sequence length lookup (skipped when lengths are stored inline)
     //   countTable  : per-sequence k-mer counts, used by the center-swapping iterations
-    size_t seqLenTableMemory = (!IncludeSeqLen) ? (dbKeySize + 1) * sizeof(T) : 0;
+    size_t seqLenTableMemory = (!IncludeSeqLen) ? (idSpaceSize + 1) * sizeof(T) : 0;
     size_t countTableMemory = 0;
     if (par.includeCountTable) {
-        if (dbKeySize > std::numeric_limits<size_t>::max() / sizeof(short)) {
+        if (idSpaceSize > std::numeric_limits<size_t>::max() / sizeof(short)) {
             Debug(Debug::ERROR) << "Count table is too large to allocate.\n";
             EXIT(EXIT_FAILURE);
         }
-        countTableMemory = dbKeySize * sizeof(short);
+        countTableMemory = idSpaceSize * sizeof(short);
     }
     size_t fixedMemory = seqLenTableMemory + countTableMemory;
     if (fixedMemory >= memoryLimit) {
@@ -1585,15 +1592,15 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
     }
 
     if (!IncludeSeqLen) {
-        T * seqkey_to_len = new(std::nothrow) T[dbKeySize+1];
+        T * seqkey_to_len = new(std::nothrow) T[idSpaceSize+1];
         Util::checkAllocation(seqkey_to_len, "Can not allocate seqkey_to_len memory");
-        memset(seqkey_to_len, 0, sizeof(T)*(dbKeySize+1));
+        memset(seqkey_to_len, 0, sizeof(T)*(idSpaceSize+1));
 #pragma omp parallel
         {
 #pragma omp for schedule(dynamic, 1000)
             for (size_t id = 0; id < seqDbr.getSize(); id++) {
-                DBKeyType seqKey = seqDbr.getDbKey(id);
-                seqkey_to_len[seqKey] = static_cast<T>(seqDbr.getSeqLen(id));
+                const DBKeyType resultId = localIds ? static_cast<DBKeyType>(id) : seqDbr.getDbKey(id);
+                seqkey_to_len[resultId] = static_cast<T>(seqDbr.getSeqLen(id));
             }
         }
         SeqLenData<T, false>::seqkey_to_len = seqkey_to_len;
@@ -1604,7 +1611,7 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
         // countTable is already reserved in fixedMemory above; its fill step allocates its own
         // k-mer buffers, which fit in the same splitMemoryLimit (seqkey_to_len + countTable stay
         // resident during the fill too).
-        countTable.assign(dbKeySize, 0);
+        countTable.assign(idSpaceSize, 0);
         size_t countTableTotalKmers = static_cast<size_t>(totalKmers * par.countTableScale);
         // hashSeqPair + writeSeqPair for the count-table fill
         size_t countTableTotalSizeNeeded = computeMemoryNeededLinearfilter<T, false, false>(countTableTotalKmers) * 2;
@@ -1758,10 +1765,13 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
     }
 #endif
     if(mpiRank == 0){
-        std::vector<char> repSequence(seqDbr.getLastKey()+1);
+        std::vector<char> repSequence(idSpaceSize);
         std::fill(repSequence.begin(), repSequence.end(), false);
-        DBWriter dbw(par.db2.c_str(), par.db2Index.c_str(), par.threads, par.compressed,
-                     (Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)) ? Parameters::DBTYPE_PREFILTER_REV_RES : Parameters::DBTYPE_PREFILTER_RES );
+        const int resultDbtype = localIds
+            ? Parameters::DBTYPE_PREFILTER_LOCAL_RES
+            : ((Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES))
+                ? Parameters::DBTYPE_PREFILTER_REV_RES : Parameters::DBTYPE_PREFILTER_RES);
+        DBWriter dbw(par.db2.c_str(), par.db2Index.c_str(), par.threads, par.compressed, resultDbtype);
         dbw.open();
 
         Timer timer;
@@ -1776,9 +1786,11 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
 
             seqDbr.unmapData();
             if (Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)) {
-                mergeKmerFilesAndOutput<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev>(dbw, splitFiles, repSequence, par.threads, maxIter);
+                mergeKmerFilesAndOutput<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev>(dbw, splitFiles, repSequence,
+                                                                                         par.threads, maxIter, &seqDbr, localIds);
             } else {
-                mergeKmerFilesAndOutput<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry>(dbw, splitFiles, repSequence, par.threads, maxIter);
+                mergeKmerFilesAndOutput<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry>(dbw, splitFiles, repSequence,
+                                                                                      par.threads, maxIter, &seqDbr, localIds);
             }
 
             for (int iter = 0; iter < maxIter; ++iter) {
@@ -1798,9 +1810,11 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
             }
         } else {
             if (Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)) {
-                writeKmerMatcherResult<Parameters::DBTYPE_NUCLEOTIDES, T, includeAdjacency, IncludeSeqLen>(dbw, hashSeqPair, totalKmersPerSplit, repSequence, 1);
+                writeKmerMatcherResult<Parameters::DBTYPE_NUCLEOTIDES, T, includeAdjacency, IncludeSeqLen>(
+                    dbw, hashSeqPair, totalKmersPerSplit, repSequence, 1, &seqDbr, localIds);
             } else {
-                writeKmerMatcherResult<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, IncludeSeqLen>(dbw, hashSeqPair, totalKmersPerSplit, repSequence, 1);
+                writeKmerMatcherResult<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, IncludeSeqLen>(
+                    dbw, hashSeqPair, totalKmersPerSplit, repSequence, 1, &seqDbr, localIds);
             }
         }
         Debug(Debug::INFO) << "Time for fill: " << timer.lap() << "\n";
@@ -1815,12 +1829,13 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
 #pragma omp for schedule(static)
             for (size_t id = 0; id < seqDbr.getSize(); id++) {
                 char buffer[100];
-                DBKeyType dbKey = seqDbr.getDbKey(id);
-                if (repSequence[dbKey] == false) {
+                const DBKeyType dbKey = seqDbr.getDbKey(id);
+                const DBKeyType resultId = localIds ? static_cast<DBKeyType>(id) : dbKey;
+                if (repSequence[resultId] == false) {
                     hit_t h;
                     h.prefScore = 0;
                     h.diagonal = 0;
-                    h.seqId = dbKey;
+                    h.seqId = resultId;
                     int len = QueryMatcher::prefilterHitToBuffer(buffer, h);
                     dbw.writeData(buffer, len, dbKey, thread_idx);
                 }
@@ -1959,7 +1974,12 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
 template <int TYPE, typename T, bool includeAdjacency, bool IncludeSeqLen>
 void writeKmerMatcherResult(DBWriter & dbw,
                             KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair, size_t totalKmers,
-                            std::vector<char> &repSequence, size_t threads) {
+                            std::vector<char> &repSequence, size_t threads,
+                            DBReader<DBKeyType> *sequenceDbr, bool localIds) {
+    if (localIds && sequenceDbr == NULL) {
+        Debug(Debug::ERROR) << "Local-ID kmermatcher output needs its source sequence DB.\n";
+        EXIT(EXIT_FAILURE);
+    }
     std::vector<size_t> threadOffsets;
     size_t splitSize = totalKmers/threads;
     threadOffsets.push_back(0);
@@ -2002,7 +2022,8 @@ void writeKmerMatcherResult(DBWriter & dbw,
             if(repSeqId != currKmer) {
                 if (writeSets > 0) {
                     repSequence[repSeqId] = true;
-                    dbw.writeData(prefResultsOutString.c_str(), prefResultsOutString.length(), repSeqId, thread);
+                    const DBKeyType outputKey = localIds ? sequenceDbr->getDbKey(repSeqId) : repSeqId;
+                    dbw.writeData(prefResultsOutString.c_str(), prefResultsOutString.length(), outputKey, thread);
                 }else{
                     if(repSeqId != SIZE_T_MAX) {
                         repSequence[repSeqId] = false;
@@ -2061,7 +2082,8 @@ void writeKmerMatcherResult(DBWriter & dbw,
         }
         if (writeSets > 0) {
             repSequence[repSeqId] = true;
-            dbw.writeData(prefResultsOutString.c_str(), prefResultsOutString.length(), repSeqId, thread);
+            const DBKeyType outputKey = localIds ? sequenceDbr->getDbKey(repSeqId) : repSeqId;
+            dbw.writeData(prefResultsOutString.c_str(), prefResultsOutString.length(), outputKey, thread);
         }else{
             if(repSeqId != SIZE_T_MAX) {
                 repSequence[repSeqId] = false;
@@ -2628,7 +2650,12 @@ template <int TYPE, typename T>
 void mergeKmerFilesAndOutput(DBWriter &dbw,
                              std::vector<std::string> tmpFiles,
                              std::vector<char> &repSequence,
-                             int numThreads, int maxIter) {
+                             int numThreads, int maxIter,
+                             DBReader<DBKeyType> *sequenceDbr, bool localIds) {
+    if (localIds && sequenceDbr == NULL) {
+        Debug(Debug::ERROR) << "Local-ID kmermatcher output needs its source sequence DB.\n";
+        EXIT(EXIT_FAILURE);
+    }
     Debug(Debug::INFO) << "Merge splits ... ";
 
     std::vector<std::vector<std::string>> threadedFiles;
@@ -2761,7 +2788,8 @@ void mergeKmerFilesAndOutput(DBWriter &dbw,
                 return;
             }
             flushHit();
-            dbw.writeData(prefResultsOutString.c_str(), prefResultsOutString.length(), currRepSeq, threadIdx);
+            const DBKeyType outputKey = localIds ? sequenceDbr->getDbKey(currRepSeq) : currRepSeq;
+            dbw.writeData(prefResultsOutString.c_str(), prefResultsOutString.length(), outputKey, threadIdx);
             if (hasRepSeq) {
                 repSequence[currRepSeq] = true;
             }
@@ -3064,7 +3092,7 @@ template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<short, false, t
 template void writeKmersToDisk<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev, short, false, true>(std::string, KmerPosition<short, false, true> *, size_t, int, std::vector<size_t> *, int);
 template void writeKmersToDisk<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry, short, false, true>(std::string, KmerPosition<short, false, true> *, size_t, int, std::vector<size_t> *, int);
 
-template void mergeKmerFilesAndOutput<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev>(DBWriter &, std::vector<std::string>, std::vector<char> &, int, int);
-template void mergeKmerFilesAndOutput<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry>(DBWriter &, std::vector<std::string>, std::vector<char> &, int, int);
+template void mergeKmerFilesAndOutput<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev>(DBWriter &, std::vector<std::string>, std::vector<char> &, int, int, DBReader<DBKeyType> *, bool);
+template void mergeKmerFilesAndOutput<Parameters::DBTYPE_AMINO_ACIDS, KmerEntry>(DBWriter &, std::vector<std::string>, std::vector<char> &, int, int, DBReader<DBKeyType> *, bool);
 
 #undef SIZE_T_MAX

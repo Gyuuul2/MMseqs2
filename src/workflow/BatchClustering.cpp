@@ -373,7 +373,14 @@ const std::vector<MMseqsParameter*>& innerClusterParameters(Parameters &par,
 }
 
 std::string buildInnerClusterParFromCurrent(Parameters &par, const std::string &clusterCmd) {
-    return par.createParameterString(innerClusterParameters(par, clusterCmd));
+    const int inheritedKmerMatcherMode = par.kmerMatcherMode;
+    if (par.PARAM_KMERMATCHER_MODE.wasSet == false
+        && par.linclustVersion == Parameters::LINCLUST_VERSION2) {
+        par.kmerMatcherMode = Parameters::KMERMATCHER_MODE_LOCAL;
+    }
+    const std::string parameters = par.createParameterString(innerClusterParameters(par, clusterCmd));
+    par.kmerMatcherMode = inheritedKmerMatcherMode;
+    return parameters;
 }
 
 std::string buildInnerClusterPar(Parameters &par, const std::string &clusterCmd) {
