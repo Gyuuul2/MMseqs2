@@ -82,6 +82,7 @@ static std::vector<ClusterResult> reorderSlots;    // slot storage, size == reor
 static std::vector<unsigned char> reorderFilled;   // 1 == slot holds an unconsumed result
 static size_t reorderCapacity = 0;                 // max out-of-order window
 static size_t reorderBufferedCount = 0;            // number of filled slots
+static size_t reorderHighWater = 0;                // peak number of simultaneously buffered results
 // Max-heap of candidates by member count (plain vector so the pool stays compactable).
 static std::vector<SetCoverCandidate> setCoverCandidates;
 static SetCoverComparator setCoverComparator;
@@ -151,15 +152,16 @@ static size_t getReorderBufferLimitFromEnv() {
     return static_cast<size_t>(parsedValue);
 }
 
-// Size the reorder buffer after preprocessing, when only the persistent arrays remain.
-static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, size_t alnSize,
-                                     int mode, size_t resultCount) {
+// Size the reorder buffer from free memory: subtract the resident per-sequence arrays,
+// keep 10% headroom, divide by the worst-case result size. Capped by
+// MMSEQS_ALIGN2CLUST_REORDER_LIMIT and by the number of results produced.
+static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int mode, size_t resultCount) {
     const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
 
-    size_t fixedMemory = dbSize * sizeof(ClusterAssignment)
-        + dbSize * sizeof(DBReader<DBKeyType>::Index)
-        + alnSize * sizeof(DBReader<DBKeyType>::Index)
-        + dbSize * ((mode == Parameters::SET_COVER) ? sizeof(PrefInfo) : sizeof(DBLocalId));
+    size_t fixedMemory = dbSize * sizeof(ClusterAssignment);
+    if (mode == Parameters::SET_COVER) {
+        fixedMemory += dbSize * sizeof(PrefInfo);
+    }
 
     const size_t budget = (memoryLimit > fixedMemory)
         ? static_cast<size_t>(static_cast<double>(memoryLimit - fixedMemory) * 0.9)
@@ -175,7 +177,8 @@ static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, size_
                        << fixedMemory << " byte, budget " << budget << " byte, " << bytesPerResult
                        << " byte/result\n";
     Debug(Debug::INFO) << "Reorder buffer capacity: " << capacity << " results ("
-                       << capacity * sizeof(ClusterResult) << " byte pre-allocated slots)\n";
+                       << capacity * sizeof(ClusterResult) << " byte pre-allocated slots, "
+                       << capacity * bytesPerResult << " byte estimated worst-case with member payloads)\n";
     return capacity;
 }
 
@@ -193,6 +196,7 @@ static void pushClusterResult(ClusterResult &&clusterResult) {
         reorderSlots[slot] = std::move(clusterResult);   // O(1) vector move, no heap sift
         reorderFilled[slot] = 1;
         reorderBufferedCount++;
+        reorderHighWater = std::max(reorderHighWater, reorderBufferedCount);
         shouldNotifyClusterThread = (idx == currentProcessPosition);
     }
     if (shouldNotifyClusterThread) {
@@ -225,52 +229,21 @@ static float parsePrecisionLib(const std::string &scoreFile, double targetSeqid,
     return 0;
 }
 
-// memberOrder groups every cluster into one contiguous range, so a split only has to be nudged
-// forward off a cluster it lands inside for the pieces to be disjoint and still in order
-static size_t clusterRangeStart(const ClusterAssignment *assignedCluster, const DBLocalId *memberOrder,
-                                size_t dbSize, size_t at) {
-    if (at >= dbSize) {
-        return dbSize;
-    }
-    while (at > 0 && loadAssignedCluster(assignedCluster, memberOrder[at])
-                     == loadAssignedCluster(assignedCluster, memberOrder[at - 1])) {
-        at++;
-        if (at >= dbSize) {
-            return dbSize;
-        }
-    }
-    return at;
-}
-
 // mirrors Clustering::writeData, but reads members through a local-id permutation
 static void writeClustering(DBWriter *dbWriter, DBReader<DBKeyType> *seqDbr,
-                            const ClusterAssignment *assignedCluster, const DBLocalId *memberOrder,
-                            size_t dbSize, int threads) {
-#pragma omp parallel num_threads(threads)
-    {
-    unsigned int thrIdx = 0;
-    int threadCnt = 1;
-#ifdef OPENMP
-    thrIdx = static_cast<unsigned int>(omp_get_thread_num());
-    threadCnt = omp_get_num_threads();
-#endif
-    // ascending, disjoint ranges written to ascending thread files, so the concatenation at close
-    // reproduces the order a single writer would have produced
-    const size_t stride = (dbSize + threadCnt - 1) / static_cast<size_t>(threadCnt);
-    const size_t rangeBegin = clusterRangeStart(assignedCluster, memberOrder, dbSize, stride * thrIdx);
-    const size_t rangeEnd = clusterRangeStart(assignedCluster, memberOrder, dbSize, stride * (thrIdx + 1));
+                            const ClusterAssignment *assignedCluster, const DBLocalId *memberOrder, size_t dbSize) {
     std::string resultString;
     resultString.reserve(1024 * 1024);
     char buffer[32];
     DBKeyType previousRepresentativeKey = DB_KEY_INVALID;
 
-    for (size_t i = rangeBegin; i < rangeEnd; i++) {
+    for (size_t i = 0; i < dbSize; i++) {
         const DBLocalId memberId = memberOrder[i];
         const DBKeyType currentRepresentativeKey = seqDbr->getDbKey(loadAssignedCluster(assignedCluster, memberId));
 
         if (previousRepresentativeKey != currentRepresentativeKey) {
             if (previousRepresentativeKey != DB_KEY_INVALID) {
-                dbWriter->writeData(resultString.c_str(), resultString.length(), previousRepresentativeKey, thrIdx);
+                dbWriter->writeData(resultString.c_str(), resultString.length(), previousRepresentativeKey);
             }
             resultString.clear();
             char *outPos = Itoa::u64toa_sse2(static_cast<uint64_t>(currentRepresentativeKey), buffer);
@@ -289,8 +262,7 @@ static void writeClustering(DBWriter *dbWriter, DBReader<DBKeyType> *seqDbr,
     }
 
     if (previousRepresentativeKey != DB_KEY_INVALID) {
-        dbWriter->writeData(resultString.c_str(), resultString.length(), previousRepresentativeKey, thrIdx);
-    }
+        dbWriter->writeData(resultString.c_str(), resultString.length(), previousRepresentativeKey);
     }
 }
 
@@ -478,27 +450,19 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
     }
 }
 
-// Both reader indices at 24 byte, the atomic assignment, the visit order and the 16 byte pair the
-// length sort builds. Counted at its peak, because that is when the page cache must already be gone.
-static size_t align2clustResidentBytesPerSeq(int mode) {
-    const size_t indices = 2 * sizeof(DBReader<DBKeyType>::Index);
-    const size_t order = (mode == Parameters::SET_COVER)
-        ? sizeof(PrefInfo)
-        : sizeof(DBLocalId) + sizeof(std::pair<unsigned int, DBLocalId>);
-    return indices + sizeof(ClusterAssignment) + order;
-}
-
 int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &alnDbr, DBWriter *alnWriter) {
     DBReader<DBKeyType> *seqDbr = new DBReader<DBKeyType>(
         par.db1.c_str(), par.db1Index.c_str(), par.threads, 
         DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
     );
-    // Random targets benefit from buffered batch reads while the DB fits comfortably in RAM.
-    // For very large DBs, let DBReader switch the same batch API to O_DIRECT before cache thrashing starts.
+    // Targets repeat across neighbour lists, so the page cache is worth keeping: measured 4.3x over
+    // O_DIRECT at 11x reuse, while O_DIRECT wins only 16% when there is none. Batched io_uring on
+    // buffered descriptors keeps that reuse and still avoids the mmap fault path.
     seqDbr->setIoBufferedBatch(true);
-    seqDbr->setIoAutoDirect(true);
-    seqDbr->setIoMemoryBudget(Util::computeMemory(par.splitMemoryLimit));
-    seqDbr->setIoExpectedResidentBytes(alnDbr.getSize() * align2clustResidentBytesPerSeq(par.clusteringMode));
+    // the per-sequence arrays live for the whole loop, so the size rule must not mistake them for cache
+    const size_t align2clustPerSeqBytes = sizeof(ClusterAssignment)
+        + ((par.clusteringMode == Parameters::SET_COVER) ? sizeof(PrefInfo) : sizeof(DBLocalId));
+    seqDbr->setIoExpectedResidentBytes(alnDbr.getSize() * align2clustPerSeqBytes);
     // SORT_BY_LENGTH costs id2local plus local2id; neither mode needs them once lengthOrder exists
     seqDbr->open(DBReader<DBKeyType>::NOSORT);
  
@@ -570,6 +534,31 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         return EXIT_FAILURE;
     }
 
+    // Ring size = out-of-order window, sized from the memory budget (OOM-aware) and
+    // capped by the result count. sequenceIdx runs over [0, endRange); every index
+    // publishes exactly one result.
+    const size_t align2clustResultCount = (mode == Parameters::SET_COVER) ? dbSize : alnDbr.getSize();
+    const size_t reorderCapacityChosen = computeReorderCapacity(par, dbSize, mode, align2clustResultCount);
+    {
+        std::lock_guard<std::mutex> lock(clusterMutex);
+        reorderCapacity = reorderCapacityChosen;
+        reorderSlots.clear();
+        reorderSlots.resize(reorderCapacity);
+        reorderFilled.assign(reorderCapacity, 0);
+        reorderBufferedCount = 0;
+        reorderHighWater = 0;
+        setCoverCandidates.clear();
+        setCoverCandidates.shrink_to_fit();
+        setCoverMemberPool.clear();
+        setCoverMemberPool.shrink_to_fit();
+        setCoverLiveMemberCount = 0;
+        currentProcessPosition = 0;
+        currentPrefSize = 0;
+        allCalculationsDone = false;
+    }
+
+    std::thread clusterThread(clusterThreadFunc, assignedCluster);
+    
     Timer timer;
     timer.reset();
     PrefInfo *prefRepSizePair = nullptr;
@@ -623,28 +612,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         }
         delete[] sortForLength;
     }
-
-    // Preprocessing peak memory is gone; only now allocate the out-of-order ring.
-    const size_t align2clustResultCount = (mode == Parameters::SET_COVER) ? dbSize : alnDbr.getSize();
-    const size_t reorderCapacityChosen = computeReorderCapacity(
-        par, dbSize, alnDbr.getSize(), mode, align2clustResultCount);
-    {
-        std::lock_guard<std::mutex> lock(clusterMutex);
-        reorderCapacity = reorderCapacityChosen;
-        reorderSlots.clear();
-        reorderSlots.resize(reorderCapacity);
-        reorderFilled.assign(reorderCapacity, 0);
-        reorderBufferedCount = 0;
-        setCoverCandidates.clear();
-        setCoverCandidates.shrink_to_fit();
-        setCoverMemberPool.clear();
-        setCoverMemberPool.shrink_to_fit();
-        setCoverLiveMemberCount = 0;
-        currentProcessPosition = 0;
-        currentPrefSize = 0;
-        allCalculationsDone = false;
-    }
-    std::thread clusterThread(clusterThreadFunc, assignedCluster);
 
     timer.reset();
 
@@ -785,10 +752,11 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             }
             clusterResult.prefSize = prefSize;   // exact parsed count for the aligned path
 
-            // Same gates the align loop below repeats, but on index data only, so the whole set of
-            // bodies it will read is known before the first read. Assignment only ever moves to
-            // assigned, so a target dropped here is never wanted below.
+            // Slot 0 is reserved for the query. The first actual sequence I/O therefore submits
+            // query + as many viable targets as fit in one io_uring batch. The query is copied out
+            // immediately, so later target windows may safely reuse the per-thread batch arena.
             batchIds.clear();
+            batchIds.push_back(queryId);
             targetSlot.assign(targetsWithDiagonal.size(), SIZE_MAX);
             for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
                 const size_t targetId = targetsWithDiagonal[targetIdx].first;
@@ -805,7 +773,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 targetSlot[targetIdx] = batchIds.size();
                 batchIds.push_back(targetId);
             }
-            // the batch is read in windows, and the loop below only ever moves forward through them
+            // [windowStart, windowEnd) indexes batchIds and describes the current batch arena.
             size_t windowStart = 0;
             size_t windowEnd = 0;
 
@@ -851,21 +819,29 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     continue;
                 }
 
-                // first target to survive filtering: now the query body is worth its random read
+                const size_t slot = targetSlot[targetIdx];
+
+                // First viable target: submit the query and the first target window together.
+                // batchIds[0] is always queryId. Copy the query out before another loadBatch()
+                // reuses the per-thread arena.
                 if (querySequence == nullptr) {
-                    // the direct io path hands back a per-thread buffer the target reads below reuse
-                    queryCopy.assign(seqDbr->getData(queryId, threadIdx), queryLength);
+                    windowStart = 0;
+                    windowEnd = seqDbr->loadBatch(batchIds.data(), batchIds.size(), threadIdx);
+                    if (windowEnd == 0) {
+                        Debug(Debug::ERROR) << "Failed to batch-load query " << queryKey << "\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    queryCopy.assign(seqDbr->batchAt(threadIdx, 0), queryLength);
                     querySequence = queryCopy.c_str();
                     query.mapSequence(queryId, queryKey, querySequence, queryLength);
                     blockAligner.initQuery(&query);
                     matcher.initQuery(&query);
                 }
 
-                // the query lives in queryCopy and the batch arena is its own buffer, so neither
-                // path can overwrite the other
-                const size_t slot = targetSlot[targetIdx];
                 const char *targetSequence;
                 if (slot == SIZE_MAX) {
+                    // This can only happen if the pre-I/O gates and the target loop diverge.
+                    // Keep the conservative fallback for correctness.
                     targetSequence = seqDbr->getData(targetId, threadIdx);
                 } else {
                     if (slot < windowStart || slot >= windowEnd) {
@@ -1147,6 +1123,8 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     if (clusterThread.joinable()) {
         clusterThread.join();
     }
+    Debug(Debug::INFO) << "Reorder buffer high water: " << reorderHighWater
+                       << " / " << reorderCapacity << " results\n";
 
     // ring and set-cover pool are dead once the consumer joins; free them before memberOrder is sized
     std::vector<ClusterResult>().swap(reorderSlots);
@@ -1193,7 +1171,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     Debug(Debug::INFO) << "Size of the alignment database: " << dbSize << "\n";
     Debug(Debug::INFO) << "Number of clusters: " << clusterCount << "\n";
 
-    writeClustering(&resultWriter, seqDbr, assignedCluster, memberOrder, dbSize, par.threads);
+    writeClustering(&resultWriter, seqDbr, assignedCluster, memberOrder, dbSize);
 
     delete[] memberOrder;
     delete[] assignedCluster;
@@ -1229,20 +1207,16 @@ int align2clust(int argc, const char **argv, const Command &command) {
     // per-entry range never contains a whole page and only a whole-file drop frees anything.
     alnDbr.setIoAutoDirect(true);
     alnDbr.setIoCacheAdvice(true);
-    alnDbr.setIoMemoryBudget(Util::computeMemory(par.splitMemoryLimit));
-    // Neither reader is open, so the entry count is estimated from the index file; a line is a key,
-    // an offset and a length, which is about 30 byte at any size that makes this decision matter.
+    // the sequence reader's index is not allocated yet, but it will sit beside this db's cache
     const size_t seqIndexFileSize = FileUtil::getFileSize(par.db1Index);
     if (seqIndexFileSize != static_cast<size_t>(-1)) {
-        const size_t estimatedEntries = seqIndexFileSize / 30;
-        alnDbr.setIoExpectedResidentBytes(estimatedEntries
-                                          * align2clustResidentBytesPerSeq(par.clusteringMode));
+        alnDbr.setIoExpectedResidentBytes(seqIndexFileSize);
     }
     // read only by key, and LINEAR_ACCCESS would advise SEQUENTIAL on a db this pass reads out of order
     alnDbr.open(DBReader<DBKeyType>::NOSORT);
     int dbtype =  Parameters::DBTYPE_CLUSTER_RES;
 
-    DBWriter resultWriter(par.db3.c_str(), par.db3Index.c_str(), par.threads, par.compressed, dbtype);
+    DBWriter resultWriter(par.db3.c_str(), par.db3Index.c_str(), 1, par.compressed, dbtype);
     resultWriter.open();
 
     // Optional alignment-result output; path derived from the cluster DB (db3 + "_aln").
