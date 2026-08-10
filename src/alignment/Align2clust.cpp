@@ -17,6 +17,9 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 
 #ifdef OPENMP
 #include <omp.h>
@@ -33,7 +36,7 @@ struct ClusterResult {
 
 struct PrefInfo {
     DBLocalId id;
-    size_t size;
+    uint32_t size;
 
     static bool compareBySizeAndId(const PrefInfo &first, const PrefInfo &second){
         if(first.size > second.size)
@@ -98,13 +101,31 @@ static size_t currentPrefSize = 0;
 static bool allCalculationsDone = false;
 
 typedef std::atomic<DBLocalId> ClusterAssignment;
+static std::atomic<uint64_t> *assignedFlags = nullptr;
+
+static size_t assignedFlagWordCount(size_t dbSize) {
+    return dbSize / 64 + static_cast<size_t>(dbSize % 64 != 0);
+}
 
 static DBLocalId loadAssignedCluster(const ClusterAssignment *assignedCluster, size_t sequenceId) {
     return assignedCluster[sequenceId].load(std::memory_order_relaxed);
 }
 
+static bool isAssigned(const ClusterAssignment *assignedCluster, size_t sequenceId) {
+    if (assignedFlags == nullptr) {
+        return loadAssignedCluster(assignedCluster, sequenceId) != DB_LOCAL_ID_INVALID;
+    }
+    const uint64_t bit = uint64_t(1) << (sequenceId & 63);
+    return (assignedFlags[sequenceId >> 6].load(std::memory_order_relaxed) & bit) != 0;
+}
+
 static void storeAssignedCluster(ClusterAssignment *assignedCluster, size_t sequenceId, DBLocalId representativeId) {
     assignedCluster[sequenceId].store(representativeId, std::memory_order_relaxed);
+    if (assignedFlags != nullptr && representativeId != DB_LOCAL_ID_INVALID) {
+        std::atomic<uint64_t> &word = assignedFlags[sequenceId >> 6];
+        word.store(word.load(std::memory_order_relaxed) | (uint64_t(1) << (sequenceId & 63)),
+                   std::memory_order_relaxed);
+    }
 }
 
 // Serialize a single alignment record and append it to the per-representative buffer.
@@ -161,6 +182,7 @@ static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int m
     const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
 
     size_t fixedMemory = dbSize * sizeof(ClusterAssignment);
+    fixedMemory += assignedFlagWordCount(dbSize) * sizeof(std::atomic<uint64_t>);
     if (mode == Parameters::SET_COVER) {
         fixedMemory += dbSize * sizeof(PrefInfo);
     } else {
@@ -171,7 +193,9 @@ static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int m
     const size_t budget = (memoryLimit > fixedMemory)
         ? static_cast<size_t>(static_cast<double>(memoryLimit - fixedMemory) * 0.9)
         : 0;
-    const size_t bytesPerResult = sizeof(ClusterResult) + (par.maxResListLen + 1) * sizeof(DBLocalId);
+    const size_t bytesPerResult = sizeof(ClusterResult) + sizeof(unsigned char)
+                                  + (par.maxResListLen + 1) * sizeof(DBLocalId)
+                                  + ((mode == Parameters::SET_COVER) ? 0 : sizeof(ClusterResult));
 
     size_t capacity = std::min(resultCount, std::max<size_t>(1, budget / bytesPerResult));
     const size_t userCap = getReorderBufferLimitFromEnv();  // 0 == use the default cap
@@ -185,6 +209,23 @@ static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int m
                        << capacity * sizeof(ClusterResult) << " byte pre-allocated slots, "
                        << capacity * bytesPerResult << " byte estimated worst-case with member payloads)\n";
     return capacity;
+}
+
+static void discardLengthOrderPrefix(DBLocalId *lengthOrder, size_t begin, size_t end) {
+#ifdef MADV_DONTNEED
+    const size_t pageSize = Util::getPageSize();
+    const uintptr_t beginAddress = reinterpret_cast<uintptr_t>(lengthOrder + begin);
+    const uintptr_t endAddress = reinterpret_cast<uintptr_t>(lengthOrder + end);
+    const uintptr_t discardBegin = (beginAddress + pageSize - 1) & ~(static_cast<uintptr_t>(pageSize) - 1);
+    const uintptr_t discardEnd = endAddress & ~(static_cast<uintptr_t>(pageSize) - 1);
+    if (discardEnd > discardBegin) {
+        madvise(reinterpret_cast<void *>(discardBegin), discardEnd - discardBegin, MADV_DONTNEED);
+    }
+#else
+    (void) lengthOrder;
+    (void) begin;
+    (void) end;
+#endif
 }
 
 static void pushClusterResult(ClusterResult &&clusterResult) {
@@ -234,21 +275,52 @@ static float parsePrecisionLib(const std::string &scoreFile, double targetSeqid,
     return 0;
 }
 
+// memberOrder groups every cluster into one contiguous range, so a split only has to be nudged
+// forward off a cluster it lands inside for the pieces to be disjoint and still in order
+static size_t clusterRangeStart(const ClusterAssignment *assignedCluster, const DBLocalId *memberOrder,
+                                size_t dbSize, size_t at) {
+    if (at >= dbSize) {
+        return dbSize;
+    }
+    while (at > 0 && loadAssignedCluster(assignedCluster, memberOrder[at])
+                     == loadAssignedCluster(assignedCluster, memberOrder[at - 1])) {
+        at++;
+        if (at >= dbSize) {
+            return dbSize;
+        }
+    }
+    return at;
+}
+
 // mirrors Clustering::writeData, but reads members through a local-id permutation
 static void writeClustering(DBWriter *dbWriter, DBReader<DBKeyType> *seqDbr,
-                            const ClusterAssignment *assignedCluster, const DBLocalId *memberOrder, size_t dbSize) {
+                            const ClusterAssignment *assignedCluster, const DBLocalId *memberOrder,
+                            size_t dbSize, int threads) {
+#pragma omp parallel num_threads(threads)
+    {
+    unsigned int thrIdx = 0;
+    int threadCnt = 1;
+#ifdef OPENMP
+    thrIdx = static_cast<unsigned int>(omp_get_thread_num());
+    threadCnt = omp_get_num_threads();
+#endif
+    // ascending, disjoint ranges written to ascending thread files, so the concatenation at close
+    // reproduces the order a single writer would have produced
+    const size_t stride = (dbSize + threadCnt - 1) / static_cast<size_t>(threadCnt);
+    const size_t rangeBegin = clusterRangeStart(assignedCluster, memberOrder, dbSize, stride * thrIdx);
+    const size_t rangeEnd = clusterRangeStart(assignedCluster, memberOrder, dbSize, stride * (thrIdx + 1));
     std::string resultString;
     resultString.reserve(1024 * 1024);
     char buffer[32];
     DBKeyType previousRepresentativeKey = DB_KEY_INVALID;
 
-    for (size_t i = 0; i < dbSize; i++) {
+    for (size_t i = rangeBegin; i < rangeEnd; i++) {
         const DBLocalId memberId = memberOrder[i];
         const DBKeyType currentRepresentativeKey = seqDbr->getDbKey(loadAssignedCluster(assignedCluster, memberId));
 
         if (previousRepresentativeKey != currentRepresentativeKey) {
             if (previousRepresentativeKey != DB_KEY_INVALID) {
-                dbWriter->writeData(resultString.c_str(), resultString.length(), previousRepresentativeKey);
+                dbWriter->writeData(resultString.c_str(), resultString.length(), previousRepresentativeKey, thrIdx);
             }
             resultString.clear();
             char *outPos = Itoa::u64toa_sse2(static_cast<uint64_t>(currentRepresentativeKey), buffer);
@@ -267,7 +339,8 @@ static void writeClustering(DBWriter *dbWriter, DBReader<DBKeyType> *seqDbr,
     }
 
     if (previousRepresentativeKey != DB_KEY_INVALID) {
-        dbWriter->writeData(resultString.c_str(), resultString.length(), previousRepresentativeKey);
+        dbWriter->writeData(resultString.c_str(), resultString.length(), previousRepresentativeKey, thrIdx);
+    }
     }
 }
 
@@ -324,7 +397,7 @@ void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
             setCoverCandidates.pop_back();
             setCoverLiveMemberCount -= candidate.memberCount;
 
-            if (loadAssignedCluster(assignedCluster, candidate.representativeId) != DB_LOCAL_ID_INVALID) {
+            if (isAssigned(assignedCluster, candidate.representativeId)) {
                 continue;
             }
 
@@ -333,7 +406,7 @@ void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
             DBLocalId *members = setCoverMemberPool.data() + candidate.memberOffset;
             size_t validCount = 0;
             for (size_t i = 0; i < candidate.memberCount; i++) {
-                if (loadAssignedCluster(assignedCluster, members[i]) == DB_LOCAL_ID_INVALID) {
+                if (!isAssigned(assignedCluster, members[i])) {
                     members[validCount++] = members[i];
                 }
             }
@@ -408,14 +481,14 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
 
         // only this thread writes assignedCluster while the producers run, so no mutex is needed
         for (ClusterResult &result : drainedResults) {
-            if (loadAssignedCluster(assignedCluster, result.representativeId) != DB_LOCAL_ID_INVALID) {
+            if (isAssigned(assignedCluster, result.representativeId)) {
                 continue;
             }
 
             validMemberIds.clear();
             validMemberIds.reserve(result.memberIds.size());
             for (DBLocalId memberId : result.memberIds) {
-                if (loadAssignedCluster(assignedCluster, memberId) == DB_LOCAL_ID_INVALID) {
+                if (!isAssigned(assignedCluster, memberId)) {
                     validMemberIds.push_back(memberId);
                 }
             }
@@ -435,7 +508,7 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
     }
 }
 
-int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &alnDbr, DBWriter *alnWriter) {
+int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &alnDbr, DBWriter *alnWriter, int writeThreads) {
     DBReader<DBKeyType> *seqDbr = new DBReader<DBKeyType>(
         par.db1.c_str(), par.db1Index.c_str(), par.threads, 
         DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
@@ -536,6 +609,14 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         return EXIT_FAILURE;
     }
 
+    const size_t flagWordCount = assignedFlagWordCount(dbSize);
+    assignedFlags = new(std::nothrow) std::atomic<uint64_t>[flagWordCount];
+    Util::checkAllocation(assignedFlags, "Can not allocate assignedFlags memory in Align2Clust");
+#pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < flagWordCount; ++i) {
+        assignedFlags[i].store(0, std::memory_order_relaxed);
+    }
+
     Timer timer;
     timer.reset();
     PrefInfo *prefRepSizePair = nullptr;
@@ -553,9 +634,11 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 #endif
 #pragma omp for schedule(dynamic, 1000)
             for (size_t i = 0; i < seqDbr->getSize(); i++) {
-                const DBKeyType clusterId = seqDbr->getDbKey(i);
-                const size_t alnId = localPrefilterIds ? i
-                    : requireId(alnDbr.getId(clusterId), "Alignment DB", clusterId);
+                size_t alnId = i;
+                if (!localPrefilterIds) {
+                    const DBKeyType clusterId = seqDbr->getDbKey(i);
+                    alnId = requireId(alnDbr.getId(clusterId), "Alignment DB", clusterId);
+                }
                 const char *data = alnDbr.getData(alnId, thread_idx);
                 const size_t dataSize = alnDbr.getEntryLen(alnId);
                 prefRepSizePair[i].id = i;
@@ -661,13 +744,17 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         BlockAligner blockAligner(Parameters::DBTYPE_AMINO_ACIDS, db_maxseqlen, subMat, &fastMatrix, 
                                  &evaluer, par.compBiasCorrection, par.compBiasCorrectionScale, 
                                  -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
-        std::vector<std::pair<size_t, unsigned short>> targetsWithDiagonal;
+        struct TargetHit {
+            size_t id;
+            uint32_t slot;
+            unsigned short diagonal;
+        };
+        std::vector<TargetHit> targetsWithDiagonal;
         targetsWithDiagonal.reserve(1000);
-        // the targets that clear the index-only gates, so one io_uring batch can cover them all
         std::vector<size_t> batchIds;
-        std::vector<size_t> targetSlot;
 
         const bool includeAlignFiles = (alnWriter != nullptr);
+        const bool needTargetKey = includeAlignFiles || cluDbr != nullptr;
         std::string queryCopy;
         std::string alnResultBuffer;
         // Staged member alignments; flushed only if the allpass-gate fully passes.
@@ -690,15 +777,20 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             }
 
             size_t representativeId;
-            DBKeyType queryKey;
+            const bool needQueryKey = !localPrefilterIds || includeAlignFiles;
+            DBKeyType queryKey = DB_KEY_INVALID;
 
             if (mode == Parameters::SET_COVER) {
                 representativeId = prefRepSizePair[i].id;
-                queryKey = seqDbr->getDbKey(representativeId);
+                if (needQueryKey) {
+                    queryKey = seqDbr->getDbKey(representativeId);
+                }
                 clusterResult.prefSize = prefRepSizePair[i].size;   // precomputed in the prefix pass
             } else { // GREEDY || GREEDY_MEM
                 representativeId = lengthOrder[i];
-                queryKey = seqDbr->getDbKey(representativeId);
+                if (needQueryKey) {
+                    queryKey = seqDbr->getDbKey(representativeId);
+                }
                 clusterResult.prefSize = 0;                         // greedy has no currentPrefSize gate
             }
             clusterResult.representativeId = representativeId;
@@ -707,7 +799,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             // by the cluster thread anyway, so skip parsing and aligning it entirely. prefSize
             // is already set (precomputed for set-cover), so the currentPrefSize gate stays
             // correct.
-            if (loadAssignedCluster(assignedCluster, representativeId) != DB_LOCAL_ID_INVALID) {
+            if (isAssigned(assignedCluster, representativeId)) {
                 pushClusterResult(std::move(clusterResult));
                 continue;
             }
@@ -723,7 +815,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
             batchIds.clear();
             batchIds.push_back(queryId);
-            targetSlot.clear();
 
             size_t prefSize = 0;
             while (*alignmentData != '\0') {
@@ -735,19 +826,21 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                         << " is outside sequence DB size " << dbSize << ".\n";
                     EXIT(EXIT_FAILURE);
                 }
-                const bool targetUnassigned =
-                    loadAssignedCluster(assignedCluster, targetId) == DB_LOCAL_ID_INVALID;
+                const bool targetUnassigned = !isAssigned(assignedCluster, targetId);
 
                 if (mode == Parameters::SET_COVER || targetUnassigned) {
-                    targetsWithDiagonal.push_back(std::make_pair(targetId, hit.diagonal));
-                    size_t slot = SIZE_MAX;
+                    uint32_t slot = std::numeric_limits<uint32_t>::max();
                     if (targetId != queryId && targetUnassigned &&
                         Util::canBeCovered(par.covThr, par.covMode, queryLength,
                                            seqDbr->getSeqLen(targetId))) {
-                        slot = batchIds.size();
+                        if (batchIds.size() >= std::numeric_limits<uint32_t>::max()) {
+                            Debug(Debug::ERROR) << "Too many batched targets for one query.\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        slot = static_cast<uint32_t>(batchIds.size());
                         batchIds.push_back(targetId);
                     }
-                    targetSlot.push_back(slot);
+                    targetsWithDiagonal.push_back({targetId, slot, hit.diagonal});
                 }
                 alignmentData = Util::skipLine(alignmentData);
                 prefSize++;
@@ -764,12 +857,12 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 // never used; stop aligning the rest. Safe in set-cover too: prefSize is
                 // already fully counted, so this is just the k-th-target form of the
                 // (k=0) rep-skip above.
-                if (loadAssignedCluster(assignedCluster, representativeId) != DB_LOCAL_ID_INVALID) {
+                if (isAssigned(assignedCluster, representativeId)) {
                     break;
                 }
 
-                const size_t targetId = targetsWithDiagonal[targetIdx].first;
-                const unsigned short diagonal = targetsWithDiagonal[targetIdx].second;
+                const size_t targetId = targetsWithDiagonal[targetIdx].id;
+                const unsigned short diagonal = targetsWithDiagonal[targetIdx].diagonal;
 
                 const bool isIdentity = (targetId == queryId);
                 if (isIdentity) {
@@ -789,12 +882,12 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 // Skip the (expensive) alignment if the target was assigned meanwhile.
                 // Safe in set-cover too: an assigned target is monotonic, so it would be
                 // dropped by the cluster thread's re-evaluation anyway.
-                if (loadAssignedCluster(assignedCluster, targetId) != DB_LOCAL_ID_INVALID) {
+                if (isAssigned(assignedCluster, targetId)) {
                     continue;
                 }
 
-                const size_t slot = targetSlot[targetIdx];
-                if (slot == SIZE_MAX) {
+                const uint32_t slot = targetsWithDiagonal[targetIdx].slot;
+                if (slot == std::numeric_limits<uint32_t>::max()) {
                     continue;
                 }
                 const size_t targetLength = seqDbr->getSeqLen(targetId);
@@ -822,7 +915,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 }
                 const char *targetSequence = seqDbr->batchAt(threadIdx, slot - windowStart);
 
-                const DBKeyType targetKey = seqDbr->getDbKey(targetId);
+                const DBKeyType targetKey = needTargetKey ? seqDbr->getDbKey(targetId) : DB_KEY_INVALID;
                 target.mapSequence(targetId, targetKey, targetSequence, targetLength);
 
                 BlockAligner::UngappedAln_res ungappedAlignment = blockAligner.ungappedAlign(&target, diagonal); 
@@ -843,10 +936,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 }
                 
                 bool hasSeqId = seqId >= (par.seqIdThr - std::numeric_limits<float>::epsilon());
-                if (loadAssignedCluster(assignedCluster, targetId) != DB_LOCAL_ID_INVALID) continue;
+                if (isAssigned(assignedCluster, targetId)) continue;
 
                 if (hasAlnLen && hasCoverage && hasSeqId && hasEvalue) {
-                    if (loadAssignedCluster(assignedCluster, targetId) != DB_LOCAL_ID_INVALID) continue;
+                    if (isAssigned(assignedCluster, targetId)) continue;
                     if (par.filterCluDBFile.empty()== false && par.filterSeqDBFile.empty()== false){
                         // check all the member from filtering file
                         const size_t cluId = requireId(cluDbr->getId(targetKey), "Filter cluster DB", targetKey);
@@ -950,7 +1043,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     continue;
                 }
 
-                if (loadAssignedCluster(assignedCluster, targetId) != DB_LOCAL_ID_INVALID) continue;
+                if (isAssigned(assignedCluster, targetId)) continue;
 
                 bool foundConsecutiveMatchSeed = false;
                 for (int blockIdx = 0; blockIdx <= alignmentLength - 3; ++blockIdx) {
@@ -987,7 +1080,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     );
                     if (Alignment::checkCriteria(result, isIdentity, par.evalThr, par.seqIdThr, 
                                                 par.alnLenThr, par.covMode, par.covThr)) {
-                        if (loadAssignedCluster(assignedCluster, targetId) != DB_LOCAL_ID_INVALID) continue;
+                        if (isAssigned(assignedCluster, targetId)) continue;
                         if (par.filterCluDBFile.empty()== false && par.filterSeqDBFile.empty()== false){
                             // check all the member from filtering file
                             const size_t cluId = requireId(cluDbr->getId(targetKey), "Filter cluster DB", targetKey);
@@ -1076,10 +1169,15 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             }
             pushClusterResult(std::move(clusterResult));
         }
-            if (dropAlnCache) {
+            if (lengthOrder != nullptr || dropAlnCache) {
 #pragma omp barrier
 #pragma omp single
-                alnDbr.dropCacheAll();
+                if (lengthOrder != nullptr) {
+                    discardLengthOrderPrefix(lengthOrder, epochStart, epochEnd);
+                }
+                if (dropAlnCache) {
+                    alnDbr.dropCacheAll();
+                }
             }
         }
     }
@@ -1112,8 +1210,14 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < dbSize; ++i) {
-        if (loadAssignedCluster(assignedCluster, i) == DB_LOCAL_ID_INVALID) {
-            storeAssignedCluster(assignedCluster, i, i);
+        if (!isAssigned(assignedCluster, i)) {
+            assignedCluster[i].store(i, std::memory_order_relaxed);
+        }
+    }
+    if (assignedFlags != nullptr) {
+#pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < assignedFlagWordCount(dbSize); ++i) {
+            assignedFlags[i].store(UINT64_MAX, std::memory_order_relaxed);
         }
     }
 
@@ -1145,9 +1249,13 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     Debug(Debug::INFO) << "Size of the alignment database: " << dbSize << "\n";
     Debug(Debug::INFO) << "Number of clusters: " << clusterCount << "\n";
 
-    writeClustering(&resultWriter, seqDbr, assignedCluster, memberOrder, dbSize);
+    Timer writeTimer;
+    writeClustering(&resultWriter, seqDbr, assignedCluster, memberOrder, dbSize, writeThreads);
+    Debug(Debug::INFO) << "Time for writing clusters: " << writeTimer.lap() << "\n";
 
     delete[] memberOrder;
+    delete[] assignedFlags;
+    assignedFlags = nullptr;
     delete[] assignedCluster;
     delete[] fastMatrix.matrix;
     delete[] fastMatrix.matrixData;
@@ -1179,7 +1287,17 @@ int align2clust(int argc, const char **argv, const Command &command) {
     alnDbr.open(DBReader<DBKeyType>::NOSORT);
     int dbtype =  Parameters::DBTYPE_CLUSTER_RES;
 
-    DBWriter resultWriter(par.db3.c_str(), par.db3Index.c_str(), 1, par.compressed, dbtype);
+    // A/B escape for the parallel cluster writer; the concatenation order makes the output identical
+    int writeThreads = par.threads;
+    if (const char *env = getenv("MMSEQS_A2C_WRITE_THREADS")) {
+        const long parsed = strtol(env, NULL, 10);
+        if (parsed > 0 && parsed <= par.threads) {
+            writeThreads = static_cast<int>(parsed);
+        } else {
+            Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_WRITE_THREADS=" << env << "\n";
+        }
+    }
+    DBWriter resultWriter(par.db3.c_str(), par.db3Index.c_str(), writeThreads, par.compressed, dbtype);
     resultWriter.open();
 
     // Optional alignment-result output; path derived from the cluster DB (db3 + "_aln").
@@ -1201,7 +1319,7 @@ int align2clust(int argc, const char **argv, const Command &command) {
         alnWriter->open();
     }
 
-    int status = doAlign2clust(par, resultWriter, alnDbr, alnWriter);
+    int status = doAlign2clust(par, resultWriter, alnDbr, alnWriter, writeThreads);
 
     Debug(Debug::INFO) << "Time for run Align2Clust: " << timer.lap() << " sec\n";
 
