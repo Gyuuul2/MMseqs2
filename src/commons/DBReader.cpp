@@ -1117,6 +1117,45 @@ const char *DBReader<T>::batchAt(unsigned int thrIdx, size_t k) {
 
 
 template <typename T>
+void DBReader<T>::dropCacheRange(size_t beginOffset, size_t endOffset) {
+#ifdef HAVE_POSIX_FADVISE
+    if ((dataMode & USE_DATA) == 0 || (dataMode & USE_FREAD) || compression == COMPRESSED) {
+        return;
+    }
+    if (dataMode & USE_WRITABLE) {
+        return;
+    }
+    if ((dataMode & USE_DIRECT_IO) && ioBufferedBatch == false) {
+        return;
+    }
+    const size_t pageSize = Util::getPageSize();
+    for (size_t fileIdx = 0; fileIdx < dataFileCnt; fileIdx++) {
+        const size_t from = std::max(beginOffset, dataSizeOffset[fileIdx]);
+        const size_t to = std::min(endOffset, dataSizeOffset[fileIdx + 1]);
+        if (from >= to) {
+            continue;
+        }
+        const size_t localFrom = ((from - dataSizeOffset[fileIdx]) + pageSize - 1) & ~(pageSize - 1);
+        const size_t localTo = (to - dataSizeOffset[fileIdx]) & ~(pageSize - 1);
+        if (localTo <= localFrom) {
+            continue;
+        }
+        // fadvise skips pages that are still mapped, so the mapping has to go first
+        if (dataFiles != NULL && dataFiles[fileIdx] != NULL) {
+            ::madvise(dataFiles[fileIdx] + localFrom, localTo - localFrom, MADV_DONTNEED);
+        }
+        const int fd = (dataFds != NULL) ? dataFds[fileIdx] : -1;
+        if (fd >= 0) {
+            posix_fadvise(fd, localFrom, localTo - localFrom, POSIX_FADV_DONTNEED);
+        }
+    }
+#else
+    (void) beginOffset;
+    (void) endOffset;
+#endif
+}
+
+template <typename T>
 void DBReader<T>::dropCacheAll() {
 #ifdef HAVE_POSIX_FADVISE
     if ((dataMode & USE_DATA) == 0 || (dataMode & USE_FREAD) || compression == COMPRESSED) {

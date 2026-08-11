@@ -112,16 +112,14 @@ static DBLocalId loadAssignedCluster(const ClusterAssignment *assignedCluster, s
 }
 
 static bool isAssigned(const ClusterAssignment *assignedCluster, size_t sequenceId) {
-    if (assignedFlags == nullptr) {
-        return loadAssignedCluster(assignedCluster, sequenceId) != DB_LOCAL_ID_INVALID;
-    }
+    (void) assignedCluster;
     const uint64_t bit = uint64_t(1) << (sequenceId & 63);
     return (assignedFlags[sequenceId >> 6].load(std::memory_order_relaxed) & bit) != 0;
 }
 
 static void storeAssignedCluster(ClusterAssignment *assignedCluster, size_t sequenceId, DBLocalId representativeId) {
     assignedCluster[sequenceId].store(representativeId, std::memory_order_relaxed);
-    if (assignedFlags != nullptr && representativeId != DB_LOCAL_ID_INVALID) {
+    if (representativeId != DB_LOCAL_ID_INVALID) {
         std::atomic<uint64_t> &word = assignedFlags[sequenceId >> 6];
         word.store(word.load(std::memory_order_relaxed) | (uint64_t(1) << (sequenceId & 63)),
                    std::memory_order_relaxed);
@@ -156,36 +154,66 @@ static void compactSetCoverMemberPool() {
     setCoverMemberPool.swap(compactedPool);
 }
 
-static const size_t ALIGN2CLUST_DEFAULT_REORDER_LIMIT = 128 * 1024;
-
-// Env override for the reorder-buffer size; 0 (unset/invalid) means the default cap above.
-static size_t getReorderBufferLimitFromEnv() {
-    const char *envValue = getenv("MMSEQS_ALIGN2CLUST_REORDER_LIMIT");
-    if (envValue == nullptr || *envValue == '\0') {
-        return 0;
-    }
-
-    char *end = nullptr;
-    unsigned long long parsedValue = strtoull(envValue, &end, 10);
-    if (end == envValue || *end != '\0' || parsedValue == 0) {
-        Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_ALIGN2CLUST_REORDER_LIMIT=" << envValue
-                              << "; sizing the reorder buffer automatically\n";
-        return 0;
-    }
-    return static_cast<size_t>(parsedValue);
-}
+// measured high water on a 5 B run was 1.88 M, so this never blocks a producer
+static const size_t ALIGN2CLUST_DEFAULT_REORDER_LIMIT = 2 * 1000 * 1000;
 
 // Size the reorder buffer from free memory: subtract the resident per-sequence arrays,
-// keep 10% headroom, divide by the worst-case result size. Capped by
-// MMSEQS_ALIGN2CLUST_REORDER_LIMIT and by the number of results produced.
-static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int mode, size_t resultCount) {
+// keep 10% headroom, divide by the worst-case result size, cap by ALIGN2CLUST_DEFAULT_REORDER_LIMIT.
+// one drop per this many bytes: MADV_DONTNEED shoots down TLBs on every thread, and a range
+// smaller than a page frees nothing after the inward rounding
+static const size_t ALIGN2CLUST_CACHE_DROP_BYTES = 256 * 1024 * 1024;
+static const size_t ALIGN2CLUST_CACHE_DROP_STRIDE = 65536;
+static std::atomic<size_t> seqCacheDroppedTo(0);
+static std::atomic<size_t> alnCacheDroppedTo(0);
+
+// first id a query of this length can still cover; everything before it is out of the band for good
+static size_t coverageBandStart(DBReader<DBKeyType> *seqDbr, size_t queryId, float covThr, int covMode) {
+    const float queryLength = static_cast<float>(seqDbr->getSeqLen(queryId));
+    size_t low = 0;
+    size_t high = queryId;
+    while (low < high) {
+        const size_t mid = low + (high - low) / 2;
+        if (Util::canBeCovered(covThr, covMode, queryLength, static_cast<float>(seqDbr->getSeqLen(mid)))) {
+            high = mid;
+        } else {
+            low = mid + 1;
+        }
+    }
+    return low;
+}
+
+static void dropBehind(DBReader<DBKeyType> &reader, std::atomic<size_t> &droppedTo, size_t end) {
+    size_t seen = droppedTo.load(std::memory_order_relaxed);
+    if (end < seen + ALIGN2CLUST_CACHE_DROP_BYTES) {
+        return;
+    }
+    if (droppedTo.compare_exchange_strong(seen, end, std::memory_order_relaxed)) {
+        reader.dropCacheRange(seen, end);
+    }
+}
+
+// GREEDY visits (entry length descending, local id ascending), so such a db needs no visit order
+static bool seqDbIsLengthDescending(DBReader<DBKeyType> *reader, size_t dbSize, int threads) {
+    if (dbSize < 2) {
+        return true;
+    }
+    bool sorted = true;
+#pragma omp parallel for schedule(static) num_threads(threads) reduction(&&:sorted)
+    for (size_t i = 1; i < dbSize; ++i) {
+        sorted = sorted && (reader->getEntryLen(i - 1) >= reader->getEntryLen(i));
+    }
+    return sorted;
+}
+
+static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int mode, size_t resultCount,
+                                     bool ownsLengthOrder) {
     const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
 
     size_t fixedMemory = dbSize * sizeof(ClusterAssignment);
     fixedMemory += assignedFlagWordCount(dbSize) * sizeof(std::atomic<uint64_t>);
     if (mode == Parameters::SET_COVER) {
         fixedMemory += dbSize * sizeof(PrefInfo);
-    } else {
+    } else if (ownsLengthOrder) {
         // GREEDY keeps this visit order until every producer has completed.
         fixedMemory += dbSize * sizeof(DBLocalId);
     }
@@ -198,8 +226,7 @@ static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int m
                                   + ((mode == Parameters::SET_COVER) ? 0 : sizeof(ClusterResult));
 
     size_t capacity = std::min(resultCount, std::max<size_t>(1, budget / bytesPerResult));
-    const size_t userCap = getReorderBufferLimitFromEnv();  // 0 == use the default cap
-    capacity = std::min(capacity, userCap != 0 ? userCap : ALIGN2CLUST_DEFAULT_REORDER_LIMIT);
+    capacity = std::min(capacity, ALIGN2CLUST_DEFAULT_REORDER_LIMIT);
     capacity = std::max<size_t>(1, capacity);
 
     Debug(Debug::INFO) << "Reorder buffer sizing: memory limit " << memoryLimit << " byte, reserved (fixed) "
@@ -508,12 +535,12 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
     }
 }
 
-int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &alnDbr, DBWriter *alnWriter, int writeThreads) {
+int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &alnDbr, DBWriter *alnWriter) {
     DBReader<DBKeyType> *seqDbr = new DBReader<DBKeyType>(
         par.db1.c_str(), par.db1Index.c_str(), par.threads, 
         DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
     );
-    seqDbr->setIoBufferedBatch(true);
+    seqDbr->setIoCacheAdvice(true);
     seqDbr->open(DBReader<DBKeyType>::NOSORT);
 
     const size_t ioMemoryLimit = Util::computeMemory(par.splitMemoryLimit);
@@ -524,17 +551,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     const char *ioPolicy = getenv("MMSEQS_IO_POLICY");
     const bool ioPolicyPinned = ioPolicy != nullptr;
     const bool ioPolicyIsDirect = ioPolicyPinned && strcmp(ioPolicy, "direct") == 0;
-    if (cacheStarved && !ioPolicyPinned) {
-        seqDbr->setIoBufferedBatch(true);
-        alnDbr.setIoBufferedBatch(true);
-        const bool seqSwitched = seqDbr->setIoDirect(true);
-        const bool alnSwitched = alnDbr.setIoDirect(true);
-        if (!seqSwitched || !alnSwitched) {
-            Debug(Debug::WARNING) << "Could not switch every align2clust reader to buffered descriptors; "
-                                  << "keeping the supported mmap path(s)\n";
-        }
-    }
- 
     DBReader<DBKeyType> *cluDbr = nullptr;
     DBReader<DBKeyType> *cluSeqDbr = nullptr;
     if (par.filterCluDBFile.empty()== false && par.filterSeqDBFile.empty()== false) {
@@ -617,6 +633,27 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         assignedFlags[i].store(0, std::memory_order_relaxed);
     }
 
+    bool identityOrder = false;
+    if (mode != Parameters::SET_COVER) {
+        Timer orderTimer;
+        identityOrder = seqDbIsLengthDescending(seqDbr, dbSize, par.threads);
+        Debug(Debug::INFO) << "Sequence DB length order: "
+                           << (identityOrder ? "descending, visit order is the local id" : "unsorted")
+                           << " (" << orderTimer.lap() << ")\n";
+    }
+
+    // The sequence db is read scattered whatever the order, so descriptors still read less than a
+    // page fault per entry. A length ordered greedy run reads the prefilter strictly in id order,
+    // where a mapping with readahead beats one descriptor read per entry.
+    const bool seqOnMapping = (cacheStarved && !ioPolicyPinned)
+                              ? seqDbr->useDescriptorIo(true) == false : true;
+    if (cacheStarved && !ioPolicyPinned && !identityOrder) {
+        alnDbr.useDescriptorIo(true);
+    }
+    if (identityOrder) {
+        alnDbr.setSequentialAdvice();
+    }
+
     Timer timer;
     timer.reset();
     PrefInfo *prefRepSizePair = nullptr;
@@ -646,7 +683,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             }
         }
         SORT_PARALLEL(prefRepSizePair, prefRepSizePair + dbSize, PrefInfo::compareBySizeAndId);
-    } else {
+    } else if (identityOrder == false) {
         // NOSORT drops the reader's length order, so materialise it from a fused (length, id) array
         std::pair<unsigned int, DBLocalId> *sortForLength =
             new(std::nothrow) std::pair<unsigned int, DBLocalId>[dbSize];
@@ -677,8 +714,8 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     timer.reset();
 
     size_t endRange = (mode == Parameters::SET_COVER) ? dbSize : alnDbr.getSize();
-    // lengthOrder is indexed by i, so replace the bounds check getDbKey(i) used to do
-    if (lengthOrder != nullptr && endRange > dbSize) {
+    // the visit index addresses the sequence db directly, so replace the bounds check getDbKey(i) did
+    if (mode != Parameters::SET_COVER && endRange > dbSize) {
         Debug(Debug::ERROR) << "Alignment DB has " << endRange << " entries but the sequence DB has " << dbSize << "\n";
         EXIT(EXIT_FAILURE);
     }
@@ -687,7 +724,8 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     // resident while producers run, so reserve it here as well instead of overcommitting the
     // cache budget on a large GREEDY run.
     const size_t align2clustResultCount = (mode == Parameters::SET_COVER) ? dbSize : alnDbr.getSize();
-    const size_t reorderCapacityChosen = computeReorderCapacity(par, dbSize, mode, align2clustResultCount);
+    const size_t reorderCapacityChosen = computeReorderCapacity(par, dbSize, mode, align2clustResultCount,
+                                                                lengthOrder != nullptr);
     {
         std::lock_guard<std::mutex> lock(clusterMutex);
         reorderCapacity = reorderCapacityChosen;
@@ -709,12 +747,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     std::thread clusterThread(clusterThreadFunc, assignedCluster);
 
     unsigned int swMode = Alignment::initSWMode(par.alignmentMode, par.covThr, par.seqIdThr);
-    bool dropAlnCache = cacheStarved && !ioPolicyIsDirect;
-    if (const char *dropEnv = getenv("MMSEQS_A2C_DROP_ALN")) {
-        if (strcmp(dropEnv, "1") == 0) dropAlnCache = true;
-        else if (strcmp(dropEnv, "0") == 0) dropAlnCache = false;
-        else Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_DROP_ALN=" << dropEnv << " (use 0 or 1)\n";
-    }
+    bool dropAlnCache = cacheStarved && !ioPolicyIsDirect && !identityOrder;
     const size_t alnEpoch = dropAlnCache
         ? std::max<size_t>(ioMemoryLimit / 4 / Util::getPageSize(), 1)
         : std::max<size_t>(endRange, 1);
@@ -787,7 +820,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 }
                 clusterResult.prefSize = prefRepSizePair[i].size;   // precomputed in the prefix pass
             } else { // GREEDY || GREEDY_MEM
-                representativeId = lengthOrder[i];
+                representativeId = identityOrder ? i : lengthOrder[i];
                 if (needQueryKey) {
                     queryKey = seqDbr->getDbKey(representativeId);
                 }
@@ -1168,6 +1201,18 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 alnWriter->writeData(alnResultBuffer.c_str(), alnResultBuffer.length(), queryKey, threadIdx);
             }
             pushClusterResult(std::move(clusterResult));
+
+            if (identityOrder && i > reorderCapacity && (i % ALIGN2CLUST_CACHE_DROP_STRIDE) == 0) {
+                // a producer here is not blocked, so every entry this far back is already consumed
+                const size_t safeEnd = i - reorderCapacity;
+                if (localPrefilterIds) {
+                    dropBehind(alnDbr, alnCacheDroppedTo, alnDbr.getOffset(safeEnd));
+                }
+                if (seqOnMapping) {
+                    dropBehind(*seqDbr, seqCacheDroppedTo,
+                               seqDbr->getOffset(coverageBandStart(seqDbr, safeEnd, par.covThr, par.covMode)));
+                }
+            }
         }
             if (lengthOrder != nullptr || dropAlnCache) {
 #pragma omp barrier
@@ -1184,6 +1229,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
     // nothing past the producer loop reads the visit order, so drop it before memberOrder is sized
     delete[] lengthOrder;
+    // no sequence body is read past here either; writeClustering only needs the index
+    seqDbr->dropCacheAll();
+    seqDbr->unmapData();
 
     {
         std::lock_guard<std::mutex> lock(clusterMutex);
@@ -1214,11 +1262,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             assignedCluster[i].store(i, std::memory_order_relaxed);
         }
     }
-    if (assignedFlags != nullptr) {
 #pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < assignedFlagWordCount(dbSize); ++i) {
-            assignedFlags[i].store(UINT64_MAX, std::memory_order_relaxed);
-        }
+    for (size_t i = 0; i < assignedFlagWordCount(dbSize); ++i) {
+        assignedFlags[i].store(UINT64_MAX, std::memory_order_relaxed);
     }
 
     // group members by representative through a local-id permutation: 8 byte per sequence, not 16
@@ -1250,7 +1296,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     Debug(Debug::INFO) << "Number of clusters: " << clusterCount << "\n";
 
     Timer writeTimer;
-    writeClustering(&resultWriter, seqDbr, assignedCluster, memberOrder, dbSize, writeThreads);
+    writeClustering(&resultWriter, seqDbr, assignedCluster, memberOrder, dbSize, par.threads);
     Debug(Debug::INFO) << "Time for writing clusters: " << writeTimer.lap() << "\n";
 
     delete[] memberOrder;
@@ -1287,17 +1333,7 @@ int align2clust(int argc, const char **argv, const Command &command) {
     alnDbr.open(DBReader<DBKeyType>::NOSORT);
     int dbtype =  Parameters::DBTYPE_CLUSTER_RES;
 
-    // A/B escape for the parallel cluster writer; the concatenation order makes the output identical
-    int writeThreads = par.threads;
-    if (const char *env = getenv("MMSEQS_A2C_WRITE_THREADS")) {
-        const long parsed = strtol(env, NULL, 10);
-        if (parsed > 0 && parsed <= par.threads) {
-            writeThreads = static_cast<int>(parsed);
-        } else {
-            Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_A2C_WRITE_THREADS=" << env << "\n";
-        }
-    }
-    DBWriter resultWriter(par.db3.c_str(), par.db3Index.c_str(), writeThreads, par.compressed, dbtype);
+    DBWriter resultWriter(par.db3.c_str(), par.db3Index.c_str(), par.threads, par.compressed, dbtype);
     resultWriter.open();
 
     // Optional alignment-result output; path derived from the cluster DB (db3 + "_aln").
@@ -1319,7 +1355,7 @@ int align2clust(int argc, const char **argv, const Command &command) {
         alnWriter->open();
     }
 
-    int status = doAlign2clust(par, resultWriter, alnDbr, alnWriter, writeThreads);
+    int status = doAlign2clust(par, resultWriter, alnDbr, alnWriter);
 
     Debug(Debug::INFO) << "Time for run Align2Clust: " << timer.lap() << " sec\n";
 

@@ -213,6 +213,10 @@ public:
     // contains a full page and frees nothing; only a whole-file range reliably does.
     void dropCacheAll();
 
+    // Same, for one byte range. Rounded inward: a partial page still holds live neighbours, and
+    // neither madvise nor fadvise would free it anyway.
+    void dropCacheRange(size_t beginOffset, size_t endOffset);
+
     // Reads ids[0..n) as one io_uring submission, so the device sees the whole batch at once
     // instead of one blocking pread at a time. Returns how many were loaded, which is less than
     // n when the arena fills up; the caller advances and calls again. On mmap the entries are

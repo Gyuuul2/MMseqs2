@@ -21,12 +21,54 @@
 #include <omp.h>
 #endif
 
+// both go through the batch, per split length sort and joint merge; only mode 2 has the GPU layout
+static bool isSortedCreatedbMode(int mode) {
+    return mode == Parameters::SEQUENCE_SPLIT_MODE_GPU
+        || mode == Parameters::SEQUENCE_SPLIT_MODE_GPU_DESC;
+}
+
+struct IndexOffset {
+    bool operator()(const DBReader<DBKeyType>::Index &first, const DBReader<DBKeyType>::Index &second) const {
+        return DBReader<DBKeyType>::Index::compareByOffset(first, second);
+    }
+};
+
+struct IndexLengthAsc {
+    bool operator()(const DBReader<DBKeyType>::Index &first, const DBReader<DBKeyType>::Index &second) const {
+        return DBReader<DBKeyType>::Index::compareByLength(first, second);
+    }
+};
+
+// same tie break as ascending, so reversing the length only reverses whole length groups
+struct IndexLengthDesc {
+    bool operator()(const DBReader<DBKeyType>::Index &first, const DBReader<DBKeyType>::Index &second) const {
+        if (first.length != second.length) {
+            return first.length > second.length;
+        }
+        if (first.offset != second.offset) {
+            return first.offset < second.offset;
+        }
+        return first.id < second.id;
+    }
+};
+
+// ips4o inlines a functor but not a function pointer, so the direction is a type, not an argument
+template <typename Comp>
+static void sortIndexRange(DBReader<DBKeyType>::Index *index, size_t size, Comp comp) {
+    if (omp_in_parallel()) {
+        SORT_SERIAL(index, index + size, comp);
+    } else {
+        SORT_PARALLEL(index, index + size, comp);
+    }
+}
+
 // Sort the data file in-place using your index array
 int sortWithIndex(const char *dataFileSeq,
                   const char *indexFileSeq,
                   const char *dataFileHeader,
                   const char *indexFileHeader,
-                  unsigned int threads)
+                  unsigned int threads,
+                  bool descending)
 {
     DBReader<DBKeyType> reader(dataFileSeq, indexFileSeq, 1, DBReader<DBKeyType>::USE_INDEX);
     reader.open(DBReader<DBKeyType>::HARDNOSORT);
@@ -51,10 +93,10 @@ int sortWithIndex(const char *dataFileSeq,
         index[i].id = i;
     }
 
-    if (omp_in_parallel()) {
-        SORT_SERIAL(index, index + reader.getSize(), DBReader<DBKeyType>::Index::compareByLength);
+    if (descending) {
+        sortIndexRange(index, reader.getSize(), IndexLengthDesc());
     } else {
-        SORT_PARALLEL(index, index + reader.getSize(), DBReader<DBKeyType>::Index::compareByLength);
+        sortIndexRange(index, reader.getSize(), IndexLengthAsc());
     }
 
     FILE *seqOut = FileUtil::openFileOrDie(dataFileSeq, "wb", true);
@@ -109,11 +151,7 @@ int sortWithIndex(const char *dataFileSeq,
     fclose(headerout);
     delete [] buf;
 
-    if (omp_in_parallel()) {
-        SORT_SERIAL(index, index + reader.getSize(), DBReader<DBKeyType>::Index::compareByOffset);
-    } else {
-        SORT_PARALLEL(index, index + reader.getSize(), DBReader<DBKeyType>::Index::compareByOffset);
-    }
+    sortIndexRange(index, reader.getSize(), IndexOffset());
     {
         std::string tmpIndex = std::string(indexFileSeq) + ".tmp";
         FILE *indexout = FileUtil::openFileOrDie(tmpIndex.c_str(), "wb", false);
@@ -145,7 +183,9 @@ int mergeSequentialByJointIndex(
         const char * outLookupFile,
         std::vector<unsigned int>* sourceLookup,
         size_t totalEntries,
-        size_t shuffleSplits
+        size_t shuffleSplits,
+        bool descending,
+        bool gpuLayout
 ) {
     struct JointEntry {
         unsigned int fileIdx;
@@ -155,12 +195,22 @@ int mergeSequentialByJointIndex(
         JointEntry(unsigned int fileIdx, DBKeyType id, unsigned int length)
             : fileIdx(fileIdx), id(id), length(length) {}
 
-        bool operator<(JointEntry const &o) const {
-            if (length != o.length){
-                return length < o.length;
+        struct Asc {
+            bool operator()(const JointEntry &first, const JointEntry &second) const {
+                if (first.length != second.length) {
+                    return first.length < second.length;
+                }
+                return first.id < second.id;
             }
-            return id < o.id;
-        }
+        };
+        struct Desc {
+            bool operator()(const JointEntry &first, const JointEntry &second) const {
+                if (first.length != second.length) {
+                    return first.length > second.length;
+                }
+                return first.id < second.id;
+            }
+        };
     };
 
     std::vector<JointEntry> joint(totalEntries);
@@ -190,7 +240,11 @@ int mergeSequentialByJointIndex(
         reader.close();
     }
 
-    SORT_PARALLEL(joint.begin(), joint.end());
+    if (descending) {
+        SORT_PARALLEL(joint.begin(), joint.end(), JointEntry::Desc());
+    } else {
+        SORT_PARALLEL(joint.begin(), joint.end(), JointEntry::Asc());
+    }
 
     // 4) Open each data file once (no fseek later)
     std::vector<FILE*> inFileSeq(shuffleSplits);
@@ -261,7 +315,7 @@ int mergeSequentialByJointIndex(
             EXIT(EXIT_FAILURE);
         }
         size_t written = fwrite(scratch.data(), 1, qe.length, fout);
-        const size_t sequencepadding = (qe.length % ALIGN == 0) ? 0 : ALIGN - qe.length % ALIGN;
+        const size_t sequencepadding = (gpuLayout == false || qe.length % ALIGN == 0) ? 0 : ALIGN - qe.length % ALIGN;
         written +=  fwrite(pad_buffer, 1, sequencepadding, fout);
         if (UNLIKELY(written != qe.length + sequencepadding)) {
             Debug(Debug::ERROR) << "Can not write to data file " << outDataFile << "\n";
@@ -298,8 +352,8 @@ int mergeSequentialByJointIndex(
         }
 
         entry.offset = mergedOffset;
-        // + 2 is needed for newline and null character
-        entry.length = qe.length + 2;
+        // the GPU layout stores neither, so its index still has to account for newline and terminator
+        entry.length = gpuLayout ? qe.length + 2 : qe.length;
         entry.id = i;
         DBWriter::writeIndexEntryToFile(idxOut, indexBuffer, entry);
         entry.length = writeHeaderBuf.size();
@@ -328,7 +382,20 @@ int mergeSequentialByJointIndex(
 void processSeqBatch(Parameters & par, DBWriter &seqWriter, DBWriter &hdrWriter, BaseMatrix *subMat, int querySeqType,
                      Masker ** masker, Sequence ** seqs, size_t currId,
                      std::vector<std::pair<std::vector<char>, std::string>> &entries, const size_t entriesSize,
-                     unsigned int shuffleSplits){
+                     unsigned int shuffleSplits, bool gpuLayout){
+    if (gpuLayout == false) {
+        const char newline = '\n';
+        for (size_t i = 0; i < entriesSize; i++) {
+            const size_t id = currId + i;
+            const size_t splitIdx = id % shuffleSplits;
+            seqWriter.writeStart(splitIdx);
+            seqWriter.writeAdd(entries[i].first.data(), entries[i].first.size(), splitIdx);
+            seqWriter.writeAdd(&newline, 1, splitIdx);
+            seqWriter.writeEnd(id, splitIdx, true);
+            hdrWriter.writeData(entries[i].second.c_str(), entries[i].second.length(), id, splitIdx);
+        }
+        return;
+    }
     if(masker[0] == NULL){
         for(int i = 0; i < par.threads; i++){
             masker[i] = new Masker(*subMat);
@@ -836,8 +903,8 @@ int createdb(int argc, const char **argv, const Command& command) {
         par.shuffleDatabase = false;
     }
 
-    if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU && par.shuffleDatabase == false) {
-        Debug(Debug::WARNING) << "Shuffle database cannot be turned off for --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_GPU << "\n";
+    if (isSortedCreatedbMode(par.createdbMode) && par.shuffleDatabase == false) {
+        Debug(Debug::WARNING) << "Shuffle database cannot be turned off for --createdb-mode " << par.createdbMode << "\n";
         Debug(Debug::WARNING) << "We recompute with --shuffle 1\n";
         par.shuffleDatabase = true;
     }
@@ -909,7 +976,7 @@ int createdb(int argc, const char **argv, const Command& command) {
         return ret;
     }
 
-    const bool needSourceLookup = par.writeLookup || par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU;
+    const bool needSourceLookup = par.writeLookup || isSortedCreatedbMode(par.createdbMode);
     std::vector<unsigned int>* sourceLookup = needSourceLookup ? new std::vector<unsigned int>[shuffleSplits]() : NULL;
     if (sourceLookup != NULL) {
         for (size_t i = 0; i < shuffleSplits; ++i) {
@@ -1121,7 +1188,8 @@ int createdb(int argc, const char **argv, const Command& command) {
                         }
                     }
                     processSeqBatch(par, seqWriter, hdrWriter, subMat, dbType, masker, seqs,
-                                    id - (batchPos - 1), batchEntries, batchPos, shuffleSplits);
+                                    id - (batchPos - 1), batchEntries, batchPos, shuffleSplits,
+                                    par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU);
                     batchPos = 0;
                 }
             }
@@ -1131,7 +1199,7 @@ int createdb(int argc, const char **argv, const Command& command) {
             header.clear();
         }
 
-        if(par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU && batchPos > 0){
+        if(isSortedCreatedbMode(par.createdbMode) && batchPos > 0){
             if(subMat == NULL){
                 if (isNuclCnt == sampleCount) {
                     subMat = new NucleotideMatrix(par.scoringMatrixFile.values.nucleotide().c_str(), 2.0, -0.0f);
@@ -1142,7 +1210,8 @@ int createdb(int argc, const char **argv, const Command& command) {
                 }
             }
             processSeqBatch(par, seqWriter, hdrWriter, subMat, dbType, masker, seqs,
-                            (par.identifierOffset + entries_num) - (batchPos - 1), batchEntries, batchPos, shuffleSplits);
+                            (par.identifierOffset + entries_num) - (batchPos - 1), batchEntries, batchPos, shuffleSplits,
+                            par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU);
             batchPos = 0;
         }
 
@@ -1166,8 +1235,10 @@ int createdb(int argc, const char **argv, const Command& command) {
     // sort
     bool gpuCompatibleDB = false;
     Timer timer;
-    if(par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU){
-        gpuCompatibleDB = true;
+    const bool descendingLength = (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU_DESC);
+    const bool gpuLayout = (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU);
+    if(isSortedCreatedbMode(par.createdbMode)){
+        gpuCompatibleDB = gpuLayout;
         hdrWriter.closeFiles();
         seqWriter.closeFiles();
         size_t maxSplitBytes = 0;
@@ -1186,7 +1257,7 @@ int createdb(int argc, const char **argv, const Command& command) {
         for(unsigned int i = 0; i < shuffleSplits; i++){
             sortWithIndex(seqWriter.getDataFileNames()[i], seqWriter.getIndexFileNames()[i],
                           hdrWriter.getDataFileNames()[i], hdrWriter.getIndexFileNames()[i],
-                          sortThreads);
+                          sortThreads, descendingLength);
         }
         Debug(Debug::INFO) << "Sort single files in " << timer.lap() << "\n";
         std::string lookupFile = dataFile + ".lookup";
@@ -1196,7 +1267,8 @@ int createdb(int argc, const char **argv, const Command& command) {
                                     hdrWriter.getDataFileNames(), hdrWriter.getIndexFileNames(),
                                     seqWriter.getDataFileName(), seqWriter.getIndexFileName(),
                                     hdrWriter.getDataFileName(), hdrWriter.getIndexFileName(),
-                                    lookupFile.c_str(), sourceLookup, entries_num, shuffleSplits);
+                                    lookupFile.c_str(), sourceLookup, entries_num, shuffleSplits,
+                                    descendingLength, gpuLayout);
         Debug(Debug::INFO) << "Merge all files " << timer.lap() << "\n";
         hdrWriter.clearMemory();
         seqWriter.clearMemory();

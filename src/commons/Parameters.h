@@ -302,6 +302,7 @@ public:
     static const int SEQUENCE_SPLIT_MODE_HARD = 0;
     static const int SEQUENCE_SPLIT_MODE_SOFT = 1;
     static const int SEQUENCE_SPLIT_MODE_GPU = 2;
+    static const int SEQUENCE_SPLIT_MODE_GPU_DESC = 3;
 
     // rescorediagonal
     static const int RESCORE_MODE_HAMMING = 0;
