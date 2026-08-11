@@ -287,6 +287,7 @@ Parameters::Parameters():
         PARAM_CREATEDB_MODE(PARAM_CREATEDB_MODE_ID, "--createdb-mode", "Createdb mode", "Createdb mode 0: copy data, 1: soft link data and write new index (works only with single line fasta/q) 2: GPU compatible db", typeid(int), (void *) &createdbMode, "^[0-2]{1}$"),
         PARAM_CREATEDB_THREADS(PARAM_CREATEDB_THREADS_ID, "--createdb-threads", "Createdb file threads", "Input file workers for createdb mode 0. Raise toward the number of independent storage devices. 0: default, never more than --threads", typeid(int), (void *) &createdbThreads, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_SHUFFLE(PARAM_SHUFFLE_ID, "--shuffle", "Shuffle input database", "Shuffle input database", typeid(bool), (void *) &shuffleDatabase, ""),
+        PARAM_SHUFFLE_SPLITS(PARAM_SHUFFLE_SPLITS_ID, "--shuffle-splits", "Shuffle splits", "Number of temporary splits the input is scattered over. Raise it when a single split no longer fits in memory", typeid(int), (void *) &shuffleSplits, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_WRITE_LOOKUP(PARAM_WRITE_LOOKUP_ID, "--write-lookup", "Write lookup file", "write .lookup file containing mapping from internal id, fasta id and file number", typeid(int), (void *) &writeLookup, "^[0-1]{1}", MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_HEADER_FILE(PARAM_USE_HEADER_FILE_ID, "--use-header-file", "Use header DB", "use the sequence header DB instead of the body to map the entry keys", typeid(bool), (void *) &useHeaderFile, ""),
         // setextendeddbtype
@@ -966,6 +967,7 @@ Parameters::Parameters():
     // create db
     createdb.push_back(&PARAM_DB_TYPE);
     createdb.push_back(&PARAM_SHUFFLE);
+    createdb.push_back(&PARAM_SHUFFLE_SPLITS);
     createdb.push_back(&PARAM_CREATEDB_MODE);
     createdb.push_back(&PARAM_CREATEDB_THREADS);
     createdb.push_back(&PARAM_WRITE_LOOKUP);
@@ -2887,6 +2889,7 @@ void Parameters::setDefaults() {
     createdbMode = SEQUENCE_SPLIT_MODE_HARD;
     createdbThreads = 0;
     shuffleDatabase = true;
+    shuffleSplits = 32;
     writeLookup = true;
 
     // format alignment

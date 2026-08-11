@@ -229,7 +229,12 @@ public:
     // things: a full scan wants the readahead only a mapping gets, a scattered gather wants reads
     // that fetch the entry and nothing around it. No thread may hold a data pointer across this
     // call. Returns false when the reader cannot serve descriptors, so the caller keeps the mapping.
-    bool setIoDirect(bool direct);
+    // Moves this reader off its mapping onto file descriptors, for a phase whose access is scattered
+    // enough that a page fault per entry costs more than a read. keepPageCache leaves the descriptors
+    // buffered so repeats still hit the cache; without it they carry O_DIRECT and bypass it entirely.
+    // No thread may hold a data pointer across this call. Returns false when the reader cannot serve
+    // descriptors, so the caller simply keeps the mapping.
+    bool useDescriptorIo(bool keepPageCache);
 
     void close();
 

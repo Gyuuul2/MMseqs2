@@ -484,7 +484,7 @@ void applyBatchClusterAutomagic(Parameters &par, const std::string &clusterCmd) 
     }
 }
 
-std::string buildRound0ClusterPar(Parameters &par, const std::string &clusterCmd) {
+std::string buildRound0ClusterPar(Parameters &par, const std::string &clusterCmd, bool forceClustHash = false) {
     const float prevSeqIdThr = par.seqIdThr;
     const float prevCovThr = par.covThr;
     const int prevCovMode = par.covMode;
@@ -507,6 +507,9 @@ std::string buildRound0ClusterPar(Parameters &par, const std::string &clusterCmd
     applyBatchClusterAutomagic(par, clusterCmd);
     applyRound0ClusterDefaults(par, clusterCmd);
     applyRound0ClusterOverrides(par);
+    if (forceClustHash) {
+        par.clustHash = true;
+    }
 
     std::string round0Par = buildInnerClusterParFromCurrent(par, clusterCmd);
 
@@ -549,6 +552,7 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
     const std::string createtsvPar = buildCreatetsvPar(par);
 
     cmd.addVariable("CLUSTER_CMD", clusterCmd.c_str());
+    cmd.addVariable("ROUND0_CLUSTER_CMD", clusterCmd == "cluster" ? "linclust" : NULL);
     cmd.addVariable("CLUSTER_PAR", clusterPar.c_str());
     cmd.addVariable("ROUND0_CLUSTER_PAR", round0ClusterPar.empty() ? NULL : round0ClusterPar.c_str());
     cmd.addVariable("CREATEDB_PAR", createdbPar.c_str());
@@ -787,7 +791,7 @@ int clusterbatch(int argc, const char **argv, const Command &command) {
     restoreRequestedThreads(par, requestedThreads);
     resolveBatchMergeParallelism(par);
     validateBatchBackend(par);
-    std::string round0ClusterPar = buildRound0ClusterPar(par, "cluster");
+    std::string round0ClusterPar = buildRound0ClusterPar(par, "linclust", true);
     std::string clusterPar = buildInnerClusterPar(par, "cluster");
     par.printParameters(command.cmd, argc, argv, *command.params);
     return runBatchClustering(par, command, par.clusterbatch, "cluster", clusterPar, round0ClusterPar);
@@ -818,7 +822,7 @@ int clusterbatchworker(int argc, const char **argv, const Command &command) {
     par.parseParameters(argc, argv, command, false, 0, 0);
     restoreRequestedThreads(par, requestedThreads);
     resolveBatchMergeParallelism(par);
-    std::string round0ClusterPar = buildRound0ClusterPar(par, "cluster");
+    std::string round0ClusterPar = buildRound0ClusterPar(par, "linclust", true);
     std::string clusterPar = buildInnerClusterPar(par, "cluster");
     par.printParameters(command.cmd, argc, argv, *command.params);
 

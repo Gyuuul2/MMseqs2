@@ -682,6 +682,7 @@ public:
     int createdbMode;
     int createdbThreads;
     bool shuffleDatabase;
+    int shuffleSplits;
 
     // splitsequence
     int sequenceOverlap;
@@ -1149,6 +1150,7 @@ public:
     PARAMETER(PARAM_CREATEDB_MODE)
     PARAMETER(PARAM_CREATEDB_THREADS)
     PARAMETER(PARAM_SHUFFLE)
+    PARAMETER(PARAM_SHUFFLE_SPLITS)
     PARAMETER(PARAM_WRITE_LOOKUP)
 
     // convert2fasta

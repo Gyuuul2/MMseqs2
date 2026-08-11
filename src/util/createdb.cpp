@@ -13,6 +13,7 @@
 #include "FastSort.h"
 #include "Masker.h"
 
+#include <atomic>
 #include <cctype>
 #include <sys/resource.h>
 
@@ -50,7 +51,11 @@ int sortWithIndex(const char *dataFileSeq,
         index[i].id = i;
     }
 
-    SORT_PARALLEL(index, index + reader.getSize(), DBReader<DBKeyType>::Index::compareByLength);
+    if (omp_in_parallel()) {
+        SORT_SERIAL(index, index + reader.getSize(), DBReader<DBKeyType>::Index::compareByLength);
+    } else {
+        SORT_PARALLEL(index, index + reader.getSize(), DBReader<DBKeyType>::Index::compareByLength);
+    }
 
     FILE *seqOut = FileUtil::openFileOrDie(dataFileSeq, "wb", true);
     setvbuf(seqOut, NULL, _IOFBF, 1024*1024*50);
@@ -104,7 +109,11 @@ int sortWithIndex(const char *dataFileSeq,
     fclose(headerout);
     delete [] buf;
 
-    SORT_PARALLEL(index, index + reader.getSize(), DBReader<DBKeyType>::Index::compareByOffset);
+    if (omp_in_parallel()) {
+        SORT_SERIAL(index, index + reader.getSize(), DBReader<DBKeyType>::Index::compareByOffset);
+    } else {
+        SORT_PARALLEL(index, index + reader.getSize(), DBReader<DBKeyType>::Index::compareByOffset);
+    }
     {
         std::string tmpIndex = std::string(indexFileSeq) + ".tmp";
         FILE *indexout = FileUtil::openFileOrDie(tmpIndex.c_str(), "wb", false);
@@ -142,6 +151,7 @@ int mergeSequentialByJointIndex(
         unsigned int fileIdx;
         DBKeyType id;
         unsigned int length;
+        JointEntry() = default;
         JointEntry(unsigned int fileIdx, DBKeyType id, unsigned int length)
             : fileIdx(fileIdx), id(id), length(length) {}
 
@@ -153,9 +163,16 @@ int mergeSequentialByJointIndex(
         }
     };
 
-    std::vector<JointEntry> joint;
-    joint.reserve(totalEntries);
+    std::vector<JointEntry> joint(totalEntries);
     size_t maxLen = 0;
+    // the sort below is a total order on (length, id), so the fill order does not reach the output
+    std::atomic<size_t> jointCursor(0);
+    const size_t indexBytesPerSplit = totalEntries / std::max<size_t>(shuffleSplits, 1)
+                                      * sizeof(DBReader<DBKeyType>::Index);
+    const size_t fillThreads = std::max<size_t>(1, std::min<size_t>(
+        std::min<size_t>(shuffleSplits, omp_get_max_threads()),
+        indexBytesPerSplit ? Util::computeMemory(0) / 8 / indexBytesPerSplit : shuffleSplits));
+#pragma omp parallel for schedule(dynamic, 1) num_threads(fillThreads) reduction(max: maxLen)
     for (size_t i = 0; i < shuffleSplits; i++) {
         DBReader<DBKeyType> reader(
                 dataFiles[i],
@@ -165,8 +182,9 @@ int mergeSequentialByJointIndex(
         );
         reader.open(DBReader<DBKeyType>::HARDNOSORT);
         DBReader<DBKeyType>::Index* index = reader.getIndex();
+        const size_t at = jointCursor.fetch_add(reader.getSize(), std::memory_order_relaxed);
         for(size_t j = 0; j < reader.getSize(); j++){
-            joint.emplace_back((unsigned int)i, index[j].id, index[j].length);
+            joint[at + j] = JointEntry((unsigned int)i, index[j].id, index[j].length);
             maxLen = std::max(maxLen, static_cast<size_t>(index[j].length));
         }
         reader.close();
@@ -265,7 +283,7 @@ int mergeSequentialByJointIndex(
         if (lookupEntry.entryName.empty()) {
             Debug(Debug::WARNING) << "Cannot extract identifier from entry " << lookupEntry.id  << "\n";
         }
-        lookupEntry.fileNumber = sourceLookup[qe.fileIdx][(qe.id - qe.fileIdx) / 32];
+        lookupEntry.fileNumber = sourceLookup[qe.fileIdx][(qe.id - qe.fileIdx) / shuffleSplits];
         lookupBuffer.clear();
         DBReader<DBKeyType>::lookupEntryToBuffer(lookupBuffer, lookupEntry);
         written = fwrite(lookupBuffer.data(), 1, lookupBuffer.size(), foutLookup);
@@ -839,7 +857,7 @@ int createdb(int argc, const char **argv, const Command& command) {
 
 
 
-    const unsigned int shuffleSplits = par.shuffleDatabase ? 32 : 1;
+    const unsigned int shuffleSplits = par.shuffleDatabase ? (unsigned int)par.shuffleSplits : 1;
     if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT && par.compressed) {
         Debug(Debug::WARNING) << "Compressed database cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_SOFT << "\n";
         Debug(Debug::WARNING) << "We recompute with --compressed 0\n";
@@ -1125,6 +1143,7 @@ int createdb(int argc, const char **argv, const Command& command) {
             }
             processSeqBatch(par, seqWriter, hdrWriter, subMat, dbType, masker, seqs,
                             (par.identifierOffset + entries_num) - (batchPos - 1), batchEntries, batchPos, shuffleSplits);
+            batchPos = 0;
         }
 
         if (numEntriesInCurrFile == 0) {
@@ -1151,10 +1170,23 @@ int createdb(int argc, const char **argv, const Command& command) {
         gpuCompatibleDB = true;
         hdrWriter.closeFiles();
         seqWriter.closeFiles();
+        size_t maxSplitBytes = 0;
+        for (unsigned int i = 0; i < shuffleSplits; i++) {
+            maxSplitBytes = std::max(maxSplitBytes,
+                                     std::max(FileUtil::getFileSize(seqWriter.getDataFileNames()[i]),
+                                              FileUtil::getFileSize(hdrWriter.getDataFileNames()[i])));
+        }
+        // sortWithIndex slurps a whole split into RAM, so memory caps the concurrency, not the core count
+        const unsigned int sortSplits = std::max<size_t>(1, std::min<size_t>(
+                std::min<size_t>(shuffleSplits, par.threads),
+                maxSplitBytes ? Util::computeMemory(0) / 2 / maxSplitBytes : shuffleSplits));
+        const unsigned int sortThreads = std::max<unsigned int>(1, par.threads / sortSplits);
+        Debug(Debug::INFO) << "Sorting " << shuffleSplits << " splits " << sortSplits << " at a time\n";
+#pragma omp parallel for schedule(dynamic, 1) num_threads(sortSplits)
         for(unsigned int i = 0; i < shuffleSplits; i++){
             sortWithIndex(seqWriter.getDataFileNames()[i], seqWriter.getIndexFileNames()[i],
                           hdrWriter.getDataFileNames()[i], hdrWriter.getIndexFileNames()[i],
-                          par.threads);
+                          sortThreads);
         }
         Debug(Debug::INFO) << "Sort single files in " << timer.lap() << "\n";
         std::string lookupFile = dataFile + ".lookup";

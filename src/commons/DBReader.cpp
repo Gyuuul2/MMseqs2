@@ -648,7 +648,10 @@ template <typename T> void DBReader<T>::freeDirectBuffers() {
     directBuffers = NULL;
 }
 
-template <typename T> bool DBReader<T>::setIoDirect(bool direct) {
+template <typename T> bool DBReader<T>::useDescriptorIo(bool keepPageCache) {
+    // set before the switch: openDirect reads it to decide whether the descriptors carry O_DIRECT
+    ioBufferedBatch = keepPageCache;
+    const bool direct = true;
     if ((dataMode & USE_DATA) == 0 || closed == 1 || dataMapped == false) {
         return false;
     }

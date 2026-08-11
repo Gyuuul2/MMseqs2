@@ -34,7 +34,7 @@ Usage:
 Environment (normally exported by mmseqs from the linclust-batch/cluster-batch command line;
 set them directly only when running this script standalone):
   MMSEQS ROUND0_MMSEQS THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_BUCKETS MERGE_BUCKET_JOBS COMPRESS_RATIO
-  CLUSTER_CMD CLUSTER_PAR ROUND0_CLUSTER_PAR CLUSTER_COV_MODE CREATEDB_PAR CREATETSV_PAR COMPRESS_BATCH_OUTPUTS SORT_BUFFER_SIZE SORT_TMP
+  CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_PAR ROUND0_CLUSTER_PAR CLUSTER_COV_MODE CREATEDB_PAR CREATETSV_PAR COMPRESS_BATCH_OUTPUTS SORT_BUFFER_SIZE SORT_TMP
   MAX_ROUNDS MIN_REDUCTION_RATIO MIN_REDUCTION_COUNT CONVERGENCE_PATIENCE MAX_CHUNK_ATTEMPTS
   REMOVE_TMP NODE_WORK_DIR ROUND0_NODE_WORK_DIR
   BATCH_SLURM_NODELIST ROUND0_BATCH_SLURM_NODELIST BATCH_SLURM_PARTITION ROUND0_BATCH_SLURM_PARTITION
@@ -87,6 +87,7 @@ validate_createdb_par() {
 }
 validate_createdb_par
 CLUSTER_CMD=${CLUSTER_CMD:-linclust}
+ROUND0_CLUSTER_CMD=${ROUND0_CLUSTER_CMD:-}
 CLUSTER_COV_MODE=${CLUSTER_COV_MODE:-1}
 if [[ -z "${CLUSTER_PAR+x}" ]]; then
     if [[ "$CLUSTER_CMD" == "cluster" ]]; then
@@ -182,6 +183,15 @@ round_cluster_par() {
     [[ "$round" -eq 0 ]] && spill=0
     [[ -n "${BATCH_KMER_WRITE_TO_DISK:-}" ]] && spill="$BATCH_KMER_WRITE_TO_DISK"
     printf '%s --kmer-write-to-disk %s' "$(par_without_flag "$base" --kmer-write-to-disk)" "$spill"
+}
+
+round_cluster_cmd() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_CLUSTER_CMD:-}" ]]; then
+        printf '%s' "$ROUND0_CLUSTER_CMD"
+    else
+        printf '%s' "$CLUSTER_CMD"
+    fi
 }
 
 round_chunk_max_bytes() {
@@ -1131,9 +1141,11 @@ cluster_chunk() {
         rm -f "$chunk_uri"
     fi
 
-    log "${CLUSTER_CMD} ${chunk_id}"
+    local cluster_cmd
+    cluster_cmd=$(round_cluster_cmd "$round")
+    log "${cluster_cmd} ${chunk_id}"
     # shellcheck disable=SC2046,SC2086
-    "$mmseqs_bin" ${CLUSTER_CMD} "$db" "$clu" "$work_dir/tmp" $(round_cluster_par "$round") || fail "${CLUSTER_CMD} failed (chunk ${chunk_id}, rc=$?)"
+    "$mmseqs_bin" "$cluster_cmd" "$db" "$clu" "$work_dir/tmp" $(round_cluster_par "$round") || fail "${cluster_cmd} failed (chunk ${chunk_id}, rc=$?)"
 
     log "createtsv ${chunk_id}"
     # shellcheck disable=SC2086
@@ -1781,7 +1793,7 @@ write_batch_exports() {
     for name in \
         MMSEQS ROUND0_MMSEQS THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS ROUND0_CHUNK_MAX_BYTES ROUND0_CHUNK_MAX_SEQS \
         S3_CHUNK_PREFIX COMPRESS_BATCH_OUTPUTS \
-        CREATEDB_PAR ROUND0_CREATEDB_MODE BATCH_DELETE_SOURCE_CHUNK CLUSTER_CMD CLUSTER_COV_MODE CLUSTER_PAR ROUND0_CLUSTER_PAR CREATETSV_PAR SORT_TMP \
+        CREATEDB_PAR ROUND0_CREATEDB_MODE BATCH_DELETE_SOURCE_CHUNK CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_COV_MODE CLUSTER_PAR ROUND0_CLUSTER_PAR CREATETSV_PAR SORT_TMP \
         MAX_ROUNDS MIN_REDUCTION_RATIO CONVERGENCE_PATIENCE MIN_REDUCTION_COUNT \
         MAX_CHUNK_ATTEMPTS COMPRESS_RATIO MERGE_BUCKETS MERGE_BUCKET_JOBS BATCH_BACKEND REMOVE_TMP \
         NODE_WORK_DIR ROUND0_NODE_WORK_DIR BATCH_SLURM_NODELIST ROUND0_BATCH_SLURM_NODELIST \
