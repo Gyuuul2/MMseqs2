@@ -6,6 +6,7 @@
 #include "Util.h"
 
 #include <climits>
+#include <vector>
 
 int createsubdb(int argc, const char **argv, const Command& command) {
     Parameters& par = Parameters::getInstance();
@@ -28,7 +29,7 @@ int createsubdb(int argc, const char **argv, const Command& command) {
     if (lookupMode) {
         dbMode |= DBReader<DBKeyType>::USE_LOOKUP_REV;
     }
-    DBReader<DBKeyType> reader(par.db2.c_str(), par.db2Index.c_str(), 1, dbMode);
+    DBReader<DBKeyType> reader(par.db2.c_str(), par.db2Index.c_str(), par.threads, dbMode);
     reader.open(DBReader<DBKeyType>::NOSORT);
     const bool isCompressed = reader.isCompressed();
 
@@ -40,6 +41,16 @@ int createsubdb(int argc, const char **argv, const Command& command) {
     char dbKey[256];
     DBKeyType prevKey = 0;
     bool isOrdered = true;
+    // NOSORT keeps the index key sorted, so an ascending order file needs only a forward cursor, not getId
+    const DBReader<DBKeyType>::Index *index = reader.getIndex();
+    const size_t readerSize = reader.getSize();
+    size_t cursor = 0;
+    // one fwrite per row is one stdio lock per row, so batch them and let writeIndex format in parallel
+    const size_t indexBatch = 1024 * 1024;
+    std::vector<DBReader<DBKeyType>::Index> pending;
+    if (par.subDbMode == Parameters::SUBDB_MODE_SOFT) {
+        pending.reserve(indexBatch);
+    }
     while (getline(&line, &len, orderFile) != -1) {
         Util::parseKey(line, dbKey);
         DBKeyType key;
@@ -54,15 +65,33 @@ int createsubdb(int argc, const char **argv, const Command& command) {
             key = Util::fast_atoi<DBKeyType>(dbKey);
         }
 
+        const bool ascending = isOrdered && (prevKey <= key);
         isOrdered &= (prevKey <= key);
         prevKey = key;
-        const size_t id = reader.getId(key);
+        size_t id;
+        if (ascending) {
+            while (cursor < readerSize && index[cursor].id < key) {
+                cursor++;
+            }
+            id = (cursor < readerSize && index[cursor].id == key) ? cursor : SIZE_MAX;
+        } else {
+            id = reader.getId(key);
+        }
         if (id == SIZE_MAX) {
             Debug(Debug::WARNING) << "Key " << dbKey << " not found in database\n";
             continue;
         }
         if (par.subDbMode == Parameters::SUBDB_MODE_SOFT) {
-            writer.writeIndexEntry(key, reader.getOffset(id), reader.getEntryLen(id), 0);
+            // getEntryLen returns the index's own unsigned int length, so this stores it unchanged
+            DBReader<DBKeyType>::Index entry;
+            entry.id = key;
+            entry.offset = reader.getOffset(id);
+            entry.length = static_cast<unsigned int>(reader.getEntryLen(id));
+            pending.push_back(entry);
+            if (pending.size() == indexBatch) {
+                writer.writeIndexEntries(pending.data(), pending.size(), 0, par.threads);
+                pending.clear();
+            }
         } else {
             char* data = reader.getDataUncompressed(id);
             size_t originalLength = reader.getEntryLen(id);
@@ -78,6 +107,9 @@ int createsubdb(int argc, const char **argv, const Command& command) {
             // do not write null byte since
             writer.writeIndexEntry(key, writer.getStart(0), originalLength, 0);
         }
+    }
+    if (pending.empty() == false) {
+        writer.writeIndexEntries(pending.data(), pending.size(), 0, par.threads);
     }
     // merge any kind of sequence database
     const bool shouldMerge = Parameters::isEqualDbtype(reader.getDbtype(), Parameters::DBTYPE_HMM_PROFILE)
