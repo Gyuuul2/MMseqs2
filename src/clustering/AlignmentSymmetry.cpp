@@ -70,7 +70,7 @@ void AlignmentSymmetry::readInData(DBReader<DBKeyType>*alnDbr, DBReader<DBKeyTyp
                         Debug(Debug::ERROR) << "Set " << i
                                             << " has more elements than allocated (" << setSize
                                             << ")!\n";
-                        continue;
+                        break;
                     }
                     char similarity[255 + 1];
                     char dbKey[255 + 1];
@@ -136,6 +136,8 @@ void AlignmentSymmetry::readInDataSet(DBReader<DBKeyType>*alnDbr, DBReader<DBKey
 #ifdef OPENMP
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
+            // only the positions this entry wrote are set, so it is cleared by those instead of refilled
+            std::vector<bool> bitFlags(dbSize, false);
 #pragma omp for schedule(dynamic, 100)
 
             for (size_t i = start; i < (start + bucketSize); i++) {
@@ -149,7 +151,6 @@ void AlignmentSymmetry::readInDataSet(DBReader<DBKeyType>*alnDbr, DBReader<DBKey
                 size_t isnull = 0;
 
                 size_t writePos = 0;
-                std::vector<bool> bitFlags(dbSize, false);
                 for (size_t j = 0; j < len; ++j) {
                     DBKeyType value = sourceLookupTable[clusterId][j];
                     if (value != DB_KEY_INVALID) {
@@ -204,6 +205,9 @@ void AlignmentSymmetry::readInDataSet(DBReader<DBKeyType>*alnDbr, DBReader<DBKey
                             data = Util::skipLine(data);
                         }
                     }
+                }
+                for (size_t w = 0; w < writePos; w++) {
+                    bitFlags[elementLookupTable[i][w]] = 0;
                 }
                 if (isfirst) {
                     offsets[i] = writePos;

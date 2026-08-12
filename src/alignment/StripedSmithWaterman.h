@@ -74,7 +74,7 @@ typedef struct {
 } s_align;
 
 typedef struct {
-    uint16_t score;
+    uint32_t score;  // must hold int32 SW scores (>65535); byte/word paths fit trivially
     int32_t ref;    //0-based position
     int32_t read;   //alignment ending position on read, 0-based
 } alignment_end;
@@ -292,6 +292,9 @@ private:
     int8_t * scorePerCol;
     short * profile_word_linear_data;
     int32_t * profile_int_linear_data;
+
+    // Max sequence length the buffers/profiles were sized for (query and target must not exceed it).
+    size_t maxSequenceLength;
 
     bool aaBiasCorrection;
     float aaBiasCorrectionScale;
