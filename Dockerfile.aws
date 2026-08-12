@@ -1,0 +1,39 @@
+# AWS Batch runtime image for `mmseqs {linclust,cluster}-batch --backend aws-batch`.
+#
+# WHY A SEPARATE IMAGE
+#   The default mmseqs image (Dockerfile) sets ENTRYPOINT=`exec mmseqs "$@"`. AWS Batch job
+#   submissions set containerOverrides.command, which replaces CMD but NOT ENTRYPOINT, to
+#   `bash -lc "<bootstrap>"`. Under the mmseqs entrypoint the container would run
+#   `mmseqs bash -lc ...` and fail with "unknown command bash". This image resets the entrypoint
+#   so the override command runs directly, and adds the two tools the batch workflow shells out to
+#   that the base image lacks:
+#     - awscli v2  : the bootstrap does `aws s3 cp` and drivers/merges call `aws batch submit-job`
+#     - zstd       : chunks and rep FASTAs are .zst
+#   bash, GNU awk (gawk), grep and coreutils (sort/join) already come from the base image.
+#   awscli v2 is the self-contained binary (NOT the apt `awscli`, which is v1 and pulls python) so
+#   the image stays python-free.
+#
+# BUILD  (build one image per CPU architecture you route to; round0 may run ARM and round1+ x86 --
+#         see --aws-machine / --round0-aws-machine. `uname -m` below picks the matching awscli build.)
+#   docker build -t mmseqs2:latest .                                        # base image first
+#   docker build -f Dockerfile.aws --build-arg MMSEQS_IMAGE=mmseqs2:latest \
+#          -t <registry>/mmseqs-batch:<arch> .                              # then this layer
+#
+# The job definition must reference this image.
+ARG MMSEQS_IMAGE=mmseqs2:latest
+FROM ${MMSEQS_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        zstd unzip ca-certificates \
+    && wget -q "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -O /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/aws /tmp/awscliv2.zip \
+    && apt-get purge -y --auto-remove unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && aws --version && zstd --version && mmseqs version
+
+# containerOverrides.command replaces CMD, not ENTRYPOINT -- reset the mmseqs entrypoint so the
+# override `bash -lc "<bootstrap>"` runs directly instead of becoming `mmseqs bash -lc ...`.
+ENTRYPOINT []
+CMD ["bash"]

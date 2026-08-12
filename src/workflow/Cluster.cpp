@@ -78,6 +78,11 @@ void setClusterAutomagicParameters(Parameters& par) {
         Debug(Debug::INFO) << "Set cluster sensitivity to -s " << par.sensitivity << "\n";
     }
 
+    const bool includeCountTableWasSet = par.PARAM_INCLUDE_COUNTTABLE.wasSet;
+    const bool numCountTableWasSet = par.PARAM_NUM_COUNTS.wasSet;
+    const bool includeAdjacencyWasSet = par.PARAM_INCLUDE_ADJACENCY.wasSet;
+    const bool numAdjacencyWasSet = par.PARAM_NUM_ADJACENCY.wasSet;
+
     const bool nonsymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
     if (par.PARAM_CLUSTER_MODE.wasSet == false) {
         if (nonsymetric) {
@@ -91,11 +96,18 @@ void setClusterAutomagicParameters(Parameters& par) {
     if (par.PARAM_INCLUDE_COUNTTABLE.wasSet == false) {
         if (nonsymetric) {
             par.includeCountTable = false;
+            par.countTableIteration = 0;
         } else {
             par.includeCountTable = true;
         }
         par.PARAM_INCLUDE_COUNTTABLE.wasSet = true;
     }
+    Util::resolveIncludeIterationPair(includeCountTableWasSet, par.includeCountTable,
+                                       numCountTableWasSet, par.countTableIteration,
+                                       "--include-count-table", "--num-count-table");
+    Util::resolveIncludeIterationPair(includeAdjacencyWasSet, par.includeAdjacency,
+                                       numAdjacencyWasSet, par.adjIteration,
+                                       "--include-adjacency", "--num-adjacency");
     if (nonsymetric && par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
         Debug(Debug::WARNING) << "Combining cluster mode " << par.clusteringMode
                               << " in combination with coverage mode " << par.covMode << " can produce wrong results.\n"
@@ -170,6 +182,17 @@ int clusteringworkflow(int argc, const char **argv, const Command& command) {
     cmd.addVariable("MERGECLU_PAR", par.createParameterString(par.threadsandcompression).c_str());
     cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
 
+    const int inheritedKmerMatcherMode = par.kmerMatcherMode;
+    const auto makeInnerLinclustParameters = [&par, inheritedKmerMatcherMode]() {
+        if (par.PARAM_KMERMATCHER_MODE.wasSet == false
+            && par.linclustVersion == Parameters::LINCLUST_VERSION2) {
+            par.kmerMatcherMode = Parameters::KMERMATCHER_MODE_LOCAL;
+        }
+        const std::string parameters = par.createParameterString(par.linclustworkflow);
+        par.kmerMatcherMode = inheritedKmerMatcherMode;
+        return parameters;
+    };
+
     if (par.clusterVersion == 1) {
         cmd.addVariable("CLUSTER_MODULE", "cluster1");
     } else if (par.clusterVersion == 2) {
@@ -183,7 +206,8 @@ int clusteringworkflow(int argc, const char **argv, const Command& command) {
         cmd.addVariable("EXTRACT_FRAMES_PAR", par.createParameterString(par.extractframes).c_str());
         int oldKmer = par.kmerSize;
         par.kmerSize = 0;
-        cmd.addVariable("LINCLUST_PAR", par.createParameterString(par.linclustworkflow).c_str());
+        const std::string innerLinclustPar = makeInnerLinclustParameters();
+        cmd.addVariable("LINCLUST_PAR", innerLinclustPar.c_str());
         par.kmerSize = oldKmer;
         if (par.PARAM_MAX_SEQS.wasSet == false) {
             par.maxResListLen = 300;
@@ -216,7 +240,8 @@ int clusteringworkflow(int argc, const char **argv, const Command& command) {
             par.kmerSize = Parameters::CLUST_LINEAR_DEFAULT_K;
             int maskMode = par.maskMode;
             par.maskMode = 0;
-            cmd.addVariable("LINCLUST_PAR", par.createParameterString(par.linclustworkflow).c_str());
+            const std::string innerLinclustPar = makeInnerLinclustParameters();
+            cmd.addVariable("LINCLUST_PAR", innerLinclustPar.c_str());
             par.alphabetSize = alphabetSize;
             par.kmerSize = kmerSize;
             par.maskMode = maskMode;
@@ -278,7 +303,8 @@ int clusteringworkflow(int argc, const char **argv, const Command& command) {
             // so the switch happens only once on the final cascaded clustering
             bool prevSwitch = par.switchConsensusRep;
             par.switchConsensusRep = false;
-            cmd.addVariable("LINCLUST_PAR", par.createParameterString(par.linclustworkflow).c_str());
+            const std::string innerLinclustPar = makeInnerLinclustParameters();
+            cmd.addVariable("LINCLUST_PAR", innerLinclustPar.c_str());
             par.switchConsensusRep = prevSwitch;
             cmd.addVariable("PREFILTER_PAR", par.createParameterString(par.prefilter).c_str());
             cmd.addVariable("ALIGN2CLUST_PAR", par.createParameterString(par.align2clust).c_str());

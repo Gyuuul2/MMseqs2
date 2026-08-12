@@ -231,6 +231,11 @@ Parameters::Parameters():
         PARAM_BATCH_COMPRESS_OUTPUTS(PARAM_BATCH_COMPRESS_OUTPUTS_ID, "--compress-batch-outputs", "Compress batch outputs", "Store per-round and final batch FASTA/TSV outputs as zstd files", typeid(bool), (void *) &batchCompressOutputs, "^[0-1]{1}$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_MERGE_BUCKETS(PARAM_BATCH_MERGE_BUCKETS_ID, "--merge-buckets", "Merge buckets", "Split the representative merge into this many independent hash buckets, each sorted+joined separately (smaller sorts = lower RAM/disk peak). 0 = auto from --threads (up to 256). The cluster (rep,member) mapping is identical for any value; only inter-cluster row order can differ", typeid(int), (void *) &batchMergeBuckets, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_MERGE_BUCKET_JOBS(PARAM_BATCH_MERGE_BUCKET_JOBS_ID, "--merge-bucket-jobs", "Merge bucket jobs", "Number of independent merge/finalize buckets to sort+join concurrently on the merge node. 0 = auto from --threads (roughly --threads/8, capped at 16)", typeid(int), (void *) &batchMergeBucketJobs, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_REP_SPLITS(PARAM_BATCH_REP_SPLITS_ID, "--rep-splits", "Representative splits", "Shard each chunk's representative FASTA into this many files (entry i to shard i mod N, capped at the chunk's representative count). More shards open the next round's parallel createdb parse (capped by --shuffle-splits) and let the between-round shuffle mix former chunks", typeid(int), (void *) &batchRepSplits, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_CHUNK_DISK_BUDGET(PARAM_BATCH_CHUNK_DISK_BUDGET_ID, "--chunk-disk-budget", "Chunk disk budget", "Kill a chunk stage and fail the chunk (no done-marker, so it is retried or dead-lettered) when the bytes under its work directory reach this budget. 0 disables the guard", typeid(ByteParser), (void *) &batchChunkDiskBudget, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_ROUND0_CHUNK_DISK_BUDGET(PARAM_BATCH_ROUND0_CHUNK_DISK_BUDGET_ID, "--round0-chunk-disk-budget", "Round0 chunk disk budget", "Override --chunk-disk-budget for round 0 only. If unset, round 0 uses --chunk-disk-budget", typeid(ByteParser), (void *) &batchRound0ChunkDiskBudget, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_DISK_POLL_INTERVAL(PARAM_BATCH_DISK_POLL_INTERVAL_ID, "--disk-poll-interval", "Disk poll interval", "Seconds between disk polls of a running chunk stage (peak-disk metric and --chunk-disk-budget guard)", typeid(int), (void *) &batchDiskPollInterval, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_RAM_POLL_INTERVAL(PARAM_BATCH_RAM_POLL_INTERVAL_ID, "--ram-poll-interval", "RAM poll interval", "Seconds between resident-memory polls of a running chunk stage", typeid(int), (void *) &batchRamPollInterval, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_ROUND0_MMSEQS(PARAM_BATCH_ROUND0_MMSEQS_ID, "--round0-mmseqs", "Round0 mmseqs binary", "mmseqs binary to run for round 0 only, e.g. a different architecture. Empty uses the same binary as the later rounds", typeid(std::string), (void *) &batchRound0Mmseqs, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_ROUND0_CREATEDB_MODE(PARAM_BATCH_ROUND0_CREATEDB_MODE_ID, "--round0-createdb-mode", "Round0 createdb mode", "Override --createdb-mode for round 0 only (0: copy data, 1: soft link data, 3: length-sorted copy)", typeid(int), (void *) &batchRound0CreatedbMode, "^[013]{1}$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_COMPRESS_RATIO(PARAM_BATCH_COMPRESS_RATIO_ID, "--compress-ratio", "Compression ratio estimate", "Assumed uncompressed/compressed size ratio for compressed inputs whose exact size cannot be read. Feeds chunk grouping, so changing it changes chunk boundaries", typeid(int), (void *) &batchCompressRatio, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
@@ -290,6 +295,7 @@ Parameters::Parameters():
         PARAM_SHUFFLE_SPLITS(PARAM_SHUFFLE_SPLITS_ID, "--shuffle-splits", "Shuffle splits", "Number of temporary splits the input is scattered over. Raise it when a single split no longer fits in memory", typeid(int), (void *) &shuffleSplits, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_WRITE_LOOKUP(PARAM_WRITE_LOOKUP_ID, "--write-lookup", "Write lookup file", "write .lookup file containing mapping from internal id, fasta id and file number", typeid(int), (void *) &writeLookup, "^[0-1]{1}", MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_HEADER_FILE(PARAM_USE_HEADER_FILE_ID, "--use-header-file", "Use header DB", "use the sequence header DB instead of the body to map the entry keys", typeid(bool), (void *) &useHeaderFile, ""),
+        PARAM_FASTA_SPLITS(PARAM_FASTA_SPLITS_ID, "--fasta-splits", "FASTA splits", "Write this many FASTA files instead of one, entry i going to file i mod N named <out>.split<i> before the extension. 0: single output file", typeid(int), (void *) &fastaSplits, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         // setextendeddbtype
         PARAM_EXTENDED_DBTYPE(PARAM_EXTENDED_DBTYPE_ID, "--extended-dbtype", "Extended dbtype", "Set extended dbtype 1: compressed, 2: need src, 4: context pseudoe cnts", typeid(int), (void *) &extendedDbtype, "^[0-4]{1}"),
         // splitsequence
@@ -994,6 +1000,7 @@ Parameters::Parameters():
 
     // convert2fasta
     convert2fasta.push_back(&PARAM_USE_HEADER_FILE);
+    convert2fasta.push_back(&PARAM_FASTA_SPLITS);
     convert2fasta.push_back(&PARAM_THREADS);
     convert2fasta.push_back(&PARAM_V);
 
@@ -1646,6 +1653,11 @@ Parameters::Parameters():
     batchclustering.push_back(&PARAM_BATCH_COMPRESS_OUTPUTS);
     batchclustering.push_back(&PARAM_BATCH_MERGE_BUCKETS);
     batchclustering.push_back(&PARAM_BATCH_MERGE_BUCKET_JOBS);
+    batchclustering.push_back(&PARAM_BATCH_REP_SPLITS);
+    batchclustering.push_back(&PARAM_BATCH_CHUNK_DISK_BUDGET);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_CHUNK_DISK_BUDGET);
+    batchclustering.push_back(&PARAM_BATCH_DISK_POLL_INTERVAL);
+    batchclustering.push_back(&PARAM_BATCH_RAM_POLL_INTERVAL);
     batchclustering.push_back(&PARAM_BATCH_ROUND0_MMSEQS);
     batchclustering.push_back(&PARAM_BATCH_ROUND0_CREATEDB_MODE);
     batchclustering.push_back(&PARAM_BATCH_COMPRESS_RATIO);
@@ -2857,10 +2869,15 @@ void Parameters::setDefaults() {
     batchMinReductionRatio = 0.02f;
     batchConvergencePatience = 1;
     batchMinReductionCount = 0;
-    batchMaxChunkAttempts = 2;
+    batchMaxChunkAttempts = 1;
     batchCompressOutputs = false;
     batchMergeBuckets = 0;
     batchMergeBucketJobs = 0;
+    batchRepSplits = 32;
+    batchChunkDiskBudget = 0;
+    batchRound0ChunkDiskBudget = 0;
+    batchDiskPollInterval = 60;
+    batchRamPollInterval = 2;
     batchRound0Mmseqs = "";
     batchRound0CreatedbMode = 0;
     batchCompressRatio = 3;
@@ -2976,6 +2993,7 @@ void Parameters::setDefaults() {
 
     // convert2fasta
     useHeaderFile = false;
+    fastaSplits = 0;
 
     // result2flat
     useHeader = false;

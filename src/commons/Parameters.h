@@ -528,6 +528,11 @@ public:
     bool batchCompressOutputs;
     int batchMergeBuckets;
     int batchMergeBucketJobs;
+    int batchRepSplits;
+    size_t batchChunkDiskBudget;
+    size_t batchRound0ChunkDiskBudget;
+    int batchDiskPollInterval;
+    int batchRamPollInterval;
     // former environment-only knobs; they affect results, so they belong on the command line
     std::string batchRound0Mmseqs;
     int batchRound0CreatedbMode;
@@ -693,6 +698,7 @@ public:
 
     // convert2fasta
     bool useHeaderFile;
+    int fastaSplits;
     int writeLookup;
 
     // result2flat
@@ -1092,6 +1098,11 @@ public:
     PARAMETER(PARAM_BATCH_COMPRESS_OUTPUTS)
     PARAMETER(PARAM_BATCH_MERGE_BUCKETS)
     PARAMETER(PARAM_BATCH_MERGE_BUCKET_JOBS)
+    PARAMETER(PARAM_BATCH_REP_SPLITS)
+    PARAMETER(PARAM_BATCH_CHUNK_DISK_BUDGET)
+    PARAMETER(PARAM_BATCH_ROUND0_CHUNK_DISK_BUDGET)
+    PARAMETER(PARAM_BATCH_DISK_POLL_INTERVAL)
+    PARAMETER(PARAM_BATCH_RAM_POLL_INTERVAL)
     PARAMETER(PARAM_BATCH_ROUND0_MMSEQS)
     PARAMETER(PARAM_BATCH_ROUND0_CREATEDB_MODE)
     PARAMETER(PARAM_BATCH_COMPRESS_RATIO)
@@ -1157,6 +1168,7 @@ public:
 
     // convert2fasta
     PARAMETER(PARAM_USE_HEADER_FILE)
+    PARAMETER(PARAM_FASTA_SPLITS)
 
     // setextendedbtype
     PARAMETER(PARAM_EXTENDED_DBTYPE)
