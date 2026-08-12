@@ -10,6 +10,20 @@
 #include <sys/stat.h>
 
 #include <fcntl.h>
+#include <unistd.h>
+
+#if defined(__linux__)
+#include <sys/syscall.h>
+#if defined(__NR_io_uring_setup) && defined(__NR_io_uring_enter)
+#include <linux/io_uring.h>
+#define HAVE_IO_URING 1
+#endif
+#endif
+
+// a per-thread bounce buffer starts here and grows on demand, so one huge entry cannot preallocate threads*maxSeqLen
+static const size_t BOUNCE_BUFFER_PREALLOC = 64 * 1024;
+// smallest room left for one ZSTD_decompressStream call, so a nearly full buffer cannot creep forward
+static const size_t DECOMPRESS_MIN_ROOM = 4096;
 
 #include "MemoryMapped.h"
 #include "Debug.h"
@@ -24,19 +38,22 @@
 template <typename T>
 DBReader<T>::DBReader(const char* dataFileName_, const char* indexFileName_, int threads, int dataMode) :
 threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
-        indexFileName(strdup(indexFileName_)), size(0), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0),
+        indexFileName(strdup(indexFileName_)), size(0), dataFiles(NULL), dataFds(NULL), directBuffers(NULL), ioBatch(NULL),
+        dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), index(NULL), id2local(NULL), local2id(NULL),
-        dataMapped(false), accessType(0), externalData(false), didMlock(false)
+        dataMapped(false), accessType(0), externalData(false), didMlock(false), ioBufferedBatch(false), ioCacheAdvice(false), directIoAlign(0)
 {}
 
 template <typename T>
 DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T lastKey,
         int dbType, unsigned int maxSeqLen, int threads) :
         threads(threads), dataMode(USE_INDEX), dataFileName(NULL), indexFileName(NULL),
-        size(size), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
+        size(size), dataFiles(NULL), dataFds(NULL), directBuffers(NULL), ioBatch(NULL),
+        dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index), sortedByOffset(true),
-        id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
+        id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false),
+        ioBufferedBatch(false), ioCacheAdvice(false), directIoAlign(0)
 {}
 
 template <typename T>
@@ -52,7 +69,7 @@ void DBReader<T>::setDataFile(const char* dataFileName_)  {
 
 template <typename T>
 void DBReader<T>::readMmapedDataInMemory(){
-    if ((dataMode & USE_DATA) && (dataMode & USE_FREAD) == 0) {
+    if ((dataMode & USE_DATA) && (dataMode & (USE_FREAD | USE_DIRECT_IO)) == 0) {
         //Debug(Debug::INFO) << "Touch data file " << dataFileName << "\n";
         for(size_t fileIdx = 0; fileIdx < dataFileCnt; fileIdx++){
             size_t dataSize = dataSizeOffset[fileIdx+1]-dataSizeOffset[fileIdx];
@@ -64,7 +81,7 @@ void DBReader<T>::readMmapedDataInMemory(){
 
 template <typename T>
 void DBReader<T>::mlock(){
-    if (dataMode & USE_DATA) {
+    if ((dataMode & USE_DATA) && (dataMode & USE_DIRECT_IO) == 0) {
         if (didMlock == false) {
             for(size_t fileIdx = 0; fileIdx < dataFileCnt; fileIdx++) {
                 size_t dataSize = dataSizeOffset[fileIdx+1]-dataSizeOffset[fileIdx];
@@ -104,32 +121,26 @@ template <typename T> bool DBReader<T>::open(int accessType){
     if (dataFileName != NULL) {
         dbtype = FileUtil::parseDbType(dataFileName);
     }
+    if ((dataMode & USE_DIRECT_IO) && (dataMode & USE_WRITABLE)) {
+        // writes would land in a bounce buffer and be dropped on the next read
+        Debug(Debug::ERROR) << "USE_WRITABLE cannot be combined with USE_DIRECT_IO\n";
+        EXIT(EXIT_FAILURE);
+    }
     if (dataMode & USE_DATA) {
         dataFileNames = FileUtil::findDatafiles(dataFileName);
         if (dataFileNames.empty()) {
             Debug(Debug::ERROR) << "No datafile could be found for " << dataFileName << "!\n";
             EXIT(EXIT_FAILURE);
         }
-        totalDataSize = 0;
+        resolveIoPolicy(accessType);
         dataFileCnt = dataFileNames.size();
         dataSizeOffset = new size_t[dataFileNames.size() + 1];
         dataFiles = new char*[dataFileNames.size()];
-        for(size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++){
-            FILE* dataFile = fopen(dataFileNames[fileIdx].c_str(), "r");
-            if (dataFile == NULL) {
-                Debug(Debug::ERROR) << "Cannot open data file " << dataFileName << "!\n";
-                EXIT(EXIT_FAILURE);
-            }
-            size_t dataSize;
-            dataFiles[fileIdx] = mmapData(dataFile, &dataSize);
-            dataSizeOffset[fileIdx]=totalDataSize;
-            totalDataSize += dataSize;
-            if (fclose(dataFile) != 0) {
-                Debug(Debug::ERROR) << "Cannot close file " << dataFileName << "\n";
-                EXIT(EXIT_FAILURE);
-            }
+        if (dataMode & USE_DIRECT_IO) {
+            openDataFds();
+        } else {
+            mapDataFiles();
         }
-        dataSizeOffset[dataFileNames.size()]=totalDataSize;
         dataMapped = true;
         if (accessType == LINEAR_ACCCESS || accessType == SORT_BY_OFFSET) {
             setSequentialAdvice();
@@ -198,30 +209,45 @@ template <typename T> bool DBReader<T>::open(int accessType){
         // sortIndex also handles access modes that don't require sorting
         sortIndex(isSortedById);
 
-        size_t prevOffset = 0; // makes 0 or empty string
+        // adjacent pairs carry no loop dependency, and index[0] alone is trivially sorted
         sortedByOffset = true;
-        for (size_t i = 0; i < size; i++) {
-            sortedByOffset = sortedByOffset && index[i].offset >= prevOffset;
-            prevOffset = index[i].offset;
+#pragma omp parallel for schedule(static) reduction(&&: sortedByOffset) num_threads(threads)
+        for (size_t i = 1; i < size; i++) {
+            sortedByOffset = sortedByOffset && (index[i - 1].offset <= index[i].offset);
         }
     }
 
     compression = isCompressed(dbtype);
     padded = (getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_GPU);
 
+    if (dataMode & USE_DATA) {
+        // loadBatch runs inside a parallel region, so the worker vector cannot be grown lazily there
+        freeIoBatch();
+        ioBatch = new IoBatch();
+        ioBatch->workers.resize(threads);
+    }
+
+    if ((dataMode & USE_DATA) && (dataMode & USE_DIRECT_IO)) {
+        if (compression == COMPRESSED) {
+            // a compressed index stores the decompressed length, so it cannot bound the read
+            Debug(Debug::ERROR) << "USE_DIRECT_IO cannot read the compressed database " << dataFileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        // readIndex already tracked max index[i].length in maxSeqLen, so do not walk the index again
+        allocateDirectBuffers();
+    }
+
     if(compression == COMPRESSED || padded){
         compressedBufferSizes = new size_t[threads];
         compressedBuffers = new char*[threads];
         dstream = new ZSTD_DStream*[threads];
         for(int i = 0; i < threads; i++){
-            // allocated buffer
-            compressedBufferSizes[i] = std::max(maxSeqLen+2, 1024u);
-            compressedBuffers[i] = (char*) malloc(compressedBufferSizes[i]);
-            incrementMemory(compressedBufferSizes[i]);
-            if(compressedBuffers[i]==NULL){
-                Debug(Debug::ERROR) << "Cannot allocate compressedBuffer!\n";
-                EXIT(EXIT_FAILURE);
-            }
+            // allocated buffer, grown on demand from here by getDataCompressed and getUnpadded
+            compressedBufferSizes[i] = 0;
+            compressedBuffers[i] = NULL;
+            const size_t wanted = std::max(static_cast<size_t>(maxSeqLen) + 2, (size_t) 1024);
+            growBuffer(&compressedBuffers[i], &compressedBufferSizes[i],
+                       std::min(wanted, BOUNCE_BUFFER_PREALLOC), 1, 0);
             dstream[i] = ZSTD_createDStream();
             if (dstream==NULL) {
                 Debug(Debug::ERROR) << "ZSTD_createDStream() error \n";
@@ -237,6 +263,223 @@ template <typename T> bool DBReader<T>::open(int accessType){
 template<typename T>
 bool DBReader<T>::isSortedByOffset(){
     return sortedByOffset;
+}
+
+template<typename T>
+bool DBReader<T>::isSortedByEntryLengthDescending(int threads) {
+    if (size < 2) {
+        return true;
+    }
+    bool sorted = true;
+#pragma omp parallel for schedule(static) num_threads(threads) reduction(&&:sorted)
+    for (size_t i = 1; i < size; ++i) {
+        sorted = sorted && (getEntryLen(i - 1) >= getEntryLen(i));
+    }
+    return sorted;
+}
+
+template<>
+void DBReader<std::string>::sortIndex(bool isSortedById) {
+    if (accessType == SORT_BY_ID){
+        if (isSortedById) {
+            return;
+        }
+        SORT_PARALLEL(index, index + size, Index::compareById);
+    } else {
+        if(accessType != NOSORT && accessType != HARDNOSORT){
+            Debug(Debug::ERROR) << "DBReader<std::string> cannot be opened in sort mode\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+}
+
+template<>
+void DBReader<DBKeyType>::sortIndex(float *weights) {
+
+    this->accessType=DBReader::SORT_BY_WEIGHTS;
+    std::pair<size_t, float> *sortForMapping = new std::pair<size_t, float>[size];
+    id2local = new DBLocalId[size];
+    local2id = new DBLocalId[size];
+    incrementMemory(sizeof(DBLocalId) * 2 * size);
+    for (size_t i = 0; i < size; i++) {
+        id2local[i] = i;
+        local2id[i] = i;
+        sortForMapping[i] = std::make_pair(i, weights[i]);
+    }
+    //this sort has to be stable to assure same clustering results
+    SORT_PARALLEL(sortForMapping, sortForMapping + size, comparePairByWeight());
+    for (size_t i = 0; i < size; i++) {
+        id2local[sortForMapping[i].first] = i;
+        local2id[i] = sortForMapping[i].first;
+    }
+    delete[] sortForMapping;
+}
+
+template<>
+void DBReader<DBKeyType>::sortIndex(bool isSortedById) {
+
+    // First, we sort the index by IDs and we keep track of the original
+    // ordering in mappingToOriginalIndex array
+    size_t* mappingToOriginalIndex=NULL;
+    if (accessType == SORT_BY_LINE) {
+        mappingToOriginalIndex = new size_t[size];
+    }
+    
+    if ((isSortedById == false) && (accessType != HARDNOSORT) && (accessType != SORT_BY_OFFSET)) {
+        // create an array of the joint original indeces --> this will be sorted:
+        // permutation of 0..size-1; DBLocalId keeps this 4 bytes/entry in the default build.
+        DBLocalId *sortedIndices = new DBLocalId[size];
+        for (size_t i = 0; i < size; ++i) {
+            sortedIndices[i] = i;
+        }
+        // sort sortedIndices based on index.id:
+        SORT_PARALLEL(sortedIndices, sortedIndices + size, sortIndecesById(index));
+
+        // re-order will destroy sortedIndices so copy it, if needed:
+        if (accessType == SORT_BY_LINE) {
+            for (size_t i = 0; i < size; ++i) {
+                mappingToOriginalIndex[i] = sortedIndices[i];
+            }
+        }
+
+        // re-order in-place according to sortedIndices (ruined in the process)
+        // based on: https://stackoverflow.com/questions/7365814/in-place-array-reordering
+        Index indexAndOffsetBuff;
+
+        for (size_t i = 0; i < size; i++) {
+            // fill buffers with what will be overwritten:
+            indexAndOffsetBuff.id = index[i].id;
+            indexAndOffsetBuff.offset = index[i].offset;
+            indexAndOffsetBuff.length = index[i].length;
+
+            size_t j = i;
+            while (1) {
+                // The inner loop won't re-process already processed elements
+                size_t k = sortedIndices[j];
+                sortedIndices[j] = j; // mutating sortedIndices in the process
+                if (k == i) {
+                    break;
+                }
+                // overwite at destination place:
+                index[j].id = index[k].id;
+                index[j].offset = index[k].offset;
+                index[j].length = index[k].length;
+                // re-write what was overwritten at its destination: 
+                j = k;
+                index[j].id = indexAndOffsetBuff.id;
+                index[j].offset = indexAndOffsetBuff.offset;
+                index[j].length = indexAndOffsetBuff.length;
+            }
+        }
+        delete[] sortedIndices;
+    } else if (accessType == SORT_BY_LINE) {
+        for (size_t i = 0; i < size; ++i) {
+            mappingToOriginalIndex[i] = i;
+        }
+    }
+    if (accessType == SORT_BY_LENGTH) {
+        
+        // sort the entries by the length of the sequences
+        std::pair<size_t, unsigned int> *sortForMapping = new std::pair<size_t, unsigned int>[size];
+        id2local = new DBLocalId[size];
+        local2id = new DBLocalId[size];
+        incrementMemory(sizeof(DBLocalId) * 2 * size);
+        for (size_t i = 0; i < size; i++) {
+            id2local[i] = i;
+            local2id[i] = i;
+            sortForMapping[i] = std::make_pair(i, index[i].length);
+        }
+        //this sort has to be stable to assure same clustering results
+        SORT_PARALLEL(sortForMapping, sortForMapping + size, comparePairBySeqLength());
+        for (size_t i = 0; i < size; i++) {
+            id2local[sortForMapping[i].first] = i;
+            local2id[i] = sortForMapping[i].first;
+        }
+        delete[] sortForMapping;
+    } else if (accessType == SHUFFLE) {
+        size_t *tmpIndex = new size_t[size];
+        for (size_t i = 0; i < size; i++) {
+            tmpIndex[i] = i;
+        }
+
+        std::mt19937 rnd(0);
+        std::shuffle(tmpIndex, tmpIndex + size, rnd);
+
+        id2local = new DBLocalId[size];
+        local2id = new DBLocalId[size];
+        incrementMemory(sizeof(DBLocalId) * 2 * size);
+
+        for (size_t i = 0; i < size; i++) {
+            id2local[tmpIndex[i]] = i;
+            local2id[i] = tmpIndex[i];
+        }
+        delete[] tmpIndex;
+
+    } else if (accessType == LINEAR_ACCCESS) {
+        // do not sort if its already in correct order
+        bool isSortedByOffset = true;
+        size_t prevOffset = index[0].offset;
+        for (size_t i = 0; i < size; i++) {
+            isSortedByOffset &= (prevOffset <= index[i].offset);
+            prevOffset = index[i].offset;
+        }
+        if(isSortedByOffset == true && isSortedById == true){
+            accessType = NOSORT;
+            return;
+        }
+
+        // sort the entries by the offset of the sequences
+        std::pair<size_t, size_t> *sortForMapping = new std::pair<size_t, size_t>[size];
+        id2local = new DBLocalId[size];
+        local2id = new DBLocalId[size];
+        incrementMemory(sizeof(DBLocalId) * 2 * size);
+
+        for (size_t i = 0; i < size; i++) {
+            id2local[i] = i;
+            local2id[i] = i;
+            sortForMapping[i] = std::make_pair(i, index[i].offset);
+        }
+        SORT_PARALLEL(sortForMapping, sortForMapping + size, comparePairByOffset());
+        for (size_t i = 0; i < size; i++) {
+            id2local[sortForMapping[i].first] = i;
+            local2id[i] = sortForMapping[i].first;
+        }
+        delete[] sortForMapping;
+    } else if (accessType == SORT_BY_ID_OFFSET) {
+        // sort the entries by the offset of the sequences
+        std::pair<size_t, Index> *sortForMapping = new std::pair<size_t, Index>[size];
+        id2local = new DBLocalId[size];
+        local2id = new DBLocalId[size];
+        incrementMemory(sizeof(DBLocalId) * 2 * size);
+
+        for (size_t i = 0; i < size; i++) {
+            id2local[i] = i;
+            local2id[i] = i;
+            sortForMapping[i] = std::make_pair(i, index[i]);
+        }
+        SORT_PARALLEL(sortForMapping, sortForMapping + size, comparePairByIdAndOffset());
+        for (size_t i = 0; i < size; i++) {
+            id2local[sortForMapping[i].first] = i;
+            local2id[i] = sortForMapping[i].first;
+        }
+        delete[] sortForMapping;
+    } else if (accessType == SORT_BY_LINE) {
+        // sort the entries by the original line number in the index file
+        id2local = new DBLocalId[size];
+        local2id = new DBLocalId[size];
+        incrementMemory(sizeof(DBLocalId) * 2 * size);
+
+        for (size_t i = 0; i < size; i++) {
+            id2local[i] = mappingToOriginalIndex[i];
+            local2id[mappingToOriginalIndex[i]] = i;
+        }
+    } else if (accessType == SORT_BY_OFFSET) {
+        // sort index based on index.offset (no id sorting):
+        SORT_PARALLEL(index, index + size, Index::compareByOffset);
+    }
+    if (mappingToOriginalIndex) {
+        delete [] mappingToOriginalIndex;
+    }
 }
 
 template <typename T> char* DBReader<T>::mmapData(FILE * file, size_t *dataSize) {
@@ -282,13 +525,727 @@ template <typename T> char* DBReader<T>::mmapData(FILE * file, size_t *dataSize)
     }
 }
 
+template <typename T>
+void DBReader<T>::growBuffer(char** buffer, size_t* capacity, size_t needed, size_t alignment, size_t keepBytes) {
+    if (needed <= *capacity) {
+        return;
+    }
+    // doubling bounds the number of allocations, posix_memalign is slow under contention
+    size_t newCapacity = std::max(needed, *capacity * 2);
+    if (alignment > 1) {
+        newCapacity = ((newCapacity + alignment - 1) / alignment) * alignment;
+    }
+    char* mem;
+    if (alignment > 1) {
+        void* aligned = NULL;
+        if (posix_memalign(&aligned, alignment, newCapacity) != 0) {
+            aligned = NULL;
+        }
+        mem = static_cast<char*>(aligned);
+    } else {
+        mem = static_cast<char*>(malloc(newCapacity));
+    }
+    if (mem == NULL) {
+        Debug(Debug::ERROR) << "Cannot allocate " << newCapacity << " byte buffer in DBReader!\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (keepBytes > 0) {
+        memcpy(mem, *buffer, keepBytes);
+    }
+    size_t freed = 0;
+    if (*buffer != NULL) {
+        free(*buffer);
+        freed = *capacity;
+    }
+    // threads grow their own buffers concurrently, so the shared counter needs an atomic update here
+    __sync_fetch_and_add(&totalMemorySizeInst, newCapacity - freed);
+    *buffer = mem;
+    *capacity = newCapacity;
+}
+
+// one descriptor per data file; totalDataSize is recomputed so a mid-run switch keeps the index offsets
+template <typename T> void DBReader<T>::openDataFds() {
+    totalDataSize = 0;
+    dataFds = new int[dataFileNames.size()];
+    for (size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+        // buffered descriptors have no alignment constraint, so read exactly the entry bytes
+        directIoAlign = ioBufferedBatch
+            ? 1
+            : std::max(directIoAlign, FileUtil::getDirectIoAlignment(dataFileNames[fileIdx]));
+        size_t fileSize;
+        dataFds[fileIdx] = openDirect(dataFileNames[fileIdx].c_str(), &fileSize);
+        dataFiles[fileIdx] = NULL;
+        dataSizeOffset[fileIdx] = totalDataSize;
+        totalDataSize += fileSize;
+    }
+    dataSizeOffset[dataFileNames.size()] = totalDataSize;
+}
+
+// keeps a dup'd descriptor when cache advice was asked for: fadvise needs one that outlives the mapping
+template <typename T> void DBReader<T>::mapDataFiles() {
+    const bool keepCacheAdviceFd = ioCacheAdvice
+                                   && isCompressed(dbtype) != COMPRESSED
+                                   && (dataMode & USE_FREAD) == 0;
+    if (keepCacheAdviceFd && dataFds == NULL) {
+        dataFds = new int[dataFileNames.size()];
+        for (size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+            dataFds[fileIdx] = -1;
+        }
+    }
+    totalDataSize = 0;
+    for (size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+        FILE *dataFile = fopen(dataFileNames[fileIdx].c_str(), "r");
+        if (dataFile == NULL) {
+            const int errsv = errno;
+            Debug(Debug::ERROR) << "Cannot open data file " << dataFileNames[fileIdx]
+                                << ". Error " << errsv << " (" << strerror(errsv) << ").\n";
+            EXIT(EXIT_FAILURE);
+        }
+        size_t fileSize;
+        dataFiles[fileIdx] = mmapData(dataFile, &fileSize);
+        if (keepCacheAdviceFd) {
+            dataFds[fileIdx] = ::dup(fileno(dataFile));
+            if (dataFds[fileIdx] < 0) {
+                const int errsv = errno;
+                Debug(Debug::ERROR) << "Cannot duplicate data fd for " << dataFileNames[fileIdx]
+                                    << ". Error " << errsv << ".\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+        dataSizeOffset[fileIdx] = totalDataSize;
+        totalDataSize += fileSize;
+        if (fclose(dataFile) != 0) {
+            Debug(Debug::ERROR) << "Cannot close file " << dataFileNames[fileIdx] << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+    dataSizeOffset[dataFileNames.size()] = totalDataSize;
+}
+
+// one bounce buffer per thread, wide enough for the widest aligned read a single entry can need
+template <typename T> void DBReader<T>::allocateDirectBuffers() {
+    if (directBuffers != NULL) {
+        return;
+    }
+    const size_t maxRead = ((static_cast<size_t>(maxSeqLen) + 2 * directIoAlign - 1) / directIoAlign) * directIoAlign;
+    const size_t initialSize = std::min(maxRead, BOUNCE_BUFFER_PREALLOC);
+    directBuffers = new DirectBuffer[threads];
+    for (int i = 0; i < threads; i++) {
+        directBuffers[i].buffer = NULL;
+        directBuffers[i].size = 0;
+        directBuffers[i].file = 0;
+        directBuffers[i].offset = 0;
+        directBuffers[i].length = 0;
+        growBuffer(&directBuffers[i].buffer, &directBuffers[i].size, initialSize, directIoAlign, 0);
+    }
+}
+
+template <typename T> void DBReader<T>::freeDirectBuffers() {
+    if (directBuffers == NULL) {
+        return;
+    }
+    for (int i = 0; i < threads; i++) {
+        free(directBuffers[i].buffer);
+        decrementMemory(directBuffers[i].size);
+    }
+    delete[] directBuffers;
+    directBuffers = NULL;
+}
+
+template <typename T> bool DBReader<T>::useDescriptorIo(bool keepPageCache) {
+    // set before the switch: openDirect reads it to decide whether the descriptors carry O_DIRECT
+    ioBufferedBatch = keepPageCache;
+    const bool direct = true;
+    if ((dataMode & USE_DATA) == 0 || closed == 1 || dataMapped == false) {
+        return false;
+    }
+    if (direct == ((dataMode & USE_DIRECT_IO) != 0)) {
+        return true;
+    }
+    // these hand back reader-owned buffers, which the descriptor path has no way to serve
+    if (direct && (compression == COMPRESSED || padded || (dataMode & (USE_WRITABLE | USE_FREAD)))) {
+        return false;
+    }
+    unmapData();
+    if (direct) {
+        // unmapData leaves cache-advice descriptors alone, and openDataFds allocates its own array
+        if (dataFds != NULL) {
+            for (size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+                if (dataFds[fileIdx] >= 0) {
+                    ::close(dataFds[fileIdx]);
+                }
+            }
+            delete[] dataFds;
+            dataFds = NULL;
+        }
+        dataMode |= USE_DIRECT_IO;
+        openDataFds();
+        allocateDirectBuffers();
+    } else {
+        dataMode &= ~USE_DIRECT_IO;
+        freeDirectBuffers();
+        mapDataFiles();
+    }
+    // the batch arenas were aligned for the path that is going away
+    freeIoBatch();
+    ioBatch = new IoBatch();
+    ioBatch->workers.resize(threads);
+    dataMapped = true;
+    Debug(Debug::INFO) << "IO path for " << dataFileName << " switched to "
+                       << (direct ? (ioBufferedBatch ? "buffered descriptors" : "O_DIRECT") : "mmap")
+                       << "\n";
+    return true;
+}
+
+// mmap is the default; MMSEQS_IO_POLICY pins every eligible reader.
+template <typename T> void DBReader<T>::resolveIoPolicy(int) {
+    if (dataMode & USE_DIRECT_IO) {
+        return;
+    }
+    // compressed, padded, writable and fread readers hand back reader-owned buffers the direct path cannot serve
+    if (isCompressed(dbtype) == COMPRESSED
+        || (getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_GPU)
+        || (dataMode & (USE_WRITABLE | USE_FREAD))) {
+        return;
+    }
+    // MMSEQS_IO_POLICY=mmap|direct|buffered is the escape hatch when the descriptor path misbehaves
+    const char *policyEnv = getenv("MMSEQS_IO_POLICY");
+    if (policyEnv != NULL) {
+        if (strcmp(policyEnv, "direct") == 0) {
+            // a reader that asked for buffered batching still has to end up on O_DIRECT here
+            ioBufferedBatch = false;
+            dataMode |= USE_DIRECT_IO;
+        } else if (strcmp(policyEnv, "buffered") == 0) {
+            ioBufferedBatch = true;
+            dataMode |= USE_DIRECT_IO;
+        } else {
+            ioBufferedBatch = false;   // mmap
+        }
+        Debug(Debug::INFO) << "IO policy for " << dataFileName << " pinned by MMSEQS_IO_POLICY="
+                           << policyEnv << "\n";
+        return;
+    }
+}
+
+template <typename T> int DBReader<T>::openDirect(const char *fileName, size_t *dataSize) {
+#if defined(O_DIRECT)
+    int fd = ioBufferedBatch ? ::open(fileName, O_RDONLY) : ::open(fileName, O_RDONLY | O_DIRECT);
+    if (fd < 0 && (errno == EINVAL || errno == ENOTSUP || errno == EOPNOTSUPP)) {
+        // tmpfs and some network filesystems reject O_DIRECT, the reads stay correct without it
+        fd = ::open(fileName, O_RDONLY);
+    }
+#else
+    int fd = ::open(fileName, O_RDONLY);
+#endif
+    if (fd < 0) {
+        int errsv = errno;
+        Debug(Debug::ERROR) << "Cannot open data file " << fileName << " for fd IO. Error " << errsv << ".\n";
+        EXIT(EXIT_FAILURE);
+    }
+#ifdef HAVE_POSIX_FADVISE
+    if (ioBufferedBatch) {
+        // the batched path is deliberately random, so do not spend cache on speculative neighbours
+        posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);
+    }
+#endif
+#if !defined(O_DIRECT) && defined(F_NOCACHE)
+    if (ioBufferedBatch == false) {
+        fcntl(fd, F_NOCACHE, 1);
+    }
+#endif
+    struct stat sb;
+    if (fstat(fd, &sb) < 0) {
+        int errsv = errno;
+        Debug(Debug::ERROR) << "Failed to fstat File=" << fileName << ". Error " << errsv << ".\n";
+        EXIT(EXIT_FAILURE);
+    }
+    *dataSize = sb.st_size;
+    return fd;
+}
+
+// raw syscalls, not liburing, so the build gains no dependency; a refused ring falls back to pread
+#if defined(__linux__) && defined(HAVE_IO_URING)
+struct DBReaderRing {
+    int fd;
+    unsigned *sqTail, *sqMask, *sqArray;
+    unsigned *cqHead, *cqTail, *cqMask;
+    struct io_uring_sqe *sqes;
+    struct io_uring_cqe *cqes;
+    void *sqPtr; size_t sqSize;
+    void *cqPtr; size_t cqSize;
+    void *sqePtr; size_t sqeSize;
+    unsigned entries;
+};
+
+static bool dbReaderRingInit(DBReaderRing &r, unsigned entries) {
+    struct io_uring_params p;
+    memset(&p, 0, sizeof(p));
+    const int fd = syscall(__NR_io_uring_setup, entries, &p);
+    if (fd < 0) {
+        return false;
+    }
+    size_t sqSize = p.sq_off.array + p.sq_entries * sizeof(unsigned);
+    size_t cqSize = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
+    if (p.features & IORING_FEAT_SINGLE_MMAP) {
+        sqSize = (cqSize > sqSize) ? cqSize : sqSize;
+        cqSize = sqSize;
+    }
+    void *sq = mmap(NULL, sqSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
+    if (sq == MAP_FAILED) { ::close(fd); return false; }
+    void *cq = sq;
+    if ((p.features & IORING_FEAT_SINGLE_MMAP) == 0) {
+        cq = mmap(NULL, cqSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_CQ_RING);
+        if (cq == MAP_FAILED) { munmap(sq, sqSize); ::close(fd); return false; }
+    }
+    const size_t sqeSize = p.sq_entries * sizeof(struct io_uring_sqe);
+    void *sqes = mmap(NULL, sqeSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
+    if (sqes == MAP_FAILED) {
+        if (cq != sq) { munmap(cq, cqSize); }
+        munmap(sq, sqSize);
+        ::close(fd);
+        return false;
+    }
+    r.fd = fd;
+    r.sqPtr = sq;   r.sqSize = sqSize;
+    r.cqPtr = cq;   r.cqSize = cqSize;
+    r.sqePtr = sqes; r.sqeSize = sqeSize;
+    r.entries = p.sq_entries;
+    r.sqTail  = (unsigned *) ((char *) sq + p.sq_off.tail);
+    r.sqMask  = (unsigned *) ((char *) sq + p.sq_off.ring_mask);
+    r.sqArray = (unsigned *) ((char *) sq + p.sq_off.array);
+    r.cqHead  = (unsigned *) ((char *) cq + p.cq_off.head);
+    r.cqTail  = (unsigned *) ((char *) cq + p.cq_off.tail);
+    r.cqMask  = (unsigned *) ((char *) cq + p.cq_off.ring_mask);
+    r.cqes    = (struct io_uring_cqe *) ((char *) cq + p.cq_off.cqes);
+    r.sqes    = (struct io_uring_sqe *) sqes;
+    return true;
+}
+
+static void dbReaderRingFree(DBReaderRing &r) {
+    munmap(r.sqePtr, r.sqeSize);
+    if (r.cqPtr != r.sqPtr) { munmap(r.cqPtr, r.cqSize); }
+    munmap(r.sqPtr, r.sqSize);
+    ::close(r.fd);
+}
+#endif
+
+// how many reads one thread keeps in flight; the device saturates at 4, past that only memory grows
+static const unsigned DBREADER_BATCH_DEPTH = 8;
+// one thread's arena, so a batch of a few hundred short entries never has to be split
+static const size_t DBREADER_BATCH_ARENA = 1 * 1024 * 1024;
+
+template <typename T>
+struct DBReader<T>::IoBatch {
+    struct Slot {
+        size_t arenaOffset;
+        size_t delta;
+        size_t avail;
+        size_t id;
+    };
+    // without coalescing, 20 short entries in one 4 KiB block become 20 O_DIRECT reads of that block
+    struct Request {
+        size_t arenaOffset;
+        size_t file;
+        size_t offset;
+        size_t length;
+        size_t required;
+    };
+    struct Worker {
+        char *arena;
+        size_t capacity;
+        std::vector<Slot> slots;
+        std::vector<Request> requests;
+#if defined(__linux__) && defined(HAVE_IO_URING)
+        DBReaderRing ring;
+#endif
+        bool ringReady;
+        Worker() : arena(NULL), capacity(0), ringReady(false) {}
+    };
+    std::vector<Worker> workers;
+};
+
+template <typename T> void DBReader<T>::freeIoBatch() {
+    if (ioBatch == NULL) {
+        return;
+    }
+    for (size_t i = 0; i < ioBatch->workers.size(); i++) {
+        typename IoBatch::Worker &w = ioBatch->workers[i];
+        if (w.arena != NULL) {
+            free(w.arena);
+            decrementMemory(w.capacity);
+        }
+#if defined(__linux__) && defined(HAVE_IO_URING)
+        if (w.ringReady) {
+            dbReaderRingFree(w.ring);
+        }
+#endif
+    }
+    delete ioBatch;
+    ioBatch = NULL;
+}
+
+template <typename T>
+size_t DBReader<T>::loadBatch(const size_t *ids, size_t n, unsigned int thrIdx) {
+    if (n == 0) {
+        return 0;
+    }
+    if (static_cast<int>(thrIdx) >= threads) {
+        Debug(Debug::ERROR) << "loadBatch: thread index (" << thrIdx << ") >= threads (" << threads << ")\n";
+        EXIT(EXIT_FAILURE);
+    }
+    // open() builds this, because loadBatch is called from inside a parallel region
+    typename IoBatch::Worker &worker = ioBatch->workers[thrIdx];
+    worker.slots.clear();
+    worker.requests.clear();
+    // on mmap the bytes are already addressable, so the batch is only a list of ids
+    if ((dataMode & USE_DIRECT_IO) == 0) {
+        for (size_t i = 0; i < n; i++) {
+            typename IoBatch::Slot slot;
+            slot.arenaOffset = 0;
+            slot.delta = 0;
+            slot.avail = 0;
+            slot.id = ids[i];
+            worker.slots.push_back(slot);
+        }
+        return n;
+    }
+    return loadBatchDirect(ids, n, thrIdx);
+}
+
+template <typename T>
+size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int thrIdx) {
+    typename IoBatch::Worker &worker = ioBatch->workers[thrIdx];
+    // buffered descriptors need no alignment, but posix_memalign still demands a pointer-sized one
+    const size_t arenaAlign = std::max(directIoAlign, sizeof(void *));
+    if (worker.arena == NULL) {
+        void *mem = NULL;
+        if (posix_memalign(&mem, arenaAlign, DBREADER_BATCH_ARENA) != 0 || mem == NULL) {
+            Debug(Debug::ERROR) << "Cannot allocate " << DBREADER_BATCH_ARENA << " byte batch arena\n";
+            EXIT(EXIT_FAILURE);
+        }
+        worker.arena = static_cast<char *>(mem);
+        worker.capacity = DBREADER_BATCH_ARENA;
+        incrementMemory(worker.capacity);
+    }
+
+    // one Slot per input id even after merging spans, so batchAt keeps the caller's order
+    size_t used = 0;
+    size_t taken = 0;
+    for (; taken < n; taken++) {
+        const size_t id = ids[taken];
+        if (id >= size) {
+            Debug(Debug::ERROR) << "Invalid database read for id=" << id << ", database index=" << indexFileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        const size_t localId = (local2id != NULL) ? local2id[id] : id;
+        const size_t offset = index[localId].offset;
+        const size_t length = index[localId].length;
+        size_t file = 0;
+        while ((offset >= dataSizeOffset[file] && offset < dataSizeOffset[file + 1]) == false) {
+            file++;
+        }
+        const size_t fileOffset = offset - dataSizeOffset[file];
+        const size_t alignedOffset = fileOffset & ~(directIoAlign - 1);
+        const size_t delta = fileOffset - alignedOffset;
+        const size_t readLen = (delta + length + directIoAlign - 1) & ~(directIoAlign - 1);
+        const size_t readEnd = alignedOffset + readLen;
+
+        bool merged = false;
+        if (worker.requests.empty() == false) {
+            typename IoBatch::Request &request = worker.requests.back();
+            const size_t requestEnd = request.offset + request.length;
+            // Only merge forward. Arbitrary callers still work; they simply get one request per id.
+            if (request.file == file && alignedOffset >= request.offset && alignedOffset <= requestEnd) {
+                const size_t mergedEnd = std::max(requestEnd, readEnd);
+                const size_t extra = mergedEnd - requestEnd;
+                if (used + extra <= worker.capacity) {
+                    request.length += extra;
+                    request.required = std::max(request.required, fileOffset + length - request.offset);
+                    used += extra;
+
+                    typename IoBatch::Slot slot;
+                    slot.arenaOffset = request.arenaOffset;
+                    slot.delta = fileOffset - request.offset;
+                    slot.avail = length;
+                    slot.id = id;
+                    worker.slots.push_back(slot);
+                    merged = true;
+                }
+            }
+        }
+        if (merged) {
+            continue;
+        }
+
+        if (used + readLen > worker.capacity) {
+            if (taken > 0) {
+                break;
+            }
+            // one entry wider than the arena still has to be read, so grow to exactly it
+            free(worker.arena);
+            decrementMemory(worker.capacity);
+            void *mem = NULL;
+            if (posix_memalign(&mem, arenaAlign, readLen) != 0 || mem == NULL) {
+                Debug(Debug::ERROR) << "Cannot allocate " << readLen << " byte batch arena\n";
+                EXIT(EXIT_FAILURE);
+            }
+            worker.arena = static_cast<char *>(mem);
+            worker.capacity = readLen;
+            incrementMemory(worker.capacity);
+        }
+
+        typename IoBatch::Request request;
+        request.arenaOffset = used;
+        request.file = file;
+        request.offset = alignedOffset;
+        request.length = readLen;
+        request.required = delta + length;
+        worker.requests.push_back(request);
+
+        typename IoBatch::Slot slot;
+        slot.arenaOffset = used;
+        slot.delta = delta;
+        slot.avail = length;
+        slot.id = id;
+        worker.slots.push_back(slot);
+        used += readLen;
+    }
+
+    const size_t requestCount = worker.requests.size();
+    bool submitted = false;
+#if defined(__linux__) && defined(HAVE_IO_URING)
+    if (requestCount > 1) {
+        if (worker.ringReady == false) {
+            // MMSEQS_NO_IO_URING=1 drops to the pread loop, so the ring can be A/B tested in place
+            static const bool ringOff = getenv("MMSEQS_NO_IO_URING") != NULL;
+            worker.ringReady = ringOff ? false : dbReaderRingInit(worker.ring, DBREADER_BATCH_DEPTH * 2);
+        }
+        if (worker.ringReady) {
+            DBReaderRing &r = worker.ring;
+            const unsigned sqMask = *r.sqMask;
+            const unsigned cqMask = *r.cqMask;
+            size_t next = 0;
+            size_t done = 0;
+            unsigned inflight = 0;
+            while (done < requestCount) {
+                unsigned queued = 0;
+                while (inflight + queued < DBREADER_BATCH_DEPTH && next < requestCount) {
+                    const typename IoBatch::Request &request = worker.requests[next];
+                    const unsigned sqeIdx = static_cast<unsigned>(next % r.entries);
+                    struct io_uring_sqe *sqe = &r.sqes[sqeIdx];
+                    memset(sqe, 0, sizeof(*sqe));
+                    sqe->opcode = IORING_OP_READ;
+                    sqe->fd = dataFds[request.file];
+                    sqe->off = request.offset;
+                    sqe->addr = (uint64_t) (uintptr_t) (worker.arena + request.arenaOffset);
+                    sqe->len = static_cast<unsigned>(request.length);
+                    sqe->user_data = next;
+                    const unsigned tail = *r.sqTail;
+                    r.sqArray[tail & sqMask] = sqeIdx;
+                    __atomic_store_n(r.sqTail, tail + 1, __ATOMIC_RELEASE);
+                    queued++;
+                    next++;
+                }
+                const unsigned waitFor = (next >= requestCount) ? (inflight + queued) : 1u;
+                long ret;
+                do {
+                    ret = syscall(__NR_io_uring_enter, r.fd, queued, waitFor,
+                                  IORING_ENTER_GETEVENTS, NULL, 0);
+                } while (ret < 0 && errno == EINTR);
+                if (ret < 0) {
+                    Debug(Debug::ERROR) << "io_uring_enter failed for " << dataFileName << ". Error " << errno << ".\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                inflight += queued;
+                unsigned head = *r.cqHead;
+                const unsigned cqTail = __atomic_load_n(r.cqTail, __ATOMIC_ACQUIRE);
+                while (head != cqTail) {
+                    struct io_uring_cqe *cqe = &r.cqes[head & cqMask];
+                    const size_t requestIdx = (cqe->res < 0) ? 0 : static_cast<size_t>(cqe->user_data);
+                    const typename IoBatch::Request &request = worker.requests[requestIdx];
+                    if (cqe->res < 0) {
+                        Debug(Debug::ERROR) << "Failed to read from " << dataFileName << ". Error " << -cqe->res << ".\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    if (static_cast<size_t>(cqe->res) < request.required) {
+                        Debug(Debug::ERROR) << "Short batch read of " << cqe->res << " byte from "
+                                            << dataFileName << " at offset " << request.offset << "\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    head++;
+                    inflight--;
+                    done++;
+                }
+                __atomic_store_n(r.cqHead, head, __ATOMIC_RELEASE);
+            }
+            submitted = true;
+        }
+    }
+#endif
+    if (submitted == false) {
+        // one pread per coalesced span; near EOF a short read is fine if it covers every slot in it
+        for (size_t i = 0; i < requestCount; i++) {
+            const typename IoBatch::Request &request = worker.requests[i];
+            ssize_t got;
+            do {
+                got = pread(dataFds[request.file], worker.arena + request.arenaOffset,
+                            request.length, request.offset);
+            } while (got < 0 && errno == EINTR);
+            if (got < 0 || static_cast<size_t>(got) < request.required) {
+                Debug(Debug::ERROR) << "Failed batch read of " << request.required << " byte from "
+                                    << dataFileName << " at offset " << request.offset
+                                    << ". Error " << errno << ".\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+    }
+    return taken;
+}
+
+template <typename T>
+const char *DBReader<T>::batchAt(unsigned int thrIdx, size_t k) {
+    const typename IoBatch::Slot &slot = ioBatch->workers[thrIdx].slots[k];
+    if ((dataMode & USE_DIRECT_IO) == 0) {
+        return getData(slot.id, thrIdx);
+    }
+    return ioBatch->workers[thrIdx].arena + slot.arenaOffset + slot.delta;
+}
+
+
+
+template <typename T>
+void DBReader<T>::dropCacheRange(size_t beginOffset, size_t endOffset) {
+#ifdef HAVE_POSIX_FADVISE
+    if ((dataMode & USE_DATA) == 0 || (dataMode & USE_FREAD) || compression == COMPRESSED) {
+        return;
+    }
+    if (dataMode & USE_WRITABLE) {
+        return;
+    }
+    if ((dataMode & USE_DIRECT_IO) && ioBufferedBatch == false) {
+        return;
+    }
+    const size_t pageSize = Util::getPageSize();
+    for (size_t fileIdx = 0; fileIdx < dataFileCnt; fileIdx++) {
+        const size_t from = std::max(beginOffset, dataSizeOffset[fileIdx]);
+        const size_t to = std::min(endOffset, dataSizeOffset[fileIdx + 1]);
+        if (from >= to) {
+            continue;
+        }
+        const size_t localFrom = ((from - dataSizeOffset[fileIdx]) + pageSize - 1) & ~(pageSize - 1);
+        const size_t localTo = (to - dataSizeOffset[fileIdx]) & ~(pageSize - 1);
+        if (localTo <= localFrom) {
+            continue;
+        }
+        // fadvise skips pages that are still mapped, so the mapping has to go first
+        if (dataFiles != NULL && dataFiles[fileIdx] != NULL) {
+            ::madvise(dataFiles[fileIdx] + localFrom, localTo - localFrom, MADV_DONTNEED);
+        }
+        const int fd = (dataFds != NULL) ? dataFds[fileIdx] : -1;
+        if (fd >= 0) {
+            posix_fadvise(fd, localFrom, localTo - localFrom, POSIX_FADV_DONTNEED);
+        }
+    }
+#else
+    (void) beginOffset;
+    (void) endOffset;
+#endif
+}
+
+template <typename T>
+void DBReader<T>::dropCacheAll() {
+#ifdef HAVE_POSIX_FADVISE
+    if ((dataMode & USE_DATA) == 0 || (dataMode & USE_FREAD) || compression == COMPRESSED) {
+        return;
+    }
+    // MADV_DONTNEED on a writable MAP_PRIVATE mapping silently discards the caller's edits
+    if (dataMode & USE_WRITABLE) {
+        return;
+    }
+    // O_DIRECT never populated the cache, so there is nothing to drop
+    if ((dataMode & USE_DIRECT_IO) && ioBufferedBatch == false) {
+        return;
+    }
+    for (size_t fileIdx = 0; fileIdx < dataFileCnt; fileIdx++) {
+        // fadvise skips pages that are still mapped, so the mapping has to go first
+        if (dataFiles != NULL && dataFiles[fileIdx] != NULL) {
+            const size_t fileSize = dataSizeOffset[fileIdx + 1] - dataSizeOffset[fileIdx];
+            ::madvise(dataFiles[fileIdx], fileSize, MADV_DONTNEED);
+        }
+        const int fd = (dataFds != NULL) ? dataFds[fileIdx] : -1;
+        if (fd >= 0) {
+            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+        }
+    }
+#endif
+}
+
+template <typename T> char* DBReader<T>::readDirect(size_t offset, size_t length, int thrIdx) {
+    if (thrIdx < 0) {
+#ifdef OPENMP
+        thrIdx = omp_get_thread_num();
+#else
+        thrIdx = 0;
+#endif
+    }
+    if (thrIdx >= threads) {
+        Debug(Debug::ERROR) << "readDirect: thread index (" << thrIdx << ") >= threads (" << threads << ")\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (offset >= totalDataSize) {
+        Debug(Debug::ERROR) << "Invalid database read for database data file=" << dataFileName << ", database index=" << indexFileName << "\n";
+        Debug(Debug::ERROR) << "Size of data: " << totalDataSize << "\n";
+        Debug(Debug::ERROR) << "Requested offset: " << offset << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    size_t cnt = 0;
+    while ((offset >= dataSizeOffset[cnt] && offset < dataSizeOffset[cnt+1]) == false) {
+        cnt++;
+    }
+    size_t fileOffset = offset - dataSizeOffset[cnt];
+    size_t alignedOffset = fileOffset & ~(directIoAlign - 1);
+    size_t delta = fileOffset - alignedOffset;
+    size_t readLen = (delta + length + directIoAlign - 1) & ~(directIoAlign - 1);
+    DirectBuffer &buf = directBuffers[thrIdx];
+    // an aligned read holds many short entries, so offset-ordered access mostly hits here
+    if (buf.length > 0 && buf.file == cnt && alignedOffset >= buf.offset
+        && (alignedOffset - buf.offset) + delta + length <= buf.length) {
+        return buf.buffer + (alignedOffset - buf.offset) + delta;
+    }
+    if (readLen > buf.size) {
+        // the cached block is gone with the old allocation
+        buf.length = 0;
+        growBuffer(&buf.buffer, &buf.size, readLen, directIoAlign, 0);
+    }
+    // reading past the end of the file returns a short count, the entry itself is still fully covered
+    ssize_t read;
+    do {
+        read = pread(dataFds[cnt], buf.buffer, readLen, alignedOffset);
+    } while (read < 0 && errno == EINTR);
+    if (read < 0 || static_cast<size_t>(read) < delta + length) {
+        int errsv = errno;
+        buf.length = 0;
+        Debug(Debug::ERROR) << "Failed to read " << length << " bytes at offset " << offset
+                            << " from " << dataFileNames[cnt] << ". Error " << errsv << ".\n";
+        EXIT(EXIT_FAILURE);
+    }
+    buf.file = cnt;
+    buf.offset = alignedOffset;
+    buf.length = static_cast<size_t>(read);
+    return buf.buffer + delta;
+}
+
 template <typename T> void DBReader<T>::remapData(){
-    if ((dataMode & USE_DATA) && (dataMode & USE_FREAD) == 0) {
+    if ((dataMode & USE_DATA) && (dataMode & (USE_FREAD | USE_DIRECT_IO)) == 0) {
         unmapData();
         for(size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++){
             FILE* dataFile = fopen(dataFileNames[fileIdx].c_str(), "r");
             if (dataFile == NULL) {
-                Debug(Debug::ERROR) << "Cannot open data file " << dataFileNames[fileIdx] << "!\n";
+                // EMFILE and ENOENT mean very different things when a long run reopens the db often
+                const int errsv = errno;
+                Debug(Debug::ERROR) << "Cannot reopen data file " << dataFileNames[fileIdx]
+                                    << " during remap. errno=" << errsv << " ("
+                                    << strerror(errsv) << ")\n";
                 EXIT(EXIT_FAILURE);
             }
             size_t dataSize = 0;
@@ -309,16 +1266,30 @@ template <typename T> void DBReader<T>::close(){
 
     if(dataMode & USE_DATA){
         unmapData();
+        // the cache-advice descriptors outlive unmapData on purpose, so this is where they go
+        if (dataFds != NULL) {
+            for (size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+                if (dataFds[fileIdx] >= 0) {
+                    ::close(dataFds[fileIdx]);
+                }
+            }
+            delete[] dataFds;
+            dataFds = NULL;
+        }
     }
 
     if (id2local != NULL) {
         delete[] id2local;
-        decrementMemory(size*sizeof(unsigned int));
+        decrementMemory(size*sizeof(DBLocalId));
     }
     if (local2id != NULL) {
         delete[] local2id;
-        decrementMemory(size*sizeof(unsigned int));
+        decrementMemory(size*sizeof(DBLocalId));
     }
+
+    freeDirectBuffers();
+
+    freeIoBatch();
 
     if(compressedBuffers){
         for(int i = 0; i < threads; i++){
@@ -329,6 +1300,9 @@ template <typename T> void DBReader<T>::close(){
         delete [] compressedBuffers;
         delete [] compressedBufferSizes;
         delete [] dstream;
+        compressedBuffers = NULL;
+        compressedBufferSizes = NULL;
+        dstream = NULL;
     }
 
     if(externalData == false) {
@@ -347,7 +1321,7 @@ template <typename T> size_t DBReader<T>::bsearch(const Index * index, size_t N,
 
 
 template <typename T> char* DBReader<T>::getUnpadded(size_t id, int thrIdx) {
-    char *data = getDataUncompressed(id);
+    char *data = getDataUncompressed(id, thrIdx);
     size_t seqLen = getSeqLen(id);
 
     static const char CODE_TO_CHAR[21] = {
@@ -360,6 +1334,7 @@ template <typename T> char* DBReader<T>::getUnpadded(size_t id, int thrIdx) {
             'W', /* 18 */ 'Y', /* 19 */ 'X'  /* 20 */
     };
 
+    growBuffer(&compressedBuffers[thrIdx], &compressedBufferSizes[thrIdx], seqLen + 2, 1, 0);
     for(size_t i = 0; i < seqLen; i++){
         unsigned char code = static_cast<unsigned char>(data[i]);
         unsigned char baseCode = (code >= 32) ? code - 32 : code;
@@ -372,7 +1347,7 @@ template <typename T> char* DBReader<T>::getUnpadded(size_t id, int thrIdx) {
 }
 
 template <typename T> char* DBReader<T>::getDataCompressed(size_t id, int thrIdx) {
-    char *data = getDataUncompressed(id);
+    char *data = getDataUncompressed(id, thrIdx);
 
     unsigned int cSize = *(reinterpret_cast<unsigned int *>(data));
 
@@ -383,7 +1358,11 @@ template <typename T> char* DBReader<T>::getDataCompressed(size_t id, int thrIdx
     if(isCompressed){
         ZSTD_inBuffer input = {cBuff, cSize, 0};
         while (input.pos < input.size) {
-            ZSTD_outBuffer output = {compressedBuffers[thrIdx], compressedBufferSizes[thrIdx], 0};
+            // the decompressed size is only known once the frame is consumed, so append and grow
+            growBuffer(&compressedBuffers[thrIdx], &compressedBufferSizes[thrIdx],
+                       totalSize + 1 + DECOMPRESS_MIN_ROOM, 1, totalSize);
+            ZSTD_outBuffer output = {compressedBuffers[thrIdx] + totalSize,
+                                     compressedBufferSizes[thrIdx] - totalSize - 1, 0};
             // size of next compressed block
             size_t toRead = ZSTD_decompressStream(dstream[thrIdx], &output, &input);
             if (ZSTD_isError(toRead)) {
@@ -394,6 +1373,7 @@ template <typename T> char* DBReader<T>::getDataCompressed(size_t id, int thrIdx
         }
         compressedBuffers[thrIdx][totalSize] = '\0';
     }else{
+        growBuffer(&compressedBuffers[thrIdx], &compressedBufferSizes[thrIdx], cSize + 1, 1, 0);
         memcpy(compressedBuffers[thrIdx], cBuff, cSize);
         compressedBuffers[thrIdx][cSize] = '\0';
     }
@@ -417,11 +1397,11 @@ template <typename T> char* DBReader<T>::getData(size_t id, int thrIdx){
     }else if (padded) {
         return getUnpadded(id, thrIdx);
     } else {
-        return getDataUncompressed(id);
+        return getDataUncompressed(id, thrIdx);
     }
 }
 
-template <typename T> char* DBReader<T>::getDataUncompressed(size_t id){
+template <typename T> char* DBReader<T>::getDataUncompressed(size_t id, int thrIdx){
     checkClosed();
     if(!(dataMode & USE_DATA)) {
         Debug(Debug::ERROR) << "DBReader is just open in INDEXONLY mode. Call of getData is not allowed" << "\n";
@@ -434,14 +1414,18 @@ template <typename T> char* DBReader<T>::getDataUncompressed(size_t id){
     }
 
 
-    if (local2id != NULL) {
-        return getDataByOffset(index[local2id[id]].offset);
-    }else{
-        return getDataByOffset(index[id].offset);
+    size_t localId = (local2id != NULL) ? local2id[id] : id;
+    if (dataMode & USE_DIRECT_IO) {
+        return readDirect(index[localId].offset, index[localId].length, thrIdx);
     }
+    return getDataByOffset(index[localId].offset);
 }
 
 template <typename T> char* DBReader<T>::getDataByOffset(size_t offset) {
+    if (dataMode & USE_DIRECT_IO) {
+        Debug(Debug::ERROR) << "getDataByOffset is not supported in USE_DIRECT_IO mode, the entry length is unknown\n";
+        EXIT(EXIT_FAILURE);
+    }
     if (offset >= totalDataSize){
         Debug(Debug::ERROR) << "Invalid database read for database data file=" << dataFileName << ", database index=" << indexFileName << "\n";
         Debug(Debug::ERROR) << "Size of data: " << totalDataSize << "\n";
@@ -458,7 +1442,7 @@ template <typename T> char* DBReader<T>::getDataByOffset(size_t offset) {
 
 template <typename T>
 void DBReader<T>::touchData(size_t id) {
-    if((dataMode & USE_DATA) && (dataMode & USE_FREAD) == 0) {
+    if((dataMode & USE_DATA) && (dataMode & (USE_FREAD | USE_DIRECT_IO)) == 0) {
         char *data = getDataUncompressed(id);
         size_t currDataOffset = getOffset(id);
         size_t nextDataOffset = findNextOffsetid(id);
@@ -469,13 +1453,11 @@ void DBReader<T>::touchData(size_t id) {
 
 template <typename T> char* DBReader<T>::getDataByDBKey(T dbKey, int thrIdx) {
     size_t id = getId(dbKey);
-    if(compression == COMPRESSED ){
-        return (id != DB_ENTRY_NOT_FOUND) ? getDataCompressed(id, thrIdx) : NULL;
-    } if(padded) {
-        return (id != DB_ENTRY_NOT_FOUND) ? getUnpadded(id, thrIdx) : NULL;
-    } else{
-        return (id != DB_ENTRY_NOT_FOUND) ? getDataByOffset(index[id].offset) : NULL;
+    if (id == DB_ENTRY_NOT_FOUND) {
+        return NULL;
     }
+    // getId returns a local id, so the offset lookup has to go through getData, not through index[id]
+    return getData(id, thrIdx);
 }
 
 template <typename T> size_t DBReader<T>::getLookupSize() const {
@@ -638,7 +1620,8 @@ template <typename T> size_t DBReader<T>::maxCount(char c) {
     checkClosed();
 
     size_t max = 0;
-    if (compression == COMPRESSED) {
+    // the direct io mode has no mapping to scan, so it counts per entry like the compressed mode does
+    if (compression == COMPRESSED || (dataMode & USE_DIRECT_IO)) {
         size_t entries = getSize();
 #ifdef OPENMP
         size_t localThreads = std::max(std::min(entries, static_cast<size_t>(threads)), (size_t)1);
@@ -778,7 +1761,22 @@ DBKeyType DBReader<DBKeyType>::indexIdToNum(DBKeyType * id) {
 }
 
 template <typename T> void DBReader<T>::unmapData() {
-    if (dataMapped == true) {
+    if (dataMapped == true && (dataMode & USE_DIRECT_IO)) {
+        for(size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+            if (::close(dataFds[fileIdx]) != 0) {
+                Debug(Debug::ERROR) << "Cannot close file " << dataFileNames[fileIdx] << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+        delete[] dataFds;
+        dataFds = NULL;
+        // the cached blocks belong to the descriptors that were just closed
+        if (directBuffers != NULL) {
+            for (int i = 0; i < threads; i++) {
+                directBuffers[i].length = 0;
+            }
+        }
+    } else if (dataMapped == true) {
         for(size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
             size_t fileSize = dataSizeOffset[fileIdx+1] -dataSizeOffset[fileIdx];
             if(fileSize > 0) {
@@ -796,6 +1794,8 @@ template <typename T> void DBReader<T>::unmapData() {
                     decrementMemory(dataSize);
                 }
             }
+            // DONTNEED on a reused address zero-fills it, so a stale pointer would corrupt rather than fault
+            dataFiles[fileIdx] = NULL;
         }
     }
 
@@ -916,9 +1916,23 @@ int DBReader<T>::isCompressed(int dbtype) {
 
 template<typename T>
 void DBReader<T>::setSequentialAdvice() {
+    if (dataMode & (USE_FREAD | USE_DIRECT_IO)) {
+        return;
+    }
     for(size_t i = 0; i < dataFileCnt; i++){
         size_t dataSize = dataSizeOffset[i+1] - dataSizeOffset[i];
         Util::madviseLogged(dataFiles[i], dataSize, POSIX_MADV_SEQUENTIAL, dataFileName);
+    }
+}
+
+template <typename T>
+void DBReader<T>::setNormalAdvice() {
+    if (dataMode & (USE_FREAD | USE_DIRECT_IO)) {
+        return;
+    }
+    for(size_t i = 0; i < dataFileCnt; i++){
+        size_t dataSize = dataSizeOffset[i+1] - dataSizeOffset[i];
+        Util::madviseLogged(dataFiles[i], dataSize, POSIX_MADV_NORMAL, dataFileName);
     }
 }
 

@@ -51,6 +51,9 @@ public:
 
     void writeIndexEntry(DBKeyType key, size_t offset, size_t length, unsigned int thrIdx);
 
+    void writeIndexEntries(DBReader<DBKeyType>::Index *index, size_t indexSize, unsigned int thrIdx,
+                           unsigned int threads = 1);
+
     static void writeDbtypeFile(const char* path, int dbtype, bool isCompressed);
 
     size_t getStart(unsigned int threadIdx){
@@ -62,7 +65,7 @@ public:
     }
 
     template <typename T>
-    static void writeIndex(FILE *outFile, size_t indexSize, T *index);
+    static void writeIndex(FILE *outFile, size_t indexSize, T *index, unsigned int threads = 1);
 
     template <typename T>
     static void writeIndexEntryToFile(FILE *outFile, char *buff1, T &index);
@@ -73,7 +76,11 @@ public:
         return closed;
     }
 
-    static void sortIndex(const char *inFileNameIndex, const char *outFileNameIndex, const bool lexicographicOrder);
+    static void sortIndex(DBReader<DBKeyType>::Index *index, size_t indexSize, const char *outFileNameIndex,
+                          unsigned int threads);
+
+    static void sortIndex(const char *inFileNameIndex, const char *outFileNameIndex, const bool lexicographicOrder,
+                          unsigned int threads = 1);
 private:
     size_t addToThreadBuffer(const void *data, size_t itmesize, size_t nitems, int threadIdx);
     void writeThreadBuffer(unsigned int idx, size_t dataSize);
@@ -85,7 +92,12 @@ private:
                              unsigned long fileCount, bool mergeDatafiles,
                              bool lexicographicOrder = false, bool indexNeedsToBeSorted = true);
 
-    static void mergeIndex(const char** indexFilenames, unsigned int fileCount, const std::vector<size_t> &dataSizes);
+    static void mergeIndex(const char** indexFilenames, unsigned int fileCount, const std::vector<size_t> &dataSizes,
+                           unsigned int threads = 1);
+
+    static DBReader<DBKeyType>::Index *mergeIndexInMemory(const char** indexFilenames, unsigned int fileCount,
+                                                          const std::vector<size_t> &dataSizes, unsigned int threads,
+                                                          size_t &mergedSize);
 
     char* dataFileName;
     char* indexFileName;

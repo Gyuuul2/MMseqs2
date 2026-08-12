@@ -11,6 +11,9 @@
 #include <regex.h>
 #include <unistd.h>
 #include <sched.h>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
 
 #include "blosum62.out.h"
 #include "PAM30.out.h"
@@ -173,12 +176,77 @@ Parameters::Parameters():
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
+        PARAM_COMPRESS_KMER_TMP_FILES(PARAM_COMPRESS_KMER_TMP_FILES_ID, "--compress-kmer-tmp-files", "Compress k-mer temporary files", "Compress kmermatcher temporary files and stream them during merge: 0: off, 1: zstd", typeid(int), (void *) &compressKmerTmpFiles, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_KMER_WRITE_TO_DISK(PARAM_KMER_WRITE_TO_DISK_ID, "--kmer-write-to-disk", "Write k-mers to disk", "Extract k-mers once into per-split buckets on disk, so each split reads its bucket instead of re-scanning the sequence DB (identical result; faster when splitting on fast local storage)", typeid(bool), (void *) &kmerWriteToDisk, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_KMERMATCHER_MODE(PARAM_KMERMATCHER_MODE_ID, "--kmermatcher-mode", "K-mer matcher mode", "1: database-key payloads (generic prefilter format), 2: local sequence-index payloads (linclust2/align2clust only)", typeid(int), (void *) &kmerMatcherMode, "^[1-2]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_VERSION(PARAM_LINCLUST_VERSION_ID, "--linclust-version", "Linclust version", "Linclust version: 1: Linclust1, 2: Linclust2", typeid(int), (void *) &linclustVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LINCLUST2_ITER(PARAM_LINCLUST2_ITER_ID, "--linclust2-iter", "Linclust2 iterations", "Iterations of linclust2. 2 re-clusters the representatives, 1 stops after the first iteration", typeid(int), (void *) &linclust2Iter, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_LINCLUST2_ITER(PARAM_BATCH_ROUND0_LINCLUST2_ITER_ID, "--round0-linclust2-iter", "Round0 linclust2 iterations", "Override --linclust2-iter for round 0 only. If unset, round 0 uses --linclust2-iter", typeid(int), (void *) &batchRound0Linclust2Iter, "^[1-2]$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUSTER_VERSION(PARAM_CLUSTER_VERSION_ID, "--cluster-version", "Cluster version", "Cluster version: 1: Cluster1, 2: Cluster2", typeid(int), (void *) &clusterVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         // workflow
         PARAM_RUNNER(PARAM_RUNNER_ID, "--mpi-runner", "MPI runner", "Use MPI on compute cluster with this MPI command (e.g. \"mpirun -np 42\")", typeid(std::string), (void *) &runner, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_REUSELATEST(PARAM_REUSELATEST_ID, "--force-reuse", "Force restart with latest tmp", "Reuse tmp filse in tmp/latest folder ignoring parameters and version changes", typeid(bool), (void *) &reuseLatest, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_BACKEND(PARAM_BATCH_BACKEND_ID, "--backend", "Backend", "Batch clustering backend: single-node, multi-node, or aws-batch", typeid(std::string), (void *) &batchBackend, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_CHUNK_MAX_BYTES(PARAM_BATCH_CHUNK_MAX_BYTES_ID, "--chunk-max-bytes", "Chunk bytes", "Maximum uncompressed FASTA bytes per chunk. 0 disables the byte limit", typeid(ByteParser), (void *) &batchChunkMaxBytes, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_CHUNK_MAX_SEQS(PARAM_BATCH_CHUNK_MAX_SEQS_ID, "--chunk-max-seqs", "Chunk sequences", "Maximum sequences per chunk. 0 disables the sequence-count limit", typeid(size_t), (void *) &batchChunkMaxSeqs, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_SLURM_NODELIST(PARAM_BATCH_SLURM_NODELIST_ID, "--slurm-nodelist", "SLURM nodes", "Comma-separated SLURM node list for --backend multi-node", typeid(std::string), (void *) &batchSlurmNodelist, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_SLURM_PARTITION(PARAM_BATCH_SLURM_PARTITION_ID, "--slurm-partition", "SLURM partition", "SLURM partition for --backend multi-node", typeid(std::string), (void *) &batchSlurmPartition, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_SLURM_TIME(PARAM_BATCH_SLURM_TIME_ID, "--slurm-time", "SLURM time", "SLURM time limit for submitted jobs", typeid(std::string), (void *) &batchSlurmTime, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_SLURM_MEM(PARAM_BATCH_SLURM_MEM_ID, "--slurm-mem", "SLURM memory", "SLURM memory request per submitted chunk task", typeid(std::string), (void *) &batchSlurmMem, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_SLURM_EXTRA(PARAM_BATCH_SLURM_EXTRA_ID, "--slurm-extra", "SLURM extra", "Additional raw sbatch options for --backend multi-node", typeid(std::string), (void *) &batchSlurmExtra, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_NODE_WORK_DIR(PARAM_BATCH_NODE_WORK_DIR_ID, "--node-work-dir", "Node work dir", "Per-node LOCAL disk for chunk tasks (createdb/cluster tmp + sort spill). REQUIRED for --backend multi-node and aws-batch; on single-node defaults to a subdirectory of the shared tmp directory", typeid(std::string), (void *) &batchNodeWorkDir, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_AWS_MACHINE(PARAM_BATCH_AWS_MACHINE_ID, "--aws-machine", "AWS machine", "AWS Batch machine tag value for round 1+; resolves tagged job queue and job definition", typeid(std::string), (void *) &batchAwsMachine, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_AWS_JOB_QUEUE(PARAM_BATCH_AWS_JOB_QUEUE_ID, "--aws-job-queue", "AWS job queue", "Explicit AWS Batch job queue for round 1+; overrides --aws-machine queue lookup", typeid(std::string), (void *) &batchAwsJobQueue, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_JOB_DEFINITION(PARAM_BATCH_AWS_JOB_DEFINITION_ID, "--aws-job-definition", "AWS job definition", "Explicit AWS Batch job definition for round 1+; overrides --aws-machine job-definition lookup", typeid(std::string), (void *) &batchAwsJobDefinition, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_AWS_MACHINE(PARAM_BATCH_ROUND0_AWS_MACHINE_ID, "--round0-aws-machine", "Round0 AWS machine", "AWS Batch machine tag value for round 0 only; resolves tagged job queue and job definition", typeid(std::string), (void *) &batchRound0AwsMachine, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_AWS_JOB_QUEUE(PARAM_BATCH_ROUND0_AWS_JOB_QUEUE_ID, "--round0-aws-job-queue", "Round0 AWS queue", "Explicit AWS Batch job queue for round 0 only; overrides --round0-aws-machine queue lookup", typeid(std::string), (void *) &batchRound0AwsJobQueue, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_AWS_JOB_DEFINITION(PARAM_BATCH_ROUND0_AWS_JOB_DEFINITION_ID, "--round0-aws-job-definition", "Round0 AWS job def", "Explicit AWS Batch job definition for round 0 only; overrides --round0-aws-machine job-definition lookup", typeid(std::string), (void *) &batchRound0AwsJobDefinition, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_MACHINE_TAG_KEY(PARAM_BATCH_AWS_MACHINE_TAG_KEY_ID, "--aws-machine-tag-key", "AWS machine tag", "AWS tag key used by --aws-machine lookup on Batch job queues and job definitions", typeid(std::string), (void *) &batchAwsMachineTagKey, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES(PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES_ID, "--round0-chunk-max-bytes", "Round0 chunk bytes", "Override --chunk-max-bytes for round 0 only. If unset, round 0 uses --chunk-max-bytes", typeid(ByteParser), (void *) &batchRound0ChunkMaxBytes, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS(PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS_ID, "--round0-chunk-max-seqs", "Round0 chunk sequences", "Override --chunk-max-seqs for round 0 only. If unset, round 0 uses --chunk-max-seqs", typeid(size_t), (void *) &batchRound0ChunkMaxSeqs, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_SLURM_NODELIST(PARAM_BATCH_ROUND0_SLURM_NODELIST_ID, "--round0-slurm-nodelist", "Round0 SLURM nodes", "Override --slurm-nodelist for round 0 only", typeid(std::string), (void *) &batchRound0SlurmNodelist, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_SLURM_PARTITION(PARAM_BATCH_ROUND0_SLURM_PARTITION_ID, "--round0-slurm-partition", "Round0 SLURM partition", "Override --slurm-partition for round 0 only", typeid(std::string), (void *) &batchRound0SlurmPartition, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_SLURM_TIME(PARAM_BATCH_ROUND0_SLURM_TIME_ID, "--round0-slurm-time", "Round0 SLURM time", "Override --slurm-time for round 0 only", typeid(std::string), (void *) &batchRound0SlurmTime, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_SLURM_MEM(PARAM_BATCH_ROUND0_SLURM_MEM_ID, "--round0-slurm-mem", "Round0 SLURM memory", "Override --slurm-mem for round 0 only", typeid(std::string), (void *) &batchRound0SlurmMem, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_SLURM_EXTRA(PARAM_BATCH_ROUND0_SLURM_EXTRA_ID, "--round0-slurm-extra", "Round0 SLURM extra", "Override --slurm-extra for round 0 only", typeid(std::string), (void *) &batchRound0SlurmExtra, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_NODE_WORK_DIR(PARAM_BATCH_ROUND0_NODE_WORK_DIR_ID, "--round0-node-work-dir", "Round0 node work dir", "Override --node-work-dir for round 0 only", typeid(std::string), (void *) &batchRound0NodeWorkDir, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_MIN_SEQ_ID(PARAM_BATCH_ROUND0_MIN_SEQ_ID_ID, "--round0-min-seq-id", "Round0 seq. id.", "Override --min-seq-id for round 0 only", typeid(float), (void *) &batchRound0SeqIdThr, "^0(\\.[0-9]+)?|1(\\.0+)?$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_C(PARAM_BATCH_ROUND0_C_ID, "--round0-c", "Round0 coverage", "Override -c for round 0 only", typeid(float), (void *) &batchRound0CovThr, "^0(\\.[0-9]+)?|^1(\\.0+)?$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_COV_MODE(PARAM_BATCH_ROUND0_COV_MODE_ID, "--round0-cov-mode", "Round0 coverage mode", "Override --cov-mode for round 0 only", typeid(int), (void *) &batchRound0CovMode, "^[0-5]{1}$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_CLUSTER_MODE(PARAM_BATCH_ROUND0_CLUSTER_MODE_ID, "--round0-cluster-mode", "Round0 cluster mode", "Override --cluster-mode for round 0 only", typeid(int), (void *) &batchRound0ClusteringMode, "[0-3]{1}$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_KMER_PER_SEQ(PARAM_BATCH_ROUND0_KMER_PER_SEQ_ID, "--round0-kmer-per-seq", "Round0 k-mers/sequence", "Override --kmer-per-seq for round 0 only", typeid(int), (void *) &batchRound0KmersPerSequence, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE(PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE_ID, "--round0-include-count-table", "Round0 count table", "Override --include-count-table for round 0 only", typeid(bool), (void *) &batchRound0IncludeCountTable, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_NUM_COUNTS(PARAM_BATCH_ROUND0_NUM_COUNTS_ID, "--round0-num-count-table", "Round0 count-table iterations", "Override --num-count-table for round 0 only", typeid(int), (void *) &batchRound0CountTableIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_INCLUDE_ADJACENCY(PARAM_BATCH_ROUND0_INCLUDE_ADJACENCY_ID, "--round0-include-adjacency", "Round0 adjacency", "Override --include-adjacency for round 0 only", typeid(bool), (void *) &batchRound0IncludeAdjacency, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_NUM_ADJACENCY(PARAM_BATCH_ROUND0_NUM_ADJACENCY_ID, "--round0-num-adjacency", "Round0 adjacency iterations", "Override --num-adjacency for round 0 only", typeid(int), (void *) &batchRound0AdjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_CLUST_HASH(PARAM_BATCH_ROUND0_CLUST_HASH_ID, "--round0-clust-hash", "Round0 cluster hash", "Override --clust-hash for round 0 only", typeid(bool), (void *) &batchRound0ClustHash, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT(PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT_ID, "--round0-split-memory-limit", "Round0 split memory", "Override --split-memory-limit for round 0 only", typeid(ByteParser), (void *) &batchRound0SplitMemoryLimit, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_PRELOAD_MODE(PARAM_BATCH_ROUND0_PRELOAD_MODE_ID, "--round0-db-load-mode", "Round0 preload mode", "Override --db-load-mode for round 0 only", typeid(int), (void *) &batchRound0PreloadMode, "[0-3]{1}", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_MAX_ROUNDS(PARAM_BATCH_MAX_ROUNDS_ID, "--max-rounds", "Max rounds", "Maximum representative clustering rounds", typeid(int), (void *) &batchMaxRounds, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_MIN_REDUCTION_RATIO(PARAM_BATCH_MIN_REDUCTION_RATIO_ID, "--min-reduction-ratio", "Min reduction ratio", "A representative round is low-benefit if it removes less than this fraction of representatives", typeid(float), (void *) &batchMinReductionRatio, "^(0(\\.[0-9]+)?|1(\\.0+)?)$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_CONVERGENCE_PATIENCE(PARAM_BATCH_CONVERGENCE_PATIENCE_ID, "--convergence-patience", "Convergence patience", "Number of consecutive low-benefit rounds before stopping", typeid(int), (void *) &batchConvergencePatience, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_MIN_REDUCTION_COUNT(PARAM_BATCH_MIN_REDUCTION_COUNT_ID, "--min-reduction-count", "Min reduction count", "A representative round is low-benefit if it removes fewer representatives than this count. 0 disables this condition", typeid(size_t), (void *) &batchMinReductionCount, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_MAX_CHUNK_ATTEMPTS(PARAM_BATCH_MAX_CHUNK_ATTEMPTS_ID, "--max-chunk-attempts", "Max chunk attempts", "Maximum attempts for missing or failed chunk workers before reporting a dead-letter failure", typeid(int), (void *) &batchMaxChunkAttempts, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_COMPRESS_OUTPUTS(PARAM_BATCH_COMPRESS_OUTPUTS_ID, "--compress-batch-outputs", "Compress batch outputs", "Store per-round and final batch FASTA/TSV outputs as zstd files", typeid(bool), (void *) &batchCompressOutputs, "^[0-1]{1}$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_MERGE_BUCKETS(PARAM_BATCH_MERGE_BUCKETS_ID, "--merge-buckets", "Merge buckets", "Split the representative merge into this many independent hash buckets, each sorted+joined separately (smaller sorts = lower RAM/disk peak). 0 = auto from --threads (up to 256). The cluster (rep,member) mapping is identical for any value; only inter-cluster row order can differ", typeid(int), (void *) &batchMergeBuckets, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_MERGE_BUCKET_JOBS(PARAM_BATCH_MERGE_BUCKET_JOBS_ID, "--merge-bucket-jobs", "Merge bucket jobs", "Number of independent merge/finalize buckets to sort+join concurrently on the merge node. 0 = auto from --threads (roughly --threads/8, capped at 16)", typeid(int), (void *) &batchMergeBucketJobs, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_ROUND0_MMSEQS(PARAM_BATCH_ROUND0_MMSEQS_ID, "--round0-mmseqs", "Round0 mmseqs binary", "mmseqs binary to run for round 0 only, e.g. a different architecture. Empty uses the same binary as the later rounds", typeid(std::string), (void *) &batchRound0Mmseqs, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_CREATEDB_MODE(PARAM_BATCH_ROUND0_CREATEDB_MODE_ID, "--round0-createdb-mode", "Round0 createdb mode", "Override --createdb-mode for round 0 only (0: copy data, 1: soft link data, 3: length-sorted copy)", typeid(int), (void *) &batchRound0CreatedbMode, "^[013]{1}$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_COMPRESS_RATIO(PARAM_BATCH_COMPRESS_RATIO_ID, "--compress-ratio", "Compression ratio estimate", "Assumed uncompressed/compressed size ratio for compressed inputs whose exact size cannot be read. Feeds chunk grouping, so changing it changes chunk boundaries", typeid(int), (void *) &batchCompressRatio, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_DELETE_SOURCE_CHUNK(PARAM_BATCH_DELETE_SOURCE_CHUNK_ID, "--delete-source-chunk", "Delete source chunk", "Delete the node-local source chunk once its db is written (needs --remove-tmp)", typeid(bool), (void *) &batchDeleteSourceChunk, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_SORT_TMP_DIR(PARAM_BATCH_SORT_TMP_DIR_ID, "--sort-tmp-dir", "Sort tmp directory", "Spill directory for the merge sorts. Empty derives it from the node work directory", typeid(std::string), (void *) &batchSortTmpDir, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_SORT_BUFFER_SIZE(PARAM_BATCH_SORT_BUFFER_SIZE_ID, "--sort-buffer-size", "Sort buffer size", "Per-sort memory target passed to sort --buffer-size, e.g. 200G or 25%. Empty derives it from available memory", typeid(std::string), (void *) &batchSortBufferSize, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_MMSEQS(PARAM_BATCH_AWS_MMSEQS_ID, "--aws-mmseqs", "AWS mmseqs binary", "mmseqs binary inside the AWS Batch container image", typeid(std::string), (void *) &batchAwsMmseqs, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_ROUND0_AWS_MMSEQS(PARAM_BATCH_ROUND0_AWS_MMSEQS_ID, "--round0-aws-mmseqs", "Round0 AWS mmseqs binary", "Override --aws-mmseqs for round 0 only", typeid(std::string), (void *) &batchRound0AwsMmseqs, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_JOB_PREFIX(PARAM_BATCH_AWS_JOB_PREFIX_ID, "--aws-job-prefix", "AWS job name prefix", "Prefix for the submitted AWS Batch job names", typeid(std::string), (void *) &batchAwsJobPrefix, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_LOCAL_DIR(PARAM_BATCH_AWS_LOCAL_DIR_ID, "--aws-local-dir", "AWS local directory", "Container-local scratch directory used by AWS Batch jobs", typeid(std::string), (void *) &batchAwsLocalDir, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_SCRIPT_URI(PARAM_BATCH_AWS_SCRIPT_URI_ID, "--aws-script-uri", "AWS script URI", "S3 URI the workflow script is staged to and fetched from. Empty derives it from the work prefix", typeid(std::string), (void *) &batchAwsScriptUri, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_CHUNK_PREFIX(PARAM_BATCH_AWS_CHUNK_PREFIX_ID, "--aws-chunk-prefix", "AWS chunk prefix", "S3 prefix the round chunks are written to. Empty derives it from the work prefix", typeid(std::string), (void *) &batchAwsChunkPrefix, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_TIMEOUT(PARAM_BATCH_AWS_TIMEOUT_ID, "--aws-timeout", "AWS job timeout", "attemptDurationSeconds for submitted AWS Batch jobs", typeid(int), (void *) &batchAwsTimeout, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_WORKER_ATTEMPTS(PARAM_BATCH_AWS_WORKER_ATTEMPTS_ID, "--aws-worker-attempts", "AWS worker attempts", "AWS Batch retry attempts for chunk worker jobs. 0 uses the job definition's setting", typeid(int), (void *) &batchAwsWorkerAttempts, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_DRY_RUN(PARAM_BATCH_AWS_DRY_RUN_ID, "--aws-dry-run", "AWS dry run", "Print the AWS Batch submissions instead of running them", typeid(bool), (void *) &batchAwsDryRun, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_ALLOW_NONS3_INPUT(PARAM_BATCH_AWS_ALLOW_NONS3_INPUT_ID, "--aws-allow-nons3-input", "AWS allow non-S3 input", "Allow local input paths with the aws-batch backend. They must already exist inside the container", typeid(bool), (void *) &batchAwsAllowNonS3Input, "", MMseqsParameter::COMMAND_EXPERT),
         // search workflow
         PARAM_NUM_ITERATIONS(PARAM_NUM_ITERATIONS_ID, "--num-iterations", "Search iterations", "Number of iterative profile search iterations", typeid(int), (void *) &numIterations, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_PROFILE),
         PARAM_START_SENS(PARAM_START_SENS_ID, "--start-sens", "Start sensitivity", "Start sensitivity", typeid(float), (void *) &startSens, "^[0-9]*(\\.[0-9]+)?$"),
@@ -216,8 +284,10 @@ Parameters::Parameters():
         PARAM_USE_HEADER(PARAM_USE_HEADER_ID, "--use-fasta-header", "Use fasta header", "Use the id parsed from the fasta header as the index key instead of using incrementing numeric identifiers", typeid(bool), (void *) &useHeader, ""),
         PARAM_ID_OFFSET(PARAM_ID_OFFSET_ID, "--id-offset", "Offset of numeric ids", "Numeric ids in index file are offset by this value", typeid(int), (void *) &identifierOffset, "^(0|[1-9]{1}[0-9]*)$"),
         PARAM_DB_TYPE(PARAM_DB_TYPE_ID, "--dbtype", "Database type", "Database type 0: auto, 1: amino acid 2: nucleotides", typeid(int), (void *) &dbType, "[0-2]{1}"),
-        PARAM_CREATEDB_MODE(PARAM_CREATEDB_MODE_ID, "--createdb-mode", "Createdb mode", "Createdb mode 0: copy data, 1: soft link data and write new index (works only with single line fasta/q) 2: GPU compatible db", typeid(int), (void *) &createdbMode, "^[0-2]{1}$"),
+        PARAM_CREATEDB_MODE(PARAM_CREATEDB_MODE_ID, "--createdb-mode", "Createdb mode", "Createdb mode 0: copy data, 1: soft link data and write new index (works only with single line fasta/q) 2: GPU compatible db, 3: plain db sorted by descending length", typeid(int), (void *) &createdbMode, "^[0-3]{1}$"),
+        PARAM_CREATEDB_THREADS(PARAM_CREATEDB_THREADS_ID, "--createdb-threads", "Createdb file threads", "Input file workers for createdb mode 0. Raise toward the number of independent storage devices. 0: default, never more than --threads", typeid(int), (void *) &createdbThreads, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_SHUFFLE(PARAM_SHUFFLE_ID, "--shuffle", "Shuffle input database", "Shuffle input database", typeid(bool), (void *) &shuffleDatabase, ""),
+        PARAM_SHUFFLE_SPLITS(PARAM_SHUFFLE_SPLITS_ID, "--shuffle-splits", "Shuffle splits", "Number of temporary splits the input is scattered over. Raise it when a single split no longer fits in memory", typeid(int), (void *) &shuffleSplits, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_WRITE_LOOKUP(PARAM_WRITE_LOOKUP_ID, "--write-lookup", "Write lookup file", "write .lookup file containing mapping from internal id, fasta id and file number", typeid(int), (void *) &writeLookup, "^[0-1]{1}", MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_HEADER_FILE(PARAM_USE_HEADER_FILE_ID, "--use-header-file", "Use header DB", "use the sequence header DB instead of the body to map the entry keys", typeid(bool), (void *) &useHeaderFile, ""),
         // setextendeddbtype
@@ -460,8 +530,8 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_INCLUDE_IDENTITY);
     align2clust.push_back(&PARAM_SORT_RESULTS);
     align2clust.push_back(&PARAM_PRELOAD_MODE);
+    align2clust.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     align2clust.push_back(&PARAM_THREADS);
-    align2clust.push_back(&PARAM_COMPRESSED);
     align2clust.push_back(&PARAM_V);
     align2clust.push_back(&PARAM_CLUSTER_MODE);
     align2clust.push_back(&PARAM_FILTER_CLUDB_FILE);
@@ -897,7 +967,9 @@ Parameters::Parameters():
     // create db
     createdb.push_back(&PARAM_DB_TYPE);
     createdb.push_back(&PARAM_SHUFFLE);
+    createdb.push_back(&PARAM_SHUFFLE_SPLITS);
     createdb.push_back(&PARAM_CREATEDB_MODE);
+    createdb.push_back(&PARAM_CREATEDB_THREADS);
     createdb.push_back(&PARAM_WRITE_LOOKUP);
     createdb.push_back(&PARAM_ID_OFFSET);
     createdb.push_back(&PARAM_THREADS);
@@ -922,6 +994,7 @@ Parameters::Parameters():
 
     // convert2fasta
     convert2fasta.push_back(&PARAM_USE_HEADER_FILE);
+    convert2fasta.push_back(&PARAM_THREADS);
     convert2fasta.push_back(&PARAM_V);
 
     // result2flat
@@ -1084,6 +1157,9 @@ Parameters::Parameters():
     clusthash.push_back(&PARAM_COMPRESSED);
     clusthash.push_back(&PARAM_V);
 
+    clusthashfast = clusthash;
+    clusthashfast.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+
     // kmermatcher
     kmermatcher.push_back(&PARAM_SUB_MAT);
     kmermatcher.push_back(&PARAM_ALPH_SIZE);
@@ -1116,6 +1192,9 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_NUM_ADJACENCY);
     kmermatcher.push_back(&PARAM_USE_PARALLELISM);
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
+    kmermatcher.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
+    kmermatcher.push_back(&PARAM_KMER_WRITE_TO_DISK);
+    kmermatcher.push_back(&PARAM_KMERMATCHER_MODE);
     kmermatcher.push_back(&PARAM_LINCLUST_VERSION);
 
     // kmermatcher
@@ -1269,6 +1348,7 @@ Parameters::Parameters():
     // createsubdb
     createsubdb.push_back(&PARAM_SUBDB_MODE);
     createsubdb.push_back(&PARAM_ID_MODE);
+    createsubdb.push_back(&PARAM_THREADS);
     createsubdb.push_back(&PARAM_V);
 
     // renamedbkeys
@@ -1506,6 +1586,7 @@ Parameters::Parameters():
     linclustworkflow = combineList(linclustworkflow, rescorediagonal);
     linclustworkflow = combineList(linclustworkflow, align2clust);
     linclustworkflow = combineList(linclustworkflow, clusthash);
+    linclustworkflow.push_back(&PARAM_LINCLUST2_ITER);
     linclustworkflow.push_back(&PARAM_SWITCH_CONSENSUS_REP);
     linclustworkflow.push_back(&PARAM_CLUST_HASH);
     linclustworkflow.push_back(&PARAM_REMOVE_TMP_FILES);
@@ -1519,6 +1600,129 @@ Parameters::Parameters():
     clusterworkflow = combineList(prefilter, align);
     clusterworkflow = combineList(clusterworkflow, rescorediagonal);
     clusterworkflow = combineList(clusterworkflow, clust);
+    // linclust-batch / cluster-batch
+    batchclustering.push_back(&PARAM_BATCH_BACKEND);
+    batchclustering.push_back(&PARAM_BATCH_CHUNK_MAX_BYTES);
+    batchclustering.push_back(&PARAM_BATCH_CHUNK_MAX_SEQS);
+    batchclustering.push_back(&PARAM_BATCH_SLURM_NODELIST);
+    batchclustering.push_back(&PARAM_BATCH_SLURM_PARTITION);
+    batchclustering.push_back(&PARAM_BATCH_SLURM_TIME);
+    batchclustering.push_back(&PARAM_BATCH_SLURM_MEM);
+    batchclustering.push_back(&PARAM_BATCH_SLURM_EXTRA);
+    batchclustering.push_back(&PARAM_BATCH_NODE_WORK_DIR);
+    batchclustering.push_back(&PARAM_BATCH_AWS_MACHINE);
+    batchclustering.push_back(&PARAM_BATCH_AWS_JOB_QUEUE);
+    batchclustering.push_back(&PARAM_BATCH_AWS_JOB_DEFINITION);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_AWS_MACHINE);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_AWS_JOB_QUEUE);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_AWS_JOB_DEFINITION);
+    batchclustering.push_back(&PARAM_BATCH_AWS_MACHINE_TAG_KEY);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_SLURM_NODELIST);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_SLURM_PARTITION);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_SLURM_TIME);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_SLURM_MEM);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_SLURM_EXTRA);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_NODE_WORK_DIR);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_MIN_SEQ_ID);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_C);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_COV_MODE);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_CLUSTER_MODE);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_KMER_PER_SEQ);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_NUM_COUNTS);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_INCLUDE_ADJACENCY);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_NUM_ADJACENCY);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_CLUST_HASH);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_PRELOAD_MODE);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_LINCLUST2_ITER);
+    batchclustering.push_back(&PARAM_BATCH_MAX_ROUNDS);
+    batchclustering.push_back(&PARAM_BATCH_MIN_REDUCTION_RATIO);
+    batchclustering.push_back(&PARAM_BATCH_CONVERGENCE_PATIENCE);
+    batchclustering.push_back(&PARAM_BATCH_MIN_REDUCTION_COUNT);
+    batchclustering.push_back(&PARAM_BATCH_MAX_CHUNK_ATTEMPTS);
+    batchclustering.push_back(&PARAM_BATCH_COMPRESS_OUTPUTS);
+    batchclustering.push_back(&PARAM_BATCH_MERGE_BUCKETS);
+    batchclustering.push_back(&PARAM_BATCH_MERGE_BUCKET_JOBS);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_MMSEQS);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_CREATEDB_MODE);
+    batchclustering.push_back(&PARAM_BATCH_COMPRESS_RATIO);
+    batchclustering.push_back(&PARAM_BATCH_DELETE_SOURCE_CHUNK);
+    batchclustering.push_back(&PARAM_BATCH_SORT_TMP_DIR);
+    batchclustering.push_back(&PARAM_BATCH_SORT_BUFFER_SIZE);
+    batchclustering.push_back(&PARAM_BATCH_AWS_MMSEQS);
+    batchclustering.push_back(&PARAM_BATCH_ROUND0_AWS_MMSEQS);
+    batchclustering.push_back(&PARAM_BATCH_AWS_JOB_PREFIX);
+    batchclustering.push_back(&PARAM_BATCH_AWS_LOCAL_DIR);
+    batchclustering.push_back(&PARAM_BATCH_AWS_SCRIPT_URI);
+    batchclustering.push_back(&PARAM_BATCH_AWS_CHUNK_PREFIX);
+    batchclustering.push_back(&PARAM_BATCH_AWS_TIMEOUT);
+    batchclustering.push_back(&PARAM_BATCH_AWS_WORKER_ATTEMPTS);
+    batchclustering.push_back(&PARAM_BATCH_AWS_DRY_RUN);
+    batchclustering.push_back(&PARAM_BATCH_AWS_ALLOW_NONS3_INPUT);
+    batchclustering.push_back(&PARAM_CREATEDB_MODE);
+    batchclustering.push_back(&PARAM_REMOVE_TMP_FILES);
+    batchclustering.push_back(&PARAM_REUSELATEST);
+    batchclustering.push_back(&PARAM_THREADS);
+    batchclustering.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    batchclustering.push_back(&PARAM_PRELOAD_MODE);
+    batchclustering.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
+    batchclustering.push_back(&PARAM_KMER_WRITE_TO_DISK);
+    batchclustering.push_back(&PARAM_V);
+
+    linclustbatchinner.push_back(&PARAM_C);
+    linclustbatchinner.push_back(&PARAM_COV_MODE);
+    linclustbatchinner.push_back(&PARAM_MIN_SEQ_ID);
+    linclustbatchinner.push_back(&PARAM_CLUSTER_MODE);
+    linclustbatchinner.push_back(&PARAM_KMER_PER_SEQ);
+    linclustbatchinner.push_back(&PARAM_INCLUDE_COUNTTABLE);
+    linclustbatchinner.push_back(&PARAM_NUM_COUNTS);
+    linclustbatchinner.push_back(&PARAM_INCLUDE_ADJACENCY);
+    linclustbatchinner.push_back(&PARAM_NUM_ADJACENCY);
+    linclustbatchinner.push_back(&PARAM_SWITCH_CONSENSUS_REP);
+    linclustbatchinner.push_back(&PARAM_REMOVE_TMP_FILES);
+    linclustbatchinner.push_back(&PARAM_THREADS);
+    linclustbatchinner.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    linclustbatchinner.push_back(&PARAM_PRELOAD_MODE);
+    linclustbatchinner.push_back(&PARAM_V);
+    linclustbatchinner.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
+    linclustbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
+    linclustbatchinner.push_back(&PARAM_KMERMATCHER_MODE);
+    linclustbatchinner.push_back(&PARAM_CLUST_HASH);
+    linclustbatchinner.push_back(&PARAM_LINCLUST_VERSION);
+    linclustbatchinner.push_back(&PARAM_LINCLUST2_ITER);
+    linclustbatch = combineList(linclustbatchinner, batchclustering);
+
+    clusterbatchinner.push_back(&PARAM_C);
+    clusterbatchinner.push_back(&PARAM_COV_MODE);
+    clusterbatchinner.push_back(&PARAM_MIN_SEQ_ID);
+    clusterbatchinner.push_back(&PARAM_CLUSTER_MODE);
+    clusterbatchinner.push_back(&PARAM_KMER_PER_SEQ);
+    clusterbatchinner.push_back(&PARAM_INCLUDE_COUNTTABLE);
+    clusterbatchinner.push_back(&PARAM_NUM_COUNTS);
+    clusterbatchinner.push_back(&PARAM_INCLUDE_ADJACENCY);
+    clusterbatchinner.push_back(&PARAM_NUM_ADJACENCY);
+    clusterbatchinner.push_back(&PARAM_SWITCH_CONSENSUS_REP);
+    clusterbatchinner.push_back(&PARAM_REMOVE_TMP_FILES);
+    clusterbatchinner.push_back(&PARAM_THREADS);
+    clusterbatchinner.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    clusterbatchinner.push_back(&PARAM_PRELOAD_MODE);
+    clusterbatchinner.push_back(&PARAM_V);
+    clusterbatchinner.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
+    clusterbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
+    clusterbatchinner.push_back(&PARAM_KMERMATCHER_MODE);
+    clusterbatchinner.push_back(&PARAM_CLUST_HASH);
+    clusterbatchinner.push_back(&PARAM_CLUSTER_VERSION);
+    clusterbatchinner.push_back(&PARAM_LINCLUST_VERSION);
+    clusterbatchinner.push_back(&PARAM_CASCADED);
+    clusterbatchinner.push_back(&PARAM_CLUSTER_STEPS);
+    clusterbatchinner.push_back(&PARAM_CLUSTER_REASSIGN);
+    clusterbatchinner.push_back(&PARAM_MAX_SEQS);
+    clusterbatchinner.push_back(&PARAM_S);
+    clusterbatch = combineList(clusterbatchinner, batchclustering);
+
     clusterworkflow.push_back(&PARAM_CASCADED);
     clusterworkflow.push_back(&PARAM_CLUSTER_STEPS);
     clusterworkflow.push_back(&PARAM_CLUSTER_REASSIGN);
@@ -1837,6 +2041,18 @@ bool parseBool(const std::string &p) {
     }
 }
 
+size_t parseSizeTParameter(const char *value, const char *name) {
+    errno = 0;
+    char *end = NULL;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (errno == ERANGE || end == value || *end != '\0' ||
+        parsed > static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
+        Debug(Debug::ERROR) << "Invalid size_t value for " << name << ": " << value << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return static_cast<size_t>(parsed);
+}
+
 void Parameters::initMatrices() {
     // set up substituionMatrix
     for(size_t i = 0 ; i < substitutionMatrices.size(); i++) {
@@ -1933,7 +2149,8 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
                             Debug(Debug::ERROR) << "Error in argument " << par[parIdx]->name << "\n";
                             EXIT(EXIT_FAILURE);
                         }else{
-                            *((size_t *) par[parIdx]->value) = atoi(pargv[argIdx+1]);
+                            *((size_t *) par[parIdx]->value) =
+                                parseSizeTParameter(pargv[argIdx + 1], par[parIdx]->name);
                             par[parIdx]->wasSet = true;
                         }
                         argIdx++;
@@ -2600,6 +2817,66 @@ void Parameters::setDefaults() {
         runner = "";
     }
     reuseLatest = false;
+    batchBackend = "single-node";
+    batchChunkMaxBytes = 20ULL * 1024ULL * 1024ULL * 1024ULL;
+    batchChunkMaxSeqs = 0;
+    batchSlurmNodelist = "";
+    batchSlurmPartition = "";
+    batchSlurmTime = "";
+    batchSlurmMem = "";
+    batchSlurmExtra = "";
+    batchNodeWorkDir = "";
+    batchAwsMachine = "";
+    batchAwsJobQueue = "";
+    batchAwsJobDefinition = "";
+    batchRound0AwsMachine = "";
+    batchRound0AwsJobQueue = "";
+    batchRound0AwsJobDefinition = "";
+    batchAwsMachineTagKey = "mmseqs:machine";
+    batchRound0ChunkMaxBytes = 0;
+    batchRound0ChunkMaxSeqs = 0;
+    batchRound0SlurmNodelist = "";
+    batchRound0SlurmPartition = "";
+    batchRound0SlurmTime = "";
+    batchRound0SlurmMem = "";
+    batchRound0SlurmExtra = "";
+    batchRound0NodeWorkDir = "";
+    batchRound0SeqIdThr = 0.0f;
+    batchRound0CovThr = 0.0f;
+    batchRound0CovMode = 0;
+    batchRound0ClusteringMode = 0;
+    batchRound0KmersPerSequence = 21;
+    batchRound0IncludeCountTable = false;
+    batchRound0CountTableIteration = 0;
+    batchRound0IncludeAdjacency = false;
+    batchRound0AdjIteration = 0;
+    batchRound0ClustHash = false;
+    batchRound0SplitMemoryLimit = 0;
+    batchRound0PreloadMode = 0;
+    batchMaxRounds = 32;
+    batchMinReductionRatio = 0.02f;
+    batchConvergencePatience = 1;
+    batchMinReductionCount = 0;
+    batchMaxChunkAttempts = 2;
+    batchCompressOutputs = false;
+    batchMergeBuckets = 0;
+    batchMergeBucketJobs = 0;
+    batchRound0Mmseqs = "";
+    batchRound0CreatedbMode = 0;
+    batchCompressRatio = 3;
+    batchDeleteSourceChunk = false;
+    batchSortTmpDir = "";
+    batchSortBufferSize = "";
+    batchAwsMmseqs = "mmseqs";
+    batchRound0AwsMmseqs = "";
+    batchAwsJobPrefix = "mmseqs-batch";
+    batchAwsLocalDir = "/tmp/mmseqs-batch";
+    batchAwsScriptUri = "";
+    batchAwsChunkPrefix = "";
+    batchAwsTimeout = 43200;
+    batchAwsWorkerAttempts = 0;
+    batchAwsDryRun = false;
+    batchAwsAllowNonS3Input = false;
     // Clustering workflow
     removeTmpFiles = false;
 
@@ -2611,7 +2888,9 @@ void Parameters::setDefaults() {
 
     // createdb
     createdbMode = SEQUENCE_SPLIT_MODE_HARD;
+    createdbThreads = 0;
     shuffleDatabase = true;
+    shuffleSplits = 32;
     writeLookup = true;
 
     // format alignment
@@ -2789,13 +3068,18 @@ void Parameters::setDefaults() {
     weightFile = "";
     useParallelism = false;
     needWriteBuffer = false;
+    compressKmerTmpFiles = 0;
+    kmerWriteToDisk = false;
+    kmerMatcherMode = Parameters::KMERMATCHER_MODE_KEY;
     includeCountTable = true;
-    countTableIteration = 2;
+    countTableIteration = CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE;
     countTableScale = 0.1;
     includeAdjacency = true;
-    adjIteration = 3;
+    adjIteration = CLUST_LINEAR_DEFAULT_NUM_ADJACENCY;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;
+    linclust2Iter = 2;
+    batchRound0Linclust2Iter = 2;
     clusterVersion = CLUSTER_VERSION1;
 
     // result2stats

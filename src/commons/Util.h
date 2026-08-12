@@ -335,6 +335,11 @@ public:
 
     static void checkAllocation(void *pointer, std::string message);
 
+    // reconciles an include toggle with its iteration count; contradictory explicit values are fatal
+    static void resolveIncludeIterationPair(bool includeSet, bool &includeValue,
+                                            bool numSet, int &numValue,
+                                            const char *includeName, const char *numName);
+
     template <typename Iterator, typename Container>
     static bool isLastIterator(Iterator iterator, const Container& container) {
         return (iterator != container.end()) && (++iterator == container.end());

@@ -47,6 +47,9 @@ public:
 
     static size_t getFileSize(const std::string &fileName);
 
+    // O_DIRECT offset/length/buffer alignment for the file, from statx(STATX_DIOALIGN), 4096 as fallback
+    static size_t getDirectIoAlignment(const std::string &fileName);
+
     static char *allocPageBufferWithAdvice(int input_desc, size_t insize);
 
     static bool symlinkExists(const std::string &path);

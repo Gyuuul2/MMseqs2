@@ -315,6 +315,33 @@ void Util::checkAllocation(void *pointer, std::string message) {
     }
 }
 
+void Util::resolveIncludeIterationPair(bool includeSet, bool &includeValue,
+                                       bool numSet, int &numValue,
+                                       const char *includeName, const char *numName) {
+    if (includeSet && numSet) {
+        if (includeValue && numValue == 0) {
+            Debug(Debug::ERROR) << includeName << " 1 conflicts with " << numName
+                                << " 0. Use " << includeName << " 0 to disable it.\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (includeValue == false && numValue > 0) {
+            Debug(Debug::ERROR) << includeName << " 0 conflicts with " << numName
+                                << " " << numValue << ". Disable with count 0, or enable both.\n";
+            EXIT(EXIT_FAILURE);
+        }
+        return;
+    }
+    if (includeSet) {
+        if (includeValue == false) {
+            numValue = 0;
+        }
+        return;
+    }
+    if (numSet) {
+        includeValue = (numValue > 0);
+    }
+}
+
 size_t Util::getPageSize() {
     return sysconf(_SC_PAGE_SIZE); // in bytes
 }
@@ -424,11 +451,8 @@ char Util::touchMemory(const char *memory, size_t size) {
 size_t Util::ompCountLines(const char* data, size_t dataSize, unsigned int MAYBE_UNUSED(threads)) {
     size_t cnt = 0;
 #ifdef OPENMP
-    int threadCnt = 1;
-    const int totalThreadCnt = threads;
-    if (totalThreadCnt >= 4) {
-        threadCnt = 4;
-    }
+    // a static page partition with a plain reduction; DBReader::readIndex needs its own cap and keeps it
+    int threadCnt = std::max(1, static_cast<int>(threads));
 #endif
 
     size_t pageSize = getPageSize();

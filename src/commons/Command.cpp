@@ -48,6 +48,11 @@ std::vector<int> DbValidator::msaDb = {Parameters::DBTYPE_MSA_DB};
 std::vector<int> DbValidator::genericDb = {Parameters::DBTYPE_GENERIC_DB};
 std::vector<int> DbValidator::profileDb = {Parameters::DBTYPE_HMM_PROFILE};
 std::vector<int> DbValidator::prefilterDb = {Parameters::DBTYPE_PREFILTER_RES};
+std::vector<int> DbValidator::align2clustPrefilterDb = {Parameters::DBTYPE_ALIGNMENT_RES,
+                                                        Parameters::DBTYPE_PREFILTER_RES,
+                                                        Parameters::DBTYPE_PREFILTER_REV_RES,
+                                                        Parameters::DBTYPE_CLUSTER_RES,
+                                                        Parameters::DBTYPE_PREFILTER_LOCAL_RES};
 std::vector<int> DbValidator::clusterDb = {Parameters::DBTYPE_CLUSTER_RES};
 std::vector<int> DbValidator::indexDb = {Parameters::DBTYPE_INDEX_DB};
 std::vector<int> DbValidator::taxResult = {Parameters::DBTYPE_TAXONOMICAL_RESULT};
