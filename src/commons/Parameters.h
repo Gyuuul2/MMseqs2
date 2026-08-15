@@ -646,6 +646,8 @@ public:
     int idxSeqSrc;
     bool fullHeader;
     size_t targetTsvColumn;
+    int tsvBuckets;
+    int tsvBucketColumn;
 
     //result2stats
     std::string stat;
@@ -1021,6 +1023,8 @@ public:
     PARAMETER(PARAM_FIRST_SEQ_REP_SEQ)
     PARAMETER(PARAM_FULL_HEADER)
     PARAMETER(PARAM_IDX_SEQ_SRC)
+    PARAMETER(PARAM_TSV_BUCKETS)
+    PARAMETER(PARAM_TSV_BUCKET_COLUMN)
 
     // result2stat
     PARAMETER(PARAM_STAT)

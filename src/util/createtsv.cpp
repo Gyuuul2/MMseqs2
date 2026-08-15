@@ -6,6 +6,9 @@
 #include "IndexReader.h"
 #include "FileUtil.h"
 
+#include <mutex>
+#include <vector>
+
 #ifdef OPENMP
 #include <omp.h>
 
@@ -14,6 +17,24 @@
 #ifndef SIZE_T_MAX
 #define SIZE_T_MAX ((size_t) -1)
 #endif
+
+// byte-identical port of batch_clustering.sh BUCKET_HASH_AWK: h = (h*131 + byte) % B over the column's bytes
+static unsigned int tsvBucketOfColumn(const std::string &line, int column, unsigned int buckets) {
+    size_t start = 0;
+    for (int c = 1; c < column; ++c) {
+        size_t tab = line.find('\t', start);
+        start = (tab == std::string::npos) ? line.size() : tab + 1;
+    }
+    uint64_t h = 0;
+    for (size_t i = start; i < line.size(); ++i) {
+        const unsigned char byte = line[i];
+        if (byte == '\t' || byte == '\n') {
+            break;
+        }
+        h = (h * 131 + byte) % buckets;
+    }
+    return (unsigned int) h;
+}
 
 int createtsv(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
@@ -76,8 +97,25 @@ int createtsv(int argc, const char **argv, const Command &command) {
     const std::string& indexFile = hasTargetDB ? par.db4Index : par.db3Index;
     const bool shouldCompress = par.dbOut == true && par.compressed == true;
     const int dbType = par.dbOut == true ? Parameters::DBTYPE_GENERIC_DB : Parameters::DBTYPE_OMIT_FILE;
+    // opt-in bucketed mode (batch clustering): dataFile becomes a prefix for <prefix>.bkt%05d.tsv
+    const unsigned int buckets = par.tsvBuckets > 0 ? (unsigned int) par.tsvBuckets : 0;
+    const bool bucketed = buckets > 0;
+    if (bucketed && par.dbOut) {
+        Debug(Debug::ERROR) << "--tsv-buckets cannot be combined with --db-output\n";
+        return EXIT_FAILURE;
+    }
     DBWriter writer(dataFile.c_str(), indexFile.c_str(), par.threads, shouldCompress, dbType);
-    writer.open();
+    std::vector<FILE*> bucketFiles(bucketed ? buckets : 0);
+    std::vector<std::mutex> bucketLocks(bucketed ? buckets : 0);
+    if (bucketed) {
+        char bucketName[FILENAME_MAX];
+        for (unsigned int b = 0; b < buckets; ++b) {
+            snprintf(bucketName, sizeof(bucketName), "%s.bkt%05u.tsv", dataFile.c_str(), b);
+            bucketFiles[b] = FileUtil::openAndDelete(bucketName, "w");
+        }
+    } else {
+        writer.open();
+    }
 
     const size_t targetColumn = (par.targetTsvColumn == 0) ? SIZE_T_MAX :  par.targetTsvColumn - 1;
 #pragma omp parallel
@@ -92,6 +130,10 @@ int createtsv(int argc, const char **argv, const Command &command) {
 
         std::string outputBuffer;
         outputBuffer.reserve(10 * 1024);
+        std::string lineBuffer;
+        lineBuffer.reserve(1024);
+        const size_t bucketFlushSize = 64 * 1024;
+        std::vector<std::string> bucketBuffers(bucketed ? buckets : 0);
 
 #pragma omp for schedule(dynamic, 1000)
         for (size_t i = 0; i < reader->getSize(); ++i) {
@@ -161,36 +203,75 @@ int createtsv(int argc, const char **argv, const Command &command) {
                     queryHeader = targetAccession;
                 }
 
-                outputBuffer.append(queryHeader);
-                outputBuffer.append("\t");
-                outputBuffer.append(targetAccession);
+                lineBuffer.clear();
+                lineBuffer.append(queryHeader);
+                lineBuffer.append("\t");
+                lineBuffer.append(targetAccession);
 
                 size_t offset = 0;
                 if (targetColumn != 0) {
-                    outputBuffer.append("\t");
+                    lineBuffer.append("\t");
                     offset = 0;
                 } else {
                     offset = strlen(dbKey);
                 }
 
                 char *nextLine = Util::skipLine(data);
-                outputBuffer.append(data + offset, (nextLine - (data + offset)) - 1);
-                outputBuffer.append("\n");
+                lineBuffer.append(data + offset, (nextLine - (data + offset)) - 1);
+                lineBuffer.append("\n");
+                if (bucketed) {
+                    const unsigned int b = tsvBucketOfColumn(lineBuffer, par.tsvBucketColumn, buckets);
+                    std::string &buf = bucketBuffers[b];
+                    buf.append(lineBuffer);
+                    if (buf.size() >= bucketFlushSize) {
+                        std::lock_guard<std::mutex> lock(bucketLocks[b]);
+                        if (fwrite(buf.c_str(), sizeof(char), buf.size(), bucketFiles[b]) != buf.size()) {
+                            Debug(Debug::ERROR) << "Cannot write to bucket file " << b << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        buf.clear();
+                    }
+                } else {
+                    outputBuffer.append(lineBuffer);
+                }
                 data = nextLine;
                 entryIndex++;
             }
-            writer.writeData(outputBuffer.c_str(), outputBuffer.length(), queryKey, thread_idx, par.dbOut);
-            outputBuffer.clear();
+            if (bucketed == false) {
+                writer.writeData(outputBuffer.c_str(), outputBuffer.length(), queryKey, thread_idx, par.dbOut);
+                outputBuffer.clear();
+            }
+        }
+        if (bucketed) {
+            for (unsigned int b = 0; b < buckets; ++b) {
+                if (bucketBuffers[b].empty()) {
+                    continue;
+                }
+                std::lock_guard<std::mutex> lock(bucketLocks[b]);
+                if (fwrite(bucketBuffers[b].c_str(), sizeof(char), bucketBuffers[b].size(), bucketFiles[b]) != bucketBuffers[b].size()) {
+                    Debug(Debug::ERROR) << "Cannot write to bucket file " << b << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                bucketBuffers[b].clear();
+            }
         }
         delete[] dbKey;
     }
-    writer.close(par.dbOut == false);
-
-    if (par.dbOut == false) {
-        if (hasTargetDB) {
-            FileUtil::remove(par.db4Index.c_str());
-        } else {
-            FileUtil::remove(par.db3Index.c_str());
+    if (bucketed) {
+        for (unsigned int b = 0; b < buckets; ++b) {
+            if (fclose(bucketFiles[b]) != 0) {
+                Debug(Debug::ERROR) << "Cannot close bucket file " << b << "\n";
+                return EXIT_FAILURE;
+            }
+        }
+    } else {
+        writer.close(par.dbOut == false);
+        if (par.dbOut == false) {
+            if (hasTargetDB) {
+                FileUtil::remove(par.db4Index.c_str());
+            } else {
+                FileUtil::remove(par.db3Index.c_str());
+            }
         }
     }
 

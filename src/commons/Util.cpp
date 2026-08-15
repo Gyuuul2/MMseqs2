@@ -419,11 +419,11 @@ int Util::madviseLogged(void* addr, size_t len, int advice, const char* context)
 }
 
 char Util::touchMemory(const char *memory, size_t size) {
-    Util::madviseLogged((void*)memory, size, POSIX_MADV_WILLNEED, "touchMemory");
     if(size > Util::getTotalSystemMemory()){
         Debug(Debug::WARNING) << "Can not touch " << size << " into main memory\n";
         return 0;
     }
+    Util::madviseLogged((void*)memory, size, POSIX_MADV_WILLNEED, "touchMemory");
     size_t pageSize = getPageSize();
 //    Debug::Progress progress(size/pageSize);
     size_t fourTimesPageSize = 4*pageSize;

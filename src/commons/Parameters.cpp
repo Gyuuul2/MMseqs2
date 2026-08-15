@@ -156,6 +156,8 @@ Parameters::Parameters():
         PARAM_FIRST_SEQ_REP_SEQ(PARAM_FIRST_SEQ_REP_SEQ_ID, "--first-seq-as-repr", "First sequence as representative", "Use the first sequence of the clustering result as representative sequence", typeid(bool), (void *) &firstSeqRepr, "", MMseqsParameter::COMMAND_MISC),
         PARAM_FULL_HEADER(PARAM_FULL_HEADER_ID, "--full-header", "Add full header", "Replace DB ID by its corresponding Full Header", typeid(bool), (void *) &fullHeader, ""),
         PARAM_IDX_SEQ_SRC(PARAM_IDX_SEQ_SRC_ID, "--idx-seq-src", "Sequence source", "0: auto, 1: split/translated sequences, 2: input sequences", typeid(int), (void *) &idxSeqSrc, "^[0-2]{1}$", MMseqsParameter::COMMAND_MISC),
+        PARAM_TSV_BUCKETS(PARAM_TSV_BUCKETS_ID, "--tsv-buckets", "TSV hash buckets", "Write N files <out>.bkt%05d.tsv, routing each row by hash of --tsv-bucket-column (same hash as batch clustering's merge buckets); 0 = single-file output", typeid(int), (void *) &tsvBuckets, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_MISC | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_TSV_BUCKET_COLUMN(PARAM_TSV_BUCKET_COLUMN_ID, "--tsv-bucket-column", "TSV bucket column", "1-based output column whose bytes are hashed to pick a bucket (used with --tsv-buckets)", typeid(int), (void *) &tsvBucketColumn, "^[12]$", MMseqsParameter::COMMAND_MISC | MMseqsParameter::COMMAND_EXPERT),
 
         // result2stats
         PARAM_STAT(PARAM_STAT_ID, "--stat", "Statistics to be computed", "One of: linecount, mean, min, max, doolittle, charges, seqlen, firstline", typeid(std::string), (void *) &stat, ""),
@@ -229,7 +231,7 @@ Parameters::Parameters():
         PARAM_BATCH_MIN_REDUCTION_COUNT(PARAM_BATCH_MIN_REDUCTION_COUNT_ID, "--min-reduction-count", "Min reduction count", "A representative round is low-benefit if it removes fewer representatives than this count. 0 disables this condition", typeid(size_t), (void *) &batchMinReductionCount, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_MAX_CHUNK_ATTEMPTS(PARAM_BATCH_MAX_CHUNK_ATTEMPTS_ID, "--max-chunk-attempts", "Max chunk attempts", "Maximum attempts for missing or failed chunk workers before reporting a dead-letter failure", typeid(int), (void *) &batchMaxChunkAttempts, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_COMPRESS_OUTPUTS(PARAM_BATCH_COMPRESS_OUTPUTS_ID, "--compress-batch-outputs", "Compress batch outputs", "Store per-round and final batch FASTA/TSV outputs as zstd files", typeid(bool), (void *) &batchCompressOutputs, "^[0-1]{1}$", MMseqsParameter::COMMAND_COMMON),
-        PARAM_BATCH_MERGE_BUCKETS(PARAM_BATCH_MERGE_BUCKETS_ID, "--merge-buckets", "Merge buckets", "Split the representative merge into this many independent hash buckets, each sorted+joined separately (smaller sorts = lower RAM/disk peak). 0 = auto from --threads (up to 256). The cluster (rep,member) mapping is identical for any value; only inter-cluster row order can differ", typeid(int), (void *) &batchMergeBuckets, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_MERGE_BUCKETS(PARAM_BATCH_MERGE_BUCKETS_ID, "--merge-buckets", "Merge buckets", "Split the representative merge into this many independent hash buckets, each sorted+joined separately (smaller sorts = lower RAM/disk peak). 0 = auto from --threads (up to 256). Round TSVs are written pre-bucketed, so the value is pinned per work dir on first use and reused on resume. The cluster (rep,member) mapping is identical for any value; only inter-cluster row order can differ", typeid(int), (void *) &batchMergeBuckets, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_MERGE_BUCKET_JOBS(PARAM_BATCH_MERGE_BUCKET_JOBS_ID, "--merge-bucket-jobs", "Merge bucket jobs", "Number of independent merge/finalize buckets to sort+join concurrently on the merge node. 0 = auto from --threads (roughly --threads/8, capped at 16)", typeid(int), (void *) &batchMergeBucketJobs, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_REP_SPLITS(PARAM_BATCH_REP_SPLITS_ID, "--rep-splits", "Representative splits", "Shard each chunk's representative FASTA into this many files (entry i to shard i mod N, capped at the chunk's representative count). More shards open the next round's parallel createdb parse (capped by --shuffle-splits) and let the between-round shuffle mix former chunks", typeid(int), (void *) &batchRepSplits, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_CHUNK_DISK_BUDGET(PARAM_BATCH_CHUNK_DISK_BUDGET_ID, "--chunk-disk-budget", "Chunk disk budget", "Kill a chunk stage and fail the chunk (no done-marker, so it is retried or dead-lettered) when the bytes under its work directory reach this budget. 0 disables the guard", typeid(ByteParser), (void *) &batchChunkDiskBudget, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_COMMON),
@@ -718,6 +720,8 @@ Parameters::Parameters():
     // createtsv
     createtsv.push_back(&PARAM_FIRST_SEQ_REP_SEQ);
     createtsv.push_back(&PARAM_TARGET_COLUMN);
+    createtsv.push_back(&PARAM_TSV_BUCKETS);
+    createtsv.push_back(&PARAM_TSV_BUCKET_COLUMN);
     createtsv.push_back(&PARAM_FULL_HEADER);
     createtsv.push_back(&PARAM_IDX_SEQ_SRC);
     createtsv.push_back(&PARAM_DB_OUTPUT);
@@ -3108,6 +3112,8 @@ void Parameters::setDefaults() {
     fullHeader = false;
     idxSeqSrc = 0;
     targetTsvColumn = 1;
+    tsvBuckets = 0;
+    tsvBucketColumn = 1;
 
     // createtaxdb
     taxMappingFile = "";
