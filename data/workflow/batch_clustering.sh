@@ -733,10 +733,11 @@ materialize_softlink_filelist() {
     local dst="$2"
     local tmp="${dst}.tmp.$$"
     [[ -s "$dst" ]] && return 0
-    local mem count=0
+    local mem cnt count=0
     mkdir -p "$(dirname "$dst")"
     : > "$tmp"
-    while IFS= read -r mem || [[ -n "${mem:-}" ]]; do
+    # counted filelists carry "path<TAB>seqs"; only the path matters here
+    while IFS=$'\t' read -r mem cnt || [[ -n "${mem:-}" ]]; do
         [[ -z "${mem:-}" || "$mem" =~ ^[[:space:]]*# ]] && continue
         append_singleline_fasta "$mem" "$tmp"
         count=$((count + 1))
@@ -869,9 +870,12 @@ prepare_group() {
     | sort -k1,1n | cut -f2- \
     | awk -F'\t' -v dir="$chunk_dir" -v manifest="$local_manifest" \
           -v max_bytes="$CHUNK_MAX_BYTES" -v max_seqs="$CHUNK_MAX_SEQS" '
-        function open_chunk() { cid++; flist = sprintf("%s/chunk-%08d.inputs.list", dir, cid); cb = 0; cs = 0; n = 0 }
-        function close_chunk() {
-            if (n > 0) { printf "chunk-%08d\t%s\t%d\t%d\n", cid, flist, cs, cb >> manifest; close(manifest); close(flist) }
+        function open_chunk() { cid++; flist = sprintf("%s/chunk-%08d.inputs.list", dir, cid); cb = 0; cs = 0; n = 0; counted = 1 }
+        function close_chunk(    i) {
+            if (n == 0) { return }
+            # per-file counts ride along only when every member has one: createdb takes all rows counted, or none
+            for (i = 0; i < n; i++) { print (counted ? paths[i] "\t" cnts[i] : paths[i]) > flist }
+            printf "chunk-%08d\t%s\t%d\t%d\n", cid, flist, cs, cb >> manifest; close(manifest); close(flist)
         }
         BEGIN { cid = -1; flist = ""; cb = 0; cs = 0; n = 0 }
         {
@@ -880,7 +884,8 @@ prepare_group() {
             # new chunk when adding this file would exceed a limit; an oversized file gets its own chunk
             if (n > 0 && ((max_bytes > 0 && cb + b > max_bytes) ||
                           (max_seqs  > 0 && s > 0 && cs + s > max_seqs))) { close_chunk(); open_chunk() }
-            print $1 > flist
+            paths[n] = $1; cnts[n] = s
+            if (s <= 0) { counted = 0 }
             cb += b; cs += s; n++
         }
         END { close_chunk() }
@@ -1060,9 +1065,9 @@ prepare() {
 # createdb sorts inputs by basename with a non-stable sort, so duplicate basenames must be renamed
 resolve_chunk_filelist() {
     local filelist="$1" work_dir="$2" out_list="$3"
-    local mem i=0 local_ref base ext
+    local mem cnt i=0 local_ref base ext
     : > "$out_list"
-    while IFS= read -r mem || [[ -n "${mem:-}" ]]; do
+    while IFS=$'\t' read -r mem cnt || [[ -n "${mem:-}" ]]; do
         [[ -z "${mem:-}" || "$mem" =~ ^[[:space:]]*# ]] && continue
         base=$(basename "$mem")
         ext=""
@@ -1079,7 +1084,12 @@ resolve_chunk_filelist() {
             # the link sits in another directory, so a relative path would resolve against that one
             ln -sf "$(cd -- "$(dirname -- "$mem")" && pwd -P)/$(basename -- "$mem")" "$local_ref"
         fi
-        printf '%s\n' "$local_ref" >> "$out_list"
+        # a declared count rides along so createdb can parallelise its parse on 32-bit keys too
+        if [[ -n "${cnt:-}" ]]; then
+            printf '%s\t%s\n' "$local_ref" "$cnt" >> "$out_list"
+        else
+            printf '%s\n' "$local_ref" >> "$out_list"
+        fi
         i=$((i + 1))
     done < <(stream_manifest "$filelist")
     [[ -s "$out_list" ]] || fail "empty input list for chunk: $filelist"

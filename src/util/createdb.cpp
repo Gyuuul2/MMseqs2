@@ -13,8 +13,10 @@
 #include "FastSort.h"
 #include "Masker.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstring>
 #include <fcntl.h>
 #include <sys/resource.h>
 #include <unistd.h>
@@ -316,6 +318,7 @@ int mergeSequentialByJointIndex(
         char * outHeaderIndexFile,
         const char * outLookupFile,
         std::vector<unsigned int>* sourceLookup,
+        const std::vector<DBKeyType>* fileKeyStarts,
         size_t totalEntries,
         size_t shuffleSplits,
         bool descending,
@@ -573,10 +576,12 @@ int mergeSequentialByJointIndex(
                 if (lookupEntry.entryName.empty()) {
                     Debug(Debug::WARNING) << "Cannot extract identifier from entry " << i << "\n";
                 }
-                // no table: the key encodes the input file
+                // no table: the key encodes the input file, or the counted key ranges locate it
                 lookupEntry.fileNumber = (sourceLookup != NULL)
                     ? sourceLookup[qe.fileIdx][(qe.id - qe.fileIdx) / shuffleSplits]
-                    : unpackInputFile(qe.id);
+                    : (fileKeyStarts != NULL
+                       ? static_cast<unsigned int>(std::upper_bound(fileKeyStarts->begin(), fileKeyStarts->end(), qe.id) - fileKeyStarts->begin() - 1)
+                       : unpackInputFile(qe.id));
                 DBReader<DBKeyType>::lookupEntryToBuffer(s.lookupOut, lookupEntry);
 
                 // the GPU layout stores neither, so its index still has to account for newline and terminator
@@ -709,10 +714,13 @@ static bool sequenceLooksNucleotide(const char *sequence, size_t length);
 
 // One worker per input file, each owning a disjoint range of the splits, so the writers never race.
 static DBKeyType parseInputFilesParallel(const std::vector<std::string> &filenames,
+                                         const std::vector<size_t> &declaredCounts,
+                                         std::vector<DBKeyType> &fileKeyStarts,
                                          DBWriter &seqWriter, DBWriter &hdrWriter, FILE *source,
                                          unsigned int shuffleSplits, unsigned int workers,
                                          size_t testForNucSequence, size_t &isNuclCnt, size_t &sampleCount) {
     const size_t fileCount = filenames.size();
+    const bool counted = declaredCounts.empty() == false;
     for (size_t fileIdx = 0; fileIdx < fileCount; fileIdx++) {
         const std::string sourceName = FileUtil::baseName(filenames[fileIdx]);
         char buffer[4096];
@@ -723,7 +731,22 @@ static DBKeyType parseInputFilesParallel(const std::vector<std::string> &filenam
         }
     }
 
-    if (fileCount >= (static_cast<size_t>(1) << (64 - CREATEDB_KEY_FILE_SHIFT))) {
+    if (counted) {
+        // exclusive prefix sum: with final keys assigned up front, the declared total must fit the key type
+        const uint64_t maxKey = static_cast<uint64_t>(std::numeric_limits<DBKeyType>::max());
+        uint64_t running = 0;
+        fileKeyStarts.resize(fileCount);
+        for (size_t fileIdx = 0; fileIdx < fileCount; fileIdx++) {
+            fileKeyStarts[fileIdx] = static_cast<DBKeyType>(running);
+            if (static_cast<uint64_t>(declaredCounts[fileIdx]) > maxKey - running) {
+                Debug(Debug::ERROR) << "Declared sequence counts exceed the " << sizeof(DBKeyType) * 8
+                                    << "-bit key space of " << maxKey << " at " << filenames[fileIdx]
+                                    << " (" << running << " sequences declared before it)\n";
+                EXIT(EXIT_FAILURE);
+            }
+            running += declaredCounts[fileIdx];
+        }
+    } else if (fileCount >= (static_cast<size_t>(1) << (64 - CREATEDB_KEY_FILE_SHIFT))) {
         Debug(Debug::ERROR) << "More input files than the key layout allows\n";
         EXIT(EXIT_FAILURE);
     }
@@ -756,6 +779,12 @@ static DBKeyType parseInputFilesParallel(const std::vector<std::string> &filenam
                     Debug(Debug::ERROR) << "Fasta entry " << rank << " of " << filenames[fileIdx] << " is invalid\n";
                     EXIT(EXIT_FAILURE);
                 }
+                // an undeclared entry would take the next file's first key, so stop before writing it
+                if (counted && rank >= declaredCounts[fileIdx]) {
+                    Debug(Debug::ERROR) << "File " << filenames[fileIdx] << " declares "
+                                        << declaredCounts[fileIdx] << " sequences but holds more\n";
+                    EXIT(EXIT_FAILURE);
+                }
                 // per file, so the guess does not depend on which worker took which file
                 if (rank < testForNucSequence) {
                     nuclSamples += 1;
@@ -773,7 +802,8 @@ static DBKeyType parseInputFilesParallel(const std::vector<std::string> &filenam
                 }
                 header.push_back('\n');
 
-                const DBKeyType key = packInputKey(fileIdx, rank);
+                const DBKeyType key = counted ? fileKeyStarts[fileIdx] + static_cast<DBKeyType>(rank)
+                                              : packInputKey(fileIdx, rank);
                 const unsigned int splitIdx = splitBegin + static_cast<unsigned int>(rank % splitCount);
                 hdrWriter.writeData(header.c_str(), header.length(), key, splitIdx);
                 seqWriter.writeStart(splitIdx);
@@ -784,6 +814,11 @@ static DBKeyType parseInputFilesParallel(const std::vector<std::string> &filenam
                 if ((rank & 0xFFFF) == 0) {
                     progress.updateProgress(rank);
                 }
+            }
+            if (counted && rank != declaredCounts[fileIdx]) {
+                Debug(Debug::ERROR) << "File " << filenames[fileIdx] << " declares "
+                                    << declaredCounts[fileIdx] << " sequences but holds " << rank << "\n";
+                EXIT(EXIT_FAILURE);
             }
             if (rank == 0) {
 #pragma omp critical(createdb_parallel_warning)
@@ -799,7 +834,7 @@ static DBKeyType parseInputFilesParallel(const std::vector<std::string> &filenam
     sampleCount = nuclSamples;
     DBKeyType total = 0;
     for (size_t fileIdx = 0; fileIdx < fileCount; fileIdx++) {
-        if (entriesPerFile[fileIdx] >= (static_cast<size_t>(1) << CREATEDB_KEY_FILE_SHIFT)) {
+        if (counted == false && entriesPerFile[fileIdx] >= (static_cast<size_t>(1) << CREATEDB_KEY_FILE_SHIFT)) {
             Debug(Debug::ERROR) << "File " << filenames[fileIdx] << " has more entries than the key layout allows\n";
             EXIT(EXIT_FAILURE);
         }
@@ -1217,6 +1252,7 @@ int createdb(int argc, const char **argv, const Command& command) {
     std::string dataFile = filenames.back();
     filenames.pop_back();
 
+    std::vector<size_t> declaredCounts;
     if (Util::endsWith(".tsv", filenames[0])) {
 	    if (filenames.size() > 1) {
 		    Debug(Debug::ERROR) << "Only one tsv file can be given\n";
@@ -1234,17 +1270,53 @@ int createdb(int argc, const char **argv, const Command& command) {
 			    line[read - 1] = '\0';
 			    read--;
 		    }
+		    // optional second column: the file's sequence count, so parallel parsers know their key ranges
+		    char* tab = strchr(line, '\t');
+		    if (tab != NULL) {
+			    *tab = '\0';
+			    char* end = NULL;
+			    errno = 0;
+			    const unsigned long long count = strtoull(tab + 1, &end, 10);
+			    if (isdigit(static_cast<unsigned char>(tab[1])) == 0 || errno != 0 || *end != '\0') {
+				    Debug(Debug::ERROR) << "Invalid sequence count \"" << (tab + 1) << "\" for " << line << " in " << tsv << "\n";
+				    EXIT(EXIT_FAILURE);
+			    }
+			    declaredCounts.push_back(count);
+		    }
 		    filenames.push_back(line);
 	    }
 	    free(line);
 	    fclose(file);
+	    if (declaredCounts.empty() == false && declaredCounts.size() != filenames.size()) {
+		    Debug(Debug::ERROR) << "The tsv " << tsv << " mixes rows with and without a sequence count: all rows need one, or none\n";
+		    EXIT(EXIT_FAILURE);
+	    }
     }
 
     // consistent order
-    SORT_SERIAL(filenames.begin(), filenames.end(), [](const std::string &a, const std::string &b) {
-        return FileUtil::baseName(a) < FileUtil::baseName(b);
-    });
-    
+    if (declaredCounts.empty()) {
+        SORT_SERIAL(filenames.begin(), filenames.end(), [](const std::string &a, const std::string &b) {
+            return FileUtil::baseName(a) < FileUtil::baseName(b);
+        });
+    } else {
+        // counts ride the same basename order, so row i keeps describing filenames[i]
+        std::vector<size_t> order(filenames.size());
+        for (size_t i = 0; i < order.size(); i++) {
+            order[i] = i;
+        }
+        SORT_SERIAL(order.begin(), order.end(), [&filenames](size_t a, size_t b) {
+            return FileUtil::baseName(filenames[a]) < FileUtil::baseName(filenames[b]);
+        });
+        std::vector<std::string> sortedNames(filenames.size());
+        std::vector<size_t> sortedCounts(filenames.size());
+        for (size_t i = 0; i < order.size(); i++) {
+            sortedNames[i] = filenames[order[i]];
+            sortedCounts[i] = declaredCounts[order[i]];
+        }
+        filenames.swap(sortedNames);
+        declaredCounts.swap(sortedCounts);
+    }
+
     for (size_t i = 0; i < filenames.size(); i++) {
         if (FileUtil::directoryExists(filenames[i].c_str()) == true) {
             Debug(Debug::ERROR) << "File " << filenames[i] << " is a directory\n";
@@ -1383,6 +1455,7 @@ int createdb(int argc, const char **argv, const Command& command) {
             sourceLookup[i].reserve(16384);
         }
     }
+    std::vector<DBKeyType> fileKeyStarts;
 
     redoComputation:
     FILE *source = fopen(sourceFile.c_str(), "w");
@@ -1412,13 +1485,13 @@ int createdb(int argc, const char **argv, const Command& command) {
     const size_t BATCH_SIZE = par.threads * 10000;
     std::vector<std::pair<std::vector<char>, std::string>> batchEntries(BATCH_SIZE);
     size_t batchPos = 0;
-    // the key encodes (file, rank), so the merge still reproduces the sequential order
+    // packed (file, rank) keys need 64 bit; declared counts give final key ranges at any key width
     const bool parseFilesInParallel =
         dbInput == false
         && par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LENGTH_DESC
         && filenames.size() > 1
         && allInputsAreFiles == true
-        && sizeof(DBKeyType) == sizeof(uint64_t);
+        && (declaredCounts.empty() == false || sizeof(DBKeyType) == sizeof(uint64_t));
     if (parseFilesInParallel) {
         // a worker owns at least one split, so more workers than splits would leave some with none
         const size_t wantWorkers = std::min<size_t>(filenames.size(),
@@ -1429,7 +1502,8 @@ int createdb(int argc, const char **argv, const Command& command) {
                                   << " parse workers can run: raise --shuffle-splits above "
                                   << shuffleSplits << "\n";
         }
-        entries_num = parseInputFilesParallel(filenames, seqWriter, hdrWriter, source,
+        entries_num = parseInputFilesParallel(filenames, declaredCounts, fileKeyStarts,
+                                              seqWriter, hdrWriter, source,
                                               shuffleSplits, workers, testForNucSequence,
                                               isNuclCnt, sampleCount);
         fileCount = 0;
@@ -1689,6 +1763,7 @@ int createdb(int argc, const char **argv, const Command& command) {
                                     seqWriter.getDataFileName(), seqWriter.getIndexFileName(),
                                     hdrWriter.getDataFileName(), hdrWriter.getIndexFileName(),
                                     lookupFile.c_str(), parseFilesInParallel ? NULL : sourceLookup,
+                                    fileKeyStarts.empty() ? NULL : &fileKeyStarts,
                                     entries_num, shuffleSplits, descendingLength, gpuCompatibleDB);
         Debug(Debug::INFO) << "Merge all files " << timer.lap() << "\n";
         hdrWriter.clearMemory();
