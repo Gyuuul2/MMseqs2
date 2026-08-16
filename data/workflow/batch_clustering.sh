@@ -1326,6 +1326,15 @@ cluster_chunk() {
     if round_createdb_softlink "$round" && [[ ! -L "$db" || ! -L "${db}_h" ]]; then
         fail "createdb-mode 1 fell back to a copied DB for ${chunk_id}. Batch softlink mode requires plain single-line FASTA; refusing silent NVMe expansion."
     fi
+    # staged inputs feed only createdb (the DB is a full copy here); reclaim them so S3 downloads stop charging the disk budget
+    if [[ "$createdb_input" == "$work_dir/inputs.list.tsv" && -f "$createdb_input" ]]; then
+        local staged _cnt
+        while IFS=$'\t' read -r staged _cnt || [[ -n "${staged:-}" ]]; do
+            # only ever unlink what resolve_chunk_filelist staged: a source path here would delete the user's input
+            if [[ "$staged" == "$work_dir"/input-* ]]; then rm -f "$staged"; fi
+        done < "$createdb_input"
+        rm -f "$createdb_input"
+    fi
     local cluster_cmd
     cluster_cmd=$(round_cluster_cmd "$round")
     log "${cluster_cmd} ${chunk_id}"
