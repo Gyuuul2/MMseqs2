@@ -18,8 +18,8 @@
 #define SIZE_T_MAX ((size_t) -1)
 #endif
 
-// byte-identical port of batch_clustering.sh BUCKET_HASH_AWK: h = (h*131 + byte) % B over the column's bytes
-static unsigned int tsvBucketOfColumn(const std::string &line, int column, unsigned int buckets) {
+// byte-identical port of batch_clustering.sh SPLIT_HASH_AWK: h = (h*131 + byte) % B over the column's bytes
+static unsigned int tsvSplitOfColumn(const std::string &line, int column, unsigned int splits) {
     size_t start = 0;
     for (int c = 1; c < column; ++c) {
         size_t tab = line.find('\t', start);
@@ -31,7 +31,7 @@ static unsigned int tsvBucketOfColumn(const std::string &line, int column, unsig
         if (byte == '\t' || byte == '\n') {
             break;
         }
-        h = (h * 131 + byte) % buckets;
+        h = (h * 131 + byte) % splits;
     }
     return (unsigned int) h;
 }
@@ -97,21 +97,21 @@ int createtsv(int argc, const char **argv, const Command &command) {
     const std::string& indexFile = hasTargetDB ? par.db4Index : par.db3Index;
     const bool shouldCompress = par.dbOut == true && par.compressed == true;
     const int dbType = par.dbOut == true ? Parameters::DBTYPE_GENERIC_DB : Parameters::DBTYPE_OMIT_FILE;
-    // opt-in bucketed mode (batch clustering): dataFile becomes a prefix for <prefix>.bkt%05d.tsv
-    const unsigned int buckets = par.tsvBuckets > 0 ? (unsigned int) par.tsvBuckets : 0;
-    const bool bucketed = buckets > 0;
-    if (bucketed && par.dbOut) {
-        Debug(Debug::ERROR) << "--tsv-buckets cannot be combined with --db-output\n";
+    // opt-in split mode (batch clustering): dataFile becomes a prefix for <prefix>.split%05d.tsv
+    const unsigned int splits = par.tsvSplits > 0 ? (unsigned int) par.tsvSplits : 0;
+    const bool splitMode = splits > 0;
+    if (splitMode && par.dbOut) {
+        Debug(Debug::ERROR) << "--tsv-splits cannot be combined with --db-output\n";
         return EXIT_FAILURE;
     }
     DBWriter writer(dataFile.c_str(), indexFile.c_str(), par.threads, shouldCompress, dbType);
-    std::vector<FILE*> bucketFiles(bucketed ? buckets : 0);
-    std::vector<std::mutex> bucketLocks(bucketed ? buckets : 0);
-    if (bucketed) {
-        char bucketName[FILENAME_MAX];
-        for (unsigned int b = 0; b < buckets; ++b) {
-            snprintf(bucketName, sizeof(bucketName), "%s.bkt%05u.tsv", dataFile.c_str(), b);
-            bucketFiles[b] = FileUtil::openAndDelete(bucketName, "w");
+    std::vector<FILE*> splitFiles(splitMode ? splits : 0);
+    std::vector<std::mutex> splitLocks(splitMode ? splits : 0);
+    if (splitMode) {
+        char splitName[FILENAME_MAX];
+        for (unsigned int b = 0; b < splits; ++b) {
+            snprintf(splitName, sizeof(splitName), "%s.split%05u.tsv", dataFile.c_str(), b);
+            splitFiles[b] = FileUtil::openAndDelete(splitName, "w");
         }
     } else {
         writer.open();
@@ -132,8 +132,8 @@ int createtsv(int argc, const char **argv, const Command &command) {
         outputBuffer.reserve(10 * 1024);
         std::string lineBuffer;
         lineBuffer.reserve(1024);
-        const size_t bucketFlushSize = 64 * 1024;
-        std::vector<std::string> bucketBuffers(bucketed ? buckets : 0);
+        const size_t splitFlushSize = 64 * 1024;
+        std::vector<std::string> splitBuffers(splitMode ? splits : 0);
 
 #pragma omp for schedule(dynamic, 1000)
         for (size_t i = 0; i < reader->getSize(); ++i) {
@@ -219,14 +219,14 @@ int createtsv(int argc, const char **argv, const Command &command) {
                 char *nextLine = Util::skipLine(data);
                 lineBuffer.append(data + offset, (nextLine - (data + offset)) - 1);
                 lineBuffer.append("\n");
-                if (bucketed) {
-                    const unsigned int b = tsvBucketOfColumn(lineBuffer, par.tsvBucketColumn, buckets);
-                    std::string &buf = bucketBuffers[b];
+                if (splitMode) {
+                    const unsigned int b = tsvSplitOfColumn(lineBuffer, par.tsvSplitColumn, splits);
+                    std::string &buf = splitBuffers[b];
                     buf.append(lineBuffer);
-                    if (buf.size() >= bucketFlushSize) {
-                        std::lock_guard<std::mutex> lock(bucketLocks[b]);
-                        if (fwrite(buf.c_str(), sizeof(char), buf.size(), bucketFiles[b]) != buf.size()) {
-                            Debug(Debug::ERROR) << "Cannot write to bucket file " << b << "\n";
+                    if (buf.size() >= splitFlushSize) {
+                        std::lock_guard<std::mutex> lock(splitLocks[b]);
+                        if (fwrite(buf.c_str(), sizeof(char), buf.size(), splitFiles[b]) != buf.size()) {
+                            Debug(Debug::ERROR) << "Cannot write to split file " << b << "\n";
                             EXIT(EXIT_FAILURE);
                         }
                         buf.clear();
@@ -237,30 +237,30 @@ int createtsv(int argc, const char **argv, const Command &command) {
                 data = nextLine;
                 entryIndex++;
             }
-            if (bucketed == false) {
+            if (splitMode == false) {
                 writer.writeData(outputBuffer.c_str(), outputBuffer.length(), queryKey, thread_idx, par.dbOut);
                 outputBuffer.clear();
             }
         }
-        if (bucketed) {
-            for (unsigned int b = 0; b < buckets; ++b) {
-                if (bucketBuffers[b].empty()) {
+        if (splitMode) {
+            for (unsigned int b = 0; b < splits; ++b) {
+                if (splitBuffers[b].empty()) {
                     continue;
                 }
-                std::lock_guard<std::mutex> lock(bucketLocks[b]);
-                if (fwrite(bucketBuffers[b].c_str(), sizeof(char), bucketBuffers[b].size(), bucketFiles[b]) != bucketBuffers[b].size()) {
-                    Debug(Debug::ERROR) << "Cannot write to bucket file " << b << "\n";
+                std::lock_guard<std::mutex> lock(splitLocks[b]);
+                if (fwrite(splitBuffers[b].c_str(), sizeof(char), splitBuffers[b].size(), splitFiles[b]) != splitBuffers[b].size()) {
+                    Debug(Debug::ERROR) << "Cannot write to split file " << b << "\n";
                     EXIT(EXIT_FAILURE);
                 }
-                bucketBuffers[b].clear();
+                splitBuffers[b].clear();
             }
         }
         delete[] dbKey;
     }
-    if (bucketed) {
-        for (unsigned int b = 0; b < buckets; ++b) {
-            if (fclose(bucketFiles[b]) != 0) {
-                Debug(Debug::ERROR) << "Cannot close bucket file " << b << "\n";
+    if (splitMode) {
+        for (unsigned int b = 0; b < splits; ++b) {
+            if (fclose(splitFiles[b]) != 0) {
+                Debug(Debug::ERROR) << "Cannot close split file " << b << "\n";
                 return EXIT_FAILURE;
             }
         }

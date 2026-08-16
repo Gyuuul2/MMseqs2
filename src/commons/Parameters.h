@@ -520,15 +520,18 @@ public:
     bool batchRound0ClustHash;
     size_t batchRound0SplitMemoryLimit;
     int batchRound0PreloadMode;
+    int batchRound0Threads;
+    int batchRound0ShuffleSplits;
+    int batchRound0RepFastaSplits;
     int batchMaxRounds;
     float batchMinReductionRatio;
     int batchConvergencePatience;
     size_t batchMinReductionCount;
     int batchMaxChunkAttempts;
     bool batchCompressOutputs;
-    int batchMergeBuckets;
-    int batchMergeBucketJobs;
-    int batchRepSplits;
+    int batchMergeSplits;
+    int batchMergeSplitJobs;
+    int batchRepFastaSplits;
     size_t batchChunkDiskBudget;
     size_t batchRound0ChunkDiskBudget;
     int batchDiskPollInterval;
@@ -646,8 +649,8 @@ public:
     int idxSeqSrc;
     bool fullHeader;
     size_t targetTsvColumn;
-    int tsvBuckets;
-    int tsvBucketColumn;
+    int tsvSplits;
+    int tsvSplitColumn;
 
     //result2stats
     std::string stat;
@@ -1023,8 +1026,8 @@ public:
     PARAMETER(PARAM_FIRST_SEQ_REP_SEQ)
     PARAMETER(PARAM_FULL_HEADER)
     PARAMETER(PARAM_IDX_SEQ_SRC)
-    PARAMETER(PARAM_TSV_BUCKETS)
-    PARAMETER(PARAM_TSV_BUCKET_COLUMN)
+    PARAMETER(PARAM_TSV_SPLITS)
+    PARAMETER(PARAM_TSV_SPLIT_COLUMN)
 
     // result2stat
     PARAMETER(PARAM_STAT)
@@ -1094,15 +1097,18 @@ public:
     PARAMETER(PARAM_BATCH_ROUND0_CLUST_HASH)
     PARAMETER(PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT)
     PARAMETER(PARAM_BATCH_ROUND0_PRELOAD_MODE)
+    PARAMETER(PARAM_BATCH_ROUND0_THREADS)
+    PARAMETER(PARAM_BATCH_ROUND0_SHUFFLE_SPLITS)
     PARAMETER(PARAM_BATCH_MAX_ROUNDS)
     PARAMETER(PARAM_BATCH_MIN_REDUCTION_RATIO)
     PARAMETER(PARAM_BATCH_CONVERGENCE_PATIENCE)
     PARAMETER(PARAM_BATCH_MIN_REDUCTION_COUNT)
     PARAMETER(PARAM_BATCH_MAX_CHUNK_ATTEMPTS)
     PARAMETER(PARAM_BATCH_COMPRESS_OUTPUTS)
-    PARAMETER(PARAM_BATCH_MERGE_BUCKETS)
-    PARAMETER(PARAM_BATCH_MERGE_BUCKET_JOBS)
-    PARAMETER(PARAM_BATCH_REP_SPLITS)
+    PARAMETER(PARAM_BATCH_MERGE_SPLITS)
+    PARAMETER(PARAM_BATCH_MERGE_SPLIT_JOBS)
+    PARAMETER(PARAM_BATCH_REP_FASTA_SPLITS)
+    PARAMETER(PARAM_BATCH_ROUND0_REP_FASTA_SPLITS)
     PARAMETER(PARAM_BATCH_CHUNK_DISK_BUDGET)
     PARAMETER(PARAM_BATCH_ROUND0_CHUNK_DISK_BUDGET)
     PARAMETER(PARAM_BATCH_DISK_POLL_INTERVAL)

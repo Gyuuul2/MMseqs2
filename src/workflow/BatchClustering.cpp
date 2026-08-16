@@ -49,15 +49,15 @@ int mergeDefaultThreads(const Parameters &par) {
     return (par.threads > 0) ? par.threads : 1;
 }
 
-int automaticMergeBuckets(const Parameters &par) {
-    int buckets = mergeDefaultThreads(par);   // always >= 1
-    if (buckets > 256) {
-        buckets = 256;
+int automaticMergeSplits(const Parameters &par) {
+    int splits = mergeDefaultThreads(par);   // always >= 1
+    if (splits > 256) {
+        splits = 256;
     }
-    return buckets;
+    return splits;
 }
 
-int automaticMergeBucketJobs(const Parameters &par, int buckets) {
+int automaticMergeSplitJobs(const Parameters &par, int splits) {
     int jobs = mergeDefaultThreads(par) / 8;
     if (jobs < 1) {
         jobs = 1;
@@ -65,28 +65,28 @@ int automaticMergeBucketJobs(const Parameters &par, int buckets) {
     if (jobs > 16) {
         jobs = 16;
     }
-    if (jobs > buckets) {
-        jobs = buckets;
+    if (jobs > splits) {
+        jobs = splits;
     }
     return jobs;
 }
 
 void resolveBatchMergeParallelism(Parameters &par) {
     // default is 0, so "== 0" already covers "unset"; 0 means auto (explicit or defaulted)
-    const bool autoBuckets = (par.batchMergeBuckets == 0);
-    const bool autoJobs = (par.batchMergeBucketJobs == 0);
+    const bool autoSplits = (par.batchMergeSplits == 0);
+    const bool autoJobs = (par.batchMergeSplitJobs == 0);
 
-    if (autoBuckets) {
-        par.batchMergeBuckets = automaticMergeBuckets(par);
-        if (autoJobs == false && par.batchMergeBuckets < par.batchMergeBucketJobs) {
-            par.batchMergeBuckets = par.batchMergeBucketJobs;
+    if (autoSplits) {
+        par.batchMergeSplits = automaticMergeSplits(par);
+        if (autoJobs == false && par.batchMergeSplits < par.batchMergeSplitJobs) {
+            par.batchMergeSplits = par.batchMergeSplitJobs;
         }
     }
     if (autoJobs) {
-        par.batchMergeBucketJobs = automaticMergeBucketJobs(par, par.batchMergeBuckets);
+        par.batchMergeSplitJobs = automaticMergeSplitJobs(par, par.batchMergeSplits);
     }
-    if (par.batchMergeBucketJobs > par.batchMergeBuckets) {
-        par.batchMergeBucketJobs = par.batchMergeBuckets;
+    if (par.batchMergeSplitJobs > par.batchMergeSplits) {
+        par.batchMergeSplitJobs = par.batchMergeSplits;
     }
 }
 
@@ -358,9 +358,14 @@ std::string createBatchSubmitDirectory(const std::string &hash) {
 
 std::string buildCreatedbPar(const Parameters &par) {
     // the per-chunk .lookup is unused, and shuffling would renumber ids and change tie-breaks
-    return std::string("--shuffle 0 --write-lookup 0") +
+    std::string createdbPar = std::string("--shuffle 0 --write-lookup 0") +
            " --createdb-mode " + SSTR(par.createdbMode) +
            " --threads " + SSTR(par.threads) + " -v " + SSTR(par.verbosity);
+    // only when set, so an absent flag keeps createdb's own default exactly as before
+    if (par.PARAM_SHUFFLE_SPLITS.wasSet) {
+        createdbPar += " --shuffle-splits " + SSTR(par.shuffleSplits);
+    }
+    return createdbPar;
 }
 
 std::string buildCreatetsvPar(const Parameters &par) {
@@ -544,8 +549,8 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
     const std::string minReductionCount = SSTR(par.batchMinReductionCount);
     const std::string maxChunkAttempts = SSTR(par.batchMaxChunkAttempts);
     const std::string compressBatchOutputs = par.batchCompressOutputs ? "1" : "0";
-    const std::string mergeBuckets = SSTR(par.batchMergeBuckets);
-    const std::string mergeBucketJobs = SSTR(par.batchMergeBucketJobs);
+    const std::string mergeSplits = SSTR(par.batchMergeSplits);
+    const std::string mergeSplitJobs = SSTR(par.batchMergeSplitJobs);
     const std::string createdbPar = buildCreatedbPar(par);
     const std::string createtsvPar = buildCreatetsvPar(par);
 
@@ -566,9 +571,13 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
     cmd.addVariable("ROUND0_CHUNK_DISK_BUDGET", par.PARAM_BATCH_ROUND0_CHUNK_DISK_BUDGET.wasSet ? round0ChunkDiskBudget.c_str() : NULL);
     cmd.addVariable("DISK_POLL_SEC", SSTR(par.batchDiskPollInterval).c_str());
     cmd.addVariable("RAM_POLL_SEC", SSTR(par.batchRamPollInterval).c_str());
-    cmd.addVariable("MERGE_BUCKETS", mergeBuckets.c_str());
-    cmd.addVariable("MERGE_BUCKET_JOBS", mergeBucketJobs.c_str());
-    cmd.addVariable("BATCH_REP_SPLITS", SSTR(par.batchRepSplits).c_str());
+    cmd.addVariable("MERGE_SPLITS", mergeSplits.c_str());
+    cmd.addVariable("MERGE_SPLIT_JOBS", mergeSplitJobs.c_str());
+    cmd.addVariable("BATCH_REP_FASTA_SPLITS", SSTR(par.batchRepFastaSplits).c_str());
+    cmd.addVariable("ROUND0_THREADS", par.PARAM_BATCH_ROUND0_THREADS.wasSet ? SSTR(par.batchRound0Threads).c_str() : NULL);
+    cmd.addVariable("CREATEDB_SHUFFLE_SPLITS", par.PARAM_SHUFFLE_SPLITS.wasSet ? SSTR(par.shuffleSplits).c_str() : NULL);
+    cmd.addVariable("ROUND0_CREATEDB_SHUFFLE_SPLITS", par.PARAM_BATCH_ROUND0_SHUFFLE_SPLITS.wasSet ? SSTR(par.batchRound0ShuffleSplits).c_str() : NULL);
+    cmd.addVariable("ROUND0_BATCH_REP_FASTA_SPLITS", par.PARAM_BATCH_ROUND0_REP_FASTA_SPLITS.wasSet ? SSTR(par.batchRound0RepFastaSplits).c_str() : NULL);
     cmd.addVariable("MAX_ROUNDS", maxRounds.c_str());
     cmd.addVariable("MIN_REDUCTION_RATIO", minReductionRatio.c_str());
     cmd.addVariable("CONVERGENCE_PATIENCE", convergencePatience.c_str());

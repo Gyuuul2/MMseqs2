@@ -37,10 +37,10 @@ Usage:
 
 Environment (normally exported by mmseqs from the linclust-batch/cluster-batch command line;
 set them directly only when running this script standalone):
-  MMSEQS ROUND0_MMSEQS THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_BUCKETS MERGE_BUCKET_JOBS COMPRESS_RATIO
+  MMSEQS ROUND0_MMSEQS THREADS ROUND0_THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_SPLITS MERGE_SPLIT_JOBS COMPRESS_RATIO
   CHUNK_DISK_BUDGET ROUND0_CHUNK_DISK_BUDGET DISK_POLL_SEC RAM_POLL_SEC
-  CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_PAR ROUND0_CLUSTER_PAR CLUSTER_COV_MODE CREATEDB_PAR CREATEDB_SHUFFLE_SPLITS BATCH_COMPRESS_KMER_TMP_FILES CREATETSV_PAR COMPRESS_BATCH_OUTPUTS SORT_BUFFER_SIZE SORT_TMP
-  MAX_ROUNDS MIN_REDUCTION_RATIO MIN_REDUCTION_COUNT CONVERGENCE_PATIENCE MAX_CHUNK_ATTEMPTS BATCH_REP_SPLITS
+  CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_PAR ROUND0_CLUSTER_PAR CLUSTER_COV_MODE CREATEDB_PAR CREATEDB_SHUFFLE_SPLITS ROUND0_CREATEDB_SHUFFLE_SPLITS BATCH_COMPRESS_KMER_TMP_FILES CREATETSV_PAR COMPRESS_BATCH_OUTPUTS SORT_BUFFER_SIZE SORT_TMP
+  MAX_ROUNDS MIN_REDUCTION_RATIO MIN_REDUCTION_COUNT CONVERGENCE_PATIENCE MAX_CHUNK_ATTEMPTS BATCH_REP_FASTA_SPLITS ROUND0_BATCH_REP_FASTA_SPLITS
   REMOVE_TMP NODE_WORK_DIR ROUND0_NODE_WORK_DIR
   BATCH_SLURM_NODELIST ROUND0_BATCH_SLURM_NODELIST BATCH_SLURM_PARTITION ROUND0_BATCH_SLURM_PARTITION
   BATCH_SLURM_TIME ROUND0_BATCH_SLURM_TIME BATCH_SLURM_MEM ROUND0_BATCH_SLURM_MEM BATCH_SLURM_EXTRA ROUND0_BATCH_SLURM_EXTRA
@@ -60,6 +60,9 @@ MMSEQS=${MMSEQS:-mmseqs}
 # round0 may run on a different architecture than later rounds; empty uses $MMSEQS everywhere
 ROUND0_MMSEQS=${ROUND0_MMSEQS:-}
 THREADS=${THREADS:-$(command -v nproc >/dev/null 2>&1 && nproc || echo 1)}
+# Optional round0-only thread count: round0 often runs on a smaller machine class than round1+.
+ROUND0_THREADS=${ROUND0_THREADS:-}
+[[ -z "$ROUND0_THREADS" || "$ROUND0_THREADS" =~ ^[1-9][0-9]*$ ]] || fail "ROUND0_THREADS must be a positive integer (got '$ROUND0_THREADS')"
 CHUNK_MAX_BYTES=${CHUNK_MAX_BYTES:-21474836480}   # = 20*1024^3; must match BatchClustering.cpp/Parameters.cpp batchChunkMaxBytes so a standalone run chunks identically to the mmseqs-injected run
 CHUNK_MAX_SEQS=${CHUNK_MAX_SEQS:-0}
 ROUND0_CHUNK_MAX_BYTES=${ROUND0_CHUNK_MAX_BYTES:-}
@@ -75,6 +78,8 @@ COMPRESS_BATCH_OUTPUTS=${COMPRESS_BATCH_OUTPUTS:-0}
 [[ "$COMPRESS_BATCH_OUTPUTS" =~ ^[01]$ ]] || fail "COMPRESS_BATCH_OUTPUTS must be 0 or 1 (got '$COMPRESS_BATCH_OUTPUTS')"
 # --createdb-mode 3 sorts by length, which createdb's parallel parse and align2clust's visit order both need
 CREATEDB_SHUFFLE_SPLITS=${CREATEDB_SHUFFLE_SPLITS:-$THREADS}
+ROUND0_CREATEDB_SHUFFLE_SPLITS=${ROUND0_CREATEDB_SHUFFLE_SPLITS:-}
+[[ -z "$ROUND0_CREATEDB_SHUFFLE_SPLITS" || "$ROUND0_CREATEDB_SHUFFLE_SPLITS" =~ ^[1-9][0-9]*$ ]] || fail "ROUND0_CREATEDB_SHUFFLE_SPLITS must be a positive integer (got '$ROUND0_CREATEDB_SHUFFLE_SPLITS')"
 CREATEDB_PAR=${CREATEDB_PAR:---write-lookup 0 --createdb-mode 3 --shuffle-splits ${CREATEDB_SHUFFLE_SPLITS}}
 createdb_mode_from_par() {
     local par=" ${CREATEDB_PAR} "
@@ -121,8 +126,10 @@ MAX_CHUNK_ATTEMPTS=${MAX_CHUNK_ATTEMPTS:-1}
 [[ "$MAX_CHUNK_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || fail "MAX_CHUNK_ATTEMPTS must be a positive integer (got '$MAX_CHUNK_ATTEMPTS')"
 COMPRESS_RATIO=${COMPRESS_RATIO:-3}
 # representative FASTA shards per chunk; above --shuffle-splits it only helps the shuffle, not the parse
-BATCH_REP_SPLITS=${BATCH_REP_SPLITS:-32}
-[[ "$BATCH_REP_SPLITS" =~ ^[1-9][0-9]*$ ]] || fail "BATCH_REP_SPLITS must be a positive integer (got '$BATCH_REP_SPLITS')"
+BATCH_REP_FASTA_SPLITS=${BATCH_REP_FASTA_SPLITS:-32}
+[[ "$BATCH_REP_FASTA_SPLITS" =~ ^[1-9][0-9]*$ ]] || fail "BATCH_REP_FASTA_SPLITS must be a positive integer (got '$BATCH_REP_FASTA_SPLITS')"
+ROUND0_BATCH_REP_FASTA_SPLITS=${ROUND0_BATCH_REP_FASTA_SPLITS:-}
+[[ -z "$ROUND0_BATCH_REP_FASTA_SPLITS" || "$ROUND0_BATCH_REP_FASTA_SPLITS" =~ ^[1-9][0-9]*$ ]] || fail "ROUND0_BATCH_REP_FASTA_SPLITS must be a positive integer (got '$ROUND0_BATCH_REP_FASTA_SPLITS')"
 
 merge_default_threads() {
     if [[ "${THREADS:-}" =~ ^[1-9][0-9]*$ ]]; then
@@ -132,41 +139,42 @@ merge_default_threads() {
     fi
 }
 
-auto_merge_buckets() {
-    local buckets
-    buckets=$(merge_default_threads)   # always >= 1
-    [[ "$buckets" -gt 256 ]] && buckets=256
-    printf '%s' "$buckets"
+auto_merge_splits() {
+    local splits
+    splits=$(merge_default_threads)   # always >= 1
+    [[ "$splits" -gt 256 ]] && splits=256
+    printf '%s' "$splits"
 }
 
-auto_merge_bucket_jobs() {
-    local threads buckets jobs
+auto_merge_split_jobs() {
+    local threads splits jobs
     threads=$(merge_default_threads)
-    buckets="${MERGE_BUCKETS:-1}"
+    splits="${MERGE_SPLITS:-1}"
     jobs=$((threads / 8))
     [[ "$jobs" -lt 1 ]] && jobs=1
     [[ "$jobs" -gt 16 ]] && jobs=16
-    [[ "$jobs" -gt "$buckets" ]] && jobs="$buckets"
+    [[ "$jobs" -gt "$splits" ]] && jobs="$splits"
     printf '%s' "$jobs"
 }
 
-if [[ -z "${MERGE_BUCKETS:-}" || "$MERGE_BUCKETS" == "0" ]]; then
-    MERGE_BUCKETS=$(auto_merge_buckets)
+if [[ -z "${MERGE_SPLITS:-}" || "$MERGE_SPLITS" == "0" ]]; then
+    MERGE_SPLITS=$(auto_merge_splits)
 fi
-[[ "$MERGE_BUCKETS" =~ ^[1-9][0-9]*$ ]] || fail "MERGE_BUCKETS must be a positive integer (got '$MERGE_BUCKETS')"
-if [[ -z "${MERGE_BUCKET_JOBS:-}" || "$MERGE_BUCKET_JOBS" == "0" ]]; then
-    MERGE_BUCKET_JOBS=$(auto_merge_bucket_jobs)
+[[ "$MERGE_SPLITS" =~ ^[1-9][0-9]*$ ]] || fail "MERGE_SPLITS must be a positive integer (got '$MERGE_SPLITS')"
+[[ -z "${ROUND0_MERGE_SPLITS:-}" ]] || fail "ROUND0_MERGE_SPLITS is not supported: round TSVs are written pre-split and propagate joins parent/child split by split, so a per-round split count would break the join and lose cluster members; use one global --merge-splits"
+if [[ -z "${MERGE_SPLIT_JOBS:-}" || "$MERGE_SPLIT_JOBS" == "0" ]]; then
+    MERGE_SPLIT_JOBS=$(auto_merge_split_jobs)
 fi
-[[ "$MERGE_BUCKET_JOBS" =~ ^[1-9][0-9]*$ ]] || fail "MERGE_BUCKET_JOBS must be a positive integer (got '$MERGE_BUCKET_JOBS')"
-[[ "$MERGE_BUCKET_JOBS" -gt "$MERGE_BUCKETS" ]] && MERGE_BUCKET_JOBS="$MERGE_BUCKETS"
+[[ "$MERGE_SPLIT_JOBS" =~ ^[1-9][0-9]*$ ]] || fail "MERGE_SPLIT_JOBS must be a positive integer (got '$MERGE_SPLIT_JOBS')"
+[[ "$MERGE_SPLIT_JOBS" -gt "$MERGE_SPLITS" ]] && MERGE_SPLIT_JOBS="$MERGE_SPLITS"
 
-# createtsv and the propagate fragment split each hold one open file per bucket
-check_bucket_fd_budget() {
+# createtsv and the propagate fragment writer each hold one open file per merge split
+check_split_fd_budget() {
     local fd_limit; fd_limit=$(ulimit -n 2>/dev/null || echo 256)
-    [[ "$MERGE_BUCKETS" -le $((fd_limit - 64)) ]] ||
-        fail "--merge-buckets ${MERGE_BUCKETS} exceeds this node's safe open-file budget (ulimit -n=${fd_limit}); lower --merge-buckets or raise 'ulimit -n'"
+    [[ "$MERGE_SPLITS" -le $((fd_limit - 64)) ]] ||
+        fail "--merge-splits ${MERGE_SPLITS} exceeds this node's safe open-file budget (ulimit -n=${fd_limit}); lower --merge-splits or raise 'ulimit -n'"
 }
-check_bucket_fd_budget
+check_split_fd_budget
 BATCH_BACKEND=${BATCH_BACKEND:-single-node}
 NODE_WORK_DIR=${NODE_WORK_DIR:-}
 ROUND0_NODE_WORK_DIR=${ROUND0_NODE_WORK_DIR:-}
@@ -206,6 +214,7 @@ round_cluster_par() {
     [[ -n "${BATCH_KMER_WRITE_TO_DISK:-}" ]] && spill="$BATCH_KMER_WRITE_TO_DISK"
     base=$(par_without_flag "$base" --kmer-write-to-disk)
     base=$(par_without_flag "$base" --compress-kmer-tmp-files)
+    base=$(round_par_threads "$round" "$base")
     printf '%s --kmer-write-to-disk %s --compress-kmer-tmp-files %s' \
         "$base" "$spill" "${BATCH_COMPRESS_KMER_TMP_FILES:-0}"
 }
@@ -310,20 +319,50 @@ round_mmseqs() {
     fi
 }
 
+round_threads() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_THREADS:-}" ]]; then
+        printf '%s' "$ROUND0_THREADS"
+    else
+        printf '%s' "$THREADS"
+    fi
+}
+
+round_rep_fasta_splits() {
+    local round="$1"
+    if [[ "$round" -eq 0 && -n "${ROUND0_BATCH_REP_FASTA_SPLITS:-}" ]]; then
+        printf '%s' "$ROUND0_BATCH_REP_FASTA_SPLITS"
+    else
+        printf '%s' "$BATCH_REP_FASTA_SPLITS"
+    fi
+}
+
+# rewrites --threads in a PAR string only when round0 overrides it, so absent overrides keep today's flags
+round_par_threads() {
+    local round="$1" par="$2"
+    if [[ "$round" -eq 0 && -n "${ROUND0_THREADS:-}" ]]; then
+        par="$(par_without_flag "$par" --threads) --threads $ROUND0_THREADS"
+    fi
+    printf '%s' "$par"
+}
+
 prepare_round() {
     local round="$1"
     shift
     local old_chunk_max_bytes="$CHUNK_MAX_BYTES"
     local old_chunk_max_seqs="$CHUNK_MAX_SEQS"
+    local old_threads="$THREADS"
     local rc
     CHUNK_MAX_BYTES=$(round_chunk_max_bytes "$round")
     CHUNK_MAX_SEQS=$(round_chunk_max_seqs "$round")
+    THREADS=$(round_threads "$round")
     set +e
     prepare "$@"
     rc=$?
     set -e
     CHUNK_MAX_BYTES="$old_chunk_max_bytes"
     CHUNK_MAX_SEQS="$old_chunk_max_seqs"
+    THREADS="$old_threads"
     return "$rc"
 }
 
@@ -335,10 +374,10 @@ with_round_node_work_dir() {
     NODE_WORK_DIR="$node_work_dir" NODE_SCRATCH_SCOPE="round${round}" "$@"
 }
 
-# per-sort memory target for the merge, GNU sort only; --merge-buckets sizes the input, this the memory
+# per-sort memory target for the merge, GNU sort only; --merge-splits sizes the input, this the memory
 if [[ -z "${SORT_BUFFER_SIZE+x}" ]]; then
-    if [[ "$MERGE_BUCKET_JOBS" -gt 1 ]]; then
-        sort_pct=$((25 / MERGE_BUCKET_JOBS))
+    if [[ "$MERGE_SPLIT_JOBS" -gt 1 ]]; then
+        sort_pct=$((25 / MERGE_SPLIT_JOBS))
         [[ "$sort_pct" -lt 1 ]] && sort_pct=1
         SORT_BUFFER_SIZE="${sort_pct}%"
     else
@@ -348,8 +387,8 @@ fi
 SORT_PARALLEL_OPT=""
 if sort --version 2>/dev/null | grep -q GNU; then
     MERGE_SORT_THREADS="$THREADS"
-    if [[ "$MERGE_BUCKET_JOBS" -gt 1 ]]; then
-        MERGE_SORT_THREADS=$((THREADS / MERGE_BUCKET_JOBS))
+    if [[ "$MERGE_SPLIT_JOBS" -gt 1 ]]; then
+        MERGE_SORT_THREADS=$((THREADS / MERGE_SPLIT_JOBS))
         [[ "$MERGE_SORT_THREADS" -lt 1 ]] && MERGE_SORT_THREADS=1
     fi
     SORT_PARALLEL_OPT="--parallel=$MERGE_SORT_THREADS --buffer-size=$SORT_BUFFER_SIZE"
@@ -562,11 +601,15 @@ round_createdb_softlink() {
 }
 
 round_createdb_par() {
-    local mode par
-    mode=$(round_createdb_mode "$1")
+    local round="$1" mode par
+    mode=$(round_createdb_mode "$round")
     par=$(par_without_flag "$CREATEDB_PAR" --createdb-mode)
     # mode 3 warns and forces --shuffle 1, so drop the flag rather than let it read as if it applied
     [[ "$mode" == "3" ]] && par=$(par_without_flag "$par" --shuffle)
+    if [[ "$round" -eq 0 && -n "${ROUND0_CREATEDB_SHUFFLE_SPLITS:-}" ]]; then
+        par="$(par_without_flag "$par" --shuffle-splits) --shuffle-splits $ROUND0_CREATEDB_SHUFFLE_SPLITS"
+    fi
+    par=$(round_par_threads "$round" "$par")
     printf '%s --createdb-mode %s' "$par" "$mode"
 }
 
@@ -1174,9 +1217,9 @@ run_stage() {
 
 # one stage covering both representative steps, matching the 'representatives' log line
 representatives_stage() {
-    local mmseqs_bin="$1" clu="$2" db="$3" rep="$4" rep_fa="$5" rep_splits="$6"
+    local mmseqs_bin="$1" clu="$2" db="$3" rep="$4" rep_fa="$5" rep_fasta_splits="$6"
     "$mmseqs_bin" createsubdb "$clu" "$db" "$rep" --subdb-mode 1 || return 1
-    "$mmseqs_bin" convert2fasta "$rep" "$rep_fa" --fasta-splits "$rep_splits"
+    "$mmseqs_bin" convert2fasta "$rep" "$rep_fa" --fasta-splits "$rep_fasta_splits"
 }
 
 cluster_chunk() {
@@ -1249,6 +1292,8 @@ cluster_chunk() {
     local mmseqs_bin
     mmseqs_bin=$(round_mmseqs "$round")
     need_cmd "$mmseqs_bin"
+    # cluster-chunk runs as its own process, so every $THREADS use below can follow the round's budget
+    THREADS=$(round_threads "$round")
     CHUNK_WORK_DIR="$work_dir"
     CHUNK_DISK_BUDGET_BYTES=$(round_chunk_disk_budget "$round")
     [[ "$CHUNK_DISK_BUDGET_BYTES" =~ ^[0-9]+$ ]] || fail "chunk disk budget must be an integer byte count (got '$CHUNK_DISK_BUDGET_BYTES')"
@@ -1279,35 +1324,37 @@ cluster_chunk() {
 
     log "createtsv ${chunk_id}"
     # round0 TSVs feed the merge join as child (key = rep, col 1); round1+ TSVs as parent (key = member, col 2)
-    local bucket_col=2
-    [[ "$round" -eq 0 ]] && bucket_col=1
+    local split_col=2
+    [[ "$round" -eq 0 ]] && split_col=1
     local createtsv_par
-    createtsv_par=$(par_without_flag "$CREATETSV_PAR" --tsv-buckets)
-    createtsv_par=$(par_without_flag "$createtsv_par" --tsv-bucket-column)
+    createtsv_par=$(par_without_flag "$CREATETSV_PAR" --tsv-splits)
+    createtsv_par=$(par_without_flag "$createtsv_par" --tsv-split-column)
+    createtsv_par=$(round_par_threads "$round" "$createtsv_par")
     # shellcheck disable=SC2086
-    run_stage createtsv "$chunk_id" "$round" -- "$mmseqs_bin" createtsv "$db" "$db" "$clu" "$tsv_prefix" ${createtsv_par} --tsv-buckets "$MERGE_BUCKETS" --tsv-bucket-column "$bucket_col" || fail "createtsv failed (chunk ${chunk_id}, rc=$?)"
+    run_stage createtsv "$chunk_id" "$round" -- "$mmseqs_bin" createtsv "$db" "$db" "$clu" "$tsv_prefix" ${createtsv_par} --tsv-splits "$MERGE_SPLITS" --tsv-split-column "$split_col" || fail "createtsv failed (chunk ${chunk_id}, rc=$?)"
 
     log "representatives ${chunk_id}"
     # one index line per cluster, and one representative per cluster, so this needs no fasta scan
     local rep_total
     rep_total=$(wc -l < "${clu}.index" | tr -d ' ')
     # cap the shard count at the rep count so no shard is empty
-    local rep_splits="$BATCH_REP_SPLITS"
-    [[ "$rep_splits" -gt "$rep_total" ]] && rep_splits="$rep_total"
-    [[ "$rep_splits" -ge 1 ]] || rep_splits=1
-    run_stage representatives "$chunk_id" "$round" -- representatives_stage "$mmseqs_bin" "$clu" "$db" "$rep" "$rep_fa" "$rep_splits" || fail "representatives (createsubdb/convert2fasta) failed (chunk ${chunk_id}, rc=$?)"
+    local rep_fasta_splits
+    rep_fasta_splits=$(round_rep_fasta_splits "$round")
+    [[ "$rep_fasta_splits" -gt "$rep_total" ]] && rep_fasta_splits="$rep_total"
+    [[ "$rep_fasta_splits" -ge 1 ]] || rep_fasta_splits=1
+    run_stage representatives "$chunk_id" "$round" -- representatives_stage "$mmseqs_bin" "$clu" "$db" "$rep" "$rep_fa" "$rep_fasta_splits" || fail "representatives (createsubdb/convert2fasta) failed (chunk ${chunk_id}, rc=$?)"
 
-    local batch_suffix b bkt_tsv tsv_out
+    local batch_suffix b split_tsv tsv_out
     batch_suffix=$(batch_compression_suffix)
 
     local k shard shard_out shard_bytes shard_seqs rep_bytes_total=0
     local -a shard_outs=() shard_metric_lines=()
-    for ((k = 0; k < rep_splits; k++)); do
+    for ((k = 0; k < rep_fasta_splits; k++)); do
         printf -v shard '%s/output/%s.rep.split%05d.fa' "$work_dir" "$chunk_id" "$k"
         [[ -s "$shard" ]] || fail "convert2fasta left no shard $shard (chunk ${chunk_id})"
         shard_bytes=$(wc -c < "$shard" | tr -d ' ')
-        # rep DB entry i lands in shard i % rep_splits, so the per-shard count is arithmetic
-        shard_seqs=$(( (rep_total - 1 - k) / rep_splits + 1 ))
+        # rep DB entry i lands in shard i % rep_fasta_splits, so the per-shard count is arithmetic
+        shard_seqs=$(( (rep_total - 1 - k) / rep_fasta_splits + 1 ))
         rep_bytes_total=$((rep_bytes_total + shard_bytes))
         shard_out="${shard}${batch_suffix}"
         if compress_batch_outputs_enabled; then
@@ -1324,9 +1371,9 @@ cluster_chunk() {
         printf 'input_bytes\t%s\n' "$(wc -c < "$db" 2>/dev/null | tr -d ' ' || echo 0)"
         printf 'rep_count\t%s\n' "$rep_total"
         printf 'rep_bytes\t%s\n' "$rep_bytes_total"
-        printf 'cluster_tsv\t%s\n' "$(basename "$tsv_prefix").bkt*.tsv${batch_suffix}"
-        printf 'tsv_buckets\t%s\n' "$MERGE_BUCKETS"
-        printf 'rep_splits\t%s\n' "$rep_splits"
+        printf 'cluster_tsv\t%s\n' "$(basename "$tsv_prefix").split*.tsv${batch_suffix}"
+        printf 'tsv_splits\t%s\n' "$MERGE_SPLITS"
+        printf 'rep_splits\t%s\n' "$rep_fasta_splits"
         printf '%s\n' "${shard_metric_lines[@]}"
         printf 'round\t%s\n' "$round"
         printf 'disk_budget_bytes\t%s\n' "$CHUNK_DISK_BUDGET_BYTES"
@@ -1337,12 +1384,12 @@ cluster_chunk() {
         printf '%s\n' "${STAGE_METRIC_LINES[@]}"
     } > "$metrics"
 
-    for ((b = 0; b < MERGE_BUCKETS; b++)); do
-        printf -v bkt_tsv '%s.bkt%05d.tsv' "$tsv_prefix" "$b"
-        [[ -e "$bkt_tsv" ]] || fail "createtsv left no bucket file $bkt_tsv (chunk ${chunk_id})"
-        tsv_out="${bkt_tsv}${batch_suffix}"
+    for ((b = 0; b < MERGE_SPLITS; b++)); do
+        printf -v split_tsv '%s.split%05d.tsv' "$tsv_prefix" "$b"
+        [[ -e "$split_tsv" ]] || fail "createtsv left no split file $split_tsv (chunk ${chunk_id})"
+        tsv_out="${split_tsv}${batch_suffix}"
         if compress_batch_outputs_enabled; then
-            write_batch_output "$bkt_tsv" "$tsv_out"
+            write_batch_output "$split_tsv" "$tsv_out"
         fi
         copy_out "$tsv_out" "${prefix}tsv/$(basename "$tsv_out")"
     done
@@ -1367,19 +1414,11 @@ cluster_chunk() {
 }
 
 
-# Distributed representative merge (pre-bucketed hash join).
-# Composes child(rep->member) with parent(rep->member) on parent.member == child.rep
-# to emit (new rep, original member). Both sides arrive already hash-bucketed by their
-# join key (createtsv --tsv-buckets writes round TSVs bucketed; propagate emits its
-# output re-bucketed by the new rep), so each bucket join is independent and the union
-# equals the single-node join -- no partition pass exists. The (rep,member) MAPPING is
-# identical regardless of MERGE_BUCKETS or node count; the row ORDER of the final file
-# matches a single global sort only for a fixed --merge-buckets (see finalize_outputs).
+# compose child(rep->member) with parent(rep->member) on parent.member == child.rep
 
-# Deterministic byte-hash of a chosen column into [0, B); LC_ALL=C fixes byte order.
-# Must stay byte-identical to tsvBucketOfColumn in createtsv.cpp.
-BUCKET_HASH_AWK='
-    function bucket(key,   i, h, n) {
+# byte-hash of a column into [0, B); must stay byte-identical to tsvSplitOfColumn in createtsv.cpp
+SPLIT_HASH_AWK='
+    function split_of(key,   i, h, n) {
         h = 0; n = length(key)
         for (i = 1; i <= n; i++) h = (h * 131 + ord[substr(key, i, 1)]) % B
         return h
@@ -1387,36 +1426,50 @@ BUCKET_HASH_AWK='
     BEGIN { for (i = 0; i < 256; i++) ord[sprintf("%c", i)] = i }
 '
 
-# Print the manifest entries of one bucket (*.bkt<bb>.tsv[.zst|.gz]); zero matches = bucket-count mismatch.
-bucket_manifest_files() {
+# A listed split index >= MERGE_SPLITS means the TSVs were written with MORE splits; joining with fewer would silently drop them.
+check_manifest_split_count() {
+    local manifest="$1" splits="$2" bad
+    bad=$(stream_manifest "$manifest" | awk -F'\t' -v B="$splits" '
+        {
+            n = split($1, parts, /\.split/)
+            if (n < 2) next
+            idx = parts[n]
+            sub(/\.tsv(\.zst|\.gz)?$/, "", idx)
+            if (idx ~ /^[0-9]+$/ && idx + 0 >= B) { print idx + 0; exit }
+        }')
+    [[ -z "$bad" ]] || fail "manifest $manifest lists TSV split ${bad} but this run uses --merge-splits ${splits}: the TSVs were written with more splits, and joining with fewer would silently drop cluster members (one split count must cover the whole run)"
+}
+
+# Print the manifest entries of one split (*.split<bb>.tsv[.zst|.gz]); zero matches = split-count mismatch.
+split_manifest_files() {
     local manifest="$1" bb="$2" uri _rest found=0
     while IFS=$'\t' read -r uri _rest || [[ -n "${uri:-}" ]]; do
         [[ -z "${uri:-}" || "$uri" =~ ^[[:space:]]*# ]] && continue
         case "$(basename "$uri")" in
-            *".bkt${bb}.tsv"|*".bkt${bb}.tsv.zst"|*".bkt${bb}.tsv.gz") printf '%s\n' "$uri"; found=1 ;;
+            *".split${bb}.tsv"|*".split${bb}.tsv.zst"|*".split${bb}.tsv.gz") printf '%s\n' "$uri"; found=1 ;;
         esac
     done < <(stream_manifest "$manifest")
-    [[ "$found" -eq 1 ]] || fail "no bucket ${bb} files listed in manifest $manifest (merge-buckets mismatch with the run that wrote it?)"
+    [[ "$found" -eq 1 ]] || fail "no split ${bb} files listed in manifest $manifest (merge-splits mismatch with the run that wrote it?)"
 }
 
-# Concatenate one bucket's rows from every file the manifest lists for it.
-stream_bucket_files() {
+# Concatenate one split's rows from every file the manifest lists for it.
+stream_split_files() {
     local manifest="$1" bb="$2" list uri
-    list=$(bucket_manifest_files "$manifest" "$bb")
+    list=$(split_manifest_files "$manifest" "$bb")
     while IFS= read -r uri; do
         stream_uri "$uri"
     done <<< "$list"
 }
 
-run_bucket_jobs() {
-    local label="$1" buckets="$2" jobs="$3" worker="$4"
+run_split_jobs() {
+    local label="$1" splits="$2" jobs="$3" worker="$4"
     shift 4
-    [[ "$jobs" -gt "$buckets" ]] && jobs="$buckets"
+    [[ "$jobs" -gt "$splits" ]] && jobs="$splits"
     [[ "$jobs" -lt 1 ]] && jobs=1
 
     local pids="" active=0
     local b pid rc=0
-    for ((b = 0; b < buckets; b++)); do
+    for ((b = 0; b < splits; b++)); do
         "$worker" "$@" "$b" &
         pids="${pids}$! "
         active=$((active + 1))
@@ -1428,7 +1481,7 @@ run_bucket_jobs() {
             done
             pids=""
             active=0
-            [[ "$rc" -eq 0 ]] || fail "${label}: one or more bucket jobs failed"
+            [[ "$rc" -eq 0 ]] || fail "${label}: one or more split jobs failed"
         fi
     done
     for pid in $pids; do
@@ -1436,42 +1489,42 @@ run_bucket_jobs() {
             rc=1
         fi
     done
-    [[ "$rc" -eq 0 ]] || fail "${label}: one or more bucket jobs failed"
+    [[ "$rc" -eq 0 ]] || fail "${label}: one or more split jobs failed"
 }
 
 finalize_emit_shard_job() {
-    local sorted_dir="$1" shard_prefix="$2" work_dir="$3" bucket="$4"
-    local bb batch_suffix bkt shard_out shard_tmp
-    printf -v bb '%05d' "$bucket"
+    local sorted_dir="$1" shard_prefix="$2" work_dir="$3" split_idx="$4"
+    local bb batch_suffix split_file shard_out shard_tmp
+    printf -v bb '%05d' "$split_idx"
     batch_suffix=$(batch_compression_suffix)
-    printf -v bkt '%s/final.bkt%s.tsv' "$sorted_dir" "$bb"
-    [[ -e "$bkt" ]] || fail "finalize: missing sorted bucket $bkt"
-    shard_out="${shard_prefix}final.bkt${bb}.tsv${batch_suffix}"
-    shard_tmp="$(resolve_node_scratch "$work_dir")/final.bkt${bb}.tsv${batch_suffix}.out.tmp.$$"
-    write_batch_output "$bkt" "$shard_tmp"
+    printf -v split_file '%s/final.split%s.tsv' "$sorted_dir" "$bb"
+    [[ -e "$split_file" ]] || fail "finalize: missing sorted split $split_file"
+    shard_out="${shard_prefix}final.split${bb}.tsv${batch_suffix}"
+    shard_tmp="$(resolve_node_scratch "$work_dir")/final.split${bb}.tsv${batch_suffix}.out.tmp.$$"
+    write_batch_output "$split_file" "$shard_tmp"
     copy_out "$shard_tmp" "$shard_out"
     rm -f "$shard_tmp"
 }
 
-# merge_join <child_manifest> <parent_manifest> <frag_dir> <sort_tmp> <bucket>: join parent.member == child.rep, splitting output by hash(new rep) so it leaves already bucketed.
+# merge_join <child_manifest> <parent_manifest> <frag_dir> <sort_tmp> <split>: join parent.member == child.rep, routing output by hash(new rep) so it leaves already split.
 merge_join() {
-    local child_manifest="$1" parent_manifest="$2" frag_dir="$3" sort_tmp="$4" bucket="$5"
-    local buckets="${MERGE_BUCKETS:-1}"
-    local bb; printf -v bb '%05d' "$bucket"
-    sort_tmp="$sort_tmp/bkt${bb}"
+    local child_manifest="$1" parent_manifest="$2" frag_dir="$3" sort_tmp="$4" split_idx="$5"
+    local splits="${MERGE_SPLITS:-1}"
+    local bb; printf -v bb '%05d' "$split_idx"
+    sort_tmp="$sort_tmp/split${bb}"
     mkdir -p "$frag_dir" "$sort_tmp"
-    local child_sorted="$frag_dir/.child.bkt${bb}.by_rep"
-    local parent_sorted="$frag_dir/.parent.bkt${bb}.by_member"
-    local joined_cnt="$frag_dir/.joined.bkt${bb}.count"
+    local child_sorted="$frag_dir/.child.split${bb}.by_rep"
+    local parent_sorted="$frag_dir/.parent.split${bb}.by_member"
+    local joined_cnt="$frag_dir/.joined.split${bb}.count"
     # shellcheck disable=SC2086
-    stream_bucket_files "$child_manifest" "$bb" | sort -T "$sort_tmp" -t $'\t' -k1,1 -o "$child_sorted" $SORT_PARALLEL_OPT
+    stream_split_files "$child_manifest" "$bb" | sort -T "$sort_tmp" -t $'\t' -k1,1 -o "$child_sorted" $SORT_PARALLEL_OPT
     # shellcheck disable=SC2086
-    stream_bucket_files "$parent_manifest" "$bb" | sort -T "$sort_tmp" -t $'\t' -k2,2 -o "$parent_sorted" $SORT_PARALLEL_OPT
+    stream_split_files "$parent_manifest" "$bb" | sort -T "$sort_tmp" -t $'\t' -k2,2 -o "$parent_sorted" $SORT_PARALLEL_OPT
     join -t $'\t' -1 2 -2 1 -o '1.1 2.2' "$parent_sorted" "$child_sorted" \
-        | awk -F'\t' -v B="$buckets" -v pfx="$frag_dir/joined.b${bb}.k" -v cnt="$joined_cnt" \
-              "$BUCKET_HASH_AWK"'
+        | awk -F'\t' -v B="$splits" -v pfx="$frag_dir/joined.b${bb}.k" -v cnt="$joined_cnt" \
+              "$SPLIT_HASH_AWK"'
         BEGIN { for (k = 0; k < B; k++) printf "" > (pfx sprintf("%05d.tsv", k)) }
-        { print > (pfx sprintf("%05d.tsv", bucket($1))) }
+        { print > (pfx sprintf("%05d.tsv", split_of($1))) }
         END { print NR > cnt }
     '
 
@@ -1480,22 +1533,22 @@ merge_join() {
     child_count=$(awk 'END { print NR + 0 }' "$child_sorted")
     read -r joined_count < "$joined_cnt"
     [[ "$joined_count" -eq "$child_count" ]] ||
-        fail "merge_join bucket ${bb} lost cluster members: child=${child_count} joined=${joined_count}"
+        fail "merge_join split ${bb} lost cluster members: child=${child_count} joined=${joined_count}"
     rm -f "$child_sorted" "$parent_sorted" "$joined_cnt"
-    log "merge_join bucket ${bb}: ${joined_count} members"
+    log "merge_join split ${bb}: ${joined_count} members"
 }
 
-# merge_emit_shard <frag_dir> <out_dir> <bucket>: concatenate this rep-bucket's join fragments into one shard.
+# merge_emit_shard <frag_dir> <out_dir> <split>: concatenate this rep-split's join fragments into one shard.
 merge_emit_shard() {
-    local frag_dir="$1" out_dir="$2" bucket="$3"
-    local buckets="${MERGE_BUCKETS:-1}"
-    local kk; printf -v kk '%05d' "$bucket"
+    local frag_dir="$1" out_dir="$2" split_idx="$3"
+    local splits="${MERGE_SPLITS:-1}"
+    local kk; printf -v kk '%05d' "$split_idx"
     local out
-    out="$out_dir/propagated.bkt${kk}.tsv$(batch_compression_suffix)"
+    out="$out_dir/propagated.split${kk}.tsv$(batch_compression_suffix)"
     local tmp="${out}.tmp.$$"
     local b frag
     local -a frags=()
-    for ((b = 0; b < buckets; b++)); do
+    for ((b = 0; b < splits; b++)); do
         printf -v frag '%s/joined.b%05d.k%s.tsv' "$frag_dir" "$b" "$kk"
         [[ -e "$frag" ]] || fail "propagate: missing joined fragment $frag"
         frags+=("$frag")
@@ -1511,16 +1564,15 @@ merge_emit_shard() {
     mv -f "$tmp" "$out"
 }
 
-# Rep-first sort of one final-output bucket (the rep's self-link leads its cluster, then members).
-# finalize_sort_bucket <mapping_manifest> <out_dir> <sort_tmp> <bucket>  (mapping arrives rep-bucketed)
-finalize_sort_bucket() {
-    local mapping_manifest="$1" out_dir="$2" sort_tmp="$3" bucket="$4"
-    local bb; printf -v bb '%05d' "$bucket"
-    local out="$out_dir/final.bkt${bb}.tsv"
-    sort_tmp="$sort_tmp/bkt${bb}"
+# finalize_sort_split <mapping_manifest> <out_dir> <sort_tmp> <split>: the rep's self-link leads its cluster
+finalize_sort_split() {
+    local mapping_manifest="$1" out_dir="$2" sort_tmp="$3" split_idx="$4"
+    local bb; printf -v bb '%05d' "$split_idx"
+    local out="$out_dir/final.split${bb}.tsv"
+    sort_tmp="$sort_tmp/split${bb}"
     mkdir -p "$out_dir" "$sort_tmp"
     # shellcheck disable=SC2086
-    stream_bucket_files "$mapping_manifest" "$bb" \
+    stream_split_files "$mapping_manifest" "$bb" \
         | awk 'BEGIN {FS=OFS="\t"} { print $1, ($1 == $2 ? 0 : 1), $2 }' \
         | sort -T "$sort_tmp" -t $'\t' -k1,1 -k2,2n -k3,3 $SORT_PARALLEL_OPT \
         | awk 'BEGIN {FS=OFS="\t"} { print $1, $3 }' \
@@ -1528,10 +1580,6 @@ finalize_sort_bucket() {
 }
 
 # propagate <child_manifest> <parent_manifest> <out_manifest> <work_dir>
-# Composes child.rep == parent.member on one node as MERGE_BUCKETS independent sort+joins;
-# both inputs arrive pre-bucketed by their join key, so there is no partition pass. Writes
-# out_manifest listing the output shards, re-bucketed by the new rep for the next round's
-# child side (and finalize). B=1 is the plain single join.
 propagate() {
     [[ "$#" -eq 4 ]] || usage
     local child_manifest="$1"
@@ -1539,7 +1587,7 @@ propagate() {
     local out_manifest="$3"
     local work_dir="$4"
     local done_uri="${out_manifest}.done"
-    local buckets="${MERGE_BUCKETS:-1}"
+    local splits="${MERGE_SPLITS:-1}"
     local sort_tmp; sort_tmp=$(resolve_sort_tmp "$work_dir")
 
     if [[ -s "$out_manifest" ]] && done_exists "$done_uri"; then
@@ -1553,26 +1601,28 @@ propagate() {
     rm -rf "${frag:?}" "${shards:?}" "${sort_tmp:?}"
     mkdir -p "$work_dir" "$sort_tmp" "$frag" "$shards"
 
-    log "propagate: joining ${buckets} pre-bucketed bucket(s) with ${MERGE_BUCKET_JOBS} concurrent bucket job(s)"
+    check_manifest_split_count "$child_manifest" "$splits"
+    check_manifest_split_count "$parent_manifest" "$splits"
+    log "propagate: joining ${splits} split(s), ${MERGE_SPLIT_JOBS} at a time"
     local b
-    run_bucket_jobs "propagate join" "$buckets" "$MERGE_BUCKET_JOBS" merge_join "$child_manifest" "$parent_manifest" "$frag" "$sort_tmp"
+    run_split_jobs "propagate join" "$splits" "$MERGE_SPLIT_JOBS" merge_join "$child_manifest" "$parent_manifest" "$frag" "$sort_tmp"
 
-    log "propagate: assembling ${buckets} rep-bucketed shard(s) with ${MERGE_BUCKET_JOBS} concurrent bucket job(s)"
-    run_bucket_jobs "propagate shard write" "$buckets" "$MERGE_BUCKET_JOBS" merge_emit_shard "$frag" "$shards"
+    log "propagate: assembling ${splits} shard(s), ${MERGE_SPLIT_JOBS} at a time"
+    run_split_jobs "propagate shard write" "$splits" "$MERGE_SPLIT_JOBS" merge_emit_shard "$frag" "$shards"
 
-    local bkt
+    local split_file
     : > "${out_manifest}.tmp"
-    for ((b = 0; b < buckets; b++)); do
-        printf -v bkt '%s/propagated.bkt%05d.tsv%s' "$shards" "$b" "$(batch_compression_suffix)"
-        [[ -e "$bkt" ]] || fail "propagate: missing bucket output $bkt"
-        printf '%s\n' "$bkt" >> "${out_manifest}.tmp"
+    for ((b = 0; b < splits; b++)); do
+        printf -v split_file '%s/propagated.split%05d.tsv%s' "$shards" "$b" "$(batch_compression_suffix)"
+        [[ -e "$split_file" ]] || fail "propagate: missing split output $split_file"
+        printf '%s\n' "$split_file" >> "${out_manifest}.tmp"
     done
     mv "${out_manifest}.tmp" "$out_manifest"
     mark_done "$done_uri" "$work_dir/propagate.done"
     if [[ -n "${REMOVE_TMP:-}" ]]; then
         rm -rf "$frag" "$sort_tmp"
     fi
-    log "propagated clusters written: ${buckets} shard(s) -> $out_manifest"
+    log "propagated clusters written: ${splits} shard(s) -> $out_manifest"
 }
 
 # filenames are deterministic, so the expected list needs no directory listing
@@ -1589,8 +1639,8 @@ make_manifest_from_chunk_ids() {
     done < "$chunk_manifest"
 }
 
-# make_manifest_from_chunk_ids for cluster TSVs: each chunk lists its MERGE_BUCKETS <chunk_id>.cluster.bkt%05d.tsv[.zst] files.
-make_bucketed_tsv_manifest() {
+# make_manifest_from_chunk_ids for cluster TSVs: each chunk lists its MERGE_SPLITS <chunk_id>.cluster.split%05d.tsv[.zst] files.
+make_split_tsv_manifest() {
     local chunk_manifest="$1"
     local dir="$2"
     local out="$3"
@@ -1599,8 +1649,8 @@ make_bucketed_tsv_manifest() {
     local cid _rest b
     while IFS=$'\t' read -r cid _rest || [[ -n "${cid:-}" ]]; do
         [[ -z "${cid:-}" || "$cid" =~ ^# ]] && continue
-        for ((b = 0; b < MERGE_BUCKETS; b++)); do
-            printf '%s/%s.cluster.bkt%05d.tsv%s\n' "$dir" "$cid" "$b" "$suffix" >> "$out"
+        for ((b = 0; b < MERGE_SPLITS; b++)); do
+            printf '%s/%s.cluster.split%05d.tsv%s\n' "$dir" "$cid" "$b" "$suffix" >> "$out"
         done
     done < "$chunk_manifest"
 }
@@ -1727,24 +1777,29 @@ write_counter_file() {
     printf '%s\n' "$value" > "$out"
 }
 
-# TSVs are written pre-bucketed, so a run must keep ONE bucket count: pin on first use, adopt on resume.
-pin_merge_buckets() {
+# TSVs are written pre-split, so a run must keep ONE split count: pin on first use, adopt on resume.
+pin_merge_splits() {
     local store="$1" pinned tmp
+    # a pre-rename work area pinned merge_buckets.txt and wrote .bkt TSVs; re-deriving a count here would silently break its join
+    local legacy="${store%merge_splits.txt}merge_buckets.txt"
+    if ! done_exists "$store" && done_exists "$legacy"; then
+        fail "this work area was pinned by an older version ($legacy, .bkt file naming); finish it with that version or start a fresh work dir"
+    fi
     pinned=$(read_counter_uri "$store")
     if [[ "$pinned" -gt 0 ]]; then
-        if [[ "$pinned" != "$MERGE_BUCKETS" ]]; then
-            log "merge-buckets pinned to ${pinned} by an earlier run of this work area (this run derived ${MERGE_BUCKETS}); using ${pinned}"
-            MERGE_BUCKETS="$pinned"
-            [[ "$MERGE_BUCKET_JOBS" -gt "$MERGE_BUCKETS" ]] && MERGE_BUCKET_JOBS="$MERGE_BUCKETS"
-            check_bucket_fd_budget
+        if [[ "$pinned" != "$MERGE_SPLITS" ]]; then
+            log "merge-splits pinned to ${pinned} by an earlier run of this work area (this run derived ${MERGE_SPLITS}); using ${pinned}"
+            MERGE_SPLITS="$pinned"
+            [[ "$MERGE_SPLIT_JOBS" -gt "$MERGE_SPLITS" ]] && MERGE_SPLIT_JOBS="$MERGE_SPLITS"
+            check_split_fd_budget
         fi
     else
         tmp=$(mktemp)
-        write_counter_file "$tmp" "$MERGE_BUCKETS"
+        write_counter_file "$tmp" "$MERGE_SPLITS"
         copy_out "$tmp" "$store"
         rm -f "$tmp"
     fi
-    export MERGE_BUCKETS MERGE_BUCKET_JOBS
+    export MERGE_SPLITS MERGE_SPLIT_JOBS
 }
 
 trim_field() {
@@ -1803,11 +1858,6 @@ make_chunk_work_dir() {
 }
 
 # finalize <mapping_manifest> <rep_manifest> <result_prefix> <work_dir> [mark_final]
-# The final mapping arrives already hash-bucketed by rep (propagated shards, or round0's
-# rep-bucketed TSVs); rep-first sorts each bucket and writes final_cluster_shards/
-# final.bkt*.tsv[.zst]. final_cluster_manifest.txt lists those shards and is the final cluster
-# output. Each cluster is contiguous and rep-led. With B=1 this is a global rep sort; with B>1
-# the clusters are ordered by (bucket, rep), so only inter-cluster row order differs.
 finalize_outputs() {
     [[ "$#" -ge 4 && "$#" -le 5 ]] || usage
     local mapping_manifest="$1"
@@ -1815,7 +1865,7 @@ finalize_outputs() {
     local result_prefix="$3"
     local work_dir="$4"
     local mark_final="${5:-1}"
-    local buckets="${MERGE_BUCKETS:-1}"
+    local splits="${MERGE_SPLITS:-1}"
     local sort_tmp; sort_tmp=$(resolve_sort_tmp "$work_dir")
     local prefix
     prefix=$(normalize_s3_prefix "$result_prefix")
@@ -1841,18 +1891,19 @@ finalize_outputs() {
     rm -rf "${sorted:?}" "${sort_tmp:?}"
     mkdir -p "$sorted" "$sort_tmp"
 
-    log "finalize: rep-first sorting ${buckets} pre-bucketed bucket(s) with ${MERGE_BUCKET_JOBS} concurrent bucket job(s)"
+    check_manifest_split_count "$mapping_manifest" "$splits"
+    log "finalize: sorting ${splits} split(s) representative-first, ${MERGE_SPLIT_JOBS} at a time"
     local b
-    run_bucket_jobs "finalize sort" "$buckets" "$MERGE_BUCKET_JOBS" finalize_sort_bucket "$mapping_manifest" "$sorted" "$sort_tmp"
+    run_split_jobs "finalize sort" "$splits" "$MERGE_SPLIT_JOBS" finalize_sort_split "$mapping_manifest" "$sorted" "$sort_tmp"
 
     local manifest_tmp="$work_dir/final_cluster_manifest.txt.tmp.$$"
     : > "$manifest_tmp"
-    log "finalize: writing ${buckets} final shard(s) with ${MERGE_BUCKET_JOBS} concurrent bucket job(s)"
-    run_bucket_jobs "finalize shard write" "$buckets" "$MERGE_BUCKET_JOBS" finalize_emit_shard_job "$sorted" "$final_cluster_shard_prefix" "$work_dir"
+    log "finalize: writing ${splits} final shard(s), ${MERGE_SPLIT_JOBS} at a time"
+    run_split_jobs "finalize shard write" "$splits" "$MERGE_SPLIT_JOBS" finalize_emit_shard_job "$sorted" "$final_cluster_shard_prefix" "$work_dir"
     local shard_out bb
-    for ((b = 0; b < buckets; b++)); do
+    for ((b = 0; b < splits; b++)); do
         printf -v bb '%05d' "$b"
-        shard_out="${final_cluster_shard_prefix}final.bkt${bb}.tsv${batch_suffix}"
+        shard_out="${final_cluster_shard_prefix}final.split${bb}.tsv${batch_suffix}"
         printf '%s\n' "$shard_out" >> "$manifest_tmp"
     done
     copy_out "$manifest_tmp" "$final_cluster_manifest"
@@ -1967,13 +2018,14 @@ write_batch_exports() {
     local out="$1"
     local name
     for name in \
-        MMSEQS ROUND0_MMSEQS THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS ROUND0_CHUNK_MAX_BYTES ROUND0_CHUNK_MAX_SEQS \
+        MMSEQS ROUND0_MMSEQS THREADS ROUND0_THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS ROUND0_CHUNK_MAX_BYTES ROUND0_CHUNK_MAX_SEQS \
         CHUNK_DISK_BUDGET ROUND0_CHUNK_DISK_BUDGET DISK_POLL_SEC RAM_POLL_SEC \
         S3_CHUNK_PREFIX COMPRESS_BATCH_OUTPUTS \
         CREATEDB_PAR ROUND0_CREATEDB_MODE BATCH_DELETE_SOURCE_CHUNK CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_COV_MODE CLUSTER_PAR ROUND0_CLUSTER_PAR CREATETSV_PAR SORT_TMP \
         MAX_ROUNDS MIN_REDUCTION_RATIO CONVERGENCE_PATIENCE MIN_REDUCTION_COUNT \
-        MAX_CHUNK_ATTEMPTS COMPRESS_RATIO MERGE_BUCKETS MERGE_BUCKET_JOBS BATCH_BACKEND REMOVE_TMP \
-        BATCH_KMER_WRITE_TO_DISK ROUND0_BATCH_KMER_WRITE_TO_DISK BATCH_COMPRESS_KMER_TMP_FILES CREATEDB_SHUFFLE_SPLITS BATCH_REP_SPLITS \
+        MAX_CHUNK_ATTEMPTS COMPRESS_RATIO MERGE_SPLITS MERGE_SPLIT_JOBS BATCH_BACKEND REMOVE_TMP \
+        BATCH_KMER_WRITE_TO_DISK ROUND0_BATCH_KMER_WRITE_TO_DISK BATCH_COMPRESS_KMER_TMP_FILES CREATEDB_SHUFFLE_SPLITS ROUND0_CREATEDB_SHUFFLE_SPLITS \
+        BATCH_REP_FASTA_SPLITS ROUND0_BATCH_REP_FASTA_SPLITS \
         NODE_WORK_DIR ROUND0_NODE_WORK_DIR BATCH_SLURM_NODELIST ROUND0_BATCH_SLURM_NODELIST \
         BATCH_SLURM_PARTITION ROUND0_BATCH_SLURM_PARTITION BATCH_SLURM_TIME ROUND0_BATCH_SLURM_TIME \
         BATCH_SLURM_MEM ROUND0_BATCH_SLURM_MEM BATCH_SLURM_EXTRA ROUND0_BATCH_SLURM_EXTRA SORT_BUFFER_SIZE \
@@ -2023,7 +2075,7 @@ submit_slurm_job() {
         --job-name "$job_name"
         --nodes 1
         --ntasks 1
-        --cpus-per-task "$THREADS"
+        --cpus-per-task "$(round_threads "$round")"
         --output "$log_dir/%x-%j.out"
         --error "$log_dir/%x-%j.err"
         # a requeued driver or merge would submit its workers twice, and two workers would share a work dir
@@ -2355,7 +2407,7 @@ aws_submit() {
     fi
     aws_require_submit_env
     # dry-run performs no S3 writes, so it cannot pin; the pinned value rides in config.env below
-    [[ -n "${BATCH_AWS_DRY_RUN:-}" ]] || pin_merge_buckets "$(join_uri "$work_prefix" "merge_buckets.txt")"
+    [[ -n "${BATCH_AWS_DRY_RUN:-}" ]] || pin_merge_splits "$(join_uri "$work_prefix" "merge_splits.txt")"
 
     # the round0 override is a pair: setting only the queue or only the definition mismatches arch and image
     if [[ -n "${ROUND0_BATCH_AWS_JOB_QUEUE:-}" && -z "${ROUND0_BATCH_AWS_JOB_DEFINITION:-}" ]]; then
@@ -2431,6 +2483,8 @@ aws_driver() {
     is_s3 "$work_prefix" || fail "aws-driver requires an s3:// work prefix"
     is_s3 "$result_prefix" || fail "aws-driver requires an s3:// result prefix"
     [[ "$round" -le "$MAX_ROUNDS" ]] || fail "round $round exceeds MAX_ROUNDS=$MAX_ROUNDS"
+    # adopt the run's pinned split count, so no round can write TSVs with a different one
+    [[ -n "${BATCH_AWS_DRY_RUN:-}" ]] || pin_merge_splits "$(join_uri "$work_prefix" "merge_splits.txt")"
 
     local script_uri="${BATCH_AWS_SCRIPT_URI:-${work_prefix}scripts/batch_clustering.sh}"
     local node_work_dir
@@ -2533,6 +2587,8 @@ aws_merge() {
 
     is_s3 "$work_prefix" || fail "aws-merge requires an s3:// work prefix"
     is_s3 "$result_prefix" || fail "aws-merge requires an s3:// result prefix"
+    # adopt the run's pinned split count, so retries and the propagate join stay on one count
+    [[ -n "${BATCH_AWS_DRY_RUN:-}" ]] || pin_merge_splits "$(join_uri "$work_prefix" "merge_splits.txt")"
 
     local script_uri="${BATCH_AWS_SCRIPT_URI:-${work_prefix}scripts/batch_clustering.sh}"
     local node_work_dir
@@ -2608,7 +2664,7 @@ aws_merge() {
     fi
 
     # build the manifests from chunk_ids, never from a listing, so stale objects are never ingested
-    make_bucketed_tsv_manifest "$chunk_manifest_local" "$(join_uri "$clustered_prefix" "tsv")" "$local_root/tsv_manifest.txt"
+    make_split_tsv_manifest "$chunk_manifest_local" "$(join_uri "$clustered_prefix" "tsv")" "$local_root/tsv_manifest.txt"
     make_manifest_from_chunk_ids "$chunk_manifest_local" "$(join_uri "$clustered_prefix" "metrics")" ".metrics.tsv" "$local_root/metrics_manifest.txt"
     make_rep_manifest_from_metrics "$local_root/metrics_manifest.txt" "$(join_uri "$clustered_prefix" "rep")" "$local_root/rep_manifest.txt" "$round"
     copy_out "$local_root/tsv_manifest.txt" "$tsv_manifest"
@@ -2646,10 +2702,7 @@ aws_merge() {
     parent_manifest="$tsv_manifest"
     propagated_manifest=$(join_uri "$round_prefix" "propagated_manifest.txt")
 
-    # propagate emits local bucket shards; upload each to S3 so the next round's driver
-    # (a separate container) can read them, and record their S3 URIs in the manifest.
-    # Idempotency: a re-driven merge (retry, or an infra-killed merge re-run) must not redo the whole
-    # hash-bucket join. If a previous attempt already uploaded the S3 propagated_manifest, reuse it.
+    # upload each split shard so the next round's driver container can read it
     if done_exists "$propagated_manifest"; then
         log "aws-merge round ${round}: reusing propagated manifest $propagated_manifest"
     else
@@ -2799,7 +2852,7 @@ slurm_submit() {
         log "multi-node: reusing completed result $result_dir/$final_cluster_name"
         return 0
     fi
-    pin_merge_buckets "$work_dir/merge_buckets.txt"
+    pin_merge_splits "$work_dir/merge_splits.txt"
     build_slurm_node_array 0
     [[ "${#SLURM_NODE_ARRAY[@]}" -gt 0 ]] || fail "--backend multi-node requires --slurm-nodelist"
     need_cmd sbatch
@@ -2843,6 +2896,8 @@ slurm_driver() {
     local chunks="$round_dir/chunks"
     local chunk_manifest="$round_dir/chunks.tsv"
     mkdir -p "$round_dir" "$clustered" "$slurm_dir"
+    # adopt the work area's pinned split count, so no round can write TSVs with a different one
+    pin_merge_splits "$work_dir/merge_splits.txt"
 
     if [[ -s "$chunk_manifest" ]] && done_exists "${chunk_manifest}.done"; then
         log "driver round ${round}: reusing prepared chunks ($chunk_manifest)"
@@ -2877,6 +2932,8 @@ slurm_merge() {
     local slurm_dir="$work_dir/logs"
     local chunk_manifest="$round_dir/chunks.tsv"
     mkdir -p "$clustered" "$slurm_dir"
+    # adopt the work area's pinned split count, so retries and the propagate join stay on one count
+    pin_merge_splits "$work_dir/merge_splits.txt"
 
     local tok
     tok=$(run_token "$work_dir")
@@ -2908,7 +2965,7 @@ slurm_merge() {
     local tsv_manifest="$clustered/tsv_manifest.txt"
     local rep_manifest="$clustered/rep_manifest.txt"
     local metrics_manifest="$clustered/metrics_manifest.txt"
-    make_bucketed_tsv_manifest "$chunk_manifest" "$clustered/tsv" "$tsv_manifest"
+    make_split_tsv_manifest "$chunk_manifest" "$clustered/tsv" "$tsv_manifest"
     make_rep_manifest_with_sizes "$chunk_manifest" "$clustered" "$rep_manifest" "$round"
     make_manifest_from_chunk_ids "$chunk_manifest" "$clustered/metrics" '.metrics.tsv' "$metrics_manifest"
 
@@ -3003,7 +3060,7 @@ run_workflow() {
         log "single-node: reusing completed result $result_dir/$final_cluster_name"
         return 0
     fi
-    pin_merge_buckets "$work_dir/merge_buckets.txt"
+    pin_merge_splits "$work_dir/merge_splits.txt"
 
     local round=0
     local chunks="$work_dir/round${round}/chunks"
@@ -3017,7 +3074,7 @@ run_workflow() {
     local current_rep_manifest="$work_dir/round${round}/clustered/rep_manifest.txt"
     local current_metrics_manifest="$work_dir/round${round}/clustered/metrics_manifest.txt"
     validate_clustered_outputs "$chunk_manifest" "$work_dir/round${round}/clustered"
-    make_bucketed_tsv_manifest "$chunk_manifest" "$work_dir/round${round}/clustered/tsv" "$current_mapping_manifest"
+    make_split_tsv_manifest "$chunk_manifest" "$work_dir/round${round}/clustered/tsv" "$current_mapping_manifest"
     make_rep_manifest_with_sizes "$chunk_manifest" "$work_dir/round${round}/clustered" "$current_rep_manifest" "$round"
     make_manifest_from_chunk_ids "$chunk_manifest" "$work_dir/round${round}/clustered/metrics" '.metrics.tsv' "$current_metrics_manifest"
 
@@ -3051,12 +3108,11 @@ run_workflow() {
         current_rep_manifest="$work_dir/round${round}/clustered/rep_manifest.txt"
         local round_metrics_manifest="$work_dir/round${round}/clustered/metrics_manifest.txt"
         validate_clustered_outputs "$chunk_manifest" "$work_dir/round${round}/clustered"
-        make_bucketed_tsv_manifest "$chunk_manifest" "$work_dir/round${round}/clustered/tsv" "$parent_manifest"
+        make_split_tsv_manifest "$chunk_manifest" "$work_dir/round${round}/clustered/tsv" "$parent_manifest"
         make_rep_manifest_with_sizes "$chunk_manifest" "$work_dir/round${round}/clustered" "$current_rep_manifest" "$round"
         make_manifest_from_chunk_ids "$chunk_manifest" "$work_dir/round${round}/clustered/metrics" '.metrics.tsv' "$round_metrics_manifest"
 
-        # propagate dispatches its bucket tasks per backend (single-node loop / multi-node
-        # fan-out); it emits MERGE_BUCKETS mapping shards listed in propagated_manifest.
+        # propagate dispatches its split tasks per backend and emits MERGE_SPLITS mapping shards
         local propagated_manifest="$work_dir/round${round}/propagated_manifest.txt"
         with_round_node_work_dir "$round" propagate "$current_mapping_manifest" "$parent_manifest" "$propagated_manifest" "$work_dir/round${round}/propagate"
         current_mapping_manifest="$propagated_manifest"
@@ -3101,8 +3157,7 @@ run_workflow() {
 
     local mark_final=0
     [[ "$converged" -eq 1 ]] && mark_final=1
-    # finalize dispatches its rep-first-sort buckets per backend and marks final.done only
-    # when mark_final=1, so a partial (MAX_ROUNDS) result is never mistaken for complete.
+    # finalize dispatches its rep-first-sort splits per backend and marks final.done only when mark_final=1
     with_round_node_work_dir "$current_round" finalize_outputs "$current_mapping_manifest" "$current_rep_manifest" "$result_dir" "$work_dir/finalize" "$mark_final"
 
     if [[ "$converged" -eq 1 ]]; then

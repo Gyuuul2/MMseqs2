@@ -89,7 +89,7 @@ std::vector<Command> baseCommands = {
                 "mmseqs linclust-batch input.manifest resultDir sharedTmp --backend multi-node --slurm-nodelist super001,super002 --threads 128 --chunk-max-bytes 20G --node-work-dir /scratch/mmseqs-batch\n\n"
                 "mmseqs linclust-batch s3://bucket/input.manifest s3://bucket/result/run1 s3://bucket/work/run1 --backend aws-batch --aws-machine i4i.metal --round0-aws-machine x2gd.metal --node-work-dir /scratch/mmseqs --threads 64\n\n"
                 "# Input manifest: one FASTA/.gz/.zst or s3:// path per line\n"
-                "# Output: resultDir/final_cluster_manifest.txt listing resultDir/final_cluster_shards/final.bkt*.tsv[.zst], plus resultDir/final_rep_seq.fasta[.zst]\n"
+                "# Output: resultDir/final_cluster_manifest.txt listing resultDir/final_cluster_shards/final.split*.tsv[.zst], plus resultDir/final_rep_seq.fasta[.zst]\n"
                 "# Multi-node submits SLURM jobs and requires shared input/result/tmp paths\n",
                 "Gyuri Kim <gyuribio@snu.ac.kr>",
                 "<i:inputManifest> <o:resultDir> <sharedTmpDir>",
@@ -102,7 +102,7 @@ std::vector<Command> baseCommands = {
                 "mmseqs cluster-batch input.manifest resultDir sharedTmp --backend multi-node --slurm-nodelist super001,super002 --threads 128 --chunk-max-bytes 20G --node-work-dir /scratch/mmseqs-batch\n\n"
                 "mmseqs cluster-batch s3://bucket/input.manifest s3://bucket/result/run1 s3://bucket/work/run1 --backend aws-batch --aws-machine i4i.metal --round0-aws-machine x2gd.metal --node-work-dir /scratch/mmseqs --threads 64\n\n"
                 "# Input manifest: one FASTA/.gz/.zst or s3:// path per line\n"
-                "# Output: resultDir/final_cluster_manifest.txt listing resultDir/final_cluster_shards/final.bkt*.tsv[.zst], plus resultDir/final_rep_seq.fasta[.zst]\n"
+                "# Output: resultDir/final_cluster_manifest.txt listing resultDir/final_cluster_shards/final.split*.tsv[.zst], plus resultDir/final_rep_seq.fasta[.zst]\n"
                 "# Multi-node submits SLURM jobs and requires shared input/result/tmp paths\n",
                 "Gyuri Kim <gyuribio@snu.ac.kr>",
                 "<i:inputManifest> <o:resultDir> <sharedTmpDir>",
