@@ -167,6 +167,8 @@ Parameters::Parameters():
         PARAM_INCLUDE_ONLY_EXTENDABLE(PARAM_INCLUDE_ONLY_EXTENDABLE_ID, "--include-only-extendable", "Include only extendable", "Include only extendable", typeid(bool), (void *) &includeOnlyExtendable, "", MMseqsParameter::COMMAND_CLUSTLINEAR),
         PARAM_IGNORE_MULTI_KMER(PARAM_IGNORE_MULTI_KMER_ID, "--ignore-multi-kmer", "Skip repeating k-mers", "Skip k-mers occurring multiple times (>=2)", typeid(bool), (void *) &ignoreMultiKmer, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_HASH_SHIFT(PARAM_HASH_SHIFT_ID, "--hash-shift", "Shift hash", "Shift k-mer hash initialization", typeid(int), (void *) &hashShift, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_KMER_SELECTION(PARAM_KMER_SELECTION_ID, "--kmer-selection", "K-mer selection", "0: bottom-k minhash, 1: closed syncmers pre-filtered, then bottom-k minhash", typeid(int), (void *) &kmerSelection, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_SYNCMER_S(PARAM_SYNCMER_S_ID, "--syncmer-s", "Syncmer s-mer length", "s-mer length for closed syncmer selection (0 < s < k)", typeid(int), (void *) &syncmerS, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_PICK_N_SIMILAR(PARAM_PICK_N_SIMILAR_ID, "--pick-n-sim-kmer", "Add N similar to search", "Add N similar k-mers to search", typeid(int), (void *) &pickNbest, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJUST_KMER_LEN(PARAM_ADJUST_KMER_LEN_ID, "--adjust-kmer-len", "Adjust k-mer length", "Adjust k-mer length based on specificity (only for nucleotides)", typeid(bool), (void *) &adjustKmerLength, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_RESULT_DIRECTION(PARAM_RESULT_DIRECTION_ID, "--result-direction", "Result direction", "result is 0: query, 1: target centric", typeid(int), (void *) &resultDirection, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -1193,6 +1195,8 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_C);
     kmermatcher.push_back(&PARAM_MAX_SEQ_LEN);
     kmermatcher.push_back(&PARAM_HASH_SHIFT);
+    kmermatcher.push_back(&PARAM_KMER_SELECTION);
+    kmermatcher.push_back(&PARAM_SYNCMER_S);
     kmermatcher.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     kmermatcher.push_back(&PARAM_INCLUDE_ONLY_EXTENDABLE);
     kmermatcher.push_back(&PARAM_IGNORE_MULTI_KMER);
@@ -3108,6 +3112,8 @@ void Parameters::setDefaults() {
     includeOnlyExtendable = false;
     ignoreMultiKmer = false;
     hashShift = 67;
+    kmerSelection = 0;
+    syncmerS = 6;
     pickNbest = 1;
     adjustKmerLength = false;
     resultDirection = Parameters::PARAM_RESULT_DIRECTION_TARGET;

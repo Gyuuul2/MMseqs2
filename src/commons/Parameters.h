@@ -661,6 +661,8 @@ public:
     bool includeOnlyExtendable;
     bool ignoreMultiKmer;
     int hashShift;
+    int kmerSelection;
+    int syncmerS;
     int pickNbest;
     int adjustKmerLength;
     int resultDirection;
@@ -1038,6 +1040,8 @@ public:
     PARAMETER(PARAM_INCLUDE_ONLY_EXTENDABLE)
     PARAMETER(PARAM_IGNORE_MULTI_KMER)
     PARAMETER(PARAM_HASH_SHIFT)
+    PARAMETER(PARAM_KMER_SELECTION)
+    PARAMETER(PARAM_SYNCMER_S)
     PARAMETER(PARAM_PICK_N_SIMILAR)
     PARAMETER(PARAM_ADJUST_KMER_LEN)
     PARAMETER(PARAM_RESULT_DIRECTION)
