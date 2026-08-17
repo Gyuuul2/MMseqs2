@@ -35,8 +35,8 @@ Usage:
   batch_clustering.sh aws-worker <chunk_manifest_s3> <result_s3_prefix> <round>
   batch_clustering.sh aws-merge <input_manifest> <work_s3_prefix> <result_s3_prefix> <round>
 
-Environment (normally exported by mmseqs from the linclust-batch/cluster-batch command line;
-set them directly only when running this script standalone):
+Environment (normally exported by mmseqs from the linclust-batch/cluster-batch command line,
+or their -aws variants for the AWS vars; set them directly only when running this script standalone):
   MMSEQS ROUND0_MMSEQS THREADS ROUND0_THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_SPLITS MERGE_SPLIT_JOBS COMPRESS_RATIO
   CHUNK_DISK_BUDGET ROUND0_CHUNK_DISK_BUDGET DISK_POLL_SEC RAM_POLL_SEC
   CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_PAR ROUND0_CLUSTER_PAR CLUSTER_COV_MODE CREATEDB_PAR CREATEDB_SHUFFLE_SPLITS ROUND0_CREATEDB_SHUFFLE_SPLITS BATCH_COMPRESS_KMER_TMP_FILES CREATETSV_PAR COMPRESS_BATCH_OUTPUTS SORT_BUFFER_SIZE SORT_TMP
@@ -50,7 +50,8 @@ set them directly only when running this script standalone):
   BATCH_AWS_MMSEQS ROUND0_BATCH_AWS_MMSEQS BATCH_AWS_SCRIPT_URI BATCH_AWS_LOCAL_DIR BATCH_AWS_TIMEOUT BATCH_AWS_DRY_RUN
   BATCH_DELETE_SOURCE_CHUNK ROUND0_CREATEDB_MODE S3_CHUNK_PREFIX BATCH_AWS_ALLOW_NONS3_INPUT
   (AWS env var names must NOT start with 'AWS_BATCH' -- that prefix is reserved by the AWS Batch service.)
-  All of the above also exist as command line parameters (see 'mmseqs linclust-batch -h').
+  All of the above also exist as command line parameters; the AWS ones only on the -aws commands
+  (see 'mmseqs linclust-batch -h' and 'mmseqs linclust-batch-aws -h').
 EOF
     exit 1
 }
@@ -2043,7 +2044,7 @@ write_batch_exports() {
         CREATEDB_PAR ROUND0_CREATEDB_MODE BATCH_DELETE_SOURCE_CHUNK CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_COV_MODE CLUSTER_PAR ROUND0_CLUSTER_PAR CREATETSV_PAR SORT_TMP \
         MAX_ROUNDS MIN_REDUCTION_RATIO CONVERGENCE_PATIENCE MIN_REDUCTION_COUNT \
         MAX_CHUNK_ATTEMPTS COMPRESS_RATIO MERGE_SPLITS MERGE_SPLIT_JOBS BATCH_BACKEND REMOVE_TMP \
-        BATCH_KMER_WRITE_TO_DISK ROUND0_BATCH_KMER_WRITE_TO_DISK BATCH_COMPRESS_KMER_TMP_FILES CREATEDB_SHUFFLE_SPLITS ROUND0_CREATEDB_SHUFFLE_SPLITS \
+        BATCH_KMER_WRITE_TO_DISK BATCH_COMPRESS_KMER_TMP_FILES CREATEDB_SHUFFLE_SPLITS ROUND0_CREATEDB_SHUFFLE_SPLITS \
         BATCH_REP_FASTA_SPLITS ROUND0_BATCH_REP_FASTA_SPLITS \
         NODE_WORK_DIR ROUND0_NODE_WORK_DIR BATCH_SLURM_NODELIST ROUND0_BATCH_SLURM_NODELIST \
         BATCH_SLURM_PARTITION ROUND0_BATCH_SLURM_PARTITION BATCH_SLURM_TIME ROUND0_BATCH_SLURM_TIME \

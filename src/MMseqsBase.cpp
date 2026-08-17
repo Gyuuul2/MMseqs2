@@ -87,10 +87,21 @@ std::vector<Command> baseCommands = {
                 "Batch linclust: chunk a huge input, linclust each chunk, hierarchically merge representatives",
                 "mmseqs linclust-batch input.manifest resultDir sharedTmp --backend single-node --min-seq-id 0.9 -c 0.9 --cov-mode 1 --chunk-max-bytes 20G --threads 128\n\n"
                 "mmseqs linclust-batch input.manifest resultDir sharedTmp --backend multi-node --slurm-nodelist super001,super002 --threads 128 --chunk-max-bytes 20G --node-work-dir /scratch/mmseqs-batch\n\n"
-                "mmseqs linclust-batch s3://bucket/input.manifest s3://bucket/result/run1 s3://bucket/work/run1 --backend aws-batch --aws-machine i4i.metal --round0-aws-machine x2gd.metal --node-work-dir /scratch/mmseqs --threads 64\n\n"
+                "# Input manifest: one FASTA/.gz/.zst path per line\n"
+                "# Output: resultDir/final_cluster_manifest.txt listing resultDir/final_cluster_shards/final.split*.tsv[.zst], plus resultDir/final_rep_seq.fasta[.zst]\n"
+                "# Multi-node submits SLURM jobs and requires shared input/result/tmp paths\n"
+                "# For AWS Batch use linclust-batch-aws\n",
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
+                "<i:inputManifest> <o:resultDir> <sharedTmpDir>",
+                CITATION_MMSEQS2|CITATION_LINCLUST, {{"inputManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"resultDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"sharedTmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri }}},
+        {"linclust-batch-aws",   linclustbatchaws,     &par.linclustbatchaws,     COMMAND_EASY,
+                "Batch linclust on AWS Batch: chunk a huge S3 input, linclust each chunk, hierarchically merge representatives",
+                "mmseqs linclust-batch-aws s3://bucket/input.manifest s3://bucket/result/run1 s3://bucket/work/run1 --aws-machine i4i.metal --round0-aws-machine x2gd.metal --node-work-dir /scratch/mmseqs --threads 64\n\n"
                 "# Input manifest: one FASTA/.gz/.zst or s3:// path per line\n"
                 "# Output: resultDir/final_cluster_manifest.txt listing resultDir/final_cluster_shards/final.split*.tsv[.zst], plus resultDir/final_rep_seq.fasta[.zst]\n"
-                "# Multi-node submits SLURM jobs and requires shared input/result/tmp paths\n",
+                "# Submits AWS Batch jobs; <resultDir> and <sharedTmpDir> must be s3:// prefixes\n",
                 "Gyuri Kim <gyuribio@snu.ac.kr>",
                 "<i:inputManifest> <o:resultDir> <sharedTmpDir>",
                 CITATION_MMSEQS2|CITATION_LINCLUST, {{"inputManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
@@ -100,10 +111,21 @@ std::vector<Command> baseCommands = {
                 "Batch cluster: chunk a huge input, cluster each chunk, hierarchically merge representatives",
                 "mmseqs cluster-batch input.manifest resultDir sharedTmp --backend single-node --min-seq-id 0.5 -c 0.8 --cov-mode 1 --chunk-max-bytes 20G --threads 128\n\n"
                 "mmseqs cluster-batch input.manifest resultDir sharedTmp --backend multi-node --slurm-nodelist super001,super002 --threads 128 --chunk-max-bytes 20G --node-work-dir /scratch/mmseqs-batch\n\n"
-                "mmseqs cluster-batch s3://bucket/input.manifest s3://bucket/result/run1 s3://bucket/work/run1 --backend aws-batch --aws-machine i4i.metal --round0-aws-machine x2gd.metal --node-work-dir /scratch/mmseqs --threads 64\n\n"
+                "# Input manifest: one FASTA/.gz/.zst path per line\n"
+                "# Output: resultDir/final_cluster_manifest.txt listing resultDir/final_cluster_shards/final.split*.tsv[.zst], plus resultDir/final_rep_seq.fasta[.zst]\n"
+                "# Multi-node submits SLURM jobs and requires shared input/result/tmp paths\n"
+                "# For AWS Batch use cluster-batch-aws\n",
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
+                "<i:inputManifest> <o:resultDir> <sharedTmpDir>",
+                CITATION_MMSEQS2|CITATION_LINCLUST, {{"inputManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"resultDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"sharedTmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri }}},
+        {"cluster-batch-aws",    clusterbatchaws,      &par.clusterbatchaws,      COMMAND_EASY,
+                "Batch cluster on AWS Batch: chunk a huge S3 input, cluster each chunk, hierarchically merge representatives",
+                "mmseqs cluster-batch-aws s3://bucket/input.manifest s3://bucket/result/run1 s3://bucket/work/run1 --aws-machine i4i.metal --round0-aws-machine x2gd.metal --node-work-dir /scratch/mmseqs --threads 64\n\n"
                 "# Input manifest: one FASTA/.gz/.zst or s3:// path per line\n"
                 "# Output: resultDir/final_cluster_manifest.txt listing resultDir/final_cluster_shards/final.split*.tsv[.zst], plus resultDir/final_rep_seq.fasta[.zst]\n"
-                "# Multi-node submits SLURM jobs and requires shared input/result/tmp paths\n",
+                "# Submits AWS Batch jobs; <resultDir> and <sharedTmpDir> must be s3:// prefixes\n",
                 "Gyuri Kim <gyuribio@snu.ac.kr>",
                 "<i:inputManifest> <o:resultDir> <sharedTmpDir>",
                 CITATION_MMSEQS2|CITATION_LINCLUST, {{"inputManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
@@ -117,7 +139,7 @@ std::vector<Command> baseCommands = {
                 CITATION_MMSEQS2|CITATION_LINCLUST, {{"inputManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
                                                             {"chunkDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory },
                                                             {"chunkManifest", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfile }}},
-        {"linclust-batch-worker", linclustbatchworker, &par.linclustbatch, COMMAND_HIDDEN,
+        {"linclust-batch-worker", linclustbatchworker, &par.linclustbatchall, COMMAND_HIDDEN,
                 "Cluster one prepared linclust-batch chunk",
                 NULL,
                 "Gyuri Kim <gyuribio@snu.ac.kr>",
@@ -125,7 +147,7 @@ std::vector<Command> baseCommands = {
                 CITATION_MMSEQS2|CITATION_LINCLUST, {{"chunkFasta", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
                                                             {"resultPrefix", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
                                                             {"tmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory }}},
-        {"cluster-batch-worker", clusterbatchworker, &par.clusterbatch, COMMAND_HIDDEN,
+        {"cluster-batch-worker", clusterbatchworker, &par.clusterbatchall, COMMAND_HIDDEN,
                 "Cluster one prepared cluster-batch chunk",
                 NULL,
                 "Gyuri Kim <gyuribio@snu.ac.kr>",

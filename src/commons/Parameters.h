@@ -1414,7 +1414,14 @@ public:
     std::vector<MMseqsParameter*> linclustbatchinner;
     std::vector<MMseqsParameter*> clusterbatchinner;
     std::vector<MMseqsParameter*> linclustbatch;
+    std::vector<MMseqsParameter*> linclustbatchaws;
+    std::vector<MMseqsParameter*> linclustbatchall;
     std::vector<MMseqsParameter*> clusterbatch;
+    std::vector<MMseqsParameter*> clusterbatchaws;
+    std::vector<MMseqsParameter*> clusterbatchall;
+    std::vector<MMseqsParameter*> batchcommon;
+    std::vector<MMseqsParameter*> batchserver;
+    std::vector<MMseqsParameter*> batchaws;
     std::vector<MMseqsParameter*> batchclustering;
     std::vector<MMseqsParameter*> easysearchworkflow;
     std::vector<MMseqsParameter*> searchworkflow;

@@ -189,7 +189,7 @@ Parameters::Parameters():
         // workflow
         PARAM_RUNNER(PARAM_RUNNER_ID, "--mpi-runner", "MPI runner", "Use MPI on compute cluster with this MPI command (e.g. \"mpirun -np 42\")", typeid(std::string), (void *) &runner, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_REUSELATEST(PARAM_REUSELATEST_ID, "--force-reuse", "Force restart with latest tmp", "Reuse tmp filse in tmp/latest folder ignoring parameters and version changes", typeid(bool), (void *) &reuseLatest, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_BATCH_BACKEND(PARAM_BATCH_BACKEND_ID, "--backend", "Backend", "Batch clustering backend: single-node, multi-node, or aws-batch", typeid(std::string), (void *) &batchBackend, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_BACKEND(PARAM_BATCH_BACKEND_ID, "--backend", "Backend", "Batch clustering backend: single-node or multi-node", typeid(std::string), (void *) &batchBackend, "", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_CHUNK_MAX_BYTES(PARAM_BATCH_CHUNK_MAX_BYTES_ID, "--chunk-max-bytes", "Chunk bytes", "Maximum uncompressed FASTA bytes per chunk. 0 disables the byte limit", typeid(ByteParser), (void *) &batchChunkMaxBytes, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_CHUNK_MAX_SEQS(PARAM_BATCH_CHUNK_MAX_SEQS_ID, "--chunk-max-seqs", "Chunk sequences", "Maximum sequences per chunk. 0 disables the sequence-count limit", typeid(size_t), (void *) &batchChunkMaxSeqs, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_SLURM_NODELIST(PARAM_BATCH_SLURM_NODELIST_ID, "--slurm-nodelist", "SLURM nodes", "Comma-separated SLURM node list for --backend multi-node", typeid(std::string), (void *) &batchSlurmNodelist, "", MMseqsParameter::COMMAND_COMMON),
@@ -197,7 +197,7 @@ Parameters::Parameters():
         PARAM_BATCH_SLURM_TIME(PARAM_BATCH_SLURM_TIME_ID, "--slurm-time", "SLURM time", "SLURM time limit for submitted jobs", typeid(std::string), (void *) &batchSlurmTime, "", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_SLURM_MEM(PARAM_BATCH_SLURM_MEM_ID, "--slurm-mem", "SLURM memory", "SLURM memory request per submitted chunk task", typeid(std::string), (void *) &batchSlurmMem, "", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_SLURM_EXTRA(PARAM_BATCH_SLURM_EXTRA_ID, "--slurm-extra", "SLURM extra", "Additional raw sbatch options for --backend multi-node", typeid(std::string), (void *) &batchSlurmExtra, "", MMseqsParameter::COMMAND_EXPERT),
-        PARAM_BATCH_NODE_WORK_DIR(PARAM_BATCH_NODE_WORK_DIR_ID, "--node-work-dir", "Node work dir", "Per-node LOCAL disk for chunk tasks (createdb/cluster tmp + sort spill). REQUIRED for --backend multi-node and aws-batch; on single-node defaults to a subdirectory of the shared tmp directory", typeid(std::string), (void *) &batchNodeWorkDir, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_NODE_WORK_DIR(PARAM_BATCH_NODE_WORK_DIR_ID, "--node-work-dir", "Node work dir", "Per-node LOCAL disk for chunk tasks (createdb/cluster tmp + sort spill). REQUIRED for --backend multi-node; on single-node defaults to a subdirectory of the shared tmp directory", typeid(std::string), (void *) &batchNodeWorkDir, "", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_AWS_MACHINE(PARAM_BATCH_AWS_MACHINE_ID, "--aws-machine", "AWS machine", "AWS Batch machine tag value for round 1+; resolves tagged job queue and job definition", typeid(std::string), (void *) &batchAwsMachine, "", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_AWS_JOB_QUEUE(PARAM_BATCH_AWS_JOB_QUEUE_ID, "--aws-job-queue", "AWS job queue", "Explicit AWS Batch job queue for round 1+; overrides --aws-machine queue lookup", typeid(std::string), (void *) &batchAwsJobQueue, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_AWS_JOB_DEFINITION(PARAM_BATCH_AWS_JOB_DEFINITION_ID, "--aws-job-definition", "AWS job definition", "Explicit AWS Batch job definition for round 1+; overrides --aws-machine job-definition lookup", typeid(std::string), (void *) &batchAwsJobDefinition, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
@@ -253,11 +253,11 @@ Parameters::Parameters():
         PARAM_BATCH_AWS_JOB_PREFIX(PARAM_BATCH_AWS_JOB_PREFIX_ID, "--aws-job-prefix", "AWS job name prefix", "Prefix for the submitted AWS Batch job names", typeid(std::string), (void *) &batchAwsJobPrefix, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_AWS_LOCAL_DIR(PARAM_BATCH_AWS_LOCAL_DIR_ID, "--aws-local-dir", "AWS local directory", "Container-local scratch directory used by AWS Batch jobs", typeid(std::string), (void *) &batchAwsLocalDir, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_AWS_SCRIPT_URI(PARAM_BATCH_AWS_SCRIPT_URI_ID, "--aws-script-uri", "AWS script URI", "S3 URI the workflow script is staged to and fetched from. Empty derives it from the work prefix", typeid(std::string), (void *) &batchAwsScriptUri, "", MMseqsParameter::COMMAND_EXPERT),
-        PARAM_BATCH_AWS_CHUNK_PREFIX(PARAM_BATCH_AWS_CHUNK_PREFIX_ID, "--aws-chunk-prefix", "AWS chunk prefix", "S3 prefix the round chunks are written to. Empty derives it from the work prefix", typeid(std::string), (void *) &batchAwsChunkPrefix, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_CHUNK_PREFIX(PARAM_BATCH_AWS_CHUNK_PREFIX_ID, "--aws-chunk-prefix", "AWS chunk prefix", "S3 prefix the hidden prepare mode uploads chunks to; the AWS Batch driver ignores it and derives each round's chunk prefix from the work prefix", typeid(std::string), (void *) &batchAwsChunkPrefix, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_AWS_TIMEOUT(PARAM_BATCH_AWS_TIMEOUT_ID, "--aws-timeout", "AWS job timeout", "attemptDurationSeconds for submitted AWS Batch jobs", typeid(int), (void *) &batchAwsTimeout, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_AWS_WORKER_ATTEMPTS(PARAM_BATCH_AWS_WORKER_ATTEMPTS_ID, "--aws-worker-attempts", "AWS worker attempts", "AWS Batch retry attempts for chunk worker jobs. 0 uses the job definition's setting", typeid(int), (void *) &batchAwsWorkerAttempts, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_AWS_DRY_RUN(PARAM_BATCH_AWS_DRY_RUN_ID, "--aws-dry-run", "AWS dry run", "Print the AWS Batch submissions instead of running them", typeid(bool), (void *) &batchAwsDryRun, "", MMseqsParameter::COMMAND_EXPERT),
-        PARAM_BATCH_AWS_ALLOW_NONS3_INPUT(PARAM_BATCH_AWS_ALLOW_NONS3_INPUT_ID, "--aws-allow-nons3-input", "AWS allow non-S3 input", "Allow local input paths with the aws-batch backend. They must already exist inside the container", typeid(bool), (void *) &batchAwsAllowNonS3Input, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_AWS_ALLOW_NONS3_INPUT(PARAM_BATCH_AWS_ALLOW_NONS3_INPUT_ID, "--aws-allow-nons3-input", "AWS allow non-S3 input", "Allow local input paths. They must already exist inside the container", typeid(bool), (void *) &batchAwsAllowNonS3Input, "", MMseqsParameter::COMMAND_EXPERT),
         // search workflow
         PARAM_NUM_ITERATIONS(PARAM_NUM_ITERATIONS_ID, "--num-iterations", "Search iterations", "Number of iterative profile search iterations", typeid(int), (void *) &numIterations, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_PROFILE),
         PARAM_START_SENS(PARAM_START_SENS_ID, "--start-sens", "Start sensitivity", "Start sensitivity", typeid(float), (void *) &startSens, "^[0-9]*(\\.[0-9]+)?$"),
@@ -1615,86 +1615,96 @@ Parameters::Parameters():
     clusterworkflow = combineList(prefilter, align);
     clusterworkflow = combineList(clusterworkflow, rescorediagonal);
     clusterworkflow = combineList(clusterworkflow, clust);
-    // linclust-batch / cluster-batch
-    batchclustering.push_back(&PARAM_BATCH_BACKEND);
-    batchclustering.push_back(&PARAM_BATCH_CHUNK_MAX_BYTES);
-    batchclustering.push_back(&PARAM_BATCH_CHUNK_MAX_SEQS);
-    batchclustering.push_back(&PARAM_BATCH_SLURM_NODELIST);
-    batchclustering.push_back(&PARAM_BATCH_SLURM_PARTITION);
-    batchclustering.push_back(&PARAM_BATCH_SLURM_TIME);
-    batchclustering.push_back(&PARAM_BATCH_SLURM_MEM);
-    batchclustering.push_back(&PARAM_BATCH_SLURM_EXTRA);
-    batchclustering.push_back(&PARAM_BATCH_NODE_WORK_DIR);
-    batchclustering.push_back(&PARAM_BATCH_AWS_MACHINE);
-    batchclustering.push_back(&PARAM_BATCH_AWS_JOB_QUEUE);
-    batchclustering.push_back(&PARAM_BATCH_AWS_JOB_DEFINITION);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_AWS_MACHINE);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_AWS_JOB_QUEUE);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_AWS_JOB_DEFINITION);
-    batchclustering.push_back(&PARAM_BATCH_AWS_MACHINE_TAG_KEY);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_SLURM_NODELIST);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_SLURM_PARTITION);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_SLURM_TIME);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_SLURM_MEM);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_SLURM_EXTRA);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_NODE_WORK_DIR);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_MIN_SEQ_ID);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_C);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_COV_MODE);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_CLUSTER_MODE);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_KMER_PER_SEQ);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_NUM_COUNTS);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_INCLUDE_ADJACENCY);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_NUM_ADJACENCY);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_CLUST_HASH);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_PRELOAD_MODE);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_THREADS);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_SHUFFLE_SPLITS);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_LINCLUST2_ITER);
-    batchclustering.push_back(&PARAM_BATCH_MAX_ROUNDS);
-    batchclustering.push_back(&PARAM_BATCH_MIN_REDUCTION_RATIO);
-    batchclustering.push_back(&PARAM_BATCH_CONVERGENCE_PATIENCE);
-    batchclustering.push_back(&PARAM_BATCH_MIN_REDUCTION_COUNT);
-    batchclustering.push_back(&PARAM_BATCH_MAX_CHUNK_ATTEMPTS);
-    batchclustering.push_back(&PARAM_BATCH_COMPRESS_OUTPUTS);
-    batchclustering.push_back(&PARAM_BATCH_MERGE_SPLITS);
-    batchclustering.push_back(&PARAM_BATCH_MERGE_SPLIT_JOBS);
-    batchclustering.push_back(&PARAM_BATCH_REP_FASTA_SPLITS);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_REP_FASTA_SPLITS);
-    batchclustering.push_back(&PARAM_BATCH_CHUNK_DISK_BUDGET);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_CHUNK_DISK_BUDGET);
-    batchclustering.push_back(&PARAM_BATCH_DISK_POLL_INTERVAL);
-    batchclustering.push_back(&PARAM_BATCH_RAM_POLL_INTERVAL);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_MMSEQS);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_CREATEDB_MODE);
-    batchclustering.push_back(&PARAM_BATCH_COMPRESS_RATIO);
-    batchclustering.push_back(&PARAM_BATCH_DELETE_SOURCE_CHUNK);
-    batchclustering.push_back(&PARAM_BATCH_SORT_TMP_DIR);
-    batchclustering.push_back(&PARAM_BATCH_SORT_BUFFER_SIZE);
-    batchclustering.push_back(&PARAM_BATCH_AWS_MMSEQS);
-    batchclustering.push_back(&PARAM_BATCH_ROUND0_AWS_MMSEQS);
-    batchclustering.push_back(&PARAM_BATCH_AWS_JOB_PREFIX);
-    batchclustering.push_back(&PARAM_BATCH_AWS_LOCAL_DIR);
-    batchclustering.push_back(&PARAM_BATCH_AWS_SCRIPT_URI);
-    batchclustering.push_back(&PARAM_BATCH_AWS_CHUNK_PREFIX);
-    batchclustering.push_back(&PARAM_BATCH_AWS_TIMEOUT);
-    batchclustering.push_back(&PARAM_BATCH_AWS_WORKER_ATTEMPTS);
-    batchclustering.push_back(&PARAM_BATCH_AWS_DRY_RUN);
-    batchclustering.push_back(&PARAM_BATCH_AWS_ALLOW_NONS3_INPUT);
-    batchclustering.push_back(&PARAM_CREATEDB_MODE);
-    batchclustering.push_back(&PARAM_SHUFFLE_SPLITS);
-    batchclustering.push_back(&PARAM_REMOVE_TMP_FILES);
-    batchclustering.push_back(&PARAM_REUSELATEST);
-    batchclustering.push_back(&PARAM_THREADS);
-    batchclustering.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
-    batchclustering.push_back(&PARAM_PRELOAD_MODE);
-    batchclustering.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
-    batchclustering.push_back(&PARAM_KMER_WRITE_TO_DISK);
-    batchclustering.push_back(&PARAM_V);
+    // linclust-batch / cluster-batch: infrastructure shared by every backend
+    batchcommon.push_back(&PARAM_BATCH_CHUNK_MAX_BYTES);
+    batchcommon.push_back(&PARAM_BATCH_CHUNK_MAX_SEQS);
+    batchcommon.push_back(&PARAM_BATCH_NODE_WORK_DIR);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_NODE_WORK_DIR);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_MIN_SEQ_ID);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_C);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_COV_MODE);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_CLUSTER_MODE);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_KMER_PER_SEQ);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_NUM_COUNTS);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_INCLUDE_ADJACENCY);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_NUM_ADJACENCY);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_CLUST_HASH);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_PRELOAD_MODE);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_THREADS);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_SHUFFLE_SPLITS);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_LINCLUST2_ITER);
+    batchcommon.push_back(&PARAM_BATCH_MAX_ROUNDS);
+    batchcommon.push_back(&PARAM_BATCH_MIN_REDUCTION_RATIO);
+    batchcommon.push_back(&PARAM_BATCH_CONVERGENCE_PATIENCE);
+    batchcommon.push_back(&PARAM_BATCH_MIN_REDUCTION_COUNT);
+    batchcommon.push_back(&PARAM_BATCH_MAX_CHUNK_ATTEMPTS);
+    batchcommon.push_back(&PARAM_BATCH_COMPRESS_OUTPUTS);
+    batchcommon.push_back(&PARAM_BATCH_MERGE_SPLITS);
+    batchcommon.push_back(&PARAM_BATCH_MERGE_SPLIT_JOBS);
+    batchcommon.push_back(&PARAM_BATCH_REP_FASTA_SPLITS);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_REP_FASTA_SPLITS);
+    batchcommon.push_back(&PARAM_BATCH_CHUNK_DISK_BUDGET);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_CHUNK_DISK_BUDGET);
+    batchcommon.push_back(&PARAM_BATCH_DISK_POLL_INTERVAL);
+    batchcommon.push_back(&PARAM_BATCH_RAM_POLL_INTERVAL);
+    batchcommon.push_back(&PARAM_BATCH_ROUND0_CREATEDB_MODE);
+    batchcommon.push_back(&PARAM_BATCH_COMPRESS_RATIO);
+    batchcommon.push_back(&PARAM_BATCH_DELETE_SOURCE_CHUNK);
+    batchcommon.push_back(&PARAM_BATCH_SORT_TMP_DIR);
+    batchcommon.push_back(&PARAM_BATCH_SORT_BUFFER_SIZE);
+    batchcommon.push_back(&PARAM_CREATEDB_MODE);
+    batchcommon.push_back(&PARAM_SHUFFLE_SPLITS);
+    batchcommon.push_back(&PARAM_REMOVE_TMP_FILES);
+    batchcommon.push_back(&PARAM_THREADS);
+    batchcommon.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    batchcommon.push_back(&PARAM_PRELOAD_MODE);
+    batchcommon.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
+    batchcommon.push_back(&PARAM_KMER_WRITE_TO_DISK);
+    batchcommon.push_back(&PARAM_V);
+
+    // server backends (single-node, multi-node)
+    batchserver.push_back(&PARAM_BATCH_BACKEND);
+    batchserver.push_back(&PARAM_BATCH_SLURM_NODELIST);
+    batchserver.push_back(&PARAM_BATCH_SLURM_PARTITION);
+    batchserver.push_back(&PARAM_BATCH_SLURM_TIME);
+    batchserver.push_back(&PARAM_BATCH_SLURM_MEM);
+    batchserver.push_back(&PARAM_BATCH_SLURM_EXTRA);
+    batchserver.push_back(&PARAM_BATCH_ROUND0_SLURM_NODELIST);
+    batchserver.push_back(&PARAM_BATCH_ROUND0_SLURM_PARTITION);
+    batchserver.push_back(&PARAM_BATCH_ROUND0_SLURM_TIME);
+    batchserver.push_back(&PARAM_BATCH_ROUND0_SLURM_MEM);
+    batchserver.push_back(&PARAM_BATCH_ROUND0_SLURM_EXTRA);
+    // per-round binary and tmp reuse are meaningless on AWS: the round binary is the container image, resume rides on S3 done-markers
+    batchserver.push_back(&PARAM_BATCH_ROUND0_MMSEQS);
+    batchserver.push_back(&PARAM_REUSELATEST);
+    batchserver = combineList(batchserver, batchcommon);
+
+    // aws-batch backend
+    batchaws.push_back(&PARAM_BATCH_AWS_MACHINE);
+    batchaws.push_back(&PARAM_BATCH_AWS_JOB_QUEUE);
+    batchaws.push_back(&PARAM_BATCH_AWS_JOB_DEFINITION);
+    batchaws.push_back(&PARAM_BATCH_ROUND0_AWS_MACHINE);
+    batchaws.push_back(&PARAM_BATCH_ROUND0_AWS_JOB_QUEUE);
+    batchaws.push_back(&PARAM_BATCH_ROUND0_AWS_JOB_DEFINITION);
+    batchaws.push_back(&PARAM_BATCH_AWS_MACHINE_TAG_KEY);
+    batchaws.push_back(&PARAM_BATCH_AWS_MMSEQS);
+    batchaws.push_back(&PARAM_BATCH_ROUND0_AWS_MMSEQS);
+    batchaws.push_back(&PARAM_BATCH_AWS_JOB_PREFIX);
+    batchaws.push_back(&PARAM_BATCH_AWS_LOCAL_DIR);
+    batchaws.push_back(&PARAM_BATCH_AWS_SCRIPT_URI);
+    batchaws.push_back(&PARAM_BATCH_AWS_CHUNK_PREFIX);
+    batchaws.push_back(&PARAM_BATCH_AWS_TIMEOUT);
+    batchaws.push_back(&PARAM_BATCH_AWS_WORKER_ATTEMPTS);
+    batchaws.push_back(&PARAM_BATCH_AWS_DRY_RUN);
+    batchaws.push_back(&PARAM_BATCH_AWS_ALLOW_NONS3_INPUT);
+    batchaws = combineList(batchaws, batchcommon);
+
+    // hidden batch commands keep the union of both backends
+    batchclustering = combineList(batchserver, batchaws);
 
     linclustbatchinner.push_back(&PARAM_C);
     linclustbatchinner.push_back(&PARAM_COV_MODE);
@@ -1717,7 +1727,9 @@ Parameters::Parameters():
     linclustbatchinner.push_back(&PARAM_CLUST_HASH);
     linclustbatchinner.push_back(&PARAM_LINCLUST_VERSION);
     linclustbatchinner.push_back(&PARAM_LINCLUST2_ITER);
-    linclustbatch = combineList(linclustbatchinner, batchclustering);
+    linclustbatch = combineList(linclustbatchinner, batchserver);
+    linclustbatchaws = combineList(linclustbatchinner, batchaws);
+    linclustbatchall = combineList(linclustbatchinner, batchclustering);
 
     clusterbatchinner.push_back(&PARAM_C);
     clusterbatchinner.push_back(&PARAM_COV_MODE);
@@ -1745,7 +1757,9 @@ Parameters::Parameters():
     clusterbatchinner.push_back(&PARAM_CLUSTER_REASSIGN);
     clusterbatchinner.push_back(&PARAM_MAX_SEQS);
     clusterbatchinner.push_back(&PARAM_S);
-    clusterbatch = combineList(clusterbatchinner, batchclustering);
+    clusterbatch = combineList(clusterbatchinner, batchserver);
+    clusterbatchaws = combineList(clusterbatchinner, batchaws);
+    clusterbatchall = combineList(clusterbatchinner, batchclustering);
 
     clusterworkflow.push_back(&PARAM_CASCADED);
     clusterworkflow.push_back(&PARAM_CLUSTER_STEPS);
