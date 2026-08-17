@@ -350,21 +350,11 @@ round_par_threads() {
 prepare_round() {
     local round="$1"
     shift
-    local old_chunk_max_bytes="$CHUNK_MAX_BYTES"
-    local old_chunk_max_seqs="$CHUNK_MAX_SEQS"
-    local old_threads="$THREADS"
-    local rc
-    CHUNK_MAX_BYTES=$(round_chunk_max_bytes "$round")
-    CHUNK_MAX_SEQS=$(round_chunk_max_seqs "$round")
-    THREADS=$(round_threads "$round")
-    set +e
+    # temp-env prefix, not set +e: errexit must stay live inside prepare or a failed worker is swallowed
+    CHUNK_MAX_BYTES=$(round_chunk_max_bytes "$round") \
+    CHUNK_MAX_SEQS=$(round_chunk_max_seqs "$round") \
+    THREADS=$(round_threads "$round") \
     prepare "$@"
-    rc=$?
-    set -e
-    CHUNK_MAX_BYTES="$old_chunk_max_bytes"
-    CHUNK_MAX_SEQS="$old_chunk_max_seqs"
-    THREADS="$old_threads"
-    return "$rc"
 }
 
 with_round_node_work_dir() {
@@ -822,7 +812,7 @@ measure_input() {
     [[ -n "${path:-}" ]] || fail_hard "measure-input got no path"
     [[ -z "${bytes:-}" || "$bytes" == "0" ]] && bytes=$(uncompressed_bytes "$path")
     if [[ "${bytes:-0}" -gt "$CHUNK_MAX_BYTES" ]]; then
-        fail_hard "input file '$path' has an estimated uncompressed size of $(( bytes / 1048576 )) MiB, exceeding the per-chunk limit --chunk-max-bytes=$(( CHUNK_MAX_BYTES / 1048576 )) MiB. Grouping cannot split within a single file: either raise --chunk-max-bytes to fit your machine memory, or pre-split '$path' into smaller pieces."
+        fail_hard "input file '$path' has an estimated uncompressed size of ${bytes} bytes, exceeding the per-chunk limit --chunk-max-bytes=${CHUNK_MAX_BYTES} bytes. Grouping cannot split within a single file: either raise --chunk-max-bytes to fit your machine memory, or pre-split '$path' into smaller pieces."
     fi
     if [[ "${CHUNK_MAX_SEQS:-0}" -gt 0 ]]; then
         # count only when the manifest didn't already supply a count (3-column rep manifests do)
@@ -890,7 +880,7 @@ prepare_group() {
             cb += b; cs += s; n++
         }
         END { close_chunk() }
-    '
+    ' || fail "prepare(group): measuring inputs failed (worker error above); refusing to write a partial chunk manifest"
     [[ -s "$local_manifest" ]] || fail "no input files found in manifest: $input_manifest"
 
     # S3 runs need the filelist on S3 too, since worker containers cannot see the driver's local files
