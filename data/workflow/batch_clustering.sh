@@ -1418,7 +1418,8 @@ cluster_chunk() {
     [[ -n "${REMOVE_TMP:-}" ]] && rm -rf "${work_dir:?}"
     # rmdir, never rm -rf: it fails on a non-empty parent, so a sibling chunk still running is safe
     if [[ -n "${REMOVE_TMP:-}" ]]; then
-        rmdir "$(dirname "$work_dir")" 2>/dev/null && rmdir "$(dirname "$(dirname "$work_dir")")" 2>/dev/null
+        rmdir "$(dirname "$work_dir")" 2>/dev/null || true
+        rmdir "$(dirname "$(dirname "$work_dir")")" 2>/dev/null || true
     fi
     log "cluster-chunk complete: ${chunk_id}"
 }
