@@ -1715,6 +1715,8 @@ Parameters::Parameters():
     linclustbatchinner.push_back(&PARAM_MIN_SEQ_ID);
     linclustbatchinner.push_back(&PARAM_CLUSTER_MODE);
     linclustbatchinner.push_back(&PARAM_KMER_PER_SEQ);
+    linclustbatchinner.push_back(&PARAM_KMER_SELECTION);
+    linclustbatchinner.push_back(&PARAM_SYNCMER_S);
     linclustbatchinner.push_back(&PARAM_INCLUDE_COUNTTABLE);
     linclustbatchinner.push_back(&PARAM_NUM_COUNTS);
     linclustbatchinner.push_back(&PARAM_INCLUDE_ADJACENCY);
@@ -1740,6 +1742,8 @@ Parameters::Parameters():
     clusterbatchinner.push_back(&PARAM_MIN_SEQ_ID);
     clusterbatchinner.push_back(&PARAM_CLUSTER_MODE);
     clusterbatchinner.push_back(&PARAM_KMER_PER_SEQ);
+    clusterbatchinner.push_back(&PARAM_KMER_SELECTION);
+    clusterbatchinner.push_back(&PARAM_SYNCMER_S);
     clusterbatchinner.push_back(&PARAM_INCLUDE_COUNTTABLE);
     clusterbatchinner.push_back(&PARAM_NUM_COUNTS);
     clusterbatchinner.push_back(&PARAM_INCLUDE_ADJACENCY);
