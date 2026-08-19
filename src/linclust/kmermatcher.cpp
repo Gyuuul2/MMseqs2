@@ -396,6 +396,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
 #ifdef OPENMP
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
+        size_t threadLongestKmer = par.kmerSize;
         unsigned short * scoreDist= new(std::nothrow) unsigned short[65536];
         Util::checkAllocation(scoreDist, "Can not allocate scoreDist memory in fillKmerPositionArray");
         unsigned int * hierarchicalScoreDist= new(std::nothrow) unsigned int[128];
@@ -492,7 +493,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
                             }
                             kmerLen = MarkovKmerScore::adjustedLength(kmerToHash, adjustedKmerSize,
                                                                       (par.kmerSize - MarkovScores::MARKOV_ORDER) * MarkovScores::MEDIAN_SCORE);
-                            longestKmer = std::max(kmerLen, longestKmer);
+                            threadLongestKmer = std::max(kmerLen, threadLongestKmer);
                             kmerIdx = Indexer::computeKmerIdx(kmerToHash, kmerLen);
                         }
 
@@ -707,6 +708,10 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
         delete[] scoreDist;
         if (TYPE == Parameters::DBTYPE_HMM_PROFILE) {
             delete generator;
+        }
+#pragma omp critical
+        {
+            longestKmer = std::max(threadLongestKmer, longestKmer);
         }
     }
 
@@ -1366,14 +1371,14 @@ KmerPosition<T, includeAdjacency, IncludeSeqLen> *doComputation(
             break;
         }
 
-        if (seqDbr.getDbtype() == Parameters::DBTYPE_NUCLEOTIDES) {
+        if (Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)) {
             prevHash = BIT_SET(prevHash, 63);
         }
 
         bool wasSet = false;
         for (size_t pos = thread * splitSize; pos < elementsToSort; pos++) {
             size_t currKmer = hashSeqPair[pos].kmer;
-            if (seqDbr.getDbtype() == Parameters::DBTYPE_NUCLEOTIDES) {
+            if (Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)) {
                 currKmer = BIT_SET(currKmer, 63);
             }
             if (prevHash != currKmer) {
@@ -1958,6 +1963,8 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
 
     if (par.linclustVersion == 1) {
         par.needWriteBuffer = false;
+        // in-place lanes share their boundary element, so linclust1 stays single-lane
+        par.useParallelism = false;
         par.includeCountTable = false;
         par.includeAdjacency = false;
         par.adjIteration = 0;
@@ -2022,7 +2029,7 @@ void writeKmerMatcherResult(DBWriter & dbw,
             }
         }
         if(wasSet == false){
-            threadOffsets.push_back(totalKmers - 1 );
+            threadOffsets.push_back(totalKmers);
         }
     }
     threadOffsets.push_back(totalKmers);
