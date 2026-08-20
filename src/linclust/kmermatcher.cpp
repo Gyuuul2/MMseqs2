@@ -422,7 +422,9 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
         three = ExtendedSubstitutionMatrix::calcScoreMatrix(*subMat, 3);
     }
 
-    Debug::Progress progress(seqDbr.getSize());
+    // Debug::Progress paints the id-1..id delta, so it has to count updates, not sequences
+    const size_t progressSteps = (seqDbr.getSize() + KMERMATCHER_PROGRESS_STEP - 1) / KMERMATCHER_PROGRESS_STEP;
+    Debug::Progress progress(progressSteps == 0 ? 1 : progressSteps);
 #pragma omp parallel num_threads(par.threads)
     {
         unsigned int thread_idx = 0;
@@ -475,9 +477,9 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
 // every thread in the team computes the same chunk from shared read-only state, as the schedule needs
 #pragma omp for schedule(dynamic, scanChunk)
             for (size_t id = start; id < (start + bucketSize); id++) {
-                // the argument-less form is one contended atomic per sequence
-                if ((id & (KMERMATCHER_PROGRESS_STEP - 1)) == 0 || id + 1 == seqDbr.getSize()) {
-                    progress.updateProgress(id);
+                // one atomic per 2^20 sequences, so the contention the sparse guard avoids stays avoided
+                if ((id & (KMERMATCHER_PROGRESS_STEP - 1)) == 0) {
+                    progress.updateProgress();
                 }
                 // the team sweeps forward, so ask for the next chunk while this one is still hashing
                 if (canPrefetch && ((id - start) % scanChunk) == 0) {
