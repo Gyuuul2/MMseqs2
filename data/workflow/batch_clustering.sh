@@ -1511,10 +1511,15 @@ finalize_emit_shard_job() {
     printf -v split_file '%s/final.split%s.tsv' "$sorted_dir" "$bb"
     [[ -e "$split_file" ]] || fail "finalize: missing sorted split $split_file"
     shard_out="${shard_prefix}final.split${bb}.tsv${batch_suffix}"
-    shard_tmp="$(resolve_node_scratch "$work_dir")/final.split${bb}.tsv${batch_suffix}.out.tmp.$$"
-    write_batch_output "$split_file" "$shard_tmp"
-    copy_out "$shard_tmp" "$shard_out"
-    rm -f "$shard_tmp"
+    if compress_batch_outputs_enabled; then
+        shard_tmp="$(resolve_node_scratch "$work_dir")/final.split${bb}.tsv${batch_suffix}.out.tmp.$$"
+        write_batch_output "$split_file" "$shard_tmp"
+        copy_out "$shard_tmp" "$shard_out"
+        rm -f "$shard_tmp"
+    else
+        # uncompressed leaves nothing to stage, so the sorted split publishes directly
+        copy_out "$split_file" "$shard_out"
+    fi
 }
 
 # merge_join <child_manifest> <parent_manifest> <frag_dir> <sort_tmp> <split>: join parent.member == child.rep, routing output by hash(new rep) so it leaves already split.
