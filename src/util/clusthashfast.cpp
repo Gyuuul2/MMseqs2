@@ -38,6 +38,12 @@ static const unsigned int CLUSTHASHFAST_MAX_PARTITIONS = 4096;
 static const size_t CLUSTHASHFAST_PENDING_BYTES = 8 * 1024 * 1024;
 // progress is observability, not work: billions of atomic/progress calls can otherwise dominate scans
 static const size_t CLUSTHASHFAST_PROGRESS_STEP = 1ull << 20;
+
+// Debug::Progress paints the id-1..id delta, so a sparse id prints nothing: count updates, not ids
+static size_t clusthashfastProgressSteps(size_t dbSize) {
+    const size_t steps = (dbSize + CLUSTHASHFAST_PROGRESS_STEP - 1) / CLUSTHASHFAST_PROGRESS_STEP;
+    return (steps == 0) ? 1 : steps;
+}
 // small enough that the threads' active id-order window stays inside a couple of length blocks
 static const size_t CLUSTHASHFAST_RUN_ORDER_CHUNK = 4096;
 // one loadBatch per run is a queue depth of two at the mean run size, so fill the reader arena instead
@@ -617,7 +623,7 @@ static bool hashIntoPartitions(DBReader<DBKeyType> &reader, HashPartitions &part
                                                      CLUSTHASHFAST_PENDING_BYTES, sizeof(HashEntry));
     const size_t flush = std::max<size_t>(64, pendingBytes / (partitionCount * sizeof(HashEntry)));
     std::vector<std::mutex> locks(partitionCount);
-    Debug::Progress progress(dbSize);
+    Debug::Progress progress(clusthashfastProgressSteps(dbSize));
     bool ok = true;
 #pragma omp parallel num_threads(threads) reduction(&&:ok)
     {
@@ -630,8 +636,8 @@ static bool hashIntoPartitions(DBReader<DBKeyType> &reader, HashPartitions &part
         Sequence *seq = isNuclInput ? NULL : new Sequence(maxSeqLen, reader.getDbtype(), subMat, 0, false, false);
 #pragma omp for schedule(static, scanChunk)
         for (size_t id = 0; id < dbSize; ++id) {
-            if (showProgress && ((id & (CLUSTHASHFAST_PROGRESS_STEP - 1)) == 0 || id + 1 == dbSize)) {
-                progress.updateProgress(id);
+            if (showProgress && (id & (CLUSTHASHFAST_PROGRESS_STEP - 1)) == 0) {
+                progress.updateProgress();
             }
             HashEntry entry;
             entry.hash = hashOf(reader, id, seq, thread_idx);
@@ -683,7 +689,7 @@ static void hashAllSequences(DBReader<DBKeyType> &reader, HashEntry *entries, si
                              bool isNuclInput, BaseMatrix *subMat, size_t maxSeqLen, bool showProgress,
                              int threads) {
     const size_t scanChunk = idScanBlock(reader, dbSize, threads);
-    Debug::Progress progress(dbSize);
+    Debug::Progress progress(clusthashfastProgressSteps(dbSize));
 #pragma omp parallel num_threads(threads)
     {
         unsigned int thread_idx = 0;
@@ -693,8 +699,8 @@ static void hashAllSequences(DBReader<DBKeyType> &reader, HashEntry *entries, si
         Sequence *seq = isNuclInput ? NULL : new Sequence(maxSeqLen, reader.getDbtype(), subMat, 0, false, false);
 #pragma omp for schedule(static, scanChunk)
         for (size_t id = 0; id < dbSize; ++id) {
-            if (showProgress && ((id & (CLUSTHASHFAST_PROGRESS_STEP - 1)) == 0 || id + 1 == dbSize)) {
-                progress.updateProgress(id);
+            if (showProgress && (id & (CLUSTHASHFAST_PROGRESS_STEP - 1)) == 0) {
+                progress.updateProgress();
             }
             entries[id].hash = hashOf(reader, id, seq, thread_idx);
             entries[id].id = static_cast<DBLocalId>(id);
@@ -757,7 +763,7 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
     }
 
     if (partitionCount == 1) {
-        Debug(Debug::INFO) << "Hashing sequences...\n";
+        Debug(Debug::INFO) << "Hashing " << dbSize << " sequences...\n";
         // HashEntry is trivial, so this allocation is not written until the pass below touches it
         HashEntry *entries = new(std::nothrow) HashEntry[dbSize];
         Util::checkAllocation(entries, "Cannot allocate hash entry memory in clusthashfast");
@@ -776,7 +782,7 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
         return counts;
     }
 
-    Debug(Debug::INFO) << "Hashing sequences into " << partitionCount << " partitions...\n";
+    Debug(Debug::INFO) << "Hashing " << dbSize << " sequences into " << partitionCount << " partitions...\n";
     HashPartitions parts;
     if (parts.open(tmpPrefix + ".hashpart", partitionCount) == false) {
         Debug(Debug::ERROR) << "Cannot open hash partitions under " << tmpPrefix << "\n";
