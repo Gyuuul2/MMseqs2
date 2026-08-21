@@ -124,6 +124,21 @@ if (HAVE_POSIX_FADVISE)
 endif ()
 
 check_cxx_source_compiles("
+        #include <sys/syscall.h>
+        #include <linux/io_uring.h>
+
+        int main() {
+          struct io_uring_params p;
+          struct io_uring_probe probe;
+          return (int) (sizeof(p) + sizeof(probe) + __NR_io_uring_setup + __NR_io_uring_enter
+                        + __NR_io_uring_register + IORING_OP_READ + IORING_REGISTER_PROBE);
+        }"
+        HAVE_LINUX_IO_URING)
+if (HAVE_LINUX_IO_URING AND NOT DISABLE_IO_URING)
+    target_compile_definitions(mmseqs-framework PUBLIC -DHAVE_LINUX_IO_URING=1)
+endif ()
+
+check_cxx_source_compiles("
         #include <stdlib.h>
         #include <fcntl.h>
         #include <stdio.h>

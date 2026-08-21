@@ -14,7 +14,7 @@
 
 #if defined(__linux__)
 #include <sys/syscall.h>
-#if defined(__NR_io_uring_setup) && defined(__NR_io_uring_enter)
+#if defined(HAVE_LINUX_IO_URING) && defined(__NR_io_uring_setup) && defined(__NR_io_uring_enter)
 #include <linux/io_uring.h>
 #define HAVE_IO_URING 1
 #endif
@@ -784,6 +784,17 @@ static bool dbReaderRingInit(DBReaderRing &r, unsigned entries) {
     if (fd < 0) {
         return false;
     }
+    // IORING_OP_READ is 5.6+, so a 5.1 ring that accepts setup still has to use pread
+    const size_t probeSize = sizeof(struct io_uring_probe)
+                           + (IORING_OP_READ + 1) * sizeof(struct io_uring_probe_op);
+    struct io_uring_probe *probe = (struct io_uring_probe *) calloc(1, probeSize);
+    if (probe == NULL) { ::close(fd); return false; }
+    const bool readSupported =
+        syscall(__NR_io_uring_register, fd, IORING_REGISTER_PROBE, probe, IORING_OP_READ + 1) >= 0
+        && probe->ops_len > IORING_OP_READ
+        && (probe->ops[IORING_OP_READ].flags & IO_URING_OP_SUPPORTED) != 0;
+    free(probe);
+    if (readSupported == false) { ::close(fd); return false; }
     size_t sqSize = p.sq_off.array + p.sq_entries * sizeof(unsigned);
     size_t cqSize = p.cq_off.cqes + p.cq_entries * sizeof(struct io_uring_cqe);
     if (p.features & IORING_FEAT_SINGLE_MMAP) {
@@ -859,7 +870,8 @@ struct DBReader<T>::IoBatch {
         DBReaderRing ring;
 #endif
         bool ringReady;
-        Worker() : arena(NULL), capacity(0), ringReady(false) {}
+        bool ringProbed;
+        Worker() : arena(NULL), capacity(0), ringReady(false), ringProbed(false) {}
     };
     std::vector<Worker> workers;
 };
@@ -1015,9 +1027,10 @@ size_t DBReader<T>::loadBatchDirect(const size_t *ids, size_t n, unsigned int th
     bool submitted = false;
 #if defined(__linux__) && defined(HAVE_IO_URING)
     if (requestCount > 1) {
-        if (worker.ringReady == false) {
+        if (worker.ringProbed == false) {
             // MMSEQS_NO_IO_URING=1 drops to the pread loop, so the ring can be A/B tested in place
             static const bool ringOff = getenv("MMSEQS_NO_IO_URING") != NULL;
+            worker.ringProbed = true;
             worker.ringReady = ringOff ? false : dbReaderRingInit(worker.ring, DBREADER_BATCH_DEPTH * 2);
         }
         if (worker.ringReady) {
