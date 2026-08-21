@@ -60,6 +60,9 @@ struct SetCoverCandidate {
     size_t memberOffset;
 };
 
+// entry length per local id, so the heap breaks ties by length like a length sorted reader did
+static const unsigned int *setCoverLengths = nullptr;
+
 struct SetCoverComparator {
     bool operator()(const SetCoverCandidate& a, const SetCoverCandidate& b) const {
         if (a.memberCount < b.memberCount) {
@@ -67,6 +70,11 @@ struct SetCoverComparator {
         }
         if (b.memberCount < a.memberCount) {
             return false;
+        }
+        const unsigned int lenA = setCoverLengths[a.representativeId];
+        const unsigned int lenB = setCoverLengths[b.representativeId];
+        if (lenA != lenB) {
+            return lenA > lenB;
         }
         if (a.representativeId < b.representativeId) {
             return true;
@@ -613,6 +621,16 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     const size_t flagWordCount = assignedFlagWordCount(dbSize);
     assignedFlags = new(std::nothrow) std::atomic<uint64_t>[flagWordCount];
     Util::checkAllocation(assignedFlags, "Can not allocate assignedFlags memory in Align2Clust");
+    unsigned int *entryLengths = nullptr;
+    if (mode == Parameters::SET_COVER) {
+        entryLengths = new(std::nothrow) unsigned int[dbSize];
+        Util::checkAllocation(entryLengths, "Can not allocate entryLengths memory in Align2Clust");
+#pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < dbSize; i++) {
+            entryLengths[i] = static_cast<unsigned int>(seqDbr->getEntryLen(i));
+        }
+        setCoverLengths = entryLengths;
+    }
 #pragma omp parallel for schedule(static)
     for (size_t i = 0; i < flagWordCount; ++i) {
         assignedFlags[i].store(0, std::memory_order_relaxed);
@@ -1224,6 +1242,8 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
     // neither is read past the producer loop, so the output phase does not compete with them for memory
     delete[] prefRepSizePair;
+    setCoverLengths = nullptr;
+    delete[] entryLengths;
     alnDbr.close();
 
 #pragma omp parallel for schedule(static)
