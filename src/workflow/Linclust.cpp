@@ -177,9 +177,7 @@ int linclust(int argc, const char **argv, const Command& command) {
         if (par.PARAM_KMERMATCHER_MODE.wasSet == false) {
             par.kmerMatcherMode = Parameters::KMERMATCHER_MODE_LOCAL;
         }
-        if (par.PARAM_SPACED_KMER_MODE.wasSet == false) {
-            par.spacedKmer = false;
-        }
+        par.spacedKmer = false;
         par.maskMode = false;
         cmd.addVariable("KMERMATCHER_PAR", par.createParameterString(par.kmermatcher).c_str());
         
