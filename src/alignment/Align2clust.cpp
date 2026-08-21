@@ -187,9 +187,21 @@ static void dropBehind(DBReader<DBKeyType> &reader, std::atomic<size_t> &dropped
     }
 }
 
+// Both uses of the split memory limit here only size internal buffers, and the mapped databases can
+// legitimately be larger than the limit. Util::computeMemory exits in that case, which killed
+// linclust --split-memory-limit 10M; this degrades to a zero budget instead, which makes the reorder
+// buffer take its minimum and the io policy report a starved cache -- both correct under a tight limit.
+static size_t availableBufferBudget(size_t splitMemoryLimit) {
+    const size_t limit = (splitMemoryLimit > 0)
+        ? splitMemoryLimit
+        : static_cast<size_t>(Util::getTotalSystemMemory() * 0.9);
+    const size_t committed = MemoryTracker::getSize();
+    return (committed < limit) ? (limit - committed) : 0;
+}
+
 static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int mode, size_t resultCount,
                                      bool ownsLengthOrder) {
-    const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
+    const size_t memoryLimit = availableBufferBudget(par.splitMemoryLimit);
 
     size_t fixedMemory = dbSize * sizeof(ClusterAssignment);
     fixedMemory += assignedFlagWordCount(dbSize) * sizeof(std::atomic<uint64_t>);
@@ -516,7 +528,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     seqDbr->setIoCacheAdvice(true);
     seqDbr->open(DBReader<DBKeyType>::NOSORT);
 
-    const size_t ioMemoryLimit = Util::computeMemory(par.splitMemoryLimit);
+    const size_t ioMemoryLimit = availableBufferBudget(par.splitMemoryLimit);
     const size_t seqDataSize = seqDbr->getDataSize();
     const size_t alnDataSize = alnDbr.getDataSize();
     const bool cacheStarved = seqDataSize > ioMemoryLimit
