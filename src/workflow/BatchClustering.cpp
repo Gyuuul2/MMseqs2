@@ -96,7 +96,7 @@ void setBatchClusterDefaults(Parameters *p) {
     p->evalThr = 0.001;
     p->alignmentMode = Parameters::ALIGNMENT_MODE_SCORE_COV_SEQID;
     p->maxResListLen = 20;
-    p->clusterVersion = Parameters::CLUSTER_VERSION1;
+    p->clusterVersion = Parameters::CLUSTER_VERSION2;
     p->createdbMode = Parameters::SEQUENCE_SPLIT_MODE_SOFT;   // soft-link: skip DB data copy; batch materializes single-line FASTA first
     p->removeTmpFiles = true;   // batch scale accumulates per-chunk tmp; clean by default
     p->batchDeleteSourceChunk = true;  // reclaim each chunk as it is consumed; disk is the bottleneck
