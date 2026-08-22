@@ -669,6 +669,22 @@ int execBatchEngine(Parameters &par, const std::string &programDir,
     return 0;
 }
 
+// several inputs are written into one manifest, so the engine keeps its single-manifest contract
+std::string resolveBatchInputManifest(const Parameters &par, const std::string &tmpDir) {
+    if (par.filenames.size() < 2) {
+        return par.db1;
+    }
+    std::string content;
+    for (size_t i = 0; i < par.filenames.size(); ++i) {
+        content.append(par.filenames[i]);
+        content.append("\n");
+    }
+    std::string manifest = tmpDir + "/input.manifest";
+    FileUtil::writeFile(manifest, reinterpret_cast<const unsigned char *>(content.c_str()), content.size());
+    Debug(Debug::INFO) << "Input: " << par.filenames.size() << " file(s) written to " << manifest << "\n";
+    return manifest;
+}
+
 std::string createBatchSharedTmp(Parameters &par, const Command &command,
                                  const std::vector<MMseqsParameter*> &paramList) {
     std::string tmpDir = par.db3;
@@ -686,7 +702,7 @@ int runBatchSingleNode(Parameters &par, const Command &command,
     std::string tmpDir = createBatchSharedTmp(par, command, paramList);
 
     std::vector<std::string> args;
-    args.push_back(par.db1);
+    args.push_back(resolveBatchInputManifest(par, tmpDir));
     args.push_back(tmpDir);
     args.push_back(par.db2);
     return execBatchEngine(par, tmpDir, "run-single-node", args, clusterCmd, clusterPar, round0ClusterPar);
@@ -699,7 +715,7 @@ int runBatchMultiNode(Parameters &par, const Command &command,
     std::string tmpDir = createBatchSharedTmp(par, command, paramList);
 
     std::vector<std::string> args;
-    args.push_back(par.db1);
+    args.push_back(resolveBatchInputManifest(par, tmpDir));
     args.push_back(tmpDir);
     args.push_back(par.db2);
     return execBatchEngine(par, tmpDir, "run-multi-node", args, clusterCmd, clusterPar, round0ClusterPar);
@@ -784,7 +800,11 @@ int linclustbatch(int argc, const char **argv, const Command &command) {
     int requestedThreads = parseRequestedThreads(argc, argv);
     setBatchLinclustDefaults(&par);
     setBatchClusteringDescriptions(par);
-    par.parseParameters(argc, argv, command, false, 0, 0);
+    par.parseParameters(argc, argv, command, false, Parameters::PARSE_VARIADIC, 0);
+    // the last two arguments are always the result dir and the shared tmp dir; the rest are inputs
+    par.db3 = par.filenames.back(); par.filenames.pop_back();
+    par.db2 = par.filenames.back(); par.filenames.pop_back();
+    par.db1 = par.filenames.front();
     restoreRequestedThreads(par, requestedThreads);
     resolveBatchMergeParallelism(par);
     validateBatchServerBackend(par, command);
@@ -816,7 +836,11 @@ int clusterbatch(int argc, const char **argv, const Command &command) {
     int requestedThreads = parseRequestedThreads(argc, argv);
     setBatchClusterDefaults(&par);
     setBatchClusteringDescriptions(par);
-    par.parseParameters(argc, argv, command, false, 0, 0);
+    par.parseParameters(argc, argv, command, false, Parameters::PARSE_VARIADIC, 0);
+    // the last two arguments are always the result dir and the shared tmp dir; the rest are inputs
+    par.db3 = par.filenames.back(); par.filenames.pop_back();
+    par.db2 = par.filenames.back(); par.filenames.pop_back();
+    par.db1 = par.filenames.front();
     restoreRequestedThreads(par, requestedThreads);
     resolveBatchMergeParallelism(par);
     validateBatchServerBackend(par, command);

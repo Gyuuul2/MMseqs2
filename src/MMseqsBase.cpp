@@ -92,8 +92,8 @@ std::vector<Command> baseCommands = {
                 "# Multi-node submits SLURM jobs and requires shared input/result/tmp paths\n"
                 "# For AWS Batch use linclust2-batch-aws\n",
                 "Gyuri Kim <gyuribio@snu.ac.kr>",
-                "<i:inputManifest> <o:resultDir> <sharedTmpDir>",
-                CITATION_MMSEQS2|CITATION_LINCLUST, {{"inputManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                "<i:fastaFile1[.gz|.zst]> ... <i:fastaFileN[.gz|.zst]>|<i:inputManifest> <o:resultDir> <sharedTmpDir>",
+                CITATION_MMSEQS2|CITATION_LINCLUST, {{"fastaFile[.gz|.zst]|inputManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA|DbType::VARIADIC, &DbValidator::flatfileStdinGenericUri },
                                                             {"resultDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
                                                             {"sharedTmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri }}},
         {"linclust2-batch-aws",   linclustbatchaws,     &par.linclustbatchaws,     COMMAND_EASY,
@@ -116,8 +116,8 @@ std::vector<Command> baseCommands = {
                 "# Multi-node submits SLURM jobs and requires shared input/result/tmp paths\n"
                 "# For AWS Batch use cluster2-batch-aws\n",
                 "Gyuri Kim <gyuribio@snu.ac.kr>",
-                "<i:inputManifest> <o:resultDir> <sharedTmpDir>",
-                CITATION_MMSEQS2|CITATION_LINCLUST, {{"inputManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                "<i:fastaFile1[.gz|.zst]> ... <i:fastaFileN[.gz|.zst]>|<i:inputManifest> <o:resultDir> <sharedTmpDir>",
+                CITATION_MMSEQS2|CITATION_LINCLUST, {{"fastaFile[.gz|.zst]|inputManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA|DbType::VARIADIC, &DbValidator::flatfileStdinGenericUri },
                                                             {"resultDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
                                                             {"sharedTmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri }}},
         {"cluster2-batch-aws",    clusterbatchaws,      &par.clusterbatchaws,      COMMAND_EASY,
