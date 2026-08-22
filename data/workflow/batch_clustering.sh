@@ -35,7 +35,7 @@ Usage:
   batch_clustering.sh aws-worker <chunk_manifest_s3> <result_s3_prefix> <round>
   batch_clustering.sh aws-merge <input_manifest> <work_s3_prefix> <result_s3_prefix> <round>
 
-Environment (normally exported by mmseqs from the linclust-batch/cluster-batch command line,
+Environment (normally exported by mmseqs from the linclust2-batch/cluster2-batch command line,
 or their -aws variants for the AWS vars; set them directly only when running this script standalone):
   MMSEQS ROUND0_MMSEQS THREADS ROUND0_THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_SPLITS MERGE_SPLIT_JOBS COMPRESS_RATIO
   CHUNK_DISK_BUDGET ROUND0_CHUNK_DISK_BUDGET DISK_POLL_SEC RAM_POLL_SEC
@@ -51,7 +51,7 @@ or their -aws variants for the AWS vars; set them directly only when running thi
   BATCH_DELETE_SOURCE_CHUNK ROUND0_CREATEDB_MODE S3_CHUNK_PREFIX BATCH_AWS_ALLOW_NONS3_INPUT
   (AWS env var names must NOT start with 'AWS_BATCH' -- that prefix is reserved by the AWS Batch service.)
   All of the above also exist as command line parameters; the AWS ones only on the -aws commands
-  (see 'mmseqs linclust-batch -h' and 'mmseqs linclust-batch-aws -h').
+  (see 'mmseqs linclust2-batch -h' and 'mmseqs linclust2-batch-aws -h').
 EOF
     exit 1
 }
@@ -110,7 +110,7 @@ ROUND0_CLUSTER_CMD=${ROUND0_CLUSTER_CMD:-}
 CLUSTER_COV_MODE=${CLUSTER_COV_MODE:-1}
 if [[ -z "${CLUSTER_PAR+x}" ]]; then
     if [[ "$CLUSTER_CMD" == "cluster" ]]; then
-        CLUSTER_PAR="-c 0.8 --cov-mode ${CLUSTER_COV_MODE} --cluster-version 1 --threads $THREADS"
+        CLUSTER_PAR="-c 0.8 --cov-mode ${CLUSTER_COV_MODE} --cluster-version 2 --threads $THREADS"
     elif [[ "$CLUSTER_COV_MODE" -eq 0 ]]; then
         CLUSTER_PAR="--linclust-version 2 -c 0.8 --cov-mode 0 --cluster-mode 0 --num-adjacency 3 --num-count-table 2 --min-seq-id 0.9 --threads $THREADS"
     else
@@ -126,6 +126,8 @@ MIN_REDUCTION_COUNT=${MIN_REDUCTION_COUNT:-0}
 MAX_CHUNK_ATTEMPTS=${MAX_CHUNK_ATTEMPTS:-1}
 [[ "$MAX_CHUNK_ATTEMPTS" =~ ^[1-9][0-9]*$ ]] || fail "MAX_CHUNK_ATTEMPTS must be a positive integer (got '$MAX_CHUNK_ATTEMPTS')"
 COMPRESS_RATIO=${COMPRESS_RATIO:-3}
+# decompressor fan-out; the measure dispatch sets it to 1 because it already runs THREADS workers
+ZSTD_THREADS=${ZSTD_THREADS:-${THREADS:-1}}
 # representative FASTA shards per chunk; above --shuffle-splits it only helps the shuffle, not the parse
 BATCH_REP_FASTA_SPLITS=${BATCH_REP_FASTA_SPLITS:-32}
 [[ "$BATCH_REP_FASTA_SPLITS" =~ ^[1-9][0-9]*$ ]] || fail "BATCH_REP_FASTA_SPLITS must be a positive integer (got '$BATCH_REP_FASTA_SPLITS')"
@@ -512,13 +514,13 @@ stream_uri() {
     if is_s3 "$uri"; then
         need_cmd aws
         case "$uri" in
-            *.zst) need_cmd pzstd; aws s3 cp "$uri" - --no-progress | pzstd -dc ;;
+            *.zst) need_cmd pzstd; aws s3 cp "$uri" - --no-progress | pzstd -dc -p "$ZSTD_THREADS" ;;
             *.gz)  aws s3 cp "$uri" - --no-progress | gzip -dc ;;
             *)     aws s3 cp "$uri" - --no-progress ;;
         esac
     else
         case "$uri" in
-            *.zst) need_cmd pzstd; pzstd -dc "$uri" ;;
+            *.zst) need_cmd pzstd; pzstd -dc -p "$ZSTD_THREADS" "$uri" ;;
             *.gz)  gzip -dc "$uri" ;;
             *)     cat "$uri" ;;
         esac
@@ -760,6 +762,21 @@ file_size_bytes() {
     fi
 }
 
+# uncompressed size the container already records, empty when only a full read can tell
+declared_uncompressed_bytes() {
+    local uri="$1" n
+    case "$uri" in
+        *.zst)
+            command -v zstd >/dev/null 2>&1 || return 0
+            # `|| true`: zstd -lv exits non-zero when there is no embedded content size
+            n=$(zstd -lv "$uri" 2>/dev/null | awk -F'[()]' '/Decompressed Size:/ {split($2, a, " "); print a[1]; exit}' || true)
+            [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]] && printf '%s' "$n"
+            ;;
+        *.gz) ;;
+        *) file_size_bytes "$uri" ;;
+    esac
+}
+
 # must be exact, not estimated: a different number per backend bin-packs round 1 differently
 uncompressed_bytes() {
     local uri="$1" sz n
@@ -767,15 +784,14 @@ uncompressed_bytes() {
         case "$uri" in
             *.zst)
                 if command -v zstd >/dev/null 2>&1; then
-                    # `|| true`: zstd -lv exits non-zero when there is no embedded content size
-                    n=$(zstd -lv "$uri" 2>/dev/null | awk -F'[()]' '/Decompressed Size:/ {split($2, a, " "); print a[1]; exit}' || true)
-                    if [[ "$n" =~ ^[0-9]+$ && "$n" -gt 0 ]]; then
+                    n=$(declared_uncompressed_bytes "$uri")
+                    if [[ -n "$n" ]]; then
                         printf '%s' "$n"
                         return
                     fi
                     log "sizing $uri by decompressing it: the frame header carries no decompressed size"
                     if command -v pzstd >/dev/null 2>&1; then
-                        n=$(pzstd -dc -p "${THREADS:-1}" "$uri" 2>/dev/null | wc -c || true)
+                        n=$(pzstd -dc -p "$ZSTD_THREADS" "$uri" 2>/dev/null | wc -c || true)
                     else
                         n=$(zstd -dc "$uri" 2>/dev/null | wc -c || true)
                     fi
@@ -810,14 +826,35 @@ measure_input() {
     local idx path bytes seqs
     IFS=$'\t' read -r idx path bytes seqs <<< "$1"
     [[ -n "${path:-}" ]] || fail_hard "measure-input got no path"
-    [[ -z "${bytes:-}" || "$bytes" == "0" ]] && bytes=$(uncompressed_bytes "$path")
+    # a stale manifest entry costs one clear line here instead of a buried decompressor error
+    if ! is_s3 "$path" && [[ ! -s "$path" ]]; then
+        fail_hard "input '$path' is missing, empty, or unreadable"
+    fi
+    local need_seqs=0 combined
+    if [[ "${CHUNK_MAX_SEQS:-0}" -gt 0 ]] && [[ -z "${seqs:-}" || "$seqs" == "0" ]]; then
+        need_seqs=1
+    fi
+    if [[ -z "${bytes:-}" || "$bytes" == "0" ]]; then
+        if [[ "$need_seqs" -eq 1 ]] && ! is_s3 "$path" && [[ -z "$(declared_uncompressed_bytes "$path")" ]]; then
+            # no recorded size, so take both numbers from one decompression instead of reading the file twice
+            if ! combined=$(stream_uri "$path" | awk '/^>/ {n++} {b += length($0) + 1} END {printf "%d\t%d\n", b, n + 0}'); then
+                fail_hard "cannot measure '$path': reading or decompressing it failed"
+            fi
+            IFS=$'\t' read -r bytes seqs <<< "$combined"
+            need_seqs=0
+        else
+            bytes=$(uncompressed_bytes "$path")
+        fi
+    fi
     if [[ "${bytes:-0}" -gt "$CHUNK_MAX_BYTES" ]]; then
         fail_hard "input file '$path' has an estimated uncompressed size of ${bytes} bytes, exceeding the per-chunk limit --chunk-max-bytes=${CHUNK_MAX_BYTES} bytes. Grouping cannot split within a single file: either raise --chunk-max-bytes to fit your machine memory, or pre-split '$path' into smaller pieces."
     fi
     if [[ "${CHUNK_MAX_SEQS:-0}" -gt 0 ]]; then
-        # count only when the manifest didn't already supply a count (3-column rep manifests do)
-        if [[ -z "${seqs:-}" || "$seqs" == "0" ]]; then
-            seqs=$(stream_uri "$path" | awk '/^>/ {n++} END {print n + 0}')
+        # count only when neither the manifest nor the combined pass above supplied one
+        if [[ "$need_seqs" -eq 1 ]]; then
+            if ! seqs=$(stream_uri "$path" | awk '/^>/ {n++} END {print n + 0}'); then
+                fail_hard "cannot count sequences in '$path': reading or decompressing it failed"
+            fi
         fi
         # oversize check runs whether the count was supplied or measured (grouping can't split a file)
         if [[ "${seqs:-0}" -gt "$CHUNK_MAX_SEQS" ]]; then
@@ -857,7 +894,7 @@ prepare_group() {
     fi
     stream_manifest "$input_manifest" \
     | awk -F'\t' 'NF && $0 !~ /^[[:space:]]*#/ { printf "%d\t%s\t%s\t%s%c", ++i, $1, $2 + 0, $3 + 0, 0 }' \
-    | xargs -0 -n 1 -P "${THREADS:-1}" env BATCH_WORKER_DISPATCH=1 bash "$BATCH_SCRIPT" measure-input \
+    | xargs -0 -n 1 -P "${THREADS:-1}" env BATCH_WORKER_DISPATCH=1 ZSTD_THREADS=1 bash "$BATCH_SCRIPT" measure-input \
     | sort -k1,1n | cut -f2- \
     | awk -F'\t' -v dir="$chunk_dir" -v manifest="$local_manifest" \
           -v max_bytes="$CHUNK_MAX_BYTES" -v max_seqs="$CHUNK_MAX_SEQS" '
