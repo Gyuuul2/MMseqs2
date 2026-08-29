@@ -692,12 +692,8 @@ public:
     std::string linclusterdbNodeList;
     int linclusterdbNodeId;
     int linclusterdbNodeCount;
-    std::string linclusthashValid;
     int lin8RepRankBlock;
     int lin8RepRankBlocks;
-    std::string linclustTaken;
-    std::string linclustDecided;
-    std::string linclustPref;
 
     // splitsequence
     int sequenceOverlap;
@@ -1176,12 +1172,8 @@ public:
     PARAMETER(PARAM_LINCLUSTERDB_NODE_LIST)
     PARAMETER(PARAM_LINCLUSTERDB_NODE_ID)
     PARAMETER(PARAM_LINCLUSTERDB_NODE_COUNT)
-    PARAMETER(PARAM_LINCLUSTHASH_VALID)
     PARAMETER(PARAM_LIN8_REP_RANK_BLOCK)
     PARAMETER(PARAM_LIN8_REP_RANK_BLOCKS)
-    PARAMETER(PARAM_LINCLUST_TAKEN)
-    PARAMETER(PARAM_LINCLUST_DECIDED)
-    PARAMETER(PARAM_LINCLUST_PREF)
     PARAMETER(PARAM_WRITE_LOOKUP)
 
     // convert2fasta
@@ -1407,15 +1399,15 @@ public:
     std::vector<MMseqsParameter*> createdb;
     std::vector<MMseqsParameter*> lin8createdb;
     std::vector<MMseqsParameter*> lin8clusthash;
-    std::vector<MMseqsParameter*> lin8kmers;
-    std::vector<MMseqsParameter*> lin8pairs;
+    std::vector<MMseqsParameter*> lin8extractkmers;
+    std::vector<MMseqsParameter*> lin8assignedpairs;
     std::vector<MMseqsParameter*> lin8pref;
-    std::vector<MMseqsParameter*> lin8align;
-    std::vector<MMseqsParameter*> lin8cluster;
-    std::vector<MMseqsParameter*> lin8expand;
-    std::vector<MMseqsParameter*> lin8merge;
+    std::vector<MMseqsParameter*> lin8align2clust;
+    std::vector<MMseqsParameter*> lin8align2clustmulti;
+    std::vector<MMseqsParameter*> lin8mergehashredundancy;
+    std::vector<MMseqsParameter*> lin8createclusterdb;
     std::vector<MMseqsParameter*> lin8createtsv;
-    std::vector<MMseqsParameter*> lin8repseq;
+    std::vector<MMseqsParameter*> lin8createrepseqfasta;
     std::vector<MMseqsParameter*> makepaddedseqdb;
     std::vector<MMseqsParameter*> convert2fasta;
     std::vector<MMseqsParameter*> result2flat;

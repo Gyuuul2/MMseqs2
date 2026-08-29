@@ -18,20 +18,19 @@ void setLinclustOneshotWorkflowDefaults(Parameters *p) {
     p->spacedKmer = false;
     p->clusteringMode = Parameters::GREEDY;
     // on by default here, unlike linclust: at a trillion metagenomic sequences the exact duplicates
-    // are most of the input, and folding them away is what the passes after it are sized for
+    // are most of the input, and reducing them away is what the passes after it are sized for
     p->clustHash = true;
 }
 
-// The script passes these itself: which machine this is, where it is in the wave, and the paths the
-// passes hand to each other. mmseqs refuses a flag given twice, so they are dropped from the strings.
+// The script passes these itself: which machine this is and where it is in the wave. mmseqs refuses
+// a flag given twice, so they are dropped from the strings the script hands on.
 static bool scriptOwns(const Parameters &par, const MMseqsParameter *p) {
     const int owned[] = {par.PARAM_LINCLUSTERDB_NODE_LIST.uniqid, par.PARAM_LINCLUSTERDB_NODE_ID.uniqid,
-                         par.PARAM_LINCLUSTERDB_NODE_COUNT.uniqid, par.PARAM_LINCLUSTHASH_VALID.uniqid,
+                         par.PARAM_LINCLUSTERDB_NODE_COUNT.uniqid,
                          par.PARAM_LIN8_REP_RANK_BLOCK.uniqid, par.PARAM_LIN8_REP_RANK_BLOCKS.uniqid,
-                         par.PARAM_LINCLUST_TAKEN.uniqid, par.PARAM_LINCLUST_DECIDED.uniqid,
-                         par.PARAM_LINCLUST_PREF.uniqid, par.PARAM_THREADS.uniqid,
+                         par.PARAM_THREADS.uniqid,
                          par.PARAM_MIN_SEQ_ID.uniqid, par.PARAM_C.uniqid, par.PARAM_COV_MODE.uniqid,
-                         par.PARAM_CLUST_HASH.uniqid, par.PARAM_TSV.uniqid};
+                         par.PARAM_TSV.uniqid};
     for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); i++) {
         if (p->uniqid == owned[i]) {
             return true;
@@ -67,7 +66,7 @@ int lin8clust(int argc, const char **argv, const Command &command) {
                                  "Name the clustering as a two column tsv beside the cluster database",
                                  NULL, par.PARAM_TSV.category);
     par.overrideParameterDescription(par.PARAM_CLUST_HASH,
-                                     "Fold exact duplicates away before the k-mer passes and put "
+                                     "Reduce exact duplicates away before the k-mer passes and put "
                                      "them back at the end", NULL, par.PARAM_CLUST_HASH.category);
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_VARIADIC, 0);
 
@@ -102,21 +101,21 @@ int lin8clust(int argc, const char **argv, const Command &command) {
     cmd.addVariable("SEQID", SSTR(par.seqIdThr).c_str());
     cmd.addVariable("COV", SSTR(par.covThr).c_str());
     cmd.addVariable("COVMODE", SSTR(par.covMode).c_str());
-    cmd.addVariable("CLUSTHASH", par.clustHash ? "1" : "0");
+    cmd.addVariable("CLUSTHASH", par.clustHash ? "TRUE" : NULL);
     cmd.addVariable("TSV", par.tsvOut ? "1" : "0");
     cmd.addVariable("REPSEQ", par.fastaSplits > 0 ? "1" : "0");
     cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
     cmd.addVariable("CREATEDB_PAR", passOn(par, par.lin8createdb).c_str());
     cmd.addVariable("HASH_PAR", passOn(par, par.lin8clusthash).c_str());
-    cmd.addVariable("EXTRACT_PAR", passOn(par, par.lin8kmers).c_str());
-    cmd.addVariable("GROUP_PAR", passOn(par, par.lin8pairs).c_str());
-    cmd.addVariable("FOLD_PAR", passOn(par, par.lin8pref).c_str());
-    cmd.addVariable("ALIGN_PAR", passOn(par, par.lin8align).c_str());
-    cmd.addVariable("ASSIGN_PAR", passOn(par, par.lin8cluster).c_str());
-    cmd.addVariable("EXPAND_PAR", passOn(par, par.lin8expand).c_str());
-    cmd.addVariable("CLUSTERDB_PAR", passOn(par, par.lin8merge).c_str());
+    cmd.addVariable("EXTRACT_PAR", passOn(par, par.lin8extractkmers).c_str());
+    cmd.addVariable("GROUP_PAR", passOn(par, par.lin8assignedpairs).c_str());
+    cmd.addVariable("PREF_PAR", passOn(par, par.lin8pref).c_str());
+    cmd.addVariable("ALIGN_PAR", passOn(par, par.lin8align2clust).c_str());
+    cmd.addVariable("ASSIGN_PAR", passOn(par, par.lin8align2clustmulti).c_str());
+    cmd.addVariable("EXPAND_PAR", passOn(par, par.lin8mergehashredundancy).c_str());
+    cmd.addVariable("CLUSTERDB_PAR", passOn(par, par.lin8createclusterdb).c_str());
     cmd.addVariable("TSV_PAR", passOn(par, par.lin8createtsv).c_str());
-    cmd.addVariable("REPSEQ_PAR", passOn(par, par.lin8repseq).c_str());
+    cmd.addVariable("REPSEQ_PAR", passOn(par, par.lin8createrepseqfasta).c_str());
 
     std::string program = tmpDir + "/lin8clust.sh";
     FileUtil::writeFile(program, lin8clust_sh, lin8clust_sh_len);

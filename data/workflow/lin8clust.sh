@@ -52,10 +52,9 @@ COV="${COV:-0.8}"
 COVMODE="${COVMODE:-0}"
 TSV="${TSV:-0}"
 REPSEQ="${REPSEQ:-0}"
-CLUSTHASH="${CLUSTHASH:-1}"
 WAIT_LIMIT="${WAIT_LIMIT:-86400}"
 
-mkdir -p "$TMP/kmer" "$TMP/pairs" "$TMP/pref" "$TMP/aligned" "$TMP/decided"
+mkdir -p "$TMP/kmer" "$TMP/pairs" "$TMP/pref" "$TMP/aln" "$TMP/clu_accepted"
 
 # The database is built in two rounds: a machine writes its own histogram, and once every machine
 # has, the next run of it places the sequences and whichever machine finds every part written
@@ -74,43 +73,41 @@ done
 
 # the same two rounds: a machine writes its shard, and once every machine has, the next run of it
 # merges them and publishes the bitmap
-_waited=0
-while notExists "$TMP/hash.valid"; do
-    notExists "$TMP/hash.$NODE.done" || [ "$NODES" -eq 1 ] && :
-    # shellcheck disable=SC2086
-    "$MMSEQS" lin8-clusthash "$TMP/db" "$TMP/hash" --node-count "$NODES" --node-id "$NODE" \
-        --clust-hash "$CLUSTHASH" \
-        --threads "$THREADS" ${HASH_PAR}
-    if notExists "$TMP/hash.valid"; then
-        [ "$_waited" -ge "$WAIT_LIMIT" ] && fail "waited ${WAIT_LIMIT}s for the redundancy pass"
-        sleep 1
-        _waited=$((_waited + 1))
-    fi
-done
+if [ -n "$CLUSTHASH" ]; then
+    _waited=0
+    while notExists "$TMP/db.clusthash_kept"; do
+        # shellcheck disable=SC2086
+        "$MMSEQS" lin8-clusthash "$TMP/db" "$TMP/hash" --node-count "$NODES" --node-id "$NODE" \
+            --threads "$THREADS" ${HASH_PAR}
+        if notExists "$TMP/db.clusthash_kept"; then
+            [ "$_waited" -ge "$WAIT_LIMIT" ] && fail "waited ${WAIT_LIMIT}s for the redundancy pass"
+            sleep 1
+            _waited=$((_waited + 1))
+        fi
+    done
 
-[ "$NODES" -gt 1 ] && waitForAll "$TMP/hash" "$NODES"
-
-VALID="--valid $TMP/hash.valid"
+    [ "$NODES" -gt 1 ] && waitForAll "$TMP/hash" "$NODES"
+fi
 
 # shellcheck disable=SC2086
 notExists "$TMP/kmer/out.$NODE.done" && \
-    "$MMSEQS" lin8-kmers "$TMP/db" "$TMP/kmer/out" --node-count "$NODES" --node-id "$NODE" \
-        --threads "$THREADS" --min-seq-id "$SEQID" $VALID ${EXTRACT_PAR}
+    "$MMSEQS" lin8-extractkmers "$TMP/db" "$TMP/kmer/out" --node-count "$NODES" --node-id "$NODE" \
+        --threads "$THREADS" --min-seq-id "$SEQID" ${EXTRACT_PAR}
 
 [ "$NODES" -gt 1 ] && waitForAll "$TMP/kmer/out" "$NODES"
 
 # shellcheck disable=SC2086
 notExists "$TMP/pairs/pairs.$NODE.done" && \
-    "$MMSEQS" lin8-pairs "$TMP/db" "$TMP/kmer/out" "$TMP/pairs/pairs" \
+    "$MMSEQS" lin8-assignedpairs "$TMP/db" "$TMP/kmer/out" "$TMP/pairs/pairs" \
         --node-count "$NODES" --node-id "$NODE" --threads "$THREADS" --rep-rank-blocks "$REP_RANK_BLOCKS" \
-        -c "$COV" --cov-mode "$COVMODE" $VALID ${GROUP_PAR}
+        -c "$COV" --cov-mode "$COVMODE" ${GROUP_PAR}
 
 [ "$NODES" -gt 1 ] && waitForAll "$TMP/pairs/pairs" "$NODES"
 
 # shellcheck disable=SC2086
 notExists "$TMP/pref/pref.$NODE.done" && \
     "$MMSEQS" lin8-pref "$TMP/pairs/pairs" "$TMP/db" "$TMP/pref/pref" \
-        --node-count "$NODES" --node-id "$NODE" --threads "$THREADS" $VALID ${FOLD_PAR}
+        --node-count "$NODES" --node-id "$NODE" --threads "$THREADS" ${PREF_PAR}
 
 [ "$NODES" -gt 1 ] && waitForAll "$TMP/pref/pref" "$NODES"
 
@@ -129,35 +126,33 @@ notExists "$TMP/pref/pref.$NODE.done" && \
 # representative in it already taken and write an empty repRankBlock over a full one.
 if [ "$NODES" -eq 1 ]; then
     # shellcheck disable=SC2086
-    notExists "$TMP/decided/decided.0.$((REP_RANK_BLOCKS - 1))" && \
-        "$MMSEQS" lin8-align "$TMP/db" "$TMP/pref/pref" "$TMP/aligned/aligned" \
-            --node-count 1 --node-id 0 --taken "$TMP/taken.0" \
-            --decided "$TMP/decided/decided" \
+    notExists "$TMP/clu_accepted/clu_accepted.0.$((REP_RANK_BLOCKS - 1))" && \
+        "$MMSEQS" lin8-align2clust "$TMP/db" "$TMP/pref/pref" "$TMP/aln/aln" \
+            "$TMP/clu_accepted/clu_accepted" --node-count 1 --node-id 0 \
             --threads "$THREADS" --min-seq-id "$SEQID" -c "$COV" --cov-mode "$COVMODE" \
-            $VALID ${ALIGN_PAR}
+            ${ALIGN_PAR}
     R="$REP_RANK_BLOCKS"
 else
     R=0
 fi
 while [ "$R" -lt "$REP_RANK_BLOCKS" ]; do
-    if notExists "$TMP/decided/decided.0.$R"; then
+    if notExists "$TMP/clu_accepted/clu_accepted.0.$R"; then
         # shellcheck disable=SC2086
-        notExists "$TMP/aligned/aligned.$R.$NODE.done" && \
-            "$MMSEQS" lin8-align "$TMP/db" "$TMP/pref/pref" "$TMP/aligned/aligned" \
-                --node-count "$NODES" --node-id "$NODE" --repRankBlock "$R" --taken "$TMP/taken.$NODE" \
-                --decided "$TMP/decided/decided" \
-                        --threads "$THREADS" --min-seq-id "$SEQID" -c "$COV" --cov-mode "$COVMODE" \
-                $VALID ${ALIGN_PAR}
+        notExists "$TMP/aln/aln.$R.$NODE.done" && \
+            "$MMSEQS" lin8-align2clust "$TMP/db" "$TMP/pref/pref" "$TMP/aln/aln" \
+                "$TMP/clu_accepted/clu_accepted" \
+                --node-count "$NODES" --node-id "$NODE" --rep-rank-block "$R" \
+                --threads "$THREADS" --min-seq-id "$SEQID" -c "$COV" --cov-mode "$COVMODE" \
+                ${ALIGN_PAR}
         if [ "$NODE" -eq 0 ]; then
-            [ "$NODES" -gt 1 ] && waitForAll "$TMP/aligned/aligned.$R" "$NODES"
+            [ "$NODES" -gt 1 ] && waitForAll "$TMP/aln/aln.$R" "$NODES"
             # shellcheck disable=SC2086
-            "$MMSEQS" lin8-cluster "$TMP/aligned/aligned" "$TMP/decided/decided" \
-                --repRankBlock "$R" --taken "$TMP/taken.assign" \
-                --pref "$TMP/pref/pref" ${ASSIGN_PAR}
+            "$MMSEQS" lin8-align2clustmulti "$TMP/aln/aln" "$TMP/pref/pref" \
+                "$TMP/clu_accepted/clu_accepted" --rep-rank-block "$R" ${ASSIGN_PAR}
         else
             # the next repRankBlock needs the bitmap this repRankBlock produced, so wait for it
             _waited=0
-            while notExists "$TMP/decided/decided.0.$R"; do
+            while notExists "$TMP/clu_accepted/clu_accepted.0.$R"; do
                 [ "$_waited" -ge "$WAIT_LIMIT" ] && fail "waited ${WAIT_LIMIT}s for repRankBlock $R to be decided"
                 sleep 1
                 _waited=$((_waited + 1))
@@ -167,19 +162,23 @@ while [ "$R" -lt "$REP_RANK_BLOCKS" ]; do
     R=$((R + 1))
 done
 
-# The sequences the redundancy pass folded away go back in on the pair stream, which is the form
+# The sequences the redundancy pass set aside go back in on the pair stream, which is the form
 # that scales, and the clustering database is made from that. A database has an index entry a
 # representative, which at a trillion sequences is tens of terabytes of index that nothing here
 # looks anything up in, so at that size the pair stream is the output and this last step is skipped.
 if [ "$NODE" -eq 0 ]; then
-    mkdir -p "$TMP/expanded"
-    # shellcheck disable=SC2086
-    notExists "$TMP/expanded/expanded" && \
-        "$MMSEQS" lin8-expand "$TMP/decided/decided" "$TMP/hash" "$TMP/expanded/expanded" \
-            ${EXPAND_PAR}
+    CLUDB="$TMP/clu_accepted/clu_accepted"
+    if [ -n "$CLUSTHASH" ]; then
+        mkdir -p "$TMP/clu_accepted_plus_redundant"
+        # shellcheck disable=SC2086
+        notExists "$TMP/clu_accepted_plus_redundant/clu_accepted_plus_redundant" && \
+            "$MMSEQS" lin8-mergehashredundancy "$CLUDB" "$TMP/hash" \
+                "$TMP/clu_accepted_plus_redundant/clu_accepted_plus_redundant" ${EXPAND_PAR}
+        CLUDB="$TMP/clu_accepted_plus_redundant/clu_accepted_plus_redundant"
+    fi
     # shellcheck disable=SC2086
     notExists "$OUT.dbtype" && \
-        "$MMSEQS" lin8-merge "$TMP/expanded/expanded" "$OUT" ${CLUSTERDB_PAR}
+        "$MMSEQS" lin8-createclusterdb "$CLUDB" "$OUT" ${CLUSTERDB_PAR}
 
     # createtsv cannot read a run table database, which has no per entry index to open, so the naming
     # is its own pass. At a trillion sequences the names are tens of terabytes nothing looks up, so it
@@ -190,17 +189,17 @@ if [ "$NODE" -eq 0 ]; then
 
     # shellcheck disable=SC2086
     [ "$REPSEQ" -eq 1 ] && notExists "$OUT.rep.fasta" && \
-        "$MMSEQS" lin8-repseq "$TMP/db" "$OUT" "$OUT.rep.fasta" ${REPSEQ_PAR}
+        "$MMSEQS" lin8-createrepseqfasta "$TMP/db" "$OUT" "$OUT.rep.fasta" ${REPSEQ_PAR}
 fi
 
 # The passes drop what they have finished reading as they go, so what is left here is what a rerun
 # would have needed. Every machine clears its own, and the last of them takes the directories.
 if [ -n "$REMOVE_TMP" ]; then
-    rm -f "$TMP/taken.$NODE" "$TMP/kmer/out.$NODE."* "$TMP/pairs/pairs.$NODE."* \
-          "$TMP/pref/pref.$NODE."* "$TMP/aligned/aligned."*".$NODE"*
+    rm -f "$TMP/clu_accepted/clu_accepted.align_assigned_$NODE" "$TMP/kmer/out.$NODE."* "$TMP/pairs/pairs.$NODE."* \
+          "$TMP/pref/pref.$NODE."* "$TMP/aln/aln."*".$NODE"*
     if [ "$NODE" -eq 0 ]; then
-        rm -f "$TMP/taken.assign"
-        rm -rf "$TMP/kmer" "$TMP/pairs" "$TMP/pref" "$TMP/aligned" "$TMP/decided" "$TMP/expanded"
+        rm -rf "$TMP/kmer" "$TMP/pairs" "$TMP/pref" "$TMP/aln" "$TMP/clu_accepted" \
+               "$TMP/clu_accepted_plus_redundant"
         # The sequence database stays unless the clustering has already been named: a cluster is named
         # by rank, so what maps a rank to a name is part of the answer until the answer carries it.
         rm -f "$TMP/hash" "$TMP/hash."* "$TMP/lin8clust.sh"

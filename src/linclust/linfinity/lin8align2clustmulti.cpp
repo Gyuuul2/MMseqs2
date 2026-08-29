@@ -13,7 +13,7 @@
 static void readPipelineShape(const std::string &path, unsigned int &nodes, size_t &repRankBlocks, uint64_t &ranks) {
     FILE *in = fopen(path.c_str(), "r");
     if (in == NULL) {
-        Debug(Debug::ERROR) << "Cannot open " << path << ". Run lin8align first\n";
+        Debug(Debug::ERROR) << "Cannot open " << path << ". Run lin8-align2clust first\n";
         EXIT(EXIT_FAILURE);
     }
     nodes = 0;
@@ -56,7 +56,7 @@ static void readRepRankBlock(const std::string &prefix, unsigned int nodes, size
     }
 }
 
-int lin8cluster(int argc, const char **argv, const Command &command) {
+int lin8align2clustmulti(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
@@ -76,10 +76,11 @@ int lin8cluster(int argc, const char **argv, const Command &command) {
     }
 
     RankBitmap taken;
-    taken.open(par.linclustTaken, ranks);
-    taken.catchUpTo(par.db2, firstRepRankBlock);
+    // beside the accepted pairs, the same place the aligning half keeps its own
+    taken.open(par.db3 + ".cluster_assigned", ranks);
+    taken.catchUpTo(par.db3, firstRepRankBlock);
 
-    const std::string outPath = par.db2 + ".0." + SSTR(firstRepRankBlock);
+    const std::string outPath = par.db3 + ".0." + SSTR(firstRepRankBlock);
     const std::string outTmp = outPath + ".tmp";
     FILE *out = FileUtil::openAndDelete(outTmp.c_str(), "w");
 
@@ -139,20 +140,20 @@ int lin8cluster(int argc, const char **argv, const Command &command) {
     FileUtil::publishAtomically(outTmp, outPath);
     // the decisions are on disk now, so the cache may name the repRankBlocks that made them
     taken.save(lastRepRankBlock);
-    if (par.linclustPref.empty() == false && par.removeTmpFiles) {
+    if (par.removeTmpFiles) {
         for (size_t repRankBlock = firstRepRankBlock; repRankBlock < lastRepRankBlock; repRankBlock++) {
-            dropConsumed(par.linclustPref, alignNodes, repRankBlock, repRankBlock + 1, 1);
+            dropConsumed(par.db2, alignNodes, repRankBlock, repRankBlock + 1, 1);
         }
     }
 
-    const std::string shapeTmp = par.db2 + "." + SSTR(firstRepRankBlock) + ".shape.tmp";
+    const std::string shapeTmp = par.db3 + "." + SSTR(firstRepRankBlock) + ".shape.tmp";
     FILE *shape = FileUtil::openAndDelete(shapeTmp.c_str(), "w");
     fprintf(shape, "repRankBlocks\t%zu\nranks\t%zu\n", repRankBlocks, (size_t) ranks);
     if (fclose(shape) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << shapeTmp << "\n";
         EXIT(EXIT_FAILURE);
     }
-    FileUtil::publishAtomically(shapeTmp, par.db2);
+    FileUtil::publishAtomically(shapeTmp, par.db3);
 
     Debug(Debug::INFO) << "Made " << clusters << " clusters holding " << (clusters + assigned)
                        << " sequences in " << timer.lap() << "\n";

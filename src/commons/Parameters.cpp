@@ -298,10 +298,6 @@ Parameters::Parameters():
         PARAM_LINCLUSTERDB_NODE_COUNT(PARAM_LINCLUSTERDB_NODE_COUNT_ID, "--node-count", "Node count", "Number of nodes when no node list is given", typeid(int), (void *) &linclusterdbNodeCount, "^[0-9]+$", MMseqsParameter::COMMAND_COMMON),
         PARAM_LIN8_REP_RANK_BLOCKS(PARAM_LIN8_REP_RANK_BLOCKS_ID, "--rep-rank-blocks", "Representative rank blocks", "How many blocks of representative ranks the candidate pairs are routed into. A block is what a later pass holds at once, and the blocks are decided in order, so this sets both the memory one of them needs and how much of the greedy skip survives", typeid(int), (void *) &lin8RepRankBlocks, "^[1-9][0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_LIN8_REP_RANK_BLOCK(PARAM_LIN8_REP_RANK_BLOCK_ID, "--rep-rank-block", "Representative rank block", "Which block of representative ranks this invocation works on", typeid(int), (void *) &lin8RepRankBlock, "^-?[0-9]+$", MMseqsParameter::COMMAND_COMMON),
-        PARAM_LINCLUST_PREF(PARAM_LINCLUST_PREF_ID, "--pref", "Prefilter pairs", "The pairs the k-mer passes raised, which is what the aligning pass reads", typeid(std::string), (void *) &linclustPref, "", MMseqsParameter::COMMAND_COMMON),
-        PARAM_LINCLUST_DECIDED(PARAM_LINCLUST_DECIDED_ID, "--decided", "Decided pairs", "Where the deciding pass puts what it decided, so this pass brings its own bitmap up to date from the repRankBlocks before its own", typeid(std::string), (void *) &linclustDecided, "", MMseqsParameter::COMMAND_COMMON),
-        PARAM_LINCLUST_TAKEN(PARAM_LINCLUST_TAKEN_ID, "--taken", "Taken bitmap", "Bitmap of the sequences already in a cluster, carried between the repRankBlocks so a later representative can skip what an earlier one took", typeid(std::string), (void *) &linclustTaken, "", MMseqsParameter::COMMAND_COMMON),
-        PARAM_LINCLUSTHASH_VALID(PARAM_LINCLUSTHASH_VALID_ID, "--valid", "Valid bitmap", "Bitmap of the sequences a previous round left, empty means all of them", typeid(std::string), (void *) &linclusthashValid, "", MMseqsParameter::COMMAND_COMMON),
         PARAM_WRITE_LOOKUP(PARAM_WRITE_LOOKUP_ID, "--write-lookup", "Write lookup file", "write .lookup file containing mapping from internal id, fasta id and file number", typeid(int), (void *) &writeLookup, "^[0-1]{1}", MMseqsParameter::COMMAND_EXPERT),
         PARAM_FASTA_SPLITS(PARAM_FASTA_SPLITS_ID, "--fasta-splits", "FASTA splits", "Write this many FASTA files instead of one (entry i to file i mod N). 0: single file", typeid(int), (void *) &fastaSplits, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_HEADER_FILE(PARAM_USE_HEADER_FILE_ID, "--use-header-file", "Use header DB", "use the sequence header DB instead of the body to map the entry keys", typeid(bool), (void *) &useHeaderFile, ""),
@@ -1007,8 +1003,6 @@ Parameters::Parameters():
     lin8clusthash.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
     lin8clusthash.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
     lin8clusthash.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
-    lin8clusthash.push_back(&PARAM_CLUST_HASH);
-    lin8clusthash.push_back(&PARAM_LINCLUSTHASH_VALID);
     lin8clusthash.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     lin8clusthash.push_back(&PARAM_ALPH_SIZE);
     lin8clusthash.push_back(&PARAM_MIN_SEQ_ID);
@@ -1016,38 +1010,35 @@ Parameters::Parameters():
     lin8clusthash.push_back(&PARAM_THREADS);
     lin8clusthash.push_back(&PARAM_V);
 
-    lin8kmers.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
-    lin8kmers.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
-    lin8kmers.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
-    lin8kmers.push_back(&PARAM_LINCLUSTHASH_VALID);
-    lin8kmers.push_back(&PARAM_MIN_SEQ_ID);
-    lin8kmers.push_back(&PARAM_K);
-    lin8kmers.push_back(&PARAM_ALPH_SIZE);
-    lin8kmers.push_back(&PARAM_KMER_PER_SEQ);
-    lin8kmers.push_back(&PARAM_KMER_PER_SEQ_SCALE);
-    lin8kmers.push_back(&PARAM_MASK_LOWER_CASE);
-    lin8kmers.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
-    lin8kmers.push_back(&PARAM_SUB_MAT);
-    lin8kmers.push_back(&PARAM_THREADS);
-    lin8kmers.push_back(&PARAM_V);
+    lin8extractkmers.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
+    lin8extractkmers.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
+    lin8extractkmers.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
+    lin8extractkmers.push_back(&PARAM_MIN_SEQ_ID);
+    lin8extractkmers.push_back(&PARAM_K);
+    lin8extractkmers.push_back(&PARAM_ALPH_SIZE);
+    lin8extractkmers.push_back(&PARAM_KMER_PER_SEQ);
+    lin8extractkmers.push_back(&PARAM_KMER_PER_SEQ_SCALE);
+    lin8extractkmers.push_back(&PARAM_MASK_LOWER_CASE);
+    lin8extractkmers.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8extractkmers.push_back(&PARAM_SUB_MAT);
+    lin8extractkmers.push_back(&PARAM_THREADS);
+    lin8extractkmers.push_back(&PARAM_V);
 
-    lin8pairs.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
-    lin8pairs.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
-    lin8pairs.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
-    lin8pairs.push_back(&PARAM_LINCLUSTHASH_VALID);
-    lin8pairs.push_back(&PARAM_LIN8_REP_RANK_BLOCKS);
-    lin8pairs.push_back(&PARAM_C);
-    lin8pairs.push_back(&PARAM_COV_MODE);
-    lin8pairs.push_back(&PARAM_INCLUDE_ONLY_EXTENDABLE);
-    lin8pairs.push_back(&PARAM_SUB_MAT);
-    lin8pairs.push_back(&PARAM_INCLUDE_ADJACENCY);
-    lin8pairs.push_back(&PARAM_NUM_ADJACENCY);
-    lin8pairs.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
-    lin8pairs.push_back(&PARAM_THREADS);
-    lin8pairs.push_back(&PARAM_REMOVE_TMP_FILES);
-    lin8pairs.push_back(&PARAM_V);
+    lin8assignedpairs.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
+    lin8assignedpairs.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
+    lin8assignedpairs.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
+    lin8assignedpairs.push_back(&PARAM_LIN8_REP_RANK_BLOCKS);
+    lin8assignedpairs.push_back(&PARAM_C);
+    lin8assignedpairs.push_back(&PARAM_COV_MODE);
+    lin8assignedpairs.push_back(&PARAM_INCLUDE_ONLY_EXTENDABLE);
+    lin8assignedpairs.push_back(&PARAM_SUB_MAT);
+    lin8assignedpairs.push_back(&PARAM_INCLUDE_ADJACENCY);
+    lin8assignedpairs.push_back(&PARAM_NUM_ADJACENCY);
+    lin8assignedpairs.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8assignedpairs.push_back(&PARAM_THREADS);
+    lin8assignedpairs.push_back(&PARAM_REMOVE_TMP_FILES);
+    lin8assignedpairs.push_back(&PARAM_V);
 
-    lin8pref.push_back(&PARAM_LINCLUSTHASH_VALID);
     lin8pref.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
     lin8pref.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
     lin8pref.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
@@ -1056,51 +1047,46 @@ Parameters::Parameters():
     lin8pref.push_back(&PARAM_REMOVE_TMP_FILES);
     lin8pref.push_back(&PARAM_V);
 
-    lin8align.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
-    lin8align.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
-    lin8align.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
-    lin8align.push_back(&PARAM_MIN_SEQ_ID);
-    lin8align.push_back(&PARAM_SEQ_ID_MODE);
-    lin8align.push_back(&PARAM_C);
-    lin8align.push_back(&PARAM_COV_MODE);
-    lin8align.push_back(&PARAM_E);
-    lin8align.push_back(&PARAM_MIN_ALN_LEN);
-    lin8align.push_back(&PARAM_GAP_OPEN);
-    lin8align.push_back(&PARAM_GAP_EXTEND);
-    lin8align.push_back(&PARAM_NO_COMP_BIAS_CORR);
-    lin8align.push_back(&PARAM_SUB_MAT);
-    lin8align.push_back(&PARAM_SCORE_BIAS);
-    lin8align.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
-    lin8align.push_back(&PARAM_THREADS);
-    lin8align.push_back(&PARAM_LIN8_REP_RANK_BLOCK);
-    lin8align.push_back(&PARAM_LINCLUST_TAKEN);
-    lin8align.push_back(&PARAM_LINCLUST_DECIDED);
-    lin8align.push_back(&PARAM_LINCLUSTHASH_VALID);
-    lin8align.push_back(&PARAM_REMOVE_TMP_FILES);
-    lin8align.push_back(&PARAM_V);
+    lin8align2clust.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
+    lin8align2clust.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
+    lin8align2clust.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
+    lin8align2clust.push_back(&PARAM_MIN_SEQ_ID);
+    lin8align2clust.push_back(&PARAM_SEQ_ID_MODE);
+    lin8align2clust.push_back(&PARAM_C);
+    lin8align2clust.push_back(&PARAM_COV_MODE);
+    lin8align2clust.push_back(&PARAM_E);
+    lin8align2clust.push_back(&PARAM_MIN_ALN_LEN);
+    lin8align2clust.push_back(&PARAM_GAP_OPEN);
+    lin8align2clust.push_back(&PARAM_GAP_EXTEND);
+    lin8align2clust.push_back(&PARAM_NO_COMP_BIAS_CORR);
+    lin8align2clust.push_back(&PARAM_SUB_MAT);
+    lin8align2clust.push_back(&PARAM_SCORE_BIAS);
+    lin8align2clust.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8align2clust.push_back(&PARAM_THREADS);
+    lin8align2clust.push_back(&PARAM_LIN8_REP_RANK_BLOCK);
+    lin8align2clust.push_back(&PARAM_REMOVE_TMP_FILES);
+    lin8align2clust.push_back(&PARAM_V);
 
-    lin8cluster.push_back(&PARAM_LIN8_REP_RANK_BLOCK);
-    lin8cluster.push_back(&PARAM_LINCLUST_TAKEN);
-    lin8cluster.push_back(&PARAM_LINCLUST_PREF);
+    lin8align2clustmulti.push_back(&PARAM_LIN8_REP_RANK_BLOCK);
     lin8createtsv.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     lin8createtsv.push_back(&PARAM_THREADS);
     lin8createtsv.push_back(&PARAM_V);
 
-    lin8repseq = lin8createtsv;
-    lin8repseq.push_back(&PARAM_FASTA_SPLITS);
+    lin8createrepseqfasta = lin8createtsv;
+    lin8createrepseqfasta.push_back(&PARAM_FASTA_SPLITS);
 
-    lin8expand.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
-    lin8expand.push_back(&PARAM_THREADS);
-    lin8expand.push_back(&PARAM_V);
+    lin8mergehashredundancy.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8mergehashredundancy.push_back(&PARAM_THREADS);
+    lin8mergehashredundancy.push_back(&PARAM_V);
 
-    lin8merge.push_back(&PARAM_COMPRESSED);
-    lin8merge.push_back(&PARAM_THREADS);
-    lin8merge.push_back(&PARAM_V);
+    lin8createclusterdb.push_back(&PARAM_COMPRESSED);
+    lin8createclusterdb.push_back(&PARAM_THREADS);
+    lin8createclusterdb.push_back(&PARAM_V);
 
-    lin8cluster.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
-    lin8cluster.push_back(&PARAM_THREADS);
-    lin8cluster.push_back(&PARAM_REMOVE_TMP_FILES);
-    lin8cluster.push_back(&PARAM_V);
+    lin8align2clustmulti.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8align2clustmulti.push_back(&PARAM_THREADS);
+    lin8align2clustmulti.push_back(&PARAM_REMOVE_TMP_FILES);
+    lin8align2clustmulti.push_back(&PARAM_V);
 
     // makepaddedseqdb
     makepaddedseqdb.push_back(&PARAM_SUB_MAT);
@@ -3056,12 +3042,8 @@ void Parameters::setDefaults() {
     linclusterdbNodeList = "";
     linclusterdbNodeId = -1;
     linclusterdbNodeCount = 1;
-    linclusthashValid = "";
     lin8RepRankBlock = -1;
     lin8RepRankBlocks = (int) PairRecord::DEFAULT_REP_RANK_BLOCKS;
-    linclustTaken = "";
-    linclustDecided = "";
-    linclustPref = "";
     writeLookup = true;
 
     // format alignment

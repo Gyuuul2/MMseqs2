@@ -51,8 +51,11 @@ public:
         size_t at;
     };
 
-    RunDbReader(const std::string &db, const std::string &validPath = "",
-                bool withHeaders = false);
+    // The redundancy pass leaves its bitmap beside the database it describes, the way an index or a
+    // lookup sits beside it, so every later pass finds it without being told where it is.
+    static const char *KEPT_BITMAP_SUFFIX;
+
+    RunDbReader(const std::string &db, bool withHeaders = false);
     ~RunDbReader();
 
     void open();
@@ -69,8 +72,14 @@ public:
     const char *getData(uint64_t rank, Cursor &cursor) const;
 
     void openBatch(unsigned int threads, size_t arenaBytes, size_t memoryBudget);
-    size_t loadBatch(const uint64_t *ranks, size_t n, unsigned int thread) const;
-    const char *batchAt(unsigned int thread, size_t k) const;
+
+    // Reads the query and as many of the members as the arena holds, in one submission, and answers
+    // how many members that was. The query rides along with every batch rather than being fetched on
+    // its own, so it stays valid while the members it is compared against come and go, and it costs
+    // no separate round trip to the disk.
+    size_t loadBatch(uint64_t queryRank, const uint64_t *members, size_t n, unsigned int thread) const;
+    const char *batchQueryAt(unsigned int thread) const;
+    const char *batchAt(unsigned int thread, size_t member) const;
 
     bool isValid(uint64_t rank) const;
     uint64_t countValid() const;
@@ -94,35 +103,25 @@ public:
     };
 
 private:
-    struct BatchSlot {
-        size_t arenaOffset;
-        size_t length;
-    };
-    struct BatchRead {
-        size_t arenaOffset;
-        uint32_t file;
-        uint64_t offset;
-        size_t length;
-        size_t required;
-    };
     struct BatchWorker {
         std::vector<char> arena;
         char *aligned;
-        std::vector<BatchSlot> slots;
-        std::vector<BatchRead> reads;
+        const char *queryAt;
+        std::vector<const char *> memberAt;
+        std::vector<IoRing::Read> reads;
         IoRing ring;
-        BatchWorker() : aligned(NULL) {}
+        BatchWorker() : aligned(NULL), queryAt(NULL) {}
     };
     // pointers, because a worker owns a ring and a ring is not copyable
     mutable std::vector<BatchWorker *> batch;
 
+    bool appendBatchRead(BatchWorker &worker, uint64_t rank, Cursor &cursor, const char *&at) const;
     int directOf(uint32_t file) const;
     const char *fileData(uint32_t file, uint64_t offset) const;
     void mapFile(uint32_t file) const;
     void mapHeader(uint32_t file) const;
 
     std::string db;
-    std::string validPath;
     bool withHeaders;
     RunTable runs;
     mutable std::vector<char *> data;

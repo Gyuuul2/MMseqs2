@@ -225,7 +225,7 @@ size_t KmerExtractor::extract(const char *letters, size_t length,
     return keptScore.size();
 }
 
-// ---- lin8kmers ----
+// ---- lin8extractkmers ----
 #ifdef OPENMP
 #endif
 
@@ -373,7 +373,7 @@ static void setKmerLengthAndAlphabet(Parameters &par, uint64_t residues) {
     }
 }
 
-int lin8kmers(int argc, const char **argv, const Command &command) {
+int lin8extractkmers(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.kmerSize = 0;
     par.alphabetSize = MultiParam<NuclAA<int> >(NuclAA<int>(0, 5));
@@ -383,7 +383,7 @@ int lin8kmers(int argc, const char **argv, const Command &command) {
     FileUtil::fixRlimitNoFile();
 
     const NodePlacement node = NodePlacement::resolve(par);
-    RunDbReader reader(par.db1, par.linclusthashValid);
+    RunDbReader reader(par.db1);
     reader.open();
     setKmerLengthAndAlphabet(par, reader.getTotalBytes());
 
@@ -480,7 +480,7 @@ int lin8kmers(int argc, const char **argv, const Command &command) {
     return EXIT_SUCCESS;
 }
 
-// ---- lin8pairs ----
+// ---- lin8assignedpairs ----
 #ifdef OPENMP
 #endif
 
@@ -491,7 +491,7 @@ static void readKmerBucketShape(const std::string &path, unsigned int &nodes, si
                       uint64_t &ranks) {
     FILE *in = fopen(path.c_str(), "r");
     if (in == NULL) {
-        Debug(Debug::ERROR) << "Cannot open " << path << ". Run lin8kmers first\n";
+        Debug(Debug::ERROR) << "Cannot open " << path << ". Run lin8extractkmers first\n";
         EXIT(EXIT_FAILURE);
     }
     nodes = 0;
@@ -725,13 +725,13 @@ static std::vector<size_t> setupThreadOffsets(const RawArray<KmerRecord> &record
     return threadOffsets;
 }
 
-int lin8pairs(int argc, const char **argv, const Command &command) {
+int lin8assignedpairs(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
     FileUtil::fixRlimitNoFile();
     const NodePlacement node = NodePlacement::resolve(par);
-    RunDbReader reader(par.db1, par.linclusthashValid);
+    RunDbReader reader(par.db1);
     reader.open();
     unsigned int writerNodes = 0;
     size_t buckets = 0;
@@ -807,7 +807,7 @@ int lin8pairs(int argc, const char **argv, const Command &command) {
         const std::vector<size_t> starts =
             loadBucket(par.db2, bucketCounts, writerNodes, bucket, KmerRecord::SUB_BUCKET_COUNT,
                        BySubBucket(), budget - writer.bytesHeld(), par.threads, "Bucket",
-                       "build with more buckets", "lin8-kmers", records);
+                       "build with more buckets", "lin8-extractkmers", records);
         spentReading += omp_get_wtime() - mark;
         mark = omp_get_wtime();
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
@@ -908,7 +908,7 @@ static void readRepRankBlockShape(const std::string &path, unsigned int &nodes, 
                       uint64_t &ranks) {
     FILE *in = fopen(path.c_str(), "r");
     if (in == NULL) {
-        Debug(Debug::ERROR) << "Cannot open " << path << ". Run lin8pairs first\n";
+        Debug(Debug::ERROR) << "Cannot open " << path << ". Run lin8assignedpairs first\n";
         EXIT(EXIT_FAILURE);
     }
     nodes = 0;
@@ -944,7 +944,7 @@ static void pickBestDiagonal(const PairRecord *run, size_t size, PairRecord &out
 
 static void addRanksWithNoRows(uint64_t from, uint64_t until,
                                const std::vector<std::vector<PairRecord> > &rows,
-                               const RunDbReader *live, std::vector<PairRecord> &out) {
+                               const RunDbReader &live, std::vector<PairRecord> &out) {
     size_t piece = 0;
     size_t at = 0;
     for (uint64_t rank = from; rank < until; rank++) {
@@ -961,7 +961,7 @@ static void addRanksWithNoRows(uint64_t from, uint64_t until,
         if (piece < rows.size() && rows[piece][at].rep() == rank) {
             continue;
         }
-        if (live != NULL && live->isValid(rank) == false) {
+        if (live.isValid(rank) == false) {
             continue;
         }
         PairRecord alone;
@@ -970,16 +970,16 @@ static void addRanksWithNoRows(uint64_t from, uint64_t until,
     }
 }
 
-static void foldRepRankSubBlock(const PairRecord *pairs, size_t size, std::vector<PairRecord> &out) {
+static void keepBestPairPerMember(const PairRecord *pairs, size_t size, std::vector<PairRecord> &out) {
     size_t at = 0;
     while (at < size) {
         size_t end = at + 1;
         while (end < size && PairRecord::sameRepAndMember(pairs[at], pairs[end])) {
             end++;
         }
-        PairRecord folded;
-        pickBestDiagonal(pairs + at, end - at, folded);
-        out.push_back(folded);
+        PairRecord best;
+        pickBestDiagonal(pairs + at, end - at, best);
+        out.push_back(best);
         at = end;
     }
 }
@@ -998,11 +998,10 @@ int lin8pref(int argc, const char **argv, const Command &command) {
     requireEveryNodeDone(par.db1, writerNodes);
     const BucketCounts repRankBlockCounts(par.db1, writerNodes, PairRecord::REP_RANK_SUB_BLOCKS, repRankBlocks);
 
-    RunDbReader *live = NULL;
-    if (par.linclusthashValid.empty() == false) {
-        live = new RunDbReader(par.db2, par.linclusthashValid);
-        live->open();
-    }
+    // an absent bitmap makes every rank valid, so the reader answers for both cases and there is
+    // nothing here to be null
+    RunDbReader live(par.db2);
+    live.open();
 
     const size_t outEntries = repRankBlocks * PairRecord::REP_RANK_SUB_BLOCKS;
     const std::string outCounts = par.db3 + "." + SSTR(node.index) + ".counts";
@@ -1023,7 +1022,7 @@ int lin8pref(int argc, const char **argv, const Command &command) {
     std::vector<std::pair<std::string, std::string> > pending;
     size_t pendingFirst = node.index;
     uint64_t pendingBytes = 0;
-    std::vector<std::vector<PairRecord> > folded(PairRecord::REP_RANK_SUB_BLOCKS);
+    std::vector<std::vector<PairRecord> > bestPairs(PairRecord::REP_RANK_SUB_BLOCKS);
     std::vector<PairRecord> alone;
     std::vector<size_t> aloneAt(PairRecord::REP_RANK_SUB_BLOCKS + 1, 0);
     std::vector<size_t> outAt(PairRecord::REP_RANK_SUB_BLOCKS + 1, 0);
@@ -1033,7 +1032,7 @@ int lin8pref(int argc, const char **argv, const Command &command) {
         const std::vector<size_t> starts =
             loadBucket(par.db1, repRankBlockCounts, writerNodes, repRankBlock, PairRecord::REP_RANK_SUB_BLOCKS,
                        ByRepRankSubBlock(ranks, repRankBlocks), budget, par.threads, "Representative rank block", "raise --rep-rank-blocks",
-                       "lin8-pairs", pairs);
+                       "lin8-assignedpairs", pairs);
         read += pairs.size();
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
         for (size_t i = 0; i < PairRecord::REP_RANK_SUB_BLOCKS; i++) {
@@ -1043,13 +1042,13 @@ int lin8pref(int argc, const char **argv, const Command &command) {
 
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
         for (size_t i = 0; i < PairRecord::REP_RANK_SUB_BLOCKS; i++) {
-            folded[i].clear();
-            foldRepRankSubBlock(pairs.begin() + starts[i], starts[i + 1] - starts[i], folded[i]);
+            bestPairs[i].clear();
+            keepBestPairPerMember(pairs.begin() + starts[i], starts[i + 1] - starts[i], bestPairs[i]);
         }
 
         alone.clear();
         addRanksWithNoRows(PairRecord::firstRankOf(repRankBlock, ranks, repRankBlocks),
-                           PairRecord::firstRankOf(repRankBlock + 1, ranks, repRankBlocks), folded, live, alone);
+                           PairRecord::firstRankOf(repRankBlock + 1, ranks, repRankBlocks), bestPairs, live, alone);
 
         {
             size_t at = 0;
@@ -1066,7 +1065,7 @@ int lin8pref(int argc, const char **argv, const Command &command) {
         std::vector<uint64_t> &outCount = outRepRankSubBlock[0];
         outAt[0] = 0;
         for (size_t i = 0; i < PairRecord::REP_RANK_SUB_BLOCKS; i++) {
-            const size_t mine = folded[i].size() + (aloneAt[i + 1] - aloneAt[i]);
+            const size_t mine = bestPairs[i].size() + (aloneAt[i + 1] - aloneAt[i]);
             outAt[i + 1] = outAt[i] + mine;
             outCount[repRankBlock * PairRecord::REP_RANK_SUB_BLOCKS + i] = mine;
         }
@@ -1093,11 +1092,11 @@ int lin8pref(int argc, const char **argv, const Command &command) {
             size_t wrote = 0;
             size_t row = 0;
             size_t next = aloneAt[i];
-            while (row < folded[i].size()) {
-                while (next < aloneAt[i + 1] && alone[next].rep() < folded[i][row].rep()) {
+            while (row < bestPairs[i].size()) {
+                while (next < aloneAt[i + 1] && alone[next].rep() < bestPairs[i][row].rep()) {
                     alone[next++].pack(&into[wrote++ * PairRecord::DISK_BYTES]);
                 }
-                folded[i][row++].pack(&into[wrote++ * PairRecord::DISK_BYTES]);
+                bestPairs[i][row++].pack(&into[wrote++ * PairRecord::DISK_BYTES]);
             }
             while (next < aloneAt[i + 1]) {
                 alone[next++].pack(&into[wrote++ * PairRecord::DISK_BYTES]);
@@ -1145,10 +1144,7 @@ int lin8pref(int argc, const char **argv, const Command &command) {
     }
     FileUtil::publishAtomically(shapeTmp, par.db3);
     markNodeDone(par.db3, node.index);
-    if (live != NULL) {
-        live->close();
-        delete live;
-    }
+    live.close();
     Debug(Debug::INFO) << "Read " << read << " pairs, kept " << kept << " in " << timer.lap() << "\n";
     return EXIT_SUCCESS;
 }

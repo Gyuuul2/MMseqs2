@@ -56,21 +56,21 @@ static void readPipelineShape(const std::string &path, unsigned int &nodes, size
     ranks = seen;
     if (read == false || nodes == 0 || repRankBlocks == 0 || repRankBlocks > PairRecord::MAX_REP_RANK_BLOCKS) {
         Debug(Debug::ERROR) << path << " names " << nodes << " nodes and " << repRankBlocks
-                            << " repRankBlocks, which is not a set of folded pairs\n";
+                            << " repRankBlocks, which is not a set of prefilter pairs\n";
         EXIT(EXIT_FAILURE);
     }
 }
 
 class RepRankBlockReader {
 public:
-    RepRankBlockReader(const std::string &prefix, unsigned int foldNodes, size_t repRankBlock, size_t bufferRows,
+    RepRankBlockReader(const std::string &prefix, unsigned int prefNodes, size_t repRankBlock, size_t bufferRows,
                 uint64_t skipRows)
         : buffer(bufferRows), at(0), filled(0), stopped(false) {
         const std::string path =
-            prefix + "." + SSTR(repRankBlock % foldNodes) + "." + SSTR(repRankBlock);
+            prefix + "." + SSTR(repRankBlock % prefNodes) + "." + SSTR(repRankBlock);
         file = fopen(path.c_str(), "r");
         if (file == NULL) {
-            Debug(Debug::ERROR) << "Cannot open " << path << ", which node " << (repRankBlock % foldNodes)
+            Debug(Debug::ERROR) << "Cannot open " << path << ", which node " << (repRankBlock % prefNodes)
                                 << " should have written for repRankBlock " << repRankBlock << "\n";
             EXIT(EXIT_FAILURE);
         }
@@ -269,13 +269,11 @@ static bool rescueWithGaps(uint64_t member, uint32_t queryLen, uint32_t targetLe
 static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, const PairRecord *rows, size_t count,
                        const RankBitmap &taken, Sequence &query, Sequence &target,
                        BlockAligner &aligner, const Parameters &par, unsigned int thread,
-                       Candidates &candidates, std::vector<uint64_t> &out, GateCounts &gate,
-                       float scorePerColThreshold, int xDrop) {
+                       Candidates &candidates,
+                       std::vector<uint64_t> &out, GateCounts &gate, float scorePerColThreshold,
+                       int xDrop) {
     candidates.clear();
     const uint32_t queryLen = reader.getSeqLen(rep);
-    const char *querySeq = reader.getData(rep);
-    query.mapSequence(0, 0, (char *) querySeq, queryLen);
-    aligner.initQuery(&query);
 
     for (size_t i = 0; i < count; i++) {
         const uint64_t member = rows[i].member();
@@ -291,12 +289,11 @@ static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, const Pair
 
     size_t from = 0;
     while (from < candidates.members.size()) {
-        const size_t got = reader.loadBatch(candidates.members.data() + from,
+        const size_t got = reader.loadBatch(rep, candidates.members.data() + from,
                                             candidates.members.size() - from, thread);
-        if (got == 0) {
-            Debug(Debug::ERROR) << "A single sequence does not fit the read arena\n";
-            EXIT(EXIT_FAILURE);
-        }
+        const char *querySeq = reader.batchQueryAt(thread);
+        query.mapSequence(0, 0, (char *) querySeq, queryLen);
+        aligner.initQuery(&query);
         for (size_t k = 0; k < got; k++) {
             const uint64_t member = candidates.members[from + k];
             const uint32_t targetLen = reader.getSeqLen(member);
@@ -337,7 +334,7 @@ static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, const Pair
     }
 }
 
-int lin8align(int argc, const char **argv, const Command &command) {
+int lin8align2clust(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
@@ -349,14 +346,14 @@ int lin8align(int argc, const char **argv, const Command &command) {
     readPipelineShape(par.db2, writerNodes, repRankBlocks, ranks);
     requireEveryNodeDone(par.db2, writerNodes);
 
-    RunDbReader reader(par.db1, par.linclusthashValid);
+    RunDbReader reader(par.db1);
     reader.open();
     if (reader.getSize() != ranks) {
         Debug(Debug::ERROR) << "The database holds " << reader.getSize()
                             << " sequences and the pairs were made for " << ranks << "\n";
         EXIT(EXIT_FAILURE);
     }
-    const unsigned int threads = std::max<unsigned int>(par.threads, 3);
+    const unsigned int threads = par.threads;
     reader.openBatch(threads, ARENA_BYTES, Util::computeMemory(par.splitMemoryLimit));
 
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, par.scoreBias);
@@ -368,13 +365,9 @@ int lin8align(int argc, const char **argv, const Command &command) {
     const size_t lastRepRankBlock = par.lin8RepRankBlock < 0 ? repRankBlocks : std::min(firstRepRankBlock + 1, repRankBlocks);
 
     const bool decideHere = node.count == 1;
-    if (decideHere && par.linclustDecided.empty()) {
-        Debug(Debug::ERROR) << "One machine decides as it aligns and needs --decided to write to\n";
-        EXIT(EXIT_FAILURE);
-    }
     if (decideHere && par.lin8RepRankBlock < 0) {
         while (firstRepRankBlock < lastRepRankBlock
-               && FileUtil::fileExists((par.linclustDecided + ".0." + SSTR(firstRepRankBlock)).c_str())) {
+               && FileUtil::fileExists((par.db4 + ".0." + SSTR(firstRepRankBlock)).c_str())) {
             firstRepRankBlock++;
         }
         if (firstRepRankBlock > 0) {
@@ -384,15 +377,15 @@ int lin8align(int argc, const char **argv, const Command &command) {
     Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes its share of "
                        << (lastRepRankBlock - firstRepRankBlock) << " of " << repRankBlocks << " repRankBlocks\n";
 
+    // The bitmaps are this run's progress, not a property of the database, so they sit beside the
+    // accepted pairs that produced them. One a node, because a node only knows what it has aligned.
     RankBitmap taken;
-    taken.open(par.linclustTaken, ranks);
-    if (par.linclustDecided.empty() == false) {
-        taken.catchUpTo(par.linclustDecided, firstRepRankBlock);
-        if (decideHere == false) {
-            taken.save(firstRepRankBlock);
-        }
+    taken.open(par.db4 + ".align_assigned_" + SSTR(node.index), ranks);
+    taken.catchUpTo(par.db4, firstRepRankBlock);
+    if (decideHere == false) {
+        taken.save(firstRepRankBlock);
     }
-    const BucketCounts foldCounts(par.db2, writerNodes, PairRecord::REP_RANK_SUB_BLOCKS, repRankBlocks);
+    const BucketCounts prefCounts(par.db2, writerNodes, PairRecord::REP_RANK_SUB_BLOCKS, repRankBlocks);
 
     Timer timer;
     uint64_t aligned = 0;
@@ -431,7 +424,7 @@ int lin8align(int argc, const char **argv, const Command &command) {
         const uint64_t myFrom = blockFirstRank + span * node.index / node.count;
         const uint64_t myUntil = blockFirstRank + span * (node.index + 1) / node.count;
 
-        const std::string outPath = decideHere ? par.linclustDecided + ".0." + SSTR(repRankBlock)
+        const std::string outPath = decideHere ? par.db4 + ".0." + SSTR(repRankBlock)
                                               : par.db3 + "." + SSTR(node.index) + "." + SSTR(repRankBlock);
         const std::string outTmp = outPath + ".tmp";
         FILE *out = FileUtil::openAndDelete(outTmp.c_str(), "w");
@@ -440,7 +433,7 @@ int lin8align(int argc, const char **argv, const Command &command) {
         uint64_t skipRows = 0;
         if (node.count > 1) {
             const size_t mySub = PairRecord::repRankSubBlockOf(myFrom, ranks, repRankBlocks);
-            const std::vector<uint64_t> counts = foldCounts.of(repRankBlock, repRankBlock % writerNodes);
+            const std::vector<uint64_t> counts = prefCounts.of(repRankBlock, repRankBlock % writerNodes);
             for (size_t sub = 0; sub < mySub; sub++) {
                 skipRows += counts[sub];
             }
@@ -512,8 +505,8 @@ int lin8align(int argc, const char **argv, const Command &command) {
                 batchSurvivors[w].clear();
                 alignMemberBatch(reader, batch[at].rep(), &batch[at + item.from], item.count, taken,
                                  worker.query, worker.target, worker.aligner, par, thread,
-                                 candidates[thread], batchSurvivors[w], gate[thread],
-                                 scorePerColThreshold, xDrop);
+                                 candidates[thread], batchSurvivors[w],
+                                 gate[thread], scorePerColThreshold, xDrop);
             }
             // the batches of one representative are in the order the serial version made them, so
             // joining them in that order gives the list it would have produced
@@ -592,7 +585,7 @@ int lin8align(int argc, const char **argv, const Command &command) {
         taken.save(lastRepRankBlock);
     }
 
-    const std::string shapeTmp = (decideHere ? par.linclustDecided : par.db3)
+    const std::string shapeTmp = (decideHere ? par.db4 : par.db3)
                                  + "." + SSTR(node.index) + ".shape.tmp";
     FILE *shape = FileUtil::openAndDelete(shapeTmp.c_str(), "w");
     if (decideHere) {
@@ -604,7 +597,7 @@ int lin8align(int argc, const char **argv, const Command &command) {
         Debug(Debug::ERROR) << "Cannot close " << shapeTmp << "\n";
         EXIT(EXIT_FAILURE);
     }
-    FileUtil::publishAtomically(shapeTmp, decideHere ? par.linclustDecided : par.db3);
+    FileUtil::publishAtomically(shapeTmp, decideHere ? par.db4 : par.db3);
 
     GateCounts all;
     for (size_t i = 0; i < gate.size(); i++) {

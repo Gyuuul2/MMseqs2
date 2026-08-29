@@ -10,8 +10,8 @@ set(linclust_source_files
         linclust/linfinity/lin8kmermatcher.cpp
         linclust/linfinity/lin8mergeclusters.cpp
         linclust/linfinity/lin8align2clust.cpp
-        linclust/linfinity/lin8cluster.cpp
+        linclust/linfinity/lin8align2clustmulti.cpp
         linclust/linfinity/lin8createtsv.cpp
-        linclust/linfinity/lin8repseq.cpp
+        linclust/linfinity/lin8createrepseqfasta.cpp
         PARENT_SCOPE
         )

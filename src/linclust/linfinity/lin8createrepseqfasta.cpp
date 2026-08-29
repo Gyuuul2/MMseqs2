@@ -15,11 +15,11 @@
 #include <string>
 #include <vector>
 
-int lin8repseq(int argc, const char **argv, const Command &command) {
+int lin8createrepseqfasta(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
-    RunDbReader reader(par.db1, "", true);
+    RunDbReader reader(par.db1, true);
     reader.open();
 
     Timer timer;

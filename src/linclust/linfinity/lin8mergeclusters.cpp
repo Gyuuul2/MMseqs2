@@ -57,7 +57,7 @@ static void readJoinRowsFromFile(const std::string &path, std::vector<JoinRow> &
     fclose(in);
 }
 
-int lin8expand(int argc, const char **argv, const Command &command) {
+int lin8mergehashredundancy(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
@@ -66,7 +66,7 @@ int lin8expand(int argc, const char **argv, const Command &command) {
     FILE *shape = fopen(par.db1.c_str(), "r");
     if (shape == NULL || fscanf(shape, "repRankBlocks\t%zu\nranks\t%zu", &repRankBlocks, &ranks) != 2
         || repRankBlocks == 0) {
-        Debug(Debug::ERROR) << "Cannot read " << par.db1 << ". Run lin8cluster first\n";
+        Debug(Debug::ERROR) << "Cannot read " << par.db1 << ". Run lin8align2clustmulti first\n";
         EXIT(EXIT_FAILURE);
     }
     fclose(shape);
@@ -124,17 +124,17 @@ int lin8expand(int argc, const char **argv, const Command &command) {
         PairFileHeader header;
         if (fread(&header, sizeof(PairFileHeader), 1, in) != 1
             || header.magic != LINCLUSTHASH_MAGIC) {
-            Debug(Debug::ERROR) << par.db2 << " is not a set of folded pairs\n";
+            Debug(Debug::ERROR) << par.db2 << " is not a set of redundancy pairs\n";
             EXIT(EXIT_FAILURE);
         }
-        std::vector<JoinRow> folded(1u << 16);
+        std::vector<JoinRow> redundancy(1u << 16);
         size_t read = 0;
-        while ((read = fread(folded.data(), sizeof(JoinRow), folded.size(), in)) > 0) {
+        while ((read = fread(redundancy.data(), sizeof(JoinRow), redundancy.size(), in)) > 0) {
             for (size_t k = 0; k < read; k++) {
-                // the file holds (folded, kept), so the join key is the second field
+                // the file holds (redundant, kept), so the join key is the second field
                 JoinRow row;
-                row.on = folded[k].carried;
-                row.carried = folded[k].on;
+                row.on = redundancy[k].carried;
+                row.carried = redundancy[k].on;
                 kept.add(0, row, PairRecord::repRankBlockOf(row.on, ranks, repRankBlocks));
             }
         }
@@ -164,7 +164,7 @@ int lin8expand(int argc, const char **argv, const Command &command) {
             std::vector<JoinRow> right;
             readJoinRowsFromFile(byKept + "." + SSTR(repRankBlock), right);
             if (right.empty()) {
-                continue;  // nothing was folded into any rank of this repRankBlock
+                continue;  // nothing was reduced into any rank of this repRankBlock
             }
             readJoinRowsFromFile(byMember + "." + SSTR(repRankBlock), left);
             SORT_SERIAL(left.begin(), left.end(), JoinRow::byJoinKey);
@@ -242,7 +242,7 @@ int lin8expand(int argc, const char **argv, const Command &command) {
     }
     FileUtil::publishAtomically(shapeTmp, par.db3);
 
-    Debug(Debug::INFO) << "Put back " << added << " folded sequences, " << rows
+    Debug(Debug::INFO) << "Put back " << added << " redundant sequences, " << rows
                        << " rows in all, in " << timer.lap() << "\n";
     return EXIT_SUCCESS;
 }
@@ -255,7 +255,7 @@ static void appendDecimalKey(std::string &into, uint64_t key) {
     into.push_back('\n');
 }
 
-int lin8merge(int argc, const char **argv, const Command &command) {
+int lin8createclusterdb(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
@@ -265,7 +265,7 @@ int lin8merge(int argc, const char **argv, const Command &command) {
     FILE *shape = fopen(par.db1.c_str(), "r");
     if (shape == NULL || fscanf(shape, "repRankBlocks\t%zu\nranks\t%zu", &repRankBlocks, &ranks) != 2
         || repRankBlocks == 0) {
-        Debug(Debug::ERROR) << "Cannot read " << par.db1 << ". Run lin8cluster first\n";
+        Debug(Debug::ERROR) << "Cannot read " << par.db1 << ". Run lin8align2clustmulti first\n";
         EXIT(EXIT_FAILURE);
     }
     fclose(shape);

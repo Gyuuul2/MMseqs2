@@ -14,7 +14,7 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
-    RunDbReader reader(par.db1, "", true);
+    RunDbReader reader(par.db1, true);
     reader.open();
 
     // Every row names both sides, so every rank's name is needed and there is no subset to hold.
@@ -26,7 +26,7 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
     if (need > budget) {
         Debug(Debug::ERROR) << "Naming " << reader.getSize() << " sequences needs about "
                             << (need >> 30) << " GB of names and the limit is " << (budget >> 30)
-                            << " GB. The cluster database and lin8-repseq hold the same answer "
+                            << " GB. The cluster database and lin8-createrepseqfasta hold the same answer "
                             << "without a name for every sequence\n";
         EXIT(EXIT_FAILURE);
     }

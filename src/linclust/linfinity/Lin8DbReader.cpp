@@ -281,8 +281,10 @@ char *mapFileReadOnly(const std::string &path, size_t length, int &keptFd) {
 }
 }
 
-RunDbReader::RunDbReader(const std::string &db, const std::string &validPath, bool withHeaders)
-    : db(db), validPath(validPath), withHeaders(withHeaders), valid(NULL),
+const char *RunDbReader::KEPT_BITMAP_SUFFIX = ".clusthash_kept";
+
+RunDbReader::RunDbReader(const std::string &db, bool withHeaders)
+    : db(db), withHeaders(withHeaders), valid(NULL),
       validMap(NULL), validSize(0), validCount(0), validLoaded(false),
       wantDirect(true) {}
 
@@ -318,12 +320,13 @@ void RunDbReader::open() {
             }
         }
     }
-    // an absent bitmap means every entry is valid, which is the state a fresh database is in
-    if (validPath.empty() == false) {
+    // an absent bitmap means every entry is kept, which is the state a database is in until the
+    // redundancy pass has run over it
+    const std::string validPath = db + KEPT_BITMAP_SUFFIX;
+    {
         const int fd = ::open(validPath.c_str(), O_RDONLY);
         if (fd < 0) {
-            Debug(Debug::ERROR) << "Cannot open the valid bitmap " << validPath << "\n";
-            EXIT(EXIT_FAILURE);
+            return;
         }
         // the bitmap has to say which database it belongs to, or a stale one is read past its end
         uint64_t header[3];
@@ -523,7 +526,9 @@ bool RunDbReader::HeaderStream::next(const char *&begin, size_t &length) {
 }
 
 static const size_t DIRECT_BLOCK = 512;
-static const unsigned RING_DEPTH = 256;
+// deep enough for a whole batch in one submission: 64 byte a submission entry makes even a
+// hundred threads a few megabyte, and a shallower ring only drip-feeds the same reads
+static const unsigned RING_DEPTH = 1024;
 
 void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
                             size_t memoryBudget) {
@@ -537,12 +542,29 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
     //
     // The rule is the size of the sequences against the memory the run was given, so a machine that
     // can hold its database uses the cache and one that cannot does not.
-    const size_t budget = memoryBudget;
+    const size_t arenaTotal = (size_t) threads * (arenaBytes + DIRECT_BLOCK);
+    if (arenaTotal >= memoryBudget) {
+        Debug(Debug::ERROR) << "Read arenas for " << threads << " thread need "
+                            << (arenaTotal >> 20) << " MB, which is the whole "
+                            << (memoryBudget >> 20) << " MB limit\n";
+        EXIT(EXIT_FAILURE);
+    }
+    // the arenas are this pass's own memory, so what is left is what the page cache could hold
+    const size_t budget = memoryBudget - arenaTotal;
     const uint64_t sequenceBytes = runs.totalBytes();
     wantDirect = sequenceBytes > budget / 2;
     Debug(Debug::INFO) << "Sequences are " << (sequenceBytes >> 30) << " GB against a "
-                       << (budget >> 30) << " GB limit, reading "
+                       << (budget >> 30) << " GB limit past " << (arenaTotal >> 20)
+                       << " MB of read arena, reading "
                        << (wantDirect ? "past the page cache" : "through the page cache") << "\n";
+    // A batch holds the query and at least one member, each grown outward to whole blocks, or it
+    // could not make progress. Demanding the room here is what lets loadBatch have no failure case.
+    const size_t longest = 2 * ((size_t) runs.maxSeqLen() + DIRECT_BLOCK);
+    if (arenaBytes < longest) {
+        Debug(Debug::ERROR) << "A read arena of " << arenaBytes << " byte cannot hold two sequences of "
+                            << runs.maxSeqLen() << " byte, which needs " << longest << "\n";
+        EXIT(EXIT_FAILURE);
+    }
     for (unsigned int i = 0; i < threads; i++) {
         BatchWorker *worker = new BatchWorker();
         // room to grow every span outward to whole blocks
@@ -556,88 +578,113 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
 }
 
 // opened on demand, so a pass that never batches never opens them
+// the fast path reads a descriptor another thread may be publishing, so that read is atomic too
 int RunDbReader::directOf(uint32_t file) const {
-    if (directFd[file] >= 0) {
-        return directFd[file];
+    int fd = -1;
+#pragma omp atomic read
+    fd = directFd[file];
+    if (fd >= 0) {
+        return fd;
     }
-    const std::string path = db + "." + SSTR(file);
-    int fd = ::open(path.c_str(), wantDirect ? (O_RDONLY | O_DIRECT) : O_RDONLY);
-    if (fd < 0) {
-        // a filesystem that refuses direct reads still has to work, just with the page cache
-        fd = ::open(path.c_str(), O_RDONLY);
-        if (fd < 0) {
-            Debug(Debug::ERROR) << "Cannot open " << path << " for reading\n";
-            EXIT(EXIT_FAILURE);
+#pragma omp critical(rundb_direct)
+    {
+        if (directFd[file] < 0) {
+            const std::string path = db + "." + SSTR(file);
+            int opened = ::open(path.c_str(), wantDirect ? (O_RDONLY | O_DIRECT) : O_RDONLY);
+            if (opened < 0) {
+                // a filesystem that refuses direct reads still has to work, just with the page cache
+                opened = ::open(path.c_str(), O_RDONLY);
+                if (opened < 0) {
+                    Debug(Debug::ERROR) << "Cannot open " << path << " for reading\n";
+                    EXIT(EXIT_FAILURE);
+                }
+            }
+#pragma omp atomic write
+            directFd[file] = opened;
         }
     }
-    directFd[file] = fd;
+#pragma omp atomic read
+    fd = directFd[file];
     return fd;
 }
 
-size_t RunDbReader::loadBatch(const uint64_t *ranks, size_t n, unsigned int thread) const {
-    BatchWorker &worker = *batch[thread];
-    worker.slots.clear();
-    worker.reads.clear();
+const char *RunDbReader::batchQueryAt(unsigned int thread) const {
+    return batch[thread]->queryAt;
+}
+
+// Grows the last read to cover this rank when the two touch on the disk, and starts a new one when
+// they do not. Answers false once the arena is full, which openBatch guarantees cannot happen before
+// a query and one member are in.
+bool RunDbReader::appendBatchRead(BatchWorker &worker, uint64_t rank, Cursor &cursor,
+                                  const char *&at) const {
+    cursor.at = runs.segmentOfFrom(rank, cursor.at);
+    const uint64_t offset = runs.offsetIn(cursor.at, rank);
+    const size_t length = runs[cursor.at].seqLen();
+    const int fd = directOf(runs[cursor.at].fileIdx());
+    const uint64_t blockFrom = offset - offset % DIRECT_BLOCK;
+    const uint64_t blockUntil = ((offset + length + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
+
     const size_t room = worker.arena.size() - DIRECT_BLOCK;
     size_t used = 0;
+    if (worker.reads.empty() == false) {
+        IoRing::Read &last = worker.reads.back();
+        char *into = static_cast<char *>(last.into);
+        used = (size_t) (into - worker.aligned) + last.length;
+        const uint64_t end = last.offset + last.length;
+        if (last.fd == fd && last.offset <= blockFrom && blockFrom <= end) {
+            const size_t extra = (blockUntil > end) ? (size_t) (blockUntil - end) : 0;
+            if (used + extra > room) {
+                return false;
+            }
+            last.length += extra;
+            last.required = (size_t) (offset + length - last.offset);
+            at = into + (size_t) (offset - last.offset);
+            return true;
+        }
+    }
+    const size_t span = (size_t) (blockUntil - blockFrom);
+    if (used + span > room) {
+        return false;
+    }
+    IoRing::Read read;
+    read.into = worker.aligned + used;
+    read.fd = fd;
+    read.offset = blockFrom;
+    read.length = span;
+    read.required = (size_t) (offset + length - blockFrom);
+    worker.reads.push_back(read);
+    at = worker.aligned + used + (size_t) (offset - blockFrom);
+    return true;
+}
+
+size_t RunDbReader::loadBatch(uint64_t queryRank, const uint64_t *members, size_t n,
+                              unsigned int thread) const {
+    BatchWorker &worker = *batch[thread];
+    worker.memberAt.clear();
+    worker.reads.clear();
     Cursor cursor;
+    // the query goes in first because it is the lowest rank of the batch, which keeps the run cursor
+    // and the disk offsets moving forward and lets a member that lands next to it share its read
+    appendBatchRead(worker, queryRank, cursor, worker.queryAt);
     size_t taken = 0;
     for (; taken < n; taken++) {
-        cursor.at = runs.segmentOfFrom(ranks[taken], cursor.at);
-        const uint32_t file = runs[cursor.at].fileIdx();
-        const uint64_t offset = runs.offsetIn(cursor.at, ranks[taken]);
-        const size_t length = runs[cursor.at].seqLen();
-        const uint64_t blockFrom = offset - offset % DIRECT_BLOCK;
-        const uint64_t blockUntil =
-            ((offset + length + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
-
-        BatchSlot slot;
-        if (worker.reads.empty() == false) {
-            BatchRead &last = worker.reads.back();
-            const uint64_t end = last.offset + last.length;
-            if (last.file == file && blockFrom <= end) {
-                const size_t extra = (blockUntil > end) ? (size_t) (blockUntil - end) : 0;
-                if (used + extra > room) {
-                    break;
-                }
-                last.length += extra;
-                last.required = (size_t) (offset + length - last.offset);
-                used += extra;
-                slot.arenaOffset = last.arenaOffset + (size_t) (offset - last.offset);
-                slot.length = length;
-                worker.slots.push_back(slot);
-                continue;
-            }
-        }
-        const size_t span = (size_t) (blockUntil - blockFrom);
-        if (used + span > room) {
+        const char *at = NULL;
+        if (appendBatchRead(worker, members[taken], cursor, at) == false) {
             break;
         }
-        BatchRead read;
-        read.arenaOffset = used;
-        read.file = file;
-        read.offset = blockFrom;
-        read.length = span;
-        read.required = (size_t) (offset + length - blockFrom);
-        worker.reads.push_back(read);
-        slot.arenaOffset = used + (size_t) (offset - blockFrom);
-        slot.length = length;
-        worker.slots.push_back(slot);
-        used += span;
+        worker.memberAt.push_back(at);
     }
-
-    std::vector<IoRing::Read> submit(worker.reads.size());
-    for (size_t i = 0; i < worker.reads.size(); i++) {
-        submit[i].into = worker.aligned + worker.reads[i].arenaOffset;
-        submit[i].fd = directOf(worker.reads[i].file);
-        submit[i].offset = worker.reads[i].offset;
-        submit[i].length = worker.reads[i].length;
-        submit[i].required = worker.reads[i].required;
+    if (taken == 0 && n > 0) {
+        // openBatch sized the arena so this cannot happen; a hung node costs far more to find than
+        // a stopped one, so it is worth the one comparison a batch to say so out loud
+        Debug(Debug::ERROR) << "A read arena of " << worker.arena.size() << " byte took none of "
+                            << n << " member, so the pass would not move\n";
+        EXIT(EXIT_FAILURE);
     }
-    worker.ring.submit(submit, db.c_str());
+    worker.ring.submit(worker.reads, db.c_str());
     return taken;
 }
 
-const char *RunDbReader::batchAt(unsigned int thread, size_t k) const {
-    return batch[thread]->aligned + batch[thread]->slots[k].arenaOffset;
+const char *RunDbReader::batchAt(unsigned int thread, size_t member) const {
+    return batch[thread]->memberAt[member];
 }
