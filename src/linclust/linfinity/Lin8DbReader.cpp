@@ -234,6 +234,15 @@ void IoRing::pump(const char *what, bool untilDone) {
 }
 
 void IoRing::submit(const char *what) {
+    // Whatever the last batch left in the kernel would be counted against this one, so await would
+    // answer for reads that had not arrived and the caller would read an arena the kernel was still
+    // filling. That is a wrong alignment rather than a crash, so it stops the run instead.
+    if (done < reads.size()) {
+        Debug(Debug::ERROR) << "A batch of " << reads.size() << " reads for " << what
+                            << " was submitted with " << (reads.size() - done)
+                            << " of the last one still out\n";
+        EXIT(EXIT_FAILURE);
+    }
     queued = 0;
     done = 0;
     inflight = 0;

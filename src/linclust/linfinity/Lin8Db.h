@@ -308,7 +308,7 @@ public:
         poolDepth = std::min<size_t>(poolDepth, POOL_BYTES / sizeof(Record));
         pooled.resize(buckets);
         gate.assign(buckets, 0);
-        held = (threads * depth + poolDepth) * buckets * sizeof(Record);
+        held = (threads * depth + poolDepth + depth) * buckets * sizeof(Record);
     }
 
     size_t bytesHeld() const { return held; }
@@ -401,12 +401,15 @@ private:
             return;
         }
         while (__sync_lock_test_and_set(&gate[bucket], 1) != 0) {
-            while (gate[bucket] != 0) {
+            // the wait has to be an atomic read: a plain one has nothing in the loop that could
+            // change it, so the compiler is free to hoist it out and spin on a value from before
+            while (__atomic_load_n(&gate[bucket], __ATOMIC_RELAXED) != 0) {
             }
         }
         std::vector<Record> &pool = pooled[bucket];
-        if (pool.capacity() < poolDepth) {
-            pool.reserve(poolDepth);
+        if (pool.capacity() < poolDepth + depth) {
+            // room for one more thread buffer, because the size is checked after it goes in
+            pool.reserve(poolDepth + depth);
         }
         pool.insert(pool.end(), buffer.begin(), buffer.end());
         if (pool.size() >= poolDepth) {
@@ -448,7 +451,7 @@ private:
     size_t depth;
     size_t poolDepth;
     std::vector<std::vector<Record> > pooled;
-    mutable std::vector<int> gate;
+    std::vector<int> gate;
     size_t held;
     std::vector<int> files;
     std::vector<uint64_t> written;
