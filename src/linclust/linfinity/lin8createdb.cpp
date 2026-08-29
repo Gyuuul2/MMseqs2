@@ -324,9 +324,14 @@ public:
             want += seqRoom[length] + hdrRoom[length];
         }
         if (want > budget && want > 0) {
+            // a floor a length, or a rare one rounds to nothing and writes a sequence at a time
+            const uint64_t floorRoom = (budget / 2) / LINCLUSTERDB_HISTOGRAM_SIZE;
             for (size_t length = 1; length < LINCLUSTERDB_HISTOGRAM_SIZE; length++) {
-                seqRoom[length] = seqRoom[length] * budget / want;
-                hdrRoom[length] = hdrRoom[length] * budget / want;
+                const uint64_t share = budget / 2;
+                seqRoom[length] = std::min<uint64_t>(
+                    seqRoom[length], std::max<uint64_t>(seqRoom[length] * share / want, floorRoom));
+                hdrRoom[length] = std::min<uint64_t>(
+                    hdrRoom[length], std::max<uint64_t>(hdrRoom[length] * share / want, floorRoom));
             }
         }
     }

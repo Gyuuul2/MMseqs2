@@ -167,9 +167,7 @@ void IoRing::preadAll(const char *what) {
     }
 }
 
-// Hands the queued reads to the kernel. With untilDone it stays until every one has come back,
-// otherwise it returns as soon as the kernel has taken what fits, which is what leaves the caller
-// free to compute while the disk works.
+// untilDone waits for every read; without it the caller is free to compute while the disk works
 void IoRing::pump(const char *what, bool untilDone) {
 #if defined(__linux__) && defined(HAVE_LINUX_IO_URING)
     Ring &r = *static_cast<Ring *>(state);
@@ -234,13 +232,10 @@ void IoRing::pump(const char *what, bool untilDone) {
 }
 
 void IoRing::submit(const char *what) {
-    // Whatever the last batch left in the kernel would be counted against this one, so await would
-    // answer for reads that had not arrived and the caller would read an arena the kernel was still
-    // filling. That is a wrong alignment rather than a crash, so it stops the run instead.
-    if (done < reads.size()) {
-        Debug(Debug::ERROR) << "A batch of " << reads.size() << " reads for " << what
-                            << " was submitted with " << (reads.size() - done)
-                            << " of the last one still out\n";
+    // the caller has already refilled the list, so what is outstanding is inflight and not done
+    if (inflight != 0) {
+        Debug(Debug::ERROR) << "A batch for " << what << " was submitted with " << inflight
+                            << " reads of the last one still with the kernel\n";
         EXIT(EXIT_FAILURE);
     }
     queued = 0;
@@ -595,10 +590,7 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
                        << (budget >> 30) << " GB limit past " << (arenaTotal >> 20)
                        << " MB of read arena, reading "
                        << (wantDirect ? "past the page cache" : "through the page cache") << "\n";
-    // The memory a thread gets is split between its lanes, so prefetching costs no more of it than
-    // waiting did. A lane holds the query and at least one member, each grown outward to whole
-    // blocks, or it could not make progress, and demanding that here is what lets startBatch have
-    // no failure case.
+    // split between the lanes, so prefetching costs no more memory than waiting did
     const size_t laneBytes = arenaBytes / LANES;
     const size_t longest = 2 * ((size_t) runs.maxSeqLen() + DIRECT_BLOCK);
     if (laneBytes < longest) {
@@ -664,9 +656,7 @@ void RunDbReader::awaitBatch(unsigned int thread, unsigned int lane) const {
     batch[thread]->lane[lane].ring.await(db.c_str());
 }
 
-// Grows the last read to cover this rank when the two touch on the disk, and starts a new one when
-// they do not. Answers false once the arena is full, which openBatch guarantees cannot happen before
-// a query and one member are in.
+// grows the last read when the two touch on the disk, and answers false once the lane is full
 bool RunDbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor,
                                   const char *&at) const {
     cursor.at = runs.segmentOfFrom(rank, cursor.at);
@@ -728,8 +718,7 @@ size_t RunDbReader::startBatch(uint64_t queryRank, const uint64_t *members, size
         at.memberAt.push_back(where);
     }
     if (taken == 0 && n > 0) {
-        // openBatch sized the lanes so this cannot happen; a hung node costs far more to find than
-        // a stopped one, so it is worth the one comparison a batch to say so out loud
+        // openBatch sized the lanes so this cannot happen; a hung node is worse than a stopped one
         Debug(Debug::ERROR) << "A read lane of " << at.arena.size() << " byte took none of "
                             << n << " member, so the pass would not move\n";
         EXIT(EXIT_FAILURE);
