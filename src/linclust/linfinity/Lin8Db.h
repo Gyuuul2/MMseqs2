@@ -293,10 +293,22 @@ public:
     BucketWriter(const std::string &prefix, size_t buckets, unsigned int threads, size_t budget)
         : prefix(prefix), buckets(buckets), files(buckets, -1), written(buckets, 0),
           offsets(buckets, 0), staged(threads, std::vector<std::vector<Record> >(buckets)) {
+        // Every thread staging every bucket is threads times buckets buffers, and at eight thousand
+        // buckets and twenty threads that is a hundred and sixty thousand of them, so each one is
+        // tens of kilobyte and that is the size that reaches the disk. Eight thousand files being
+        // appended in seventy kilobyte pieces is the worst shape a write can have.
+        //
+        // So a thread's own buffer is small and only has to be lock free, and it empties into one
+        // buffer a bucket that every thread shares. What reaches the disk is that shared buffer,
+        // which is as many times larger as there are threads.
         const size_t share = budget / STAGING_SHARE;
-        depth = std::max<size_t>(256, share / (threads * buckets * sizeof(Record)));
+        depth = std::max<size_t>(256, (share / 4) / (threads * buckets * sizeof(Record)));
         depth = std::min<size_t>(depth, FLUSH_BYTES / sizeof(Record));
-        held = threads * buckets * depth * sizeof(Record);
+        poolDepth = std::max<size_t>(depth, (share - share / 4) / (buckets * sizeof(Record)));
+        poolDepth = std::min<size_t>(poolDepth, POOL_BYTES / sizeof(Record));
+        pooled.resize(buckets);
+        gate.assign(buckets, 0);
+        held = (threads * depth + poolDepth) * buckets * sizeof(Record);
     }
 
     size_t bytesHeld() const { return held; }
@@ -331,7 +343,7 @@ public:
         }
         buffer.push_back(record);
         if (buffer.size() >= depth) {
-            flush(bucket, buffer);
+            drain(bucket, buffer);
         }
     }
 
@@ -339,8 +351,9 @@ public:
 #pragma omp parallel for schedule(dynamic, 16) num_threads(threads)
         for (size_t bucket = 0; bucket < buckets; bucket++) {
             for (size_t thread = 0; thread < staged.size(); thread++) {
-                flush(bucket, staged[thread][bucket]);
+                drain(bucket, staged[thread][bucket]);
             }
+            flush(bucket, pooled[bucket]);
         }
     }
 
@@ -348,8 +361,9 @@ public:
 #pragma omp parallel for schedule(dynamic, 16) num_threads(threads)
         for (size_t bucket = 0; bucket < buckets; bucket++) {
             for (size_t thread = 0; thread < staged.size(); thread++) {
-                flush(bucket, staged[thread][bucket]);
+                drain(bucket, staged[thread][bucket]);
             }
+            flush(bucket, pooled[bucket]);
             if (written[bucket] > 0) {
                 sync_file_range(files[bucket], 0, 0, SYNC_FILE_RANGE_WRITE);
             }
@@ -379,6 +393,29 @@ public:
 private:
     std::string name(size_t bucket) const { return prefix + "." + SSTR(bucket); }
 
+    // Hands a thread's buffer to the one the bucket shares, and writes that when it is full. The
+    // write happens holding the bucket, which is what keeps one write a bucket in flight; two
+    // threads wanting the same bucket at the same moment is one chance in four hundred here.
+    void drain(size_t bucket, std::vector<Record> &buffer) {
+        if (buffer.empty()) {
+            return;
+        }
+        while (__sync_lock_test_and_set(&gate[bucket], 1) != 0) {
+            while (gate[bucket] != 0) {
+            }
+        }
+        std::vector<Record> &pool = pooled[bucket];
+        if (pool.capacity() < poolDepth) {
+            pool.reserve(poolDepth);
+        }
+        pool.insert(pool.end(), buffer.begin(), buffer.end());
+        if (pool.size() >= poolDepth) {
+            flush(bucket, pool);
+        }
+        __sync_lock_release(&gate[bucket]);
+        buffer.clear();
+    }
+
     void flush(size_t bucket, std::vector<Record> &buffer) {
         if (buffer.empty()) {
             return;
@@ -407,7 +444,11 @@ private:
     size_t buckets;
     static const size_t STAGING_SHARE = 8;
     static const size_t FLUSH_BYTES = 4 * 1024 * 1024;
+    static const size_t POOL_BYTES = 16 * 1024 * 1024;
     size_t depth;
+    size_t poolDepth;
+    std::vector<std::vector<Record> > pooled;
+    mutable std::vector<int> gate;
     size_t held;
     std::vector<int> files;
     std::vector<uint64_t> written;
