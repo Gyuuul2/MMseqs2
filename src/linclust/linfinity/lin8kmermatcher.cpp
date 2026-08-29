@@ -23,7 +23,7 @@
 
 class KmerExtractor {
 public:
-    KmerExtractor(unsigned int kmerSize, unsigned int alphabetSize, unsigned int mostPerSequence);
+    KmerExtractor(unsigned int kmerSize, unsigned int alphabetSize, unsigned int mostKmersOneSequenceCanKeep);
 
     size_t extract(const char *letters, size_t length, const unsigned char *letterToCode,
                    unsigned int keepPerSequence);
@@ -93,8 +93,8 @@ private:
 };
 
 KmerExtractor::KmerExtractor(unsigned int kmerSize, unsigned int alphabetSize,
-                             unsigned int mostPerSequence)
-    : kmerSize(kmerSize), alphabetSize(alphabetSize), most(mostPerSequence), keep(mostPerSequence) {
+                             unsigned int mostKmersOneSequenceCanKeep)
+    : kmerSize(kmerSize), alphabetSize(alphabetSize), most(mostKmersOneSequenceCanKeep), keep(mostKmersOneSequenceCanKeep) {
     uint64_t span = 1;
     for (unsigned int i = 0; i < kmerSize; i++) {
         if (span > CODE_MASK / alphabetSize) {
@@ -229,9 +229,9 @@ size_t KmerExtractor::extract(const char *letters, size_t length,
 #ifdef OPENMP
 #endif
 
-static const uint64_t CHUNK_BYTES = 64ull * 1024 * 1024 * 1024;
+static const uint64_t BYTES_PER_MANIFEST = 64ull * 1024 * 1024 * 1024;
 
-struct ChunkPlan {
+struct ManifestChunk {
     uint64_t rankBegin;
     uint64_t rankEnd;
     size_t lengthBlock;
@@ -241,9 +241,9 @@ static std::string chunkName(const std::string &out, unsigned int node, size_t c
     return out + "." + SSTR(node) + "." + SSTR(chunk);
 }
 
-static std::vector<ChunkPlan> planChunks(const RunDbReader &reader, const std::vector<size_t> &blocks,
+static std::vector<ManifestChunk> planManifestChunks(const RunDbReader &reader, const std::vector<size_t> &blocks,
                                          uint64_t capBytes) {
-    std::vector<ChunkPlan> chunks;
+    std::vector<ManifestChunk> chunks;
     const RunTable &runs = reader.getRunTable();
     for (size_t at = 0; at < blocks.size(); at++) {
         uint64_t begin = 0;
@@ -264,7 +264,7 @@ static std::vector<ChunkPlan> planChunks(const RunDbReader &reader, const std::v
         const uint64_t parts = std::max<uint64_t>(1, (span + capBytes - 1) / capBytes);
         const uint64_t step = std::max<uint64_t>(1, (span + parts - 1) / parts);
         for (uint64_t byteAt = fromByte; byteAt < toByte; byteAt += step) {
-            ChunkPlan chunk;
+            ManifestChunk chunk;
             chunk.lengthBlock = blocks[at];
             chunk.rankBegin = runs.rankAtByte(byteAt);
             chunk.rankEnd = std::min<uint64_t>(runs.rankAtByte(std::min(byteAt + step, toByte)), end);
@@ -276,16 +276,16 @@ static std::vector<ChunkPlan> planChunks(const RunDbReader &reader, const std::v
     return chunks;
 }
 
-static unsigned int keepFor(unsigned int keepPerSequence, float keepScale, uint32_t length) {
+static unsigned int kmersToKeepForLength(unsigned int keepPerSequence, float keepScale, uint32_t length) {
     const double asked = (double) keepPerSequence + (double) keepScale * (double) length;
     return (unsigned int) (asked < (double) length ? asked : (double) length);
 }
 
-static unsigned int mostPerSequence(unsigned int keepPerSequence, float keepScale) {
-    return keepFor(keepPerSequence, keepScale, RunTable::MAX_SEQ_LEN);
+static unsigned int mostKmersOneSequenceCanKeep(unsigned int keepPerSequence, float keepScale) {
+    return kmersToKeepForLength(keepPerSequence, keepScale, RunTable::MAX_SEQ_LEN);
 }
 
-static uint64_t extractChunk(const RunDbReader &reader, const ChunkPlan &chunk, BucketWriter<KmerRecord> &writer,
+static uint64_t extractOneManifestChunk(const RunDbReader &reader, const ManifestChunk &chunk, BucketWriter<KmerRecord> &writer,
                          const unsigned char *letterToCode, unsigned int kmerSize,
                          unsigned int alphabetSize, unsigned int keepPerSequence, float keepScale,
                          unsigned int threads, std::vector<std::vector<uint64_t> > &subBucketCounts) {
@@ -297,7 +297,7 @@ static uint64_t extractChunk(const RunDbReader &reader, const ChunkPlan &chunk, 
 #ifdef OPENMP
         thread = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-        KmerExtractor extractor(kmerSize, alphabetSize, mostPerSequence(keepPerSequence, keepScale));
+        KmerExtractor extractor(kmerSize, alphabetSize, mostKmersOneSequenceCanKeep(keepPerSequence, keepScale));
         RunDbReader::Cursor cursor;
         KmerRecord record;
         std::vector<uint64_t> &counts = subBucketCounts[thread];
@@ -312,7 +312,7 @@ static uint64_t extractChunk(const RunDbReader &reader, const ChunkPlan &chunk, 
             }
             const char *letters = reader.getData(rank, cursor);
             const size_t kept = extractor.extract(letters, length, letterToCode,
-                                                  keepFor(keepPerSequence, keepScale, length));
+                                                  kmersToKeepForLength(keepPerSequence, keepScale, length));
             for (size_t i = 0; i < kept; i++) {
                 const uint64_t spread = KmerExtractor::spread(extractor.keys()[i]);
                 const uint64_t pos = extractor.positions()[i];
@@ -399,7 +399,7 @@ int lin8kmers(int argc, const char **argv, const Command &command) {
         par.kmersPerSequence > 1 ? par.kmersPerSequence - 1 : 1;
     const size_t budget = static_cast<size_t>(Util::computeMemory(par.splitMemoryLimit) * 0.95);
     const std::vector<size_t> blocks = lengthBlocksForNode(reader.getRunTable(), node);
-    const std::vector<ChunkPlan> chunks = planChunks(reader, blocks, CHUNK_BYTES);
+    const std::vector<ManifestChunk> chunks = planManifestChunks(reader, blocks, BYTES_PER_MANIFEST);
     Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << blocks.size()
                        << " length blocks in " << chunks.size() << " chunks, k " << par.kmerSize
                        << ", alphabet " << reduced << ", keeping " << keepPerSequence << "\n";
@@ -438,12 +438,12 @@ int lin8kmers(int argc, const char **argv, const Command &command) {
     uint64_t pendingRecords = 0;
     writer.resetCounts();
     for (size_t at = resume; at < chunks.size(); at++) {
-        pendingRecords += extractChunk(reader, chunks[at], writer, letterToCode.data(), par.kmerSize,
+        pendingRecords += extractOneManifestChunk(reader, chunks[at], writer, letterToCode.data(), par.kmerSize,
                                        classes, keepPerSequence,
                                        par.kmersPerSequenceScale.values.aminoacid(), par.threads,
                                        subBucketCounts);
         // a durable chunk is a run of planned chunks ended by bytes, so a small database is one flush
-        if (pendingRecords * KmerRecord::DISK_BYTES >= CHUNK_BYTES || at + 1 == chunks.size()) {
+        if (pendingRecords * KmerRecord::DISK_BYTES >= BYTES_PER_MANIFEST || at + 1 == chunks.size()) {
             writer.endChunk(par.threads);
             // the manifest goes down after the data it describes, so its presence means it is whole
             writeBucketManifest(chunkName(par.db2, node.index, manifest) + ".manifest",
@@ -487,7 +487,7 @@ int lin8kmers(int argc, const char **argv, const Command &command) {
 #ifdef OPENMP
 #endif
 
-static void readBucketShape(const std::string &path, unsigned int &nodes, size_t &buckets, int &alphabet,
+static void readKmerBucketShape(const std::string &path, unsigned int &nodes, size_t &buckets, int &alphabet,
                       uint64_t &ranks) {
     FILE *in = fopen(path.c_str(), "r");
     if (in == NULL) {
@@ -509,7 +509,7 @@ static void readBucketShape(const std::string &path, unsigned int &nodes, size_t
     }
 }
 
-struct FileSlice {
+struct BucketExtent {
     unsigned int node;
     size_t first;
     size_t count;
@@ -519,35 +519,35 @@ struct BySubBucket {
     size_t operator()(const KmerRecord &record) const { return record.subBucket(); }
 };
 
-struct BySubRange {
+struct ByRepRankSubBlock {
     uint64_t ranks;
-    size_t ranges;
-    BySubRange(uint64_t ranks, size_t ranges) : ranks(ranks), ranges(ranges) {}
+    size_t repRankBlocks;
+    ByRepRankSubBlock(uint64_t ranks, size_t repRankBlocks) : ranks(ranks), repRankBlocks(repRankBlocks) {}
     size_t operator()(const PairRecord &record) const {
-        return PairRecord::subRangeOf(record.rep(), ranks, ranges);
+        return PairRecord::repRankSubBlockOf(record.rep(), ranks, repRankBlocks);
     }
 };
 
 template <typename Record, typename SubOf>
-static void scanSlice(const std::string &path, const FileSlice &slice, const SubOf &subOf,
+static void scanBucketExtent(const std::string &path, const BucketExtent &extent, const SubOf &subOf,
                       std::vector<uint64_t> &perPrefix, std::vector<size_t> &place,
                       RawArray<Record> &into) {
     const int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
-        Debug(Debug::ERROR) << "Cannot open " << path << ", which node " << slice.node
+        Debug(Debug::ERROR) << "Cannot open " << path << ", which node " << extent.node
                             << " should have written\n";
         EXIT(EXIT_FAILURE);
     }
-    const off_t at = static_cast<off_t>(slice.first * Record::DISK_BYTES);
-    const off_t span = static_cast<off_t>(slice.count * Record::DISK_BYTES);
+    const off_t at = static_cast<off_t>(extent.first * Record::DISK_BYTES);
+    const off_t span = static_cast<off_t>(extent.count * Record::DISK_BYTES);
     posix_fadvise(fd, at, span, POSIX_FADV_SEQUENTIAL);
-    const size_t batch = std::min<size_t>(slice.count, 1u << 16);
+    const size_t batch = std::min<size_t>(extent.count, 1u << 16);
     std::vector<unsigned char> raw(batch * Record::DISK_BYTES);
-    for (size_t done = 0; done < slice.count; ) {
-        const size_t want = std::min<size_t>(slice.count - done, batch);
+    for (size_t done = 0; done < extent.count; ) {
+        const size_t want = std::min<size_t>(extent.count - done, batch);
         size_t got = 0;
         while (got < want * Record::DISK_BYTES) {
-            const off_t at = static_cast<off_t>((slice.first + done) * Record::DISK_BYTES + got);
+            const off_t at = static_cast<off_t>((extent.first + done) * Record::DISK_BYTES + got);
             const ssize_t read = pread(fd, raw.data() + got, want * Record::DISK_BYTES - got, at);
             if (read <= 0) {
                 Debug(Debug::ERROR) << "Cannot read " << path << "\n";
@@ -588,7 +588,7 @@ static std::vector<size_t> loadBucket(const std::string &prefix, const BucketCou
                  narrower);
     into.resize(starts.back());
 
-    std::vector<FileSlice> slices;
+    std::vector<BucketExtent> extents;
     std::vector<std::string> path(nodes);
     for (unsigned int node = 0; node < nodes; node++) {
         path[node] = prefix + "." + SSTR(node) + "." + SSTR(bucket);
@@ -599,29 +599,29 @@ static std::vector<size_t> loadBucket(const std::string &prefix, const BucketCou
         }
         const size_t cut = std::min<size_t>(std::max<size_t>(threads / nodes, 1), records);
         for (size_t i = 0; i < cut; i++) {
-            FileSlice slice;
-            slice.node = node;
-            slice.first = records * i / cut;
-            slice.count = records * (i + 1) / cut - slice.first;
-            slices.push_back(slice);
+            BucketExtent extent;
+            extent.node = node;
+            extent.first = records * i / cut;
+            extent.count = records * (i + 1) / cut - extent.first;
+            extents.push_back(extent);
         }
     }
 
-    std::vector<std::vector<uint64_t> > sliceCounts(slices.size(),
+    std::vector<std::vector<uint64_t> > extentCounts(extents.size(),
                                                     std::vector<uint64_t>(prefixes, 0));
     std::vector<size_t> counting;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (size_t i = 0; i < slices.size(); i++) {
-        scanSlice(path[slices[i].node], slices[i], subOf, sliceCounts[i], counting, into);
+    for (size_t i = 0; i < extents.size(); i++) {
+        scanBucketExtent(path[extents[i].node], extents[i], subOf, extentCounts[i], counting, into);
     }
 
-    std::vector<std::vector<size_t> > at(slices.size());
+    std::vector<std::vector<size_t> > at(extents.size());
     {
         std::vector<size_t> running(starts.begin(), starts.end() - 1);
-        for (size_t i = 0; i < slices.size(); i++) {
+        for (size_t i = 0; i < extents.size(); i++) {
             at[i] = running;
             for (size_t j = 0; j < prefixes; j++) {
-                running[j] += sliceCounts[i][j];
+                running[j] += extentCounts[i][j];
             }
         }
         for (size_t j = 0; j < prefixes; j++) {
@@ -635,8 +635,8 @@ static std::vector<size_t> loadBucket(const std::string &prefix, const BucketCou
     }
 
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (size_t i = 0; i < slices.size(); i++) {
-        scanSlice(path[slices[i].node], slices[i], subOf, sliceCounts[i], at[i], into);
+    for (size_t i = 0; i < extents.size(); i++) {
+        scanBucketExtent(path[extents[i].node], extents[i], subOf, extentCounts[i], at[i], into);
     }
     return starts;
 }
@@ -710,10 +710,11 @@ static void assignGroup(KmerRecord *group, size_t size, const RunDbReader &reade
     }
 }
 
-static std::vector<size_t> setupThreadOffsets(const RawArray<KmerRecord> &records, size_t pieces) {
+static std::vector<size_t> setupThreadOffsets(const RawArray<KmerRecord> &records,
+                                             size_t workSplits) {
     std::vector<size_t> threadOffsets(1, 0);
-    const size_t even = records.size() / std::max<size_t>(1, pieces);
-    for (size_t thread = 1; thread < pieces; thread++) {
+    const size_t even = records.size() / std::max<size_t>(1, workSplits);
+    for (size_t thread = 1; thread < workSplits; thread++) {
         size_t at = std::max<size_t>(std::max(threadOffsets.back(), thread * even), 1);
         while (at < records.size() && records[at].key() == records[at - 1].key()) {
             at++;
@@ -736,7 +737,7 @@ int lin8pairs(int argc, const char **argv, const Command &command) {
     size_t buckets = 0;
     int alphabet = 0;
     uint64_t ranks = 0;
-    readBucketShape(par.db2, writerNodes, buckets, alphabet, ranks);
+    readKmerBucketShape(par.db2, writerNodes, buckets, alphabet, ranks);
     requireEveryNodeDone(par.db2, writerNodes);
     const BucketCounts bucketCounts(par.db2, writerNodes, KmerRecord::SUB_BUCKET_COUNT,
                                     KmerRecord::BUCKET_COUNT);
@@ -757,23 +758,23 @@ int lin8pairs(int argc, const char **argv, const Command &command) {
     Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << myBuckets
                        << " of " << buckets << " buckets\n";
 
-    if (par.linclustRanges < 1 || (size_t) par.linclustRanges > PairRecord::MAX_RANGE_COUNT) {
-        Debug(Debug::ERROR) << "--ranges must be between 1 and " << PairRecord::MAX_RANGE_COUNT
-                            << ", past which the sub range arithmetic leaves sixty four bits\n";
+    if (par.lin8RepRankBlocks < 1 || (size_t) par.lin8RepRankBlocks > PairRecord::MAX_REP_RANK_BLOCKS) {
+        Debug(Debug::ERROR) << "--repRankBlocks must be between 1 and " << PairRecord::MAX_REP_RANK_BLOCKS
+                            << ", past which the sub repRankBlock arithmetic leaves sixty four bits\n";
         EXIT(EXIT_FAILURE);
     }
-    const size_t rangeCount = (size_t) par.linclustRanges;
+    const size_t repRankBlockCount = (size_t) par.lin8RepRankBlocks;
 
-    const uint64_t CHUNK_BYTES = 4ull * 1024 * 1024 * 1024;
+    const uint64_t BYTES_PER_MANIFEST = 4ull * 1024 * 1024 * 1024;
     const std::string prefix = par.db3 + "." + SSTR(node.index);
     const size_t budget = static_cast<size_t>(Util::computeMemory(par.splitMemoryLimit) * 0.95);
-    std::vector<uint64_t> keep(rangeCount, 0);
+    std::vector<uint64_t> keep(repRankBlockCount, 0);
     // as in the extraction pass: the lower of what the manifests claim and what the table covers
     uint64_t resumeAt = 0;
-    const size_t countEntries = rangeCount * PairRecord::SUB_RANGE_COUNT;
+    const size_t countEntries = repRankBlockCount * PairRecord::REP_RANK_SUB_BLOCKS;
     const std::string countsPath = par.db3 + "." + SSTR(node.index) + ".counts";
     size_t tableChunks = 0;
-    std::vector<uint64_t> subRangeBase =
+    std::vector<uint64_t> repRankSubBlockBase =
         readSubBucketCounts(countsPath, countEntries, tableChunks);
     const size_t doneChunks = readBucketManifests(prefix, myBuckets, keep, &resumeAt);
     const size_t done = std::min(doneChunks, tableChunks);
@@ -785,9 +786,9 @@ int lin8pairs(int argc, const char **argv, const Command &command) {
     if (done > 0) {
         Debug(Debug::INFO) << "Resuming after " << done << " chunks a previous run finished\n";
     }
-    std::vector<std::vector<uint64_t> > subRangeCounts(par.threads,
+    std::vector<std::vector<uint64_t> > repRankSubBlockCounts(par.threads,
                                                        std::vector<uint64_t>(countEntries, 0));
-    BucketWriter<PairRecord> writer(prefix, rangeCount, par.threads, budget);
+    BucketWriter<PairRecord> writer(prefix, repRankBlockCount, par.threads, budget);
     writer.openAt(keep);
 
     Debug::Progress progress(myBuckets);
@@ -798,21 +799,27 @@ int lin8pairs(int argc, const char **argv, const Command &command) {
         first += node.count;
     }
     size_t chunkFirst = first;
+    double spentReading = 0, spentSorting = 0, spentGrouping = 0, spentWriting = 0;
     writer.resetCounts();
     for (size_t bucket = first; bucket < buckets; bucket += node.count) {
         RawArray<KmerRecord> records;
+        double mark = omp_get_wtime();
         const std::vector<size_t> starts =
             loadBucket(par.db2, bucketCounts, writerNodes, bucket, KmerRecord::SUB_BUCKET_COUNT,
                        BySubBucket(), budget - writer.bytesHeld(), par.threads, "Bucket",
                        "build with more buckets", "lin8-kmers", records);
+        spentReading += omp_get_wtime() - mark;
+        mark = omp_get_wtime();
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
         for (size_t i = 0; i < KmerRecord::SUB_BUCKET_COUNT; i++) {
             SORT_SERIAL(records.begin() + starts[i], records.begin() + starts[i + 1],
                         KmerRecord::byKeyAndRank);
         }
-        // a thread owns a range of the sorted bucket, so moving a center only touches its own
-        const size_t pieces = par.threads * 8;
-        const std::vector<size_t> threadOffsets = setupThreadOffsets(records, pieces);
+        spentSorting += omp_get_wtime() - mark;
+        mark = omp_get_wtime();
+        // a thread owns a stretch of the sorted bucket, so moving a center only touches its own
+        const size_t bucketWorkSplits = par.threads * 8;
+        const std::vector<size_t> threadOffsets = setupThreadOffsets(records, bucketWorkSplits);
         std::vector<uint64_t> made(par.threads, 0);
         std::vector<uint64_t> seen(par.threads, 0);
 #pragma omp parallel num_threads(par.threads)
@@ -822,9 +829,9 @@ int lin8pairs(int argc, const char **argv, const Command &command) {
             thread = static_cast<unsigned int>(omp_get_thread_num());
 #endif
             std::vector<PairRecord> out;
-            std::vector<uint64_t> &counts = subRangeCounts[thread];
+            std::vector<uint64_t> &counts = repRankSubBlockCounts[thread];
 #pragma omp for schedule(dynamic, 1)
-            for (int part = 0; part < (int) pieces; part++) {
+            for (int part = 0; part < (int) bucketWorkSplits; part++) {
                 size_t begin = threadOffsets[part];
                 while (begin < threadOffsets[part + 1]) {
                     size_t end = begin + 1;
@@ -836,8 +843,8 @@ int lin8pairs(int argc, const char **argv, const Command &command) {
                                  par.includeOnlyExtendable, &subMat, adjacentRounds, out);
                     for (size_t i = 0; i < out.size(); i++) {
                         // one division for the file and the place inside it, not one each
-                        const size_t fine = PairRecord::fineOf(out[i].rep(), ranks, rangeCount);
-                        writer.add(thread, out[i], fine / PairRecord::SUB_RANGE_COUNT);
+                        const size_t fine = PairRecord::fineOf(out[i].rep(), ranks, repRankBlockCount);
+                        writer.add(thread, out[i], fine / PairRecord::REP_RANK_SUB_BLOCKS);
                         counts[fine]++;
                     }
                     made[thread] += out.size();
@@ -851,18 +858,21 @@ int lin8pairs(int argc, const char **argv, const Command &command) {
             inBucket += made[thread];
             groups += seen[thread];
         }
+        spentGrouping += omp_get_wtime() - mark;
         pairs += inBucket;
         pending += inBucket * PairRecord::DISK_BYTES;
         const bool last = bucket + node.count >= buckets;
-        if (pending >= CHUNK_BYTES || last) {
+        if (pending >= BYTES_PER_MANIFEST || last) {
+            const double put = omp_get_wtime();
             writer.endChunk(par.threads);
             writeBucketManifest(prefix + "." + SSTR(chunk) + ".manifest", writer.chunkCounts(),
                                 "bucket", chunkFirst, bucket + 1);
-            writeSubBucketCounts(countsPath, subRangeBase, subRangeCounts, chunk + 1);
+            writeSubBucketCounts(countsPath, repRankSubBlockBase, repRankSubBlockCounts, chunk + 1);
             if (par.removeTmpFiles) {
                 dropConsumed(par.db2, writerNodes, chunkFirst, bucket + 1, node.count);
             }
             writer.resetCounts();
+            spentWriting += omp_get_wtime() - put;
             chunkFirst = bucket + node.count;
             pending = 0;
             chunk++;
@@ -873,7 +883,7 @@ int lin8pairs(int argc, const char **argv, const Command &command) {
 
     const std::string shapeTmp = par.db3 + "." + SSTR(node.index) + ".tmp";
     FILE *shape = FileUtil::openAndDelete(shapeTmp.c_str(), "w");
-    fprintf(shape, "nodes\t%u\nranges\t%zu\nranks\t%zu\n", node.count, rangeCount,
+    fprintf(shape, "nodes\t%u\nrepRankBlocks\t%zu\nranks\t%zu\n", node.count, repRankBlockCount,
             (size_t) ranks);
     if (fclose(shape) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << shapeTmp << "\n";
@@ -881,6 +891,10 @@ int lin8pairs(int argc, const char **argv, const Command &command) {
     }
     FileUtil::publishAtomically(shapeTmp, par.db3);
     markNodeDone(par.db3, node.index);
+    Debug(Debug::INFO) << "Where the time went: reading " << (uint64_t) spentReading
+                       << "s, sorting " << (uint64_t) spentSorting << "s, grouping "
+                       << (uint64_t) spentGrouping << "s, publishing " << (uint64_t) spentWriting
+                       << "s\n";
     Debug(Debug::INFO) << "Made " << pairs << " pairs from " << groups << " groups in " << timer.lap() << "\n";
     reader.close();
     return EXIT_SUCCESS;
@@ -890,7 +904,7 @@ int lin8pairs(int argc, const char **argv, const Command &command) {
 #ifdef OPENMP
 #endif
 
-static void readRangeShape(const std::string &path, unsigned int &nodes, size_t &ranges,
+static void readRepRankBlockShape(const std::string &path, unsigned int &nodes, size_t &repRankBlocks,
                       uint64_t &ranks) {
     FILE *in = fopen(path.c_str(), "r");
     if (in == NULL) {
@@ -898,14 +912,14 @@ static void readRangeShape(const std::string &path, unsigned int &nodes, size_t 
         EXIT(EXIT_FAILURE);
     }
     nodes = 0;
-    ranges = 0;
+    repRankBlocks = 0;
     size_t seen = 0;
-    const bool read = fscanf(in, "nodes\t%u\nranges\t%zu\nranks\t%zu", &nodes, &ranges, &seen) == 3;
+    const bool read = fscanf(in, "nodes\t%u\nrepRankBlocks\t%zu\nranks\t%zu", &nodes, &repRankBlocks, &seen) == 3;
     fclose(in);
     ranks = seen;
-    if (read == false || nodes == 0 || ranges == 0 || ranges > PairRecord::MAX_RANGE_COUNT) {
-        Debug(Debug::ERROR) << path << " names " << nodes << " nodes and " << ranges
-                            << " ranges, which is not a set of candidate pairs\n";
+    if (read == false || nodes == 0 || repRankBlocks == 0 || repRankBlocks > PairRecord::MAX_REP_RANK_BLOCKS) {
+        Debug(Debug::ERROR) << path << " names " << nodes << " nodes and " << repRankBlocks
+                            << " repRankBlocks, which is not a set of candidate pairs\n";
         EXIT(EXIT_FAILURE);
     }
 }
@@ -956,7 +970,7 @@ static void addRanksWithNoRows(uint64_t from, uint64_t until,
     }
 }
 
-static void foldSubRange(const PairRecord *pairs, size_t size, std::vector<PairRecord> &out) {
+static void foldRepRankSubBlock(const PairRecord *pairs, size_t size, std::vector<PairRecord> &out) {
     size_t at = 0;
     while (at < size) {
         size_t end = at + 1;
@@ -977,12 +991,12 @@ int lin8pref(int argc, const char **argv, const Command &command) {
     FileUtil::fixRlimitNoFile();
     const NodePlacement node = NodePlacement::resolve(par);
     unsigned int writerNodes = 0;
-    size_t ranges = 0;
+    size_t repRankBlocks = 0;
     uint64_t ranks = 0;
-    readRangeShape(par.db1, writerNodes, ranges, ranks);
+    readRepRankBlockShape(par.db1, writerNodes, repRankBlocks, ranks);
     const size_t budget = static_cast<size_t>(Util::computeMemory(par.splitMemoryLimit) * 0.95);
     requireEveryNodeDone(par.db1, writerNodes);
-    const BucketCounts rangeCounts(par.db1, writerNodes, PairRecord::SUB_RANGE_COUNT, ranges);
+    const BucketCounts repRankBlockCounts(par.db1, writerNodes, PairRecord::REP_RANK_SUB_BLOCKS, repRankBlocks);
 
     RunDbReader *live = NULL;
     if (par.linclusthashValid.empty() == false) {
@@ -990,74 +1004,74 @@ int lin8pref(int argc, const char **argv, const Command &command) {
         live->open();
     }
 
-    const size_t outEntries = ranges * PairRecord::SUB_RANGE_COUNT;
+    const size_t outEntries = repRankBlocks * PairRecord::REP_RANK_SUB_BLOCKS;
     const std::string outCounts = par.db3 + "." + SSTR(node.index) + ".counts";
-    std::vector<std::vector<uint64_t> > outSubRange(1, std::vector<uint64_t>(outEntries, 0));
+    std::vector<std::vector<uint64_t> > outRepRankSubBlock(1, std::vector<uint64_t>(outEntries, 0));
     std::vector<uint64_t> outBase(outEntries, 0);
 
     Timer timer;
     uint64_t read = 0;
     uint64_t kept = 0;
-    size_t myRanges = 0;
-    for (size_t range = node.index; range < ranges; range += node.count) {
-        myRanges++;
+    size_t myRepRankBlocks = 0;
+    for (size_t repRankBlock = node.index; repRankBlock < repRankBlocks; repRankBlock += node.count) {
+        myRepRankBlocks++;
     }
-    Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << myRanges
-                       << " of " << ranges << " ranges\n";
+    Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << myRepRankBlocks
+                       << " of " << repRankBlocks << " repRankBlocks\n";
 
-    Debug::Progress progress(myRanges);
+    Debug::Progress progress(myRepRankBlocks);
     std::vector<std::pair<std::string, std::string> > pending;
     size_t pendingFirst = node.index;
     uint64_t pendingBytes = 0;
-    std::vector<std::vector<PairRecord> > folded(PairRecord::SUB_RANGE_COUNT);
+    std::vector<std::vector<PairRecord> > folded(PairRecord::REP_RANK_SUB_BLOCKS);
     std::vector<PairRecord> alone;
-    std::vector<size_t> aloneAt(PairRecord::SUB_RANGE_COUNT + 1, 0);
-    std::vector<size_t> outAt(PairRecord::SUB_RANGE_COUNT + 1, 0);
+    std::vector<size_t> aloneAt(PairRecord::REP_RANK_SUB_BLOCKS + 1, 0);
+    std::vector<size_t> outAt(PairRecord::REP_RANK_SUB_BLOCKS + 1, 0);
     std::vector<std::vector<unsigned char> > packed(par.threads);
     RawArray<PairRecord> pairs;
-    for (size_t range = node.index; range < ranges; range += node.count) {
+    for (size_t repRankBlock = node.index; repRankBlock < repRankBlocks; repRankBlock += node.count) {
         const std::vector<size_t> starts =
-            loadBucket(par.db1, rangeCounts, writerNodes, range, PairRecord::SUB_RANGE_COUNT,
-                       BySubRange(ranks, ranges), budget, par.threads, "Range", "raise --ranges",
+            loadBucket(par.db1, repRankBlockCounts, writerNodes, repRankBlock, PairRecord::REP_RANK_SUB_BLOCKS,
+                       ByRepRankSubBlock(ranks, repRankBlocks), budget, par.threads, "Representative rank block", "raise --rep-rank-blocks",
                        "lin8-pairs", pairs);
         read += pairs.size();
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-        for (size_t i = 0; i < PairRecord::SUB_RANGE_COUNT; i++) {
+        for (size_t i = 0; i < PairRecord::REP_RANK_SUB_BLOCKS; i++) {
             SORT_SERIAL(pairs.begin() + starts[i], pairs.begin() + starts[i + 1],
                         PairRecord::byRepAndMember);
         }
 
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-        for (size_t i = 0; i < PairRecord::SUB_RANGE_COUNT; i++) {
+        for (size_t i = 0; i < PairRecord::REP_RANK_SUB_BLOCKS; i++) {
             folded[i].clear();
-            foldSubRange(pairs.begin() + starts[i], starts[i + 1] - starts[i], folded[i]);
+            foldRepRankSubBlock(pairs.begin() + starts[i], starts[i + 1] - starts[i], folded[i]);
         }
 
         alone.clear();
-        addRanksWithNoRows(PairRecord::firstRankOf(range, ranks, ranges),
-                           PairRecord::firstRankOf(range + 1, ranks, ranges), folded, live, alone);
+        addRanksWithNoRows(PairRecord::firstRankOf(repRankBlock, ranks, repRankBlocks),
+                           PairRecord::firstRankOf(repRankBlock + 1, ranks, repRankBlocks), folded, live, alone);
 
         {
             size_t at = 0;
-            for (size_t i = 0; i < PairRecord::SUB_RANGE_COUNT; i++) {
+            for (size_t i = 0; i < PairRecord::REP_RANK_SUB_BLOCKS; i++) {
                 aloneAt[i] = at;
                 while (at < alone.size()
-                       && PairRecord::subRangeOf(alone[at].rep(), ranks, ranges) == i) {
+                       && PairRecord::repRankSubBlockOf(alone[at].rep(), ranks, repRankBlocks) == i) {
                     at++;
                 }
             }
-            aloneAt[PairRecord::SUB_RANGE_COUNT] = alone.size();
+            aloneAt[PairRecord::REP_RANK_SUB_BLOCKS] = alone.size();
         }
 
-        std::vector<uint64_t> &outCount = outSubRange[0];
+        std::vector<uint64_t> &outCount = outRepRankSubBlock[0];
         outAt[0] = 0;
-        for (size_t i = 0; i < PairRecord::SUB_RANGE_COUNT; i++) {
+        for (size_t i = 0; i < PairRecord::REP_RANK_SUB_BLOCKS; i++) {
             const size_t mine = folded[i].size() + (aloneAt[i + 1] - aloneAt[i]);
             outAt[i + 1] = outAt[i] + mine;
-            outCount[range * PairRecord::SUB_RANGE_COUNT + i] = mine;
+            outCount[repRankBlock * PairRecord::REP_RANK_SUB_BLOCKS + i] = mine;
         }
 
-        const std::string path = par.db3 + "." + SSTR(node.index) + "." + SSTR(range);
+        const std::string path = par.db3 + "." + SSTR(node.index) + "." + SSTR(repRankBlock);
         const std::string tmp = path + ".tmp";
         const int out = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
         if (out < 0 || ftruncate(out, static_cast<off_t>(outAt.back() * PairRecord::DISK_BYTES)) != 0) {
@@ -1065,7 +1079,7 @@ int lin8pref(int argc, const char **argv, const Command &command) {
             EXIT(EXIT_FAILURE);
         }
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-        for (size_t i = 0; i < PairRecord::SUB_RANGE_COUNT; i++) {
+        for (size_t i = 0; i < PairRecord::REP_RANK_SUB_BLOCKS; i++) {
             const size_t mine = outAt[i + 1] - outAt[i];
             if (mine == 0) {
                 continue;
@@ -1108,23 +1122,23 @@ int lin8pref(int argc, const char **argv, const Command &command) {
         }
         pending.push_back(std::make_pair(tmp, path));
         pendingBytes += outAt.back() * PairRecord::DISK_BYTES;
-        // batched like a chunk: a restart redoes the whole pass, so a range needs no flush of its own
+        // batched like a chunk: a restart redoes the whole pass, so a repRankBlock needs no flush of its own
         if (pendingBytes >= PUBLISH_BATCH_BYTES || pending.size() >= PUBLISH_BATCH_FILES
-            || range + node.count >= ranges) {
+            || repRankBlock + node.count >= repRankBlocks) {
             publishAllAtomically(pending, par.threads);
             if (par.removeTmpFiles) {
-                dropConsumed(par.db1, writerNodes, pendingFirst, range + 1, node.count);
+                dropConsumed(par.db1, writerNodes, pendingFirst, repRankBlock + 1, node.count);
             }
-            pendingFirst = range + node.count;
+            pendingFirst = repRankBlock + node.count;
             pendingBytes = 0;
         }
         progress.updateProgress();
     }
-    writeSubBucketCounts(outCounts, outBase, outSubRange, ranges);
+    writeSubBucketCounts(outCounts, outBase, outRepRankSubBlock, repRankBlocks);
 
     const std::string shapeTmp = par.db3 + "." + SSTR(node.index) + ".tmp";
     FILE *shape = FileUtil::openAndDelete(shapeTmp.c_str(), "w");
-    fprintf(shape, "nodes\t%u\nranges\t%zu\nranks\t%zu\n", node.count, ranges, (size_t) ranks);
+    fprintf(shape, "nodes\t%u\nrepRankBlocks\t%zu\nranks\t%zu\n", node.count, repRankBlocks, (size_t) ranks);
     if (fclose(shape) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << shapeTmp << "\n";
         EXIT(EXIT_FAILURE);

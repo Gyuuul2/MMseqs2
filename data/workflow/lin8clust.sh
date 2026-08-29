@@ -45,7 +45,7 @@ fi
 [ ! -d "$TMP" ] && mkdir -p "$TMP"
 NODES="${NODES:-1}"
 NODE="${NODE:-0}"
-RANGES="${RANGES:-1024}"
+REP_RANK_BLOCKS="${REP_RANK_BLOCKS:-1024}"
 THREADS="${THREADS:-1}"
 SEQID="${SEQID:-0.9}"
 COV="${COV:-0.8}"
@@ -102,7 +102,7 @@ notExists "$TMP/kmer/out.$NODE.done" && \
 # shellcheck disable=SC2086
 notExists "$TMP/pairs/pairs.$NODE.done" && \
     "$MMSEQS" lin8-pairs "$TMP/db" "$TMP/kmer/out" "$TMP/pairs/pairs" \
-        --node-count "$NODES" --node-id "$NODE" --threads "$THREADS" --ranges "$RANGES" \
+        --node-count "$NODES" --node-id "$NODE" --threads "$THREADS" --rep-rank-blocks "$REP_RANK_BLOCKS" \
         -c "$COV" --cov-mode "$COVMODE" $VALID ${GROUP_PAR}
 
 [ "$NODES" -gt 1 ] && waitForAll "$TMP/pairs/pairs" "$NODES"
@@ -114,37 +114,37 @@ notExists "$TMP/pref/pref.$NODE.done" && \
 
 [ "$NODES" -gt 1 ] && waitForAll "$TMP/pref/pref" "$NODES"
 
-# The wave. A representative can only be taken by one of a lower rank and the ranges ascend with that
-# rank, so aligning range k only needs what was decided up to the end of range k-1. Deciding is one
+# The wave. A representative can only be taken by one of a lower rank and the blocks ascend with that
+# rank, so aligning block k only needs what was decided up to the end of block k-1. Deciding is one
 # thread, because a greedy assignment is one order over the whole database.
 #
-# One machine is its own whole share of every range, so there is nothing to wait for: it walks the
-# ranges in one process, deciding each group as the aligner hands it over. The bitmap is then a
+# One machine is its own whole share of every repRankBlock, so there is nothing to wait for: it walks the
+# repRankBlocks in one process, deciding each group as the aligner hands it over. The bitmap is then a
 # variable rather than a file, and the pairs the deciding pass would have read never reach the disk.
 #
-# Many machines cannot do that: range k is not decided until every one of them has aligned its share
-# of it, so they keep a process a range and this loop holds the barrier between the two halves. The
-# guard is per range and guards both halves together: the bitmap the deciding pass hands on is only
-# consistent with the ranges it has already decided, so redoing a decided range would find every
-# representative in it already taken and write an empty range over a full one.
+# Many machines cannot do that: block k is not decided until every one of them has aligned its share
+# of it, so they keep a process a repRankBlock and this loop holds the barrier between the two halves. The
+# guard is per repRankBlock and guards both halves together: the bitmap the deciding pass hands on is only
+# consistent with the repRankBlocks it has already decided, so redoing a decided repRankBlock would find every
+# representative in it already taken and write an empty repRankBlock over a full one.
 if [ "$NODES" -eq 1 ]; then
     # shellcheck disable=SC2086
-    notExists "$TMP/decided/decided.0.$((RANGES - 1))" && \
+    notExists "$TMP/decided/decided.0.$((REP_RANK_BLOCKS - 1))" && \
         "$MMSEQS" lin8-align "$TMP/db" "$TMP/pref/pref" "$TMP/aligned/aligned" \
             --node-count 1 --node-id 0 --taken "$TMP/taken.0" \
             --decided "$TMP/decided/decided" \
             --threads "$THREADS" --min-seq-id "$SEQID" -c "$COV" --cov-mode "$COVMODE" \
             $VALID ${ALIGN_PAR}
-    R="$RANGES"
+    R="$REP_RANK_BLOCKS"
 else
     R=0
 fi
-while [ "$R" -lt "$RANGES" ]; do
+while [ "$R" -lt "$REP_RANK_BLOCKS" ]; do
     if notExists "$TMP/decided/decided.0.$R"; then
         # shellcheck disable=SC2086
         notExists "$TMP/aligned/aligned.$R.$NODE.done" && \
             "$MMSEQS" lin8-align "$TMP/db" "$TMP/pref/pref" "$TMP/aligned/aligned" \
-                --node-count "$NODES" --node-id "$NODE" --range "$R" --taken "$TMP/taken.$NODE" \
+                --node-count "$NODES" --node-id "$NODE" --repRankBlock "$R" --taken "$TMP/taken.$NODE" \
                 --decided "$TMP/decided/decided" \
                         --threads "$THREADS" --min-seq-id "$SEQID" -c "$COV" --cov-mode "$COVMODE" \
                 $VALID ${ALIGN_PAR}
@@ -152,13 +152,13 @@ while [ "$R" -lt "$RANGES" ]; do
             [ "$NODES" -gt 1 ] && waitForAll "$TMP/aligned/aligned.$R" "$NODES"
             # shellcheck disable=SC2086
             "$MMSEQS" lin8-cluster "$TMP/aligned/aligned" "$TMP/decided/decided" \
-                --range "$R" --taken "$TMP/taken.assign" \
+                --repRankBlock "$R" --taken "$TMP/taken.assign" \
                 --pref "$TMP/pref/pref" ${ASSIGN_PAR}
         else
-            # the next range needs the bitmap this range produced, so wait for it
+            # the next repRankBlock needs the bitmap this repRankBlock produced, so wait for it
             _waited=0
             while notExists "$TMP/decided/decided.0.$R"; do
-                [ "$_waited" -ge "$WAIT_LIMIT" ] && fail "waited ${WAIT_LIMIT}s for range $R to be decided"
+                [ "$_waited" -ge "$WAIT_LIMIT" ] && fail "waited ${WAIT_LIMIT}s for repRankBlock $R to be decided"
                 sleep 1
                 _waited=$((_waited + 1))
             done

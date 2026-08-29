@@ -175,7 +175,7 @@ static bool sequencesMatch(const char *left, const char *right, uint32_t length,
     return same >= need;
 }
 
-static void clusterHashBucket(const RunDbReader &reader, const HashEntry *bucket, size_t size,
+static void foldOneHashBucket(const RunDbReader &reader, const HashEntry *bucket, size_t size,
                           uint32_t length, const unsigned char *aa2num, float identity,
                           std::vector<char> &taken, std::vector<ClusterPair> &out) {
     if (size < 2) {
@@ -301,12 +301,12 @@ private:
 
 static const size_t HASH_PER_THREAD = 256;
 
-static unsigned int threadsFor(size_t work, unsigned int threads) {
+static unsigned int threadsWorthStarting(size_t work, unsigned int threads) {
     const size_t want = work / HASH_PER_THREAD;
     return (unsigned int) std::max<size_t>(1, std::min<size_t>(threads, want));
 }
 
-static void clusterEntries(const RunDbReader &reader, std::vector<HashEntry> &entries,
+static void foldEntriesIntoClusters(const RunDbReader &reader, std::vector<HashEntry> &entries,
                            uint32_t length, const unsigned char *aa2num, float identity,
                            unsigned int threads, std::vector<ClusterPair> &out, size_t &crowded) {
     SORT_PARALLEL(entries.begin(), entries.end(), HashEntry::byHashAndRank);
@@ -324,7 +324,7 @@ static void clusterEntries(const RunDbReader &reader, std::vector<HashEntry> &en
         }
         i = j;
     }
-    const unsigned int useThreads = threadsFor(bucketStart.size() / 2, threads);
+    const unsigned int useThreads = threadsWorthStarting(bucketStart.size() / 2, threads);
     std::vector<std::vector<ClusterPair> > pairsPerThread(useThreads);
 #pragma omp parallel num_threads(useThreads)
     {
@@ -335,7 +335,7 @@ static void clusterEntries(const RunDbReader &reader, std::vector<HashEntry> &en
         std::vector<char> taken;
 #pragma omp for schedule(dynamic, 1)
         for (size_t b = 0; b < bucketStart.size() / 2; b++) {
-            clusterHashBucket(reader, entries.data() + bucketStart[2 * b],
+            foldOneHashBucket(reader, entries.data() + bucketStart[2 * b],
                               bucketStart[2 * b + 1] - bucketStart[2 * b], length, aa2num, identity,
                               taken, pairsPerThread[thread]);
         }
@@ -345,7 +345,7 @@ static void clusterEntries(const RunDbReader &reader, std::vector<HashEntry> &en
     }
 }
 
-static void clusterOneLength(const RunDbReader &reader, uint64_t rankBegin, uint64_t rankEnd,
+static void foldSequencesOfOneLength(const RunDbReader &reader, uint64_t rankBegin, uint64_t rankEnd,
                              uint32_t length, const unsigned char *aa2num, float identity,
                              uint32_t anchorK, size_t budget, unsigned int threads, const std::string &tmpPrefix,
                              std::vector<ClusterPair> &out, size_t &crowded) {
@@ -357,7 +357,7 @@ static void clusterOneLength(const RunDbReader &reader, uint64_t rankBegin, uint
     std::vector<HashEntry> entries;
     if (partitions == 1) {
         // nothing to divide, so the entries never leave memory
-        const unsigned int useThreads = threadsFor(count, threads);
+        const unsigned int useThreads = threadsWorthStarting(count, threads);
         std::vector<std::vector<HashEntry> > perThread(useThreads);
 #pragma omp parallel num_threads(useThreads)
         {
@@ -392,11 +392,11 @@ static void clusterOneLength(const RunDbReader &reader, uint64_t rankBegin, uint
             entries.insert(entries.end(), perThread[i].begin(), perThread[i].end());
             std::vector<HashEntry>().swap(perThread[i]);
         }
-        clusterEntries(reader, entries, length, aa2num, identity, threads, out, crowded);
+        foldEntriesIntoClusters(reader, entries, length, aa2num, identity, threads, out, crowded);
         return;
     }
 
-    const unsigned int useThreads = threadsFor(count, threads);
+    const unsigned int useThreads = threadsWorthStarting(count, threads);
     HashPartitions parts(tmpPrefix, partitions, useThreads);
 #pragma omp parallel num_threads(useThreads)
     {
@@ -430,7 +430,7 @@ static void clusterOneLength(const RunDbReader &reader, uint64_t rankBegin, uint
     parts.finish();
     for (size_t at = 0; at < partitions; at++) {
         parts.load(at, entries);
-        clusterEntries(reader, entries, length, aa2num, identity, threads, out, crowded);
+        foldEntriesIntoClusters(reader, entries, length, aa2num, identity, threads, out, crowded);
     }
 }
 
@@ -589,7 +589,7 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
                 if (hashPartitionCount(static_cast<size_t>(rankEnd - rankBegin), budget) > 1) {
                     oversized++;
                 }
-                clusterOneLength(reader, rankBegin, rankEnd, length, hashMat->aa2num, identity,
+                foldSequencesOfOneLength(reader, rankBegin, rankEnd, length, hashMat->aa2num, identity,
                                  anchorLength(identity), budget,
                                  par.threads, par.db2 + ".part" + uniqueTmpSuffix(), pairs, crowded);
                 SORT_PARALLEL(pairs.begin(), pairs.end(), ClusterPair::byMemberAndRepresentative);

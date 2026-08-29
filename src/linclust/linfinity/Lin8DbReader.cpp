@@ -239,7 +239,7 @@ void IoRing::submit(const std::vector<Read> &reads, const char *what) {
 const uint64_t RunDbReader::VALID_MAGIC = 0x4C494E4356414C44ull;
 
 namespace {
-size_t sizeOf(const std::string &path, bool &exists) {
+size_t fileSizeIfExists(const std::string &path, bool &exists) {
     struct stat sb;
     exists = (stat(path.c_str(), &sb) == 0);
     return exists ? static_cast<size_t>(sb.st_size) : 0;
@@ -259,7 +259,7 @@ void unmapAndDrop(char *&at, int &fd, size_t length) {
     }
 }
 
-char *mapWhole(const std::string &path, size_t length, int &keptFd) {
+char *mapFileReadOnly(const std::string &path, size_t length, int &keptFd) {
     keptFd = -1;
     if (length == 0) {
         return NULL;
@@ -283,7 +283,8 @@ char *mapWhole(const std::string &path, size_t length, int &keptFd) {
 
 RunDbReader::RunDbReader(const std::string &db, const std::string &validPath, bool withHeaders)
     : db(db), validPath(validPath), withHeaders(withHeaders), valid(NULL),
-      validMap(NULL), validSize(0), validCount(0), validLoaded(false) {}
+      validMap(NULL), validSize(0), validCount(0), validLoaded(false),
+      wantDirect(true) {}
 
 RunDbReader::~RunDbReader() {
     close();
@@ -295,7 +296,7 @@ void RunDbReader::open() {
     // the layout states how many files there are, so a missing one is an error and not a shorter db
     for (unsigned int i = 0; i < runs.fileCount(); i++) {
         bool exists = false;
-        const size_t length = sizeOf(db + "." + SSTR(i), exists);
+        const size_t length = fileSizeIfExists(db + "." + SSTR(i), exists);
         if (exists == false) {
             Debug(Debug::ERROR) << "Data file " << (db + "." + SSTR(i)) << " is missing, the run "
                                 << "table declares " << runs.fileCount() << " of them\n";
@@ -308,7 +309,7 @@ void RunDbReader::open() {
     if (withHeaders) {
         for (unsigned int i = 0; i < data.size(); i++) {
             bool exists = false;
-            headerSize.push_back(sizeOf(db + "_h." + SSTR(i), exists));
+            headerSize.push_back(fileSizeIfExists(db + "_h." + SSTR(i), exists));
             headers.push_back(NULL);
             headerFd.push_back(-1);
             if (exists == false) {
@@ -403,7 +404,7 @@ void RunDbReader::mapFile(uint32_t file) const {
     {
         if (data[file] == NULL) {
             int fd = -1;
-            char *mapped = mapWhole(db + "." + SSTR(file), dataSize[file], fd);
+            char *mapped = mapFileReadOnly(db + "." + SSTR(file), dataSize[file], fd);
             dataFd[file] = fd;
 #pragma omp atomic write
             data[file] = mapped;
@@ -422,7 +423,7 @@ void RunDbReader::mapHeader(uint32_t file) const {
     {
         if (headers[file] == NULL) {
             int fd = -1;
-            char *mapped = mapWhole(db + "_h." + SSTR(file), headerSize[file], fd);
+            char *mapped = mapFileReadOnly(db + "_h." + SSTR(file), headerSize[file], fd);
             headerFd[file] = fd;
 #pragma omp atomic write
             headers[file] = mapped;
@@ -524,8 +525,24 @@ bool RunDbReader::HeaderStream::next(const char *&begin, size_t &length) {
 static const size_t DIRECT_BLOCK = 512;
 static const unsigned RING_DEPTH = 256;
 
-void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes) {
+void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
+                            size_t memoryBudget) {
     directFd.assign(data.size(), -1);
+    // Direct reads exist so that a database far larger than memory does not fill the page cache with
+    // sequences it will not see again and push the read arenas out. A database that fits has the
+    // opposite problem: a sequence is a member of several representatives, and every one of them
+    // then fetches it from the disk again. Measured on a 22 GB database in 121 GB of memory, direct
+    // reads moved 107 GB to read it 4.9 times and the pass took 492s; through the cache it read
+    // 47 GB and took 217s, with sixteen of twenty threads running rather than ten.
+    //
+    // The rule is the size of the sequences against the memory the run was given, so a machine that
+    // can hold its database uses the cache and one that cannot does not.
+    const size_t budget = memoryBudget;
+    const uint64_t sequenceBytes = runs.totalBytes();
+    wantDirect = sequenceBytes > budget / 2;
+    Debug(Debug::INFO) << "Sequences are " << (sequenceBytes >> 30) << " GB against a "
+                       << (budget >> 30) << " GB limit, reading "
+                       << (wantDirect ? "past the page cache" : "through the page cache") << "\n";
     for (unsigned int i = 0; i < threads; i++) {
         BatchWorker *worker = new BatchWorker();
         // room to grow every span outward to whole blocks
@@ -544,7 +561,7 @@ int RunDbReader::directOf(uint32_t file) const {
         return directFd[file];
     }
     const std::string path = db + "." + SSTR(file);
-    int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT);
+    int fd = ::open(path.c_str(), wantDirect ? (O_RDONLY | O_DIRECT) : O_RDONLY);
     if (fd < 0) {
         // a filesystem that refuses direct reads still has to work, just with the page cache
         fd = ::open(path.c_str(), O_RDONLY);

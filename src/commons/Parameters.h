@@ -693,8 +693,8 @@ public:
     int linclusterdbNodeId;
     int linclusterdbNodeCount;
     std::string linclusthashValid;
-    int linclustRange;
-    int linclustRanges;
+    int lin8RepRankBlock;
+    int lin8RepRankBlocks;
     std::string linclustTaken;
     std::string linclustDecided;
     std::string linclustPref;
@@ -1177,8 +1177,8 @@ public:
     PARAMETER(PARAM_LINCLUSTERDB_NODE_ID)
     PARAMETER(PARAM_LINCLUSTERDB_NODE_COUNT)
     PARAMETER(PARAM_LINCLUSTHASH_VALID)
-    PARAMETER(PARAM_LINCLUST_RANGE)
-    PARAMETER(PARAM_LINCLUST_RANGES)
+    PARAMETER(PARAM_LIN8_REP_RANK_BLOCK)
+    PARAMETER(PARAM_LIN8_REP_RANK_BLOCKS)
     PARAMETER(PARAM_LINCLUST_TAKEN)
     PARAMETER(PARAM_LINCLUST_DECIDED)
     PARAMETER(PARAM_LINCLUST_PREF)

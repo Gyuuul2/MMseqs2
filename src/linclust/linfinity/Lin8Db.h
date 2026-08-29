@@ -164,31 +164,31 @@ struct __attribute__((packed)) PairRecord {
 
     static const unsigned int RANK_BITS = KmerRecord::RANK_BITS;
     static const unsigned int DIAGONAL_BITS = 16;
-    // shifted up by half its range, so comparing the field unsigned compares the diagonals signed
+    // shifted up by half its repRankBlock, so comparing the field unsigned compares the diagonals signed
     static const int DIAGONAL_BIAS = 1 << (DIAGONAL_BITS - 1);
 
-    static const size_t DEFAULT_RANGE_COUNT = 1024;
-    static const size_t MAX_RANGE_COUNT = 4096;
+    static const size_t DEFAULT_REP_RANK_BLOCKS = 1024;
+    static const size_t MAX_REP_RANK_BLOCKS = 4096;
 
-    static size_t rangeOf(uint64_t rep, uint64_t ranks, size_t ranges) {
-        return ranks == 0 ? 0 : std::min(rep * ranges / ranks, ranges - 1);
+    static size_t repRankBlockOf(uint64_t rep, uint64_t ranks, size_t repRankBlocks) {
+        return ranks == 0 ? 0 : std::min(rep * repRankBlocks / ranks, repRankBlocks - 1);
     }
 
-    static uint64_t firstRankOf(size_t range, uint64_t ranks, size_t ranges) {
-        return (range * ranks + ranges - 1) / ranges;
+    static uint64_t firstRankOf(size_t repRankBlock, uint64_t ranks, size_t repRankBlocks) {
+        return (repRankBlock * ranks + repRankBlocks - 1) / repRankBlocks;
     }
 
-    static const unsigned int SUB_RANGE_BITS = 8;
-    // subRangeOf multiplies a rank by both counts before dividing, unsigned
-    static_assert(RunTable::RANK_BITS + 12 + SUB_RANGE_BITS <= 64,
-                  "a rank times the range count times the sub range count is over 64 bits");
-    static const size_t SUB_RANGE_COUNT = size_t(1) << SUB_RANGE_BITS;
-    static size_t fineOf(uint64_t rep, uint64_t ranks, size_t ranges) {
-        return ranks == 0 ? 0 : std::min(rep * ranges * SUB_RANGE_COUNT / ranks,
-                                         ranges * SUB_RANGE_COUNT - 1);
+    static const unsigned int REP_RANK_SUB_BLOCK_BITS = 8;
+    // repRankSubBlockOf multiplies a rank by both counts before dividing, unsigned
+    static_assert(RunTable::RANK_BITS + 12 + REP_RANK_SUB_BLOCK_BITS <= 64,
+                  "a rank times the repRankBlock count times the sub repRankBlock count is over 64 bits");
+    static const size_t REP_RANK_SUB_BLOCKS = size_t(1) << REP_RANK_SUB_BLOCK_BITS;
+    static size_t fineOf(uint64_t rep, uint64_t ranks, size_t repRankBlocks) {
+        return ranks == 0 ? 0 : std::min(rep * repRankBlocks * REP_RANK_SUB_BLOCKS / ranks,
+                                         repRankBlocks * REP_RANK_SUB_BLOCKS - 1);
     }
-    static size_t subRangeOf(uint64_t rep, uint64_t ranks, size_t ranges) {
-        return fineOf(rep, ranks, ranges) % SUB_RANGE_COUNT;
+    static size_t repRankSubBlockOf(uint64_t rep, uint64_t ranks, size_t repRankBlocks) {
+        return fineOf(rep, ranks, repRankBlocks) % REP_RANK_SUB_BLOCKS;
     }
 
     static const unsigned int MEMBER_HIGH_BITS = 64 - RANK_BITS;
@@ -243,7 +243,7 @@ private:
 
 class KSeqWrapper;
 
-struct InputChunk {
+struct InputSplit {
     size_t file;
     uint64_t from;   // where to start looking for the first record
     uint64_t until;  // where to stop starting new records; the last one is finished past it
@@ -251,23 +251,23 @@ struct InputChunk {
     uint64_t bytes() const { return until - from; }
 };
 
-std::vector<InputChunk> planInputChunks(const std::vector<std::string> &filenames, size_t want);
+std::vector<InputSplit> planInputSplits(const std::vector<std::string> &filenames, size_t want);
 
-class InputChunkReader {
+class InputSplitReader {
 public:
-    InputChunkReader(const std::string &filename, const InputChunk &chunk);
-    ~InputChunkReader();
+    InputSplitReader(const std::string &filename, const InputSplit &chunk);
+    ~InputSplitReader();
 
     bool next(const char *&header, size_t &headerLength, const char *&sequence, size_t &length);
 
 private:
-    InputChunkReader(const InputChunkReader &);
-    InputChunkReader &operator=(const InputChunkReader &);
+    InputSplitReader(const InputSplitReader &);
+    InputSplitReader &operator=(const InputSplitReader &);
 
     bool fill();
 
     int fd;
-    InputChunk chunk;
+    InputSplit chunk;
     std::string name;
     std::vector<char> buffer;
     size_t at;        // where in the buffer the next unread byte is
@@ -277,7 +277,7 @@ private:
     std::string header;
     std::string sequence;
     KSeqWrapper *whole;
-    void *stream;       // a ZSTD_DStream when the piece is compressed
+    void *stream;       // a ZSTD_DStream when the input is compressed
     std::vector<char> packed;
     size_t packedAt;
     size_t packedFilled;

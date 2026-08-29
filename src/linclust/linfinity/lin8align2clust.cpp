@@ -26,54 +26,55 @@
 #include <omp.h>
 #endif
 
-struct RingSlot {
-    RingSlot() : state(0), rep(0) {}
-    volatile int state;   // 0 empty, 1 filled, 2 aligned
-    uint64_t rep;
-    std::vector<PairRecord> rows;
-    std::vector<uint64_t> survivors;
-};
-
 static const size_t STREAM_ROWS = 1u << 16;
-static const size_t RING_SLOTS = 4096;
+// enough representatives that a fork and a join are lost in the aligning, and few enough that
+// one batch of them is megabytes rather than a repRankBlock
+static const size_t BATCH_ROWS = 1u << 18;
 static const size_t ARENA_BYTES = 64u << 20;
 
-static const size_t MEMBERS_PER_SLICE = 512;
+static const size_t MEMBERS_PER_ALIGN_BATCH = 512;
 
-// one representative and a slice of its members, so a big group becomes many pieces
-static void readShape(const std::string &path, unsigned int &nodes, size_t &ranges, uint64_t &ranks) {
+// one representative's members, cut so a large group is shared rather than owned
+struct MemberBatch {
+    size_t group;
+    size_t from;
+    size_t count;
+};
+
+// one representative and a batch of its members, so a big group becomes many of them
+static void readPipelineShape(const std::string &path, unsigned int &nodes, size_t &repRankBlocks, uint64_t &ranks) {
     FILE *in = fopen(path.c_str(), "r");
     if (in == NULL) {
         Debug(Debug::ERROR) << "Cannot open " << path << ". Run lin8pref first\n";
         EXIT(EXIT_FAILURE);
     }
     nodes = 0;
-    ranges = 0;
+    repRankBlocks = 0;
     size_t seen = 0;
-    const bool read = fscanf(in, "nodes\t%u\nranges\t%zu\nranks\t%zu", &nodes, &ranges, &seen) == 3;
+    const bool read = fscanf(in, "nodes\t%u\nrepRankBlocks\t%zu\nranks\t%zu", &nodes, &repRankBlocks, &seen) == 3;
     fclose(in);
     ranks = seen;
-    if (read == false || nodes == 0 || ranges == 0 || ranges > PairRecord::MAX_RANGE_COUNT) {
-        Debug(Debug::ERROR) << path << " names " << nodes << " nodes and " << ranges
-                            << " ranges, which is not a set of folded pairs\n";
+    if (read == false || nodes == 0 || repRankBlocks == 0 || repRankBlocks > PairRecord::MAX_REP_RANK_BLOCKS) {
+        Debug(Debug::ERROR) << path << " names " << nodes << " nodes and " << repRankBlocks
+                            << " repRankBlocks, which is not a set of folded pairs\n";
         EXIT(EXIT_FAILURE);
     }
 }
 
-class RangeReader {
+class RepRankBlockReader {
 public:
-    RangeReader(const std::string &prefix, unsigned int foldNodes, size_t range, size_t bufferRows,
+    RepRankBlockReader(const std::string &prefix, unsigned int foldNodes, size_t repRankBlock, size_t bufferRows,
                 uint64_t skipRows)
-        : buffer(bufferRows), at(0), filled(0) {
+        : buffer(bufferRows), at(0), filled(0), stopped(false) {
         const std::string path =
-            prefix + "." + SSTR(range % foldNodes) + "." + SSTR(range);
+            prefix + "." + SSTR(repRankBlock % foldNodes) + "." + SSTR(repRankBlock);
         file = fopen(path.c_str(), "r");
         if (file == NULL) {
-            Debug(Debug::ERROR) << "Cannot open " << path << ", which node " << (range % foldNodes)
-                                << " should have written for range " << range << "\n";
+            Debug(Debug::ERROR) << "Cannot open " << path << ", which node " << (repRankBlock % foldNodes)
+                                << " should have written for repRankBlock " << repRankBlock << "\n";
             EXIT(EXIT_FAILURE);
         }
-        // off_t, not long: a range is two hundred gigabytes at a trillion sequences
+        // off_t, not long: a repRankBlock is two hundred gigabytes at a trillion sequences
         const off_t skip = static_cast<off_t>(skipRows * PairRecord::DISK_BYTES);
         if (skip > 0 && fseeko(file, skip, SEEK_SET) != 0) {
             Debug(Debug::ERROR) << "Cannot seek " << skip << " byte into " << path << "\n";
@@ -82,7 +83,7 @@ public:
         refill();
     }
 
-    ~RangeReader() {
+    ~RepRankBlockReader() {
         if (file != NULL) {
             fclose(file);
         }
@@ -99,9 +100,51 @@ public:
         return true;
     }
 
+    // A batch of whole representatives. Rows arrive in representative order, so a batch that stops
+    // at the last change of representative holds every row of every group in it, and those groups can
+    // be aligned in any order. The rows of the representative it stopped inside are carried to the
+    // next batch rather than pushed back, because a batch can span a refill.
+    bool fillBatch(std::vector<PairRecord> &into, size_t want, uint64_t until) {
+        into.clear();
+        into.swap(carry);
+        PairRecord row;
+        while (stopped == false && into.size() < want) {
+            if (next(row) == false || row.rep() >= until) {
+                stopped = true;
+                break;
+            }
+            into.push_back(row);
+        }
+        if (stopped == false && into.empty() == false) {
+            const uint64_t last = into.back().rep();
+            size_t keep = into.size();
+            while (keep > 0 && into[keep - 1].rep() == last) {
+                keep--;
+            }
+            if (keep == 0) {
+                // one representative is larger than a batch, so its rows are read to the end of it
+                while (true) {
+                    if (next(row) == false || row.rep() >= until) {
+                        stopped = true;
+                        break;
+                    }
+                    if (row.rep() != last) {
+                        carry.push_back(row);
+                        break;
+                    }
+                    into.push_back(row);
+                }
+            } else {
+                carry.assign(into.begin() + keep, into.end());
+                into.resize(keep);
+            }
+        }
+        return into.empty() == false;
+    }
+
 private:
-    RangeReader(const RangeReader &);
-    RangeReader &operator=(const RangeReader &);
+    RepRankBlockReader(const RepRankBlockReader &);
+    RepRankBlockReader &operator=(const RepRankBlockReader &);
 
     void refill() {
         filled = readRecords(buffer.data(), buffer.size(), file);
@@ -112,6 +155,8 @@ private:
     FILE *file;
     size_t at;
     size_t filled;
+    bool stopped;
+    std::vector<PairRecord> carry;
 };
 
 struct Candidates {
@@ -221,7 +266,7 @@ static bool rescueWithGaps(uint64_t member, uint32_t queryLen, uint32_t targetLe
     return true;
 }
 
-static void alignSlice(const RunDbReader &reader, uint64_t rep, const PairRecord *rows, size_t count,
+static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, const PairRecord *rows, size_t count,
                        const RankBitmap &taken, Sequence &query, Sequence &target,
                        BlockAligner &aligner, const Parameters &par, unsigned int thread,
                        Candidates &candidates, std::vector<uint64_t> &out, GateCounts &gate,
@@ -299,9 +344,9 @@ int lin8align(int argc, const char **argv, const Command &command) {
     FileUtil::fixRlimitNoFile();
     const NodePlacement node = NodePlacement::resolve(par);
     unsigned int writerNodes = 0;
-    size_t ranges = 0;
+    size_t repRankBlocks = 0;
     uint64_t ranks = 0;
-    readShape(par.db2, writerNodes, ranges, ranks);
+    readPipelineShape(par.db2, writerNodes, repRankBlocks, ranks);
     requireEveryNodeDone(par.db2, writerNodes);
 
     RunDbReader reader(par.db1, par.linclusthashValid);
@@ -312,47 +357,54 @@ int lin8align(int argc, const char **argv, const Command &command) {
         EXIT(EXIT_FAILURE);
     }
     const unsigned int threads = std::max<unsigned int>(par.threads, 3);
-    reader.openBatch(threads, ARENA_BYTES);
+    reader.openBatch(threads, ARENA_BYTES, Util::computeMemory(par.splitMemoryLimit));
 
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, par.scoreBias);
     SubstitutionMatrix::FastMatrix fastMatrix = SubstitutionMatrix::createAsciiSubMat(subMat);
     EvalueComputation evaluer(reader.getTotalBytes(), &subMat);
     const size_t maxLen = std::max<size_t>(reader.getRunTable().maxSeqLen(), 1);
 
-    size_t firstRange = par.linclustRange < 0 ? 0 : (size_t) par.linclustRange;
-    const size_t lastRange = par.linclustRange < 0 ? ranges : std::min(firstRange + 1, ranges);
+    size_t firstRepRankBlock = par.lin8RepRankBlock < 0 ? 0 : (size_t) par.lin8RepRankBlock;
+    const size_t lastRepRankBlock = par.lin8RepRankBlock < 0 ? repRankBlocks : std::min(firstRepRankBlock + 1, repRankBlocks);
 
     const bool decideHere = node.count == 1;
     if (decideHere && par.linclustDecided.empty()) {
         Debug(Debug::ERROR) << "One machine decides as it aligns and needs --decided to write to\n";
         EXIT(EXIT_FAILURE);
     }
-    if (decideHere && par.linclustRange < 0) {
-        while (firstRange < lastRange
-               && FileUtil::fileExists((par.linclustDecided + ".0." + SSTR(firstRange)).c_str())) {
-            firstRange++;
+    if (decideHere && par.lin8RepRankBlock < 0) {
+        while (firstRepRankBlock < lastRepRankBlock
+               && FileUtil::fileExists((par.linclustDecided + ".0." + SSTR(firstRepRankBlock)).c_str())) {
+            firstRepRankBlock++;
         }
-        if (firstRange > 0) {
-            Debug(Debug::INFO) << "Resuming at range " << firstRange << ", the earlier ones are decided\n";
+        if (firstRepRankBlock > 0) {
+            Debug(Debug::INFO) << "Resuming at repRankBlock " << firstRepRankBlock << ", the earlier ones are decided\n";
         }
     }
     Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes its share of "
-                       << (lastRange - firstRange) << " of " << ranges << " ranges\n";
+                       << (lastRepRankBlock - firstRepRankBlock) << " of " << repRankBlocks << " repRankBlocks\n";
 
     RankBitmap taken;
     taken.open(par.linclustTaken, ranks);
     if (par.linclustDecided.empty() == false) {
-        taken.catchUpTo(par.linclustDecided, firstRange);
+        taken.catchUpTo(par.linclustDecided, firstRepRankBlock);
         if (decideHere == false) {
-            taken.save(firstRange);
+            taken.save(firstRepRankBlock);
         }
     }
-    const BucketCounts foldCounts(par.db2, writerNodes, PairRecord::SUB_RANGE_COUNT, ranges);
+    const BucketCounts foldCounts(par.db2, writerNodes, PairRecord::REP_RANK_SUB_BLOCKS, repRankBlocks);
 
     Timer timer;
     uint64_t aligned = 0;
     uint64_t passed = 0;
-    Debug::Progress progress(lastRange - firstRange);
+    std::vector<PairRecord> batch;
+    std::vector<size_t> starts;
+    std::vector<std::vector<uint64_t> > survivors;
+    std::vector<MemberBatch> work;
+    std::vector<std::vector<uint64_t> > batchSurvivors;
+    // where the wall clock of this pass actually goes, so a slow run says which part was slow
+    double spentReading = 0, spentAligning = 0, spentDeciding = 0, spentWriting = 0;
+    Debug::Progress progress(lastRepRankBlock - firstRepRankBlock);
     std::vector<PairRecord> rows;
     std::vector<Candidates> candidates(threads);
     std::vector<PairRecord> outBuffer;
@@ -370,155 +422,137 @@ int lin8align(int argc, const char **argv, const Command &command) {
     uint64_t assigned = 0;
 
     std::vector<std::pair<std::string, std::string> > pendingOut;
-    size_t pendingFirst = firstRange;
+    size_t pendingFirst = firstRepRankBlock;
     uint64_t pendingBytes = 0;
-    for (size_t range = firstRange; range < lastRange; range++) {
-        const uint64_t rangeFrom = PairRecord::firstRankOf(range, ranks, ranges);
-        const uint64_t rangeUntil = PairRecord::firstRankOf(range + 1, ranks, ranges);
-        const uint64_t span = rangeUntil - rangeFrom;
-        const uint64_t myFrom = rangeFrom + span * node.index / node.count;
-        const uint64_t myUntil = rangeFrom + span * (node.index + 1) / node.count;
+    for (size_t repRankBlock = firstRepRankBlock; repRankBlock < lastRepRankBlock; repRankBlock++) {
+        const uint64_t blockFirstRank = PairRecord::firstRankOf(repRankBlock, ranks, repRankBlocks);
+        const uint64_t blockLastRank = PairRecord::firstRankOf(repRankBlock + 1, ranks, repRankBlocks);
+        const uint64_t span = blockLastRank - blockFirstRank;
+        const uint64_t myFrom = blockFirstRank + span * node.index / node.count;
+        const uint64_t myUntil = blockFirstRank + span * (node.index + 1) / node.count;
 
-        const std::string outPath = decideHere ? par.linclustDecided + ".0." + SSTR(range)
-                                              : par.db3 + "." + SSTR(node.index) + "." + SSTR(range);
+        const std::string outPath = decideHere ? par.linclustDecided + ".0." + SSTR(repRankBlock)
+                                              : par.db3 + "." + SSTR(node.index) + "." + SSTR(repRankBlock);
         const std::string outTmp = outPath + ".tmp";
         FILE *out = FileUtil::openAndDelete(outTmp.c_str(), "w");
         outBuffer.clear();
 
         uint64_t skipRows = 0;
         if (node.count > 1) {
-            const size_t mySub = PairRecord::subRangeOf(myFrom, ranks, ranges);
-            const std::vector<uint64_t> counts = foldCounts.of(range, range % writerNodes);
+            const size_t mySub = PairRecord::repRankSubBlockOf(myFrom, ranks, repRankBlocks);
+            const std::vector<uint64_t> counts = foldCounts.of(repRankBlock, repRankBlock % writerNodes);
             for (size_t sub = 0; sub < mySub; sub++) {
                 skipRows += counts[sub];
             }
         }
-        RangeReader stream(par.db2, writerNodes, range, STREAM_ROWS, skipRows);
+        RepRankBlockReader stream(par.db2, writerNodes, repRankBlock, STREAM_ROWS, skipRows);
 
-        std::vector<RingSlot> ring(RING_SLOTS);
-        volatile uint64_t filled = 0;      // slots the reader has produced
-        volatile uint64_t claimed = 0;     // slots an aligner has taken
-        volatile uint64_t decided = 0;     // slots the decider has drained
-        volatile bool ended = false;       // the reader saw the end of this machine's share
-
-#pragma omp parallel num_threads(threads)
-        {
-            unsigned int thread = 0;
-#ifdef OPENMP
-            thread = static_cast<unsigned int>(omp_get_thread_num());
-#endif
-            if (thread == 0) {
-                // reader: one representative a slot, in rank order
-                PairRecord row;
-                bool more = stream.next(row);
-                uint64_t at = 0;
-                while (more) {
-                    while (at - decided >= RING_SLOTS) {
-                        sched_yield();
-                    }
-                    RingSlot &slot = ring[at % RING_SLOTS];
-                    slot.rows.clear();
-                    slot.survivors.clear();
-                    slot.rep = row.rep();
-                    while (more && row.rep() == slot.rep) {
-                        slot.rows.push_back(row);
-                        more = stream.next(row);
-                    }
-                    if (more && row.rep() >= myUntil) {
-                        more = false;
-                    }
-                    __sync_synchronize();
-                    slot.state = 1;
-                    at++;
-                    filled = at;
-                }
-                ended = true;
-            } else if (thread == 1) {
-                // decider: strictly in index order, the only writer of the bitmap
-                uint64_t at = 0;
-                while (true) {
-                    while (at >= filled) {
-                        if (ended && at >= filled) {
-                            break;
-                        }
-                        sched_yield();
-                    }
-                    if (at >= filled && ended) {
-                        break;
-                    }
-                    RingSlot &slot = ring[at % RING_SLOTS];
-                    while (slot.state != 2) {
-                        sched_yield();
-                    }
-                    __sync_synchronize();
-                    if (slot.rows.empty() == false) {
-                        aligned += slot.rows.size();
-                        passed += slot.survivors.size();
-                        if (decideHere) {
-                            clusters += takeCluster(slot.rep, slot.survivors.data(),
-                                                    slot.survivors.size(), taken, outBuffer,
-                                                    assigned) ? 1 : 0;
-                        } else {
-                            PairRecord line;
-                            line.set(slot.rep, slot.rep, 0);
-                            outBuffer.push_back(line);
-                            for (size_t k = 0; k < slot.survivors.size(); k++) {
-                                line.set(slot.rep, slot.survivors[k], 0);
-                                outBuffer.push_back(line);
-                            }
-                        }
-                        if (outBuffer.size() >= STREAM_ROWS) {
-                            if (writeRecords(outBuffer.data(), outBuffer.size(), out)
-                                != outBuffer.size()) {
-                                Debug(Debug::ERROR) << "Cannot write " << outTmp << "\n";
-                                EXIT(EXIT_FAILURE);
-                            }
-                            outBuffer.clear();
-                        }
-                    }
-                    slot.state = 0;
-                    at++;
-                    decided = at;
-                }
-            } else {
-                // aligners: claim the next slot and align it
-                while (true) {
-                    uint64_t at = __sync_fetch_and_add((uint64_t *) &claimed, 1);
-                    while (at >= filled) {
-                        if (ended && at >= filled) {
-                            break;
-                        }
-                        sched_yield();
-                    }
-                    if (at >= filled && ended) {
-                        break;
-                    }
-                    RingSlot &slot = ring[at % RING_SLOTS];
-                    while (slot.state != 1) {
-                        sched_yield();
-                    }
-                    __sync_synchronize();
-                    if (workers[thread] == NULL) {
-                        workers[thread] = new AlignWorker(maxLen, subMat, fastMatrix, evaluer, par);
-                    }
-                    AlignWorker &worker = *workers[thread];
-                    slot.survivors.clear();
-                    if (slot.rep >= myFrom && slot.rep < myUntil && taken.taken(slot.rep) == false) {
-                        for (size_t from = 0; from < slot.rows.size(); from += MEMBERS_PER_SLICE) {
-                            const size_t until =
-                                std::min(from + MEMBERS_PER_SLICE, slot.rows.size());
-                            alignSlice(reader, slot.rep, &slot.rows[from], until - from, taken,
-                                       worker.query, worker.target, worker.aligner, par, thread,
-                                       candidates[thread], slot.survivors, gate[thread],
-                                       scorePerColThreshold, xDrop);
-                        }
-                    } else {
-                        slot.rows.clear();
-                    }
-                    __sync_synchronize();
-                    slot.state = 2;
+        // A batch of whole representatives is read, aligned on every thread, and then decided on
+        // one in representative order. The decision has to be ordered -- the bitmap it writes is what
+        // the next one reads -- but nothing else does, and takeCluster checks the bitmap again, so a
+        // thread aligning against a batch old view can only do work that is thrown away, never reach
+        // a different answer.
+        while (true) {
+            double mark = omp_get_wtime();
+            const bool more = stream.fillBatch(batch, BATCH_ROWS, myUntil);
+            spentReading += omp_get_wtime() - mark;
+            if (more == false) {
+                break;
+            }
+            starts.clear();
+            starts.push_back(0);
+            for (size_t i = 1; i < batch.size(); i++) {
+                if (batch[i].rep() != batch[i - 1].rep()) {
+                    starts.push_back(i);
                 }
             }
+            starts.push_back(batch.size());
+            const size_t groups = starts.size() - 1;
+            if (survivors.size() < groups) {
+                survivors.resize(groups);
+            }
+
+            // One unit of work is a batch of one representative's members, not a whole
+            // representative. Groups are six rows on average and thousands in the tail, so a thread
+            // that draws a tail group holds the barrier while the rest sleep: measured, half the
+            // threads were asleep waiting for it. Flattened, the tail is shared.
+            work.clear();
+            for (size_t g = 0; g < groups; g++) {
+                survivors[g].clear();
+                const uint64_t rep = batch[starts[g]].rep();
+                if (rep < myFrom || rep >= myUntil || taken.taken(rep)) {
+                    continue;
+                }
+                const size_t rows = starts[g + 1] - starts[g];
+                for (size_t from = 0; from < rows; from += MEMBERS_PER_ALIGN_BATCH) {
+                    MemberBatch item;
+                    item.group = g;
+                    item.from = from;
+                    item.count = std::min(MEMBERS_PER_ALIGN_BATCH, rows - from);
+                    work.push_back(item);
+                }
+            }
+            if (batchSurvivors.size() < work.size()) {
+                batchSurvivors.resize(work.size());
+            }
+
+            mark = omp_get_wtime();
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+            for (size_t w = 0; w < work.size(); w++) {
+                unsigned int thread = 0;
+#ifdef OPENMP
+                thread = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+                if (workers[thread] == NULL) {
+                    workers[thread] = new AlignWorker(maxLen, subMat, fastMatrix, evaluer, par);
+                }
+                AlignWorker &worker = *workers[thread];
+                const MemberBatch &item = work[w];
+                const size_t at = starts[item.group];
+                batchSurvivors[w].clear();
+                alignMemberBatch(reader, batch[at].rep(), &batch[at + item.from], item.count, taken,
+                                 worker.query, worker.target, worker.aligner, par, thread,
+                                 candidates[thread], batchSurvivors[w], gate[thread],
+                                 scorePerColThreshold, xDrop);
+            }
+            // the batches of one representative are in the order the serial version made them, so
+            // joining them in that order gives the list it would have produced
+            for (size_t w = 0; w < work.size(); w++) {
+                std::vector<uint64_t> &into = survivors[work[w].group];
+                into.insert(into.end(), batchSurvivors[w].begin(), batchSurvivors[w].end());
+            }
+            spentAligning += omp_get_wtime() - mark;
+            mark = omp_get_wtime();
+            for (size_t g = 0; g < groups; g++) {
+                const uint64_t rep = batch[starts[g]].rep();
+                if (rep < myFrom || rep >= myUntil) {
+                    continue;
+                }
+                aligned += starts[g + 1] - starts[g];
+                passed += survivors[g].size();
+                if (decideHere) {
+                    clusters += takeCluster(rep, survivors[g].data(), survivors[g].size(), taken,
+                                            outBuffer, assigned) ? 1 : 0;
+                } else {
+                    PairRecord line;
+                    line.set(rep, rep, 0);
+                    outBuffer.push_back(line);
+                    for (size_t k = 0; k < survivors[g].size(); k++) {
+                        line.set(rep, survivors[g][k], 0);
+                        outBuffer.push_back(line);
+                    }
+                }
+                if (outBuffer.size() >= STREAM_ROWS) {
+                    const double put = omp_get_wtime();
+                    if (writeRecords(outBuffer.data(), outBuffer.size(), out) != outBuffer.size()) {
+                        Debug(Debug::ERROR) << "Cannot write " << outTmp << "\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    outBuffer.clear();
+                    spentWriting += omp_get_wtime() - put;
+                }
+            }
+            spentDeciding += omp_get_wtime() - mark;
         }
 
         if (outBuffer.empty() == false
@@ -533,38 +567,38 @@ int lin8align(int argc, const char **argv, const Command &command) {
             EXIT(EXIT_FAILURE);
         }
         if (decideHere) {
-            // renamed in range order after a batched flush, so a crash leaves a whole decided prefix
+            // renamed in repRankBlock order after a batched flush, so a crash leaves a whole decided prefix
             pendingOut.push_back(std::make_pair(outTmp, outPath));
             pendingBytes += outBytes;
             if (pendingBytes >= PUBLISH_BATCH_BYTES || pendingOut.size() >= PUBLISH_BATCH_FILES
-                || range + 1 == lastRange) {
+                || repRankBlock + 1 == lastRepRankBlock) {
                 publishAllAtomically(pendingOut, threads);
-                // these ranges are decided and published, so what they read is read by nobody again
+                // these repRankBlocks are decided and published, so what they read is read by nobody again
                 if (par.removeTmpFiles) {
-                    dropConsumed(par.db2, writerNodes, pendingFirst, range + 1, 1);
+                    dropConsumed(par.db2, writerNodes, pendingFirst, repRankBlock + 1, 1);
                 }
-                pendingFirst = range + 1;
+                pendingFirst = repRankBlock + 1;
                 pendingBytes = 0;
             }
         } else {
             FileUtil::publishAtomically(outTmp, outPath);
-            markNodeDone(par.db3 + "." + SSTR(range), node.index);
+            markNodeDone(par.db3 + "." + SSTR(repRankBlock), node.index);
         }
         progress.updateProgress();
     }
 
     if (decideHere) {
-        // every range this run decided is published, so the cache can name them all
-        taken.save(lastRange);
+        // every repRankBlock this run decided is published, so the cache can name them all
+        taken.save(lastRepRankBlock);
     }
 
     const std::string shapeTmp = (decideHere ? par.linclustDecided : par.db3)
                                  + "." + SSTR(node.index) + ".shape.tmp";
     FILE *shape = FileUtil::openAndDelete(shapeTmp.c_str(), "w");
     if (decideHere) {
-        fprintf(shape, "ranges\t%zu\nranks\t%zu\n", ranges, (size_t) ranks);
+        fprintf(shape, "repRankBlocks\t%zu\nranks\t%zu\n", repRankBlocks, (size_t) ranks);
     } else {
-        fprintf(shape, "nodes\t%u\nranges\t%zu\nranks\t%zu\n", node.count, ranges, (size_t) ranks);
+        fprintf(shape, "nodes\t%u\nrepRankBlocks\t%zu\nranks\t%zu\n", node.count, repRankBlocks, (size_t) ranks);
     }
     if (fclose(shape) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << shapeTmp << "\n";
@@ -582,6 +616,9 @@ int lin8align(int argc, const char **argv, const Command &command) {
     Debug(Debug::INFO) << "The gate saw " << all.seen << " pairs and turned away " << all.rejected
                        << ", of which " << all.rescued << " were worth a gapped alignment and "
                        << all.kept << " held up\n";
+    Debug(Debug::INFO) << "Where the time went: reading " << (uint64_t) spentReading << "s, aligning "
+                       << (uint64_t) spentAligning << "s, deciding " << (uint64_t) spentDeciding
+                       << "s, writing " << (uint64_t) spentWriting << "s\n";
     Debug(Debug::INFO) << "Aligned " << aligned << " candidates, " << passed << " passed, in "
                        << timer.lap() << "\n";
     if (decideHere) {

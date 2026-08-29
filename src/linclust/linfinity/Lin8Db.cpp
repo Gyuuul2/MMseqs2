@@ -44,7 +44,7 @@ void RunTable::reserve(size_t count) {
 void RunTable::append(uint64_t rankBase, uint32_t len, uint64_t byteBase, uint32_t file,
                       uint64_t hdrBase) {
     if (rankBase > MAX_RANK || byteBase > MAX_BYTE || file > MAX_FILE || len > MAX_ENTRY_LEN) {
-        Debug(Debug::ERROR) << "Run table segment out of range: rank " << rankBase << " byte "
+        Debug(Debug::ERROR) << "Run table segment out of repRankBlock: rank " << rankBase << " byte "
                             << byteBase << " file " << file << " length " << len << "\n";
         EXIT(EXIT_FAILURE);
     }
@@ -219,19 +219,19 @@ void RunTable::read(const std::string &path) {
 
 
 
-static std::string suffixOf(const std::string &name) {
+static std::string fileNameExtension(const std::string &name) {
     const size_t dot = name.find_last_of('.');
     return dot == std::string::npos ? std::string() : name.substr(dot);
 }
 
 static bool isPlain(const std::string &name) {
-    const std::string suffix = suffixOf(name);
+    const std::string suffix = fileNameExtension(name);
     return suffix != ".gz" && suffix != ".zst" && suffix != ".zstd" && suffix != ".bz2"
            && suffix != ".xz";
 }
 
 static bool isZstd(const std::string &name) {
-    const std::string suffix = suffixOf(name);
+    const std::string suffix = fileNameExtension(name);
     return suffix == ".zst" || suffix == ".zstd";
 }
 
@@ -296,7 +296,7 @@ static std::vector<uint64_t> zstdFrames(const std::string &name) {
     while (at < size) {
         const uint64_t span = zstdFrameSize(in, at, size, budget);
         if (span == 0) {
-            // not a frame boundary after all: whatever is left is one piece, which is always correct
+            // not a frame boundary after all: whatever is left is one split, which is always correct
             break;
         }
         frames.push_back(at);
@@ -309,20 +309,20 @@ static std::vector<uint64_t> zstdFrames(const std::string &name) {
     return frames;
 }
 
-std::vector<InputChunk> planInputChunks(const std::vector<std::string> &filenames, size_t want) {
+std::vector<InputSplit> planInputSplits(const std::vector<std::string> &filenames, size_t want) {
     std::vector<uint64_t> sizes(filenames.size(), 0);
     uint64_t total = 0;
     for (size_t i = 0; i < filenames.size(); i++) {
         sizes[i] = std::max<uint64_t>(FileUtil::getFileSize(filenames[i]), 1);
         total += sizes[i];
     }
-    // cuts of about this many bytes, so a big file becomes many pieces and a small one stays whole
+    // cuts of about this many bytes, so a big file becomes many splits and a small one stays whole
     const uint64_t per = std::max<uint64_t>(1, (total + std::max<size_t>(want, 1) - 1) / std::max<size_t>(want, 1));
 
-    std::vector<InputChunk> chunks;
+    std::vector<InputSplit> chunks;
     for (size_t i = 0; i < filenames.size(); i++) {
         if (isZstd(filenames[i])) {
-            // frame boundaries are the only places decompression can start, so pieces end there
+            // frame boundaries are the only places decompression can start, so splits end there
             const std::vector<uint64_t> frames = zstdFrames(filenames[i]);
             size_t begin = 0;
             while (begin < frames.size()) {
@@ -330,7 +330,7 @@ std::vector<InputChunk> planInputChunks(const std::vector<std::string> &filename
                 while (end < frames.size() && frames[end] - frames[begin] < per) {
                     end++;
                 }
-                InputChunk chunk;
+                InputSplit chunk;
                 chunk.file = i;
                 chunk.from = frames[begin];
                 chunk.until = (end < frames.size()) ? frames[end] : sizes[i];
@@ -341,7 +341,7 @@ std::vector<InputChunk> planInputChunks(const std::vector<std::string> &filename
             continue;
         }
         if (isPlain(filenames[i]) == false || sizes[i] <= per) {
-            InputChunk whole;
+            InputSplit whole;
             whole.file = i;
             whole.from = 0;
             whole.until = sizes[i];
@@ -350,7 +350,7 @@ std::vector<InputChunk> planInputChunks(const std::vector<std::string> &filename
             continue;
         }
         for (uint64_t at = 0; at < sizes[i]; at += per) {
-            InputChunk chunk;
+            InputSplit chunk;
             chunk.file = i;
             chunk.from = at;
             chunk.until = std::min<uint64_t>(at + per, sizes[i]);
@@ -361,7 +361,7 @@ std::vector<InputChunk> planInputChunks(const std::vector<std::string> &filename
     return chunks;
 }
 
-InputChunkReader::InputChunkReader(const std::string &filename, const InputChunk &chunk)
+InputSplitReader::InputSplitReader(const std::string &filename, const InputSplit &chunk)
     : chunk(chunk), name(filename), buffer(0), at(0), filled(0), readTo(chunk.from),
       started(chunk.from == 0), whole(NULL), stream(NULL), packedAt(0), packedFilled(0),
       packedTo(chunk.from), fileSize(0), endsAt(chunk.until) {
@@ -395,7 +395,7 @@ InputChunkReader::InputChunkReader(const std::string &filename, const InputChunk
 #endif
 }
 
-InputChunkReader::~InputChunkReader() {
+InputSplitReader::~InputSplitReader() {
     if (fd >= 0) {
         ::close(fd);
     }
@@ -405,7 +405,7 @@ InputChunkReader::~InputChunkReader() {
     delete whole;
 }
 
-bool InputChunkReader::fill() {
+bool InputSplitReader::fill() {
     if (at < filled) {
         return true;
     }
@@ -444,7 +444,7 @@ bool InputChunkReader::fill() {
         readTo += filled;
         return filled > 0;
     }
-    // reads past the piece's end on purpose, to finish the record that began inside it
+    // reads past the split's end on purpose, to finish the record that began inside it
     const ssize_t got = pread(fd, buffer.data(), buffer.size(), static_cast<off_t>(readTo));
     if (got < 0) {
         Debug(Debug::ERROR) << "Cannot read " << name << " at " << readTo << "\n";
@@ -456,7 +456,7 @@ bool InputChunkReader::fill() {
     return filled > 0;
 }
 
-bool InputChunkReader::next(const char *&headerOut, size_t &headerLength, const char *&sequenceOut,
+bool InputSplitReader::next(const char *&headerOut, size_t &headerLength, const char *&sequenceOut,
                             size_t &length) {
     if (whole != NULL) {
         if (whole->ReadEntry() == false) {

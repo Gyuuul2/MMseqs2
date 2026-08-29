@@ -10,36 +10,36 @@
 #include <cstdio>
 #include <vector>
 
-static void readShape(const std::string &path, unsigned int &nodes, size_t &ranges, uint64_t &ranks) {
+static void readPipelineShape(const std::string &path, unsigned int &nodes, size_t &repRankBlocks, uint64_t &ranks) {
     FILE *in = fopen(path.c_str(), "r");
     if (in == NULL) {
         Debug(Debug::ERROR) << "Cannot open " << path << ". Run lin8align first\n";
         EXIT(EXIT_FAILURE);
     }
     nodes = 0;
-    ranges = 0;
+    repRankBlocks = 0;
     size_t seen = 0;
-    const bool read = fscanf(in, "nodes\t%u\nranges\t%zu\nranks\t%zu", &nodes, &ranges, &seen) == 3;
+    const bool read = fscanf(in, "nodes\t%u\nrepRankBlocks\t%zu\nranks\t%zu", &nodes, &repRankBlocks, &seen) == 3;
     fclose(in);
     ranks = seen;
-    if (read == false || nodes == 0 || ranges == 0) {
-        Debug(Debug::ERROR) << path << " does not name a set of aligned ranges\n";
+    if (read == false || nodes == 0 || repRankBlocks == 0) {
+        Debug(Debug::ERROR) << path << " does not name a set of aligned repRankBlocks\n";
         EXIT(EXIT_FAILURE);
     }
 }
 
-static void readRange(const std::string &prefix, unsigned int nodes, size_t range, size_t budget,
+static void readRepRankBlock(const std::string &prefix, unsigned int nodes, size_t repRankBlock, size_t budget,
                       std::vector<PairRecord> &rows) {
     rows.clear();
     size_t bytes = 0;
     for (unsigned int node = 0; node < nodes; node++) {
-        bytes += FileUtil::getFileSize(prefix + "." + SSTR(node) + "." + SSTR(range));
+        bytes += FileUtil::getFileSize(prefix + "." + SSTR(node) + "." + SSTR(repRankBlock));
     }
-    requireArena("Range " + SSTR(range), bytes / PairRecord::DISK_BYTES * sizeof(PairRecord),
-                 budget, "raise --ranges");
+    requireArena("Representative rank block " + SSTR(repRankBlock), bytes / PairRecord::DISK_BYTES * sizeof(PairRecord),
+                 budget, "raise --rep-rank-blocks");
     std::vector<PairRecord> buffer(1u << 16);
     for (unsigned int node = 0; node < nodes; node++) {
-        const std::string path = prefix + "." + SSTR(node) + "." + SSTR(range);
+        const std::string path = prefix + "." + SSTR(node) + "." + SSTR(repRankBlock);
         FILE *in = fopen(path.c_str(), "r");
         if (in == NULL) {
             continue;
@@ -62,24 +62,24 @@ int lin8cluster(int argc, const char **argv, const Command &command) {
 
     FileUtil::fixRlimitNoFile();
     unsigned int alignNodes = 0;
-    size_t ranges = 0;
+    size_t repRankBlocks = 0;
     uint64_t ranks = 0;
-    readShape(par.db1, alignNodes, ranges, ranks);
-    if (par.linclustRange < 0 || (size_t) par.linclustRange >= ranges) {
-        Debug(Debug::ERROR) << "--range must name one of the " << ranges << " ranges\n";
+    readPipelineShape(par.db1, alignNodes, repRankBlocks, ranks);
+    if (par.lin8RepRankBlock < 0 || (size_t) par.lin8RepRankBlock >= repRankBlocks) {
+        Debug(Debug::ERROR) << "--repRankBlock must name one of the " << repRankBlocks << " repRankBlocks\n";
         EXIT(EXIT_FAILURE);
     }
-    const size_t firstRange = (size_t) par.linclustRange;
-    const size_t lastRange = firstRange + 1;
-    for (size_t range = firstRange; range < lastRange; range++) {
-        requireEveryNodeDone(par.db1 + "." + SSTR(range), alignNodes);
+    const size_t firstRepRankBlock = (size_t) par.lin8RepRankBlock;
+    const size_t lastRepRankBlock = firstRepRankBlock + 1;
+    for (size_t repRankBlock = firstRepRankBlock; repRankBlock < lastRepRankBlock; repRankBlock++) {
+        requireEveryNodeDone(par.db1 + "." + SSTR(repRankBlock), alignNodes);
     }
 
     RankBitmap taken;
     taken.open(par.linclustTaken, ranks);
-    taken.catchUpTo(par.db2, firstRange);
+    taken.catchUpTo(par.db2, firstRepRankBlock);
 
-    const std::string outPath = par.db2 + ".0." + SSTR(firstRange);
+    const std::string outPath = par.db2 + ".0." + SSTR(firstRepRankBlock);
     const std::string outTmp = outPath + ".tmp";
     FILE *out = FileUtil::openAndDelete(outTmp.c_str(), "w");
 
@@ -90,18 +90,18 @@ int lin8cluster(int argc, const char **argv, const Command &command) {
     std::vector<PairRecord> rows;
     std::vector<PairRecord> outBuffer;
     std::vector<uint64_t> members;
-    Debug::Progress progress(lastRange - firstRange);
+    Debug::Progress progress(lastRepRankBlock - firstRepRankBlock);
 
-    for (size_t range = firstRange; range < lastRange; range++) {
-        readRange(par.db1, alignNodes, range, budget, rows);
+    for (size_t repRankBlock = firstRepRankBlock; repRankBlock < lastRepRankBlock; repRankBlock++) {
+        readRepRankBlock(par.db1, alignNodes, repRankBlock, budget, rows);
         size_t at = 0;
         uint64_t lastRep = 0;
         while (at < rows.size()) {
             const uint64_t rep = rows[at].rep();
             if (rep < lastRep) {
-                Debug(Debug::ERROR) << "Range " << range << " goes back from representative "
+                Debug(Debug::ERROR) << "Representative rank block " << repRankBlock << " goes back from representative "
                                     << lastRep << " to " << rep
-                                    << ". The aligning pass did not slice it in rank order\n";
+                                    << ". The aligning pass did not cut it in rank order\n";
                 EXIT(EXIT_FAILURE);
             }
             lastRep = rep;
@@ -137,17 +137,17 @@ int lin8cluster(int argc, const char **argv, const Command &command) {
         EXIT(EXIT_FAILURE);
     }
     FileUtil::publishAtomically(outTmp, outPath);
-    // the decisions are on disk now, so the cache may name the ranges that made them
-    taken.save(lastRange);
+    // the decisions are on disk now, so the cache may name the repRankBlocks that made them
+    taken.save(lastRepRankBlock);
     if (par.linclustPref.empty() == false && par.removeTmpFiles) {
-        for (size_t range = firstRange; range < lastRange; range++) {
-            dropConsumed(par.linclustPref, alignNodes, range, range + 1, 1);
+        for (size_t repRankBlock = firstRepRankBlock; repRankBlock < lastRepRankBlock; repRankBlock++) {
+            dropConsumed(par.linclustPref, alignNodes, repRankBlock, repRankBlock + 1, 1);
         }
     }
 
-    const std::string shapeTmp = par.db2 + "." + SSTR(firstRange) + ".shape.tmp";
+    const std::string shapeTmp = par.db2 + "." + SSTR(firstRepRankBlock) + ".shape.tmp";
     FILE *shape = FileUtil::openAndDelete(shapeTmp.c_str(), "w");
-    fprintf(shape, "ranges\t%zu\nranks\t%zu\n", ranges, (size_t) ranks);
+    fprintf(shape, "repRankBlocks\t%zu\nranks\t%zu\n", repRankBlocks, (size_t) ranks);
     if (fclose(shape) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << shapeTmp << "\n";
         EXIT(EXIT_FAILURE);

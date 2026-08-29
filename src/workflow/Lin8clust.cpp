@@ -27,7 +27,7 @@ void setLinclustOneshotWorkflowDefaults(Parameters *p) {
 static bool scriptOwns(const Parameters &par, const MMseqsParameter *p) {
     const int owned[] = {par.PARAM_LINCLUSTERDB_NODE_LIST.uniqid, par.PARAM_LINCLUSTERDB_NODE_ID.uniqid,
                          par.PARAM_LINCLUSTERDB_NODE_COUNT.uniqid, par.PARAM_LINCLUSTHASH_VALID.uniqid,
-                         par.PARAM_LINCLUST_RANGE.uniqid, par.PARAM_LINCLUST_RANGES.uniqid,
+                         par.PARAM_LIN8_REP_RANK_BLOCK.uniqid, par.PARAM_LIN8_REP_RANK_BLOCKS.uniqid,
                          par.PARAM_LINCLUST_TAKEN.uniqid, par.PARAM_LINCLUST_DECIDED.uniqid,
                          par.PARAM_LINCLUST_PREF.uniqid, par.PARAM_THREADS.uniqid,
                          par.PARAM_MIN_SEQ_ID.uniqid, par.PARAM_C.uniqid, par.PARAM_COV_MODE.uniqid,
@@ -72,7 +72,7 @@ int lin8clust(int argc, const char **argv, const Command &command) {
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_VARIADIC, 0);
 
     // The wave is greedy by rank: a representative may only take what no lower rank took, and the
-    // range order is that rank order, so the other modes have no order to run in.
+    // repRankBlock order is that rank order, so the other modes have no order to run in.
     if (par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
         Debug(Debug::ERROR) << "lin8clust clusters greedily by length, so --cluster-mode must "
                             << "be " << Parameters::GREEDY << " or " << Parameters::GREEDY_MEM << "\n";
@@ -97,7 +97,7 @@ int lin8clust(int argc, const char **argv, const Command &command) {
     const NodePlacement node = NodePlacement::resolve(par);
     cmd.addVariable("NODES", SSTR(node.count).c_str());
     cmd.addVariable("NODE", SSTR(node.index).c_str());
-    cmd.addVariable("RANGES", SSTR(par.linclustRanges).c_str());
+    cmd.addVariable("REP_RANK_BLOCKS", SSTR(par.lin8RepRankBlocks).c_str());
     cmd.addVariable("THREADS", SSTR(par.threads).c_str());
     cmd.addVariable("SEQID", SSTR(par.seqIdThr).c_str());
     cmd.addVariable("COV", SSTR(par.covThr).c_str());

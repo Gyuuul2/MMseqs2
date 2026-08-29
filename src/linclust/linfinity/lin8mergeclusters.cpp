@@ -39,7 +39,7 @@ struct JoinRow {
     }
 };
 
-static void readAll(const std::string &path, std::vector<JoinRow> &into) {
+static void readJoinRowsFromFile(const std::string &path, std::vector<JoinRow> &into) {
     into.clear();
     FILE *in = fopen(path.c_str(), "r");
     if (in == NULL) {
@@ -61,11 +61,11 @@ int lin8expand(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
-    size_t ranges = 0;
+    size_t repRankBlocks = 0;
     size_t ranks = 0;
     FILE *shape = fopen(par.db1.c_str(), "r");
-    if (shape == NULL || fscanf(shape, "ranges\t%zu\nranks\t%zu", &ranges, &ranks) != 2
-        || ranges == 0) {
+    if (shape == NULL || fscanf(shape, "repRankBlocks\t%zu\nranks\t%zu", &repRankBlocks, &ranks) != 2
+        || repRankBlocks == 0) {
         Debug(Debug::ERROR) << "Cannot read " << par.db1 << ". Run lin8cluster first\n";
         EXIT(EXIT_FAILURE);
     }
@@ -79,22 +79,22 @@ int lin8expand(int argc, const char **argv, const Command &command) {
 
     // both sides routed on the rank they are joined on
     {
-        BucketWriter<JoinRow> members(byMember, ranges, par.threads, budget);
-        BucketWriter<JoinRow> kept(byKept, ranges, par.threads, budget);
-        std::vector<uint64_t> nothing(ranges, 0);
+        BucketWriter<JoinRow> members(byMember, repRankBlocks, par.threads, budget);
+        BucketWriter<JoinRow> kept(byKept, repRankBlocks, par.threads, budget);
+        std::vector<uint64_t> nothing(repRankBlocks, 0);
         members.openAt(nothing);
         kept.openAt(nothing);
 
         // every consumer of these files sorts before it reads, so which thread wrote a row where
         // does not reach the answer
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-        for (size_t range = 0; range < ranges; range++) {
+        for (size_t repRankBlock = 0; repRankBlock < repRankBlocks; repRankBlock++) {
             unsigned int thread = 0;
 #ifdef OPENMP
             thread = static_cast<unsigned int>(omp_get_thread_num());
 #endif
             std::vector<PairRecord> pairs(1u << 16);
-            const std::string path = par.db1 + ".0." + SSTR(range);
+            const std::string path = par.db1 + ".0." + SSTR(repRankBlock);
             FILE *in = fopen(path.c_str(), "r");
             if (in == NULL) {
                 Debug(Debug::ERROR) << "Cannot open " << path << "\n";
@@ -106,7 +106,7 @@ int lin8expand(int argc, const char **argv, const Command &command) {
                     JoinRow row;
                     row.on = pairs[k].member();
                     row.carried = pairs[k].rep();
-                    members.add(thread, row, PairRecord::rangeOf(row.on, ranks, ranges));
+                    members.add(thread, row, PairRecord::repRankBlockOf(row.on, ranks, repRankBlocks));
                 }
             }
             if (ferror(in) != 0) {
@@ -135,7 +135,7 @@ int lin8expand(int argc, const char **argv, const Command &command) {
                 JoinRow row;
                 row.on = folded[k].carried;
                 row.carried = folded[k].on;
-                kept.add(0, row, PairRecord::rangeOf(row.on, ranks, ranges));
+                kept.add(0, row, PairRecord::repRankBlockOf(row.on, ranks, repRankBlocks));
             }
         }
         if (ferror(in) != 0) {
@@ -151,22 +151,22 @@ int lin8expand(int argc, const char **argv, const Command &command) {
 
     uint64_t added = 0;
     {
-        BucketWriter<PairRecord> writer(extra, ranges, par.threads, budget);
-        std::vector<uint64_t> nothing(ranges, 0);
+        BucketWriter<PairRecord> writer(extra, repRankBlocks, par.threads, budget);
+        std::vector<uint64_t> nothing(repRankBlocks, 0);
         writer.openAt(nothing);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+ : added)
-        for (size_t range = 0; range < ranges; range++) {
+        for (size_t repRankBlock = 0; repRankBlock < repRankBlocks; repRankBlock++) {
             unsigned int thread = 0;
 #ifdef OPENMP
             thread = static_cast<unsigned int>(omp_get_thread_num());
 #endif
             std::vector<JoinRow> left;
             std::vector<JoinRow> right;
-            readAll(byKept + "." + SSTR(range), right);
+            readJoinRowsFromFile(byKept + "." + SSTR(repRankBlock), right);
             if (right.empty()) {
-                continue;  // nothing was folded into any rank of this range
+                continue;  // nothing was folded into any rank of this repRankBlock
             }
-            readAll(byMember + "." + SSTR(range), left);
+            readJoinRowsFromFile(byMember + "." + SSTR(repRankBlock), left);
             SORT_SERIAL(left.begin(), left.end(), JoinRow::byJoinKey);
             SORT_SERIAL(right.begin(), right.end(), JoinRow::byJoinKey);
             size_t at = 0;
@@ -177,7 +177,7 @@ int lin8expand(int argc, const char **argv, const Command &command) {
                 for (size_t k = at; k < left.size() && left[k].on == right[i].on; k++) {
                     PairRecord row;
                     row.set(left[k].carried, right[i].carried, 0);
-                    writer.add(thread, row, PairRecord::rangeOf(left[k].carried, ranks, ranges));
+                    writer.add(thread, row, PairRecord::repRankBlockOf(left[k].carried, ranks, repRankBlocks));
                     added++;
                 }
             }
@@ -190,12 +190,12 @@ int lin8expand(int argc, const char **argv, const Command &command) {
     uint64_t rows = 0;
     std::vector<std::pair<std::string, std::string> > pending;
     uint64_t pendingBytes = 0;
-    for (size_t range = 0; range < ranges; range++) {
+    for (size_t repRankBlock = 0; repRankBlock < repRankBlocks; repRankBlock++) {
         std::vector<PairRecord> all;
         std::vector<PairRecord> buffer(1u << 16);
         const char *names[2] = {NULL, NULL};
-        const std::string a = par.db1 + ".0." + SSTR(range);
-        const std::string b = extra + "." + SSTR(range);
+        const std::string a = par.db1 + ".0." + SSTR(repRankBlock);
+        const std::string b = extra + "." + SSTR(repRankBlock);
         (void) names;
         for (int which = 0; which < 2; which++) {
             const std::string path = (which == 0) ? a : b;
@@ -210,7 +210,7 @@ int lin8expand(int argc, const char **argv, const Command &command) {
             fclose(in);
         }
         SORT_PARALLEL(all.begin(), all.end(), PairRecord::byRepAndMember);
-        const std::string outPath = par.db3 + ".0." + SSTR(range);
+        const std::string outPath = par.db3 + ".0." + SSTR(repRankBlock);
         const std::string outTmp = outPath + ".tmp";
         FILE *out = FileUtil::openAndDelete(outTmp.c_str(), "w");
         if (all.empty() == false
@@ -224,9 +224,9 @@ int lin8expand(int argc, const char **argv, const Command &command) {
         }
         pending.push_back(std::make_pair(outTmp, outPath));
         pendingBytes += all.size() * PairRecord::DISK_BYTES;
-        // batched like a chunk: a restart redoes the whole pass, so a range needs no flush of its own
+        // batched like a chunk: a restart redoes the whole pass, so a repRankBlock needs no flush of its own
         if (pendingBytes >= PUBLISH_BATCH_BYTES || pending.size() >= PUBLISH_BATCH_FILES
-            || range + 1 == ranges) {
+            || repRankBlock + 1 == repRankBlocks) {
             publishAllAtomically(pending, par.threads);
             pendingBytes = 0;
         }
@@ -235,7 +235,7 @@ int lin8expand(int argc, const char **argv, const Command &command) {
 
     const std::string shapeTmp = par.db3 + ".shape.tmp";
     FILE *shapeOut = FileUtil::openAndDelete(shapeTmp.c_str(), "w");
-    fprintf(shapeOut, "ranges\t%zu\nranks\t%zu\n", ranges, ranks);
+    fprintf(shapeOut, "repRankBlocks\t%zu\nranks\t%zu\n", repRankBlocks, ranks);
     if (fclose(shapeOut) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << shapeTmp << "\n";
         EXIT(EXIT_FAILURE);
@@ -248,7 +248,7 @@ int lin8expand(int argc, const char **argv, const Command &command) {
 }
 
 
-static void appendKey(std::string &into, uint64_t key) {
+static void appendDecimalKey(std::string &into, uint64_t key) {
     char buffer[32];
     char *end = Itoa::u64toa_sse2(key, buffer);
     into.append(buffer, end - buffer - 1);
@@ -259,12 +259,12 @@ int lin8merge(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
-    // the deciding pass names how many ranges it covered, so this reads a shape rather than probing
-    size_t ranges = 0;
+    // the deciding pass names how many repRankBlocks it covered, so this reads a shape rather than probing
+    size_t repRankBlocks = 0;
     size_t ranks = 0;
     FILE *shape = fopen(par.db1.c_str(), "r");
-    if (shape == NULL || fscanf(shape, "ranges\t%zu\nranks\t%zu", &ranges, &ranks) != 2
-        || ranges == 0) {
+    if (shape == NULL || fscanf(shape, "repRankBlocks\t%zu\nranks\t%zu", &repRankBlocks, &ranks) != 2
+        || repRankBlocks == 0) {
         Debug(Debug::ERROR) << "Cannot read " << par.db1 << ". Run lin8cluster first\n";
         EXIT(EXIT_FAILURE);
     }
@@ -282,11 +282,11 @@ int lin8merge(int argc, const char **argv, const Command &command) {
     std::string entry;
     std::vector<PairRecord> buffer(1u << 16);
 
-    for (size_t range = 0; range < ranges; range++) {
-        const std::string path = par.db1 + ".0." + SSTR(range);
+    for (size_t repRankBlock = 0; repRankBlock < repRankBlocks; repRankBlock++) {
+        const std::string path = par.db1 + ".0." + SSTR(repRankBlock);
         FILE *in = fopen(path.c_str(), "r");
         if (in == NULL) {
-            Debug(Debug::ERROR) << "Cannot open " << path << ", which range " << range
+            Debug(Debug::ERROR) << "Cannot open " << path << ", which repRankBlock " << repRankBlock
                                 << " should have decided\n";
             EXIT(EXIT_FAILURE);
         }
@@ -305,13 +305,13 @@ int lin8merge(int argc, const char **argv, const Command &command) {
                         EXIT(EXIT_FAILURE);
                     }
                     entry.clear();
-                    appendKey(entry, rep);
+                    appendDecimalKey(entry, rep);
                     lastRep = rep;
                     haveRep = true;
                     clusters++;
                 }
                 if (member != rep) {
-                    appendKey(entry, member);
+                    appendDecimalKey(entry, member);
                     members++;
                 }
             }

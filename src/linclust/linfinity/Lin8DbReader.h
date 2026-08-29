@@ -68,7 +68,7 @@ public:
     uint32_t getSeqLen(uint64_t rank, Cursor &cursor) const;
     const char *getData(uint64_t rank, Cursor &cursor) const;
 
-    void openBatch(unsigned int threads, size_t arenaBytes);
+    void openBatch(unsigned int threads, size_t arenaBytes, size_t memoryBudget);
     size_t loadBatch(const uint64_t *ranks, size_t n, unsigned int thread) const;
     const char *batchAt(unsigned int thread, size_t k) const;
 
@@ -138,11 +138,12 @@ private:
     size_t validSize;
     size_t validCount;
     bool validLoaded;
+    mutable bool wantDirect;
 };
 
 class RankBitmap {
 public:
-    RankBitmap() : words(NULL), ranks(0), wordCount(0), appliedRanges(0) {}
+    RankBitmap() : words(NULL), ranks(0), wordCount(0), appliedRepRankBlocks(0) {}
 
     ~RankBitmap() {
         if (words != NULL) {
@@ -150,7 +151,7 @@ public:
         }
     }
 
-    // an empty path means nothing is carried between ranges, which is what a single range wants
+    // an empty path means nothing is carried between repRankBlocks, which is what a single repRankBlock wants
     void open(const std::string &path, uint64_t ranks) {
         this->ranks = ranks;
         this->cache = path;
@@ -184,22 +185,22 @@ public:
             Debug(Debug::ERROR) << "Cannot close " << path << "\n";
             EXIT(EXIT_FAILURE);
         }
-        appliedRanges = header[2];
+        appliedRepRankBlocks = header[2];
     }
 
     bool taken(uint64_t rank) const { return (words[rank >> 6] >> (rank & 63) & 1) != 0; }
     void take(uint64_t rank) { words[rank >> 6] |= uint64_t(1) << (rank & 63); }
     uint64_t size() const { return ranks; }
-    size_t applied() const { return appliedRanges; }
+    size_t applied() const { return appliedRepRankBlocks; }
 
-    void catchUpTo(const std::string &decided, size_t range) {
+    void catchUpTo(const std::string &decided, size_t repRankBlock) {
         std::vector<PairRecord> buffer(1u << 16);
-        for (size_t at = applied(); at < range; at++) {
+        for (size_t at = applied(); at < repRankBlock; at++) {
             const std::string path = decided + ".0." + SSTR(at);
             FILE *in = fopen(path.c_str(), "r");
             if (in == NULL) {
                 Debug(Debug::ERROR) << "Cannot open " << path
-                                    << ", which range " << at << " should have decided\n";
+                                    << ", which repRankBlock " << at << " should have decided\n";
                 EXIT(EXIT_FAILURE);
             }
             size_t read = 0;
@@ -215,21 +216,21 @@ public:
             }
             fclose(in);
         }
-        if (range > appliedRanges) {
-            appliedRanges = range;
+        if (repRankBlock > appliedRepRankBlocks) {
+            appliedRepRankBlocks = repRankBlock;
         }
     }
 
-    void save(size_t range) {
+    void save(size_t repRankBlock) {
         if (cache.empty()) {
             return;
         }
-        if (range > appliedRanges) {
-            appliedRanges = range;
+        if (repRankBlock > appliedRepRankBlocks) {
+            appliedRepRankBlocks = repRankBlock;
         }
         const std::string tmp = cache + ".tmp";
         FILE *out = FileUtil::openAndDelete(tmp.c_str(), "w");
-        const uint64_t header[HEADER_WORDS] = {MAGIC, ranks, appliedRanges};
+        const uint64_t header[HEADER_WORDS] = {MAGIC, ranks, appliedRepRankBlocks};
         if (fwrite(header, sizeof(uint64_t), HEADER_WORDS, out) != HEADER_WORDS
             || (wordCount > 0 && fwrite(words, sizeof(uint64_t), wordCount, out) != wordCount)) {
             Debug(Debug::ERROR) << "Cannot write " << tmp << "\n";
@@ -253,7 +254,7 @@ private:
     uint64_t *words;
     uint64_t ranks;
     size_t wordCount;
-    size_t appliedRanges;
+    size_t appliedRepRankBlocks;
     std::string cache;
 };
 
