@@ -9,6 +9,21 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <fcntl.h>
+#include <unistd.h>
+
+static void writeAt(int fd, const std::string &path, std::string &line, uint64_t &at) {
+    if (line.empty()) {
+        return;
+    }
+    const ssize_t wrote = pwrite(fd, line.c_str(), line.size(), (off_t) at);
+    if (wrote < 0 || (size_t) wrote != line.size()) {
+        Debug(Debug::ERROR) << "Cannot write " << line.size() << " byte to " << path << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    at += line.size();
+    line.clear();
+}
 
 int lin8createtsv(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
@@ -32,20 +47,37 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
     }
 
     Timer timer;
+    const unsigned int threads = std::max<unsigned int>(1, par.threads);
     std::vector<std::string> nameOfRank(reader.getSize());
+    // The headers are one forward stream and stay mapped for as long as it runs, so a batch of
+    // where they begin can be collected in order and then cut up: finding a header is a memchr,
+    // making a name out of it is not, and that is the half worth spreading out.
+    const size_t NAME_BATCH = 1u << 16;
+    std::vector<const char *> beginOf(NAME_BATCH, NULL);
     RunDbReader::HeaderStream headers(reader);
     const char *begin = NULL;
     size_t length = 0;
     uint64_t rank = 0;
-    while (headers.next(begin, length)) {
-        if (rank >= nameOfRank.size()) {
-            Debug(Debug::ERROR) << "The headers hold more entries than the " << reader.getSize()
-                                << " the run table names\n";
-            EXIT(EXIT_FAILURE);
+    while (true) {
+        size_t got = 0;
+        while (got < NAME_BATCH && headers.next(begin, length)) {
+            if (rank + got >= nameOfRank.size()) {
+                Debug(Debug::ERROR) << "The headers hold more entries than the " << reader.getSize()
+                                    << " the run table names\n";
+                EXIT(EXIT_FAILURE);
+            }
+            beginOf[got] = begin;
+            got++;
         }
-        // the same name createtsv would give, so the two can be compared
-        nameOfRank[rank] = Util::parseFastaHeader(begin);
-        rank++;
+        if (got == 0) {
+            break;
+        }
+#pragma omp parallel for schedule(static) num_threads(threads)
+        for (size_t i = 0; i < got; i++) {
+            // the same name createtsv would give, so the two can be compared
+            nameOfRank[rank + i] = Util::parseFastaHeader(beginOf[i]);
+        }
+        rank += got;
     }
     if (rank != reader.getSize()) {
         Debug(Debug::ERROR) << "The headers hold " << rank << " entries and the run table names "
@@ -58,51 +90,90 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
                                  DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
     clusters.open(DBReader<DBKeyType>::LINEAR_ACCCESS);
 
-    const std::string tmp = par.db3 + ".tmp";
-    FILE *out = FileUtil::openAndDelete(tmp.c_str(), "w");
-    std::string line;
-    line.reserve(1u << 20);
-    uint64_t rows = 0;
-    for (size_t i = 0; i < clusters.getSize(); i++) {
-        const uint64_t rep = clusters.getDbKey(i);
-        if (rep >= nameOfRank.size()) {
-            Debug(Debug::ERROR) << "The clustering names rank " << rep << ", past the database\n";
-            EXIT(EXIT_FAILURE);
-        }
-        char *data = clusters.getData(i, 0);
-        while (data != NULL && *data != '\0') {
-            const uint64_t member = strtoull(data, NULL, 10);
-            if (member >= nameOfRank.size()) {
-                Debug(Debug::ERROR) << "The clustering names rank " << member
-                                    << ", past the database\n";
+    // Where each thread's stretch of the file begins. Sizing it takes the same walk over the
+    // clusters that writing does, but both walks are spread out, and knowing the byte lets every
+    // thread write its own stretch while the rows stay in the order the clustering made them.
+    std::vector<size_t> edge(threads + 1, 0);
+    for (unsigned int t = 0; t <= threads; t++) {
+        edge[t] = clusters.getSize() * t / threads;
+    }
+    std::vector<uint64_t> bytesOf(threads, 0);
+    std::vector<uint64_t> rowsOf(threads, 0);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+    for (unsigned int t = 0; t < threads; t++) {
+        uint64_t sum = 0;
+        uint64_t mine = 0;
+        for (size_t i = edge[t]; i < edge[t + 1]; i++) {
+            const uint64_t rep = clusters.getDbKey(i);
+            if (rep >= nameOfRank.size()) {
+                Debug(Debug::ERROR) << "The clustering names rank " << rep << ", past the database\n";
                 EXIT(EXIT_FAILURE);
             }
-            line.append(nameOfRank[rep]);
-            line.push_back('\t');
-            line.append(nameOfRank[member]);
-            line.push_back('\n');
-            rows++;
-            data = Util::skipLine(data);
-            // a cluster can be larger than the machine, so the buffer empties on rows and not on
-            // clusters, which is where it used to
-            if (line.size() >= (1u << 20)) {
-                if (fwrite(line.c_str(), 1, line.size(), out) != line.size()) {
-                    Debug(Debug::ERROR) << "Cannot write " << tmp << "\n";
+            char *data = clusters.getData(i, t);
+            while (data != NULL && *data != '\0') {
+                const uint64_t member = strtoull(data, NULL, 10);
+                if (member >= nameOfRank.size()) {
+                    Debug(Debug::ERROR) << "The clustering names rank " << member
+                                        << ", past the database\n";
                     EXIT(EXIT_FAILURE);
                 }
-                line.clear();
+                sum += nameOfRank[rep].size() + nameOfRank[member].size() + 2;
+                mine++;
+                data = Util::skipLine(data);
             }
         }
+        bytesOf[t] = sum;
+        rowsOf[t] = mine;
     }
-    if (line.empty() == false && fwrite(line.c_str(), 1, line.size(), out) != line.size()) {
-        Debug(Debug::ERROR) << "Cannot write " << tmp << "\n";
+    std::vector<uint64_t> startOf(threads + 1, 0);
+    for (unsigned int t = 0; t < threads; t++) {
+        startOf[t + 1] = startOf[t] + bytesOf[t];
+    }
+
+    const std::string tmp = par.db3 + ".tmp";
+    const int out = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    if (out < 0 || ftruncate(out, (off_t) startOf[threads]) != 0) {
+        Debug(Debug::ERROR) << "Cannot make " << tmp << " of " << startOf[threads] << " byte\n";
         EXIT(EXIT_FAILURE);
     }
-    if (fclose(out) != 0) {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+    for (unsigned int t = 0; t < threads; t++) {
+        uint64_t at = startOf[t];
+        std::string line;
+        line.reserve(1u << 20);
+        for (size_t i = edge[t]; i < edge[t + 1]; i++) {
+            const uint64_t rep = clusters.getDbKey(i);
+            char *data = clusters.getData(i, t);
+            while (data != NULL && *data != '\0') {
+                const uint64_t member = strtoull(data, NULL, 10);
+                line.append(nameOfRank[rep]);
+                line.push_back('\t');
+                line.append(nameOfRank[member]);
+                line.push_back('\n');
+                data = Util::skipLine(data);
+                // a cluster can be larger than the machine, so the buffer empties on rows and not
+                // on clusters, which is where it used to
+                if (line.size() >= (1u << 20)) {
+                    writeAt(out, tmp, line, at);
+                }
+            }
+        }
+        writeAt(out, tmp, line, at);
+        if (at != startOf[t + 1]) {
+            Debug(Debug::ERROR) << "Thread " << t << " wrote to " << at << " and was sized to "
+                                << startOf[t + 1] << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+    if (::close(out) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << tmp << "\n";
         EXIT(EXIT_FAILURE);
     }
     FileUtil::publishAtomically(tmp, par.db3);
+    uint64_t rows = 0;
+    for (unsigned int t = 0; t < threads; t++) {
+        rows += rowsOf[t];
+    }
 
     clusters.close();
     reader.close();
