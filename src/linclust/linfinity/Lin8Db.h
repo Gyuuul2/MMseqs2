@@ -255,6 +255,9 @@ std::vector<InputSplit> planInputSplits(const std::vector<std::string> &filename
 
 class InputSplitReader {
 public:
+    // one read a thread at a time, so it has to be large enough to be worth a shared filesystem
+    static const size_t PACKED_READ_BYTES = 4u << 20;
+
     InputSplitReader(const std::string &filename, const InputSplit &chunk);
     ~InputSplitReader();
 

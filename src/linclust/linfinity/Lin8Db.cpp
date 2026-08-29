@@ -383,10 +383,14 @@ InputSplitReader::InputSplitReader(const std::string &filename, const InputSplit
             EXIT(EXIT_FAILURE);
         }
         stream = ds;
-        packed.resize(ZSTD_DStreamInSize());
+        // the size zstd asks for is what it likes to be fed, not what the disk likes to be asked
+        packed.resize(std::max<size_t>(ZSTD_DStreamInSize(), PACKED_READ_BYTES));
         fileSize = FileUtil::getFileSize(filename);
         endsAt = UINT64_MAX;
         readTo = 0;
+#ifdef HAVE_POSIX_FADVISE
+        posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#endif
         return;
     }
 #ifdef HAVE_POSIX_FADVISE
