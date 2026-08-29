@@ -14,6 +14,21 @@
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <fcntl.h>
+#include <unistd.h>
+
+static void writeAt(int fd, const std::string &path, std::string &record, uint64_t &at) {
+    if (record.empty()) {
+        return;
+    }
+    const ssize_t wrote = pwrite(fd, record.c_str(), record.size(), (off_t) at);
+    if (wrote < 0 || (size_t) wrote != record.size()) {
+        Debug(Debug::ERROR) << "Cannot write " << record.size() << " byte to " << path << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    at += record.size();
+    record.clear();
+}
 
 int lin8createrepseqfasta(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
@@ -34,6 +49,14 @@ int lin8createrepseqfasta(int argc, const char **argv, const Command &command) {
 
     // Only the names of the ranks that head a cluster. Keeping one for every sequence is thirty two
     // byte a rank before a single character of it, which at a trillion is more than the machine has.
+    const size_t budget = Util::computeMemory(par.splitMemoryLimit);
+    const size_t need = reps.size() * (sizeof(std::string) + 24);
+    if (need > budget) {
+        Debug(Debug::ERROR) << "Naming " << reps.size() << " representatives needs about "
+                            << (need >> 30) << " GB of names and the limit is " << (budget >> 30)
+                            << " GB. The cluster database holds the same answer without them\n";
+        EXIT(EXIT_FAILURE);
+    }
     std::vector<std::string> nameOfRep(reps.size());
     RunDbReader::HeaderStream headers(reader);
     const char *begin = NULL;
@@ -63,27 +86,55 @@ int lin8createrepseqfasta(int argc, const char **argv, const Command &command) {
                        << timer.lap() << "\n";
 
 
-    const size_t splits = par.fastaSplits > 1 ? (size_t) par.fastaSplits : 1;
+    // How many pieces the work is cut into is a question about threads; how many files come out is
+    // a question about --fasta-splits. They used to be the same number, so asking for twenty threads
+    // and one file got one thread.
+    const bool sharded = par.fastaSplits > 1;
+    const size_t splits = sharded ? (size_t) par.fastaSplits
+                                  : std::max<size_t>(1, (size_t) par.threads);
     const unsigned int threads = (unsigned int) std::min<size_t>(splits, par.threads);
 
+    // Where each piece starts, in representatives and in byte, the byte being what it pwrites at.
+    // Two walks over the representatives rather than a running total held for every one of them,
+    // which at a trillion would be eight byte a representative of nothing but arithmetic.
     std::vector<size_t> edge(splits + 1, reps.size());
+    std::vector<uint64_t> edgeByte(splits + 1, 0);
     {
-        RunDbReader::Cursor at;
-        std::vector<uint64_t> upto(reps.size() + 1, 0);
-        for (size_t i = 0; i < reps.size(); i++) {
-            upto[i + 1] = upto[i] + reader.getSeqLen(reps[i], at) + nameOfRep[i].size() + 2;
-        }
         edge[0] = 0;
-        for (size_t split = 1; split < splits; split++) {
-            const uint64_t want = upto.back() * split / splits;
-            edge[split] = std::lower_bound(upto.begin(), upto.end(), want) - upto.begin();
-            if (edge[split] > reps.size()) {
-                edge[split] = reps.size();
+        uint64_t total = 0;
+        RunDbReader::Cursor at;
+        for (size_t i = 0; i < reps.size(); i++) {
+            total += reader.getSeqLen(reps[i], at) + nameOfRep[i].size() + 3;
+        }
+        RunDbReader::Cursor again;
+        uint64_t sum = 0;
+        size_t next = 1;
+        for (size_t i = 0; i < reps.size() && next < splits; i++) {
+            sum += reader.getSeqLen(reps[i], again) + nameOfRep[i].size() + 3;
+            while (next < splits && sum >= total * next / splits) {
+                edge[next] = i + 1;
+                edgeByte[next] = sum;
+                next++;
             }
         }
+        edgeByte[splits] = total;
     }
     std::vector<uint64_t> counted(splits, 0);
     Debug::Progress progress(reps.size());
+
+    // One file is the usual answer, and the byte each piece starts at is already known, so every
+    // thread writes its own stretch of it rather than taking turns. Shards keep a file each.
+    const std::string wholeTmp = par.db3 + ".tmp";
+    int whole = -1;
+    if (sharded == false) {
+        whole = open(wholeTmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+        if (whole < 0 || ftruncate(whole, (off_t) edgeByte[splits]) != 0) {
+            Debug(Debug::ERROR) << "Cannot make " << wholeTmp << " of " << edgeByte[splits]
+                                << " byte\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
     for (size_t split = 0; split < splits; split++) {
         const size_t from = edge[split];
@@ -91,9 +142,17 @@ int lin8createrepseqfasta(int argc, const char **argv, const Command &command) {
         // zero padded, so listing the shards in name order lists them in rank order
         char suffix[16];
         snprintf(suffix, sizeof(suffix), ".%05zu", split);
-        const std::string path = splits == 1 ? par.db3 : par.db3 + suffix;
+        const std::string path = sharded ? par.db3 + suffix : par.db3;
         const std::string tmp = path + ".tmp";
-        FILE *out = FileUtil::openAndDelete(tmp.c_str(), "w");
+        int out = whole;
+        if (sharded) {
+            out = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+            if (out < 0) {
+                Debug(Debug::ERROR) << "Cannot open " << tmp << " for writing\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+        uint64_t at = sharded ? 0 : edgeByte[split];
         RunDbReader::Cursor cursor;
         std::string record;
         record.reserve(1u << 20);
@@ -111,25 +170,26 @@ int lin8createrepseqfasta(int argc, const char **argv, const Command &command) {
             record.append(residues, len);
             record.append(1, '\n');
             if (record.size() >= (1u << 20)) {
-                if (fwrite(record.c_str(), 1, record.size(), out) != record.size()) {
-                    Debug(Debug::ERROR) << "Cannot write to " << tmp << "\n";
-                    EXIT(EXIT_FAILURE);
-                }
-                record.clear();
+                writeAt(out, tmp, record, at);
             }
             counted[split]++;
             progress.updateProgress();
         }
-        if (record.empty() == false
-            && fwrite(record.c_str(), 1, record.size(), out) != record.size()) {
-            Debug(Debug::ERROR) << "Cannot write to " << tmp << "\n";
+        writeAt(out, tmp, record, at);
+        if (sharded) {
+            if (::close(out) != 0) {
+                Debug(Debug::ERROR) << "Cannot close " << tmp << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            FileUtil::publishAtomically(tmp, path);
+        }
+    }
+    if (sharded == false) {
+        if (::close(whole) != 0) {
+            Debug(Debug::ERROR) << "Cannot close " << wholeTmp << "\n";
             EXIT(EXIT_FAILURE);
         }
-        if (fclose(out) != 0) {
-            Debug(Debug::ERROR) << "Cannot close " << tmp << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        FileUtil::publishAtomically(tmp, path);
+        FileUtil::publishAtomically(wholeTmp, par.db3);
     }
     uint64_t written = 0;
     for (size_t i = 0; i < splits; i++) {

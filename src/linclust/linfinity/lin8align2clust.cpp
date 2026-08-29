@@ -281,6 +281,12 @@ static size_t startMemberBatch(const RunDbReader &reader, uint64_t rep, const Pa
                                size_t count, const RankBitmap &taken, const Parameters &par,
                                unsigned int thread, unsigned int lane, Candidates &candidates) {
     candidates.clear();
+    // The work list was drawn against a bitmap this batch is now behind, and a representative that
+    // has since been taken is a whole group of reads and alignments that takeCluster would throw
+    // away. Ask again here, where it costs one look.
+    if (taken.taken(rep)) {
+        return 0;
+    }
     const uint32_t queryLen = reader.getSeqLen(rep);
     for (size_t i = 0; i < count; i++) {
         const uint64_t member = rows[i].member();
@@ -316,7 +322,12 @@ static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, size_t got
         aligner.initQuery(&query);
         for (size_t k = 0; k < got; k++) {
             const uint64_t member = candidates.members[from + k];
-            gate.stale += taken.taken(member);
+            // taken while this batch was in flight: the read is already spent but the alignment is
+            // not, and takeCluster would turn the result away anyway
+            if (taken.taken(member)) {
+                gate.stale++;
+                continue;
+            }
             const uint32_t targetLen = reader.getSeqLen(member);
             const char *targetSeq = reader.batchAt(thread, lane, k);
             target.mapSequence(0, 0, (char *) targetSeq, targetLen);

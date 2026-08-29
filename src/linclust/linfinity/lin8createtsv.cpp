@@ -83,13 +83,15 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
             line.push_back('\n');
             rows++;
             data = Util::skipLine(data);
-        }
-        if (line.size() > (1u << 20)) {
-            if (fwrite(line.c_str(), 1, line.size(), out) != line.size()) {
-                Debug(Debug::ERROR) << "Cannot write " << tmp << "\n";
-                EXIT(EXIT_FAILURE);
+            // a cluster can be larger than the machine, so the buffer empties on rows and not on
+            // clusters, which is where it used to
+            if (line.size() >= (1u << 20)) {
+                if (fwrite(line.c_str(), 1, line.size(), out) != line.size()) {
+                    Debug(Debug::ERROR) << "Cannot write " << tmp << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                line.clear();
             }
-            line.clear();
         }
     }
     if (line.empty() == false && fwrite(line.c_str(), 1, line.size(), out) != line.size()) {
