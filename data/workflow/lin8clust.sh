@@ -1,17 +1,10 @@
 #!/bin/sh -e
-# One shot linear clustering. Every pass is a command of its own, so a pass can be rerun on its own,
-# and the barrier between the waves is held here rather than inside a module, as elsewhere in mmseqs.
-#
-# Run this once on every machine with the same NODES and its own NODE. A pass leaves a marker of its
-# own per machine, and the guards are on those markers rather than on the output: the output of a
-# pass is one path every machine publishes, so guarding on it would make the machine that finished
-# second skip its own work.
+# One shot linear clustering. Run it once on every machine with the same NODES and its own NODE.
+# Guards are on the per machine markers, not on the output every machine publishes into.
 fail() { echo "$1" >&2; exit 1; }
 notExists() { [ ! -f "$1" ]; }
 
-# Waits for every machine to leave its marker. Every pass reads what all of them wrote, and a machine
-# that has not started is indistinguishable from one that wrote nothing, so the check inside the
-# modules refuses rather than waits and the waiting is here.
+# waits for every machine's marker, because a machine that has not started looks like one with nothing
 waitForAll() {
     _path="$1"; _n="$2"; _waited=0
     while true; do
@@ -27,8 +20,7 @@ waitForAll() {
     done
 }
 
-# Called either as a command, which hands the inputs in as arguments, or on its own with IN, OUT and
-# TMP in the environment. Every machine gets the same arguments and its own NODE.
+# arguments when called as a command, IN/OUT/TMP in the environment when called on its own
 if [ "$#" -ge 3 ]; then
     OUT="$(eval echo "\${$(($# - 1))}")"
     TMP="$(eval echo "\${$#}")"
@@ -50,15 +42,12 @@ THREADS="${THREADS:-1}"
 SEQID="${SEQID:-0.9}"
 COV="${COV:-0.8}"
 COVMODE="${COVMODE:-0}"
-TSV="${TSV:-0}"
 REPSEQ="${REPSEQ:-0}"
 WAIT_LIMIT="${WAIT_LIMIT:-86400}"
 
 mkdir -p "$TMP/kmer" "$TMP/pairs" "$TMP/pref" "$TMP/aln" "$TMP/clu_accepted"
 
-# The database is built in two rounds: a machine writes its own histogram, and once every machine
-# has, the next run of it places the sequences and whichever machine finds every part written
-# publishes the database. So this is a retry loop, which is what the pass says to do.
+# two rounds: every machine writes a histogram, then places sequences, so this is a retry loop
 _waited=0
 while notExists "$TMP/db.$NODE.done" || notExists "$TMP/db.dbtype"; do
     # shellcheck disable=SC2086
@@ -71,8 +60,7 @@ while notExists "$TMP/db.$NODE.done" || notExists "$TMP/db.dbtype"; do
     fi
 done
 
-# the same two rounds: a machine writes its shard, and once every machine has, the next run of it
-# merges them and publishes the bitmap
+# the same two rounds, ending in the bitmap
 if [ -n "$CLUSTHASH" ]; then
     _waited=0
     while notExists "$TMP/db.clusthash_kept"; do
@@ -111,19 +99,8 @@ notExists "$TMP/pref/pref.$NODE.done" && \
 
 [ "$NODES" -gt 1 ] && waitForAll "$TMP/pref/pref" "$NODES"
 
-# The wave. A representative can only be taken by one of a lower rank and the blocks ascend with that
-# rank, so aligning block k only needs what was decided up to the end of block k-1. Deciding is one
-# thread, because a greedy assignment is one order over the whole database.
-#
-# One machine is its own whole share of every repRankBlock, so there is nothing to wait for: it walks the
-# repRankBlocks in one process, deciding each group as the aligner hands it over. The bitmap is then a
-# variable rather than a file, and the pairs the deciding pass would have read never reach the disk.
-#
-# Many machines cannot do that: block k is not decided until every one of them has aligned its share
-# of it, so they keep a process a repRankBlock and this loop holds the barrier between the two halves. The
-# guard is per repRankBlock and guards both halves together: the bitmap the deciding pass hands on is only
-# consistent with the repRankBlocks it has already decided, so redoing a decided repRankBlock would find every
-# representative in it already taken and write an empty repRankBlock over a full one.
+# The wave: block k only needs what was decided up to k-1, and deciding is one thread because a
+# greedy assignment is one order. One machine fuses the two halves; many machines barrier here.
 if [ "$NODES" -eq 1 ]; then
     # shellcheck disable=SC2086
     notExists "$TMP/clu_accepted/clu_accepted.0.$((REP_RANK_BLOCKS - 1))" && \
@@ -150,7 +127,7 @@ while [ "$R" -lt "$REP_RANK_BLOCKS" ]; do
             "$MMSEQS" lin8-align2clustmulti "$TMP/aln/aln" "$TMP/pref/pref" \
                 "$TMP/clu_accepted/clu_accepted" --rep-rank-block "$R" ${ASSIGN_PAR}
         else
-            # the next repRankBlock needs the bitmap this repRankBlock produced, so wait for it
+            # the next block needs this one's bitmap
             _waited=0
             while notExists "$TMP/clu_accepted/clu_accepted.0.$R"; do
                 [ "$_waited" -ge "$WAIT_LIMIT" ] && fail "waited ${WAIT_LIMIT}s for repRankBlock $R to be decided"
@@ -162,10 +139,7 @@ while [ "$R" -lt "$REP_RANK_BLOCKS" ]; do
     R=$((R + 1))
 done
 
-# The sequences the redundancy pass set aside go back in on the pair stream, which is the form
-# that scales, and the clustering database is made from that. A database has an index entry a
-# representative, which at a trillion sequences is tens of terabytes of index that nothing here
-# looks anything up in, so at that size the pair stream is the output and this last step is skipped.
+# the redundant sequences go back in on the pair stream, and the clustering database is made from that
 if [ "$NODE" -eq 0 ]; then
     CLUDB="$TMP/clu_accepted/clu_accepted"
     if [ -n "$CLUSTHASH" ]; then
@@ -180,11 +154,9 @@ if [ "$NODE" -eq 0 ]; then
     notExists "$OUT.dbtype" && \
         "$MMSEQS" lin8-createclusterdb "$CLUDB" "$OUT" ${CLUSTERDB_PAR}
 
-    # createtsv cannot read a run table database, which has no per entry index to open, so the naming
-    # is its own pass. At a trillion sequences the names are tens of terabytes nothing looks up, so it
-    # is asked for rather than assumed.
+    # naming is its own pass, and it runs the way linclust names its answer: always
     # shellcheck disable=SC2086
-    [ "$TSV" -eq 1 ] && notExists "$OUT.tsv" && \
+    notExists "$OUT.tsv" && \
         "$MMSEQS" lin8-createtsv "$TMP/db" "$OUT" "$OUT.tsv" ${TSV_PAR}
 
     # shellcheck disable=SC2086
@@ -192,18 +164,16 @@ if [ "$NODE" -eq 0 ]; then
         "$MMSEQS" lin8-createrepseqfasta "$TMP/db" "$OUT" "$OUT.rep.fasta" ${REPSEQ_PAR}
 fi
 
-# The passes drop what they have finished reading as they go, so what is left here is what a rerun
-# would have needed. Every machine clears its own, and the last of them takes the directories.
+# what is left here is what a rerun would have needed; every machine clears its own
 if [ -n "$REMOVE_TMP" ]; then
     rm -f "$TMP/clu_accepted/clu_accepted.align_assigned_$NODE" "$TMP/kmer/out.$NODE."* "$TMP/pairs/pairs.$NODE."* \
           "$TMP/pref/pref.$NODE."* "$TMP/aln/aln."*".$NODE"*
     if [ "$NODE" -eq 0 ]; then
         rm -rf "$TMP/kmer" "$TMP/pairs" "$TMP/pref" "$TMP/aln" "$TMP/clu_accepted" \
                "$TMP/clu_accepted_plus_redundant"
-        # The sequence database stays unless the clustering has already been named: a cluster is named
-        # by rank, so what maps a rank to a name is part of the answer until the answer carries it.
+        # the database stays until the clustering is named, because a cluster is named by rank
         rm -f "$TMP/hash" "$TMP/hash."* "$TMP/lin8clust.sh"
-        [ "$TSV" -eq 1 ] && [ "$REPSEQ" -eq 0 ] && rm -f "$TMP/db" "$TMP/db".[0-9]* "$TMP/db.hist."* "$TMP/db.runs"* \
+        [ "$REPSEQ" -eq 0 ] && rm -f "$TMP/db" "$TMP/db".[0-9]* "$TMP/db.hist."* "$TMP/db.runs"* \
             "$TMP/db.files" "$TMP/db.dbtype" "$TMP/db_h."*
     fi
 fi

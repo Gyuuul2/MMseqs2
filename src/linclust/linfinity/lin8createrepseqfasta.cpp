@@ -47,8 +47,7 @@ int lin8createrepseqfasta(int argc, const char **argv, const Command &command) {
     }
     std::sort(reps.begin(), reps.end());
 
-    // Only the names of the ranks that head a cluster. Keeping one for every sequence is thirty two
-    // byte a rank before a single character of it, which at a trillion is more than the machine has.
+    // only the ranks that head a cluster: one name a sequence is more than the machine has
     const size_t budget = Util::computeMemory(par.splitMemoryLimit);
     const size_t need = reps.size() * (sizeof(std::string) + 24);
     if (need > budget) {
@@ -86,17 +85,13 @@ int lin8createrepseqfasta(int argc, const char **argv, const Command &command) {
                        << timer.lap() << "\n";
 
 
-    // How many pieces the work is cut into is a question about threads; how many files come out is
-    // a question about --fasta-splits. They used to be the same number, so asking for twenty threads
-    // and one file got one thread.
+    // pieces are a question about threads, files are a question about --fasta-splits
     const bool sharded = par.fastaSplits > 1;
     const size_t splits = sharded ? (size_t) par.fastaSplits
                                   : std::max<size_t>(1, (size_t) par.threads);
     const unsigned int threads = (unsigned int) std::min<size_t>(splits, par.threads);
 
-    // Where each piece starts, in representatives and in byte, the byte being what it pwrites at.
-    // Two walks over the representatives rather than a running total held for every one of them,
-    // which at a trillion would be eight byte a representative of nothing but arithmetic.
+    // two walks rather than a running total a representative, the byte being what it pwrites at
     std::vector<size_t> edge(splits + 1, reps.size());
     std::vector<uint64_t> edgeByte(splits + 1, 0);
     {
@@ -122,8 +117,7 @@ int lin8createrepseqfasta(int argc, const char **argv, const Command &command) {
     std::vector<uint64_t> counted(splits, 0);
     Debug::Progress progress(reps.size());
 
-    // One file is the usual answer, and the byte each piece starts at is already known, so every
-    // thread writes its own stretch of it rather than taking turns. Shards keep a file each.
+    // one file written by every thread at its own byte; shards keep a file each
     const std::string wholeTmp = par.db3 + ".tmp";
     int whole = -1;
     if (sharded == false) {

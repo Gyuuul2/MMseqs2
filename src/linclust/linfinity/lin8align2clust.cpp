@@ -100,10 +100,7 @@ public:
         return true;
     }
 
-    // A batch of whole representatives. Rows arrive in representative order, so a batch that stops
-    // at the last change of representative holds every row of every group in it, and those groups can
-    // be aligned in any order. The rows of the representative it stopped inside are carried to the
-    // next batch rather than pushed back, because a batch can span a refill.
+    // stops at the last change of representative, carrying the rows of the one it stopped inside
     bool fillBatch(std::vector<PairRecord> &into, size_t want, uint64_t until) {
         into.clear();
         into.swap(carry);
@@ -275,15 +272,12 @@ static bool rescueWithGaps(uint64_t member, uint32_t queryLen, uint32_t targetLe
     return true;
 }
 
-// Picks the members worth reading and puts the read in flight, so the caller can spend the time it
-// takes on the batch it already has.
+// puts the read in flight, so the caller can spend the time it takes on the batch it already has
 static size_t startMemberBatch(const RunDbReader &reader, uint64_t rep, const PairRecord *rows,
                                size_t count, const RankBitmap &taken, const Parameters &par,
                                unsigned int thread, unsigned int lane, Candidates &candidates) {
     candidates.clear();
-    // The work list was drawn against a bitmap this batch is now behind, and a representative that
-    // has since been taken is a whole group of reads and alignments that takeCluster would throw
-    // away. Ask again here, where it costs one look.
+    // taken since the work list was drawn: a whole group of reads takeCluster would throw away
     if (taken.taken(rep)) {
         return 0;
     }
@@ -305,8 +299,7 @@ static size_t startMemberBatch(const RunDbReader &reader, uint64_t rep, const Pa
     return reader.startBatch(rep, candidates.members.data(), candidates.members.size(), thread, lane);
 }
 
-// Aligns what one lane holds, and if the lane could not take every candidate, reads and aligns the
-// rest through the same lane, which is the only path that has to wait.
+// a lane that could not hold every candidate finishes the rest through itself, and that path waits
 static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, size_t got,
                        const RankBitmap &taken, Sequence &query, Sequence &target,
                        BlockAligner &aligner, const Parameters &par, unsigned int thread,
@@ -322,8 +315,7 @@ static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, size_t got
         aligner.initQuery(&query);
         for (size_t k = 0; k < got; k++) {
             const uint64_t member = candidates.members[from + k];
-            // taken while this batch was in flight: the read is already spent but the alignment is
-            // not, and takeCluster would turn the result away anyway
+            // taken while in flight: the read is spent, the alignment is not
             if (taken.taken(member)) {
                 gate.stale++;
                 continue;
@@ -413,8 +405,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes its share of "
                        << (lastRepRankBlock - firstRepRankBlock) << " of " << repRankBlocks << " repRankBlocks\n";
 
-    // The bitmaps are this run's progress, not a property of the database, so they sit beside the
-    // accepted pairs that produced them. One a node, because a node only knows what it has aligned.
+    // this run's progress rather than the database's, so it sits beside the accepted pairs
     RankBitmap taken;
     taken.open(par.db4 + ".align_assigned_" + SSTR(node.index), ranks);
     taken.catchUpTo(par.db4, firstRepRankBlock);
@@ -477,11 +468,8 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
         }
         RepRankBlockReader stream(par.db2, writerNodes, repRankBlock, STREAM_ROWS, skipRows);
 
-        // A batch of whole representatives is read, aligned on every thread, and then decided on
-        // one in representative order. The decision has to be ordered -- the bitmap it writes is what
-        // the next one reads -- but nothing else does, and takeCluster checks the bitmap again, so a
-        // thread aligning against a batch old view can only do work that is thrown away, never reach
-        // a different answer.
+        // only the deciding is ordered; takeCluster checks the bitmap again, so a stale view of it
+        // costs work that is thrown away and never reaches a different answer
         while (true) {
             double mark = omp_get_wtime();
             const bool more = stream.fillBatch(batch, BATCH_ROWS, myUntil);
@@ -502,10 +490,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                 survivors.resize(groups);
             }
 
-            // One unit of work is a batch of one representative's members, not a whole
-            // representative. Groups are six rows on average and thousands in the tail, so a thread
-            // that draws a tail group holds the barrier while the rest sleep: measured, half the
-            // threads were asleep waiting for it. Flattened, the tail is shared.
+            // groups are six rows on average and thousands in the tail, so the tail is shared
             work.clear();
             for (size_t g = 0; g < groups; g++) {
                 survivors[g].clear();
@@ -527,11 +512,8 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
             }
 
             mark = omp_get_wtime();
-            // A thread draws its own work so that it can draw the next one before it aligns this
-            // one: the reads of the next batch are then in flight for the whole time this batch
-            // takes, which is time the disk used to spend idle. Drawing in order is what a dynamic
-            // schedule does too, and the answer does not depend on who drew what, because every
-            // batch writes to its own slot and the slots are joined in order afterwards.
+            // a thread draws the next batch before aligning this one, so its reads are in flight
+            // meanwhile; who drew what cannot matter, the slots are joined in order afterwards
             size_t drawn = 0;
 #pragma omp parallel num_threads(threads)
             {
@@ -576,8 +558,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                     got = nextGot;
                 }
             }
-            // the batches of one representative are in the order the serial version made them, so
-            // joining them in that order gives the list it would have produced
+            // joined in the order the serial version made them
             for (size_t w = 0; w < work.size(); w++) {
                 std::vector<uint64_t> &into = survivors[work[w].group];
                 into.insert(into.end(), batchSurvivors[w].begin(), batchSurvivors[w].end());

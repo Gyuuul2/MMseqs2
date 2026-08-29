@@ -28,9 +28,7 @@ struct IoRing {
     bool open(unsigned depth);
     bool isOpen() const { return ready; }
 
-    // The ring owns the list it is waiting on, so the caller fills it in place and then hands it
-    // over. Between submit and await the buffers belong to the kernel: nothing may read or move
-    // them, and the list itself has to stay as it was handed over.
+    // between submit and await the buffers belong to the kernel: do not read or move them
     std::vector<Read> &list() { return reads; }
     void submit(const char *what);
     void await(const char *what);
@@ -61,8 +59,7 @@ public:
         size_t at;
     };
 
-    // The redundancy pass leaves its bitmap beside the database it describes, the way an index or a
-    // lookup sits beside it, so every later pass finds it without being told where it is.
+    // beside the database it describes, the way an index or a lookup is
     static const char *KEPT_BITMAP_SUFFIX;
 
     RunDbReader(const std::string &db, bool withHeaders = false);
@@ -83,12 +80,7 @@ public:
 
     void openBatch(unsigned int threads, size_t arenaBytes, size_t memoryBudget);
 
-    // Queues the query and as many of the members as one lane holds, in one submission, and answers
-    // how many members that was. The query rides along with every batch rather than being fetched on
-    // its own, so it stays valid while the members it is compared against come and go, and it costs
-    // no separate round trip to the disk. Two lanes a thread, so one can be read while the other is
-    // being aligned; awaitBatch is what says a lane has arrived, and until then it belongs to the
-    // kernel.
+    // the query rides with its members: one submission, and it outlives every batch of them
     size_t startBatch(uint64_t queryRank, const uint64_t *members, size_t n, unsigned int thread,
                       unsigned int lane) const;
     void awaitBatch(unsigned int thread, unsigned int lane) const;

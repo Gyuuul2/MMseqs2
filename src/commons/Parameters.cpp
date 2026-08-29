@@ -1705,7 +1705,6 @@ Parameters::Parameters():
     linclustoneshotworkflow.push_back(&PARAM_COV_MODE);
     linclustoneshotworkflow.push_back(&PARAM_CLUSTER_MODE);
     linclustoneshotworkflow.push_back(&PARAM_CLUST_HASH);
-    linclustoneshotworkflow.push_back(&PARAM_TSV);
     linclustoneshotworkflow.push_back(&PARAM_FASTA_SPLITS);
     linclustoneshotworkflow.push_back(&PARAM_K);
     linclustoneshotworkflow.push_back(&PARAM_ALPH_SIZE);

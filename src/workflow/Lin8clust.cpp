@@ -17,20 +17,18 @@ void setLinclustOneshotWorkflowDefaults(Parameters *p) {
     p->maskMode = 0;
     p->spacedKmer = false;
     p->clusteringMode = Parameters::GREEDY;
-    // on by default here, unlike linclust: at a trillion metagenomic sequences the exact duplicates
-    // are most of the input, and reducing them away is what the passes after it are sized for
+    // on by default, unlike linclust: the duplicates are most of a metagenomic input
     p->clustHash = true;
 }
 
-// The script passes these itself: which machine this is and where it is in the wave. mmseqs refuses
-// a flag given twice, so they are dropped from the strings the script hands on.
+// the script passes these itself, and mmseqs refuses a flag given twice
 static bool scriptOwns(const Parameters &par, const MMseqsParameter *p) {
     const int owned[] = {par.PARAM_LINCLUSTERDB_NODE_LIST.uniqid, par.PARAM_LINCLUSTERDB_NODE_ID.uniqid,
                          par.PARAM_LINCLUSTERDB_NODE_COUNT.uniqid,
                          par.PARAM_LIN8_REP_RANK_BLOCK.uniqid, par.PARAM_LIN8_REP_RANK_BLOCKS.uniqid,
                          par.PARAM_THREADS.uniqid,
                          par.PARAM_MIN_SEQ_ID.uniqid, par.PARAM_C.uniqid, par.PARAM_COV_MODE.uniqid,
-                         par.PARAM_TSV.uniqid};
+};
     for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); i++) {
         if (p->uniqid == owned[i]) {
             return true;
@@ -46,8 +44,7 @@ static std::string passOn(Parameters &par, const std::vector<MMseqsParameter *> 
             mine.push_back(all[i]);
         }
     }
-    // only what the caller actually asked for: a pass reads a zero as "decide this yourself", and
-    // handing it the global default instead would answer a question the pass was meant to answer
+    // only what was actually asked for: a pass reads a zero as "decide this yourself"
     return par.createParameterString(mine, true);
 }
 
@@ -62,16 +59,12 @@ int lin8clust(int argc, const char **argv, const Command &command) {
                                      "Take this position in --node-list rather than the one the host "
                                      "name finds, for a scheduler that renames machines or a test "
                                      "putting several on one", NULL, par.PARAM_LINCLUSTERDB_NODE_ID.category);
-    par.overrideParameterDescription(par.PARAM_TSV,
-                                 "Name the clustering as a two column tsv beside the cluster database",
-                                 NULL, par.PARAM_TSV.category);
     par.overrideParameterDescription(par.PARAM_CLUST_HASH,
                                      "Reduce exact duplicates away before the k-mer passes and put "
                                      "them back at the end", NULL, par.PARAM_CLUST_HASH.category);
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_VARIADIC, 0);
 
-    // The wave is greedy by rank: a representative may only take what no lower rank took, and the
-    // repRankBlock order is that rank order, so the other modes have no order to run in.
+    // the wave is greedy by rank, so the other cluster modes have no order to run in
     if (par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
         Debug(Debug::ERROR) << "lin8clust clusters greedily by length, so --cluster-mode must "
                             << "be " << Parameters::GREEDY << " or " << Parameters::GREEDY_MEM << "\n";
@@ -88,8 +81,7 @@ int lin8clust(int argc, const char **argv, const Command &command) {
         EXIT(EXIT_FAILURE);
     }
 
-    // Every machine runs this same command with the same arguments and its own --node-id, so the
-    // script is handed the node pair rather than reading it from the environment.
+    // handed to the script rather than read from the environment
     CommandCaller cmd;
     cmd.addVariable("REMOVE_TMP", par.removeTmpFiles ? "TRUE" : NULL);
     // the same resolution the passes do, so a node list places the script as it places them
@@ -102,7 +94,6 @@ int lin8clust(int argc, const char **argv, const Command &command) {
     cmd.addVariable("COV", SSTR(par.covThr).c_str());
     cmd.addVariable("COVMODE", SSTR(par.covMode).c_str());
     cmd.addVariable("CLUSTHASH", par.clustHash ? "TRUE" : NULL);
-    cmd.addVariable("TSV", par.tsvOut ? "1" : "0");
     cmd.addVariable("REPSEQ", par.fastaSplits > 0 ? "1" : "0");
     cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
     cmd.addVariable("CREATEDB_PAR", passOn(par, par.lin8createdb).c_str());

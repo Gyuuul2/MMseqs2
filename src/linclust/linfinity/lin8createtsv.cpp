@@ -32,10 +32,7 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
     RunDbReader reader(par.db1, true);
     reader.open();
 
-    // Every row names both sides, so every rank's name is needed and there is no subset to hold.
-    // An empty string is thirty two byte before a character of it: at a trillion sequences that is
-    // thirty two terabyte, and the tsv it would write is forty. Say so rather than dying in the
-    // allocator, and name the two commands that do work at that size.
+    // every row names both sides, so there is no subset to hold and no answer at a trillion
     const size_t budget = Util::computeMemory(par.splitMemoryLimit);
     const size_t need = reader.getSize() * (sizeof(std::string) + 24);
     if (need > budget) {
@@ -49,9 +46,7 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
     Timer timer;
     const unsigned int threads = std::max<unsigned int>(1, par.threads);
     std::vector<std::string> nameOfRank(reader.getSize());
-    // The headers are one forward stream and stay mapped for as long as it runs, so a batch of
-    // where they begin can be collected in order and then cut up: finding a header is a memchr,
-    // making a name out of it is not, and that is the half worth spreading out.
+    // finding a header is a memchr and stays in order; making a name out of it is what is spread
     const size_t NAME_BATCH = 1u << 16;
     std::vector<const char *> beginOf(NAME_BATCH, NULL);
     RunDbReader::HeaderStream headers(reader);
@@ -90,9 +85,7 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
                                  DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
     clusters.open(DBReader<DBKeyType>::LINEAR_ACCCESS);
 
-    // Where each thread's stretch of the file begins. Sizing it takes the same walk over the
-    // clusters that writing does, but both walks are spread out, and knowing the byte lets every
-    // thread write its own stretch while the rows stay in the order the clustering made them.
+    // sized first so every thread writes its own stretch and the rows keep the clustering's order
     std::vector<size_t> edge(threads + 1, 0);
     for (unsigned int t = 0; t <= threads; t++) {
         edge[t] = clusters.getSize() * t / threads;
@@ -151,8 +144,7 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
                 line.append(nameOfRank[member]);
                 line.push_back('\n');
                 data = Util::skipLine(data);
-                // a cluster can be larger than the machine, so the buffer empties on rows and not
-                // on clusters, which is where it used to
+                // on rows, because a cluster can be larger than the machine
                 if (line.size() >= (1u << 20)) {
                     writeAt(out, tmp, line, at);
                 }

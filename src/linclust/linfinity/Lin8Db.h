@@ -293,14 +293,7 @@ public:
     BucketWriter(const std::string &prefix, size_t buckets, unsigned int threads, size_t budget)
         : prefix(prefix), buckets(buckets), files(buckets, -1), written(buckets, 0),
           offsets(buckets, 0), staged(threads, std::vector<std::vector<Record> >(buckets)) {
-        // Every thread staging every bucket is threads times buckets buffers, and at eight thousand
-        // buckets and twenty threads that is a hundred and sixty thousand of them, so each one is
-        // tens of kilobyte and that is the size that reaches the disk. Eight thousand files being
-        // appended in seventy kilobyte pieces is the worst shape a write can have.
-        //
-        // So a thread's own buffer is small and only has to be lock free, and it empties into one
-        // buffer a bucket that every thread shares. What reaches the disk is that shared buffer,
-        // which is as many times larger as there are threads.
+        // a thread's buffer is small and lock free, the bucket's is shared and is what reaches the disk
         const size_t share = budget / STAGING_SHARE;
         depth = std::max<size_t>(256, (share / 4) / (threads * buckets * sizeof(Record)));
         depth = std::min<size_t>(depth, FLUSH_BYTES / sizeof(Record));
@@ -393,22 +386,18 @@ public:
 private:
     std::string name(size_t bucket) const { return prefix + "." + SSTR(bucket); }
 
-    // Hands a thread's buffer to the one the bucket shares, and writes that when it is full. The
-    // write happens holding the bucket, which is what keeps one write a bucket in flight; two
-    // threads wanting the same bucket at the same moment is one chance in four hundred here.
+    // holds the bucket across the write, so one write a bucket is in flight at a time
     void drain(size_t bucket, std::vector<Record> &buffer) {
         if (buffer.empty()) {
             return;
         }
         while (__sync_lock_test_and_set(&gate[bucket], 1) != 0) {
-            // the wait has to be an atomic read: a plain one has nothing in the loop that could
-            // change it, so the compiler is free to hoist it out and spin on a value from before
+            // atomic, or the compiler hoists the load out and spins on a value from before
             while (__atomic_load_n(&gate[bucket], __ATOMIC_RELAXED) != 0) {
             }
         }
         std::vector<Record> &pool = pooled[bucket];
         if (pool.capacity() < poolDepth + depth) {
-            // room for one more thread buffer, because the size is checked after it goes in
             pool.reserve(poolDepth + depth);
         }
         pool.insert(pool.end(), buffer.begin(), buffer.end());
