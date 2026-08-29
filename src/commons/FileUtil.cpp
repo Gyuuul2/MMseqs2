@@ -169,6 +169,28 @@ std::string FileUtil::getHashFromSymLink(const std::string path){
     return base;
 }
 
+void FileUtil::publishAtomically(const std::string &tmp, const std::string &path) {
+    // the rename is metadata and can reach the server before the bytes it names do, so without this
+    // a crash can leave a whole looking file that is empty or short
+    int fd = open(tmp.c_str(), O_RDONLY);
+    if (fd < 0) {
+        Debug(Debug::ERROR) << "Cannot open " << tmp << " to flush it\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fsync(fd) != 0) {
+        Debug(Debug::ERROR) << "Cannot flush " << tmp << " to storage\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (close(fd) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << tmp << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (rename(tmp.c_str(), path.c_str()) != 0) {
+        Debug(Debug::ERROR) << "Cannot publish " << tmp << " as " << path << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
 void FileUtil::symlinkAlias(const std::string &file, const std::string &alias) {
     char *p = realpath(file.c_str(), NULL);
     if (p == NULL) {
@@ -269,25 +291,6 @@ size_t FileUtil::getFileSize(const std::string &fileName) {
     struct stat stat_buf;
     int rc = stat(fileName.c_str(), &stat_buf);
     return rc == 0 ? stat_buf.st_size : -1;
-}
-
-size_t FileUtil::getDirectIoAlignment(const std::string &fileName) {
-    // 4096 covers 512e and 4Kn devices where the kernel cannot say (statx is Linux 6.1+)
-    size_t align = 4096;
-#if defined(__linux__) && defined(STATX_DIOALIGN)
-    struct statx stx;
-    memset(&stx, 0, sizeof(stx));
-    if (statx(AT_FDCWD, fileName.c_str(), 0, STATX_DIOALIGN, &stx) == 0 && (stx.stx_mask & STATX_DIOALIGN)) {
-        const size_t offAlign = stx.stx_dio_offset_align;
-        const size_t memAlign = stx.stx_dio_mem_align;
-        // one value serves both roles, so it must satisfy the larger of the two constraints
-        if (offAlign != 0 && memAlign != 0 && (offAlign & (offAlign - 1)) == 0 && (memAlign & (memAlign - 1)) == 0) {
-            align = std::max(offAlign, memAlign);
-        }
-    }
-#endif
-    // posix_memalign rejects alignments below sizeof(void*), and larger powers of two satisfy smaller ones
-    return std::max(align, sizeof(void *));
 }
 
 char *FileUtil::allocPageBufferWithAdvice(int input_desc, size_t insize) {
@@ -480,7 +483,7 @@ void FileUtil::fixRlimitNoFile() {
             Debug(Debug::WARNING) << "Could not increase maximum number of open files (getrlimit " << errno << "). Use ulimit manually\n";
             return;
         }
-        limit.rlim_cur = std::min(std::max((rlim_t)32768, limit.rlim_cur), limit.rlim_max);
+        limit.rlim_cur = std::min(std::max((rlim_t)8192, limit.rlim_cur), limit.rlim_max);
         limit.rlim_max = std::min(RLIM_INFINITY, limit.rlim_max);
         if (setrlimit(RLIMIT_NOFILE, &limit) != 0) {
             Debug(Debug::WARNING) << "Could not increase maximum number of open files (setrlimit " << errno << "). Use ulimit manually\n";

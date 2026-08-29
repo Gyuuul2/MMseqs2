@@ -23,8 +23,8 @@ public:
         KSEQ_STREAM,
         KSEQ_GZIP,
         KSEQ_BZIP,
-        KSEQ_BUFFER,
-        KSEQ_ZSTD
+        KSEQ_ZSTD,
+        KSEQ_BUFFER
     };
     kseq_type type;
 
@@ -78,7 +78,6 @@ private:
 };
 #endif
 
-// zstd is always linked; the streaming state stays in the .cpp behind an opaque handle.
 class KSeqZstd : public KSeqWrapper {
 public:
     KSeqZstd(const char* file);

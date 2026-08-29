@@ -156,8 +156,6 @@ public:
             this->totalEntries = totalEntries;
             currentPos = 0;
             prevPrintedId = 0;
-            // lapProgress does not reset, so every bar but the first would report the total elapsed time
-            timer.reset();
         }
 
         void updateProgress(size_t pos = SIZE_MAX){

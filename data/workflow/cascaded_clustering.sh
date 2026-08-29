@@ -138,7 +138,7 @@ elif [ "$CLUSTER_MODULE" = "cluster1" ]; then
         if [ -n "$REASSIGN" ]; then
             if notExists "${TMP_PATH}/clu.dbtype"; then
                 # shellcheck disable=SC2086
-                "$MMSEQS" mergeclusters "$SOURCE" "${TMP_PATH}/clu" "${TMP_PATH}/clu_redundancy" ${CLUSTER_STR} $MERGECLU_PAR \
+                "$MMSEQS" mergeclusters "$SOURCE" "${TMP_PATH}/clu" "${TMP_PATH}/clu_redundancy" ${CLUSTER_STR} \
                 || fail "Merging of clusters has died"
             fi
         else

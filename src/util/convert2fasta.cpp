@@ -23,8 +23,6 @@
 
 // a worker holds one slice of the output before it lands, so this bounds threads * this much memory
 static const size_t CONVERT2FASTA_SLICE_BYTES = 8 * 1024 * 1024;
-// MADV_DONTNEED shoots down the TLB on every thread, so reclaim in large steps
-static const size_t CONVERT2FASTA_DROP_STRIDE = 256 * 1024 * 1024;
 
 // the whole output would otherwise sit in page cache as dirty until the process exits, which on a
 // multi terabyte fasta competes with the index for memory. Start writeback on what was just written
@@ -78,14 +76,12 @@ int convert2fasta(int argc, const char **argv, const Command& command) {
     par.parseParameters(argc, argv, command, true, 0, 0);
 
     DBReader<DBKeyType> db(par.db1.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_INDEX);
-    db.setIoCacheAdvice(true);
     db.open(DBReader<DBKeyType>::NOSORT);
     // a length ordered subdb walks its parent's data front to back, so the readahead is worth having
     // and the pages behind the sweep are never touched again
     db.setSequentialAdvice();
 
     DBReader<DBKeyType> db_header(par.hdr1.c_str(), par.hdr1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_INDEX);
-    db_header.setIoCacheAdvice(true);
     db_header.open(DBReader<DBKeyType>::NOSORT);
     db_header.setSequentialAdvice();
 
@@ -167,7 +163,6 @@ int convert2fasta(int argc, const char **argv, const Command& command) {
 
     size_t at = 0;
     size_t fileOffset = 0;
-    size_t droppedBody = 0, droppedHeader = 0;
     size_t roundBase = 0;
     size_t prevBase = 0;
     size_t prevBytes = 0;
@@ -226,20 +221,6 @@ int convert2fasta(int argc, const char **argv, const Command& command) {
         retireWritten(fastaFd, roundBase, fileOffset - roundBase, prevBase, prevBytes);
         prevBase = roundBase;
         prevBytes = fileOffset - roundBase;
-        // the sweep is monotone in the parent's offsets, so everything below the round it just left
-        // is dead; hand those pages back instead of letting them push the index into swap
-        if (at > 0) {
-            const size_t bodyUpTo = db.getIndex()[db.getId(from->getDbKey(at - 1))].offset;
-            const size_t headerUpTo = db_header.getIndex()[db_header.getId(from->getDbKey(at - 1))].offset;
-            if (bodyUpTo > droppedBody + CONVERT2FASTA_DROP_STRIDE) {
-                db.dropCacheRange(droppedBody, bodyUpTo);
-                droppedBody = bodyUpTo;
-            }
-            if (headerUpTo > droppedHeader + CONVERT2FASTA_DROP_STRIDE) {
-                db_header.dropCacheRange(droppedHeader, headerUpTo);
-                droppedHeader = headerUpTo;
-            }
-        }
     }
 
     if (close(fastaFd) != 0) {

@@ -21,16 +21,28 @@ SOURCE="$INPUT"
 if [ "$LINCLUST_MODULE" = "linclust2" ]; then
     # 0. clusthash
     if [ -n "$CLUSTHASH" ]; then
-        # clusthashfast writes the clustering directly, so no alignment DB and no clust step
-        if notExists "${TMP_PATH}/input_clusthash_clust.dbtype"; then
+        if notExists "${TMP_PATH}/input_clusthash.dbtype"; then
             # shellcheck disable=SC2086
-            $RUNNER "$MMSEQS" clusthashfast "$INPUT" "${TMP_PATH}/input_clusthash_clust" ${CLUSTHASHFAST_PAR} \
-                || fail "clusthashfast died"
+            $RUNNER "$MMSEQS" clusthash "$INPUT" "${TMP_PATH}/input_clusthash" ${CLUSTHASH_PAR} \
+                || fail "clusthash died"
         fi
 
-        [ ! -f "${TMP_PATH}/input_clusthash_clust_redundancy.dbtype" ] \
-            && fail "clusthashfast representative DB is missing"
-        INPUT="${TMP_PATH}/input_clusthash_clust_redundancy"
+        if notExists "${TMP_PATH}/input_clusthash_clust.dbtype"; then
+            # shellcheck disable=SC2086
+            $RUNNER "$MMSEQS" clust "$INPUT" "${TMP_PATH}/input_clusthash" "${TMP_PATH}/input_clusthash_clust" ${CLUSTHASH_CLUST_PAR} \
+                || fail "clusthash-based clust died"
+        fi
+
+        awk '{print $1}' "${TMP_PATH}/input_clusthash_clust.index" \
+            > "${TMP_PATH}/order_clusthash_redundancy"
+
+        if notExists "${TMP_PATH}/input_clusthash_redundancy.dbtype"; then
+            # shellcheck disable=SC2086
+            "$MMSEQS" createsubdb "${TMP_PATH}/order_clusthash_redundancy" "$SOURCE" \
+                "${TMP_PATH}/input_clusthash_redundancy" ${VERBOSITY} --subdb-mode 1 \
+                || fail "createsubdb (clusthash representatives) died"
+        fi
+        INPUT="${TMP_PATH}/input_clusthash_redundancy"
     fi
 
     # 1. k-mer matching
@@ -62,7 +74,6 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
     fi
 
     # 3. Refinement pass: re-cluster representative sequences, unless --linclust2-iter 1
-    REFINEDB=""
     if [ -n "$REFINE_ROUND" ]; then
         if notExists "${TMP_PATH}/input_rep.dbtype"; then
             # shellcheck disable=SC2086
@@ -84,20 +95,19 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
                 --filter-seqdb-file "$SOURCE" \
                 || fail "align2clust (representatives) died"
         fi
-        REFINEDB="${TMP_PATH}/clu_rep"
-    fi
 
-    if notExists "$2.dbtype"; then
-        if [ -z "$REFINEDB" ]; then
-            # one input clustering makes mergeclusters an identity copy, so move it instead
-            # shellcheck disable=SC2086
-            "$MMSEQS" mvdb "$CLUDB" "$2" ${VERBOSITY} \
-                || fail "mvdb clustering died"
-        else
+        if notExists "$2.dbtype"; then
             # shellcheck disable=SC2086
             "$MMSEQS" mergeclusters "$SOURCE" "$2" \
-                "$CLUDB" $REFINEDB $MERGECLU_PAR \
+                "$CLUDB" "${TMP_PATH}/clu_rep" $MERGECLU_PAR \
                 || fail "mergeclusters died"
+        fi
+    else
+        # one iteration: the first pass is the answer, so it is renamed into place rather than merged
+        if notExists "$2.dbtype"; then
+            # shellcheck disable=SC2086
+            "$MMSEQS" mvdb "$CLUDB" "$2" ${VERBOSITY} \
+                || fail "mvdb (single iteration result) died"
         fi
     fi
 
@@ -141,17 +151,26 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
 elif [ "$LINCLUST_MODULE" = "linclust1" ]; then
     # 0. clusthash
     if [ -n "$CLUSTHASH" ]; then
-        # clusthashfast writes the clustering directly, so no alignment DB and no clust step
-        if notExists "${TMP_PATH}/input_clusthash_clust.dbtype"; then
+        if notExists "${TMP_PATH}/input_clusthash.dbtype"; then
             # shellcheck disable=SC2086
-            $RUNNER "$MMSEQS" clusthashfast "$INPUT" "${TMP_PATH}/input_clusthash_clust" ${CLUSTHASHFAST_PAR} \
-                || fail "clusthashfast died"
+            $RUNNER "$MMSEQS" clusthash "$INPUT" "${TMP_PATH}/input_clusthash" ${CLUSTHASH_PAR} \
+                    || fail "clust hash died"
         fi
 
+        if notExists "${TMP_PATH}/input_clusthash_clust.dbtype"; then
+            # shellcheck disable=SC2086
+            $RUNNER "$MMSEQS" clust "$INPUT" "${TMP_PATH}/input_clusthash" "${TMP_PATH}/input_clusthash_clust" ${CLUSTHASH_CLUST_PAR} \
+                    || fail "clust hash based clust died"
+        fi
 
-        [ ! -f "${TMP_PATH}/input_clusthash_clust_redundancy.dbtype" ] \
-            && fail "clusthashfast representative DB is missing"
-        INPUT="${TMP_PATH}/input_clusthash_clust_redundancy"
+        awk '{print $1}' "${TMP_PATH}/input_clusthash_clust.index" > "${TMP_PATH}/order_clusthash_redundancy"
+
+        if notExists "${TMP_PATH}/input_clusthash_redundancy.dbtype"; then
+            # shellcheck disable=SC2086
+            "$MMSEQS" createsubdb "${TMP_PATH}/order_clusthash_redundancy" "$SOURCE" "${TMP_PATH}/input_clusthash_redundancy" ${VERBOSITY} --subdb-mode 1 \
+                || fail "Createsubdb step died"
+        fi
+        INPUT="${TMP_PATH}/input_clusthash_redundancy"
     fi
 
     # 1. Finding exact k-mer matches.
@@ -184,7 +203,6 @@ elif [ "$LINCLUST_MODULE" = "linclust1" ]; then
         fi
         PRECLUST="${TMP_PATH}/pre_clust_clusthash"
     fi
-
 
     awk '{ print $1 }' "${PRECLUST}.index" > "${TMP_PATH}/order_redundancy"
 
@@ -248,16 +266,13 @@ if [ -n "$REMOVE_TMP" ]; then
         # shellcheck disable=SC2086
         "$MMSEQS" rmdb "${TMP_PATH}/clu" ${VERBOSITY}
         # shellcheck disable=SC2086
-        if [ -n "$REFINE_ROUND" ]; then
-            # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_rep" ${VERBOSITY}
-            # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_rep_h" ${VERBOSITY}
-            # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/pref_rep" ${VERBOSITY}
-            # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/clu_rep" ${VERBOSITY}
-        fi
+        "$MMSEQS" rmdb "${TMP_PATH}/input_rep" ${VERBOSITY}
+        # shellcheck disable=SC2086
+        "$MMSEQS" rmdb "${TMP_PATH}/input_rep_h" ${VERBOSITY}
+        # shellcheck disable=SC2086
+        "$MMSEQS" rmdb "${TMP_PATH}/pref_rep" ${VERBOSITY}
+        # shellcheck disable=SC2086
+        "$MMSEQS" rmdb "${TMP_PATH}/clu_rep" ${VERBOSITY}
         # align intermediates (only present with --include-align-files)
         if [ -f "${TMP_PATH}/clu_aln.dbtype" ]; then
             # shellcheck disable=SC2086
@@ -269,12 +284,14 @@ if [ -n "$REMOVE_TMP" ]; then
         fi
         if [ -n "$CLUSTHASH" ]; then
             # shellcheck disable=SC2086
+            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash" ${VERBOSITY}
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust" ${VERBOSITY}
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust_redundancy" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_redundancy" ${VERBOSITY}
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/clu_merged" ${VERBOSITY}
+            rm -f "${TMP_PATH}/order_clusthash_redundancy"
         fi
         rm -f "${TMP_PATH}/linclust.sh"
     elif [ "$LINCLUST_MODULE" = "linclust1" ]; then
@@ -299,12 +316,14 @@ if [ -n "$REMOVE_TMP" ]; then
         fi
         if [ -n "$CLUSTHASH" ]; then
             # shellcheck disable=SC2086
+            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash" ${VERBOSITY}
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust" ${VERBOSITY}
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust_redundancy" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_redundancy" ${VERBOSITY}
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/pre_clust_clusthash" ${VERBOSITY}
+            rm -f "${TMP_PATH}/order_clusthash_redundancy"
         fi
         # shellcheck disable=SC2086
         "$MMSEQS" rmdb "${TMP_PATH}/aln" ${VERBOSITY}

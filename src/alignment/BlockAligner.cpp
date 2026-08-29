@@ -6,7 +6,6 @@
 #include "EvalueComputation.h"
 #include "DistanceCalculator.h"
 
-#define MAX_SIZE 4096 //change
 #define MIN_SIZE 32
 
 #include <algorithm>
@@ -16,7 +15,8 @@ BlockAligner::BlockAligner(
     size_t maxSequenceLength,
     BaseMatrix *m, SubstitutionMatrix::FastMatrix* fastMatrix, EvalueComputation * evaluer,
     bool compBiasCorrection, float compBiasCorrectionScale,
-    int8_t gapOpen, int8_t gapExtend
+    int8_t gapOpen, int8_t gapExtend,
+    size_t maxBand
 ) : 
     maxSequenceLength(maxSequenceLength),
     gaps({gapOpen, gapExtend}),
@@ -26,7 +26,7 @@ BlockAligner::BlockAligner(
     subMat((SubstitutionMatrix*) m),
     fastMatrix(fastMatrix),
     evaluer(evaluer) {
-    range={MIN_SIZE, MAX_SIZE};
+    range={BlockAligner::MIN_BAND, (size_t) maxBand};
     query = block_new_padded_aa(maxSequenceLength, range.max);
     queryBias = block_new_pos_bias(maxSequenceLength, range.max);
     queryRevNumSeq = new int8_t[maxSequenceLength];

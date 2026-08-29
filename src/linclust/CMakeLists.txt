@@ -1,7 +1,17 @@
 set(linclust_source_files
+        linclust/linfinity/Lin8Db.cpp
+        linclust/linfinity/Lin8DbReader.cpp
         linclust/kmermatcher.cpp
         linclust/kmerindexdb.cpp
         linclust/kmersearch.cpp
         linclust/LinsearchIndexReader.cpp
+        linclust/linfinity/lin8createdb.cpp
+        linclust/linfinity/lin8clusthash.cpp
+        linclust/linfinity/lin8kmermatcher.cpp
+        linclust/linfinity/lin8mergeclusters.cpp
+        linclust/linfinity/lin8align2clust.cpp
+        linclust/linfinity/lin8cluster.cpp
+        linclust/linfinity/lin8createtsv.cpp
+        linclust/linfinity/lin8repseq.cpp
         PARENT_SCOPE
         )

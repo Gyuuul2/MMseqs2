@@ -5,7 +5,6 @@
 //
 // Manages DB read access.
 //
-#include <algorithm>
 #include "MemoryTracker.h"
 #include <cstddef>
 #include <utility>
@@ -60,8 +59,7 @@ public:
     struct Index {
         T id;
         size_t offset;
-        // size_t: padding makes it free in both builds, and a 4 GB entry used to wrap here
-        size_t length;
+        unsigned int length;
 
         // we need a non-strict-weak ordering function here
         // so our upper_bound call works correctly
@@ -200,28 +198,6 @@ public:
 
     bool open(int sort);
 
-    // the batched path on buffered descriptors, so reuse still hits the page cache; beats O_DIRECT unless the working set is far past cacheable
-
-    // keeps a descriptor on an mmap reader so dropCacheAll can fadvise it; off by default
-    void setIoCacheAdvice(bool enabled) { ioCacheAdvice = enabled; }
-
-    // whole file only: an entry is a few hundred bytes, so a per-entry range never holds a full page
-    void dropCacheAll();
-
-    // same for one range, rounded inward: a partial page still holds live neighbours
-    void dropCacheRange(size_t beginOffset, size_t endOffset);
-
-    // one io_uring submission for ids[0..n); returns how many fit the arena, so the caller advances and calls again
-    size_t loadBatch(const size_t *ids, size_t n, unsigned int thrIdx);
-
-    // the k-th entry of the batch loadBatch just returned
-    const char *batchAt(unsigned int thrIdx, size_t k);
-
-    bool isDirectIo() const { return (dataMode & USE_DIRECT_IO) != 0; }
-
-    // swaps the mapping for descriptors when a fault per entry costs more than a read; no data pointer may outlive the call
-    bool useDescriptorIo(bool keepPageCache);
-
     void close();
 
     const char* getDataFileName() { return dataFileName; }
@@ -239,23 +215,13 @@ public:
 
     char* getUnpadded(size_t id, int thrIdx);
 
-    // USE_DIRECT_IO only: thrIdx picks the bounce buffer (-1 means omp_get_thread_num) and the pointer lives until the next call on it
-    char* getDataUncompressed(size_t id, int thrIdx = -1);
+    char* getDataUncompressed(size_t id);
 
     void touchData(size_t id);
 
     char* getDataByDBKey(T key, int thrIdx);
 
     char * getDataByOffset(size_t offset);
-
-    // dataSizeOffset is the running total over the data files, so it is sorted and the owning
-    // file is a binary search. A result db has one data file per writer thread, so the linear
-    // walk this replaces costs up to that many comparisons on every entry read.
-    size_t fileIdxByOffset(size_t offset) const {
-        return static_cast<size_t>(
-            std::upper_bound(dataSizeOffset, dataSizeOffset + dataFileCnt + 1, offset)
-            - dataSizeOffset) - 1;
-    }
 
     size_t getSize() const;
 
@@ -350,8 +316,6 @@ public:
     static const unsigned int USE_LOOKUP_REV = 16;
     static const unsigned int USE_SOURCE     = 32;
     static const unsigned int USE_SOURCE_REV = 64;
-    // per-entry pread with the page cache bypassed, for databases far larger than RAM
-    static const unsigned int USE_DIRECT_IO  = 128;
 
 
     // compressed
@@ -359,10 +323,6 @@ public:
     static const int COMPRESSED     = 1;
 
     char * getDataForFile(size_t fileIdx){
-        if (dataMode & USE_DIRECT_IO) {
-            Debug(Debug::ERROR) << "getDataForFile is not supported in USE_DIRECT_IO mode, the data file is not mapped\n";
-            EXIT(EXIT_FAILURE);
-        }
         return dataFiles[fileIdx];
     }
 
@@ -413,9 +373,6 @@ public:
     void sortIndex(bool isSortedById);
     void sortIndex(float *weights);
     bool isSortedByOffset();
-
-    // entry length descending with ascending local id, the order createdb mode 3 publishes
-    bool isSortedByEntryLengthDescending(int threads);
 
     void unmapData();
 
@@ -541,24 +498,10 @@ public:
 
     void setSequentialAdvice();
 
-
     void decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize, size_t *startEntry, size_t *numEntries);
 
 private:
     void checkClosed() const;
-
-    void resolveIoPolicy(int accessType);
-
-    int openDirect(const char *fileName, size_t *dataSize);
-
-    char* readDirect(size_t offset, size_t length, int thrIdx);
-
-    // falls back to a pread loop when io_uring is unavailable, so the batch api always works
-    size_t loadBatchDirect(const size_t *ids, size_t n, unsigned int thrIdx);
-    void freeIoBatch();
-
-    // grows one thread's bounce buffer, alignment 1 means malloc, keepBytes are carried over
-    void growBuffer(char** buffer, size_t* capacity, size_t needed, size_t alignment, size_t keepBytes);
 
     int threads;
 
@@ -572,20 +515,6 @@ private:
 
     // offset for all datafiles
     char** dataFiles;
-    // USE_DIRECT_IO only: dataFiles stays NULL and entries are pread from these descriptors
-    int* dataFds;
-    // an aligned read covers whole blocks, so neighbouring entries are already in the buffer
-    struct DirectBuffer {
-        char* buffer;
-        size_t size;    // capacity, grown on demand so it never has to cover the largest entry
-        size_t file;
-        size_t offset;  // aligned file offset the buffer was filled from
-        size_t length;  // bytes valid in the buffer, 0 when empty
-    };
-    DirectBuffer* directBuffers;
-    // io_uring rings and per-thread arenas, allocated on the first loadBatch, see DBReader.cpp
-    struct IoBatch;
-    IoBatch* ioBatch;
     size_t * dataSizeOffset;
     size_t dataFileCnt;
     size_t totalDataSize;
@@ -626,17 +555,6 @@ private:
     bool externalData;
 
     bool didMlock;
-
-    bool ioBufferedBatch;
-    bool ioCacheAdvice;
-
-    // O_DIRECT alignment resolved per data file at open time, the device can want less than 4096
-    size_t directIoAlign;
-
-    void allocateDirectBuffers();
-    void freeDirectBuffers();
-    void openDataFds();
-    void mapDataFiles();
 
     // needed to prevent the compiler from optimizing away the loop
     char magicBytes;

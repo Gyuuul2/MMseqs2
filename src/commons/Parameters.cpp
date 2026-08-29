@@ -1,3 +1,4 @@
+#include "Lin8Db.h"
 #include "Parameters.h"
 #include "Util.h"
 #include "DistanceCalculator.h"
@@ -11,9 +12,6 @@
 #include <regex.h>
 #include <unistd.h>
 #include <sched.h>
-#include <cerrno>
-#include <cstdlib>
-#include <limits>
 
 #include "blosum62.out.h"
 #include "PAM30.out.h"
@@ -153,11 +151,11 @@ Parameters::Parameters():
         PARAM_TAU(PARAM_TAU_ID, "--tau", "Tau", "Tau: context state pseudo count mixture (0.0,1.0)", typeid(float), (void *) &tau, "[0-9]*(\\.[0-9]+)?$", MMseqsParameter::COMMAND_PROFILE),
         //createtsv
         PARAM_TARGET_COLUMN(PARAM_TARGET_COLUMN_ID, "--target-column", "Target column", "Select a target column (default 1), 0 if no target id exists", typeid(int), (void *) &targetTsvColumn, "^[0-9]*$"),
+        PARAM_TSV_SPLITS(PARAM_TSV_SPLITS_ID, "--tsv-splits", "TSV hash splits", "Write N files <out>.split%05d.tsv routed by hashing --tsv-split-column. 0: single file", typeid(int), (void *) &tsvSplits, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_MISC | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_TSV_SPLIT_COLUMN(PARAM_TSV_SPLIT_COLUMN_ID, "--tsv-split-column", "TSV split column", "1-based column hashed to pick a row's split", typeid(int), (void *) &tsvSplitColumn, "^[12]$", MMseqsParameter::COMMAND_MISC | MMseqsParameter::COMMAND_EXPERT),
         PARAM_FIRST_SEQ_REP_SEQ(PARAM_FIRST_SEQ_REP_SEQ_ID, "--first-seq-as-repr", "First sequence as representative", "Use the first sequence of the clustering result as representative sequence", typeid(bool), (void *) &firstSeqRepr, "", MMseqsParameter::COMMAND_MISC),
         PARAM_FULL_HEADER(PARAM_FULL_HEADER_ID, "--full-header", "Add full header", "Replace DB ID by its corresponding Full Header", typeid(bool), (void *) &fullHeader, ""),
         PARAM_IDX_SEQ_SRC(PARAM_IDX_SEQ_SRC_ID, "--idx-seq-src", "Sequence source", "0: auto, 1: split/translated sequences, 2: input sequences", typeid(int), (void *) &idxSeqSrc, "^[0-2]{1}$", MMseqsParameter::COMMAND_MISC),
-        PARAM_TSV_SPLITS(PARAM_TSV_SPLITS_ID, "--tsv-splits", "TSV hash splits", "Write N files <out>.split%05d.tsv routed by hashing --tsv-split-column. 0: single file", typeid(int), (void *) &tsvSplits, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_MISC | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_TSV_SPLIT_COLUMN(PARAM_TSV_SPLIT_COLUMN_ID, "--tsv-split-column", "TSV split column", "1-based column hashed to pick a row's split", typeid(int), (void *) &tsvSplitColumn, "^[12]$", MMseqsParameter::COMMAND_MISC | MMseqsParameter::COMMAND_EXPERT),
 
         // result2stats
         PARAM_STAT(PARAM_STAT_ID, "--stat", "Statistics to be computed", "One of: linecount, mean, min, max, doolittle, charges, seqlen, firstline", typeid(std::string), (void *) &stat, ""),
@@ -167,8 +165,6 @@ Parameters::Parameters():
         PARAM_INCLUDE_ONLY_EXTENDABLE(PARAM_INCLUDE_ONLY_EXTENDABLE_ID, "--include-only-extendable", "Include only extendable", "Include only extendable", typeid(bool), (void *) &includeOnlyExtendable, "", MMseqsParameter::COMMAND_CLUSTLINEAR),
         PARAM_IGNORE_MULTI_KMER(PARAM_IGNORE_MULTI_KMER_ID, "--ignore-multi-kmer", "Skip repeating k-mers", "Skip k-mers occurring multiple times (>=2)", typeid(bool), (void *) &ignoreMultiKmer, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_HASH_SHIFT(PARAM_HASH_SHIFT_ID, "--hash-shift", "Shift hash", "Shift k-mer hash initialization", typeid(int), (void *) &hashShift, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_KMER_SELECTION(PARAM_KMER_SELECTION_ID, "--kmer-selection", "K-mer selection", "0: bottom-k minhash, 1: closed syncmers pre-filtered, then bottom-k minhash", typeid(int), (void *) &kmerSelection, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_SYNCMER_S(PARAM_SYNCMER_S_ID, "--syncmer-s", "Syncmer s-mer length", "s-mer length for closed syncmer selection (0 < s < k)", typeid(int), (void *) &syncmerS, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_PICK_N_SIMILAR(PARAM_PICK_N_SIMILAR_ID, "--pick-n-sim-kmer", "Add N similar to search", "Add N similar k-mers to search", typeid(int), (void *) &pickNbest, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJUST_KMER_LEN(PARAM_ADJUST_KMER_LEN_ID, "--adjust-kmer-len", "Adjust k-mer length", "Adjust k-mer length based on specificity (only for nucleotides)", typeid(bool), (void *) &adjustKmerLength, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_RESULT_DIRECTION(PARAM_RESULT_DIRECTION_ID, "--result-direction", "Result direction", "result is 0: query, 1: target centric", typeid(int), (void *) &resultDirection, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -180,13 +176,9 @@ Parameters::Parameters():
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
-        PARAM_COMPRESS_KMER_TMP_FILES(PARAM_COMPRESS_KMER_TMP_FILES_ID, "--compress-kmer-tmp-files", "Compress k-mer temporary files", "Compress kmermatcher temporary files and stream them during merge: 0: off, 1: zstd", typeid(int), (void *) &compressKmerTmpFiles, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_KMER_WRITE_TO_DISK(PARAM_KMER_WRITE_TO_DISK_ID, "--kmer-write-to-disk", "Write k-mers to disk", "Extract k-mers once into per-split files on disk, so each split reads its file instead of re-scanning the sequence DB (identical result; faster when splitting on fast local storage)", typeid(bool), (void *) &kmerWriteToDisk, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_KMERMATCHER_MODE(PARAM_KMERMATCHER_MODE_ID, "--kmermatcher-mode", "K-mer matcher mode", "1: database-key payloads (generic prefilter format), 2: local sequence-index payloads (linclust2/align2clust only)", typeid(int), (void *) &kmerMatcherMode, "^[1-2]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_VERSION(PARAM_LINCLUST_VERSION_ID, "--linclust-version", "Linclust version", "Linclust version: 1: Linclust1, 2: Linclust2", typeid(int), (void *) &linclustVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST2_ITER(PARAM_LINCLUST2_ITER_ID, "--linclust2-iter", "Linclust2 iterations", "Iterations of linclust2. 2 re-clusters the representatives, 1 stops after the first iteration", typeid(int), (void *) &linclust2Iter, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_BATCH_ROUND0_LINCLUST2_ITER(PARAM_BATCH_ROUND0_LINCLUST2_ITER_ID, "--round0-linclust2-iter", "Round0 linclust2 iterations", "Override --linclust2-iter for round 0 only. If unset, round 0 uses --linclust2-iter", typeid(int), (void *) &batchRound0Linclust2Iter, "^[1-2]$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUSTER_VERSION(PARAM_CLUSTER_VERSION_ID, "--cluster-version", "Cluster version", "Cluster version: 1: Cluster1, 2: Cluster2", typeid(int), (void *) &clusterVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         // workflow
         PARAM_RUNNER(PARAM_RUNNER_ID, "--mpi-runner", "MPI runner", "Use MPI on compute cluster with this MPI command (e.g. \"mpirun -np 42\")", typeid(std::string), (void *) &runner, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
@@ -238,6 +230,8 @@ Parameters::Parameters():
         // pinned per work area on first use (pin_merge_splits): round TSVs are written pre-split, so one count must cover every round
         PARAM_BATCH_MERGE_SPLITS(PARAM_BATCH_MERGE_SPLITS_ID, "--merge-splits", "Merge splits", "Number of hash splits the representative merge is processed in. 0: auto from --threads", typeid(int), (void *) &batchMergeSplits, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_MERGE_SPLIT_JOBS(PARAM_BATCH_MERGE_SPLIT_JOBS_ID, "--merge-split-jobs", "Merge split jobs", "Number of merge splits to sort and join concurrently. 0: auto from --threads", typeid(int), (void *) &batchMergeSplitJobs, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_MERGE_SPLIT_JOBS_CAP(PARAM_BATCH_MERGE_SPLIT_JOBS_CAP_ID, "--merge-split-jobs-cap", "Merge split jobs cap", "Upper bound for the auto-derived --merge-split-jobs (threads/8, at most this many)", typeid(int), (void *) &batchMergeSplitJobsCap, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BATCH_MERGE_NODES(PARAM_BATCH_MERGE_NODES_ID, "--merge-nodes", "Merge nodes", "Number of machines the final deferred merge join is distributed across. 1: run it inside the merge job", typeid(int), (void *) &batchMergeNodes, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_REP_FASTA_SPLITS(PARAM_BATCH_REP_FASTA_SPLITS_ID, "--rep-fasta-splits", "Representative FASTA splits", "Number of FASTA files each chunk's representatives are sharded into", typeid(int), (void *) &batchRepFastaSplits, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_ROUND0_REP_FASTA_SPLITS(PARAM_BATCH_ROUND0_REP_FASTA_SPLITS_ID, "--round0-rep-fasta-splits", "Round0 rep FASTA splits", "Override --rep-fasta-splits for round 0 only", typeid(int), (void *) &batchRound0RepFastaSplits, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_BATCH_CHUNK_DISK_BUDGET(PARAM_BATCH_CHUNK_DISK_BUDGET_ID, "--chunk-disk-budget", "Chunk disk budget", "Fail a chunk when the bytes under its work directory reach this budget. 0: no limit", typeid(ByteParser), (void *) &batchChunkDiskBudget, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_COMMON),
@@ -297,13 +291,20 @@ Parameters::Parameters():
         PARAM_USE_HEADER(PARAM_USE_HEADER_ID, "--use-fasta-header", "Use fasta header", "Use the id parsed from the fasta header as the index key instead of using incrementing numeric identifiers", typeid(bool), (void *) &useHeader, ""),
         PARAM_ID_OFFSET(PARAM_ID_OFFSET_ID, "--id-offset", "Offset of numeric ids", "Numeric ids in index file are offset by this value", typeid(int), (void *) &identifierOffset, "^(0|[1-9]{1}[0-9]*)$"),
         PARAM_DB_TYPE(PARAM_DB_TYPE_ID, "--dbtype", "Database type", "Database type 0: auto, 1: amino acid 2: nucleotides", typeid(int), (void *) &dbType, "[0-2]{1}"),
-        PARAM_CREATEDB_MODE(PARAM_CREATEDB_MODE_ID, "--createdb-mode", "Createdb mode", "Createdb mode 0: copy data, 1: soft link data and write new index (works only with single line fasta/q) 2: GPU compatible db, 3: plain db sorted by descending length", typeid(int), (void *) &createdbMode, "^[0-3]{1}$"),
-        PARAM_CREATEDB_THREADS(PARAM_CREATEDB_THREADS_ID, "--createdb-threads", "Createdb file threads", "Input file workers for createdb mode 0. Raise toward the number of independent storage devices. 0: default, never more than --threads", typeid(int), (void *) &createdbThreads, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_CREATEDB_MODE(PARAM_CREATEDB_MODE_ID, "--createdb-mode", "Createdb mode", "Createdb mode 0: copy data, 1: soft link data and write new index (works only with single line fasta/q) 2: GPU compatible db", typeid(int), (void *) &createdbMode, "^[0-2]{1}$"),
         PARAM_SHUFFLE(PARAM_SHUFFLE_ID, "--shuffle", "Shuffle input database", "Shuffle input database", typeid(bool), (void *) &shuffleDatabase, ""),
-        PARAM_SHUFFLE_SPLITS(PARAM_SHUFFLE_SPLITS_ID, "--shuffle-splits", "Shuffle splits", "Number of temporary splits the input is scattered over. Raise it when a single split no longer fits in memory", typeid(int), (void *) &shuffleSplits, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LINCLUSTERDB_NODE_LIST(PARAM_LINCLUSTERDB_NODE_LIST_ID, "--node-list", "Node list", "Comma-separated node list, the node finds itself by host name", typeid(std::string), (void *) &linclusterdbNodeList, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_LINCLUSTERDB_NODE_ID(PARAM_LINCLUSTERDB_NODE_ID_ID, "--node-id", "Node id", "Index of this node, overrides the host name lookup", typeid(int), (void *) &linclusterdbNodeId, "^-?[0-9]+$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_LINCLUSTERDB_NODE_COUNT(PARAM_LINCLUSTERDB_NODE_COUNT_ID, "--node-count", "Node count", "Number of nodes when no node list is given", typeid(int), (void *) &linclusterdbNodeCount, "^[0-9]+$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_LINCLUST_RANGES(PARAM_LINCLUST_RANGES_ID, "--ranges", "Representative ranges", "How many ranges of representative ranks to route the pairs into: the memory a later pass needs for one of them, and how much of the greedy skip survives", typeid(int), (void *) &linclustRanges, "^[1-9][0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_LINCLUST_RANGE(PARAM_LINCLUST_RANGE_ID, "--range", "Range of representatives", "Which range of representative ranks to work on", typeid(int), (void *) &linclustRange, "^-?[0-9]+$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_LINCLUST_PREF(PARAM_LINCLUST_PREF_ID, "--pref", "Prefilter pairs", "The pairs the k-mer passes raised, which is what the aligning pass reads", typeid(std::string), (void *) &linclustPref, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_LINCLUST_DECIDED(PARAM_LINCLUST_DECIDED_ID, "--decided", "Decided pairs", "Where the deciding pass puts what it decided, so this pass brings its own bitmap up to date from the ranges before its own", typeid(std::string), (void *) &linclustDecided, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_LINCLUST_TAKEN(PARAM_LINCLUST_TAKEN_ID, "--taken", "Taken bitmap", "Bitmap of the sequences already in a cluster, carried between the ranges so a later representative can skip what an earlier one took", typeid(std::string), (void *) &linclustTaken, "", MMseqsParameter::COMMAND_COMMON),
+        PARAM_LINCLUSTHASH_VALID(PARAM_LINCLUSTHASH_VALID_ID, "--valid", "Valid bitmap", "Bitmap of the sequences a previous round left, empty means all of them", typeid(std::string), (void *) &linclusthashValid, "", MMseqsParameter::COMMAND_COMMON),
         PARAM_WRITE_LOOKUP(PARAM_WRITE_LOOKUP_ID, "--write-lookup", "Write lookup file", "write .lookup file containing mapping from internal id, fasta id and file number", typeid(int), (void *) &writeLookup, "^[0-1]{1}", MMseqsParameter::COMMAND_EXPERT),
-        PARAM_USE_HEADER_FILE(PARAM_USE_HEADER_FILE_ID, "--use-header-file", "Use header DB", "use the sequence header DB instead of the body to map the entry keys", typeid(bool), (void *) &useHeaderFile, ""),
         PARAM_FASTA_SPLITS(PARAM_FASTA_SPLITS_ID, "--fasta-splits", "FASTA splits", "Write this many FASTA files instead of one (entry i to file i mod N). 0: single file", typeid(int), (void *) &fastaSplits, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_USE_HEADER_FILE(PARAM_USE_HEADER_FILE_ID, "--use-header-file", "Use header DB", "use the sequence header DB instead of the body to map the entry keys", typeid(bool), (void *) &useHeaderFile, ""),
         // setextendeddbtype
         PARAM_EXTENDED_DBTYPE(PARAM_EXTENDED_DBTYPE_ID, "--extended-dbtype", "Extended dbtype", "Set extended dbtype 1: compressed, 2: need src, 4: context pseudoe cnts", typeid(int), (void *) &extendedDbtype, "^[0-4]{1}"),
         // splitsequence
@@ -544,8 +545,8 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_INCLUDE_IDENTITY);
     align2clust.push_back(&PARAM_SORT_RESULTS);
     align2clust.push_back(&PARAM_PRELOAD_MODE);
-    align2clust.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     align2clust.push_back(&PARAM_THREADS);
+    align2clust.push_back(&PARAM_COMPRESSED);
     align2clust.push_back(&PARAM_V);
     align2clust.push_back(&PARAM_CLUSTER_MODE);
     align2clust.push_back(&PARAM_FILTER_CLUDB_FILE);
@@ -724,10 +725,10 @@ Parameters::Parameters():
     result2profile.push_back(&PARAM_PROFILE_OUTPUT_MODE);
 
     // createtsv
-    createtsv.push_back(&PARAM_FIRST_SEQ_REP_SEQ);
-    createtsv.push_back(&PARAM_TARGET_COLUMN);
     createtsv.push_back(&PARAM_TSV_SPLITS);
     createtsv.push_back(&PARAM_TSV_SPLIT_COLUMN);
+    createtsv.push_back(&PARAM_FIRST_SEQ_REP_SEQ);
+    createtsv.push_back(&PARAM_TARGET_COLUMN);
     createtsv.push_back(&PARAM_FULL_HEADER);
     createtsv.push_back(&PARAM_IDX_SEQ_SRC);
     createtsv.push_back(&PARAM_DB_OUTPUT);
@@ -983,9 +984,7 @@ Parameters::Parameters():
     // create db
     createdb.push_back(&PARAM_DB_TYPE);
     createdb.push_back(&PARAM_SHUFFLE);
-    createdb.push_back(&PARAM_SHUFFLE_SPLITS);
     createdb.push_back(&PARAM_CREATEDB_MODE);
-    createdb.push_back(&PARAM_CREATEDB_THREADS);
     createdb.push_back(&PARAM_WRITE_LOOKUP);
     createdb.push_back(&PARAM_ID_OFFSET);
     createdb.push_back(&PARAM_THREADS);
@@ -996,6 +995,111 @@ Parameters::Parameters():
     createdb.push_back(&PARAM_MASK_N_REPEAT);
     createdb.push_back(&PARAM_GPU);
     createdb.push_back(&PARAM_V);
+
+    lin8createdb.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
+    lin8createdb.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
+    lin8createdb.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
+    lin8createdb.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8createdb.push_back(&PARAM_MAX_SEQ_LEN);
+    lin8createdb.push_back(&PARAM_THREADS);
+    lin8createdb.push_back(&PARAM_V);
+
+    lin8clusthash.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
+    lin8clusthash.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
+    lin8clusthash.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
+    lin8clusthash.push_back(&PARAM_CLUST_HASH);
+    lin8clusthash.push_back(&PARAM_LINCLUSTHASH_VALID);
+    lin8clusthash.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8clusthash.push_back(&PARAM_ALPH_SIZE);
+    lin8clusthash.push_back(&PARAM_MIN_SEQ_ID);
+    lin8clusthash.push_back(&PARAM_SUB_MAT);
+    lin8clusthash.push_back(&PARAM_THREADS);
+    lin8clusthash.push_back(&PARAM_V);
+
+    lin8kmers.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
+    lin8kmers.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
+    lin8kmers.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
+    lin8kmers.push_back(&PARAM_LINCLUSTHASH_VALID);
+    lin8kmers.push_back(&PARAM_MIN_SEQ_ID);
+    lin8kmers.push_back(&PARAM_K);
+    lin8kmers.push_back(&PARAM_ALPH_SIZE);
+    lin8kmers.push_back(&PARAM_KMER_PER_SEQ);
+    lin8kmers.push_back(&PARAM_KMER_PER_SEQ_SCALE);
+    lin8kmers.push_back(&PARAM_MASK_LOWER_CASE);
+    lin8kmers.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8kmers.push_back(&PARAM_SUB_MAT);
+    lin8kmers.push_back(&PARAM_THREADS);
+    lin8kmers.push_back(&PARAM_V);
+
+    lin8pairs.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
+    lin8pairs.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
+    lin8pairs.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
+    lin8pairs.push_back(&PARAM_LINCLUSTHASH_VALID);
+    lin8pairs.push_back(&PARAM_LINCLUST_RANGES);
+    lin8pairs.push_back(&PARAM_C);
+    lin8pairs.push_back(&PARAM_COV_MODE);
+    lin8pairs.push_back(&PARAM_INCLUDE_ONLY_EXTENDABLE);
+    lin8pairs.push_back(&PARAM_SUB_MAT);
+    lin8pairs.push_back(&PARAM_INCLUDE_ADJACENCY);
+    lin8pairs.push_back(&PARAM_NUM_ADJACENCY);
+    lin8pairs.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8pairs.push_back(&PARAM_THREADS);
+    lin8pairs.push_back(&PARAM_REMOVE_TMP_FILES);
+    lin8pairs.push_back(&PARAM_V);
+
+    lin8pref.push_back(&PARAM_LINCLUSTHASH_VALID);
+    lin8pref.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
+    lin8pref.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
+    lin8pref.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
+    lin8pref.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8pref.push_back(&PARAM_THREADS);
+    lin8pref.push_back(&PARAM_REMOVE_TMP_FILES);
+    lin8pref.push_back(&PARAM_V);
+
+    lin8align.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
+    lin8align.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
+    lin8align.push_back(&PARAM_LINCLUSTERDB_NODE_COUNT);
+    lin8align.push_back(&PARAM_MIN_SEQ_ID);
+    lin8align.push_back(&PARAM_SEQ_ID_MODE);
+    lin8align.push_back(&PARAM_C);
+    lin8align.push_back(&PARAM_COV_MODE);
+    lin8align.push_back(&PARAM_E);
+    lin8align.push_back(&PARAM_MIN_ALN_LEN);
+    lin8align.push_back(&PARAM_GAP_OPEN);
+    lin8align.push_back(&PARAM_GAP_EXTEND);
+    lin8align.push_back(&PARAM_NO_COMP_BIAS_CORR);
+    lin8align.push_back(&PARAM_SUB_MAT);
+    lin8align.push_back(&PARAM_SCORE_BIAS);
+    lin8align.push_back(&PARAM_THREADS);
+    lin8align.push_back(&PARAM_LINCLUST_RANGE);
+    lin8align.push_back(&PARAM_LINCLUST_TAKEN);
+    lin8align.push_back(&PARAM_LINCLUST_DECIDED);
+    lin8align.push_back(&PARAM_LINCLUSTHASH_VALID);
+    lin8align.push_back(&PARAM_REMOVE_TMP_FILES);
+    lin8align.push_back(&PARAM_V);
+
+    lin8cluster.push_back(&PARAM_LINCLUST_RANGE);
+    lin8cluster.push_back(&PARAM_LINCLUST_TAKEN);
+    lin8cluster.push_back(&PARAM_LINCLUST_PREF);
+    lin8createtsv.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8createtsv.push_back(&PARAM_THREADS);
+    lin8createtsv.push_back(&PARAM_V);
+
+    lin8repseq = lin8createtsv;
+    lin8repseq.push_back(&PARAM_FASTA_SPLITS);
+
+    lin8expand.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8expand.push_back(&PARAM_THREADS);
+    lin8expand.push_back(&PARAM_V);
+
+    lin8merge.push_back(&PARAM_COMPRESSED);
+    lin8merge.push_back(&PARAM_THREADS);
+    lin8merge.push_back(&PARAM_V);
+
+    lin8cluster.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    lin8cluster.push_back(&PARAM_THREADS);
+    lin8cluster.push_back(&PARAM_REMOVE_TMP_FILES);
+    lin8cluster.push_back(&PARAM_V);
 
     // makepaddedseqdb
     makepaddedseqdb.push_back(&PARAM_SUB_MAT);
@@ -1009,9 +1113,8 @@ Parameters::Parameters():
     makepaddedseqdb.push_back(&PARAM_V);
 
     // convert2fasta
-    convert2fasta.push_back(&PARAM_USE_HEADER_FILE);
     convert2fasta.push_back(&PARAM_FASTA_SPLITS);
-    convert2fasta.push_back(&PARAM_THREADS);
+    convert2fasta.push_back(&PARAM_USE_HEADER_FILE);
     convert2fasta.push_back(&PARAM_V);
 
     // result2flat
@@ -1195,8 +1298,6 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_C);
     kmermatcher.push_back(&PARAM_MAX_SEQ_LEN);
     kmermatcher.push_back(&PARAM_HASH_SHIFT);
-    kmermatcher.push_back(&PARAM_KMER_SELECTION);
-    kmermatcher.push_back(&PARAM_SYNCMER_S);
     kmermatcher.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     kmermatcher.push_back(&PARAM_INCLUDE_ONLY_EXTENDABLE);
     kmermatcher.push_back(&PARAM_IGNORE_MULTI_KMER);
@@ -1211,9 +1312,6 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_NUM_ADJACENCY);
     kmermatcher.push_back(&PARAM_USE_PARALLELISM);
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
-    kmermatcher.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
-    kmermatcher.push_back(&PARAM_KMER_WRITE_TO_DISK);
-    kmermatcher.push_back(&PARAM_KMERMATCHER_MODE);
     kmermatcher.push_back(&PARAM_LINCLUST_VERSION);
 
     // kmermatcher
@@ -1367,7 +1465,6 @@ Parameters::Parameters():
     // createsubdb
     createsubdb.push_back(&PARAM_SUBDB_MODE);
     createsubdb.push_back(&PARAM_ID_MODE);
-    createsubdb.push_back(&PARAM_THREADS);
     createsubdb.push_back(&PARAM_V);
 
     // renamedbkeys
@@ -1605,12 +1702,46 @@ Parameters::Parameters():
     linclustworkflow = combineList(linclustworkflow, rescorediagonal);
     linclustworkflow = combineList(linclustworkflow, align2clust);
     linclustworkflow = combineList(linclustworkflow, clusthash);
-    linclustworkflow.push_back(&PARAM_LINCLUST2_ITER);
     linclustworkflow.push_back(&PARAM_SWITCH_CONSENSUS_REP);
     linclustworkflow.push_back(&PARAM_CLUST_HASH);
+    linclustworkflow.push_back(&PARAM_LINCLUST2_ITER);
     linclustworkflow.push_back(&PARAM_REMOVE_TMP_FILES);
     linclustworkflow.push_back(&PARAM_REUSELATEST);
     linclustworkflow.push_back(&PARAM_RUNNER);
+
+    // one shot: the workflow hands each pass its own flags, so it takes the union of what they read
+    linclustoneshotworkflow.push_back(&PARAM_LINCLUSTERDB_NODE_LIST);
+    linclustoneshotworkflow.push_back(&PARAM_LINCLUSTERDB_NODE_ID);
+    linclustoneshotworkflow.push_back(&PARAM_LINCLUST_RANGES);
+    linclustoneshotworkflow.push_back(&PARAM_MIN_SEQ_ID);
+    linclustoneshotworkflow.push_back(&PARAM_C);
+    linclustoneshotworkflow.push_back(&PARAM_COV_MODE);
+    linclustoneshotworkflow.push_back(&PARAM_CLUSTER_MODE);
+    linclustoneshotworkflow.push_back(&PARAM_CLUST_HASH);
+    linclustoneshotworkflow.push_back(&PARAM_TSV);
+    linclustoneshotworkflow.push_back(&PARAM_FASTA_SPLITS);
+    linclustoneshotworkflow.push_back(&PARAM_K);
+    linclustoneshotworkflow.push_back(&PARAM_ALPH_SIZE);
+    linclustoneshotworkflow.push_back(&PARAM_KMER_PER_SEQ);
+    linclustoneshotworkflow.push_back(&PARAM_KMER_PER_SEQ_SCALE);
+    linclustoneshotworkflow.push_back(&PARAM_MASK_LOWER_CASE);
+    linclustoneshotworkflow.push_back(&PARAM_INCLUDE_ONLY_EXTENDABLE);
+    linclustoneshotworkflow.push_back(&PARAM_INCLUDE_ADJACENCY);
+    linclustoneshotworkflow.push_back(&PARAM_NUM_ADJACENCY);
+    linclustoneshotworkflow.push_back(&PARAM_SEQ_ID_MODE);
+    linclustoneshotworkflow.push_back(&PARAM_E);
+    linclustoneshotworkflow.push_back(&PARAM_MIN_ALN_LEN);
+    linclustoneshotworkflow.push_back(&PARAM_GAP_OPEN);
+    linclustoneshotworkflow.push_back(&PARAM_GAP_EXTEND);
+    linclustoneshotworkflow.push_back(&PARAM_NO_COMP_BIAS_CORR);
+    linclustoneshotworkflow.push_back(&PARAM_SCORE_BIAS);
+    linclustoneshotworkflow.push_back(&PARAM_SUB_MAT);
+    linclustoneshotworkflow.push_back(&PARAM_MAX_SEQ_LEN);
+    linclustoneshotworkflow.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    linclustoneshotworkflow.push_back(&PARAM_REMOVE_TMP_FILES);
+    linclustoneshotworkflow.push_back(&PARAM_THREADS);
+    linclustoneshotworkflow.push_back(&PARAM_COMPRESSED);
+    linclustoneshotworkflow.push_back(&PARAM_V);
 
     // easylinclustworkflow
     easylinclustworkflow = combineList(linclustworkflow, createdb);
@@ -1640,7 +1771,6 @@ Parameters::Parameters():
     batchcommon.push_back(&PARAM_BATCH_ROUND0_PRELOAD_MODE);
     batchcommon.push_back(&PARAM_BATCH_ROUND0_THREADS);
     batchcommon.push_back(&PARAM_BATCH_ROUND0_SHUFFLE_SPLITS);
-    batchcommon.push_back(&PARAM_BATCH_ROUND0_LINCLUST2_ITER);
     batchcommon.push_back(&PARAM_BATCH_MAX_ROUNDS);
     batchcommon.push_back(&PARAM_BATCH_MIN_REDUCTION_RATIO);
     batchcommon.push_back(&PARAM_BATCH_CONVERGENCE_PATIENCE);
@@ -1649,6 +1779,8 @@ Parameters::Parameters():
     batchcommon.push_back(&PARAM_BATCH_COMPRESS_OUTPUTS);
     batchcommon.push_back(&PARAM_BATCH_MERGE_SPLITS);
     batchcommon.push_back(&PARAM_BATCH_MERGE_SPLIT_JOBS);
+    batchcommon.push_back(&PARAM_BATCH_MERGE_SPLIT_JOBS_CAP);
+    batchcommon.push_back(&PARAM_BATCH_MERGE_NODES);
     batchcommon.push_back(&PARAM_BATCH_REP_FASTA_SPLITS);
     batchcommon.push_back(&PARAM_BATCH_ROUND0_REP_FASTA_SPLITS);
     batchcommon.push_back(&PARAM_BATCH_CHUNK_DISK_BUDGET);
@@ -1661,13 +1793,10 @@ Parameters::Parameters():
     batchcommon.push_back(&PARAM_BATCH_SORT_TMP_DIR);
     batchcommon.push_back(&PARAM_BATCH_SORT_BUFFER_SIZE);
     batchcommon.push_back(&PARAM_CREATEDB_MODE);
-    batchcommon.push_back(&PARAM_SHUFFLE_SPLITS);
     batchcommon.push_back(&PARAM_REMOVE_TMP_FILES);
     batchcommon.push_back(&PARAM_THREADS);
     batchcommon.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     batchcommon.push_back(&PARAM_PRELOAD_MODE);
-    batchcommon.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
-    batchcommon.push_back(&PARAM_KMER_WRITE_TO_DISK);
     batchcommon.push_back(&PARAM_V);
 
     // server backends (single-node, multi-node)
@@ -1715,8 +1844,6 @@ Parameters::Parameters():
     linclustbatchinner.push_back(&PARAM_MIN_SEQ_ID);
     linclustbatchinner.push_back(&PARAM_CLUSTER_MODE);
     linclustbatchinner.push_back(&PARAM_KMER_PER_SEQ);
-    linclustbatchinner.push_back(&PARAM_KMER_SELECTION);
-    linclustbatchinner.push_back(&PARAM_SYNCMER_S);
     linclustbatchinner.push_back(&PARAM_INCLUDE_COUNTTABLE);
     linclustbatchinner.push_back(&PARAM_NUM_COUNTS);
     linclustbatchinner.push_back(&PARAM_INCLUDE_ADJACENCY);
@@ -1727,9 +1854,6 @@ Parameters::Parameters():
     linclustbatchinner.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     linclustbatchinner.push_back(&PARAM_PRELOAD_MODE);
     linclustbatchinner.push_back(&PARAM_V);
-    linclustbatchinner.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
-    linclustbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
-    linclustbatchinner.push_back(&PARAM_KMERMATCHER_MODE);
     linclustbatchinner.push_back(&PARAM_CLUST_HASH);
     linclustbatchinner.push_back(&PARAM_LINCLUST_VERSION);
     linclustbatchinner.push_back(&PARAM_LINCLUST2_ITER);
@@ -1742,8 +1866,6 @@ Parameters::Parameters():
     clusterbatchinner.push_back(&PARAM_MIN_SEQ_ID);
     clusterbatchinner.push_back(&PARAM_CLUSTER_MODE);
     clusterbatchinner.push_back(&PARAM_KMER_PER_SEQ);
-    clusterbatchinner.push_back(&PARAM_KMER_SELECTION);
-    clusterbatchinner.push_back(&PARAM_SYNCMER_S);
     clusterbatchinner.push_back(&PARAM_INCLUDE_COUNTTABLE);
     clusterbatchinner.push_back(&PARAM_NUM_COUNTS);
     clusterbatchinner.push_back(&PARAM_INCLUDE_ADJACENCY);
@@ -1754,12 +1876,10 @@ Parameters::Parameters():
     clusterbatchinner.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     clusterbatchinner.push_back(&PARAM_PRELOAD_MODE);
     clusterbatchinner.push_back(&PARAM_V);
-    clusterbatchinner.push_back(&PARAM_COMPRESS_KMER_TMP_FILES);
-    clusterbatchinner.push_back(&PARAM_KMER_WRITE_TO_DISK);
-    clusterbatchinner.push_back(&PARAM_KMERMATCHER_MODE);
     clusterbatchinner.push_back(&PARAM_CLUST_HASH);
     clusterbatchinner.push_back(&PARAM_CLUSTER_VERSION);
     clusterbatchinner.push_back(&PARAM_LINCLUST_VERSION);
+    clusterbatchinner.push_back(&PARAM_LINCLUST2_ITER);
     clusterbatchinner.push_back(&PARAM_CASCADED);
     clusterbatchinner.push_back(&PARAM_CLUSTER_STEPS);
     clusterbatchinner.push_back(&PARAM_CLUSTER_REASSIGN);
@@ -2087,18 +2207,6 @@ bool parseBool(const std::string &p) {
     }
 }
 
-size_t parseSizeTParameter(const char *value, const char *name) {
-    errno = 0;
-    char *end = NULL;
-    unsigned long long parsed = strtoull(value, &end, 10);
-    if (errno == ERANGE || end == value || *end != '\0' ||
-        parsed > static_cast<unsigned long long>(std::numeric_limits<size_t>::max())) {
-        Debug(Debug::ERROR) << "Invalid size_t value for " << name << ": " << value << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    return static_cast<size_t>(parsed);
-}
-
 void Parameters::initMatrices() {
     // set up substituionMatrix
     for(size_t i = 0 ; i < substitutionMatrices.size(); i++) {
@@ -2195,8 +2303,7 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
                             Debug(Debug::ERROR) << "Error in argument " << par[parIdx]->name << "\n";
                             EXIT(EXIT_FAILURE);
                         }else{
-                            *((size_t *) par[parIdx]->value) =
-                                parseSizeTParameter(pargv[argIdx + 1], par[parIdx]->name);
+                            *((size_t *) par[parIdx]->value) = atoi(pargv[argIdx+1]);
                             par[parIdx]->wasSet = true;
                         }
                         argIdx++;
@@ -2910,6 +3017,8 @@ void Parameters::setDefaults() {
     batchCompressOutputs = false;
     batchMergeSplits = 0;
     batchMergeSplitJobs = 0;
+    batchMergeSplitJobsCap = 16;
+    batchMergeNodes = 1;
     batchRepFastaSplits = 32;
     batchChunkDiskBudget = 0;
     batchRound0ChunkDiskBudget = 0;
@@ -2942,9 +3051,16 @@ void Parameters::setDefaults() {
 
     // createdb
     createdbMode = SEQUENCE_SPLIT_MODE_HARD;
-    createdbThreads = 0;
     shuffleDatabase = true;
-    shuffleSplits = 32;
+    linclusterdbNodeList = "";
+    linclusterdbNodeId = -1;
+    linclusterdbNodeCount = 1;
+    linclusthashValid = "";
+    linclustRange = -1;
+    linclustRanges = (int) PairRecord::DEFAULT_RANGE_COUNT;
+    linclustTaken = "";
+    linclustDecided = "";
+    linclustPref = "";
     writeLookup = true;
 
     // format alignment
@@ -3029,8 +3145,8 @@ void Parameters::setDefaults() {
     headerSplitMode = 0;
 
     // convert2fasta
-    useHeaderFile = false;
     fastaSplits = 0;
+    useHeaderFile = false;
 
     // result2flat
     useHeader = false;
@@ -3116,8 +3232,6 @@ void Parameters::setDefaults() {
     includeOnlyExtendable = false;
     ignoreMultiKmer = false;
     hashShift = 67;
-    kmerSelection = 0;
-    syncmerS = 6;
     pickNbest = 1;
     adjustKmerLength = false;
     resultDirection = Parameters::PARAM_RESULT_DIRECTION_TARGET;
@@ -3125,30 +3239,26 @@ void Parameters::setDefaults() {
     weightFile = "";
     useParallelism = false;
     needWriteBuffer = false;
-    compressKmerTmpFiles = 0;
-    kmerWriteToDisk = false;
-    kmerMatcherMode = Parameters::KMERMATCHER_MODE_KEY;
     includeCountTable = true;
-    countTableIteration = CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE;
+    countTableIteration = 2;
     countTableScale = 0.1;
     includeAdjacency = true;
-    adjIteration = CLUST_LINEAR_DEFAULT_NUM_ADJACENCY;
+    adjIteration = 3;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;
     linclust2Iter = 2;
-    batchRound0Linclust2Iter = 2;
     clusterVersion = CLUSTER_VERSION1;
 
     // result2stats
     stat = "";
 
     // createtsv
+    tsvSplits = 0;
+    tsvSplitColumn = 1;
     firstSeqRepr = false;
     fullHeader = false;
     idxSeqSrc = 0;
     targetTsvColumn = 1;
-    tsvSplits = 0;
-    tsvSplitColumn = 1;
 
     // createtaxdb
     taxMappingFile = "";

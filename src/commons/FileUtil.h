@@ -43,12 +43,12 @@ public:
     static std::string getCurrentWorkingDirectory();
 
     static void symlinkAlias(const std::string &file, const std::string &alias);
+    // every node writes the same merged bytes, so a rename lets them all publish without a reader
+    // ever seeing a half written file
+    static void publishAtomically(const std::string &tmp, const std::string &path);
     static void symlinkAbs(const std::string &target, const std::string &link);
 
     static size_t getFileSize(const std::string &fileName);
-
-    // O_DIRECT offset/length/buffer alignment for the file, from statx(STATX_DIOALIGN), 4096 as fallback
-    static size_t getDirectIoAlignment(const std::string &fileName);
 
     static char *allocPageBufferWithAdvice(int input_desc, size_t insize);
 

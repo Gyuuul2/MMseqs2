@@ -99,8 +99,6 @@ public:
 
     static char touchMemory(const char* memory, size_t size);
 
-    static bool canTouchMemory(size_t size);
-
     // Wrap posix_madvise with errno-aware logging. Returns posix_madvise's
     // return value (errno-valued, 0 on success). Severity is WARNING for
     // benign cases (advisory SEQUENTIAL hint failures, or EINVAL on

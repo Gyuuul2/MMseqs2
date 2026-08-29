@@ -13,8 +13,18 @@ public:
         size_t maxSequenceLength,
         BaseMatrix *m, SubstitutionMatrix::FastMatrix* fastMatrix, EvalueComputation * evaluer,
         bool compBiasCorrection, float compBiasCorrectionScale,
-        int8_t gapOpen, int8_t gapExtend
+        int8_t gapOpen, int8_t gapExtend,
+        // The widest the adaptive band may grow, which also sizes the buffers. Wider finds alignments
+        // with longer gaps and costs both time and memory to build; clustering wants neither, since a
+        // pair needing a gap that long is not the same protein.
+        size_t maxBand = DEFAULT_MAX_BAND
     );
+
+    // the band grows adaptively between these; the floor is also what an x-drop is derived from, so a
+    // caller that narrows the ceiling must not widen the drop with it
+    static const size_t MIN_BAND = 32;
+    static const size_t DEFAULT_MAX_BAND = 4096;
+    static const size_t CLUSTER_MAX_BAND = 256;
 
     ~BlockAligner();
 

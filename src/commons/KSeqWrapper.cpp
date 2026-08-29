@@ -1,12 +1,10 @@
 #include "KSeqWrapper.h"
+#include <zstd.h>
 #include "kseq.h"
 #include "FileUtil.h"
 #include "Util.h"
 #include "Debug.h"
 #include <unistd.h>
-#include <cerrno>
-#include <cstdlib>
-#include <zstd.h>
 
 namespace KSEQFILE {
     KSEQ_INIT(int, read)
@@ -156,7 +154,6 @@ KSeqBzip::~KSeqBzip() {
 }
 #endif
 
-
 // Wrap zstd streaming decompression into the (handle, buf, len) reader kseq expects.
 namespace KSEQZSTD {
     struct ZstdReader {
@@ -297,8 +294,13 @@ KSeqWrapper* KSeqFactory(const char* file) {
         return kseq;
     }
 
-    if(Util::endsWith(".gz", file) == false && Util::endsWith(".bz2", file) == false && Util::endsWith(".zst", file) == false ) {
+    if(Util::endsWith(".gz", file) == false && Util::endsWith(".bz2", file) == false
+       && Util::endsWith(".zst", file) == false && Util::endsWith(".zstd", file) == false) {
         kseq = new KSeqFile(file);
+        return kseq;
+    }
+    else if(Util::endsWith(".zst", file) == true || Util::endsWith(".zstd", file) == true) {
+        kseq = new KSeqZstd(file);
         return kseq;
     }
 #ifdef HAVE_ZLIB
@@ -324,10 +326,6 @@ KSeqWrapper* KSeqFactory(const char* file) {
         EXIT(EXIT_FAILURE);
     }
 #endif
-    else if(Util::endsWith(".zst", file) == true) {
-        kseq = new KSeqZstd(file);
-        return kseq;
-    }
 
     return kseq;
 }

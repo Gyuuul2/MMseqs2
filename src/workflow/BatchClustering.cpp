@@ -62,8 +62,9 @@ int automaticMergeSplitJobs(const Parameters &par, int splits) {
     if (jobs < 1) {
         jobs = 1;
     }
-    if (jobs > 16) {
-        jobs = 16;
+    int cap = par.batchMergeSplitJobsCap < 1 ? 1 : par.batchMergeSplitJobsCap;
+    if (jobs > cap) {
+        jobs = cap;
     }
     if (jobs > splits) {
         jobs = splits;
@@ -87,6 +88,12 @@ void resolveBatchMergeParallelism(Parameters &par) {
     }
     if (par.batchMergeSplitJobs > par.batchMergeSplits) {
         par.batchMergeSplitJobs = par.batchMergeSplits;
+    }
+    if (par.batchMergeNodes < 1) {
+        par.batchMergeNodes = 1;
+    }
+    if (par.batchMergeNodes > par.batchMergeSplits) {
+        par.batchMergeNodes = par.batchMergeSplits;
     }
 }
 
@@ -237,9 +244,8 @@ void applyBatchClusterAutomagic(Parameters &par) {
 
 void validateBatchCreatedbMode(const Parameters &par) {
     if (par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_HARD &&
-        par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_SOFT &&
-        par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_LENGTH_DESC) {
-        Debug(Debug::ERROR) << "Batch clustering supports --createdb-mode 0, 1 or 3 only. "
+        par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_SOFT) {
+        Debug(Debug::ERROR) << "Batch clustering supports --createdb-mode 0 or 1 only. "
                             << "--createdb-mode " << par.createdbMode
                             << " changes the createdb layout and can change clustering results.\n";
         EXIT(EXIT_FAILURE);
@@ -353,10 +359,6 @@ std::string buildCreatedbPar(const Parameters &par) {
     std::string createdbPar = std::string("--shuffle 0 --write-lookup 0") +
            " --createdb-mode " + SSTR(par.createdbMode) +
            " --threads " + SSTR(par.threads) + " -v " + SSTR(par.verbosity);
-    // only when set, so an absent flag keeps createdb's own default exactly as before
-    if (par.PARAM_SHUFFLE_SPLITS.wasSet) {
-        createdbPar += " --shuffle-splits " + SSTR(par.shuffleSplits);
-    }
     return createdbPar;
 }
 
@@ -370,14 +372,7 @@ const std::vector<MMseqsParameter*>& innerClusterParameters(Parameters &par,
 }
 
 std::string buildInnerClusterParFromCurrent(Parameters &par, const std::string &clusterCmd) {
-    const int inheritedKmerMatcherMode = par.kmerMatcherMode;
-    if (par.PARAM_KMERMATCHER_MODE.wasSet == false
-        && par.linclustVersion == Parameters::LINCLUST_VERSION2) {
-        par.kmerMatcherMode = Parameters::KMERMATCHER_MODE_LOCAL;
-    }
-    const std::string parameters = par.createParameterString(innerClusterParameters(par, clusterCmd));
-    par.kmerMatcherMode = inheritedKmerMatcherMode;
-    return parameters;
+    return par.createParameterString(innerClusterParameters(par, clusterCmd));
 }
 
 std::string buildInnerClusterPar(Parameters &par, const std::string &clusterCmd) {
@@ -466,9 +461,6 @@ void applyRound0ClusterOverrides(Parameters &par) {
     if (par.PARAM_BATCH_ROUND0_PRELOAD_MODE.wasSet) {
         par.preloadMode = par.batchRound0PreloadMode;
     }
-    if (par.PARAM_BATCH_ROUND0_LINCLUST2_ITER.wasSet) {
-        par.linclust2Iter = par.batchRound0Linclust2Iter;
-    }
 }
 
 void applyBatchClusterAutomagic(Parameters &par, const std::string &clusterCmd) {
@@ -555,8 +547,6 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
     cmd.addVariable("THREADS", threads.c_str());
     cmd.addVariable("CHUNK_MAX_BYTES", chunkMaxBytes.c_str());
     cmd.addVariable("CHUNK_MAX_SEQS", chunkMaxSeqs.c_str());
-    // round_cluster_par picks the spill per round; an explicit --kmer-write-to-disk must win
-    cmd.addVariable("BATCH_KMER_WRITE_TO_DISK", par.PARAM_KMER_WRITE_TO_DISK.wasSet ? (par.kmerWriteToDisk ? "1" : "0") : NULL);
     cmd.addVariable("ROUND0_CHUNK_MAX_BYTES", par.PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES.wasSet ? round0ChunkMaxBytes.c_str() : NULL);
     cmd.addVariable("ROUND0_CHUNK_MAX_SEQS", par.PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS.wasSet ? round0ChunkMaxSeqs.c_str() : NULL);
     cmd.addVariable("CHUNK_DISK_BUDGET", chunkDiskBudget.c_str());
@@ -565,9 +555,10 @@ void addBatchEngineVariables(CommandCaller &cmd, const Parameters &par,
     cmd.addVariable("RAM_POLL_SEC", SSTR(par.batchRamPollInterval).c_str());
     cmd.addVariable("MERGE_SPLITS", mergeSplits.c_str());
     cmd.addVariable("MERGE_SPLIT_JOBS", mergeSplitJobs.c_str());
+    cmd.addVariable("MERGE_SPLIT_JOBS_CAP", SSTR(par.batchMergeSplitJobsCap).c_str());
+    cmd.addVariable("MERGE_NODES", SSTR(par.batchMergeNodes).c_str());
     cmd.addVariable("BATCH_REP_FASTA_SPLITS", SSTR(par.batchRepFastaSplits).c_str());
     cmd.addVariable("ROUND0_THREADS", par.PARAM_BATCH_ROUND0_THREADS.wasSet ? SSTR(par.batchRound0Threads).c_str() : NULL);
-    cmd.addVariable("CREATEDB_SHUFFLE_SPLITS", par.PARAM_SHUFFLE_SPLITS.wasSet ? SSTR(par.shuffleSplits).c_str() : NULL);
     cmd.addVariable("ROUND0_CREATEDB_SHUFFLE_SPLITS", par.PARAM_BATCH_ROUND0_SHUFFLE_SPLITS.wasSet ? SSTR(par.batchRound0ShuffleSplits).c_str() : NULL);
     cmd.addVariable("ROUND0_BATCH_REP_FASTA_SPLITS", par.PARAM_BATCH_ROUND0_REP_FASTA_SPLITS.wasSet ? SSTR(par.batchRound0RepFastaSplits).c_str() : NULL);
     cmd.addVariable("MAX_ROUNDS", maxRounds.c_str());
@@ -773,11 +764,6 @@ void setBatchClusteringDescriptions(Parameters &par) {
         "Batch createdb mode: 0 copies FASTA/.zst into a compact MMseqs DB, 1 soft-links plain single-line FASTA, 3 copies it ordered by descending length. Mode 2/GPU DB layout is not supported by batch clustering",
         NULL,
         par.PARAM_CREATEDB_MODE.category);
-    par.overrideParameterDescription(
-        par.PARAM_COMPRESS_KMER_TMP_FILES,
-        "Compress kmermatcher spill files during inner linclust/cluster. Separate from --compressed and from --compress-batch-outputs",
-        NULL,
-        par.PARAM_COMPRESS_KMER_TMP_FILES.category);
     par.overrideParameterDescription(
         par.PARAM_BATCH_COMPRESS_OUTPUTS,
         "Compress per-round and final batch FASTA/TSV shard files as .zst. This does not compress createdb sequence DBs",

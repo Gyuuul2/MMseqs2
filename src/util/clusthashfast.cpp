@@ -46,7 +46,6 @@ static size_t clusthashfastProgressSteps(size_t dbSize) {
 }
 // small enough that the threads' active id-order window stays inside a couple of length blocks
 static const size_t CLUSTHASHFAST_RUN_ORDER_CHUNK = 4096;
-// one loadBatch per run is a queue depth of two at the mean run size, so fill the reader arena instead
 static const size_t CLUSTHASHFAST_BATCH_IDS = 4096;
 // far enough behind the sweep that a straggling thread is not evicted out from under it
 static const size_t CLUSTHASHFAST_CACHE_DROP_BYTES = 256 * 1024 * 1024;
@@ -228,20 +227,13 @@ static size_t firstOwnedRun(const HashEntry *entries, size_t chunkBegin, size_t 
     return runBegin;
 }
 
-// loadBatch always makes progress, so a zero return is a broken reader, not a partial window
-static size_t loadRunWindow(DBReader<DBKeyType> &reader, const size_t *ids, size_t n, unsigned int thread_idx) {
-    const size_t got = reader.loadBatch(ids, n, thread_idx);
-    if (got == 0) {
-        Debug(Debug::ERROR) << "DBReader::loadBatch returned zero entries in clusthashfast\n";
-        EXIT(EXIT_FAILURE);
-    }
-    return got;
-}
+// This reader has no batch arena, so an entry is taken one at a time straight from the mapping. The
+// batch was a queue depth, not an answer: what it returns is the same bytes in the same order.
 
 // the first unclaimed entry of the run represents it and claims every unclaimed entry it covers
 static void clusterHashRun(DBReader<DBKeyType> &reader, DBWriter &writer, DBWriter &representativeWriter,
                            const HashEntry *run, size_t runSize, float seqIdThr, ClusterWorker &worker,
-                           unsigned int thread_idx, size_t preloadedBase) {
+                           unsigned int thread_idx) {
     worker.counts.runs++;
     if (runSize == 1) {
         const DBKeyType representativeKey = reader.getDbKey(run[0].id);
@@ -251,22 +243,13 @@ static void clusterHashRun(DBReader<DBKeyType> &reader, DBWriter &writer, DBWrit
     }
 
     // resolve lengths once per member, so a large run spends its O(n^2) work on the distance only
-    const bool preloaded = preloadedBase != SIZE_MAX;
     worker.memberLength.resize(runSize);
-    if (preloaded == false) {
-        worker.batchIds.resize(runSize);
-    }
+    worker.batchIds.resize(runSize);
     for (size_t k = 0; k < runSize; ++k) {
         worker.memberLength[k] = static_cast<unsigned int>(reader.getSeqLen(run[k].id));
-        if (preloaded == false) {
-            worker.batchIds[k] = static_cast<size_t>(run[k].id);
-        }
+        worker.batchIds[k] = static_cast<size_t>(run[k].id);
     }
 
-    // [windowStart, windowEnd) indexes batchIds; a run wider than one batch slides it like align2clust
-    const size_t slotBase = preloaded ? preloadedBase : 0;
-    size_t windowStart = 0;
-    size_t windowEnd = preloaded ? runSize : 0;
     worker.claimed.assign(runSize, 0);
     for (size_t i = 0; i < runSize; i++) {
         if (worker.claimed[i]) {
@@ -284,19 +267,10 @@ static void clusterHashRun(DBReader<DBKeyType> &reader, DBWriter &writer, DBWrit
                 continue;
             }
             if (querySeq == NULL) {
-                if (i < windowStart || i >= windowEnd) {
-                    windowStart = i;
-                    windowEnd = i + loadRunWindow(reader, &worker.batchIds[i], runSize - i, thread_idx);
-                }
-                // batch reads reuse a per-thread arena, so copy the query out before any target IO
-                worker.querySeq.assign(reader.batchAt(thread_idx, slotBase + i - windowStart), queryLength);
+                worker.querySeq.assign(reader.getData(worker.batchIds[i], thread_idx), queryLength);
                 querySeq = worker.querySeq.data();
             }
-            if (j < windowStart || j >= windowEnd) {
-                windowStart = j;
-                windowEnd = j + loadRunWindow(reader, &worker.batchIds[j], runSize - j, thread_idx);
-            }
-            const char *targetSeq = reader.batchAt(thread_idx, slotBase + j - windowStart);
+            const char *targetSeq = reader.getData(worker.batchIds[j], thread_idx);
             const unsigned int distance =
                 DistanceCalculator::computeInverseHammingDistance(querySeq, targetSeq, queryLength);
             const float seqId = static_cast<float>(distance) / static_cast<float>(queryLength);
@@ -341,7 +315,7 @@ static ClusterCounts clusterHashRuns(DBReader<DBKeyType> &reader, DBWriter &writ
                 // a singleton is its own cluster and needs no sequence read at all
                 if (runEnd - pos == 1) {
                     clusterHashRun(reader, writer, representativeWriter, entries + pos, 1, seqIdThr,
-                                   worker, thread_idx, SIZE_MAX);
+                                   worker, thread_idx);
                 } else {
                     worker.chunkRunPos.push_back(pos);
                     worker.chunkRunPos.push_back(runEnd - pos);
@@ -350,39 +324,11 @@ static ClusterCounts clusterHashRuns(DBReader<DBKeyType> &reader, DBWriter &writ
             }
 
             const size_t runCount = worker.chunkRunPos.size() / 2;
-            size_t first = 0;
-            while (first < runCount) {
-                worker.chunkIds.clear();
-                worker.chunkRunSlot.clear();
-                size_t last = first;
-                while (last < runCount) {
-                    const size_t size = worker.chunkRunPos[2 * last + 1];
-                    if (worker.chunkIds.empty() == false && worker.chunkIds.size() + size > CLUSTHASHFAST_BATCH_IDS) {
-                        break;
-                    }
-                    worker.chunkRunSlot.push_back(worker.chunkIds.size());
-                    const HashEntry *run = entries + worker.chunkRunPos[2 * last];
-                    for (size_t k = 0; k < size; ++k) {
-                        worker.chunkIds.push_back(static_cast<size_t>(run[k].id));
-                    }
-                    last++;
-                }
-                const size_t got = loadRunWindow(reader, worker.chunkIds.data(), worker.chunkIds.size(), thread_idx);
-                size_t done = first;
-                // a run the arena could not hold whole re-slides its own window, exactly as before
-                while (done < last
-                       && worker.chunkRunSlot[done - first] + worker.chunkRunPos[2 * done + 1] <= got) {
-                    clusterHashRun(reader, writer, representativeWriter, entries + worker.chunkRunPos[2 * done],
-                                   worker.chunkRunPos[2 * done + 1], seqIdThr, worker, thread_idx,
-                                   worker.chunkRunSlot[done - first]);
-                    done++;
-                }
-                if (done == first) {
-                    clusterHashRun(reader, writer, representativeWriter, entries + worker.chunkRunPos[2 * first],
-                                   worker.chunkRunPos[2 * first + 1], seqIdThr, worker, thread_idx, SIZE_MAX);
-                    done = first + 1;
-                }
-                first = done;
+            // Without a batch arena there is nothing to fill, so a run is clustered where it is found.
+            for (size_t r = 0; r < runCount; r++) {
+                clusterHashRun(reader, writer, representativeWriter,
+                               entries + worker.chunkRunPos[2 * r], worker.chunkRunPos[2 * r + 1],
+                               seqIdThr, worker, thread_idx);
             }
         }
         totalClusters += worker.counts.clusters;
@@ -403,9 +349,8 @@ static void dropSweptCache(DBReader<DBKeyType> &reader, std::atomic<size_t> &dro
     if (end < seen + CLUSTHASHFAST_CACHE_DROP_BYTES) {
         return;
     }
-    if (droppedTo.compare_exchange_strong(seen, end, std::memory_order_relaxed)) {
-        reader.dropCacheRange(seen, end);
-    }
+    // this reader cannot be told to forget a range it has passed, so the sweep only records where it is
+    droppedTo.compare_exchange_strong(seen, end, std::memory_order_relaxed);
 }
 
 // on a length-descending db a run lives inside one length block, so an id-order sweep caches one block
@@ -441,7 +386,7 @@ static ClusterCounts clusterPartition(DBReader<DBKeyType> &reader, DBWriter &wri
                 const size_t runEnd = hashRunEnd(entries, entryCount, pos);
                 if (runEnd - pos == 1) {
                     clusterHashRun(reader, writer, representativeWriter, entries + pos, 1, seqIdThr,
-                                   worker, thread_idx, SIZE_MAX);
+                                   worker, thread_idx);
                 } else {
                     mine.push_back(pos);
                 }
@@ -504,8 +449,7 @@ static ClusterCounts clusterPartition(DBReader<DBKeyType> &reader, DBWriter &wri
             for (size_t idx = begin; idx < end; ++idx) {
                 const size_t pos = runOrder[idx];
                 clusterHashRun(reader, writer, representativeWriter, entries + pos,
-                               hashRunEnd(entries, entryCount, pos) - pos, seqIdThr, worker, thread_idx,
-                               SIZE_MAX);
+                               hashRunEnd(entries, entryCount, pos) - pos, seqIdThr, worker, thread_idx);
             }
             if (dropSweptPages) {
                 dropSweptCache(reader, droppedTo, reader.getOffset(entries[runOrder[end - 1]].id));
@@ -676,11 +620,8 @@ static void clusthashfastSetClusterIo(DBReader<DBKeyType> &reader, bool idOrderS
     }
     // a sequence belongs to one hash run, and a run's rereads are served by the batch arena, so unlike
     // align2clust nothing here is ever read twice and the page cache would only be pollution
-    if (reader.useDescriptorIo(false) == false) {
-        Debug(Debug::WARNING) << "Sequence IO policy: this reader cannot use descriptors, staying on mmap\n";
-        return;
-    }
-    Debug(Debug::INFO) << "Sequence IO policy: O_DIRECT, no run is read twice\n";
+    Debug(Debug::WARNING) << "Sequence IO policy: mmap. The working set does not fit and this reader "
+                          << "has no descriptor path to fall back to\n";
 }
 
 static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType> &reader, DBWriter &writer,
@@ -702,7 +643,10 @@ static ClusterCounts clusterSequences(const Parameters &par, DBReader<DBKeyType>
                        << dbSize * sizeof(HashEntry) / partitionCount << " byte per partition\n";
 
     Timer lengthOrderTimer;
-    const bool lengthDescending = reader.isSortedByEntryLengthDescending(par.threads);
+    bool lengthDescending = true;
+    for (size_t i = 1; i < reader.getSize() && lengthDescending; i++) {
+        lengthDescending = reader.getSeqLen(i - 1) >= reader.getSeqLen(i);
+    }
     Debug(Debug::INFO) << "Sequence DB length order: " << (lengthDescending ? "descending" : "unsorted")
                        << " (" << lengthOrderTimer.lap() << ")\n";
     bool idOrderSweep = lengthDescending;
@@ -793,8 +737,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     // NOSORT: nothing here needs a sorted access order and it saves the two 8 byte per sequence id maps
     DBReader<DBKeyType> reader(par.db1.c_str(), par.db1Index.c_str(), par.threads,
                                DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX);
-    // keep an fd next to the mapping so the cache can be advised if descriptor IO takes over later
-    reader.setIoCacheAdvice(true);
     reader.open(DBReader<DBKeyType>::NOSORT);
     // only preload what can stay resident once the reader index is accounted for
     const bool dataFitsInMemory = reader.getDataSize() < Util::getTotalSystemMemory() / 2;
