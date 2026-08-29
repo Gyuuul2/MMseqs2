@@ -186,12 +186,21 @@ struct AlignWorker {
     BlockAligner aligner;
 };
 
+// one shared counter, so every batch is drawn exactly once and no thread waits on another
+static size_t draw(size_t &counter) {
+    size_t mine = 0;
+#pragma omp atomic capture
+    mine = counter++;
+    return mine;
+}
+
 struct GateCounts {
-    GateCounts() : seen(0), rejected(0), rescued(0), kept(0) {}
+    GateCounts() : seen(0), rejected(0), rescued(0), kept(0), stale(0) {}
     uint64_t seen;
     uint64_t rejected;
     uint64_t rescued;   // turned away and worth a gapped alignment
     uint64_t kept;      // and the gapped alignment held up
+    uint64_t stale;     // read, then found already in a cluster, so the read was wasted
 };
 
 static float parsePrecisionLib(const std::string &table, double seqId, double cov,
@@ -266,15 +275,13 @@ static bool rescueWithGaps(uint64_t member, uint32_t queryLen, uint32_t targetLe
     return true;
 }
 
-static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, const PairRecord *rows, size_t count,
-                       const RankBitmap &taken, Sequence &query, Sequence &target,
-                       BlockAligner &aligner, const Parameters &par, unsigned int thread,
-                       Candidates &candidates,
-                       std::vector<uint64_t> &out, GateCounts &gate, float scorePerColThreshold,
-                       int xDrop) {
+// Picks the members worth reading and puts the read in flight, so the caller can spend the time it
+// takes on the batch it already has.
+static size_t startMemberBatch(const RunDbReader &reader, uint64_t rep, const PairRecord *rows,
+                               size_t count, const RankBitmap &taken, const Parameters &par,
+                               unsigned int thread, unsigned int lane, Candidates &candidates) {
     candidates.clear();
     const uint32_t queryLen = reader.getSeqLen(rep);
-
     for (size_t i = 0; i < count; i++) {
         const uint64_t member = rows[i].member();
         if (member == rep || taken.taken(member)) {
@@ -286,18 +293,32 @@ static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, const Pair
         candidates.members.push_back(member);
         candidates.diagonals.push_back(rows[i].diagonal());
     }
+    if (candidates.members.empty()) {
+        return 0;
+    }
+    return reader.startBatch(rep, candidates.members.data(), candidates.members.size(), thread, lane);
+}
 
+// Aligns what one lane holds, and if the lane could not take every candidate, reads and aligns the
+// rest through the same lane, which is the only path that has to wait.
+static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, size_t got,
+                       const RankBitmap &taken, Sequence &query, Sequence &target,
+                       BlockAligner &aligner, const Parameters &par, unsigned int thread,
+                       unsigned int lane, Candidates &candidates,
+                       std::vector<uint64_t> &out, GateCounts &gate, float scorePerColThreshold,
+                       int xDrop) {
+    const uint32_t queryLen = reader.getSeqLen(rep);
     size_t from = 0;
     while (from < candidates.members.size()) {
-        const size_t got = reader.loadBatch(rep, candidates.members.data() + from,
-                                            candidates.members.size() - from, thread);
-        const char *querySeq = reader.batchQueryAt(thread);
+        reader.awaitBatch(thread, lane);
+        const char *querySeq = reader.batchQueryAt(thread, lane);
         query.mapSequence(0, 0, (char *) querySeq, queryLen);
         aligner.initQuery(&query);
         for (size_t k = 0; k < got; k++) {
             const uint64_t member = candidates.members[from + k];
+            gate.stale += taken.taken(member);
             const uint32_t targetLen = reader.getSeqLen(member);
-            const char *targetSeq = reader.batchAt(thread, k);
+            const char *targetSeq = reader.batchAt(thread, lane, k);
             target.mapSequence(0, 0, (char *) targetSeq, targetLen);
             const BlockAligner::UngappedAln_res hit = aligner.ungappedAlign(
                 &target, static_cast<unsigned short>(candidates.diagonals[from + k]));
@@ -331,6 +352,10 @@ static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, const Pair
             out.push_back(member);
         }
         from += got;
+        if (from < candidates.members.size()) {
+            got = reader.startBatch(rep, candidates.members.data() + from,
+                                    candidates.members.size() - from, thread, lane);
+        }
     }
 }
 
@@ -399,7 +424,8 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     double spentReading = 0, spentAligning = 0, spentDeciding = 0, spentWriting = 0;
     Debug::Progress progress(lastRepRankBlock - firstRepRankBlock);
     std::vector<PairRecord> rows;
-    std::vector<Candidates> candidates(threads);
+    std::vector<std::vector<Candidates> > candidates(threads,
+                                                     std::vector<Candidates>(RunDbReader::LANES));
     std::vector<PairRecord> outBuffer;
     std::vector<AlignWorker *> workers(threads, NULL);
     std::vector<GateCounts> gate(threads);
@@ -490,8 +516,14 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
             }
 
             mark = omp_get_wtime();
-#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-            for (size_t w = 0; w < work.size(); w++) {
+            // A thread draws its own work so that it can draw the next one before it aligns this
+            // one: the reads of the next batch are then in flight for the whole time this batch
+            // takes, which is time the disk used to spend idle. Drawing in order is what a dynamic
+            // schedule does too, and the answer does not depend on who drew what, because every
+            // batch writes to its own slot and the slots are joined in order afterwards.
+            size_t drawn = 0;
+#pragma omp parallel num_threads(threads)
+            {
                 unsigned int thread = 0;
 #ifdef OPENMP
                 thread = static_cast<unsigned int>(omp_get_thread_num());
@@ -500,13 +532,38 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                     workers[thread] = new AlignWorker(maxLen, subMat, fastMatrix, evaluer, par);
                 }
                 AlignWorker &worker = *workers[thread];
-                const MemberBatch &item = work[w];
-                const size_t at = starts[item.group];
-                batchSurvivors[w].clear();
-                alignMemberBatch(reader, batch[at].rep(), &batch[at + item.from], item.count, taken,
-                                 worker.query, worker.target, worker.aligner, par, thread,
-                                 candidates[thread], batchSurvivors[w],
-                                 gate[thread], scorePerColThreshold, xDrop);
+                unsigned int lane = 0;
+                size_t here = draw(drawn);
+                size_t got = 0;
+                if (here < work.size()) {
+                    const MemberBatch &item = work[here];
+                    const size_t at = starts[item.group];
+                    got = startMemberBatch(reader, batch[at].rep(), &batch[at + item.from],
+                                           item.count, taken, par, thread, lane,
+                                           candidates[thread][lane]);
+                }
+                while (here < work.size()) {
+                    const size_t next = draw(drawn);
+                    const unsigned int nextLane = lane ^ 1u;
+                    size_t nextGot = 0;
+                    if (next < work.size()) {
+                        const MemberBatch &item = work[next];
+                        const size_t at = starts[item.group];
+                        nextGot = startMemberBatch(reader, batch[at].rep(), &batch[at + item.from],
+                                                   item.count, taken, par, thread, nextLane,
+                                                   candidates[thread][nextLane]);
+                    }
+                    const MemberBatch &item = work[here];
+                    const size_t at = starts[item.group];
+                    batchSurvivors[here].clear();
+                    alignMemberBatch(reader, batch[at].rep(), got, taken, worker.query,
+                                     worker.target, worker.aligner, par, thread, lane,
+                                     candidates[thread][lane], batchSurvivors[here],
+                                     gate[thread], scorePerColThreshold, xDrop);
+                    here = next;
+                    lane = nextLane;
+                    got = nextGot;
+                }
             }
             // the batches of one representative are in the order the serial version made them, so
             // joining them in that order gives the list it would have produced
@@ -605,10 +662,13 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
         all.rejected += gate[i].rejected;
         all.rescued += gate[i].rescued;
         all.kept += gate[i].kept;
+        all.stale += gate[i].stale;
     }
     Debug(Debug::INFO) << "The gate saw " << all.seen << " pairs and turned away " << all.rejected
                        << ", of which " << all.rescued << " were worth a gapped alignment and "
                        << all.kept << " held up\n";
+    Debug(Debug::INFO) << all.stale << " of the sequences it read were already in a cluster by the "
+                       << "time it looked, so those reads were spent for nothing\n";
     Debug(Debug::INFO) << "Where the time went: reading " << (uint64_t) spentReading << "s, aligning "
                        << (uint64_t) spentAligning << "s, deciding " << (uint64_t) spentDeciding
                        << "s, writing " << (uint64_t) spentWriting << "s\n";

@@ -28,16 +28,26 @@ struct IoRing {
     bool open(unsigned depth);
     bool isOpen() const { return ready; }
 
-    void submit(const std::vector<Read> &reads, const char *what);
+    // The ring owns the list it is waiting on, so the caller fills it in place and then hands it
+    // over. Between submit and await the buffers belong to the kernel: nothing may read or move
+    // them, and the list itself has to stay as it was handed over.
+    std::vector<Read> &list() { return reads; }
+    void submit(const char *what);
+    void await(const char *what);
 
 private:
     IoRing(const IoRing &);
     IoRing &operator=(const IoRing &);
-    void preadAll(const std::vector<Read> &reads, const char *what);
+    void preadAll(const char *what);
+    void pump(const char *what, bool untilDone);
 
     bool ready;
     unsigned depth;
     void *state;
+    std::vector<Read> reads;
+    size_t queued;
+    size_t done;
+    unsigned inflight;
 };
 
 class RunDbReader {
@@ -73,13 +83,19 @@ public:
 
     void openBatch(unsigned int threads, size_t arenaBytes, size_t memoryBudget);
 
-    // Reads the query and as many of the members as the arena holds, in one submission, and answers
+    // Queues the query and as many of the members as one lane holds, in one submission, and answers
     // how many members that was. The query rides along with every batch rather than being fetched on
     // its own, so it stays valid while the members it is compared against come and go, and it costs
-    // no separate round trip to the disk.
-    size_t loadBatch(uint64_t queryRank, const uint64_t *members, size_t n, unsigned int thread) const;
-    const char *batchQueryAt(unsigned int thread) const;
-    const char *batchAt(unsigned int thread, size_t member) const;
+    // no separate round trip to the disk. Two lanes a thread, so one can be read while the other is
+    // being aligned; awaitBatch is what says a lane has arrived, and until then it belongs to the
+    // kernel.
+    size_t startBatch(uint64_t queryRank, const uint64_t *members, size_t n, unsigned int thread,
+                      unsigned int lane) const;
+    void awaitBatch(unsigned int thread, unsigned int lane) const;
+    const char *batchQueryAt(unsigned int thread, unsigned int lane) const;
+    const char *batchAt(unsigned int thread, unsigned int lane, size_t member) const;
+
+    static const unsigned int LANES = 2;
 
     bool isValid(uint64_t rank) const;
     uint64_t countValid() const;
@@ -103,19 +119,21 @@ public:
     };
 
 private:
-    struct BatchWorker {
+    struct BatchLane {
         std::vector<char> arena;
         char *aligned;
         const char *queryAt;
         std::vector<const char *> memberAt;
-        std::vector<IoRing::Read> reads;
         IoRing ring;
-        BatchWorker() : aligned(NULL), queryAt(NULL) {}
+        BatchLane() : aligned(NULL), queryAt(NULL) {}
+    };
+    struct BatchWorker {
+        BatchLane lane[LANES];
     };
     // pointers, because a worker owns a ring and a ring is not copyable
     mutable std::vector<BatchWorker *> batch;
 
-    bool appendBatchRead(BatchWorker &worker, uint64_t rank, Cursor &cursor, const char *&at) const;
+    bool appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor, const char *&at) const;
     int directOf(uint32_t file) const;
     const char *fileData(uint32_t file, uint64_t offset) const;
     void mapFile(uint32_t file) const;

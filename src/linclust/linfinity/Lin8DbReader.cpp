@@ -113,7 +113,7 @@ void ringClose(Ring &r) {
 }  // namespace
 #endif
 
-IoRing::IoRing() : ready(false), depth(0), state(NULL) {}
+IoRing::IoRing() : ready(false), depth(0), state(NULL), queued(0), done(0), inflight(0) {}
 
 IoRing::~IoRing() {
 #if defined(__linux__) && defined(HAVE_LINUX_IO_URING)
@@ -143,7 +143,7 @@ bool IoRing::open(unsigned depth) {
     return ready;
 }
 
-void IoRing::preadAll(const std::vector<Read> &reads, const char *what) {
+void IoRing::preadAll(const char *what) {
     for (size_t i = 0; i < reads.size(); i++) {
         size_t got = 0;
         while (got < reads[i].length) {
@@ -167,49 +167,46 @@ void IoRing::preadAll(const std::vector<Read> &reads, const char *what) {
     }
 }
 
-void IoRing::submit(const std::vector<Read> &reads, const char *what) {
-    if (reads.empty()) {
-        return;
-    }
+// Hands the queued reads to the kernel. With untilDone it stays until every one has come back,
+// otherwise it returns as soon as the kernel has taken what fits, which is what leaves the caller
+// free to compute while the disk works.
+void IoRing::pump(const char *what, bool untilDone) {
 #if defined(__linux__) && defined(HAVE_LINUX_IO_URING)
-    if (ready == false) {
-        preadAll(reads, what);
-        return;
-    }
     Ring &r = *static_cast<Ring *>(state);
     const unsigned sqMask = *r.sqMask;
     const unsigned cqMask = *r.cqMask;
-    size_t next = 0;
-    size_t done = 0;
-    unsigned inflight = 0;
-    while (done < reads.size()) {
-        unsigned queued = 0;
-        while (next < reads.size() && inflight + queued < r.entries) {
-            const unsigned sqeIdx = (unsigned) ((inflight + queued) % r.entries);
+    do {
+        unsigned toQueue = 0;
+        while (queued < reads.size() && inflight + toQueue < r.entries) {
+            const unsigned sqeIdx = (unsigned) ((inflight + toQueue) % r.entries);
             struct io_uring_sqe *sqe = &r.sqes[sqeIdx];
             memset(sqe, 0, sizeof(*sqe));
             sqe->opcode = IORING_OP_READ;
-            sqe->fd = reads[next].fd;
-            sqe->off = reads[next].offset;
-            sqe->addr = (uint64_t) (uintptr_t) reads[next].into;
-            sqe->len = static_cast<unsigned>(reads[next].length);
-            sqe->user_data = next;
+            sqe->fd = reads[queued].fd;
+            sqe->off = reads[queued].offset;
+            sqe->addr = (uint64_t) (uintptr_t) reads[queued].into;
+            sqe->len = static_cast<unsigned>(reads[queued].length);
+            sqe->user_data = queued;
             const unsigned tail = *r.sqTail;
             r.sqArray[tail & sqMask] = sqeIdx;
             __atomic_store_n(r.sqTail, tail + 1, __ATOMIC_RELEASE);
+            toQueue++;
             queued++;
-            next++;
         }
-        const unsigned waitFor = (next >= reads.size()) ? (inflight + queued) : 1u;
+        unsigned waitFor = 0;
+        if (untilDone) {
+            waitFor = (queued >= reads.size()) ? (inflight + toQueue) : 1u;
+        }
         long ret;
         do {
-            ret = syscall(__NR_io_uring_enter, r.fd, queued, waitFor, IORING_ENTER_GETEVENTS, NULL, 0);
+            ret = syscall(__NR_io_uring_enter, r.fd, toQueue, waitFor,
+                          waitFor > 0 ? IORING_ENTER_GETEVENTS : 0u, NULL, 0);
         } while (ret < 0 && errno == EINTR);
         if (ret < 0) {
             Debug(Debug::ERROR) << "Cannot submit reads for " << what << ". Error " << errno << "\n";
             EXIT(EXIT_FAILURE);
         }
-        inflight += queued;
+        inflight += toQueue;
         unsigned head = *r.cqHead;
         const unsigned cqTail = __atomic_load_n(r.cqTail, __ATOMIC_ACQUIRE);
         while (head != cqTail) {
@@ -229,9 +226,41 @@ void IoRing::submit(const std::vector<Read> &reads, const char *what) {
             done++;
         }
         __atomic_store_n(r.cqHead, head, __ATOMIC_RELEASE);
-    }
+    } while (untilDone && done < reads.size());
 #else
-    preadAll(reads, what);
+    (void) what;
+    (void) untilDone;
+#endif
+}
+
+void IoRing::submit(const char *what) {
+    queued = 0;
+    done = 0;
+    inflight = 0;
+    if (reads.empty()) {
+        return;
+    }
+#if defined(__linux__) && defined(HAVE_LINUX_IO_URING)
+    if (ready == false) {
+        preadAll(what);
+        done = reads.size();
+        return;
+    }
+    pump(what, false);
+#else
+    preadAll(what);
+    done = reads.size();
+#endif
+}
+
+void IoRing::await(const char *what) {
+    if (done >= reads.size()) {
+        return;
+    }
+#if defined(__linux__) && defined(HAVE_LINUX_IO_URING)
+    pump(what, true);
+#else
+    (void) what;
 #endif
 }
 
@@ -542,7 +571,7 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
     //
     // The rule is the size of the sequences against the memory the run was given, so a machine that
     // can hold its database uses the cache and one that cannot does not.
-    const size_t arenaTotal = (size_t) threads * (arenaBytes + DIRECT_BLOCK);
+    const size_t arenaTotal = (size_t) threads * (arenaBytes + LANES * DIRECT_BLOCK);
     if (arenaTotal >= memoryBudget) {
         Debug(Debug::ERROR) << "Read arenas for " << threads << " thread need "
                             << (arenaTotal >> 20) << " MB, which is the whole "
@@ -557,22 +586,28 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
                        << (budget >> 30) << " GB limit past " << (arenaTotal >> 20)
                        << " MB of read arena, reading "
                        << (wantDirect ? "past the page cache" : "through the page cache") << "\n";
-    // A batch holds the query and at least one member, each grown outward to whole blocks, or it
-    // could not make progress. Demanding the room here is what lets loadBatch have no failure case.
+    // The memory a thread gets is split between its lanes, so prefetching costs no more of it than
+    // waiting did. A lane holds the query and at least one member, each grown outward to whole
+    // blocks, or it could not make progress, and demanding that here is what lets startBatch have
+    // no failure case.
+    const size_t laneBytes = arenaBytes / LANES;
     const size_t longest = 2 * ((size_t) runs.maxSeqLen() + DIRECT_BLOCK);
-    if (arenaBytes < longest) {
-        Debug(Debug::ERROR) << "A read arena of " << arenaBytes << " byte cannot hold two sequences of "
+    if (laneBytes < longest) {
+        Debug(Debug::ERROR) << "A read lane of " << laneBytes << " byte cannot hold two sequences of "
                             << runs.maxSeqLen() << " byte, which needs " << longest << "\n";
         EXIT(EXIT_FAILURE);
     }
     for (unsigned int i = 0; i < threads; i++) {
         BatchWorker *worker = new BatchWorker();
-        // room to grow every span outward to whole blocks
-        worker->arena.resize(arenaBytes + DIRECT_BLOCK);
-        char *at = worker->arena.data();
-        const size_t off = reinterpret_cast<uintptr_t>(at) % DIRECT_BLOCK;
-        worker->aligned = at + (off == 0 ? 0 : DIRECT_BLOCK - off);
-        worker->ring.open(RING_DEPTH);
+        for (unsigned int l = 0; l < LANES; l++) {
+            BatchLane &lane = worker->lane[l];
+            // room to grow every span outward to whole blocks
+            lane.arena.resize(laneBytes + DIRECT_BLOCK);
+            char *at = lane.arena.data();
+            const size_t off = reinterpret_cast<uintptr_t>(at) % DIRECT_BLOCK;
+            lane.aligned = at + (off == 0 ? 0 : DIRECT_BLOCK - off);
+            lane.ring.open(RING_DEPTH);
+        }
         batch.push_back(worker);
     }
 }
@@ -608,14 +643,22 @@ int RunDbReader::directOf(uint32_t file) const {
     return fd;
 }
 
-const char *RunDbReader::batchQueryAt(unsigned int thread) const {
-    return batch[thread]->queryAt;
+const char *RunDbReader::batchQueryAt(unsigned int thread, unsigned int lane) const {
+    return batch[thread]->lane[lane].queryAt;
+}
+
+const char *RunDbReader::batchAt(unsigned int thread, unsigned int lane, size_t member) const {
+    return batch[thread]->lane[lane].memberAt[member];
+}
+
+void RunDbReader::awaitBatch(unsigned int thread, unsigned int lane) const {
+    batch[thread]->lane[lane].ring.await(db.c_str());
 }
 
 // Grows the last read to cover this rank when the two touch on the disk, and starts a new one when
 // they do not. Answers false once the arena is full, which openBatch guarantees cannot happen before
 // a query and one member are in.
-bool RunDbReader::appendBatchRead(BatchWorker &worker, uint64_t rank, Cursor &cursor,
+bool RunDbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor,
                                   const char *&at) const {
     cursor.at = runs.segmentOfFrom(rank, cursor.at);
     const uint64_t offset = runs.offsetIn(cursor.at, rank);
@@ -624,12 +667,13 @@ bool RunDbReader::appendBatchRead(BatchWorker &worker, uint64_t rank, Cursor &cu
     const uint64_t blockFrom = offset - offset % DIRECT_BLOCK;
     const uint64_t blockUntil = ((offset + length + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
 
-    const size_t room = worker.arena.size() - DIRECT_BLOCK;
+    const size_t room = lane.arena.size() - DIRECT_BLOCK;
     size_t used = 0;
-    if (worker.reads.empty() == false) {
-        IoRing::Read &last = worker.reads.back();
+    std::vector<IoRing::Read> &reads = lane.ring.list();
+    if (reads.empty() == false) {
+        IoRing::Read &last = reads.back();
         char *into = static_cast<char *>(last.into);
-        used = (size_t) (into - worker.aligned) + last.length;
+        used = (size_t) (into - lane.aligned) + last.length;
         const uint64_t end = last.offset + last.length;
         if (last.fd == fd && last.offset <= blockFrom && blockFrom <= end) {
             const size_t extra = (blockUntil > end) ? (size_t) (blockUntil - end) : 0;
@@ -647,44 +691,41 @@ bool RunDbReader::appendBatchRead(BatchWorker &worker, uint64_t rank, Cursor &cu
         return false;
     }
     IoRing::Read read;
-    read.into = worker.aligned + used;
+    read.into = lane.aligned + used;
     read.fd = fd;
     read.offset = blockFrom;
     read.length = span;
     read.required = (size_t) (offset + length - blockFrom);
-    worker.reads.push_back(read);
-    at = worker.aligned + used + (size_t) (offset - blockFrom);
+    reads.push_back(read);
+    at = lane.aligned + used + (size_t) (offset - blockFrom);
     return true;
 }
 
-size_t RunDbReader::loadBatch(uint64_t queryRank, const uint64_t *members, size_t n,
-                              unsigned int thread) const {
-    BatchWorker &worker = *batch[thread];
-    worker.memberAt.clear();
-    worker.reads.clear();
+size_t RunDbReader::startBatch(uint64_t queryRank, const uint64_t *members, size_t n,
+                              unsigned int thread, unsigned int lane) const {
+    BatchLane &at = batch[thread]->lane[lane];
+    at.memberAt.clear();
+    at.ring.list().clear();
     Cursor cursor;
     // the query goes in first because it is the lowest rank of the batch, which keeps the run cursor
     // and the disk offsets moving forward and lets a member that lands next to it share its read
-    appendBatchRead(worker, queryRank, cursor, worker.queryAt);
+    appendBatchRead(at, queryRank, cursor, at.queryAt);
     size_t taken = 0;
     for (; taken < n; taken++) {
-        const char *at = NULL;
-        if (appendBatchRead(worker, members[taken], cursor, at) == false) {
+        const char *where = NULL;
+        if (appendBatchRead(at, members[taken], cursor, where) == false) {
             break;
         }
-        worker.memberAt.push_back(at);
+        at.memberAt.push_back(where);
     }
     if (taken == 0 && n > 0) {
-        // openBatch sized the arena so this cannot happen; a hung node costs far more to find than
+        // openBatch sized the lanes so this cannot happen; a hung node costs far more to find than
         // a stopped one, so it is worth the one comparison a batch to say so out loud
-        Debug(Debug::ERROR) << "A read arena of " << worker.arena.size() << " byte took none of "
+        Debug(Debug::ERROR) << "A read lane of " << at.arena.size() << " byte took none of "
                             << n << " member, so the pass would not move\n";
         EXIT(EXIT_FAILURE);
     }
-    worker.ring.submit(worker.reads, db.c_str());
+    at.ring.submit(db.c_str());
     return taken;
 }
 
-const char *RunDbReader::batchAt(unsigned int thread, size_t member) const {
-    return batch[thread]->memberAt[member];
-}
