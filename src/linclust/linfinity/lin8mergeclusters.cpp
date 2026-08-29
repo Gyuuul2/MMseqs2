@@ -1,0 +1,333 @@
+
+#include "Lin8Db.h"
+
+#include <cstring>
+#include "Parameters.h"
+#include "Debug.h"
+#include "FileUtil.h"
+#include "Util.h"
+#include "Timer.h"
+#include "FastSort.h"
+#include <algorithm>
+#include <cstdio>
+#include <vector>
+#include "DBWriter.h"
+#include "itoa.h"
+
+static const uint64_t LINCLUSTHASH_MAGIC = 0x4C494E4348504153ull;
+struct PairFileHeader {
+    uint64_t magic;
+    uint64_t version;
+    uint64_t keyWidth;
+    uint64_t pairs;
+};
+
+struct JoinRow {
+    uint64_t on;
+    uint64_t carried;
+
+    // the redundancy pairs are a fraction of a percent of the run, so they are not worth narrowing
+    static const size_t DISK_BYTES = 16;
+    void pack(unsigned char *to) const { memcpy(to, this, DISK_BYTES); }
+    void unpack(const unsigned char *from) { memcpy(this, from, DISK_BYTES); }
+
+    static bool byJoinKey(const JoinRow &first, const JoinRow &second) {
+        if (first.on != second.on) {
+            return first.on < second.on;
+        }
+        return first.carried < second.carried;
+    }
+};
+
+static void readAll(const std::string &path, std::vector<JoinRow> &into) {
+    into.clear();
+    FILE *in = fopen(path.c_str(), "r");
+    if (in == NULL) {
+        return;
+    }
+    std::vector<JoinRow> buffer(1u << 16);
+    size_t read = 0;
+    while ((read = fread(buffer.data(), sizeof(JoinRow), buffer.size(), in)) > 0) {
+        into.insert(into.end(), buffer.begin(), buffer.begin() + read);
+    }
+    if (ferror(in) != 0) {
+        Debug(Debug::ERROR) << "Cannot read " << path << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    fclose(in);
+}
+
+int lin8expand(int argc, const char **argv, const Command &command) {
+    Parameters &par = Parameters::getInstance();
+    par.parseParameters(argc, argv, command, true, 0, 0);
+
+    size_t ranges = 0;
+    size_t ranks = 0;
+    FILE *shape = fopen(par.db1.c_str(), "r");
+    if (shape == NULL || fscanf(shape, "ranges\t%zu\nranks\t%zu", &ranges, &ranks) != 2
+        || ranges == 0) {
+        Debug(Debug::ERROR) << "Cannot read " << par.db1 << ". Run lin8cluster first\n";
+        EXIT(EXIT_FAILURE);
+    }
+    fclose(shape);
+
+    const size_t budget = static_cast<size_t>(Util::computeMemory(par.splitMemoryLimit) * 0.95);
+    const std::string byMember = par.db3 + ".member";
+    const std::string byKept = par.db3 + ".kept";
+    const std::string extra = par.db3 + ".extra";
+    Timer timer;
+
+    // both sides routed on the rank they are joined on
+    {
+        BucketWriter<JoinRow> members(byMember, ranges, par.threads, budget);
+        BucketWriter<JoinRow> kept(byKept, ranges, par.threads, budget);
+        std::vector<uint64_t> nothing(ranges, 0);
+        members.openAt(nothing);
+        kept.openAt(nothing);
+
+        // every consumer of these files sorts before it reads, so which thread wrote a row where
+        // does not reach the answer
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+        for (size_t range = 0; range < ranges; range++) {
+            unsigned int thread = 0;
+#ifdef OPENMP
+            thread = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+            std::vector<PairRecord> pairs(1u << 16);
+            const std::string path = par.db1 + ".0." + SSTR(range);
+            FILE *in = fopen(path.c_str(), "r");
+            if (in == NULL) {
+                Debug(Debug::ERROR) << "Cannot open " << path << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            size_t read = 0;
+            while ((read = readRecords(pairs.data(), pairs.size(), in)) > 0) {
+                for (size_t k = 0; k < read; k++) {
+                    JoinRow row;
+                    row.on = pairs[k].member();
+                    row.carried = pairs[k].rep();
+                    members.add(thread, row, PairRecord::rangeOf(row.on, ranks, ranges));
+                }
+            }
+            if (ferror(in) != 0) {
+                Debug(Debug::ERROR) << "Cannot read " << path << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            fclose(in);
+        }
+
+        FILE *in = fopen(par.db2.c_str(), "r");
+        if (in == NULL) {
+            Debug(Debug::ERROR) << "Cannot open " << par.db2 << ". Run lin8clusthash first\n";
+            EXIT(EXIT_FAILURE);
+        }
+        PairFileHeader header;
+        if (fread(&header, sizeof(PairFileHeader), 1, in) != 1
+            || header.magic != LINCLUSTHASH_MAGIC) {
+            Debug(Debug::ERROR) << par.db2 << " is not a set of folded pairs\n";
+            EXIT(EXIT_FAILURE);
+        }
+        std::vector<JoinRow> folded(1u << 16);
+        size_t read = 0;
+        while ((read = fread(folded.data(), sizeof(JoinRow), folded.size(), in)) > 0) {
+            for (size_t k = 0; k < read; k++) {
+                // the file holds (folded, kept), so the join key is the second field
+                JoinRow row;
+                row.on = folded[k].carried;
+                row.carried = folded[k].on;
+                kept.add(0, row, PairRecord::rangeOf(row.on, ranks, ranges));
+            }
+        }
+        if (ferror(in) != 0) {
+            Debug(Debug::ERROR) << "Cannot read " << par.db2 << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        fclose(in);
+        members.flushAll(par.threads);
+        kept.flushAll(par.threads);
+        members.close();
+        kept.close();
+    }
+
+    uint64_t added = 0;
+    {
+        BucketWriter<PairRecord> writer(extra, ranges, par.threads, budget);
+        std::vector<uint64_t> nothing(ranges, 0);
+        writer.openAt(nothing);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+ : added)
+        for (size_t range = 0; range < ranges; range++) {
+            unsigned int thread = 0;
+#ifdef OPENMP
+            thread = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+            std::vector<JoinRow> left;
+            std::vector<JoinRow> right;
+            readAll(byKept + "." + SSTR(range), right);
+            if (right.empty()) {
+                continue;  // nothing was folded into any rank of this range
+            }
+            readAll(byMember + "." + SSTR(range), left);
+            SORT_SERIAL(left.begin(), left.end(), JoinRow::byJoinKey);
+            SORT_SERIAL(right.begin(), right.end(), JoinRow::byJoinKey);
+            size_t at = 0;
+            for (size_t i = 0; i < right.size(); i++) {
+                while (at < left.size() && left[at].on < right[i].on) {
+                    at++;
+                }
+                for (size_t k = at; k < left.size() && left[k].on == right[i].on; k++) {
+                    PairRecord row;
+                    row.set(left[k].carried, right[i].carried, 0);
+                    writer.add(thread, row, PairRecord::rangeOf(left[k].carried, ranks, ranges));
+                    added++;
+                }
+            }
+        }
+        writer.flushAll(par.threads);
+        writer.close();
+    }
+
+    // and merged back in, both sides being in representative order
+    uint64_t rows = 0;
+    std::vector<std::pair<std::string, std::string> > pending;
+    uint64_t pendingBytes = 0;
+    for (size_t range = 0; range < ranges; range++) {
+        std::vector<PairRecord> all;
+        std::vector<PairRecord> buffer(1u << 16);
+        const char *names[2] = {NULL, NULL};
+        const std::string a = par.db1 + ".0." + SSTR(range);
+        const std::string b = extra + "." + SSTR(range);
+        (void) names;
+        for (int which = 0; which < 2; which++) {
+            const std::string path = (which == 0) ? a : b;
+            FILE *in = fopen(path.c_str(), "r");
+            if (in == NULL) {
+                continue;
+            }
+            size_t read = 0;
+            while ((read = readRecords(buffer.data(), buffer.size(), in)) > 0) {
+                all.insert(all.end(), buffer.begin(), buffer.begin() + read);
+            }
+            fclose(in);
+        }
+        SORT_PARALLEL(all.begin(), all.end(), PairRecord::byRepAndMember);
+        const std::string outPath = par.db3 + ".0." + SSTR(range);
+        const std::string outTmp = outPath + ".tmp";
+        FILE *out = FileUtil::openAndDelete(outTmp.c_str(), "w");
+        if (all.empty() == false
+            && writeRecords(all.data(), all.size(), out) != all.size()) {
+            Debug(Debug::ERROR) << "Cannot write " << outTmp << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (fclose(out) != 0) {
+            Debug(Debug::ERROR) << "Cannot close " << outTmp << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        pending.push_back(std::make_pair(outTmp, outPath));
+        pendingBytes += all.size() * PairRecord::DISK_BYTES;
+        // batched like a chunk: a restart redoes the whole pass, so a range needs no flush of its own
+        if (pendingBytes >= PUBLISH_BATCH_BYTES || pending.size() >= PUBLISH_BATCH_FILES
+            || range + 1 == ranges) {
+            publishAllAtomically(pending, par.threads);
+            pendingBytes = 0;
+        }
+        rows += all.size();
+    }
+
+    const std::string shapeTmp = par.db3 + ".shape.tmp";
+    FILE *shapeOut = FileUtil::openAndDelete(shapeTmp.c_str(), "w");
+    fprintf(shapeOut, "ranges\t%zu\nranks\t%zu\n", ranges, ranks);
+    if (fclose(shapeOut) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << shapeTmp << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    FileUtil::publishAtomically(shapeTmp, par.db3);
+
+    Debug(Debug::INFO) << "Put back " << added << " folded sequences, " << rows
+                       << " rows in all, in " << timer.lap() << "\n";
+    return EXIT_SUCCESS;
+}
+
+
+static void appendKey(std::string &into, uint64_t key) {
+    char buffer[32];
+    char *end = Itoa::u64toa_sse2(key, buffer);
+    into.append(buffer, end - buffer - 1);
+    into.push_back('\n');
+}
+
+int lin8merge(int argc, const char **argv, const Command &command) {
+    Parameters &par = Parameters::getInstance();
+    par.parseParameters(argc, argv, command, true, 0, 0);
+
+    // the deciding pass names how many ranges it covered, so this reads a shape rather than probing
+    size_t ranges = 0;
+    size_t ranks = 0;
+    FILE *shape = fopen(par.db1.c_str(), "r");
+    if (shape == NULL || fscanf(shape, "ranges\t%zu\nranks\t%zu", &ranges, &ranks) != 2
+        || ranges == 0) {
+        Debug(Debug::ERROR) << "Cannot read " << par.db1 << ". Run lin8cluster first\n";
+        EXIT(EXIT_FAILURE);
+    }
+    fclose(shape);
+
+    DBWriter writer(par.db2.c_str(), par.db2Index.c_str(), 1, par.compressed,
+                    Parameters::DBTYPE_CLUSTER_RES);
+    writer.open();
+
+    Timer timer;
+    uint64_t clusters = 0;
+    uint64_t members = 0;
+    uint64_t lastRep = 0;
+    bool haveRep = false;
+    std::string entry;
+    std::vector<PairRecord> buffer(1u << 16);
+
+    for (size_t range = 0; range < ranges; range++) {
+        const std::string path = par.db1 + ".0." + SSTR(range);
+        FILE *in = fopen(path.c_str(), "r");
+        if (in == NULL) {
+            Debug(Debug::ERROR) << "Cannot open " << path << ", which range " << range
+                                << " should have decided\n";
+            EXIT(EXIT_FAILURE);
+        }
+        size_t read = 0;
+        while ((read = readRecords(buffer.data(), buffer.size(), in)) > 0) {
+            for (size_t k = 0; k < read; k++) {
+                const uint64_t rep = buffer[k].rep();
+                const uint64_t member = buffer[k].member();
+                if (haveRep == false || rep != lastRep) {
+                    if (haveRep) {
+                        writer.writeData(entry.c_str(), entry.length(), lastRep, 0);
+                    }
+                    if (haveRep && rep < lastRep) {
+                        Debug(Debug::ERROR) << "The pairs go back from representative " << lastRep
+                                            << " to " << rep << ", so they are not in order\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    entry.clear();
+                    appendKey(entry, rep);
+                    lastRep = rep;
+                    haveRep = true;
+                    clusters++;
+                }
+                if (member != rep) {
+                    appendKey(entry, member);
+                    members++;
+                }
+            }
+        }
+        if (ferror(in) != 0) {
+            Debug(Debug::ERROR) << "Cannot read " << path << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        fclose(in);
+    }
+    if (haveRep) {
+        writer.writeData(entry.c_str(), entry.length(), lastRep, 0);
+    }
+    writer.close(false);
+
+    Debug(Debug::INFO) << "Wrote " << clusters << " clusters holding " << (clusters + members)
+                       << " sequences in " << timer.lap() << "\n";
+    return EXIT_SUCCESS;
+}
