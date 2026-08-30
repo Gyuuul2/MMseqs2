@@ -285,6 +285,11 @@ static unsigned int mostKmersOneSequenceCanKeep(unsigned int keepPerSequence, fl
     return kmersToKeepForLength(keepPerSequence, keepScale, RunTable::MAX_SEQ_LEN);
 }
 
+// ranks to read at once: mmap faults one readahead window at a time and never fills the queue
+static const uint64_t EXTRACT_BATCH = 2048;
+// a read arena a thread, the same size the other passes use
+static const size_t READ_ARENA_BYTES = 64u << 20;
+
 static uint64_t extractOneManifestChunk(const RunDbReader &reader, const ManifestChunk &chunk, BucketWriter<KmerRecord> &writer,
                          const unsigned char *letterToCode, unsigned int kmerSize,
                          unsigned int alphabetSize, unsigned int keepPerSequence, float keepScale,
@@ -301,38 +306,58 @@ static uint64_t extractOneManifestChunk(const RunDbReader &reader, const Manifes
         RunDbReader::Cursor cursor;
         KmerRecord record;
         std::vector<uint64_t> &counts = subBucketCounts[thread];
-#pragma omp for schedule(dynamic, 1024)
-        for (uint64_t rank = chunk.rankBegin; rank < chunk.rankEnd; rank++) {
-            if (reader.isValid(rank) == false) {
-                continue;
+        std::vector<uint64_t> want;
+        want.reserve(EXTRACT_BATCH);
+#pragma omp for schedule(dynamic, 1)
+        for (uint64_t base = chunk.rankBegin; base < chunk.rankEnd; base += EXTRACT_BATCH) {
+            const uint64_t until = std::min(base + EXTRACT_BATCH, chunk.rankEnd);
+            uint64_t at = base;
+            while (at < until) {
+                want.clear();
+                while (at < until && want.size() < EXTRACT_BATCH) {
+                    if (reader.isValid(at) && reader.getSeqLen(at, cursor) <= RunTable::MAX_SEQ_LEN) {
+                        want.push_back(at);
+                    }
+                    at++;
+                }
+                if (want.empty()) {
+                    break;
+                }
+                const size_t took = 1 + reader.startBatch(want[0], want.data() + 1, want.size() - 1, thread, 0);
+                // the lane can fill before the batch does, so the rest waits for the next one
+                if (took < want.size()) {
+                    at = want[took];
+                }
+                reader.awaitBatch(thread, 0);
+                for (size_t which = 0; which < took; which++) {
+                    const uint64_t rank = want[which];
+                    const uint32_t length = reader.getSeqLen(rank, cursor);
+                    const char *letters = (which == 0) ? reader.batchQueryAt(thread, 0)
+                                                       : reader.batchAt(thread, 0, which - 1);
+                    const size_t kept = extractor.extract(letters, length, letterToCode,
+                                                          kmersToKeepForLength(keepPerSequence, keepScale, length));
+                    for (size_t i = 0; i < kept; i++) {
+                        const uint64_t spread = KmerExtractor::spread(extractor.keys()[i]);
+                        const uint64_t pos = extractor.positions()[i];
+                        record.set(KmerExtractor::storedKey(spread), rank, pos, false,
+                                   extractor.adjacentAt(letters, length, letterToCode, pos));
+                        const size_t bucket = KmerExtractor::bucketOfKmer(spread, buckets);
+                        writer.add(thread, record, bucket);
+                        counts[bucket * KmerRecord::SUB_BUCKET_COUNT + record.subBucket()]++;
+                        emitted++;
+                    }
+                    // a sequence with no k-mer of its own would otherwise never be seen again
+                    if (kept == 0) {
+                        const uint64_t spread =
+                            KmerExtractor::spread(KmerExtractor::identityKey(letters, length, letterToCode));
+                        record.set(KmerExtractor::storedKey(spread), rank, 0, true,
+                                   extractor.adjacentUnknown());
+                        const size_t bucket = KmerExtractor::bucketOfKmer(spread, buckets);
+                        writer.add(thread, record, bucket);
+                        counts[bucket * KmerRecord::SUB_BUCKET_COUNT + record.subBucket()]++;
+                        emitted++;
             }
-            const uint32_t length = reader.getSeqLen(rank, cursor);
-            if (length > RunTable::MAX_SEQ_LEN) {
-                continue;
-            }
-            const char *letters = reader.getData(rank, cursor);
-            const size_t kept = extractor.extract(letters, length, letterToCode,
-                                                  kmersToKeepForLength(keepPerSequence, keepScale, length));
-            for (size_t i = 0; i < kept; i++) {
-                const uint64_t spread = KmerExtractor::spread(extractor.keys()[i]);
-                const uint64_t pos = extractor.positions()[i];
-                record.set(KmerExtractor::storedKey(spread), rank, pos, false,
-                           extractor.adjacentAt(letters, length, letterToCode, pos));
-                const size_t bucket = KmerExtractor::bucketOfKmer(spread, buckets);
-                writer.add(thread, record, bucket);
-                counts[bucket * KmerRecord::SUB_BUCKET_COUNT + record.subBucket()]++;
-                emitted++;
-            }
-            // a sequence with no k-mer of its own would otherwise never be seen again
-            if (kept == 0) {
-                const uint64_t spread =
-                    KmerExtractor::spread(KmerExtractor::identityKey(letters, length, letterToCode));
-                record.set(KmerExtractor::storedKey(spread), rank, 0, true,
-                           extractor.adjacentUnknown());
-                const size_t bucket = KmerExtractor::bucketOfKmer(spread, buckets);
-                writer.add(thread, record, bucket);
-                counts[bucket * KmerRecord::SUB_BUCKET_COUNT + record.subBucket()]++;
-                emitted++;
+                }
             }
         }
     }
@@ -430,7 +455,10 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
                                                         std::vector<uint64_t>(countEntries, 0));
 
     Timer timer;
-    BucketWriter<KmerRecord> writer(prefix, KmerRecord::BUCKET_COUNT, par.threads, budget);
+    // it sees a sequence once, so the arenas come out of the budget the staging would have had
+    reader.openBatch(par.threads, READ_ARENA_BYTES, budget, RunDbReader::READ_ONCE);
+    BucketWriter<KmerRecord> writer(prefix, KmerRecord::BUCKET_COUNT, par.threads,
+                                    budget - (size_t) par.threads * READ_ARENA_BYTES);
     writer.openAt(keep);
     uint64_t written = 0;
     Debug::Progress progress(chunks.size() - resume);
