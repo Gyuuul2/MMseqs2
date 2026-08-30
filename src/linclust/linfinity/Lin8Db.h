@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/resource.h>
 #ifdef OPENMP
 #include <omp.h>
 #endif
@@ -334,7 +335,44 @@ public:
         }
     }
 
+    // how many descriptors to leave for the database, the input and stdio
+    static const size_t DESCRIPTOR_SLACK = 512;
+
+    // raise the soft limit toward what a descriptor a bucket would need, and say what it gave
+    size_t lendDescriptors() const {
+        struct rlimit limit;
+        if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+            return 0;
+        }
+        const rlim_t want = (rlim_t) buckets + DESCRIPTOR_SLACK;
+        if (limit.rlim_cur < want) {
+            limit.rlim_cur = std::min(want, limit.rlim_max);
+            if (setrlimit(RLIMIT_NOFILE, &limit) != 0 || getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+                return 0;
+            }
+        }
+        const size_t lent = limit.rlim_cur > DESCRIPTOR_SLACK
+                                ? std::min<size_t>(buckets, (size_t) limit.rlim_cur - DESCRIPTOR_SLACK)
+                                : 0;
+        Debug(Debug::INFO) << "Keeping " << lent << " of " << buckets
+                           << " buckets open; the rest are opened for the write\n";
+        return lent;
+    }
+
+    // A kept descriptor costs nothing to write through; one opened for the write and closed after it
+    // costs two trips to the filesystem, which a shared one charges for. Ask for a descriptor a
+    // bucket, keep as many as the machine lends, and open the rest for as long as a write takes.
+    int fdOf(size_t bucket) const { return kept[bucket] >= 0 ? kept[bucket] : openBucket(bucket); }
+
+    void release(int fd, size_t bucket) const {
+        if (kept[bucket] < 0) {
+            closeBucket(fd, bucket);
+        }
+    }
+
     void openAt(const std::vector<uint64_t> &keep) {
+        const size_t lent = lendDescriptors();
+        kept.assign(buckets, -1);
         for (size_t i = 0; i < buckets; i++) {
             const int fd = openBucket(i);
             offsets[i] = keep[i] * Record::DISK_BYTES;
@@ -342,7 +380,11 @@ public:
                 Debug(Debug::ERROR) << "Cannot cut " << name(i) << " to " << offsets[i] << " byte\n";
                 EXIT(EXIT_FAILURE);
             }
-            closeBucket(fd, i);
+            if (i < lent) {
+                kept[i] = fd;
+            } else {
+                closeBucket(fd, i);
+            }
             written[i] = 0;
         }
     }
@@ -376,9 +418,9 @@ public:
             }
             flush(bucket, pooled[bucket]);
             if (written[bucket] > 0) {
-                const int fd = openBucket(bucket);
+                const int fd = fdOf(bucket);
                 sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE);
-                closeBucket(fd, bucket);
+                release(fd, bucket);
             }
         }
 #pragma omp parallel for schedule(dynamic, 16) num_threads(threads)
@@ -386,17 +428,23 @@ public:
             if (written[bucket] == 0) {
                 continue;
             }
-            const int fd = openBucket(bucket);
+            const int fd = fdOf(bucket);
             if (fdatasync(fd) != 0) {
                 Debug(Debug::ERROR) << "Cannot flush " << name(bucket) << " to storage\n";
                 EXIT(EXIT_FAILURE);
             }
-            closeBucket(fd, bucket);
+            release(fd, bucket);
         }
     }
 
-    // nothing stays open between writes, so there is nothing to close
-    void close() {}
+    void close() {
+        for (size_t i = 0; i < kept.size(); i++) {
+            if (kept[i] >= 0) {
+                closeBucket(kept[i], i);
+                kept[i] = -1;
+            }
+        }
+    }
 
     const std::vector<uint64_t> &chunkCounts() const { return written; }
     void resetCounts() { std::fill(written.begin(), written.end(), 0); }
@@ -458,13 +506,13 @@ private:
         }
         const uint64_t at = __sync_fetch_and_add(&offsets[bucket], bytes);
         __sync_fetch_and_add(&written[bucket], buffer.size());
-        const int fd = openBucket(bucket);
+        const int fd = fdOf(bucket);
         const ssize_t wrote = pwrite(fd, bytesOut, bytes, static_cast<off_t>(at));
         if (wrote < 0 || static_cast<size_t>(wrote) != bytes) {
             Debug(Debug::ERROR) << "Cannot write " << bytes << " byte to " << name(bucket) << "\n";
             EXIT(EXIT_FAILURE);
         }
-        closeBucket(fd, bucket);
+        release(fd, bucket);
         buffer.clear();
     }
 
@@ -478,6 +526,7 @@ private:
     std::vector<std::vector<Record> > pooled;
     std::vector<std::vector<Record> > leaving;
     std::vector<int> gate;
+    mutable std::vector<int> kept;
     size_t held;
     std::vector<uint64_t> written;
     std::vector<uint64_t> offsets;
