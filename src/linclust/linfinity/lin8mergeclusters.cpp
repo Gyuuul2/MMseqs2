@@ -85,6 +85,8 @@ int lin8mergehashredundancy(int argc, const char **argv, const Command &command)
         members.openAt(nothing);
         kept.openAt(nothing);
 
+        Debug(Debug::INFO) << "Routing " << repRankBlocks << " blocks on the rank they join on\n";
+        Debug::Progress routeProgress(repRankBlocks);
         // every consumer sorts first, so which thread wrote a row where cannot reach the answer
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
         for (size_t repRankBlock = 0; repRankBlock < repRankBlocks; repRankBlock++) {
@@ -113,6 +115,7 @@ int lin8mergehashredundancy(int argc, const char **argv, const Command &command)
                 EXIT(EXIT_FAILURE);
             }
             fclose(in);
+            routeProgress.updateProgress();
         }
 
         FILE *in = fopen(par.db2.c_str(), "r");
@@ -153,6 +156,9 @@ int lin8mergehashredundancy(int argc, const char **argv, const Command &command)
         BucketWriter<PairRecord> writer(extra, repRankBlocks, par.threads, budget);
         std::vector<uint64_t> nothing(repRankBlocks, 0);
         writer.openAt(nothing);
+        Debug(Debug::INFO) << "Putting the redundant sequences back into " << repRankBlocks
+                           << " blocks\n";
+        Debug::Progress backProgress(repRankBlocks);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+ : added)
         for (size_t repRankBlock = 0; repRankBlock < repRankBlocks; repRankBlock++) {
             unsigned int thread = 0;
@@ -163,7 +169,9 @@ int lin8mergehashredundancy(int argc, const char **argv, const Command &command)
             std::vector<JoinRow> right;
             readJoinRowsFromFile(byKept + "." + SSTR(repRankBlock), right);
             if (right.empty()) {
-                continue;  // nothing was reduced into any rank of this repRankBlock
+                // nothing was reduced into any rank of this repRankBlock
+                backProgress.updateProgress();
+                continue;
             }
             readJoinRowsFromFile(byMember + "." + SSTR(repRankBlock), left);
             SORT_SERIAL(left.begin(), left.end(), JoinRow::byJoinKey);
@@ -180,6 +188,7 @@ int lin8mergehashredundancy(int argc, const char **argv, const Command &command)
                     added++;
                 }
             }
+            backProgress.updateProgress();
         }
         writer.flushAll(par.threads);
         writer.close();

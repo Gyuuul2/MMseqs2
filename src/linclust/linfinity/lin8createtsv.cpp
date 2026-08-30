@@ -50,6 +50,9 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
     const size_t NAME_BATCH = 1u << 16;
     std::vector<const char *> beginOf(NAME_BATCH, NULL);
     RunDbReader::HeaderStream headers(reader);
+    Debug(Debug::INFO) << "Naming " << reader.getSize() << " sequences, one step a "
+                       << NAME_BATCH << "\n";
+    Debug::Progress nameProgress(reader.getSize() / NAME_BATCH + 1);
     const char *begin = NULL;
     size_t length = 0;
     uint64_t rank = 0;
@@ -67,6 +70,7 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
         if (got == 0) {
             break;
         }
+        nameProgress.updateProgress();
 #pragma omp parallel for schedule(static) num_threads(threads)
         for (size_t i = 0; i < got; i++) {
             // the same name createtsv would give, so the two can be compared
@@ -125,6 +129,9 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
 
     const std::string tmp = par.db3 + ".tmp";
     const int out = open(tmp.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0666);
+    Debug(Debug::INFO) << "Writing " << (startOf[threads] >> 20) << " MB of rows in "
+                       << threads << " parts\n";
+    Debug::Progress writeProgress(threads);
     if (out < 0 || ftruncate(out, (off_t) startOf[threads]) != 0) {
         Debug(Debug::ERROR) << "Cannot make " << tmp << " of " << startOf[threads] << " byte\n";
         EXIT(EXIT_FAILURE);
@@ -156,6 +163,7 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
                                 << startOf[t + 1] << "\n";
             EXIT(EXIT_FAILURE);
         }
+        writeProgress.updateProgress();
     }
     if (::close(out) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << tmp << "\n";
