@@ -32,7 +32,9 @@ static const uint64_t PROGRESS_STEP = 1000000;
 
 static std::vector<InputSplit> inputSplitsForNode(const std::vector<std::string> &filenames,
                                              const NodePlacement &placement, unsigned int threads) {
-    const size_t want = std::max<size_t>(1, (size_t) placement.count * std::max(threads, 1u) * 4);
+    // more pieces than threads so a slow one does not hold a barrier, and no more than that
+    // because the counting arrays are a histogram a piece
+    const size_t want = std::max<size_t>(1, (size_t) placement.count * std::max(threads, 1u) * 2);
     const std::vector<InputSplit> all = planInputSplits(filenames, want);
     std::vector<uint64_t> upTo(all.size() + 1, 0);
     for (size_t i = 0; i < all.size(); i++) {
