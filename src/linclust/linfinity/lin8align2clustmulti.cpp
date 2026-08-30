@@ -75,10 +75,10 @@ int lin8align2clustmulti(int argc, const char **argv, const Command &command) {
         requireEveryNodeDone(par.db1 + "." + SSTR(repRankBlock), alignNodes);
     }
 
-    RankBitmap taken;
+    ClusterAssignmentBitmap assignedCluster;
     // beside the accepted pairs, the same place the aligning half keeps its own
-    taken.open(par.db3 + ".cluster_assigned", ranks);
-    taken.catchUpTo(par.db3, firstRepRankBlock);
+    assignedCluster.open(par.db3 + ".cluster_assigned", ranks);
+    assignedCluster.catchUpTo(par.db3, firstRepRankBlock);
 
     const std::string outPath = par.db3 + ".0." + SSTR(firstRepRankBlock);
     const std::string outTmp = outPath + ".tmp";
@@ -114,7 +114,7 @@ int lin8align2clustmulti(int argc, const char **argv, const Command &command) {
             for (size_t i = at; i < end; i++) {
                 members.push_back(rows[i].member());
             }
-            clusters += takeCluster(rep, members.data(), members.size(), taken, outBuffer, assigned)
+            clusters += assignCluster(rep, members.data(), members.size(), assignedCluster, outBuffer, assigned)
                         ? 1 : 0;
             at = end;
             if (outBuffer.size() >= (1u << 16)) {
@@ -139,7 +139,7 @@ int lin8align2clustmulti(int argc, const char **argv, const Command &command) {
     }
     FileUtil::publishAtomically(outTmp, outPath);
     // the decisions are on disk now, so the cache may name the repRankBlocks that made them
-    taken.save(lastRepRankBlock);
+    assignedCluster.save(lastRepRankBlock);
     if (par.removeTmpFiles) {
         for (size_t repRankBlock = firstRepRankBlock; repRankBlock < lastRepRankBlock; repRankBlock++) {
             dropConsumed(par.db2, alignNodes, repRankBlock, repRankBlock + 1, 1);

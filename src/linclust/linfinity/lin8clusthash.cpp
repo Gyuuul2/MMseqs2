@@ -177,29 +177,29 @@ static bool sequencesMatch(const char *left, const char *right, uint32_t length,
 
 static void reduceOneHashBucket(const RunDbReader &reader, const HashEntry *bucket, size_t size,
                           uint32_t length, const unsigned char *aa2num, float identity,
-                          std::vector<char> &taken, std::vector<ClusterPair> &out) {
+                          std::vector<char> &claimed, std::vector<ClusterPair> &out) {
     if (size < 2) {
         return;
     }
-    taken.assign(size, 0);
+    claimed.assign(size, 0);
     for (size_t i = 0; i < size; i++) {
-        if (taken[i]) {
+        if (claimed[i]) {
             continue;
         }
         const char *query = reader.getData(bucket[i].rankOf());
         for (size_t j = i + 1; j < size; j++) {
-            if (taken[j]) {
+            if (claimed[j]) {
                 continue;
             }
             if (sequencesMatch(query, reader.getData(bucket[j].rankOf()), length, identity)) {
-                taken[j] = 1;
+                claimed[j] = 1;
                 ClusterPair pair;
                 pair.member = bucket[j].rankOf();
                 pair.representative = bucket[i].rankOf();
                 out.push_back(pair);
             }
         }
-        taken[i] = 1;
+        claimed[i] = 1;
     }
 }
 
@@ -332,12 +332,12 @@ static void reduceEntriesToClusters(const RunDbReader &reader, std::vector<HashE
 #ifdef OPENMP
         thread = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-        std::vector<char> taken;
+        std::vector<char> claimed;
 #pragma omp for schedule(dynamic, 1)
         for (size_t b = 0; b < bucketStart.size() / 2; b++) {
             reduceOneHashBucket(reader, entries.data() + bucketStart[2 * b],
                               bucketStart[2 * b + 1] - bucketStart[2 * b], length, aa2num, identity,
-                              taken, pairsPerThread[thread]);
+                              claimed, pairsPerThread[thread]);
         }
     }
     for (unsigned int i = 0; i < useThreads; i++) {

@@ -226,14 +226,14 @@ static float parsePrecisionLib(const std::string &table, double seqId, double co
 
 static bool rescueWithGaps(uint64_t member, uint32_t queryLen, uint32_t targetLen,
                            const char *querySeq, const char *targetSeq,
-                           const BlockAligner::UngappedAln_res &hit, const RankBitmap &taken,
+                           const BlockAligner::UngappedAln_res &hit, const ClusterAssignmentBitmap &assignedCluster,
                            Sequence &target, BlockAligner &aligner, const Parameters &par,
                            float scorePerColThreshold, int xDrop, GateCounts &gate) {
     if (hit.diagonalLen <= 0
         || (float) hit.score / (float) hit.diagonalLen < scorePerColThreshold) {
         return false;
     }
-    if (hit.qStart < 0 || hit.tStart < 0 || hit.alnLen < 3 || taken.taken(member)) {
+    if (hit.qStart < 0 || hit.tStart < 0 || hit.alnLen < 3 || assignedCluster.isAssigned(member)) {
         return false;
     }
     int queryFrom = -1;
@@ -274,17 +274,17 @@ static bool rescueWithGaps(uint64_t member, uint32_t queryLen, uint32_t targetLe
 
 // puts the read in flight, so the caller can spend the time it takes on the batch it already has
 static size_t startMemberBatch(const RunDbReader &reader, uint64_t rep, const PairRecord *rows,
-                               size_t count, const RankBitmap &taken, const Parameters &par,
+                               size_t count, const ClusterAssignmentBitmap &assignedCluster, const Parameters &par,
                                unsigned int thread, unsigned int lane, Candidates &candidates) {
     candidates.clear();
-    // taken since the work list was drawn: a whole group of reads takeCluster would throw away
-    if (taken.taken(rep)) {
+    // assigned since the work list was drawn: a whole group of reads assignCluster would throw away
+    if (assignedCluster.isAssigned(rep)) {
         return 0;
     }
     const uint32_t queryLen = reader.getSeqLen(rep);
     for (size_t i = 0; i < count; i++) {
         const uint64_t member = rows[i].member();
-        if (member == rep || taken.taken(member)) {
+        if (member == rep || assignedCluster.isAssigned(member)) {
             continue;
         }
         if (Util::canBeCovered(par.covThr, par.covMode, queryLen, reader.getSeqLen(member)) == false) {
@@ -301,7 +301,7 @@ static size_t startMemberBatch(const RunDbReader &reader, uint64_t rep, const Pa
 
 // a lane that could not hold every candidate finishes the rest through itself, and that path waits
 static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, size_t got,
-                       const RankBitmap &taken, Sequence &query, Sequence &target,
+                       const ClusterAssignmentBitmap &assignedCluster, Sequence &query, Sequence &target,
                        BlockAligner &aligner, const Parameters &par, unsigned int thread,
                        unsigned int lane, Candidates &candidates,
                        std::vector<uint64_t> &out, GateCounts &gate, float scorePerColThreshold,
@@ -315,8 +315,8 @@ static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, size_t got
         aligner.initQuery(&query);
         for (size_t k = 0; k < got; k++) {
             const uint64_t member = candidates.members[from + k];
-            // taken while in flight: the read is spent, the alignment is not
-            if (taken.taken(member)) {
+            // assigned while in flight: the read is spent, the alignment is not
+            if (assignedCluster.isAssigned(member)) {
                 gate.stale++;
                 continue;
             }
@@ -329,7 +329,7 @@ static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, size_t got
             if (hit.eval > par.evalThr || hit.alnLen < par.alnLenThr
                 || Util::hasCoverage(par.covThr, par.covMode, hit.qcov, hit.tcov) == false) {
                 gate.rejected++;
-                if (rescueWithGaps(member, queryLen, targetLen, querySeq, targetSeq, hit, taken,
+                if (rescueWithGaps(member, queryLen, targetLen, querySeq, targetSeq, hit, assignedCluster,
                                    target, aligner, par, scorePerColThreshold, xDrop, gate)) {
                     out.push_back(member);
                 }
@@ -346,7 +346,7 @@ static void alignMemberBatch(const RunDbReader &reader, uint64_t rep, size_t got
             if (Util::computeSeqId(par.seqIdMode, identical, queryLen, targetLen, hit.alnLen)
                 < par.seqIdThr - FLT_EPSILON) {
                 gate.rejected++;
-                if (rescueWithGaps(member, queryLen, targetLen, querySeq, targetSeq, hit, taken,
+                if (rescueWithGaps(member, queryLen, targetLen, querySeq, targetSeq, hit, assignedCluster,
                                    target, aligner, par, scorePerColThreshold, xDrop, gate)) {
                     out.push_back(member);
                 }
@@ -406,11 +406,11 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                        << (lastRepRankBlock - firstRepRankBlock) << " of " << repRankBlocks << " repRankBlocks\n";
 
     // this run's progress rather than the database's, so it sits beside the accepted pairs
-    RankBitmap taken;
-    taken.open(par.db4 + ".align_assigned_" + SSTR(node.index), ranks);
-    taken.catchUpTo(par.db4, firstRepRankBlock);
+    ClusterAssignmentBitmap assignedCluster;
+    assignedCluster.open(par.db4 + ".align_assigned_" + SSTR(node.index), ranks);
+    assignedCluster.catchUpTo(par.db4, firstRepRankBlock);
     if (decideHere == false) {
-        taken.save(firstRepRankBlock);
+        assignedCluster.save(firstRepRankBlock);
     }
     const BucketCounts prefCounts(par.db2, writerNodes, PairRecord::REP_RANK_SUB_BLOCKS, repRankBlocks);
 
@@ -468,7 +468,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
         }
         RepRankBlockReader stream(par.db2, writerNodes, repRankBlock, STREAM_ROWS, skipRows);
 
-        // only the deciding is ordered; takeCluster checks the bitmap again, so a stale view of it
+        // only the deciding is ordered; assignCluster checks the bitmap again, so a stale view of it
         // costs work that is thrown away and never reaches a different answer
         while (true) {
             double mark = omp_get_wtime();
@@ -495,7 +495,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
             for (size_t g = 0; g < groups; g++) {
                 survivors[g].clear();
                 const uint64_t rep = batch[starts[g]].rep();
-                if (rep < myFrom || rep >= myUntil || taken.taken(rep)) {
+                if (rep < myFrom || rep >= myUntil || assignedCluster.isAssigned(rep)) {
                     continue;
                 }
                 const size_t rows = starts[g + 1] - starts[g];
@@ -532,7 +532,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                     const MemberBatch &item = work[here];
                     const size_t at = starts[item.group];
                     got = startMemberBatch(reader, batch[at].rep(), &batch[at + item.from],
-                                           item.count, taken, par, thread, lane,
+                                           item.count, assignedCluster, par, thread, lane,
                                            candidates[thread][lane]);
                 }
                 while (here < work.size()) {
@@ -543,13 +543,13 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                         const MemberBatch &item = work[next];
                         const size_t at = starts[item.group];
                         nextGot = startMemberBatch(reader, batch[at].rep(), &batch[at + item.from],
-                                                   item.count, taken, par, thread, nextLane,
+                                                   item.count, assignedCluster, par, thread, nextLane,
                                                    candidates[thread][nextLane]);
                     }
                     const MemberBatch &item = work[here];
                     const size_t at = starts[item.group];
                     batchSurvivors[here].clear();
-                    alignMemberBatch(reader, batch[at].rep(), got, taken, worker.query,
+                    alignMemberBatch(reader, batch[at].rep(), got, assignedCluster, worker.query,
                                      worker.target, worker.aligner, par, thread, lane,
                                      candidates[thread][lane], batchSurvivors[here],
                                      gate[thread], scorePerColThreshold, xDrop);
@@ -573,7 +573,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                 aligned += starts[g + 1] - starts[g];
                 passed += survivors[g].size();
                 if (decideHere) {
-                    clusters += takeCluster(rep, survivors[g].data(), survivors[g].size(), taken,
+                    clusters += assignCluster(rep, survivors[g].data(), survivors[g].size(), assignedCluster,
                                             outBuffer, assigned) ? 1 : 0;
                 } else {
                     PairRecord line;
@@ -631,7 +631,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
 
     if (decideHere) {
         // every repRankBlock this run decided is published, so the cache can name them all
-        taken.save(lastRepRankBlock);
+        assignedCluster.save(lastRepRankBlock);
     }
 
     const std::string shapeTmp = (decideHere ? par.db4 : par.db3)

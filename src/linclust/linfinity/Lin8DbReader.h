@@ -150,11 +150,11 @@ private:
     mutable bool wantDirect;
 };
 
-class RankBitmap {
+class ClusterAssignmentBitmap {
 public:
-    RankBitmap() : words(NULL), ranks(0), wordCount(0), appliedRepRankBlocks(0) {}
+    ClusterAssignmentBitmap() : words(NULL), ranks(0), wordCount(0), appliedRepRankBlocks(0) {}
 
-    ~RankBitmap() {
+    ~ClusterAssignmentBitmap() {
         if (words != NULL) {
             munmap(words, bytes());
         }
@@ -167,7 +167,7 @@ public:
         wordCount = (ranks + 63) / 64;
         void *at = mmap(NULL, bytes(), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
         if (at == MAP_FAILED) {
-            Debug(Debug::ERROR) << "Cannot reserve " << bytes() << " byte for the taken bitmap\n";
+            Debug(Debug::ERROR) << "Cannot reserve " << bytes() << " byte for the cluster assignment bitmap\n";
             EXIT(EXIT_FAILURE);
         }
         words = static_cast<uint64_t *>(at);
@@ -197,8 +197,8 @@ public:
         appliedRepRankBlocks = header[2];
     }
 
-    bool taken(uint64_t rank) const { return (words[rank >> 6] >> (rank & 63) & 1) != 0; }
-    void take(uint64_t rank) { words[rank >> 6] |= uint64_t(1) << (rank & 63); }
+    bool isAssigned(uint64_t rank) const { return (words[rank >> 6] >> (rank & 63) & 1) != 0; }
+    void assign(uint64_t rank) { words[rank >> 6] |= uint64_t(1) << (rank & 63); }
     uint64_t size() const { return ranks; }
     size_t applied() const { return appliedRepRankBlocks; }
 
@@ -215,8 +215,8 @@ public:
             size_t read = 0;
             while ((read = readRecords(buffer.data(), buffer.size(), in)) > 0) {
                 for (size_t k = 0; k < read; k++) {
-                    take(buffer[k].rep());
-                    take(buffer[k].member());
+                    assign(buffer[k].rep());
+                    assign(buffer[k].member());
                 }
             }
             if (ferror(in) != 0) {
@@ -253,8 +253,8 @@ public:
     }
 
 private:
-    RankBitmap(const RankBitmap &);
-    RankBitmap &operator=(const RankBitmap &);
+    ClusterAssignmentBitmap(const ClusterAssignmentBitmap &);
+    ClusterAssignmentBitmap &operator=(const ClusterAssignmentBitmap &);
 
     size_t bytes() const { return wordCount * sizeof(uint64_t); }
 
@@ -267,21 +267,22 @@ private:
     std::string cache;
 };
 
-inline bool takeCluster(uint64_t rep, const uint64_t *members, size_t count, RankBitmap &taken,
-                        std::vector<PairRecord> &out, uint64_t &assigned) {
-    if (taken.taken(rep)) {
+inline bool assignCluster(uint64_t rep, const uint64_t *members, size_t count,
+                          ClusterAssignmentBitmap &assignedCluster, std::vector<PairRecord> &out,
+                          uint64_t &assigned) {
+    if (assignedCluster.isAssigned(rep)) {
         return false;
     }
-    taken.take(rep);
+    assignedCluster.assign(rep);
     PairRecord line;
     line.set(rep, rep, 0);
     out.push_back(line);
     for (size_t i = 0; i < count; i++) {
         const uint64_t member = members[i];
-        if (member == rep || taken.taken(member)) {
+        if (member == rep || assignedCluster.isAssigned(member)) {
             continue;
         }
-        taken.take(member);
+        assignedCluster.assign(member);
         line.set(rep, member, 0);
         out.push_back(line);
         assigned++;

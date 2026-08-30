@@ -709,21 +709,21 @@ size_t RunDbReader::startBatch(uint64_t queryRank, const uint64_t *members, size
     // the query goes in first because it is the lowest rank of the batch, which keeps the run cursor
     // and the disk offsets moving forward and lets a member that lands next to it share its read
     appendBatchRead(at, queryRank, cursor, at.queryAt);
-    size_t taken = 0;
-    for (; taken < n; taken++) {
+    size_t loaded = 0;
+    for (; loaded < n; loaded++) {
         const char *where = NULL;
-        if (appendBatchRead(at, members[taken], cursor, where) == false) {
+        if (appendBatchRead(at, members[loaded], cursor, where) == false) {
             break;
         }
         at.memberAt.push_back(where);
     }
-    if (taken == 0 && n > 0) {
+    if (loaded == 0 && n > 0) {
         // openBatch sized the lanes so this cannot happen; a hung node is worse than a stopped one
         Debug(Debug::ERROR) << "A read lane of " << at.arena.size() << " byte took none of "
                             << n << " member, so the pass would not move\n";
         EXIT(EXIT_FAILURE);
     }
     at.ring.submit(db.c_str());
-    return taken;
+    return loaded;
 }
 
