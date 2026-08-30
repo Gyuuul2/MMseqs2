@@ -84,6 +84,16 @@ static std::pair<size_t, size_t> runsInFileSlot(const RunTable &runs, size_t fil
 
 static const uint64_t ANCHOR_BASE = 1099511628211ull;
 
+// where the wall clock of this pass actually goes, so a slow run says which part was slow
+static double spentHashing = 0;
+static double spentSorting = 0;
+static double spentGrouping = 0;
+static double spentComparing = 0;
+static double spentSpilling = 0;
+static double hashingThreadSeconds = 0;   // useThreads x elapsed, so the average parallelism shows
+static uint64_t segmentsSeen = 0;
+static uint64_t segmentsOnOneThread = 0;
+
 static uint32_t anchorLength(float identity) {
     if (identity >= 1.0f) {
         return 12;
@@ -203,12 +213,15 @@ static void reduceOneHashBucket(const RunDbReader &reader, const HashEntry *buck
     }
 }
 
+// a partition is a file held open, so the count is capped the way clusthashfast caps its own
+static const size_t MAX_HASH_PARTITIONS = 4096;
+
 static size_t hashPartitionCount(size_t entries, size_t budget) {
     const size_t need = entries * sizeof(HashEntry) * 3;
     if (budget == 0 || need <= budget) {
         return 1;
     }
-    return (need + budget - 1) / budget;
+    return std::min(MAX_HASH_PARTITIONS, (need + budget - 1) / budget);
 }
 
 class HashPartitions {
@@ -309,7 +322,10 @@ static unsigned int threadsWorthStarting(size_t work, unsigned int threads) {
 static void reduceEntriesToClusters(const RunDbReader &reader, std::vector<HashEntry> &entries,
                            uint32_t length, const unsigned char *aa2num, float identity,
                            unsigned int threads, std::vector<ClusterPair> &out, size_t &crowded) {
+    double mark = omp_get_wtime();
     SORT_PARALLEL(entries.begin(), entries.end(), HashEntry::byHashAndRank);
+    spentSorting += omp_get_wtime() - mark;
+    mark = omp_get_wtime();
     std::vector<size_t> bucketStart;
     for (size_t i = 0; i < entries.size();) {
         size_t j = i + 1;
@@ -324,6 +340,8 @@ static void reduceEntriesToClusters(const RunDbReader &reader, std::vector<HashE
         }
         i = j;
     }
+    spentGrouping += omp_get_wtime() - mark;
+    mark = omp_get_wtime();
     const unsigned int useThreads = threadsWorthStarting(bucketStart.size() / 2, threads);
     std::vector<std::vector<ClusterPair> > pairsPerThread(useThreads);
 #pragma omp parallel num_threads(useThreads)
@@ -340,6 +358,7 @@ static void reduceEntriesToClusters(const RunDbReader &reader, std::vector<HashE
                               claimed, pairsPerThread[thread]);
         }
     }
+    spentComparing += omp_get_wtime() - mark;
     for (unsigned int i = 0; i < useThreads; i++) {
         out.insert(out.end(), pairsPerThread[i].begin(), pairsPerThread[i].end());
     }
@@ -357,6 +376,7 @@ static void reduceSequencesOfOneLength(const RunDbReader &reader, uint64_t rankB
     std::vector<HashEntry> entries;
     if (partitions == 1) {
         // nothing to divide, so the entries never leave memory
+        const double mark = omp_get_wtime();
         const unsigned int useThreads = threadsWorthStarting(count, threads);
         std::vector<std::vector<HashEntry> > perThread(useThreads);
 #pragma omp parallel num_threads(useThreads)
@@ -392,10 +412,16 @@ static void reduceSequencesOfOneLength(const RunDbReader &reader, uint64_t rankB
             entries.insert(entries.end(), perThread[i].begin(), perThread[i].end());
             std::vector<HashEntry>().swap(perThread[i]);
         }
+        const double took = omp_get_wtime() - mark;
+        spentHashing += took;
+        hashingThreadSeconds += took * useThreads;
+        segmentsSeen++;
+        segmentsOnOneThread += (useThreads == 1);
         reduceEntriesToClusters(reader, entries, length, aa2num, identity, threads, out, crowded);
         return;
     }
 
+    double mark = omp_get_wtime();
     const unsigned int useThreads = threadsWorthStarting(count, threads);
     HashPartitions parts(tmpPrefix, partitions, useThreads);
 #pragma omp parallel num_threads(useThreads)
@@ -428,8 +454,17 @@ static void reduceSequencesOfOneLength(const RunDbReader &reader, uint64_t rankB
         }
     }
     parts.finish();
+    {
+        const double took = omp_get_wtime() - mark;
+        spentHashing += took;
+        hashingThreadSeconds += took * useThreads;
+        segmentsSeen++;
+        segmentsOnOneThread += (useThreads == 1);
+    }
     for (size_t at = 0; at < partitions; at++) {
+        mark = omp_get_wtime();
         parts.load(at, entries);
+        spentSpilling += omp_get_wtime() - mark;
         reduceEntriesToClusters(reader, entries, length, aa2num, identity, threads, out, crowded);
     }
 }
@@ -649,6 +684,13 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
 
     const uint64_t all = mergeNodeShards(par.db2, par.db1 + RunDbReader::KEPT_BITMAP_SUFFIX,
                                          node.count, reader, uniqueTmpSuffix());
+    Debug(Debug::INFO) << "Where the time went: hashing " << (uint64_t) spentHashing
+                       << "s, sorting " << (uint64_t) spentSorting << "s, grouping "
+                       << (uint64_t) spentGrouping << "s, comparing " << (uint64_t) spentComparing
+                       << "s, spilling " << (uint64_t) spentSpilling << "s\n";
+    Debug(Debug::INFO) << "Hashing ran on " << (spentHashing > 0 ? hashingThreadSeconds / spentHashing : 0)
+                       << " threads on average over " << segmentsSeen << " length segments, "
+                       << segmentsOnOneThread << " of which got one thread\n";
     Debug(Debug::INFO) << "Kept " << all << " of " << reader.getSize() << " sequences ("
                        << (100.0 * static_cast<double>(reader.getSize() - all)
                            / static_cast<double>(std::max<uint64_t>(reader.getSize(), 1)))
