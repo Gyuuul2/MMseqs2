@@ -655,6 +655,8 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
                 lengths += (segment == span.first || runs[segment].seqLen() != runs[segment - 1].seqLen());
             }
         }
+        Debug(Debug::INFO) << "Hashing and comparing " << lengths
+                           << " length groups, one step a group\n";
         Debug::Progress progress(lengths);
         for (size_t at = 0; at < mine.size(); at++) {
             const std::pair<size_t, size_t> span = runsInFileSlot(runs, mine[at]);

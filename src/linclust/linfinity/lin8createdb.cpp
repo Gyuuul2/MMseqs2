@@ -27,6 +27,9 @@ static const size_t LINCLUSTERDB_HISTOGRAM_SIZE = LINCLUSTERDB_MAX_SEQ_LEN + 1;
 static const uint64_t LINCLUSTERDB_HISTOGRAM_MAGIC = 0x4C494E4348495354ull;
 
 
+// a step of the placing bar, so it moves on a minute rather than on a whole input file
+static const uint64_t PROGRESS_STEP = 1000000;
+
 static std::vector<InputSplit> inputSplitsForNode(const std::vector<std::string> &filenames,
                                              const NodePlacement &placement, unsigned int threads) {
     const size_t want = std::max<size_t>(1, (size_t) placement.count * std::max(threads, 1u) * 4);
@@ -83,6 +86,7 @@ static LocalCounts countSequenceLengths(const std::vector<std::string> &filename
     nodeCounts.perInputSplitHeaderBytes.assign(LINCLUSTERDB_HISTOGRAM_SIZE * nodeCounts.inputSplitCount, 0);
     std::vector<std::pair<std::string, size_t> > skippedAll;
     std::vector<std::pair<std::string, size_t> > aloneAll;
+    Debug::Progress progress(nodeInputSplits.size());
 #pragma omp parallel num_threads(threads)
     {
         uint64_t sequences = 0;
@@ -116,6 +120,7 @@ static LocalCounts countSequenceLengths(const std::vector<std::string> &filename
                 residues += length;
                 headerBytes += header;
             }
+            progress.updateProgress();
         }
 #pragma omp critical
         {
@@ -416,13 +421,13 @@ static void writeSequencesAndHeaders(const std::vector<std::string> &filenames, 
                       const std::vector<int> &seqFd, const std::vector<int> &hdrFd,
                       unsigned int threads, size_t budget, uint32_t maxSeqLen) {
     uint64_t written = 0;
-    Debug::Progress progress(nodeInputSplits.size());
+    // one step a million sequences, because there are far fewer splits than there are minutes
+    Debug::Progress progress(nodeCounts.sequences / PROGRESS_STEP + 1);
 #pragma omp parallel num_threads(threads)
     {
         std::string header;
 #pragma omp for schedule(dynamic, 1)
         for (size_t at = 0; at < nodeInputSplits.size(); at++) {
-            progress.updateProgress();
             SequenceWriter writer(seqFd, hdrFd, nodeCounts, layout, static_cast<unsigned int>(at),
                               std::max<size_t>(budget / threads, 1u << 20));
             InputSplitReader reader(filenames[nodeInputSplits[at].file], nodeInputSplits[at]);
@@ -430,14 +435,22 @@ static void writeSequencesAndHeaders(const std::vector<std::string> &filenames, 
             const char *seq = NULL;
             size_t nameLength = 0;
             size_t length = 0;
+            uint64_t placed = 0;
             while (reader.next(name, nameLength, seq, length)) {
                 if (length == 0 || length > maxSeqLen) {
                     continue;
+                }
+                if (++placed % PROGRESS_STEP == 0) {
+                    progress.updateProgress();
                 }
                 header.assign(name, nameLength);
                 header.append(1, '\n');
                 writer.add(length, reinterpret_cast<const unsigned char *>(seq), header.c_str(),
                            header.size());
+            }
+            // the bar closes on an exact count, so a split hands back what its last step did not fill
+            if (placed % PROGRESS_STEP != 0) {
+                progress.updateProgress();
             }
             writer.flush();
 #pragma omp atomic
@@ -574,6 +587,7 @@ int lin8createdb(int argc, const char **argv, const Command &command) {
                            << " of " << filenames.size() << " input file"
                            << (filenames.size() == 1 ? "" : "s") << ", buffer budget "
                            << (budget / (1024 * 1024)) << " MB\n";
+        Debug(Debug::INFO) << "Counting the sequences and their lengths\n";
         nodeCounts = countSequenceLengths(filenames, nodeInputSplits, par.threads, maxSeqLen);
         Debug(Debug::INFO) << "Counted " << nodeCounts.sequences << " sequences, " << nodeCounts.residues
                            << " residues in " << timer.lap() << "\n";
@@ -627,6 +641,8 @@ int lin8createdb(int argc, const char **argv, const Command &command) {
                                                layout.seqBytes, layout.seqFileStart);
         std::vector<int> hdrFd = openDataFiles(headerDb, node.index * par.threads, par.threads,
                                                layout.hdrBytes, layout.hdrFileStart);
+        Debug(Debug::INFO) << "Placing " << nodeCounts.sequences << " sequences by length, "
+                           << PROGRESS_STEP / 1000000 << "M a step\n";
         writeSequencesAndHeaders(filenames, nodeInputSplits, nodeCounts, layout, seqFd, hdrFd, par.threads, budget,
                                  maxSeqLen);
         dropCacheAndCloseFiles(seqFd);
