@@ -788,7 +788,24 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
     }
     std::vector<std::vector<uint64_t> > repRankSubBlockCounts(par.threads,
                                                        std::vector<uint64_t>(countEntries, 0));
-    BucketWriter<PairRecord> writer(prefix, repRankBlockCount, par.threads, budget);
+    // loadBucket has to hold one whole bucket out of the same budget, so the writer takes the rest
+    uint64_t largestBucket = 0;
+    for (size_t bucket = 0; bucket < buckets; bucket++) {
+        const std::vector<uint64_t> counts = bucketCounts.of(bucket);
+        uint64_t here = 0;
+        for (size_t i = 0; i < counts.size(); i++) {
+            here += counts[i];
+        }
+        largestBucket = std::max(largestBucket, here);
+    }
+    const size_t forReading = (size_t) largestBucket * sizeof(KmerRecord);
+    if (forReading >= budget) {
+        Debug(Debug::ERROR) << "The largest k-mer bucket is " << (forReading >> 30)
+                            << " GB and the limit is " << (budget >> 30)
+                            << " GB, so raise --split-memory-limit\n";
+        EXIT(EXIT_FAILURE);
+    }
+    BucketWriter<PairRecord> writer(prefix, repRankBlockCount, par.threads, budget - forReading);
     writer.openAt(keep);
 
     Debug::Progress progress(myBuckets);
@@ -998,8 +1015,7 @@ int lin8pref(int argc, const char **argv, const Command &command) {
     requireEveryNodeDone(par.db1, writerNodes);
     const BucketCounts repRankBlockCounts(par.db1, writerNodes, PairRecord::REP_RANK_SUB_BLOCKS, repRankBlocks);
 
-    // an absent bitmap makes every rank valid, so the reader answers for both cases and there is
-    // nothing here to be null
+    // an absent bitmap makes every rank valid, so there is nothing here to be null
     RunDbReader live(par.db2);
     live.open();
 
