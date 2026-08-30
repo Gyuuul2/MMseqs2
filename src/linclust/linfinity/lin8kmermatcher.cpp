@@ -680,8 +680,8 @@ static int adjacencyScore(const KmerRecord &member, const short **centerRow) {
 
 // ranksRepeat says whether a rank can appear twice; when it cannot, a member past the centres
 // already chosen cannot be one of them, and the scan that looks for that is pure cost
-static void swapCenterSequence(KmerRecord *group, size_t size, size_t round, BaseMatrix *subMat,
-                               bool ranksRepeat) {
+static void swapCenterSequence(KmerRecord *group, std::vector<uint32_t> &lengths, size_t size,
+                               size_t round, BaseMatrix *subMat, bool ranksRepeat) {
     const short *centerRow[KmerRecord::ADJACENT_COUNT];
     for (unsigned int slot = 0; slot < KmerRecord::ADJACENT_COUNT; slot++) {
         centerRow[slot] = subMat->subMatrix[group[round - 1].adjacentAt(slot)];
@@ -703,32 +703,38 @@ static void swapCenterSequence(KmerRecord *group, size_t size, size_t round, Bas
         }
     }
     std::swap(group[round], group[best]);
+    std::swap(lengths[round], lengths[best]);
 }
 
+// The lengths are read once and carried through the rounds, the way the original keeps a length
+// beside every k-mer. A trillion will not fit in an array, so they come from the run table, and
+// asking it once a member rather than once a member a round is what makes that affordable.
 static void assignGroup(KmerRecord *group, size_t size, const RunDbReader &reader,
                          float covThr, int covMode, bool onlyExtendable, BaseMatrix *subMat,
-                         int adjacentRounds, std::vector<PairRecord> &out) {
+                         int adjacentRounds, std::vector<PairRecord> &out,
+                         std::vector<uint32_t> &lengths, RunDbReader::Cursor &at) {
     if (size < 2) {
         return;
     }
     const size_t before = out.size();
-    // the rounds each pick a different centre, so a pair can only repeat when one sequence put two
-    // k-mers of this key in the group. The group arrives sorted by rank, so one look answers that.
+    // the group arrives sorted by rank, so the cursor only moves forward and the same pass answers
+    // whether a rank repeats, which is the only way a pair can
+    lengths.resize(size);
     bool ranksRepeat = false;
-    for (size_t i = 1; i < size && ranksRepeat == false; i++) {
-        ranksRepeat = group[i].rank() == group[i - 1].rank();
+    for (size_t i = 0; i < size; i++) {
+        lengths[i] = reader.getSeqLen(group[i].rank(), at);
+        ranksRepeat = ranksRepeat || (i > 0 && group[i].rank() == group[i - 1].rank());
     }
     for (size_t round = 0; round <= (size_t) adjacentRounds && round < size; round++) {
         if (round > 0) {
-            swapCenterSequence(group, size, round, subMat, ranksRepeat);
+            swapCenterSequence(group, lengths, size, round, subMat, ranksRepeat);
         }
         const uint64_t rep = group[round].rank();
         const uint64_t repPos = group[round].pos();
-        const uint32_t queryLen = reader.getSeqLen(rep);
-        RunDbReader::Cursor at;
+        const uint32_t queryLen = lengths[round];
         for (size_t i = 0; i < size; i++) {
             const uint64_t member = group[i].rank();
-            const uint32_t targetLen = reader.getSeqLen(member, at);
+            const uint32_t targetLen = lengths[i];
             const int diagonal = static_cast<int>(repPos) - static_cast<int>(group[i].pos());
             const bool extendable =
                 diagonal < 0 || diagonal > static_cast<int>(queryLen) - static_cast<int>(targetLen);
@@ -883,6 +889,8 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
             thread = static_cast<unsigned int>(omp_get_thread_num());
 #endif
             std::vector<PairRecord> out;
+            std::vector<uint32_t> lengths;
+            RunDbReader::Cursor at;
             std::vector<uint64_t> &counts = repRankSubBlockCounts[thread];
 #pragma omp for schedule(dynamic, 1)
             for (int part = 0; part < (int) bucketWorkSplits; part++) {
@@ -894,7 +902,8 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
                     }
                     out.clear();
                     assignGroup(&records[begin], end - begin, reader, par.covThr, par.covMode,
-                                 par.includeOnlyExtendable, &subMat, adjacentRounds, out);
+                                 par.includeOnlyExtendable, &subMat, adjacentRounds, out,
+                                 lengths, at);
                     for (size_t i = 0; i < out.size(); i++) {
                         // one division for the file and the place inside it, not one each
                         const size_t fine = PairRecord::fineOf(out[i].rep(), ranks, repRankBlockCount);
