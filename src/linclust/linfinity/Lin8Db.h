@@ -13,6 +13,9 @@
 #include <cerrno>
 #include <fcntl.h>
 #include <unistd.h>
+#ifdef OPENMP
+#include <omp.h>
+#endif
 
 class RunTable {
 public:
@@ -293,8 +296,9 @@ private:
 template <typename Record>
 class BucketWriter {
 public:
+    // staging gets the spare memory, and never more than a bucket holds
     BucketWriter(const std::string &prefix, size_t buckets, unsigned int threads, size_t budget)
-        : prefix(prefix), buckets(buckets), files(buckets, -1), written(buckets, 0),
+        : prefix(prefix), buckets(buckets), written(buckets, 0),
           offsets(buckets, 0), staged(threads, std::vector<std::vector<Record> >(buckets)) {
         // a thread's buffer is small and lock free, the bucket's is shared and is what reaches the disk
         const size_t share = budget / STAGING_SHARE;
@@ -303,6 +307,7 @@ public:
         poolDepth = std::max<size_t>(depth, (share - share / 4) / (buckets * sizeof(Record)));
         poolDepth = std::min<size_t>(poolDepth, POOL_BYTES / sizeof(Record));
         pooled.resize(buckets);
+        leaving.resize(threads);
         gate.assign(buckets, 0);
         held = (threads * depth + poolDepth + depth) * buckets * sizeof(Record);
     }
@@ -311,23 +316,33 @@ public:
 
     ~BucketWriter() { close(); }
 
+    // open only while writing: one descriptor a bucket at once is more than a machine may allow
+    int openBucket(size_t bucket) const {
+        const std::string path = name(bucket);
+        const int fd = open(path.c_str(), O_WRONLY | O_CREAT, 0666);
+        if (fd < 0) {
+            Debug(Debug::ERROR) << "Cannot open " << path << " for writing, error " << errno << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        return fd;
+    }
+
+    void closeBucket(int fd, size_t bucket) const {
+        if (::close(fd) != 0) {
+            Debug(Debug::ERROR) << "Cannot close " << name(bucket) << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+
     void openAt(const std::vector<uint64_t> &keep) {
         for (size_t i = 0; i < buckets; i++) {
-            const std::string path = name(i);
-            files[i] = open(path.c_str(), O_WRONLY | O_CREAT, 0666);
-            if (files[i] < 0) {
-                Debug(Debug::ERROR) << "Cannot open " << path << " for writing\n";
-                if (errno == EMFILE || errno == ENFILE) {
-                    Debug(Debug::ERROR) << buckets << " buckets need that many open files at once."
-                                        << " Raise the limit with ulimit -n\n";
-                }
-                EXIT(EXIT_FAILURE);
-            }
+            const int fd = openBucket(i);
             offsets[i] = keep[i] * Record::DISK_BYTES;
-            if (ftruncate(files[i], static_cast<off_t>(offsets[i])) != 0) {
-                Debug(Debug::ERROR) << "Cannot cut " << path << " to " << offsets[i] << " byte\n";
+            if (ftruncate(fd, static_cast<off_t>(offsets[i])) != 0) {
+                Debug(Debug::ERROR) << "Cannot cut " << name(i) << " to " << offsets[i] << " byte\n";
                 EXIT(EXIT_FAILURE);
             }
+            closeBucket(fd, i);
             written[i] = 0;
         }
     }
@@ -361,27 +376,27 @@ public:
             }
             flush(bucket, pooled[bucket]);
             if (written[bucket] > 0) {
-                sync_file_range(files[bucket], 0, 0, SYNC_FILE_RANGE_WRITE);
+                const int fd = openBucket(bucket);
+                sync_file_range(fd, 0, 0, SYNC_FILE_RANGE_WRITE);
+                closeBucket(fd, bucket);
             }
         }
 #pragma omp parallel for schedule(dynamic, 16) num_threads(threads)
         for (size_t bucket = 0; bucket < buckets; bucket++) {
-            if (written[bucket] > 0 && fdatasync(files[bucket]) != 0) {
+            if (written[bucket] == 0) {
+                continue;
+            }
+            const int fd = openBucket(bucket);
+            if (fdatasync(fd) != 0) {
                 Debug(Debug::ERROR) << "Cannot flush " << name(bucket) << " to storage\n";
                 EXIT(EXIT_FAILURE);
             }
+            closeBucket(fd, bucket);
         }
     }
 
-    void close() {
-        for (size_t i = 0; i < buckets; i++) {
-            if (files[i] >= 0 && ::close(files[i]) != 0) {
-                Debug(Debug::ERROR) << "Cannot close " << name(i) << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            files[i] = -1;
-        }
-    }
+    // nothing stays open between writes, so there is nothing to close
+    void close() {}
 
     const std::vector<uint64_t> &chunkCounts() const { return written; }
     void resetCounts() { std::fill(written.begin(), written.end(), 0); }
@@ -389,7 +404,7 @@ public:
 private:
     std::string name(size_t bucket) const { return prefix + "." + SSTR(bucket); }
 
-    // holds the bucket across the write, so one write a bucket is in flight at a time
+    // the bucket is held only to hand the records over; the write itself happens outside it
     void drain(size_t bucket, std::vector<Record> &buffer) {
         if (buffer.empty()) {
             return;
@@ -404,11 +419,27 @@ private:
             pool.reserve(poolDepth + depth);
         }
         pool.insert(pool.end(), buffer.begin(), buffer.end());
+        // its own vector: swapping the staging buffer would leave it holding a pool's capacity
+        size_t here = 0;
+#ifdef OPENMP
+        here = (size_t) omp_get_thread_num();
+#endif
+        if (here >= leaving.size()) {
+            // more threads than scratches, so this one writes while it holds the bucket
+            if (pool.size() >= poolDepth) {
+                flush(bucket, pool);
+            }
+            __sync_lock_release(&gate[bucket]);
+            buffer.clear();
+            return;
+        }
+        std::vector<Record> &outbound = leaving[here];
         if (pool.size() >= poolDepth) {
-            flush(bucket, pool);
+            outbound.swap(pool);
         }
         __sync_lock_release(&gate[bucket]);
         buffer.clear();
+        flush(bucket, outbound);
     }
 
     void flush(size_t bucket, std::vector<Record> &buffer) {
@@ -427,25 +458,27 @@ private:
         }
         const uint64_t at = __sync_fetch_and_add(&offsets[bucket], bytes);
         __sync_fetch_and_add(&written[bucket], buffer.size());
-        const ssize_t wrote = pwrite(files[bucket], bytesOut, bytes, static_cast<off_t>(at));
+        const int fd = openBucket(bucket);
+        const ssize_t wrote = pwrite(fd, bytesOut, bytes, static_cast<off_t>(at));
         if (wrote < 0 || static_cast<size_t>(wrote) != bytes) {
             Debug(Debug::ERROR) << "Cannot write " << bytes << " byte to " << name(bucket) << "\n";
             EXIT(EXIT_FAILURE);
         }
+        closeBucket(fd, bucket);
         buffer.clear();
     }
 
-    std::string prefix;
-    size_t buckets;
     static const size_t STAGING_SHARE = 8;
     static const size_t FLUSH_BYTES = 4 * 1024 * 1024;
     static const size_t POOL_BYTES = 16 * 1024 * 1024;
+    std::string prefix;
+    size_t buckets;
     size_t depth;
     size_t poolDepth;
     std::vector<std::vector<Record> > pooled;
+    std::vector<std::vector<Record> > leaving;
     std::vector<int> gate;
     size_t held;
-    std::vector<int> files;
     std::vector<uint64_t> written;
     std::vector<uint64_t> offsets;
     std::vector<std::vector<std::vector<Record> > > staged;
