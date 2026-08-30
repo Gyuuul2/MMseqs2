@@ -85,8 +85,7 @@ int lin8mergehashredundancy(int argc, const char **argv, const Command &command)
         members.openAt(nothing);
         kept.openAt(nothing);
 
-        // every consumer of these files sorts before it reads, so which thread wrote a row where
-        // does not reach the answer
+        // every consumer sorts first, so which thread wrote a row where cannot reach the answer
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
         for (size_t repRankBlock = 0; repRankBlock < repRankBlocks; repRankBlock++) {
             unsigned int thread = 0;

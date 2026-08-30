@@ -353,8 +353,7 @@ void RunDbReader::open() {
             }
         }
     }
-    // an absent bitmap means every entry is kept, which is the state a database is in until the
-    // redundancy pass has run over it
+    // an absent bitmap means every entry is kept, which is a database the redundancy pass has not seen
     const std::string validPath = db + KEPT_BITMAP_SUFFIX;
     {
         const int fd = ::open(validPath.c_str(), O_RDONLY);
@@ -380,9 +379,7 @@ void RunDbReader::open() {
                                 << " sequences, " << db << " holds " << runs.entryCount() << "\n";
             EXIT(EXIT_FAILURE);
         }
-        // One bit a sequence is a hundred and twenty five gigabytes at a trillion, and a pass reads
-        // the bits of the ranks it owns. Mapped, it costs the pages it touches; read, it costs all
-        // of them on every node and against no budget.
+        // mapped, not read: 125 GB at a trillion and a pass touches only the ranks it owns
         validSize = sizeof(header) + words * sizeof(uint64_t);
         void *at = mmap(NULL, validSize, PROT_READ, MAP_PRIVATE, fd, 0);
         if (at == MAP_FAILED) {
@@ -559,22 +556,12 @@ bool RunDbReader::HeaderStream::next(const char *&begin, size_t &length) {
 }
 
 static const size_t DIRECT_BLOCK = 512;
-// deep enough for a whole batch in one submission: 64 byte a submission entry makes even a
-// hundred threads a few megabyte, and a shallower ring only drip-feeds the same reads
+// deep enough for a whole batch in one submission; shallower only drip-feeds the same reads
 static const unsigned RING_DEPTH = 1024;
 
 void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
                             size_t memoryBudget) {
     directFd.assign(data.size(), -1);
-    // Direct reads exist so that a database far larger than memory does not fill the page cache with
-    // sequences it will not see again and push the read arenas out. A database that fits has the
-    // opposite problem: a sequence is a member of several representatives, and every one of them
-    // then fetches it from the disk again. Measured on a 22 GB database in 121 GB of memory, direct
-    // reads moved 107 GB to read it 4.9 times and the pass took 492s; through the cache it read
-    // 47 GB and took 217s, with sixteen of twenty threads running rather than ten.
-    //
-    // The rule is the size of the sequences against the memory the run was given, so a machine that
-    // can hold its database uses the cache and one that cannot does not.
     const size_t arenaTotal = (size_t) threads * (arenaBytes + LANES * DIRECT_BLOCK);
     if (arenaTotal >= memoryBudget) {
         Debug(Debug::ERROR) << "Read arenas for " << threads << " thread need "
@@ -582,7 +569,7 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
                             << (memoryBudget >> 20) << " MB limit\n";
         EXIT(EXIT_FAILURE);
     }
-    // the arenas are this pass's own memory, so what is left is what the page cache could hold
+    // a database that fits is read through the cache, one that does not is read past it
     const size_t budget = memoryBudget - arenaTotal;
     const uint64_t sequenceBytes = runs.totalBytes();
     wantDirect = sequenceBytes > budget / 2;
@@ -613,8 +600,7 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
     }
 }
 
-// opened on demand, so a pass that never batches never opens them
-// the fast path reads a descriptor another thread may be publishing, so that read is atomic too
+// opened on demand; the fast path reads a descriptor another thread may be publishing
 int RunDbReader::directOf(uint32_t file) const {
     int fd = -1;
 #pragma omp atomic read
@@ -706,8 +692,7 @@ size_t RunDbReader::startBatch(uint64_t queryRank, const uint64_t *members, size
     at.memberAt.clear();
     at.ring.list().clear();
     Cursor cursor;
-    // the query goes in first because it is the lowest rank of the batch, which keeps the run cursor
-    // and the disk offsets moving forward and lets a member that lands next to it share its read
+    // the query goes first: lowest rank of the batch, so cursor and offsets only move forward
     appendBatchRead(at, queryRank, cursor, at.queryAt);
     size_t loaded = 0;
     for (; loaded < n; loaded++) {

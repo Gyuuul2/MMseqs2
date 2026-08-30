@@ -27,8 +27,7 @@
 #endif
 
 static const size_t STREAM_ROWS = 1u << 16;
-// enough representatives that a fork and a join are lost in the aligning, and few enough that
-// one batch of them is megabytes rather than a repRankBlock
+// enough that a fork and a join are lost in the aligning, few enough that a batch is megabytes
 static const size_t BATCH_ROWS = 1u << 18;
 static const size_t ARENA_BYTES = 64u << 20;
 
@@ -468,8 +467,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
         }
         RepRankBlockReader stream(par.db2, writerNodes, repRankBlock, STREAM_ROWS, skipRows);
 
-        // only the deciding is ordered; assignCluster checks the bitmap again, so a stale view of it
-        // costs work that is thrown away and never reaches a different answer
+        // only the deciding is ordered; assignCluster rechecks, so a stale view only wastes work
         while (true) {
             double mark = omp_get_wtime();
             const bool more = stream.fillBatch(batch, BATCH_ROWS, myUntil);
@@ -513,7 +511,6 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
 
             mark = omp_get_wtime();
             // a thread draws the next batch before aligning this one, so its reads are in flight
-            // meanwhile; who drew what cannot matter, the slots are joined in order afterwards
             size_t drawn = 0;
 #pragma omp parallel num_threads(threads)
             {
