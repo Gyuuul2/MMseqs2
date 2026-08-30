@@ -313,6 +313,8 @@ private:
 };
 
 static const size_t HASH_PER_THREAD = 256;
+// a read arena a thread, the same size the aligning pass uses
+static const size_t READ_ARENA_BYTES = 64u << 20;
 
 static unsigned int threadsWorthStarting(size_t work, unsigned int threads) {
     const size_t want = work / HASH_PER_THREAD;
@@ -364,6 +366,65 @@ static void reduceEntriesToClusters(const RunDbReader &reader, std::vector<HashE
     }
 }
 
+// One thread's stretch of one length, read a batch at a time with the next batch already in flight.
+// mmap faults one readahead window at a time and the queue never gets deep enough to keep a disk busy.
+static void hashRankRange(const RunDbReader &reader, uint64_t from, uint64_t until, uint32_t length,
+                          const unsigned char *aa2num, uint32_t anchorK, unsigned int thread,
+                          std::vector<HashEntry> &into) {
+    const size_t perBatch = std::max<size_t>(1, reader.batchRoomFor(length));
+    std::vector<uint64_t> want[RunDbReader::LANES];
+    size_t took[RunDbReader::LANES] = {0, 0};
+    unsigned int lane = 0;
+    uint64_t at = from;
+    // fills one lane with the next ranks worth reading and puts the read in flight
+    struct Fill {
+        static size_t run(const RunDbReader &reader, uint64_t &at, uint64_t until, size_t perBatch,
+                          unsigned int thread, unsigned int lane, std::vector<uint64_t> &want) {
+            want.clear();
+            while (at < until && want.size() < perBatch) {
+                if (reader.isValid(at)) {
+                    want.push_back(at);
+                }
+                at++;
+            }
+            if (want.empty()) {
+                return 0;
+            }
+            const size_t took = 1 + reader.startBatch(want[0], want.data() + 1, want.size() - 1, thread, lane);
+            // the lane can fill before the batch does, so the rest waits for the next one
+            if (took < want.size()) {
+                at = want[took];
+            }
+            return took;
+        }
+    };
+    took[lane] = Fill::run(reader, at, until, perBatch, thread, lane, want[lane]);
+    while (took[lane] > 0) {
+        const unsigned int next = lane ^ 1u;
+        took[next] = Fill::run(reader, at, until, perBatch, thread, next, want[next]);
+        reader.awaitBatch(thread, lane);
+        for (size_t i = 0; i < took[lane]; i++) {
+            const char *data = (i == 0) ? reader.batchQueryAt(thread, lane)
+                                        : reader.batchAt(thread, lane, i - 1);
+            HashEntry entry;
+            entry.rank = want[lane][i];
+            entry.hash = hashSequence(data, length, aa2num);
+            into.push_back(entry);
+            uint64_t anchor[ANCHOR_COUNT];
+            anchorHashes(data, length, anchorK, anchor);
+            for (unsigned int a = 0; a < ANCHOR_COUNT; a++) {
+                if (anchor[a] == UINT64_MAX || anchor[a] == 0) {
+                    continue;
+                }
+                entry.hash = anchor[a];
+                entry.rank = want[lane][i] | HashEntry::ANCHOR;
+                into.push_back(entry);
+            }
+        }
+        lane = next;
+    }
+}
+
 static void reduceSequencesOfOneLength(const RunDbReader &reader, uint64_t rankBegin, uint64_t rankEnd,
                              uint32_t length, const unsigned char *aa2num, float identity,
                              uint32_t anchorK, size_t budget, unsigned int threads, const std::string &tmpPrefix,
@@ -385,28 +446,11 @@ static void reduceSequencesOfOneLength(const RunDbReader &reader, uint64_t rankB
 #ifdef OPENMP
             thread = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-            RunDbReader::Cursor cursor;
-#pragma omp for schedule(static)
-            for (uint64_t rank = rankBegin; rank < rankEnd; rank++) {
-                if (reader.isValid(rank) == false) {
-                    continue;
-                }
-                const char *data = reader.getData(rank, cursor);
-                HashEntry entry;
-                entry.rank = rank;
-                entry.hash = hashSequence(data, length, aa2num);
-                perThread[thread].push_back(entry);
-                uint64_t anchor[ANCHOR_COUNT];
-                anchorHashes(data, length, anchorK, anchor);
-                for (unsigned int a = 0; a < ANCHOR_COUNT; a++) {
-                    if (anchor[a] == UINT64_MAX || anchor[a] == 0) {
-                        continue;
-                    }
-                    entry.hash = anchor[a];
-                    entry.rank = rank | HashEntry::ANCHOR;
-                    perThread[thread].push_back(entry);
-                }
-            }
+            // the same stretches a static schedule would hand out, so the entries keep their order
+            const uint64_t span = rankEnd - rankBegin;
+            const uint64_t from = rankBegin + span * thread / useThreads;
+            const uint64_t until = rankBegin + span * (thread + 1) / useThreads;
+            hashRankRange(reader, from, until, length, aa2num, anchorK, thread, perThread[thread]);
         }
         for (unsigned int i = 0; i < useThreads; i++) {
             entries.insert(entries.end(), perThread[i].begin(), perThread[i].end());
@@ -594,6 +638,7 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
         }
 
         Timer timer;
+        reader.openBatch(par.threads, READ_ARENA_BYTES, budget, RunDbReader::READ_AGAIN);
         const RunTable &runs = reader.getRunTable();
         const std::vector<size_t> mine = nodeFileSlots(runs, node);
         Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << mine.size()

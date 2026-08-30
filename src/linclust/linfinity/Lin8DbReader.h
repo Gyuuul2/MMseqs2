@@ -78,7 +78,13 @@ public:
     uint32_t getSeqLen(uint64_t rank, Cursor &cursor) const;
     const char *getData(uint64_t rank, Cursor &cursor) const;
 
-    void openBatch(unsigned int threads, size_t arenaBytes, size_t memoryBudget);
+    // a pass that sees a sequence once may read past the cache, one that comes back for it may not
+    static const int READ_ONCE = 0;
+    static const int READ_AGAIN = 1;
+    void openBatch(unsigned int threads, size_t arenaBytes, size_t memoryBudget, int revisit = READ_ONCE);
+
+    // how many sequences of one length a lane holds, so a caller can size its batch
+    size_t batchRoomFor(uint32_t seqLen) const;
 
     // the query rides with its members: one submission, and it outlives every batch of them
     size_t startBatch(uint64_t queryRank, const uint64_t *members, size_t n, unsigned int thread,

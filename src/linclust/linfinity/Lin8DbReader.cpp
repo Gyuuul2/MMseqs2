@@ -560,7 +560,7 @@ static const size_t DIRECT_BLOCK = 512;
 static const unsigned RING_DEPTH = 1024;
 
 void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
-                            size_t memoryBudget) {
+                            size_t memoryBudget, int revisit) {
     directFd.assign(data.size(), -1);
     const size_t arenaTotal = (size_t) threads * (arenaBytes + LANES * DIRECT_BLOCK);
     if (arenaTotal >= memoryBudget) {
@@ -572,7 +572,7 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
     // a database that fits is read through the cache, one that does not is read past it
     const size_t budget = memoryBudget - arenaTotal;
     const uint64_t sequenceBytes = runs.totalBytes();
-    wantDirect = sequenceBytes > budget / 2;
+    wantDirect = revisit == READ_ONCE && sequenceBytes > budget / 2;
     Debug(Debug::INFO) << "Sequences are " << (sequenceBytes >> 30) << " GB against a "
                        << (budget >> 30) << " GB limit past " << (arenaTotal >> 20)
                        << " MB of read arena, reading "
@@ -636,6 +636,14 @@ const char *RunDbReader::batchQueryAt(unsigned int thread, unsigned int lane) co
 
 const char *RunDbReader::batchAt(unsigned int thread, unsigned int lane, size_t member) const {
     return batch[thread]->lane[lane].memberAt[member];
+}
+
+size_t RunDbReader::batchRoomFor(uint32_t seqLen) const {
+    if (batch.empty()) {
+        return 0;
+    }
+    const size_t room = batch[0]->lane[0].arena.size() - DIRECT_BLOCK;
+    return room / ((size_t) seqLen + DIRECT_BLOCK);
 }
 
 void RunDbReader::awaitBatch(unsigned int thread, unsigned int lane) const {
