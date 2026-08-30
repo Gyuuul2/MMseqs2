@@ -455,8 +455,10 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
                                                         std::vector<uint64_t>(countEntries, 0));
 
     Timer timer;
-    // it sees a sequence once, so the arenas come out of the budget the staging would have had
-    reader.openBatch(par.threads, READ_ARENA_BYTES, budget, RunDbReader::READ_ONCE);
+    // It sees a sequence once, which was the argument for reading past the cache: nothing comes
+    // back for it. That holds where the cache is somewhere to keep things. Where it is also what
+    // reads ahead, giving it up costs more than the room it saves.
+    reader.openBatch(par.threads, READ_ARENA_BYTES, budget, RunDbReader::READ_AGAIN);
     BucketWriter<KmerRecord> writer(prefix, KmerRecord::BUCKET_COUNT, par.threads,
                                     budget - (size_t) par.threads * READ_ARENA_BYTES);
     writer.openAt(keep);

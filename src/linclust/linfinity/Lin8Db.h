@@ -354,8 +354,8 @@ public:
         const size_t lent = limit.rlim_cur > DESCRIPTOR_SLACK
                                 ? std::min<size_t>(buckets, (size_t) limit.rlim_cur - DESCRIPTOR_SLACK)
                                 : 0;
-        Debug(Debug::INFO) << "Keeping " << lent << " of " << buckets
-                           << " buckets open; the rest are opened for the write\n";
+        Debug(Debug::INFO) << "Keeping " << lent << " of " << buckets << " buckets open"
+                           << (lent < buckets ? "; the rest are opened for the write" : "") << "\n";
         return lent;
     }
 
