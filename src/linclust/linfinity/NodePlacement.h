@@ -71,6 +71,6 @@ inline NodePlacement NodePlacement::resolve(const Parameters &par) {
 }
 
 // the split is a function of the run table and the node count, so no node has to ask another
-std::vector<size_t> lengthBlocksForNode(const RunTable &runs, const NodePlacement &node);
+std::vector<size_t> nodeFileSlots(const RunTable &runs, const NodePlacement &node);
 
 #endif

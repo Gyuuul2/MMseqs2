@@ -23,12 +23,15 @@ void setLinclustOneshotWorkflowDefaults(Parameters *p) {
 
 // the script passes these itself, and mmseqs refuses a flag given twice
 static bool scriptOwns(const Parameters &par, const MMseqsParameter *p) {
-    const int owned[] = {par.PARAM_LINCLUSTERDB_NODE_LIST.uniqid, par.PARAM_LINCLUSTERDB_NODE_ID.uniqid,
+    const int owned[] = {par.PARAM_LINCLUSTERDB_NODE_LIST.uniqid,
+                         par.PARAM_LINCLUSTERDB_NODE_ID.uniqid,
                          par.PARAM_LINCLUSTERDB_NODE_COUNT.uniqid,
-                         par.PARAM_LIN8_REP_RANK_BLOCK.uniqid, par.PARAM_LIN8_REP_RANK_BLOCKS.uniqid,
+                         par.PARAM_LIN8_REP_RANK_BLOCK.uniqid,
+                         par.PARAM_LIN8_REP_RANK_BLOCKS.uniqid,
                          par.PARAM_THREADS.uniqid,
-                         par.PARAM_MIN_SEQ_ID.uniqid, par.PARAM_C.uniqid, par.PARAM_COV_MODE.uniqid,
-};
+                         par.PARAM_MIN_SEQ_ID.uniqid,
+                         par.PARAM_C.uniqid,
+                         par.PARAM_COV_MODE.uniqid};
     for (size_t i = 0; i < sizeof(owned) / sizeof(owned[0]); i++) {
         if (p->uniqid == owned[i]) {
             return true;

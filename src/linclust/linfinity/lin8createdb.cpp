@@ -490,7 +490,7 @@ static void dropCacheAndCloseFiles(std::vector<int> &fd) {
         fd[i] = -1;
     }
 }
-static void writeFileManifest(const std::string &db, const RunTable &runs, unsigned int blocksPerNode) {
+static void writeFileManifest(const std::string &db, const RunTable &runs, unsigned int filesPerNode) {
     const size_t files = runs.fileCount();
     std::vector<uint32_t> maxLen(files, 0);
     std::vector<uint32_t> minLen(files, 0);
@@ -507,7 +507,7 @@ static void writeFileManifest(const std::string &db, const RunTable &runs, unsig
     FILE *out = FileUtil::openAndDelete(tmp.c_str(), "w");
     fprintf(out, "#file\tnode\tsuffix\tmaxLen\tminLen\tentries\n");
     for (size_t file = 0; file < files; file++) {
-        fprintf(out, "%zu\t%zu\t%zu\t%u\t%u\t%zu\n", file, file / blocksPerNode, file % blocksPerNode,
+        fprintf(out, "%zu\t%zu\t%zu\t%u\t%u\t%zu\n", file, file / filesPerNode, file % filesPerNode,
                 maxLen[file], minLen[file], static_cast<size_t>(entries[file]));
     }
     if (fclose(out) != 0) {
@@ -519,7 +519,7 @@ static void writeFileManifest(const std::string &db, const RunTable &runs, unsig
 
 // every node states its segments with the global rank it computed, so the merge is a sort by rank
 static RunTable mergeRunTables(const std::string &db, unsigned int nodeCount,
-                               unsigned int blocksPerNode, uint64_t sequences) {
+                               unsigned int filesPerNode, uint64_t sequences) {
     std::vector<RunTable::Segment> all;
     for (unsigned int node = 0; node < nodeCount; node++) {
         RunTable part;
@@ -531,7 +531,7 @@ static RunTable mergeRunTables(const std::string &db, unsigned int nodeCount,
                       return first.rankBase() < second.rankBase();
                   });
     RunTable merged;
-    merged.setLayout(nodeCount, blocksPerNode);
+    merged.setLayout(nodeCount, filesPerNode);
     merged.reserve(all.size());
     for (size_t i = 0; i < all.size(); i++) {
         merged.append(all[i].rankBase(), all[i].seqLen(), all[i].byteBase(), all[i].fileIdx(),

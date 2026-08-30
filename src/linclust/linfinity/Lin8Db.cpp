@@ -27,14 +27,14 @@ struct Header {
     // an int32 build must refuse a table an int64 build wrote, the text index used to make that safe
     uint32_t keyWidth;
     uint32_t nodeCount;
-    uint32_t blockCount;
+    uint32_t filesPerNode;
     uint64_t segmentCount;
     uint64_t entryCount;
     uint64_t byteCount;
 };
 }
 
-RunTable::RunTable() : entries(0), bytes(0), nodes(1), blocks(1) {}
+RunTable::RunTable() : entries(0), bytes(0), nodes(1), perNodeFiles(1) {}
 
 void RunTable::reserve(size_t count) {
     segments.reserve(count);
@@ -157,7 +157,7 @@ void RunTable::write(const std::string &path) const {
     header.version = RUN_TABLE_VERSION;
     header.keyWidth = static_cast<uint32_t>(sizeof(DBKeyType));
     header.nodeCount = nodes;
-    header.blockCount = blocks;
+    header.filesPerNode = perNodeFiles;
     header.segmentCount = segments.size();
     header.entryCount = entries;
     header.byteCount = bytes;
@@ -208,7 +208,7 @@ void RunTable::read(const std::string &path) {
     fclose(in);
     entries = header.entryCount;
     nodes = (header.nodeCount > 0) ? header.nodeCount : 1;
-    blocks = (header.blockCount > 0) ? header.blockCount : 1;
+    perNodeFiles = (header.filesPerNode > 0) ? header.filesPerNode : 1;
     rebuildByteStarts();
     if (bytes != header.byteCount) {
         Debug(Debug::ERROR) << "Run table " << path << " covers " << bytes << " byte, header says "
@@ -764,24 +764,24 @@ void requireEveryNodeDone(const std::string &path, unsigned int nodes) {
 
 
 // the split is a function of the run table and the node count, so no node has to ask another
-std::vector<size_t> lengthBlocksForNode(const RunTable &runs, const NodePlacement &node) {
-    std::vector<uint64_t> bytes(runs.blocksPerNode(), 0);
+std::vector<size_t> nodeFileSlots(const RunTable &runs, const NodePlacement &node) {
+    std::vector<uint64_t> bytes(runs.filesPerNode(), 0);
     uint64_t total = 0;
     for (size_t i = 0; i < runs.size(); i++) {
         const uint64_t span = (runs.rankEnd(i) - runs[i].rankBase()) * runs[i].seqLen();
-        bytes[runs[i].fileIdx() % runs.blocksPerNode()] += span;
+        bytes[runs[i].fileIdx() % runs.filesPerNode()] += span;
         total += span;
     }
     std::vector<size_t> mine;
     uint64_t at = 0;
-    for (size_t lengthBlock = 0; lengthBlock < bytes.size(); lengthBlock++) {
-        const uint64_t middle = at + bytes[lengthBlock] / 2;
+    for (size_t fileSlot = 0; fileSlot < bytes.size(); fileSlot++) {
+        const uint64_t middle = at + bytes[fileSlot] / 2;
         const unsigned int owner = static_cast<unsigned int>(
             std::min<uint64_t>(total == 0 ? 0 : middle * node.count / total, node.count - 1));
         if (owner == node.index) {
-            mine.push_back(lengthBlock);
+            mine.push_back(fileSlot);
         }
-        at += bytes[lengthBlock];
+        at += bytes[fileSlot];
     }
     return mine;
 }

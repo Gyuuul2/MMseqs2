@@ -95,7 +95,7 @@ public:
     const uint64_t *validWords() const { return valid; }
     size_t validWordCount() const { return validCount; }
 
-    void releaseLengthBlock(size_t suffix);
+    void releaseFileSlot(size_t suffix);
 
     uint64_t rankAtByte(uint64_t globalByte) const { return runs.rankAtByte(globalByte); }
 

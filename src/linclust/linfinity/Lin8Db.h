@@ -70,11 +70,11 @@ public:
     void read(const std::string &path);
     // the reader stops at the first gap in db.0, db.1, ..., so it needs the declared count
     unsigned int nodeCount() const { return nodes; }
-    unsigned int blocksPerNode() const { return blocks; }
-    unsigned int fileCount() const { return nodes * blocks; }
-    void setLayout(unsigned int nodeCount, unsigned int blockCount) {
+    unsigned int filesPerNode() const { return perNodeFiles; }
+    unsigned int fileCount() const { return nodes * perNodeFiles; }
+    void setLayout(unsigned int nodeCount, unsigned int filesPerNode) {
         nodes = nodeCount;
-        blocks = blockCount;
+        perNodeFiles = filesPerNode;
     }
     void finish(uint64_t totalEntries);
     void checkLengthsDescend() const;
@@ -85,7 +85,7 @@ private:
     uint64_t entries;
     uint64_t bytes;
     unsigned int nodes;
-    unsigned int blocks;
+    unsigned int perNodeFiles;
 
     void rebuildByteStarts();
 };

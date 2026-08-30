@@ -500,8 +500,8 @@ bool RunDbReader::isValid(uint64_t rank) const {
 }
 
 
-void RunDbReader::releaseLengthBlock(size_t lengthBlock) {
-    for (size_t file = lengthBlock; file < data.size(); file += runs.blocksPerNode()) {
+void RunDbReader::releaseFileSlot(size_t fileSlot) {
+    for (size_t file = fileSlot; file < data.size(); file += runs.filesPerNode()) {
         unmapAndDrop(data[file], dataFd[file], dataSize[file]);
         if (file < headers.size()) {
             unmapAndDrop(headers[file], headerFd[file], headerSize[file]);

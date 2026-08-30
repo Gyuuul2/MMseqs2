@@ -234,7 +234,7 @@ static const uint64_t BYTES_PER_MANIFEST = 64ull * 1024 * 1024 * 1024;
 struct ManifestChunk {
     uint64_t rankBegin;
     uint64_t rankEnd;
-    size_t lengthBlock;
+    size_t fileSlot;
 };
 
 static std::string chunkName(const std::string &out, unsigned int node, size_t chunk) {
@@ -249,7 +249,7 @@ static std::vector<ManifestChunk> planManifestChunks(const RunDbReader &reader, 
         uint64_t begin = 0;
         uint64_t end = 0;
         for (size_t i = 0; i < runs.size(); i++) {
-            if (runs[i].fileIdx() % runs.blocksPerNode() != blocks[at]) {
+            if (runs[i].fileIdx() % runs.filesPerNode() != blocks[at]) {
                 continue;
             }
             begin = (end == 0) ? runs[i].rankBase() : std::min(begin, runs[i].rankBase());
@@ -265,7 +265,7 @@ static std::vector<ManifestChunk> planManifestChunks(const RunDbReader &reader, 
         const uint64_t step = std::max<uint64_t>(1, (span + parts - 1) / parts);
         for (uint64_t byteAt = fromByte; byteAt < toByte; byteAt += step) {
             ManifestChunk chunk;
-            chunk.lengthBlock = blocks[at];
+            chunk.fileSlot = blocks[at];
             chunk.rankBegin = runs.rankAtByte(byteAt);
             chunk.rankEnd = std::min<uint64_t>(runs.rankAtByte(std::min(byteAt + step, toByte)), end);
             if (chunk.rankEnd > chunk.rankBegin) {
@@ -398,7 +398,7 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
     const unsigned int keepPerSequence =
         par.kmersPerSequence > 1 ? par.kmersPerSequence - 1 : 1;
     const size_t budget = static_cast<size_t>(Util::computeMemory(par.splitMemoryLimit) * 0.95);
-    const std::vector<size_t> blocks = lengthBlocksForNode(reader.getRunTable(), node);
+    const std::vector<size_t> blocks = nodeFileSlots(reader.getRunTable(), node);
     const std::vector<ManifestChunk> chunks = planManifestChunks(reader, blocks, BYTES_PER_MANIFEST);
     Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << blocks.size()
                        << " length blocks in " << chunks.size() << " chunks, k " << par.kmerSize
@@ -455,8 +455,8 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
             pendingRecords = 0;
             manifest++;
         }
-        if (at + 1 == chunks.size() || chunks[at + 1].lengthBlock != chunks[at].lengthBlock) {
-            reader.releaseLengthBlock(chunks[at].lengthBlock);
+        if (at + 1 == chunks.size() || chunks[at + 1].fileSlot != chunks[at].fileSlot) {
+            reader.releaseFileSlot(chunks[at].fileSlot);
         }
         progress.updateProgress();
     }

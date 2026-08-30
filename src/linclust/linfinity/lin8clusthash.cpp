@@ -68,11 +68,11 @@ struct ClusterPair {
     }
 };
 
-static std::pair<size_t, size_t> segmentsOfLengthBlock(const RunTable &runs, size_t lengthBlock) {
+static std::pair<size_t, size_t> runsInFileSlot(const RunTable &runs, size_t fileSlot) {
     size_t begin = runs.size();
     size_t end = 0;
     for (size_t i = 0; i < runs.size(); i++) {
-        if (runs[i].fileIdx() % runs.blocksPerNode() == lengthBlock) {
+        if (runs[i].fileIdx() % runs.filesPerNode() == fileSlot) {
             begin = std::min(begin, i);
             end = std::max(end, i + 1);
         }
@@ -560,9 +560,9 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
 
         Timer timer;
         const RunTable &runs = reader.getRunTable();
-        const std::vector<size_t> mine = lengthBlocksForNode(runs, node);
+        const std::vector<size_t> mine = nodeFileSlots(runs, node);
         Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << mine.size()
-                           << " of " << runs.blocksPerNode() << " lengthBlocks\n";
+                           << " of " << runs.filesPerNode() << " lengthBlocks\n";
 
         std::vector<ClusterPair> pairs;
         uint64_t written = 0;
@@ -570,14 +570,14 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
         size_t crowded = 0;
         size_t lengths = 0;
         for (size_t at = 0; at < mine.size(); at++) {
-            const std::pair<size_t, size_t> span = segmentsOfLengthBlock(runs, mine[at]);
+            const std::pair<size_t, size_t> span = runsInFileSlot(runs, mine[at]);
             for (size_t segment = span.first; segment < span.second; segment++) {
                 lengths += (segment == span.first || runs[segment].seqLen() != runs[segment - 1].seqLen());
             }
         }
         Debug::Progress progress(lengths);
         for (size_t at = 0; at < mine.size(); at++) {
-            const std::pair<size_t, size_t> span = segmentsOfLengthBlock(runs, mine[at]);
+            const std::pair<size_t, size_t> span = runsInFileSlot(runs, mine[at]);
             for (size_t segment = span.first; segment < span.second;) {
                 const uint32_t length = runs[segment].seqLen();
                 const uint64_t rankBegin = runs[segment].rankBase();
@@ -617,7 +617,7 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
                 progress.updateProgress();
                 segment = next;
             }
-            reader.releaseLengthBlock(mine[at]);
+            reader.releaseFileSlot(mine[at]);
         }
         if (oversized > 0) {
             Debug(Debug::INFO) << oversized << " lengths did not fit the budget and were split by hash\n";
