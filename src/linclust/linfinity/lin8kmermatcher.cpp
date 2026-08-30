@@ -556,11 +556,13 @@ struct ByRepRankSubBlock {
     }
 };
 
+// the descriptor comes from the caller: the extents of one node read one file at different offsets,
+// and opening it once an extent is a round trip an extent on a shared filesystem
 template <typename Record, typename SubOf>
-static void scanBucketExtent(const std::string &path, const BucketExtent &extent, const SubOf &subOf,
+static void scanBucketExtent(int fd, const std::string &path, const BucketExtent &extent,
+                      const SubOf &subOf,
                       std::vector<uint64_t> &perPrefix, std::vector<size_t> &place,
                       RawArray<Record> &into) {
-    const int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         Debug(Debug::ERROR) << "Cannot open " << path << ", which node " << extent.node
                             << " should have written\n";
@@ -598,7 +600,6 @@ static void scanBucketExtent(const std::string &path, const BucketExtent &extent
     if (place.empty() == false) {
         posix_fadvise(fd, at, span, POSIX_FADV_DONTNEED);
     }
-    close(fd);
 }
 
 template <typename Record, typename SubOf>
@@ -635,12 +636,18 @@ static std::vector<size_t> loadBucket(const std::string &prefix, const BucketCou
         }
     }
 
+    // one descriptor a node, shared by that node's extents: pread carries its own offset
+    std::vector<int> bucketFd(nodes, -1);
+    for (unsigned int node = 0; node < nodes; node++) {
+        bucketFd[node] = open(path[node].c_str(), O_RDONLY);
+    }
     std::vector<std::vector<uint64_t> > extentCounts(extents.size(),
                                                     std::vector<uint64_t>(prefixes, 0));
     std::vector<size_t> counting;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
     for (size_t i = 0; i < extents.size(); i++) {
-        scanBucketExtent(path[extents[i].node], extents[i], subOf, extentCounts[i], counting, into);
+        scanBucketExtent(bucketFd[extents[i].node], path[extents[i].node], extents[i], subOf,
+                         extentCounts[i], counting, into);
     }
 
     std::vector<std::vector<size_t> > at(extents.size());
@@ -664,7 +671,13 @@ static std::vector<size_t> loadBucket(const std::string &prefix, const BucketCou
 
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
     for (size_t i = 0; i < extents.size(); i++) {
-        scanBucketExtent(path[extents[i].node], extents[i], subOf, extentCounts[i], at[i], into);
+        scanBucketExtent(bucketFd[extents[i].node], path[extents[i].node], extents[i], subOf,
+                         extentCounts[i], at[i], into);
+    }
+    for (unsigned int node = 0; node < nodes; node++) {
+        if (bucketFd[node] >= 0) {
+            close(bucketFd[node]);
+        }
     }
     return starts;
 }
