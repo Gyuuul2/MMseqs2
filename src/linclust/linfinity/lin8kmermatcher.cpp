@@ -678,7 +678,10 @@ static int adjacencyScore(const KmerRecord &member, const short **centerRow) {
     return score;
 }
 
-static void swapCenterSequence(KmerRecord *group, size_t size, size_t round, BaseMatrix *subMat) {
+// ranksRepeat says whether a rank can appear twice; when it cannot, a member past the centres
+// already chosen cannot be one of them, and the scan that looks for that is pure cost
+static void swapCenterSequence(KmerRecord *group, size_t size, size_t round, BaseMatrix *subMat,
+                               bool ranksRepeat) {
     const short *centerRow[KmerRecord::ADJACENT_COUNT];
     for (unsigned int slot = 0; slot < KmerRecord::ADJACENT_COUNT; slot++) {
         centerRow[slot] = subMat->subMatrix[group[round - 1].adjacentAt(slot)];
@@ -687,7 +690,7 @@ static void swapCenterSequence(KmerRecord *group, size_t size, size_t round, Bas
     int lowest = INT_MAX;
     for (size_t i = round; i < size; i++) {
         bool spent = false;
-        for (size_t used = 0; used < round && spent == false; used++) {
+        for (size_t used = 0; ranksRepeat && used < round && spent == false; used++) {
             spent = group[used].rank() == group[i].rank();
         }
         if (spent) {
@@ -709,9 +712,15 @@ static void assignGroup(KmerRecord *group, size_t size, const RunDbReader &reade
         return;
     }
     const size_t before = out.size();
+    // the rounds each pick a different centre, so a pair can only repeat when one sequence put two
+    // k-mers of this key in the group. The group arrives sorted by rank, so one look answers that.
+    bool ranksRepeat = false;
+    for (size_t i = 1; i < size && ranksRepeat == false; i++) {
+        ranksRepeat = group[i].rank() == group[i - 1].rank();
+    }
     for (size_t round = 0; round <= (size_t) adjacentRounds && round < size; round++) {
         if (round > 0) {
-            swapCenterSequence(group, size, round, subMat);
+            swapCenterSequence(group, size, round, subMat, ranksRepeat);
         }
         const uint64_t rep = group[round].rank();
         const uint64_t repPos = group[round].pos();
@@ -731,7 +740,7 @@ static void assignGroup(KmerRecord *group, size_t size, const RunDbReader &reade
             }
         }
     }
-    if (adjacentRounds > 0) {
+    if (adjacentRounds > 0 && ranksRepeat) {
         std::sort(out.begin() + before, out.end(), PairRecord::byRepAndMember);
         out.erase(std::unique(out.begin() + before, out.end(), PairRecord::sameRepAndMember),
                   out.end());
