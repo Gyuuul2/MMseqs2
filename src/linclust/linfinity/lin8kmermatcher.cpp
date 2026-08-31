@@ -244,7 +244,7 @@ static std::string chunkName(const std::string &out, unsigned int node, size_t c
 static std::vector<ManifestChunk> planManifestChunks(const RunDbReader &reader, const std::vector<size_t> &blocks,
                                          uint64_t capBytes) {
     std::vector<ManifestChunk> chunks;
-    const RunTable &runs = reader.getRunTable();
+    const SequenceLocator &runs = reader.getSequenceLocator();
     for (size_t at = 0; at < blocks.size(); at++) {
         uint64_t begin = 0;
         uint64_t end = 0;
@@ -282,7 +282,7 @@ static unsigned int kmersToKeepForLength(unsigned int keepPerSequence, float kee
 }
 
 static unsigned int mostKmersOneSequenceCanKeep(unsigned int keepPerSequence, float keepScale) {
-    return kmersToKeepForLength(keepPerSequence, keepScale, RunTable::MAX_SEQ_LEN);
+    return kmersToKeepForLength(keepPerSequence, keepScale, SequenceLocator::MAX_SEQ_LEN);
 }
 
 // ranks to read at once: mmap faults one readahead window at a time and never fills the queue
@@ -315,7 +315,7 @@ static uint64_t extractOneManifestChunk(const RunDbReader &reader, const Manifes
             while (at < until) {
                 want.clear();
                 while (at < until && want.size() < EXTRACT_BATCH) {
-                    if (reader.isValid(at) && reader.getSeqLen(at, cursor) <= RunTable::MAX_SEQ_LEN) {
+                    if (reader.isValid(at) && reader.getSeqLen(at, cursor) <= SequenceLocator::MAX_SEQ_LEN) {
                         want.push_back(at);
                     }
                     at++;
@@ -423,7 +423,7 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
     const unsigned int keepPerSequence =
         par.kmersPerSequence > 1 ? par.kmersPerSequence - 1 : 1;
     const size_t budget = static_cast<size_t>(Util::computeMemory(par.splitMemoryLimit) * 0.95);
-    const std::vector<size_t> blocks = nodeFileSlots(reader.getRunTable(), node);
+    const std::vector<size_t> blocks = nodeFileSlots(reader.getSequenceLocator(), node);
     const std::vector<ManifestChunk> chunks = planManifestChunks(reader, blocks, BYTES_PER_MANIFEST);
     Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << blocks.size()
                        << " length blocks in " << chunks.size() << " chunks, k " << par.kmerSize
@@ -467,14 +467,20 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
     Debug::Progress progress(chunks.size() - resume);
     size_t chunkFirst = resume;
     uint64_t pendingRecords = 0;
+    // what the chunk boundary costs: it flushes every bucket and waits for the disk to take it,
+    // which over NFS is a commit a bucket
+    double spentExtracting = 0, spentEndingChunks = 0;
     writer.resetCounts();
     for (size_t at = resume; at < chunks.size(); at++) {
+        double mark = omp_get_wtime();
         pendingRecords += extractOneManifestChunk(reader, chunks[at], writer, letterToCode.data(), par.kmerSize,
                                        classes, keepPerSequence,
                                        par.kmersPerSequenceScale.values.aminoacid(), par.threads,
                                        subBucketCounts);
+        spentExtracting += omp_get_wtime() - mark;
         // a durable chunk is a run of planned chunks ended by bytes, so a small database is one flush
         if (pendingRecords * KmerRecord::DISK_BYTES >= BYTES_PER_MANIFEST || at + 1 == chunks.size()) {
+            mark = omp_get_wtime();
             writer.endChunk(par.threads);
             // the manifest goes down after the data it describes, so its presence means it is whole
             writeBucketManifest(chunkName(par.db2, node.index, manifest) + ".manifest",
@@ -485,6 +491,7 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
             chunkFirst = at + 1;
             pendingRecords = 0;
             manifest++;
+            spentEndingChunks += omp_get_wtime() - mark;
         }
         if (at + 1 == chunks.size() || chunks[at + 1].fileSlot != chunks[at].fileSlot) {
             reader.releaseFileSlot(chunks[at].fileSlot);
@@ -506,6 +513,9 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
     FileUtil::publishAtomically(nodesTmp, par.db2);
     markNodeDone(par.db2, node.index);
 
+    Debug(Debug::INFO) << "Where the time went: extracting " << (uint64_t) spentExtracting
+                       << "s, ending " << manifest << " chunks " << (uint64_t) spentEndingChunks
+                       << "s\n";
     Debug(Debug::INFO) << "Wrote " << written << " k-mer records in " << timer.lap() << "\n";
     reader.close();
     return EXIT_SUCCESS;
@@ -640,10 +650,19 @@ static std::vector<size_t> loadBucket(const std::string &prefix, const BucketCou
         }
     }
 
-    // one descriptor a node, shared by that node's extents: pread carries its own offset
+    // one descriptor a node, shared by that node's extents: pread carries its own offset. Opened
+    // here rather than inside the reads so a missing file is one message and not one a thread.
     std::vector<int> bucketFd(nodes, -1);
     for (unsigned int node = 0; node < nodes; node++) {
         bucketFd[node] = open(path[node].c_str(), O_RDONLY);
+        if (bucketFd[node] < 0) {
+            Debug(Debug::ERROR) << "Cannot open " << path[node] << ", which " << producer
+                                << " wrote and this pass has not read yet. With --remove-tmp-files"
+                                << " it drops them as it consumes them, so a run that got part way"
+                                << " and lost its own output cannot be resumed: rerun " << producer
+                                << " to make them again\n";
+            EXIT(EXIT_FAILURE);
+        }
     }
     // Read once, in the order the files hold them, then sort. The pass that counted first existed
     // only to find where each record belonged, and the sub bucket is the top of the sort key, so
@@ -720,7 +739,7 @@ static void swapCenterSequence(KmerRecord *group, std::vector<uint32_t> &lengths
 }
 
 // The lengths are read once and carried through the rounds, the way the original keeps a length
-// beside every k-mer. A trillion will not fit in an array, so they come from the run table, and
+// beside every k-mer. A trillion will not fit in an array, so they come from the sequence locator, and
 // asking it once a member rather than once a member a round is what makes that affordable.
 static void assignGroup(KmerRecord *group, size_t size, const RunDbReader &reader,
                          float covThr, int covMode, bool onlyExtendable, BaseMatrix *subMat,
@@ -911,8 +930,8 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
                     }
                     out.clear();
                     assignGroup(&records[begin], end - begin, reader, par.covThr, par.covMode,
-                                 par.includeOnlyExtendable, &subMat, adjacentRounds, out,
-                                 lengths, at);
+                                par.includeOnlyExtendable, &subMat, adjacentRounds, out,
+                                lengths, at);
                     for (size_t i = 0; i < out.size(); i++) {
                         // one division for the file and the place inside it, not one each
                         const size_t fine = PairRecord::fineOf(out[i].rep(), ranks, repRankBlockCount);
