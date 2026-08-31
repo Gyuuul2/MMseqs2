@@ -5,6 +5,7 @@
 #include "Util.h"
 
 #include <vector>
+#include <algorithm>
 
 #include "NodePlacement.h"
 
@@ -94,6 +95,10 @@ int lin8clust(int argc, const char **argv, const Command &command) {
     cmd.addVariable("REP_RANK_BLOCKS", SSTR(par.lin8RepRankBlocks).c_str());
     cmd.addVariable("THREADS", SSTR(par.threads).c_str());
     cmd.addVariable("SEQID", SSTR(par.seqIdThr).c_str());
+    // folding at a threshold above the target only folds what the target would have folded anyway,
+    // and clusthash compares equal lengths so coverage is whole; the loosest safe value is the most
+    // work it can take off the four passes that follow
+    cmd.addVariable("HASHSEQID", SSTR(std::max(0.9f, par.seqIdThr)).c_str());
     cmd.addVariable("COV", SSTR(par.covThr).c_str());
     cmd.addVariable("COVMODE", SSTR(par.covMode).c_str());
     cmd.addVariable("CLUSTHASH", par.clustHash ? "TRUE" : NULL);

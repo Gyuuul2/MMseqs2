@@ -40,6 +40,9 @@ NODE="${NODE:-0}"
 REP_RANK_BLOCKS="${REP_RANK_BLOCKS:-1024}"
 THREADS="${THREADS:-1}"
 SEQID="${SEQID:-0.9}"
+# the redundancy pass may fold at any threshold at or above the target, and 0.9 is the loosest
+# the original allows; the workflow sets this, so this is for a script run on its own
+HASHSEQID="${HASHSEQID:-$(awk -v s="$SEQID" 'BEGIN{print (s>0.9)?s:0.9}')}"
 COV="${COV:-0.8}"
 COVMODE="${COVMODE:-0}"
 REPSEQ="${REPSEQ:-0}"
@@ -66,7 +69,7 @@ if [ -n "$CLUSTHASH" ]; then
     while notExists "$TMP/db.clusthash_kept"; do
         # shellcheck disable=SC2086
         "$MMSEQS" lin8-clusthash "$TMP/db" "$TMP/hash" --node-count "$NODES" --node-id "$NODE" \
-            --threads "$THREADS" ${HASH_PAR}
+            --threads "$THREADS" --min-seq-id "$HASHSEQID" ${HASH_PAR}
         if notExists "$TMP/db.clusthash_kept"; then
             [ "$_waited" -ge "$WAIT_LIMIT" ] && fail "waited ${WAIT_LIMIT}s for the redundancy pass"
             sleep 1
