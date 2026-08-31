@@ -65,7 +65,7 @@ int lin8createrepseqfasta(int argc, const char **argv, const Command &command) {
     while (headers.next(begin, length)) {
         if (rank >= reader.getSize()) {
             Debug(Debug::ERROR) << "The headers hold more entries than the " << reader.getSize()
-                                << " the run table names\n";
+                                << " the sequence locator names\n";
             EXIT(EXIT_FAILURE);
         }
         while (want < reps.size() && reps[want] < rank) {
@@ -77,7 +77,7 @@ int lin8createrepseqfasta(int argc, const char **argv, const Command &command) {
         rank++;
     }
     if (rank != reader.getSize()) {
-        Debug(Debug::ERROR) << "The headers hold " << rank << " entries and the run table names "
+        Debug(Debug::ERROR) << "The headers hold " << rank << " entries and the sequence locator names "
                             << reader.getSize() << "\n";
         EXIT(EXIT_FAILURE);
     }

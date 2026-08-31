@@ -70,7 +70,7 @@ public:
 
     uint64_t getSize() const { return runs.entryCount(); }
     uint64_t getTotalBytes() const { return runs.totalBytes(); }
-    const RunTable &getRunTable() const { return runs; }
+    const SequenceLocator &getSequenceLocator() const { return runs; }
 
     uint32_t getSeqLen(uint64_t rank) const { return runs.seqLen(rank); }
     const char *getData(uint64_t rank) const;
@@ -139,7 +139,7 @@ private:
 
     std::string db;
     bool withHeaders;
-    RunTable runs;
+    SequenceLocator runs;
     mutable std::vector<char *> data;
     mutable std::vector<int> dataFd;
     // a second descriptor a file, opened direct, so a batch read takes only its own blocks

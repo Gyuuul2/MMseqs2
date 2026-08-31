@@ -61,7 +61,7 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
         while (got < NAME_BATCH && headers.next(begin, length)) {
             if (rank + got >= nameOfRank.size()) {
                 Debug(Debug::ERROR) << "The headers hold more entries than the " << reader.getSize()
-                                    << " the run table names\n";
+                                    << " the sequence locator names\n";
                 EXIT(EXIT_FAILURE);
             }
             beginOf[got] = begin;
@@ -79,7 +79,7 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
         rank += got;
     }
     if (rank != reader.getSize()) {
-        Debug(Debug::ERROR) << "The headers hold " << rank << " entries and the run table names "
+        Debug(Debug::ERROR) << "The headers hold " << rank << " entries and the sequence locator names "
                             << reader.getSize() << "\n";
         EXIT(EXIT_FAILURE);
     }

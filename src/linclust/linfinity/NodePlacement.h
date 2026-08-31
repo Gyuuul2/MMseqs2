@@ -12,7 +12,7 @@
 #include <unistd.h>
 #include <vector>
 
-class RunTable;
+class SequenceLocator;
 
 struct NodePlacement {
     unsigned int index;
@@ -70,7 +70,7 @@ inline NodePlacement NodePlacement::resolve(const Parameters &par) {
     return placement;
 }
 
-// the split is a function of the run table and the node count, so no node has to ask another
-std::vector<size_t> nodeFileSlots(const RunTable &runs, const NodePlacement &node);
+// the split is a function of the locator and the node count, so no node has to ask another
+std::vector<size_t> nodeFileSlots(const SequenceLocator &runs, const NodePlacement &node);
 
 #endif

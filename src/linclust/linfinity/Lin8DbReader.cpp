@@ -475,17 +475,17 @@ const char *RunDbReader::fileData(uint32_t file, uint64_t offset) const {
 }
 
 const char *RunDbReader::getData(uint64_t rank) const {
-    const size_t segment = runs.segmentOf(rank);
+    const size_t segment = runs.runOf(rank);
     return fileData(runs[segment].fileIdx(), runs.offsetIn(segment, rank));
 }
 
 uint32_t RunDbReader::getSeqLen(uint64_t rank, Cursor &cursor) const {
-    cursor.at = runs.segmentOfFrom(rank, cursor.at);
+    cursor.at = runs.runOfFrom(rank, cursor.at);
     return runs[cursor.at].seqLen();
 }
 
 const char *RunDbReader::getData(uint64_t rank, Cursor &cursor) const {
-    cursor.at = runs.segmentOfFrom(rank, cursor.at);
+    cursor.at = runs.runOfFrom(rank, cursor.at);
     return fileData(runs[cursor.at].fileIdx(), runs.offsetIn(cursor.at, rank));
 }
 
@@ -536,7 +536,7 @@ bool RunDbReader::HeaderStream::next(const char *&begin, size_t &length) {
     }
     const uint32_t file = owner.runs[segment - 1].fileIdx();
     if (file >= owner.headers.size() || at >= owner.headerSize[file]) {
-        Debug(Debug::ERROR) << "Segment " << (segment - 1) << " of " << owner.db
+        Debug(Debug::ERROR) << "Length run " << (segment - 1) << " of " << owner.db
                             << " points past header file " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
@@ -653,7 +653,7 @@ void RunDbReader::awaitBatch(unsigned int thread, unsigned int lane) const {
 // grows the last read when the two touch on the disk, and answers false once the lane is full
 bool RunDbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor,
                                   const char *&at) const {
-    cursor.at = runs.segmentOfFrom(rank, cursor.at);
+    cursor.at = runs.runOfFrom(rank, cursor.at);
     const uint64_t offset = runs.offsetIn(cursor.at, rank);
     const size_t length = runs[cursor.at].seqLen();
     const int fd = directOf(runs[cursor.at].fileIdx());

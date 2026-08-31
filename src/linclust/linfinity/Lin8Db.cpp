@@ -34,51 +34,51 @@ struct Header {
 };
 }
 
-RunTable::RunTable() : entries(0), bytes(0), nodes(1), perNodeFiles(1) {}
+SequenceLocator::SequenceLocator() : entries(0), bytes(0), nodes(1), perNodeFiles(1) {}
 
-void RunTable::reserve(size_t count) {
-    segments.reserve(count);
+void SequenceLocator::reserve(size_t count) {
+    runs.reserve(count);
     byteStarts.reserve(count + 1);
 }
 
-void RunTable::append(uint64_t rankBase, uint32_t len, uint64_t byteBase, uint32_t file,
+void SequenceLocator::append(uint64_t rankBase, uint32_t len, uint64_t byteBase, uint32_t file,
                       uint64_t hdrBase) {
     if (rankBase > MAX_RANK || byteBase > MAX_BYTE || file > MAX_FILE || len > MAX_ENTRY_LEN) {
         Debug(Debug::ERROR) << "Run table segment out of repRankBlock: rank " << rankBase << " byte "
                             << byteBase << " file " << file << " length " << len << "\n";
         EXIT(EXIT_FAILURE);
     }
-    if (segments.empty() == false && rankBase <= segments.back().rankBase()) {
-        Debug(Debug::ERROR) << "Run table segments must ascend by rank, got " << rankBase
-                            << " after " << segments.back().rankBase() << "\n";
+    if (runs.empty() == false && rankBase <= runs.back().rankBase()) {
+        Debug(Debug::ERROR) << "Run table runs must ascend by rank, got " << rankBase
+                            << " after " << runs.back().rankBase() << "\n";
         EXIT(EXIT_FAILURE);
     }
-    Segment segment;
+    LengthRun segment;
     segment.rankAndLen = rankBase | (static_cast<uint64_t>(len) << RANK_BITS);
     segment.byteAndFile = byteBase | (static_cast<uint64_t>(file) << 48);
     segment.hdrByte = hdrBase;
-    segments.push_back(segment);
+    runs.push_back(segment);
     byteStarts.push_back(bytes);
-    if (segments.size() > 1) {
-        const Segment &previous = segments[segments.size() - 2];
+    if (runs.size() > 1) {
+        const LengthRun &previous = runs[runs.size() - 2];
         bytes += (rankBase - previous.rankBase()) * previous.seqLen();
         byteStarts.back() = bytes;
     }
     entries = rankBase;
 }
 
-void RunTable::checkLengthsDescend() const {
-    for (size_t i = 1; i < segments.size(); i++) {
-        if (segments[i].seqLen() > segments[i - 1].seqLen()) {
-            Debug(Debug::ERROR) << "Segment " << i << " holds length " << segments[i].seqLen()
-                                << " after " << segments[i - 1].seqLen()
+void SequenceLocator::checkLengthsDescend() const {
+    for (size_t i = 1; i < runs.size(); i++) {
+        if (runs[i].seqLen() > runs[i - 1].seqLen()) {
+            Debug(Debug::ERROR) << "Length run " << i << " holds length " << runs[i].seqLen()
+                                << " after " << runs[i - 1].seqLen()
                                 << ", the database is not sorted by length descending\n";
             EXIT(EXIT_FAILURE);
         }
     }
 }
 
-void RunTable::finish(uint64_t totalEntries) {
+void SequenceLocator::finish(uint64_t totalEntries) {
     if (totalEntries > MAX_RANK + 1) {
         Debug(Debug::ERROR) << "Run table holds " << totalEntries << " entries, the rank field fits "
                             << (MAX_RANK + 1) << "\n";
@@ -88,65 +88,65 @@ void RunTable::finish(uint64_t totalEntries) {
     rebuildByteStarts();
 }
 
-void RunTable::rebuildByteStarts() {
-    byteStarts.assign(segments.size(), 0);
+void SequenceLocator::rebuildByteStarts() {
+    byteStarts.assign(runs.size(), 0);
     bytes = 0;
-    for (size_t i = 0; i < segments.size(); i++) {
+    for (size_t i = 0; i < runs.size(); i++) {
         byteStarts[i] = bytes;
-        const uint64_t next = (i + 1 < segments.size()) ? segments[i + 1].rankBase() : entries;
-        bytes += (next - segments[i].rankBase()) * segments[i].seqLen();
+        const uint64_t next = (i + 1 < runs.size()) ? runs[i + 1].rankBase() : entries;
+        bytes += (next - runs[i].rankBase()) * runs[i].seqLen();
     }
 }
 
-size_t RunTable::segmentOf(uint64_t rank) const {
-    if (segments.empty() || rank >= entries) {
+size_t SequenceLocator::runOf(uint64_t rank) const {
+    if (runs.empty() || rank >= entries) {
         Debug(Debug::ERROR) << "Run table lookup for rank " << rank << " of " << entries << "\n";
         EXIT(EXIT_FAILURE);
     }
     size_t low = 0;
-    size_t high = segments.size() - 1;
+    size_t high = runs.size() - 1;
     while (low < high) {
         const size_t mid = low + (high - low + 1) / 2;
-        low = (segments[mid].rankBase() <= rank) ? mid : low;
-        high = (segments[mid].rankBase() <= rank) ? high : mid - 1;
+        low = (runs[mid].rankBase() <= rank) ? mid : low;
+        high = (runs[mid].rankBase() <= rank) ? high : mid - 1;
     }
     return low;
 }
 
-size_t RunTable::segmentOfFrom(uint64_t rank, size_t cursor) const {
-    if (rank < segments[cursor].rankBase()) {
-        return segmentOf(rank);
+size_t SequenceLocator::runOfFrom(uint64_t rank, size_t cursor) const {
+    if (rank < runs[cursor].rankBase()) {
+        return runOf(rank);
     }
-    while (cursor + 1 < segments.size() && segments[cursor + 1].rankBase() <= rank) {
+    while (cursor + 1 < runs.size() && runs[cursor + 1].rankBase() <= rank) {
         cursor++;
     }
     return cursor;
 }
 
-uint64_t RunTable::offsetIn(size_t segment, uint64_t rank) const {
-    const Segment &at = segments[segment];
+uint64_t SequenceLocator::offsetIn(size_t segment, uint64_t rank) const {
+    const LengthRun &at = runs[segment];
     return at.byteBase() + (rank - at.rankBase()) * at.seqLen();
 }
 
-uint64_t RunTable::byteAtRank(uint64_t rank) const {
+uint64_t SequenceLocator::byteAtRank(uint64_t rank) const {
     if (rank >= entries) {
         return bytes;
     }
-    const size_t segment = segmentOf(rank);
-    return byteStarts[segment] + (rank - segments[segment].rankBase()) * segments[segment].seqLen();
+    const size_t segment = runOf(rank);
+    return byteStarts[segment] + (rank - runs[segment].rankBase()) * runs[segment].seqLen();
 }
 
-uint64_t RunTable::rankAtByte(uint64_t globalByte) const {
-    if (segments.empty() || globalByte >= bytes) {
+uint64_t SequenceLocator::rankAtByte(uint64_t globalByte) const {
+    if (runs.empty() || globalByte >= bytes) {
         return entries;
     }
     const size_t segment = static_cast<size_t>(
         std::upper_bound(byteStarts.begin(), byteStarts.end(), globalByte) - byteStarts.begin() - 1);
-    const uint64_t inSegment = (globalByte - byteStarts[segment]) / segments[segment].seqLen();
-    return segments[segment].rankBase() + inSegment;
+    const uint64_t inRun = (globalByte - byteStarts[segment]) / runs[segment].seqLen();
+    return runs[segment].rankBase() + inRun;
 }
 
-void RunTable::write(const std::string &path) const {
+void SequenceLocator::write(const std::string &path) const {
     char host[HOST_NAME_MAX + 1];
     memset(host, 0, sizeof(host));
     gethostname(host, HOST_NAME_MAX);
@@ -158,35 +158,35 @@ void RunTable::write(const std::string &path) const {
     header.keyWidth = static_cast<uint32_t>(sizeof(DBKeyType));
     header.nodeCount = nodes;
     header.filesPerNode = perNodeFiles;
-    header.segmentCount = segments.size();
+    header.segmentCount = runs.size();
     header.entryCount = entries;
     header.byteCount = bytes;
     if (fwrite(&header, sizeof(Header), 1, out) != 1) {
-        Debug(Debug::ERROR) << "Cannot write run table header to " << path << "\n";
+        Debug(Debug::ERROR) << "Cannot write the sequence locator header to " << path << "\n";
         EXIT(EXIT_FAILURE);
     }
-    if (segments.empty() == false
-        && fwrite(segments.data(), sizeof(Segment), segments.size(), out) != segments.size()) {
-        Debug(Debug::ERROR) << "Cannot write run table segments to " << path << "\n";
+    if (runs.empty() == false
+        && fwrite(runs.data(), sizeof(LengthRun), runs.size(), out) != runs.size()) {
+        Debug(Debug::ERROR) << "Cannot write the length runs to " << path << "\n";
         EXIT(EXIT_FAILURE);
     }
     if (fclose(out) != 0) {
-        Debug(Debug::ERROR) << "Cannot close run table " << tmp << "\n";
+        Debug(Debug::ERROR) << "Cannot close the sequence locator " << tmp << "\n";
         EXIT(EXIT_FAILURE);
     }
     FileUtil::publishAtomically(tmp, path);
 }
 
-void RunTable::read(const std::string &path) {
+void SequenceLocator::read(const std::string &path) {
     FILE *in = fopen(path.c_str(), "rb");
     if (in == NULL) {
-        Debug(Debug::ERROR) << "Cannot open run table " << path << "\n";
+        Debug(Debug::ERROR) << "Cannot open the sequence locator " << path << "\n";
         EXIT(EXIT_FAILURE);
     }
     Header header;
     if (fread(&header, sizeof(Header), 1, in) != 1
         || memcmp(header.magic, RUN_TABLE_MAGIC, sizeof(header.magic)) != 0) {
-        Debug(Debug::ERROR) << "File " << path << " is not a run table\n";
+        Debug(Debug::ERROR) << "File " << path << " is not a sequence locator\n";
         EXIT(EXIT_FAILURE);
     }
     if (header.version != RUN_TABLE_VERSION) {
@@ -199,9 +199,9 @@ void RunTable::read(const std::string &path) {
                             << " byte key, this build uses " << sizeof(DBKeyType) << "\n";
         EXIT(EXIT_FAILURE);
     }
-    segments.resize(header.segmentCount);
+    runs.resize(header.segmentCount);
     if (header.segmentCount > 0
-        && fread(segments.data(), sizeof(Segment), segments.size(), in) != segments.size()) {
+        && fread(runs.data(), sizeof(LengthRun), runs.size(), in) != runs.size()) {
         Debug(Debug::ERROR) << "Run table " << path << " is truncated\n";
         EXIT(EXIT_FAILURE);
     }
@@ -763,8 +763,8 @@ void requireEveryNodeDone(const std::string &path, unsigned int nodes) {
 
 
 
-// the split is a function of the run table and the node count, so no node has to ask another
-std::vector<size_t> nodeFileSlots(const RunTable &runs, const NodePlacement &node) {
+// the split is a function of the locator and the node count, so no node has to ask another
+std::vector<size_t> nodeFileSlots(const SequenceLocator &runs, const NodePlacement &node) {
     std::vector<uint64_t> bytes(runs.filesPerNode(), 0);
     uint64_t total = 0;
     for (size_t i = 0; i < runs.size(); i++) {

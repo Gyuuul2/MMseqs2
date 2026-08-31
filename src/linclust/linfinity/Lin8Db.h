@@ -18,9 +18,13 @@
 #include <omp.h>
 #endif
 
-class RunTable {
+// Where a sequence is, without an index a sequence. Ranks run longest first, so every sequence of
+// one length in one file is consecutive and a single row describes all of them:
+//     offsetIn(run, rank) = byteBase + (rank - rankBase) * seqLen
+// Eleven billion sequences came to ten thousand rows. An index would have been 24 TB at a trillion.
+class SequenceLocator {
 public:
-    // one place, so the table cannot hold a rank the k-mer record cannot name. 2.2e12.
+    // one place, so the locator cannot hold a rank the k-mer record cannot name. 2.2e12.
     static const unsigned int RANK_BITS = 44;
     static const uint64_t MAX_RANK = (1ull << RANK_BITS) - 1;
     static const uint64_t MAX_BYTE = (1ull << 48) - 1;
@@ -29,7 +33,8 @@ public:
     static const uint32_t MAX_SEQ_LEN = 32764;
     static const uint32_t MAX_ENTRY_LEN = 65535;
 
-    struct Segment {
+    // one length in one file, however many sequences that is
+    struct LengthRun {
         uint64_t rankAndLen;
         uint64_t byteAndFile;
         uint64_t hdrByte;
@@ -42,28 +47,28 @@ public:
     };
 
 
-    RunTable();
+    SequenceLocator();
 
-    void reserve(size_t segments);
+    void reserve(size_t runs);
     void append(uint64_t rankBase, uint32_t seqLen, uint64_t byteBase, uint32_t fileIdx,
                 uint64_t hdrBase);
 
-    size_t size() const { return segments.size(); }
+    size_t size() const { return runs.size(); }
     uint64_t entryCount() const { return entries; }
-    const Segment *data() const { return segments.data(); }
-    const Segment &operator[](size_t at) const { return segments[at]; }
+    const LengthRun *data() const { return runs.data(); }
+    const LengthRun &operator[](size_t at) const { return runs[at]; }
 
     // the caller keeps the returned index as a cursor, so a forward scan never binary searches again
-    size_t segmentOf(uint64_t rank) const;
-    size_t segmentOfFrom(uint64_t rank, size_t cursor) const;
+    size_t runOf(uint64_t rank) const;
+    size_t runOfFrom(uint64_t rank, size_t cursor) const;
 
-    uint32_t seqLen(uint64_t rank) const { return segments[segmentOf(rank)].seqLen(); }
-    uint32_t maxSeqLen() const { return segments.empty() ? 0 : segments[0].seqLen(); }
-    uint32_t fileIdx(uint64_t rank) const { return segments[segmentOf(rank)].fileIdx(); }
-    uint64_t fileOffset(uint64_t rank) const { return offsetIn(segmentOf(rank), rank); }
+    uint32_t seqLen(uint64_t rank) const { return runs[runOf(rank)].seqLen(); }
+    uint32_t maxSeqLen() const { return runs.empty() ? 0 : runs[0].seqLen(); }
+    uint32_t fileIdx(uint64_t rank) const { return runs[runOf(rank)].fileIdx(); }
+    uint64_t fileOffset(uint64_t rank) const { return offsetIn(runOf(rank), rank); }
     uint64_t offsetIn(size_t segment, uint64_t rank) const;
     uint64_t rankEnd(size_t segment) const {
-        return (segment + 1 < segments.size()) ? segments[segment + 1].rankBase() : entries;
+        return (segment + 1 < runs.size()) ? runs[segment + 1].rankBase() : entries;
     }
 
     uint64_t rankAtByte(uint64_t globalByte) const;
@@ -84,7 +89,7 @@ public:
     void checkLengthsDescend() const;
 
 private:
-    std::vector<Segment> segments;
+    std::vector<LengthRun> runs;
     std::vector<uint64_t> byteStarts;
     uint64_t entries;
     uint64_t bytes;
@@ -100,7 +105,7 @@ struct __attribute__((packed)) KmerRecord {
 
     static const unsigned int BUCKET_BITS = 13;
     static const unsigned int KEY_BITS = 51 - BUCKET_BITS;
-    static const unsigned int RANK_BITS = RunTable::RANK_BITS;
+    static const unsigned int RANK_BITS = SequenceLocator::RANK_BITS;
     static const unsigned int POS_BITS = 15;
 
     static const unsigned int SUB_BUCKET_BITS = 8;
@@ -184,7 +189,7 @@ struct __attribute__((packed)) PairRecord {
 
     static const unsigned int REP_RANK_SUB_BLOCK_BITS = 8;
     // repRankSubBlockOf multiplies a rank by both counts before dividing, unsigned
-    static_assert(RunTable::RANK_BITS + 12 + REP_RANK_SUB_BLOCK_BITS <= 64,
+    static_assert(SequenceLocator::RANK_BITS + 12 + REP_RANK_SUB_BLOCK_BITS <= 64,
                   "a rank times the repRankBlock count times the sub repRankBlock count is over 64 bits");
     static const size_t REP_RANK_SUB_BLOCKS = size_t(1) << REP_RANK_SUB_BLOCK_BITS;
     static size_t fineOf(uint64_t rep, uint64_t ranks, size_t repRankBlocks) {
