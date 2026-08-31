@@ -579,12 +579,12 @@ int lin8createdb(int argc, const char **argv, const Command &command) {
     // the record format caps the length, so a larger --max-seq-len can only be honoured up to it
     const uint32_t maxSeqLen =
         static_cast<uint32_t>(std::min<size_t>(par.maxSeqLen, LINCLUSTERDB_MAX_SEQ_LEN));
-    const bool placed = FileUtil::fileExists(nodeDonePath(db, node.index).c_str());
+    const bool isNodeDone = FileUtil::fileExists(nodeDonePath(db, node.index).c_str());
     std::vector<InputSplit> nodeInputSplits;
     size_t budget = 0;
     Timer timer;
     NodeSequenceDistribution nodeDistribution;
-    if (placed) {
+    if (isNodeDone) {
         nodeDistribution = readLengthDistribution(nodePartName(db, "hist", node.index), par.threads);
         Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " already placed "
                            << nodeDistribution.sequenceCount << " sequences, rerunning to merge\n";
@@ -627,9 +627,10 @@ int lin8createdb(int argc, const char **argv, const Command &command) {
         EXIT(EXIT_FAILURE);
     }
 
-    if (placed == false) {
-        for (unsigned int slot = 0; slot < par.threads; slot++) {
-            const std::string data = db + "." + SSTR(node.index * par.threads + slot);
+    if (isNodeDone == false) {
+        // one data file a thread, but no thread owns one: a length decides which file it lands in
+        for (unsigned int file = 0; file < par.threads; file++) {
+            const std::string data = db + "." + SSTR(node.index * par.threads + file);
             if (FileUtil::fileExists(data.c_str()) && FileUtil::getFileSize(data) > 0) {
                 Debug(Debug::ERROR) << data << " holds data but node " << node.index
                                     << " left no marker. Another run wrote it and did not finish;"
