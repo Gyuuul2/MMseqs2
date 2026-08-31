@@ -22,7 +22,7 @@
 #include <omp.h>
 #endif
 
-static const unsigned int LINCLUSTERDB_MAX_SEQ_LEN = RunTable::MAX_ENTRY_LEN;
+static const unsigned int LINCLUSTERDB_MAX_SEQ_LEN = SequenceLocator::MAX_ENTRY_LEN;
 static const size_t LINCLUSTERDB_HISTOGRAM_SIZE = LINCLUSTERDB_MAX_SEQ_LEN + 1;
 static const uint64_t LINCLUSTERDB_HISTOGRAM_MAGIC = 0x4C494E4348495354ull;
 
@@ -33,7 +33,7 @@ static const uint64_t PROGRESS_STEP = 1000000;
 static std::vector<InputSplit> inputSplitsForNode(const std::vector<std::string> &filenames,
                                              const NodePlacement &nodePlacement, unsigned int threads) {
     // more pieces than threads so a slow one does not hold a barrier, and no more than that
-    // because the counting arrays are a sequencesByLength a piece
+    // because the counting pass keeps a row of counts for every piece
     const size_t targetSplitCount =
         std::max<size_t>(1, (size_t) nodePlacement.count * std::max(threads, 1u) * 2);
     const std::vector<InputSplit> everySplit = planInputSplits(filenames, targetSplitCount);
@@ -63,23 +63,30 @@ static std::string nodePartName(const std::string &db, const char *suffix, unsig
 
 struct NodeSequenceDistribution {
     std::vector<uint64_t> sequencesByLength;
-    std::vector<uint64_t> perInputSplitCount;
-    std::vector<uint64_t> perInputSplitHeaderBytes;
-    unsigned int inputSplitCount;
+    std::vector<uint64_t> sequencesByLengthAndSplit;
+    std::vector<uint64_t> headerBytesByLengthAndSplit;
+    // the two arrays above are one row a length, so this is the stride between rows
+    unsigned int splitCount;
     uint64_t sequenceCount;
     uint64_t residueCount;
     uint64_t headerBytes;
     uint64_t rejectedSequenceCount;
 
     NodeSequenceDistribution()
-        : inputSplitCount(0), sequenceCount(0), residueCount(0), headerBytes(0),
+        : splitCount(0), sequenceCount(0), residueCount(0), headerBytes(0),
           rejectedSequenceCount(0) {}
 
-    uint64_t &at(std::vector<uint64_t> &of, size_t length, unsigned int inputSplit) {
-        return of[length * inputSplitCount + inputSplit];
+    uint64_t &sequencesAt(size_t length, unsigned int split) {
+        return sequencesByLengthAndSplit[length * splitCount + split];
     }
-    uint64_t get(const std::vector<uint64_t> &of, size_t length, unsigned int inputSplit) const {
-        return of[length * inputSplitCount + inputSplit];
+    uint64_t sequencesAt(size_t length, unsigned int split) const {
+        return sequencesByLengthAndSplit[length * splitCount + split];
+    }
+    uint64_t &headerBytesAt(size_t length, unsigned int split) {
+        return headerBytesByLengthAndSplit[length * splitCount + split];
+    }
+    uint64_t headerBytesAt(size_t length, unsigned int split) const {
+        return headerBytesByLengthAndSplit[length * splitCount + split];
     }
 };
 
@@ -87,10 +94,10 @@ static NodeSequenceDistribution countSequenceLengths(const std::vector<std::stri
                                    const std::vector<InputSplit> &nodeInputSplits, unsigned int threads,
                                    uint32_t maxSeqLen) {
     NodeSequenceDistribution nodeDistribution;
-    nodeDistribution.inputSplitCount = static_cast<unsigned int>(std::max<size_t>(nodeInputSplits.size(), 1));
+    nodeDistribution.splitCount = static_cast<unsigned int>(std::max<size_t>(nodeInputSplits.size(), 1));
     nodeDistribution.sequencesByLength.assign(LINCLUSTERDB_HISTOGRAM_SIZE, 0);
-    nodeDistribution.perInputSplitCount.assign(LINCLUSTERDB_HISTOGRAM_SIZE * nodeDistribution.inputSplitCount, 0);
-    nodeDistribution.perInputSplitHeaderBytes.assign(LINCLUSTERDB_HISTOGRAM_SIZE * nodeDistribution.inputSplitCount, 0);
+    nodeDistribution.sequencesByLengthAndSplit.assign(LINCLUSTERDB_HISTOGRAM_SIZE * nodeDistribution.splitCount, 0);
+    nodeDistribution.headerBytesByLengthAndSplit.assign(LINCLUSTERDB_HISTOGRAM_SIZE * nodeDistribution.splitCount, 0);
     std::vector<std::pair<std::string, size_t> > skippedAll;
     std::vector<std::pair<std::string, size_t> > aloneAll;
     Debug::Progress progress(nodeInputSplits.size());
@@ -117,12 +124,12 @@ static NodeSequenceDistribution countSequenceLengths(const std::vector<std::stri
                     skipped.push_back(std::make_pair(std::string(name, nameLength), length));
                     continue;
                 }
-                if (length > RunTable::MAX_SEQ_LEN) {
+                if (length > SequenceLocator::MAX_SEQ_LEN) {
                     alone.push_back(std::make_pair(std::string(name, nameLength), length));
                 }
                 const size_t header = nameLength + 1;
-                nodeDistribution.at(nodeDistribution.perInputSplitCount, length, split)++;
-                nodeDistribution.at(nodeDistribution.perInputSplitHeaderBytes, length, split) += header;
+                nodeDistribution.sequencesAt(length, split)++;
+                nodeDistribution.headerBytesAt(length, split) += header;
                 sequenceCount++;
                 residues += length;
                 headerBytes += header;
@@ -150,8 +157,8 @@ static NodeSequenceDistribution countSequenceLengths(const std::vector<std::stri
                             << skippedAll[i].first << " (" << skippedAll[i].second << " residues)\n";
     }
     for (size_t length = 0; length < LINCLUSTERDB_HISTOGRAM_SIZE; length++) {
-        for (unsigned int inputSplit = 0; inputSplit < nodeDistribution.inputSplitCount; inputSplit++) {
-            nodeDistribution.sequencesByLength[length] += nodeDistribution.get(nodeDistribution.perInputSplitCount, length, inputSplit);
+        for (unsigned int split = 0; split < nodeDistribution.splitCount; split++) {
+            nodeDistribution.sequencesByLength[length] += nodeDistribution.sequencesAt(length, split);
         }
     }
     return nodeDistribution;
@@ -182,7 +189,7 @@ static NodeSequenceDistribution readLengthDistribution(const std::string &path, 
         EXIT(EXIT_FAILURE);
     }
     NodeSequenceDistribution nodeDistribution;
-    nodeDistribution.inputSplitCount = 0;
+    nodeDistribution.splitCount = 0;
     uint64_t fields[6];
     nodeDistribution.sequencesByLength.assign(LINCLUSTERDB_HISTOGRAM_SIZE, 0);
     if (fread(fields, sizeof(uint64_t), 6, in) != 6
@@ -209,7 +216,7 @@ static NodeSequenceDistribution readLengthDistribution(const std::string &path, 
     return nodeDistribution;
 }
 
-// the ranks every node agrees on: rank ordered by length descending, then node, then slot
+// the ranks every node agrees on: longest first, and within one length by the node that read it
 struct RankLayout {
     std::vector<uint64_t> rankBase;
     uint64_t sequenceCount;
@@ -246,19 +253,22 @@ static RankLayout computeGlobalRankLayout(const std::vector<NodeSequenceDistribu
     return ranks;
 }
 
-struct DbLayout {
-    std::vector<uint64_t> seqAt;
-    std::vector<uint64_t> hdrAt;
-    std::vector<uint64_t> seqFileStart;
-    std::vector<uint64_t> hdrFileStart;
-    unsigned int inputSplitCount;
-    uint64_t seqBytes;
-    uint64_t hdrBytes;
+struct BytePlan {
+    std::vector<uint64_t> sequenceByteAt;
+    std::vector<uint64_t> headerByteAt;
+    std::vector<uint64_t> sequenceFileStart;
+    std::vector<uint64_t> headerFileStart;
+    // a file begins where a length begins, so a length never crosses one and this is enough to
+    // place any of its bytes without looking
+    std::vector<unsigned int> fileOfLength;
+    unsigned int splitCount;
+    uint64_t sequenceBytes;
+    uint64_t headerBytesTotal;
 };
 
 static void planDatabaseLayout(const std::vector<NodeSequenceDistribution> &nodeDistributions, const NodeSequenceDistribution &nodeDistribution,
                        const RankLayout &ranks, unsigned int files, unsigned int fileBase,
-                       DbLayout &layout, RunTable &partial) {
+                       BytePlan &bytePlan, SequenceLocator &nodeLocator) {
     std::vector<uint64_t> bytesAbove(LINCLUSTERDB_HISTOGRAM_SIZE, 0);
     uint64_t total = 0;
     for (size_t length = LINCLUSTERDB_MAX_SEQ_LEN; length >= 1; length--) {
@@ -271,46 +281,48 @@ static void planDatabaseLayout(const std::vector<NodeSequenceDistribution> &node
     }
     const uint64_t perFile = std::max<uint64_t>(1, (total + files - 1) / files);
 
-    const unsigned int inputSplitCount = nodeDistribution.inputSplitCount;
-    layout.inputSplitCount = inputSplitCount;
-    layout.seqAt.assign(LINCLUSTERDB_HISTOGRAM_SIZE * inputSplitCount, 0);
-    layout.hdrAt.assign(LINCLUSTERDB_HISTOGRAM_SIZE * inputSplitCount, 0);
-    layout.seqFileStart.assign(files + 1, 0);
-    layout.hdrFileStart.assign(files + 1, 0);
+    const unsigned int splitCount = nodeDistribution.splitCount;
+    bytePlan.splitCount = splitCount;
+    bytePlan.sequenceByteAt.assign(LINCLUSTERDB_HISTOGRAM_SIZE * splitCount, 0);
+    bytePlan.headerByteAt.assign(LINCLUSTERDB_HISTOGRAM_SIZE * splitCount, 0);
+    bytePlan.sequenceFileStart.assign(files + 1, 0);
+    bytePlan.headerFileStart.assign(files + 1, 0);
+    bytePlan.fileOfLength.assign(LINCLUSTERDB_HISTOGRAM_SIZE, 0);
 
-    uint64_t seqAt = 0;
-    uint64_t hdrAt = 0;
+    uint64_t sequenceByteAt = 0;
+    uint64_t headerByteAt = 0;
     unsigned int open = 0;
     for (size_t length = LINCLUSTERDB_MAX_SEQ_LEN; length >= 1; length--) {
         const unsigned int file = static_cast<unsigned int>(
             std::min<uint64_t>(bytesAbove[length] / perFile, files - 1));
+        bytePlan.fileOfLength[length] = file;
         while (open < file) {
             open++;
-            layout.seqFileStart[open] = seqAt;
-            layout.hdrFileStart[open] = hdrAt;
+            bytePlan.sequenceFileStart[open] = sequenceByteAt;
+            bytePlan.headerFileStart[open] = headerByteAt;
         }
-        const uint64_t seqFirst = seqAt;
-        const uint64_t hdrFirst = hdrAt;
-        for (unsigned int inputSplit = 0; inputSplit < inputSplitCount; inputSplit++) {
-            layout.seqAt[length * inputSplitCount + inputSplit] = seqAt;
-            layout.hdrAt[length * inputSplitCount + inputSplit] = hdrAt;
-            seqAt += nodeDistribution.get(nodeDistribution.perInputSplitCount, length, inputSplit)
+        const uint64_t seqFirst = sequenceByteAt;
+        const uint64_t hdrFirst = headerByteAt;
+        for (unsigned int split = 0; split < splitCount; split++) {
+            bytePlan.sequenceByteAt[length * splitCount + split] = sequenceByteAt;
+            bytePlan.headerByteAt[length * splitCount + split] = headerByteAt;
+            sequenceByteAt += nodeDistribution.sequencesAt(length, split)
                      * length;
-            hdrAt += nodeDistribution.get(nodeDistribution.perInputSplitHeaderBytes, length, inputSplit);
+            headerByteAt += nodeDistribution.headerBytesAt(length, split);
         }
         if (nodeDistribution.sequencesByLength[length] > 0) {
-            partial.append(ranks.rankBase[length], static_cast<uint32_t>(length),
-                           seqFirst - layout.seqFileStart[file], fileBase + file,
-                           hdrFirst - layout.hdrFileStart[file]);
+            nodeLocator.append(ranks.rankBase[length], static_cast<uint32_t>(length),
+                           seqFirst - bytePlan.sequenceFileStart[file], fileBase + file,
+                           hdrFirst - bytePlan.headerFileStart[file]);
         }
     }
     while (open < files) {
         open++;
-        layout.seqFileStart[open] = seqAt;
-        layout.hdrFileStart[open] = hdrAt;
+        bytePlan.sequenceFileStart[open] = sequenceByteAt;
+        bytePlan.headerFileStart[open] = headerByteAt;
     }
-    layout.seqBytes = seqAt;
-    layout.hdrBytes = hdrAt;
+    bytePlan.sequenceBytes = sequenceByteAt;
+    bytePlan.headerBytesTotal = headerByteAt;
 }
 
 class SequenceWriter {
@@ -318,21 +330,21 @@ public:
     static const size_t WRITE_CHUNK = 1ull << 30;
 
     SequenceWriter(const std::vector<int> &seqFd, const std::vector<int> &hdrFd,
-               const NodeSequenceDistribution &nodeDistribution, const DbLayout &layout, unsigned int file, size_t budget)
-        : seqFd(seqFd), hdrFd(hdrFd), layout(layout), file(file) {
+               const NodeSequenceDistribution &nodeDistribution, const BytePlan &bytePlan, unsigned int file, size_t budget)
+        : seqFd(seqFd), hdrFd(hdrFd), bytePlan(bytePlan), file(file) {
         seqBuf.resize(LINCLUSTERDB_HISTOGRAM_SIZE);
         hdrBuf.resize(LINCLUSTERDB_HISTOGRAM_SIZE);
         seqRoom.assign(LINCLUSTERDB_HISTOGRAM_SIZE, 0);
         hdrRoom.assign(LINCLUSTERDB_HISTOGRAM_SIZE, 0);
-        seqAt.assign(LINCLUSTERDB_HISTOGRAM_SIZE, 0);
-        hdrAt.assign(LINCLUSTERDB_HISTOGRAM_SIZE, 0);
+        sequenceByteAt.assign(LINCLUSTERDB_HISTOGRAM_SIZE, 0);
+        headerByteAt.assign(LINCLUSTERDB_HISTOGRAM_SIZE, 0);
         uint64_t want = 0;
         for (size_t length = 1; length < LINCLUSTERDB_HISTOGRAM_SIZE; length++) {
-            seqAt[length] = layout.seqAt[length * layout.inputSplitCount + file];
-            hdrAt[length] = layout.hdrAt[length * layout.inputSplitCount + file];
-            seqRoom[length] = nodeDistribution.get(nodeDistribution.perInputSplitCount, length, file)
+            sequenceByteAt[length] = bytePlan.sequenceByteAt[length * bytePlan.splitCount + file];
+            headerByteAt[length] = bytePlan.headerByteAt[length * bytePlan.splitCount + file];
+            seqRoom[length] = nodeDistribution.sequencesAt(length, file)
                               * length;
-            hdrRoom[length] = nodeDistribution.get(nodeDistribution.perInputSplitHeaderBytes, length, file);
+            hdrRoom[length] = nodeDistribution.headerBytesAt(length, file);
             want += seqRoom[length] + hdrRoom[length];
         }
         if (want > budget && want > 0) {
@@ -367,40 +379,38 @@ public:
 private:
     void flushLength(size_t length) {
         if (seqBuf[length].empty() == false) {
-            writeSpanning(seqFd, layout.seqFileStart, seqAt[length], seqBuf[length]);
-            seqAt[length] += seqBuf[length].size();
+            writeLength(seqFd, bytePlan.sequenceFileStart, bytePlan.fileOfLength[length],
+                        sequenceByteAt[length], seqBuf[length]);
+            sequenceByteAt[length] += seqBuf[length].size();
             seqBuf[length].clear();
         }
         if (hdrBuf[length].empty() == false) {
-            writeSpanning(hdrFd, layout.hdrFileStart, hdrAt[length], hdrBuf[length]);
-            hdrAt[length] += hdrBuf[length].size();
+            writeLength(hdrFd, bytePlan.headerFileStart, bytePlan.fileOfLength[length],
+                        headerByteAt[length], hdrBuf[length]);
+            headerByteAt[length] += hdrBuf[length].size();
             hdrBuf[length].clear();
         }
     }
 
-    // the outputs are sized up front, so an offset mistake would leave zeros that read as valid
-    void writeSpanning(const std::vector<int> &fd, const std::vector<uint64_t> &fileStart,
-                       uint64_t at, const std::vector<unsigned char> &data) {
+    // The bytes of one length all sit in one file, because planDatabaseLayout opens a file where a
+    // length opens, so the file is known and the offset needs no search. The outputs are sized up
+    // front and an offset mistake would leave zeros that read as sequence, hence the check. What is
+    // left is the size of one write: linux truncates a pwrite past 2 GiB and nfs may shorten one.
+    void writeLength(const std::vector<int> &fd, const std::vector<uint64_t> &fileStart,
+                     unsigned int file, uint64_t at, const std::vector<unsigned char> &data) {
+        if (at < fileStart[file] || at + data.size() > fileStart[file + 1]) {
+            Debug(Debug::ERROR) << "Write of " << data.size() << " byte at " << at
+                                << " does not fit data file " << file << ", which holds "
+                                << fileStart[file] << " to " << fileStart[file + 1] << "\n";
+            EXIT(EXIT_FAILURE);
+        }
         size_t done = 0;
         while (done < data.size()) {
-            const uint64_t now = at + done;
-            size_t which = 0;
-            while (which + 1 < fd.size() && fileStart[which + 1] <= now) {
-                which++;
-            }
-            // linux truncates a single pwrite past 2 GiB, and nfs may shorten one at any size
-            const size_t room = std::min<size_t>(data.size() - done,
-                                                 static_cast<size_t>(fileStart[which + 1] - now));
-            const size_t chunk = std::min<size_t>(room, WRITE_CHUNK);
-            if (chunk == 0) {
-                Debug(Debug::ERROR) << "Write of " << data.size() << " byte at " << at
-                                    << " ran past the last data file\n";
-                EXIT(EXIT_FAILURE);
-            }
-            const ssize_t wrote = pwrite(fd[which], data.data() + done, chunk,
-                                         static_cast<off_t>(now - fileStart[which]));
+            const size_t chunk = std::min<size_t>(data.size() - done, WRITE_CHUNK);
+            const ssize_t wrote = pwrite(fd[file], data.data() + done, chunk,
+                                         static_cast<off_t>(at + done - fileStart[file]));
             if (wrote <= 0) {
-                Debug(Debug::ERROR) << "Cannot write " << chunk << " byte to data file " << which
+                Debug(Debug::ERROR) << "Cannot write " << chunk << " byte to data file " << file
                                     << "\n";
                 EXIT(EXIT_FAILURE);
             }
@@ -411,20 +421,20 @@ private:
 
     const std::vector<int> &seqFd;
     const std::vector<int> &hdrFd;
-    const DbLayout &layout;
+    const BytePlan &bytePlan;
     unsigned int file;
     uint64_t written = 0;
     std::vector<std::vector<unsigned char> > seqBuf;
     std::vector<std::vector<unsigned char> > hdrBuf;
     std::vector<uint64_t> seqRoom;
     std::vector<uint64_t> hdrRoom;
-    std::vector<uint64_t> seqAt;
-    std::vector<uint64_t> hdrAt;
+    std::vector<uint64_t> sequenceByteAt;
+    std::vector<uint64_t> headerByteAt;
 };
 
 
 static void writeSequencesAndHeaders(const std::vector<std::string> &filenames, const std::vector<InputSplit> &nodeInputSplits,
-                      const NodeSequenceDistribution &nodeDistribution, const DbLayout &layout,
+                      const NodeSequenceDistribution &nodeDistribution, const BytePlan &bytePlan,
                       const std::vector<int> &seqFd, const std::vector<int> &hdrFd,
                       unsigned int threads, size_t budget, uint32_t maxSeqLen) {
     uint64_t written = 0;
@@ -435,7 +445,7 @@ static void writeSequencesAndHeaders(const std::vector<std::string> &filenames, 
         std::string header;
 #pragma omp for schedule(dynamic, 1)
         for (size_t split = 0; split < nodeInputSplits.size(); split++) {
-            SequenceWriter writer(seqFd, hdrFd, nodeDistribution, layout,
+            SequenceWriter writer(seqFd, hdrFd, nodeDistribution, bytePlan,
                               static_cast<unsigned int>(split),
                               std::max<size_t>(budget / threads, 1u << 20));
             InputSplitReader reader(filenames[nodeInputSplits[split].file],
@@ -466,7 +476,7 @@ static void writeSequencesAndHeaders(const std::vector<std::string> &filenames, 
             written += writer.bytesWritten();
         }
     }
-    const uint64_t expect = layout.seqBytes + layout.hdrBytes;
+    const uint64_t expect = bytePlan.sequenceBytes + bytePlan.headerBytesTotal;
     if (written != expect) {
         Debug(Debug::ERROR) << "Placed " << written << " byte but the ranks reserved " << expect
                             << ", the output would hold unwritten gaps\n";
@@ -512,7 +522,7 @@ static void dropCacheAndCloseFiles(std::vector<int> &fd) {
         fd[i] = -1;
     }
 }
-static void writeFileManifest(const std::string &db, const RunTable &runs, unsigned int filesPerNode) {
+static void writeFileManifest(const std::string &db, const SequenceLocator &runs, unsigned int filesPerNode) {
     const size_t files = runs.fileCount();
     std::vector<uint32_t> maxLen(files, 0);
     std::vector<uint32_t> minLen(files, 0);
@@ -539,20 +549,20 @@ static void writeFileManifest(const std::string &db, const RunTable &runs, unsig
     FileUtil::publishAtomically(tmp, db + ".files");
 }
 
-// every node states its segments with the global rank it computed, so the merge is a sort by rank
-static RunTable mergeRunTables(const std::string &db, unsigned int nodeCount,
+// every node states its runs with the global rank it computed, so the merge is a sort by rank
+static SequenceLocator mergeSequenceLocators(const std::string &db, unsigned int nodeCount,
                                unsigned int filesPerNode, uint64_t sequenceCount) {
-    std::vector<RunTable::Segment> all;
+    std::vector<SequenceLocator::LengthRun> all;
     for (unsigned int node = 0; node < nodeCount; node++) {
-        RunTable part;
+        SequenceLocator part;
         part.read(nodePartName(db, "runs", node));
         all.insert(all.end(), part.data(), part.data() + part.size());
     }
     SORT_SERIAL(all.begin(), all.end(),
-                  [](const RunTable::Segment &first, const RunTable::Segment &second) {
+                  [](const SequenceLocator::LengthRun &first, const SequenceLocator::LengthRun &second) {
                       return first.rankBase() < second.rankBase();
                   });
-    RunTable merged;
+    SequenceLocator merged;
     merged.setLayout(nodeCount, filesPerNode);
     merged.reserve(all.size());
     for (size_t i = 0; i < all.size(); i++) {
@@ -592,7 +602,7 @@ int lin8createdb(int argc, const char **argv, const Command &command) {
         nodeInputSplits = inputSplitsForNode(filenames, node, par.threads);
         // no margin: this staging buffer is the only large allocation the pass makes
         budget = Util::computeMemory(par.splitMemoryLimit);
-        Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << nodeInputSplits.size() << " inputSplit" << (nodeInputSplits.size() == 1 ? "" : "s")
+        Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << nodeInputSplits.size() << " split" << (nodeInputSplits.size() == 1 ? "" : "s")
                            << " of " << filenames.size() << " input file"
                            << (filenames.size() == 1 ? "" : "s") << ", buffer budget "
                            << (budget / (1024 * 1024)) << " MB\n";
@@ -638,27 +648,28 @@ int lin8createdb(int argc, const char **argv, const Command &command) {
                 EXIT(EXIT_FAILURE);
             }
         }
-        DbLayout layout;
-        RunTable partial;
-        planDatabaseLayout(nodeDistributions, nodeDistribution, ranks, par.threads, node.index * par.threads, layout, partial);
-        partial.setLayout(node.count, par.threads);
-        partial.finish(ranks.sequenceCount);
-        Debug(Debug::INFO) << "Planned " << partial.size() << " run segments over " << par.threads
-                           << " data files, " << layout.seqBytes << " byte\n";
+        BytePlan bytePlan;
+        SequenceLocator nodeLocator;
+        planDatabaseLayout(nodeDistributions, nodeDistribution, ranks, par.threads,
+                           node.index * par.threads, bytePlan, nodeLocator);
+        nodeLocator.setLayout(node.count, par.threads);
+        nodeLocator.finish(ranks.sequenceCount);
+        Debug(Debug::INFO) << "Planned " << nodeLocator.size() << " run runs over " << par.threads
+                           << " data files, " << bytePlan.sequenceBytes << " byte\n";
 
         timer.reset();
         std::vector<int> seqFd = openDataFiles(db, node.index * par.threads, par.threads,
-                                               layout.seqBytes, layout.seqFileStart);
+                                               bytePlan.sequenceBytes, bytePlan.sequenceFileStart);
         std::vector<int> hdrFd = openDataFiles(headerDb, node.index * par.threads, par.threads,
-                                               layout.hdrBytes, layout.hdrFileStart);
+                                               bytePlan.headerBytesTotal, bytePlan.headerFileStart);
         Debug(Debug::INFO) << "Placing " << nodeDistribution.sequenceCount << " sequences by length, "
                            << PROGRESS_STEP / 1000000 << "M a step\n";
-        writeSequencesAndHeaders(filenames, nodeInputSplits, nodeDistribution, layout, seqFd, hdrFd, par.threads, budget,
+        writeSequencesAndHeaders(filenames, nodeInputSplits, nodeDistribution, bytePlan, seqFd, hdrFd, par.threads, budget,
                                  maxSeqLen);
         dropCacheAndCloseFiles(seqFd);
         dropCacheAndCloseFiles(hdrFd);
         // the run part is what tells the other nodes this one is done, so it must follow the data
-        partial.write(nodePartName(db, "runs", node.index));
+        nodeLocator.write(nodePartName(db, "runs", node.index));
         Debug(Debug::INFO) << "Placed " << nodeDistribution.sequenceCount << " sequences in " << timer.lap() << "\n";
 
         markNodeDone(db, node.index);
@@ -669,7 +680,7 @@ int lin8createdb(int argc, const char **argv, const Command &command) {
         complete = complete && FileUtil::fileExists(nodePartName(db, "runs", other).c_str());
     }
     if (complete) {
-        const RunTable merged = mergeRunTables(db, node.count, par.threads, ranks.sequenceCount);
+        const SequenceLocator merged = mergeSequenceLocators(db, node.count, par.threads, ranks.sequenceCount);
         writeFileManifest(db, merged, par.threads);
         const int dbtype = DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS,
                                                                   Parameters::DBTYPE_EXTENDED_RUNS);
