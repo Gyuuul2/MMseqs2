@@ -36,7 +36,7 @@ static void readRepRankBlock(const std::string &prefix, unsigned int nodes, size
         bytes += FileUtil::getFileSize(prefix + "." + SSTR(node) + "." + SSTR(repRankBlock));
     }
     requireArena("Representative rank block " + SSTR(repRankBlock), bytes / PairRecord::DISK_BYTES * sizeof(PairRecord),
-                 budget, "raise --rep-rank-blocks");
+                 budget, "raise --pair-splits");
     std::vector<PairRecord> buffer(1u << 16);
     for (unsigned int node = 0; node < nodes; node++) {
         const std::string path = prefix + "." + SSTR(node) + "." + SSTR(repRankBlock);

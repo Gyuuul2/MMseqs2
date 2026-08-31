@@ -1181,7 +1181,7 @@ int lin8pref(int argc, const char **argv, const Command &command) {
     for (size_t repRankBlock = node.index; repRankBlock < repRankBlocks; repRankBlock += node.count) {
         const std::vector<size_t> starts =
             loadBucket(par.db1, repRankBlockCounts, writerNodes, repRankBlock, PairRecord::REP_RANK_SUB_BLOCKS,
-                       ByRepRankSubBlock(ranks, repRankBlocks), budget, par.threads, "Representative rank block", "raise --rep-rank-blocks",
+                       ByRepRankSubBlock(ranks, repRankBlocks), budget, par.threads, "Representative rank block", "raise --pair-splits",
                        "lin8-assignedpairs", PairRecord::byRepAndMember, pairs);
         read += pairs.size();
 

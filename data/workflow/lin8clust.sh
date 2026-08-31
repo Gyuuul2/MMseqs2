@@ -90,7 +90,7 @@ notExists "$TMP/kmer/out.$NODE.done" && \
 # shellcheck disable=SC2086
 notExists "$TMP/pairs/pairs.$NODE.done" && \
     "$MMSEQS" lin8-assignedpairs "$TMP/db" "$TMP/kmer/out" "$TMP/pairs/pairs" \
-        --node-count "$NODES" --node-id "$NODE" --threads "$THREADS" --rep-rank-blocks "$REP_RANK_BLOCKS" \
+        --node-count "$NODES" --node-id "$NODE" --threads "$THREADS" --pair-splits "$REP_RANK_BLOCKS" \
         -c "$COV" --cov-mode "$COVMODE" ${GROUP_PAR}
 
 [ "$NODES" -gt 1 ] && waitForAll "$TMP/pairs/pairs" "$NODES"
@@ -121,14 +121,14 @@ while [ "$R" -lt "$REP_RANK_BLOCKS" ]; do
         notExists "$TMP/aln/aln.$R.$NODE.done" && \
             "$MMSEQS" lin8-align2clust "$TMP/db" "$TMP/pref/pref" "$TMP/aln/aln" \
                 "$TMP/clu_accepted/clu_accepted" \
-                --node-count "$NODES" --node-id "$NODE" --rep-rank-block "$R" \
+                --node-count "$NODES" --node-id "$NODE" --pair-split "$R" \
                 --threads "$THREADS" --min-seq-id "$SEQID" -c "$COV" --cov-mode "$COVMODE" \
                 ${ALIGN_PAR}
         if [ "$NODE" -eq 0 ]; then
             [ "$NODES" -gt 1 ] && waitForAll "$TMP/aln/aln.$R" "$NODES"
             # shellcheck disable=SC2086
             "$MMSEQS" lin8-align2clustmulti "$TMP/aln/aln" "$TMP/pref/pref" \
-                "$TMP/clu_accepted/clu_accepted" --rep-rank-block "$R" ${ASSIGN_PAR}
+                "$TMP/clu_accepted/clu_accepted" --pair-split "$R" ${ASSIGN_PAR}
         else
             # the next block needs this one's bitmap
             _waited=0

@@ -174,7 +174,7 @@ struct __attribute__((packed)) PairRecord {
     // shifted up by half its repRankBlock, so comparing the field unsigned compares the diagonals signed
     static const int DIAGONAL_BIAS = 1 << (DIAGONAL_BITS - 1);
 
-    static const size_t DEFAULT_REP_RANK_BLOCKS = 1024;
+    static const size_t DEFAULT_REP_RANK_BLOCKS = 512;
     static const size_t MAX_REP_RANK_BLOCKS = 4096;
 
     static size_t repRankBlockOf(uint64_t rep, uint64_t ranks, size_t repRankBlocks) {
