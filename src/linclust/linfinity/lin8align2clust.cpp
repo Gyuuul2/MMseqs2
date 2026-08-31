@@ -388,7 +388,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, par.scoreBias);
     SubstitutionMatrix::FastMatrix fastMatrix = SubstitutionMatrix::createAsciiSubMat(subMat);
     EvalueComputation evaluer(reader.getTotalBytes(), &subMat);
-    const size_t maxLen = std::max<size_t>(reader.getRunTable().maxSeqLen(), 1);
+    const size_t maxLen = std::max<size_t>(reader.getSequenceLocator().maxSeqLen(), 1);
 
     size_t firstRepRankBlock = par.lin8RepRankBlock < 0 ? 0 : (size_t) par.lin8RepRankBlock;
     const size_t lastRepRankBlock = par.lin8RepRankBlock < 0 ? repRankBlocks : std::min(firstRepRankBlock + 1, repRankBlocks);
@@ -425,6 +425,8 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     std::vector<std::vector<uint64_t> > batchSurvivors;
     // where the wall clock of this pass actually goes, so a slow run says which part was slow
     double spentReading = 0, spentAligning = 0, spentDeciding = 0, spentWriting = 0;
+    // what the threads were doing while the pass was aligning, so the tail of each batch shows
+    double aligningThreadSeconds = 0;
     Debug::Progress progress(lastRepRankBlock - firstRepRankBlock);
     std::vector<PairRecord> rows;
     std::vector<std::vector<Candidates> > candidates(threads,
@@ -524,6 +526,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                     workers[thread] = new AlignWorker(maxLen, subMat, fastMatrix, evaluer, par);
                 }
                 AlignWorker &worker = *workers[thread];
+                const double began = omp_get_wtime();
                 unsigned int lane = 0;
                 size_t here = draw(drawn);
                 size_t got = 0;
@@ -556,6 +559,9 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
                     lane = nextLane;
                     got = nextGot;
                 }
+                const double mine = omp_get_wtime() - began;
+#pragma omp atomic
+                aligningThreadSeconds += mine;
             }
             // joined in the order the serial version made them
             for (size_t w = 0; w < work.size(); w++) {
@@ -663,6 +669,11 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
     Debug(Debug::INFO) << "Where the time went: reading " << (uint64_t) spentReading << "s, aligning "
                        << (uint64_t) spentAligning << "s, deciding " << (uint64_t) spentDeciding
                        << "s, writing " << (uint64_t) spentWriting << "s\n";
+    Debug(Debug::INFO) << "Aligning ran on "
+                       << (spentAligning > 0 ? aligningThreadSeconds / spentAligning : 0)
+                       << " threads on average of " << threads << ", so "
+                       << (uint64_t) (spentAligning * threads - aligningThreadSeconds)
+                       << " thread seconds went on waiting at the end of a batch\n";
     Debug(Debug::INFO) << "Aligned " << aligned << " candidates, " << passed << " passed, in "
                        << timer.lap() << "\n";
     if (decideHere) {
