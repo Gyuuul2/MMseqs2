@@ -456,8 +456,9 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
 
     Timer timer;
     // It sees a sequence once, which was the argument for reading past the cache: nothing comes
-    // back for it. That holds where the cache is somewhere to keep things. Where it is also what
-    // reads ahead, giving it up costs more than the room it saves.
+    // back for it. That holds where the cache is a place to keep things. Where it is also what
+    // reads ahead, giving it up costs more than the space it saves, and over NFS that was the
+    // difference between 208 and 86 MB/s on the same 1500 GB.
     reader.openBatch(par.threads, READ_ARENA_BYTES, budget, RunDbReader::READ_AGAIN);
     BucketWriter<KmerRecord> writer(prefix, KmerRecord::BUCKET_COUNT, par.threads,
                                     budget - (size_t) par.threads * READ_ARENA_BYTES);
@@ -590,7 +591,8 @@ static void scanBucketExtent(int fd, const std::string &path, const BucketExtent
         for (size_t i = 0; i < want; i++) {
             Record record;
             record.unpack(&raw[i * Record::DISK_BYTES]);
-            const size_t prefix = subOf(record);
+            // one slot means the caller wants them in the order the file holds them
+            const size_t prefix = place.size() == 1 ? 0 : subOf(record);
             if (place.empty()) {
                 perPrefix[prefix]++;
             } else {
@@ -604,12 +606,12 @@ static void scanBucketExtent(int fd, const std::string &path, const BucketExtent
     }
 }
 
-template <typename Record, typename SubOf>
+template <typename Record, typename SubOf, typename Less>
 static std::vector<size_t> loadBucket(const std::string &prefix, const BucketCounts &counts,
                                       unsigned int nodes, size_t bucket, size_t prefixes,
                                       const SubOf &subOf, size_t budget, unsigned int threads,
                                       const char *what, const char *narrower, const char *producer,
-                                      RawArray<Record> &into) {
+                                      const Less &less, RawArray<Record> &into) {
     const std::vector<uint64_t> subCounts = counts.of(bucket);
     std::vector<size_t> starts(prefixes + 1, 0);
     for (size_t i = 0; i < prefixes; i++) {
@@ -643,38 +645,34 @@ static std::vector<size_t> loadBucket(const std::string &prefix, const BucketCou
     for (unsigned int node = 0; node < nodes; node++) {
         bucketFd[node] = open(path[node].c_str(), O_RDONLY);
     }
-    std::vector<std::vector<uint64_t> > extentCounts(extents.size(),
-                                                    std::vector<uint64_t>(prefixes, 0));
-    std::vector<size_t> counting;
+    // Read once, in the order the files hold them, then sort. The pass that counted first existed
+    // only to find where each record belonged, and the sub bucket is the top of the sort key, so
+    // sorting puts them there anyway. Over NFS that halved what this reads.
+    std::vector<size_t> nodeStart(nodes + 1, 0);
+    for (size_t i = 0; i < extents.size(); i++) {
+        nodeStart[extents[i].node + 1] += extents[i].count;
+    }
+    for (unsigned int node = 0; node < nodes; node++) {
+        nodeStart[node + 1] += nodeStart[node];
+    }
+    std::vector<uint64_t> nothing;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
     for (size_t i = 0; i < extents.size(); i++) {
+        std::vector<size_t> place(1, nodeStart[extents[i].node] + extents[i].first);
         scanBucketExtent(bucketFd[extents[i].node], path[extents[i].node], extents[i], subOf,
-                         extentCounts[i], counting, into);
+                         nothing, place, into);
     }
-
-    std::vector<std::vector<size_t> > at(extents.size());
-    {
-        std::vector<size_t> running(starts.begin(), starts.end() - 1);
-        for (size_t i = 0; i < extents.size(); i++) {
-            at[i] = running;
-            for (size_t j = 0; j < prefixes; j++) {
-                running[j] += extentCounts[i][j];
-            }
+    SORT_PARALLEL(into.begin(), into.begin() + into.size(), less);
+    // the counts said where each sub bucket ends; if the files disagree the sort shows it here
+    for (size_t j = 0; j < prefixes; j++) {
+        if (starts[j] == starts[j + 1]) {
+            continue;
         }
-        for (size_t j = 0; j < prefixes; j++) {
-            if (running[j] != starts[j + 1]) {
-                Debug(Debug::ERROR) << what << " " << bucket << " prefix " << j << " holds "
-                                    << (running[j] - starts[j]) << " records and the counts say "
-                                    << subCounts[j] << ". Was " << producer << " still running?\n";
-                EXIT(EXIT_FAILURE);
-            }
+        if (subOf(into[starts[j]]) != j || subOf(into[starts[j + 1] - 1]) != j) {
+            Debug(Debug::ERROR) << what << " " << bucket << " prefix " << j << " is not where the "
+                                << "counts put it. Was " << producer << " still running?\n";
+            EXIT(EXIT_FAILURE);
         }
-    }
-
-#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (size_t i = 0; i < extents.size(); i++) {
-        scanBucketExtent(bucketFd[extents[i].node], path[extents[i].node], extents[i], subOf,
-                         extentCounts[i], at[i], into);
     }
     for (unsigned int node = 0; node < nodes; node++) {
         if (bucketFd[node] >= 0) {
@@ -882,14 +880,10 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
         const std::vector<size_t> starts =
             loadBucket(par.db2, bucketCounts, writerNodes, bucket, KmerRecord::SUB_BUCKET_COUNT,
                        BySubBucket(), budget - writer.bytesHeld(), par.threads, "Bucket",
-                       "build with more buckets", "lin8-extractkmers", records);
+                       "build with more buckets", "lin8-extractkmers", KmerRecord::byKeyAndRank,
+                       records);
         spentReading += omp_get_wtime() - mark;
         mark = omp_get_wtime();
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-        for (size_t i = 0; i < KmerRecord::SUB_BUCKET_COUNT; i++) {
-            SORT_SERIAL(records.begin() + starts[i], records.begin() + starts[i + 1],
-                        KmerRecord::byKeyAndRank);
-        }
         spentSorting += omp_get_wtime() - mark;
         mark = omp_get_wtime();
         // a thread owns a stretch of the sorted bucket, so moving a center only touches its own
@@ -1109,13 +1103,8 @@ int lin8pref(int argc, const char **argv, const Command &command) {
         const std::vector<size_t> starts =
             loadBucket(par.db1, repRankBlockCounts, writerNodes, repRankBlock, PairRecord::REP_RANK_SUB_BLOCKS,
                        ByRepRankSubBlock(ranks, repRankBlocks), budget, par.threads, "Representative rank block", "raise --rep-rank-blocks",
-                       "lin8-assignedpairs", pairs);
+                       "lin8-assignedpairs", PairRecord::byRepAndMember, pairs);
         read += pairs.size();
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-        for (size_t i = 0; i < PairRecord::REP_RANK_SUB_BLOCKS; i++) {
-            SORT_SERIAL(pairs.begin() + starts[i], pairs.begin() + starts[i + 1],
-                        PairRecord::byRepAndMember);
-        }
 
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
         for (size_t i = 0; i < PairRecord::REP_RANK_SUB_BLOCKS; i++) {
