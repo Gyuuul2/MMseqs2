@@ -161,6 +161,7 @@ Parameters::Parameters():
         PARAM_STAT(PARAM_STAT_ID, "--stat", "Statistics to be computed", "One of: linecount, mean, min, max, doolittle, charges, seqlen, firstline", typeid(std::string), (void *) &stat, ""),
         // linearcluster
         PARAM_KMER_PER_SEQ(PARAM_KMER_PER_SEQ_ID, "--kmer-per-seq", "k-mers per sequence", "k-mers per sequence", typeid(int), (void *) &kmersPerSequence, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR),
+        PARAM_SYNCMER_S(PARAM_SYNCMER_S_ID, "--syncmer-s", "Syncmer s-mer length", "Length of the s-mer whose least hash decides a closed syncmer; 0 picks the lowest hashing k-mers instead", typeid(int), (void *) &syncmerS, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_KMER_PER_SEQ_SCALE(PARAM_KMER_PER_SEQ_SCALE_ID, "--kmer-per-seq-scale", "Scale k-mers per sequence", "Scale k-mer per sequence based on sequence length as kmer-per-seq val + scale x seqlen", typeid(MultiParam<NuclAA<float>>), (void *) &kmersPerSequenceScale, "^0(\\.[0-9]+)?|1(\\.0+)?$", MMseqsParameter::COMMAND_CLUSTLINEAR),
         PARAM_INCLUDE_ONLY_EXTENDABLE(PARAM_INCLUDE_ONLY_EXTENDABLE_ID, "--include-only-extendable", "Include only extendable", "Include only extendable", typeid(bool), (void *) &includeOnlyExtendable, "", MMseqsParameter::COMMAND_CLUSTLINEAR),
         PARAM_IGNORE_MULTI_KMER(PARAM_IGNORE_MULTI_KMER_ID, "--ignore-multi-kmer", "Skip repeating k-mers", "Skip k-mers occurring multiple times (>=2)", typeid(bool), (void *) &ignoreMultiKmer, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -1018,6 +1019,7 @@ Parameters::Parameters():
     lin8extractkmers.push_back(&PARAM_ALPH_SIZE);
     lin8extractkmers.push_back(&PARAM_KMER_PER_SEQ);
     lin8extractkmers.push_back(&PARAM_KMER_PER_SEQ_SCALE);
+    lin8extractkmers.push_back(&PARAM_SYNCMER_S);
     lin8extractkmers.push_back(&PARAM_MASK_LOWER_CASE);
     lin8extractkmers.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     lin8extractkmers.push_back(&PARAM_SUB_MAT);
@@ -1714,6 +1716,7 @@ Parameters::Parameters():
     linclustoneshotworkflow.push_back(&PARAM_INCLUDE_ONLY_EXTENDABLE);
     linclustoneshotworkflow.push_back(&PARAM_INCLUDE_ADJACENCY);
     linclustoneshotworkflow.push_back(&PARAM_NUM_ADJACENCY);
+    linclustoneshotworkflow.push_back(&PARAM_SYNCMER_S);
     linclustoneshotworkflow.push_back(&PARAM_SEQ_ID_MODE);
     linclustoneshotworkflow.push_back(&PARAM_E);
     linclustoneshotworkflow.push_back(&PARAM_MIN_ALN_LEN);
@@ -3210,6 +3213,7 @@ void Parameters::setDefaults() {
 
     // linearcluster
     kmersPerSequence = 21;
+    syncmerS = 0;
     kmersPerSequenceScale = MultiParam<NuclAA<float>>(NuclAA<float>(0.0, 0.2));
     includeOnlyExtendable = false;
     ignoreMultiKmer = false;

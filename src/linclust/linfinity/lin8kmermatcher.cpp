@@ -23,32 +23,33 @@
 
 class KmerExtractor {
 public:
-    KmerExtractor(unsigned int kmerSize, unsigned int alphabetSize, unsigned int mostKmersOneSequenceCanKeep);
+    KmerExtractor(unsigned int kmerLength, unsigned int residueClassCount, unsigned int mostKmersOneSequenceCanKeep,
+                  unsigned int syncmerSmerLength);
 
-    size_t extract(const char *letters, size_t length, const unsigned char *letterToCode,
+    // the longest s-mer the syncmer test can pack five bits a residue into
+    static const unsigned int MAX_SMER = 12;
+
+    size_t selectFromSequence(const char *sequence, size_t length, const unsigned char *letterToCode,
                    unsigned int keepPerSequence);
 
-    static std::vector<unsigned char> buildLetterTable(const unsigned char *aa2num,
+    static std::vector<unsigned char> buildResidueToClassTable(const unsigned char *aa2num,
                                                        unsigned int reducedSize,
                                                        bool maskLowerCase);
-    unsigned char unknownClass() const { return static_cast<unsigned char>(alphabetSize); }
+    unsigned char unknownResidueClass() const { return static_cast<unsigned char>(residueClassCount); }
 
-    const uint64_t *keys() const { return keptKey.data(); }
-    const uint16_t *positions() const { return keptPos.data(); }
+    const uint64_t *selectedKmerCodes() const { return selectedCodes.data(); }
+    const uint16_t *selectedKmerPositions() const { return selectedPositions.data(); }
 
     // the score is this many low bits; the rest names the bucket and must never be compared
     static const unsigned int SCORE_BITS = 48;
     static const uint64_t SCORE_MASK = (uint64_t(1) << SCORE_BITS) - 1;
 
-    static uint64_t scoreOf(uint64_t mixed) { return mixed & SCORE_MASK; }
-    static uint64_t bucketOf(uint64_t mixed, size_t buckets) {
-        return (mixed >> SCORE_BITS) % buckets;
-    }
+    static uint64_t selectionScore(uint64_t mixed) { return mixed & SCORE_MASK; }
 
     static const unsigned int CODE_BITS = 51;
     static const uint64_t CODE_MASK = (uint64_t(1) << CODE_BITS) - 1;
 
-    static uint64_t spread(uint64_t code) {
+    static uint64_t spreadKmerCode(uint64_t code) {
         uint64_t v = code & CODE_MASK;
         v = (v * 0x9e3779b97f4a7c15ull) & CODE_MASK;
         v ^= v >> 26;
@@ -57,12 +58,12 @@ public:
         return v & CODE_MASK;
     }
 
-    static uint64_t bucketOfKmer(uint64_t spreadCode, uint64_t buckets) {
+    static uint64_t bucketForKmerHash(uint64_t spreadCode, uint64_t buckets) {
         return (spreadCode >> (CODE_BITS - KmerRecord::BUCKET_BITS)) % buckets;
     }
-    static uint64_t storedKey(uint64_t spreadCode) { return spreadCode & KmerRecord::KEY_MAX; }
+    static uint64_t recordKeyForKmerHash(uint64_t spreadCode) { return spreadCode & KmerRecord::KEY_MAX; }
 
-    static uint64_t mix(uint64_t value) {
+    static uint64_t mixHash64(uint64_t value) {
         // splitmix64 finaliser: two multiplies and three shifts, enough to make the halves independent
         value ^= value >> 30;
         value *= 0xbf58476d1ce4e5b9ull;
@@ -72,70 +73,75 @@ public:
         return value;
     }
 
-    static uint64_t identityKey(const char *letters, size_t length,
+    static uint64_t fallbackSequenceHash(const char *sequence, size_t length,
                                 const unsigned char *letterToCode);
 
-    uint64_t adjacentAt(const char *letters, size_t length, const unsigned char *letterToCode,
+    uint64_t packedFlankingClassesAt(const char *sequence, size_t length, const unsigned char *letterToCode,
                         size_t pos) const;
-    uint64_t adjacentUnknown() const;
+    uint64_t packedUnknownFlankingClasses() const;
 
 private:
-    void offer(uint64_t score, uint64_t key, uint16_t pos);
+    void considerCandidate(uint64_t score, uint64_t key, uint16_t pos);
+    bool doesNotBeatSelected(uint64_t score, uint16_t pos, size_t at) const;
+    void findWorstSelectedIndex();
+    size_t worstSelectedIndex;
 
-    unsigned int kmerSize;
-    unsigned int alphabetSize;
-    unsigned int most;
-    unsigned int keep;
-    uint64_t dropHighDigit;
-    std::vector<uint64_t> keptScore;
-    std::vector<uint64_t> keptKey;
-    std::vector<uint16_t> keptPos;
+    unsigned int kmerLength;
+    unsigned int residueClassCount;
+    unsigned int maxSelectedKmers;
+    unsigned int selectionLimit;
+    uint64_t leadingResidueWeight;
+    unsigned int syncmerSmerLength;
+    std::vector<uint64_t> selectedScores;
+    std::vector<uint64_t> selectedCodes;
+    std::vector<uint16_t> selectedPositions;
 };
 
-KmerExtractor::KmerExtractor(unsigned int kmerSize, unsigned int alphabetSize,
-                             unsigned int mostKmersOneSequenceCanKeep)
-    : kmerSize(kmerSize), alphabetSize(alphabetSize), most(mostKmersOneSequenceCanKeep), keep(mostKmersOneSequenceCanKeep) {
+KmerExtractor::KmerExtractor(unsigned int kmerLength, unsigned int residueClassCount,
+                             unsigned int mostKmersOneSequenceCanKeep, unsigned int syncmerSmerLength)
+    : kmerLength(kmerLength), residueClassCount(residueClassCount), syncmerSmerLength(syncmerSmerLength),
+      maxSelectedKmers(mostKmersOneSequenceCanKeep), selectionLimit(mostKmersOneSequenceCanKeep), worstSelectedIndex(0) {
     uint64_t span = 1;
-    for (unsigned int i = 0; i < kmerSize; i++) {
-        if (span > CODE_MASK / alphabetSize) {
-            Debug(Debug::ERROR) << "A k-mer of " << kmerSize << " over an alphabet of "
-                                << alphabetSize << " needs more than " << CODE_BITS
+    for (unsigned int i = 0; i < kmerLength; i++) {
+        if (span > CODE_MASK / residueClassCount) {
+            Debug(Debug::ERROR) << "A k-mer of " << kmerLength << " over an alphabet of "
+                                << residueClassCount << " needs more than " << CODE_BITS
                                 << " bit. Lower -k to " << i << " or fewer\n";
             EXIT(EXIT_FAILURE);
         }
-        span *= alphabetSize;
+        span *= residueClassCount;
     }
-    dropHighDigit = span / alphabetSize;
-    keptScore.reserve(most);
-    keptKey.reserve(most);
-    keptPos.reserve(most);
+    leadingResidueWeight = span / residueClassCount;
+    selectedScores.reserve(maxSelectedKmers);
+    selectedCodes.reserve(maxSelectedKmers);
+    selectedPositions.reserve(maxSelectedKmers);
 
 }
 
-uint64_t KmerExtractor::identityKey(const char *letters, size_t length,
+uint64_t KmerExtractor::fallbackSequenceHash(const char *sequence, size_t length,
                                     const unsigned char *letterToCode) {
     uint64_t hash = 1469598103934665603ull;
     for (size_t i = 0; i < length; i++) {
-        hash = (hash ^ letterToCode[static_cast<unsigned char>(letters[i])]) * 1099511628211ull;
+        hash = (hash ^ letterToCode[static_cast<unsigned char>(sequence[i])]) * 1099511628211ull;
     }
-    return mix(hash) & CODE_MASK;
+    return mixHash64(hash) & CODE_MASK;
 }
 
-uint64_t KmerExtractor::adjacentAt(const char *letters, size_t length,
+uint64_t KmerExtractor::packedFlankingClassesAt(const char *sequence, size_t length,
                                    const unsigned char *letterToCode, size_t pos) const {
     const unsigned int half = KmerRecord::ADJACENT_COUNT / 2;
     uint64_t packed = 0;
     for (unsigned int slot = 0; slot < KmerRecord::ADJACENT_COUNT; slot++) {
-        uint64_t code = unknownClass();
+        uint64_t code = unknownResidueClass();
         if (slot < half) {
             const size_t before = half - slot;
             if (pos >= before) {
-                code = letterToCode[static_cast<unsigned char>(letters[pos - before])];
+                code = letterToCode[static_cast<unsigned char>(sequence[pos - before])];
             }
         } else {
-            const size_t after = pos + kmerSize + (slot - half);
+            const size_t after = pos + kmerLength + (slot - half);
             if (after < length) {
-                code = letterToCode[static_cast<unsigned char>(letters[after])];
+                code = letterToCode[static_cast<unsigned char>(sequence[after])];
             }
         }
         packed |= (code & KmerRecord::ADJACENT_MAX) << (slot * KmerRecord::ADJACENT_BITS);
@@ -143,15 +149,15 @@ uint64_t KmerExtractor::adjacentAt(const char *letters, size_t length,
     return packed;
 }
 
-uint64_t KmerExtractor::adjacentUnknown() const {
+uint64_t KmerExtractor::packedUnknownFlankingClasses() const {
     uint64_t packed = 0;
     for (unsigned int slot = 0; slot < KmerRecord::ADJACENT_COUNT; slot++) {
-        packed |= uint64_t(unknownClass()) << (slot * KmerRecord::ADJACENT_BITS);
+        packed |= uint64_t(unknownResidueClass()) << (slot * KmerRecord::ADJACENT_BITS);
     }
     return packed;
 }
 
-std::vector<unsigned char> KmerExtractor::buildLetterTable(const unsigned char *aa2num,
+std::vector<unsigned char> KmerExtractor::buildResidueToClassTable(const unsigned char *aa2num,
                                                            unsigned int reducedSize,
                                                            bool maskLowerCase) {
     std::vector<unsigned char> table(256, static_cast<unsigned char>(reducedSize));
@@ -166,215 +172,256 @@ std::vector<unsigned char> KmerExtractor::buildLetterTable(const unsigned char *
     return table;
 }
 
-void KmerExtractor::offer(uint64_t score, uint64_t key, uint16_t pos) {
-    if (keptScore.size() < keep) {
-        keptScore.push_back(score);
-        keptKey.push_back(key);
-        keptPos.push_back(pos);
-        return;
-    }
-    size_t worst = 0;
-    for (size_t i = 1; i < keptScore.size(); i++) {
-        if (keptScore[i] > keptScore[worst]
-            || (keptScore[i] == keptScore[worst] && keptPos[i] > keptPos[worst])) {
-            worst = i;
-        }
-    }
-    // ties break on position so the choice does not depend on the order they were offered in
-    if (score > keptScore[worst] || (score == keptScore[worst] && pos >= keptPos[worst])) {
-        return;
-    }
-    keptScore[worst] = score;
-    keptKey[worst] = key;
-    keptPos[worst] = pos;
+// ties break on position so the choice does not depend on the order they were offered in
+bool KmerExtractor::doesNotBeatSelected(uint64_t score, uint16_t pos, size_t at) const {
+    return score > selectedScores[at] || (score == selectedScores[at] && pos >= selectedPositions[at]);
 }
 
-size_t KmerExtractor::extract(const char *letters, size_t length,
+void KmerExtractor::findWorstSelectedIndex() {
+    worstSelectedIndex = 0;
+    for (size_t i = 1; i < selectedScores.size(); i++) {
+        if (doesNotBeatSelected(selectedScores[i], selectedPositions[i], worstSelectedIndex)) {
+            worstSelectedIndex = i;
+        }
+    }
+}
+
+// Most of what is offered once the set is full is worse than everything in it, and the one it has
+// to beat is the worst, so remember which that is and let those go in a comparison. Finding the
+// next worst costs the scan, but only a candidate that actually got in pays for it.
+void KmerExtractor::considerCandidate(uint64_t score, uint64_t key, uint16_t pos) {
+    if (selectionLimit == 0) {
+        return;
+    }
+    if (selectedScores.size() < selectionLimit) {
+        selectedScores.push_back(score);
+        selectedCodes.push_back(key);
+        selectedPositions.push_back(pos);
+        if (selectedScores.size() == selectionLimit) {
+            findWorstSelectedIndex();
+        }
+        return;
+    }
+    if (doesNotBeatSelected(score, pos, worstSelectedIndex)) {
+        return;
+    }
+    selectedScores[worstSelectedIndex] = score;
+    selectedCodes[worstSelectedIndex] = key;
+    selectedPositions[worstSelectedIndex] = pos;
+    findWorstSelectedIndex();
+}
+
+// A closed syncmer keeps a k-mer when its least hashing s-mer sits at one of its two ends. The test
+// reads the k-mer and nothing else, so two sequences that share a k-mer either both keep it or both
+// drop it, which the lowest hashing k-mers of a sequence cannot promise (Edgar 2021).
+static bool isClosedSyncmerAt(const char *sequence, const unsigned char *letterToCode, size_t kmerStart,
+                            unsigned int kmerLength, unsigned int syncmerSmerLength) {
+    const uint64_t mask = (uint64_t(1) << (5 * syncmerSmerLength)) - 1;
+    uint64_t smer = 0;
+    uint64_t minimumSmerHash = UINT64_MAX, firstSmerHash = UINT64_MAX, lastSmerHash = UINT64_MAX;
+    for (unsigned int i = 0; i < kmerLength; i++) {
+        smer = ((smer << 5) | letterToCode[static_cast<unsigned char>(sequence[kmerStart + i])]) & mask;
+        if (i + 1 >= syncmerSmerLength) {
+            lastSmerHash = KmerExtractor::mixHash64(smer);
+            firstSmerHash = (i + 1 == syncmerSmerLength) ? lastSmerHash : firstSmerHash;
+            minimumSmerHash = std::min(minimumSmerHash, lastSmerHash);
+        }
+    }
+    return firstSmerHash == minimumSmerHash || lastSmerHash == minimumSmerHash;
+}
+
+size_t KmerExtractor::selectFromSequence(const char *sequence, size_t length,
                               const unsigned char *letterToCode,
                               unsigned int keepPerSequence) {
-    keep = keepPerSequence < most ? keepPerSequence : most;
-    const unsigned char unknownCode = unknownClass();
-    keptScore.clear();
-    keptKey.clear();
-    keptPos.clear();
-    if (length < kmerSize) {
+    selectionLimit = keepPerSequence < maxSelectedKmers ? keepPerSequence : maxSelectedKmers;
+    const unsigned char unknownCode = unknownResidueClass();
+    selectedScores.clear();
+    selectedCodes.clear();
+    selectedPositions.clear();
+    if (length < kmerLength) {
         return 0;
     }
     uint64_t code = 0;
     unsigned int filled = 0;
     for (size_t at = 0; at < length; at++) {
-        const unsigned char in = letterToCode[static_cast<unsigned char>(letters[at])];
+        const unsigned char in = letterToCode[static_cast<unsigned char>(sequence[at])];
         if (in >= unknownCode) {
             // the window cannot span an unknown residue, so it starts again after one
             code = 0;
             filled = 0;
             continue;
         }
-        if (filled == kmerSize) {
+        if (filled == kmerLength) {
             code -= static_cast<uint64_t>(
-                        letterToCode[static_cast<unsigned char>(letters[at - kmerSize])])
-                    * dropHighDigit;
+                        letterToCode[static_cast<unsigned char>(sequence[at - kmerLength])])
+                    * leadingResidueWeight;
             filled--;
         }
-        code = code * alphabetSize + in;
+        code = code * residueClassCount + in;
         filled++;
-        if (filled == kmerSize) {
-            offer(scoreOf(mix(code)), code, static_cast<uint16_t>(at + 1 - kmerSize));
+        if (filled == kmerLength) {
+            const size_t kmerStart = at + 1 - kmerLength;
+            if (syncmerSmerLength == 0
+                || isClosedSyncmerAt(sequence, letterToCode, kmerStart, kmerLength, syncmerSmerLength)) {
+                considerCandidate(selectionScore(mixHash64(code)), code, static_cast<uint16_t>(kmerStart));
+            }
         }
     }
-    return keptScore.size();
+    return selectedScores.size();
 }
 
 // ---- lin8extractkmers ----
 #ifdef OPENMP
 #endif
 
-static const uint64_t BYTES_PER_MANIFEST = 64ull * 1024 * 1024 * 1024;
+static const uint64_t CHECKPOINT_BYTE_LIMIT = 64ull * 1024 * 1024 * 1024;
 
-struct ManifestChunk {
-    uint64_t rankBegin;
-    uint64_t rankEnd;
-    size_t fileSlot;
+struct ExtractionChunk {
+    uint64_t firstRank;
+    uint64_t endRankExclusive;
+    size_t sourceFileSlot;
 };
 
-static std::string chunkName(const std::string &out, unsigned int node, size_t chunk) {
+static std::string checkpointManifestPath(const std::string &out, unsigned int node, size_t chunk) {
     return out + "." + SSTR(node) + "." + SSTR(chunk);
 }
 
-static std::vector<ManifestChunk> planManifestChunks(const RunDbReader &reader, const std::vector<size_t> &blocks,
-                                         uint64_t capBytes) {
-    std::vector<ManifestChunk> chunks;
+static std::vector<ExtractionChunk> planExtractionChunks(const RunDbReader &reader, const std::vector<size_t> &assignedFileSlots,
+                                         uint64_t targetChunkBytes) {
+    std::vector<ExtractionChunk> extractionChunks;
     const SequenceLocator &runs = reader.getSequenceLocator();
-    for (size_t at = 0; at < blocks.size(); at++) {
-        uint64_t begin = 0;
-        uint64_t end = 0;
+    for (size_t at = 0; at < assignedFileSlots.size(); at++) {
+        uint64_t slotFirstRank = 0;
+        uint64_t slotEndRankExclusive = 0;
         for (size_t i = 0; i < runs.size(); i++) {
-            if (runs[i].fileIdx() % runs.filesPerNode() != blocks[at]) {
+            if (runs[i].fileIdx() % runs.filesPerNode() != assignedFileSlots[at]) {
                 continue;
             }
-            begin = (end == 0) ? runs[i].rankBase() : std::min(begin, runs[i].rankBase());
-            end = std::max(end, runs.rankEnd(i));
+            slotFirstRank = (slotEndRankExclusive == 0) ? runs[i].rankBase() : std::min(slotFirstRank, runs[i].rankBase());
+            slotEndRankExclusive = std::max(slotEndRankExclusive, runs.rankEnd(i));
         }
-        if (end <= begin) {
+        if (slotEndRankExclusive <= slotFirstRank) {
             continue;
         }
-        const uint64_t fromByte = runs.byteAtRank(begin);
-        const uint64_t toByte = runs.byteAtRank(end);
-        const uint64_t span = toByte - fromByte;
-        const uint64_t parts = std::max<uint64_t>(1, (span + capBytes - 1) / capBytes);
-        const uint64_t step = std::max<uint64_t>(1, (span + parts - 1) / parts);
-        for (uint64_t byteAt = fromByte; byteAt < toByte; byteAt += step) {
-            ManifestChunk chunk;
-            chunk.fileSlot = blocks[at];
-            chunk.rankBegin = runs.rankAtByte(byteAt);
-            chunk.rankEnd = std::min<uint64_t>(runs.rankAtByte(std::min(byteAt + step, toByte)), end);
-            if (chunk.rankEnd > chunk.rankBegin) {
-                chunks.push_back(chunk);
+        const uint64_t firstByteOffset = runs.byteAtRank(slotFirstRank);
+        const uint64_t endByteOffset = runs.byteAtRank(slotEndRankExclusive);
+        const uint64_t slotByteCount = endByteOffset - firstByteOffset;
+        const uint64_t chunkCount = std::max<uint64_t>(1, (slotByteCount + targetChunkBytes - 1) / targetChunkBytes);
+        const uint64_t targetChunkSpanBytes = std::max<uint64_t>(1, (slotByteCount + chunkCount - 1) / chunkCount);
+        for (uint64_t byteAt = firstByteOffset; byteAt < endByteOffset; byteAt += targetChunkSpanBytes) {
+            ExtractionChunk chunk;
+            chunk.sourceFileSlot = assignedFileSlots[at];
+            chunk.firstRank = runs.rankAtByte(byteAt);
+            chunk.endRankExclusive = std::min<uint64_t>(runs.rankAtByte(std::min(byteAt + targetChunkSpanBytes, endByteOffset)), slotEndRankExclusive);
+            if (chunk.endRankExclusive > chunk.firstRank) {
+                extractionChunks.push_back(chunk);
             }
         }
     }
-    return chunks;
+    return extractionChunks;
 }
 
-static unsigned int kmersToKeepForLength(unsigned int keepPerSequence, float keepScale, uint32_t length) {
-    const double asked = (double) keepPerSequence + (double) keepScale * (double) length;
+static unsigned int selectedKmerLimitForLength(unsigned int baseKmersPerSequence, float kmersPerResidue, uint32_t length) {
+    const double asked = (double) baseKmersPerSequence + (double) kmersPerResidue * (double) length;
     return (unsigned int) (asked < (double) length ? asked : (double) length);
 }
 
-static unsigned int mostKmersOneSequenceCanKeep(unsigned int keepPerSequence, float keepScale) {
-    return kmersToKeepForLength(keepPerSequence, keepScale, SequenceLocator::MAX_SEQ_LEN);
+static unsigned int maxSelectedKmersForAnySequence(unsigned int baseKmersPerSequence, float kmersPerResidue) {
+    return selectedKmerLimitForLength(baseKmersPerSequence, kmersPerResidue, SequenceLocator::MAX_SEQ_LEN);
 }
 
 // ranks to read at once: mmap faults one readahead window at a time and never fills the queue
-static const uint64_t EXTRACT_BATCH = 2048;
+static const uint64_t RANKS_PER_READ_BATCH = 2048;
 // a read arena a thread, the same size the other passes use
-static const size_t READ_ARENA_BYTES = 64u << 20;
+static const size_t BATCH_READ_ARENA_BYTES = 64u << 20;
 
-static uint64_t extractOneManifestChunk(const RunDbReader &reader, const ManifestChunk &chunk, BucketWriter<KmerRecord> &writer,
-                         const unsigned char *letterToCode, unsigned int kmerSize,
-                         unsigned int alphabetSize, unsigned int keepPerSequence, float keepScale,
-                         unsigned int threads, std::vector<std::vector<uint64_t> > &subBucketCounts) {
-    const size_t buckets = KmerRecord::BUCKET_COUNT;
-    uint64_t emitted = 0;
-#pragma omp parallel num_threads(threads) reduction(+ : emitted)
+static uint64_t extractAndWriteChunkKmers(const RunDbReader &dbReader, const ExtractionChunk &extractionChunk, BucketWriter<KmerRecord> &kmerBucketWriter,
+                         const unsigned char *residueToClass, unsigned int kmerLength,
+                         unsigned int residueClassCount, unsigned int baseKmersPerSequence, float kmersPerResidue,
+                         unsigned int syncmerSmerLength, unsigned int threadCount,
+                         std::vector<std::vector<uint64_t> > &subBucketCountsByThread) {
+    const size_t bucketCount = KmerRecord::BUCKET_COUNT;
+    uint64_t emittedRecordCount = 0;
+#pragma omp parallel num_threads(threadCount) reduction(+ : emittedRecordCount)
     {
-        unsigned int thread = 0;
+        unsigned int threadIdx = 0;
 #ifdef OPENMP
-        thread = static_cast<unsigned int>(omp_get_thread_num());
+        threadIdx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-        KmerExtractor extractor(kmerSize, alphabetSize, mostKmersOneSequenceCanKeep(keepPerSequence, keepScale));
-        RunDbReader::Cursor cursor;
-        KmerRecord record;
-        std::vector<uint64_t> &counts = subBucketCounts[thread];
-        std::vector<uint64_t> want;
-        want.reserve(EXTRACT_BATCH);
+        KmerExtractor kmerExtractor(kmerLength, residueClassCount,
+                                maxSelectedKmersForAnySequence(baseKmersPerSequence, kmersPerResidue), syncmerSmerLength);
+        RunDbReader::Cursor dbCursor;
+        KmerRecord kmerRecord;
+        std::vector<uint64_t> &threadSubBucketCounts = subBucketCountsByThread[threadIdx];
+        std::vector<uint64_t> ranksToRead;
+        ranksToRead.reserve(RANKS_PER_READ_BATCH);
 #pragma omp for schedule(dynamic, 1)
-        for (uint64_t base = chunk.rankBegin; base < chunk.rankEnd; base += EXTRACT_BATCH) {
-            const uint64_t until = std::min(base + EXTRACT_BATCH, chunk.rankEnd);
-            uint64_t at = base;
-            while (at < until) {
-                want.clear();
-                while (at < until && want.size() < EXTRACT_BATCH) {
-                    if (reader.isValid(at) && reader.getSeqLen(at, cursor) <= SequenceLocator::MAX_SEQ_LEN) {
-                        want.push_back(at);
+        for (uint64_t batchFirstRank = extractionChunk.firstRank; batchFirstRank < extractionChunk.endRankExclusive; batchFirstRank += RANKS_PER_READ_BATCH) {
+            const uint64_t batchEndRankExclusive = std::min(batchFirstRank + RANKS_PER_READ_BATCH, extractionChunk.endRankExclusive);
+            uint64_t nextRank = batchFirstRank;
+            while (nextRank < batchEndRankExclusive) {
+                ranksToRead.clear();
+                while (nextRank < batchEndRankExclusive && ranksToRead.size() < RANKS_PER_READ_BATCH) {
+                    if (dbReader.isValid(nextRank) && dbReader.getSeqLen(nextRank, dbCursor) <= SequenceLocator::MAX_SEQ_LEN) {
+                        ranksToRead.push_back(nextRank);
                     }
-                    at++;
+                    nextRank++;
                 }
-                if (want.empty()) {
+                if (ranksToRead.empty()) {
                     break;
                 }
-                const size_t took = 1 + reader.startBatch(want[0], want.data() + 1, want.size() - 1, thread, 0);
+                const size_t loadedRankCount = 1 + dbReader.startBatch(ranksToRead[0], ranksToRead.data() + 1, ranksToRead.size() - 1, threadIdx, 0);
                 // the lane can fill before the batch does, so the rest waits for the next one
-                if (took < want.size()) {
-                    at = want[took];
+                if (loadedRankCount < ranksToRead.size()) {
+                    nextRank = ranksToRead[loadedRankCount];
                 }
-                reader.awaitBatch(thread, 0);
-                for (size_t which = 0; which < took; which++) {
-                    const uint64_t rank = want[which];
-                    const uint32_t length = reader.getSeqLen(rank, cursor);
-                    const char *letters = (which == 0) ? reader.batchQueryAt(thread, 0)
-                                                       : reader.batchAt(thread, 0, which - 1);
-                    const size_t kept = extractor.extract(letters, length, letterToCode,
-                                                          kmersToKeepForLength(keepPerSequence, keepScale, length));
-                    for (size_t i = 0; i < kept; i++) {
-                        const uint64_t spread = KmerExtractor::spread(extractor.keys()[i]);
-                        const uint64_t pos = extractor.positions()[i];
-                        record.set(KmerExtractor::storedKey(spread), rank, pos, false,
-                                   extractor.adjacentAt(letters, length, letterToCode, pos));
-                        const size_t bucket = KmerExtractor::bucketOfKmer(spread, buckets);
-                        writer.add(thread, record, bucket);
-                        counts[bucket * KmerRecord::SUB_BUCKET_COUNT + record.subBucket()]++;
-                        emitted++;
+                dbReader.awaitBatch(threadIdx, 0);
+                for (size_t sequenceIndexInBatch = 0; sequenceIndexInBatch < loadedRankCount; sequenceIndexInBatch++) {
+                    const uint64_t rank = ranksToRead[sequenceIndexInBatch];
+                    const uint32_t length = dbReader.getSeqLen(rank, dbCursor);
+                    const char *sequence = (sequenceIndexInBatch == 0) ? dbReader.batchQueryAt(threadIdx, 0)
+                                                       : dbReader.batchAt(threadIdx, 0, sequenceIndexInBatch - 1);
+                    const size_t selectedKmerCount = kmerExtractor.selectFromSequence(sequence, length, residueToClass,
+                                                          selectedKmerLimitForLength(baseKmersPerSequence, kmersPerResidue, length));
+                    for (size_t i = 0; i < selectedKmerCount; i++) {
+                        const uint64_t spreadKmerHash = KmerExtractor::spreadKmerCode(kmerExtractor.selectedKmerCodes()[i]);
+                        const uint64_t kmerStart = kmerExtractor.selectedKmerPositions()[i];
+                        kmerRecord.set(KmerExtractor::recordKeyForKmerHash(spreadKmerHash), rank, kmerStart,
+                                   kmerExtractor.packedFlankingClassesAt(sequence, length, residueToClass, kmerStart));
+                        const size_t bucketIndex = KmerExtractor::bucketForKmerHash(spreadKmerHash, bucketCount);
+                        kmerBucketWriter.add(threadIdx, kmerRecord, bucketIndex);
+                        threadSubBucketCounts[bucketIndex * KmerRecord::SUB_BUCKET_COUNT + kmerRecord.subBucket()]++;
+                        emittedRecordCount++;
                     }
                     // a sequence with no k-mer of its own would otherwise never be seen again
-                    if (kept == 0) {
-                        const uint64_t spread =
-                            KmerExtractor::spread(KmerExtractor::identityKey(letters, length, letterToCode));
-                        record.set(KmerExtractor::storedKey(spread), rank, 0, true,
-                                   extractor.adjacentUnknown());
-                        const size_t bucket = KmerExtractor::bucketOfKmer(spread, buckets);
-                        writer.add(thread, record, bucket);
-                        counts[bucket * KmerRecord::SUB_BUCKET_COUNT + record.subBucket()]++;
-                        emitted++;
-            }
+                    if (selectedKmerCount == 0) {
+                        const uint64_t spreadKmerHash =
+                            KmerExtractor::spreadKmerCode(KmerExtractor::fallbackSequenceHash(sequence, length, residueToClass));
+                        kmerRecord.set(KmerExtractor::recordKeyForKmerHash(spreadKmerHash), rank, 0,
+                                   kmerExtractor.packedUnknownFlankingClasses());
+                        const size_t bucketIndex = KmerExtractor::bucketForKmerHash(spreadKmerHash, bucketCount);
+                        kmerBucketWriter.add(threadIdx, kmerRecord, bucketIndex);
+                        threadSubBucketCounts[bucketIndex * KmerRecord::SUB_BUCKET_COUNT + kmerRecord.subBucket()]++;
+                        emittedRecordCount++;
+                    }
                 }
             }
         }
     }
-    return emitted;
+    return emittedRecordCount;
 }
 
-static unsigned int longestKmer(unsigned int classes) {
+static unsigned int longestKmer(unsigned int validResidueClassCount) {
     uint64_t span = 1;
     unsigned int k = 0;
-    while (span <= KmerExtractor::CODE_MASK / classes) {
-        span *= classes;
+    while (span <= KmerExtractor::CODE_MASK / validResidueClassCount) {
+        span *= validResidueClassCount;
         k++;
     }
     return k;
 }
 
-static void setKmerLengthAndAlphabet(Parameters &par, uint64_t residues) {
+static void configureKmerParameters(Parameters &par, uint64_t residues) {
     const bool nearIdentical = par.seqIdThr + 0.001 >= 0.99;
     if (par.alphabetSize.values.aminoacid() == 0) {
         const int reduced = (par.kmerSize == 0 && nearIdentical)
@@ -383,8 +430,8 @@ static void setKmerLengthAndAlphabet(Parameters &par, uint64_t residues) {
         par.alphabetSize = MultiParam<NuclAA<int> >(NuclAA<int>(reduced, 5));
     }
     // one class short of the alphabet: the unknown class ends a window rather than joining it
-    const unsigned int classes = (unsigned int) par.alphabetSize.values.aminoacid() - 1;
-    const unsigned int longest = longestKmer(classes);
+    const unsigned int validResidueClassCount = (unsigned int) par.alphabetSize.values.aminoacid() - 1;
+    const unsigned int longest = longestKmer(validResidueClassCount);
     if (par.kmerSize == 0) {
         par.kmerSize = par.seqIdThr + 0.001 >= 0.9
                            ? 14
@@ -392,7 +439,7 @@ static void setKmerLengthAndAlphabet(Parameters &par, uint64_t residues) {
         if ((unsigned int) par.kmerSize > longest) {
             Debug(Debug::WARNING) << "A database this size asks for a k-mer of " << par.kmerSize
                                   << ", which does not fit " << KmerExtractor::CODE_BITS
-                                  << " bit over " << classes << " classes. Using " << longest << "\n";
+                                  << " bit over " << validResidueClassCount << " classes. Using " << longest << "\n";
             par.kmerSize = (int) longest;
         }
     }
@@ -410,113 +457,122 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
     const NodePlacement node = NodePlacement::resolve(par);
     RunDbReader reader(par.db1);
     reader.open();
-    setKmerLengthAndAlphabet(par, reader.getTotalBytes());
+    configureKmerParameters(par, reader.getTotalBytes());
 
-    SubstitutionMatrix full(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, -0.2);
-    const int reduced = par.alphabetSize.values.aminoacid();
-    ReducedMatrix subMat(full.probMatrix, full.subMatrixPseudoCounts, full.aa2num, full.num2aa,
-                         full.alphabetSize, reduced, 2.0);
-    const unsigned int classes = static_cast<unsigned int>(reduced) - 1;
+    SubstitutionMatrix fullMatrix(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, -0.2);
+    const int reducedAlphabetSize = par.alphabetSize.values.aminoacid();
+    ReducedMatrix reducedMatrix(fullMatrix.probMatrix, fullMatrix.subMatrixPseudoCounts, fullMatrix.aa2num, fullMatrix.num2aa,
+                         fullMatrix.alphabetSize, reducedAlphabetSize, 2.0);
+    const unsigned int validResidueClassCount = static_cast<unsigned int>(reducedAlphabetSize) - 1;
     const std::vector<unsigned char> letterToCode =
-        KmerExtractor::buildLetterTable(subMat.aa2num, classes, par.maskLowerCaseMode == 1);
+        KmerExtractor::buildResidueToClassTable(reducedMatrix.aa2num, validResidueClassCount, par.maskLowerCaseMode == 1);
 
-    const unsigned int keepPerSequence =
+    const unsigned int baseKmersPerSequence =
         par.kmersPerSequence > 1 ? par.kmersPerSequence - 1 : 1;
-    const size_t budget = static_cast<size_t>(Util::computeMemory(par.splitMemoryLimit) * 0.95);
-    const std::vector<size_t> blocks = nodeFileSlots(reader.getSequenceLocator(), node);
-    const std::vector<ManifestChunk> chunks = planManifestChunks(reader, blocks, BYTES_PER_MANIFEST);
-    Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << blocks.size()
-                       << " length blocks in " << chunks.size() << " chunks, k " << par.kmerSize
-                       << ", alphabet " << reduced << ", keeping " << keepPerSequence << "\n";
+    const unsigned int syncmerSmerLength = (unsigned int) par.syncmerS;
+    if (syncmerSmerLength > 0 && (syncmerSmerLength > KmerExtractor::MAX_SMER || syncmerSmerLength > (unsigned int) par.kmerSize)) {
+        Debug(Debug::ERROR) << "--syncmer-s " << syncmerSmerLength << " must be at most the k-mer length "
+                            << par.kmerSize << " and at most " << KmerExtractor::MAX_SMER << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    const size_t workingMemoryBudgetBytes = static_cast<size_t>(Util::computeMemory(par.splitMemoryLimit) * 0.95);
+    const std::vector<size_t> assignedFileSlots = nodeFileSlots(reader.getSequenceLocator(), node);
+    const std::vector<ExtractionChunk> extractionChunks = planExtractionChunks(reader, assignedFileSlots, CHECKPOINT_BYTE_LIMIT);
+    Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << assignedFileSlots.size()
+                       << " length blocks in " << extractionChunks.size() << " chunks, k " << par.kmerSize
+                       << ", alphabet " << reducedAlphabetSize << ", keeping " << baseKmersPerSequence
+                       << (syncmerSmerLength > 0 ? " of the closed syncmers at s " + SSTR(syncmerSmerLength)
+                                        : std::string(" lowest hashing"))
+                       << "\n";
 
-    const std::string prefix = par.db2 + "." + SSTR(node.index);
-    std::vector<uint64_t> keep(KmerRecord::BUCKET_COUNT, 0);
-    const size_t countEntries = KmerRecord::BUCKET_COUNT * KmerRecord::SUB_BUCKET_COUNT;
-    const std::string countsPath = par.db2 + "." + SSTR(node.index) + ".counts";
-    size_t tableChunks = 0;
-    std::vector<uint64_t> subBucketBase =
-        readSubBucketCounts(countsPath, countEntries, tableChunks);
+    const std::string nodeBucketFilePrefix = par.db2 + "." + SSTR(node.index);
+    std::vector<uint64_t> existingRecordsPerBucket(KmerRecord::BUCKET_COUNT, 0);
+    const size_t subBucketCountEntryCount = KmerRecord::BUCKET_COUNT * KmerRecord::SUB_BUCKET_COUNT;
+    const std::string subBucketCountsPath = par.db2 + "." + SSTR(node.index) + ".counts";
+    size_t completedCountCheckpoints = 0;
+    std::vector<uint64_t> persistedSubBucketCounts =
+        readSubBucketCounts(subBucketCountsPath, subBucketCountEntryCount, completedCountCheckpoints);
     // a manifest covers a run of planned chunks and names in its span how many it reaches
-    uint64_t coveredPlanned = 0;
-    const size_t doneManifests =
-        readBucketManifests(par.db2 + "." + SSTR(node.index), chunks.size(), keep, &coveredPlanned);
-    size_t manifest = std::min(doneManifests, tableChunks);
-    if (manifest < doneManifests) {
-        keep.assign(keep.size(), 0);
-        coveredPlanned = 0;
-        readBucketManifests(par.db2 + "." + SSTR(node.index), manifest, keep, &coveredPlanned);
+    uint64_t completedExtractionChunkCount = 0;
+    const size_t completedManifestCount =
+        readBucketManifests(par.db2 + "." + SSTR(node.index), extractionChunks.size(), existingRecordsPerBucket, &completedExtractionChunkCount);
+    size_t checkpointIndex = std::min(completedManifestCount, completedCountCheckpoints);
+    if (checkpointIndex < completedManifestCount) {
+        existingRecordsPerBucket.assign(existingRecordsPerBucket.size(), 0);
+        completedExtractionChunkCount = 0;
+        readBucketManifests(par.db2 + "." + SSTR(node.index), checkpointIndex, existingRecordsPerBucket, &completedExtractionChunkCount);
     }
-    const size_t resume = coveredPlanned;
-    if (resume > 0) {
-        Debug(Debug::INFO) << "Resuming after " << resume << " chunks a previous run finished\n";
+    const size_t firstUnprocessedChunk = completedExtractionChunkCount;
+    if (firstUnprocessedChunk > 0) {
+        Debug(Debug::INFO) << "Resuming after " << firstUnprocessedChunk << " chunks a previous run finished\n";
     }
 
-    std::vector<std::vector<uint64_t> > subBucketCounts(par.threads,
-                                                        std::vector<uint64_t>(countEntries, 0));
+    std::vector<std::vector<uint64_t> > pendingSubBucketCountsByThread(par.threads,
+                                                        std::vector<uint64_t>(subBucketCountEntryCount, 0));
 
     Timer timer;
     // It sees a sequence once, which was the argument for reading past the cache: nothing comes
     // back for it. That holds where the cache is a place to keep things. Where it is also what
     // reads ahead, giving it up costs more than the space it saves, and over NFS that was the
     // difference between 208 and 86 MB/s on the same 1500 GB.
-    reader.openBatch(par.threads, READ_ARENA_BYTES, budget, RunDbReader::READ_AGAIN);
-    BucketWriter<KmerRecord> writer(prefix, KmerRecord::BUCKET_COUNT, par.threads,
-                                    budget - (size_t) par.threads * READ_ARENA_BYTES);
-    writer.openAt(keep);
-    uint64_t written = 0;
-    Debug::Progress progress(chunks.size() - resume);
-    size_t chunkFirst = resume;
-    uint64_t pendingRecords = 0;
+    reader.openBatch(par.threads, BATCH_READ_ARENA_BYTES, workingMemoryBudgetBytes, RunDbReader::READ_AGAIN);
+    BucketWriter<KmerRecord> writer(nodeBucketFilePrefix, KmerRecord::BUCKET_COUNT, par.threads,
+                                    workingMemoryBudgetBytes - (size_t) par.threads * BATCH_READ_ARENA_BYTES);
+    writer.openAt(existingRecordsPerBucket);
+    uint64_t writtenRecordCount = 0;
+    Debug::Progress progress(extractionChunks.size() - firstUnprocessedChunk);
+    size_t checkpointFirstChunk = firstUnprocessedChunk;
+    uint64_t pendingCheckpointRecordCount = 0;
     // what the chunk boundary costs: it flushes every bucket and waits for the disk to take it,
     // which over NFS is a commit a bucket
-    double spentExtracting = 0, spentEndingChunks = 0;
+    double extractionSeconds = 0, checkpointFlushSeconds = 0;
     writer.resetCounts();
-    for (size_t at = resume; at < chunks.size(); at++) {
-        double mark = omp_get_wtime();
-        pendingRecords += extractOneManifestChunk(reader, chunks[at], writer, letterToCode.data(), par.kmerSize,
-                                       classes, keepPerSequence,
-                                       par.kmersPerSequenceScale.values.aminoacid(), par.threads,
-                                       subBucketCounts);
-        spentExtracting += omp_get_wtime() - mark;
+    for (size_t at = firstUnprocessedChunk; at < extractionChunks.size(); at++) {
+        double phaseStartTime = omp_get_wtime();
+        pendingCheckpointRecordCount += extractAndWriteChunkKmers(reader, extractionChunks[at], writer, letterToCode.data(), par.kmerSize,
+                                       validResidueClassCount, baseKmersPerSequence,
+                                       par.kmersPerSequenceScale.values.aminoacid(), syncmerSmerLength,
+                                       par.threads, pendingSubBucketCountsByThread);
+        extractionSeconds += omp_get_wtime() - phaseStartTime;
         // a durable chunk is a run of planned chunks ended by bytes, so a small database is one flush
-        if (pendingRecords * KmerRecord::DISK_BYTES >= BYTES_PER_MANIFEST || at + 1 == chunks.size()) {
-            mark = omp_get_wtime();
+        if (pendingCheckpointRecordCount * KmerRecord::DISK_BYTES >= CHECKPOINT_BYTE_LIMIT || at + 1 == extractionChunks.size()) {
+            phaseStartTime = omp_get_wtime();
             writer.endChunk(par.threads);
             // the manifest goes down after the data it describes, so its presence means it is whole
-            writeBucketManifest(chunkName(par.db2, node.index, manifest) + ".manifest",
-                                writer.chunkCounts(), "chunk", chunkFirst, at + 1);
-            writeSubBucketCounts(countsPath, subBucketBase, subBucketCounts, manifest + 1);
-            written += pendingRecords;
+            writeBucketManifest(checkpointManifestPath(par.db2, node.index, checkpointIndex) + ".manifest",
+                                writer.chunkCounts(), "chunk", checkpointFirstChunk, at + 1);
+            writeSubBucketCounts(subBucketCountsPath, persistedSubBucketCounts, pendingSubBucketCountsByThread, checkpointIndex + 1);
+            writtenRecordCount += pendingCheckpointRecordCount;
             writer.resetCounts();
-            chunkFirst = at + 1;
-            pendingRecords = 0;
-            manifest++;
-            spentEndingChunks += omp_get_wtime() - mark;
+            checkpointFirstChunk = at + 1;
+            pendingCheckpointRecordCount = 0;
+            checkpointIndex++;
+            checkpointFlushSeconds += omp_get_wtime() - phaseStartTime;
         }
-        if (at + 1 == chunks.size() || chunks[at + 1].fileSlot != chunks[at].fileSlot) {
-            reader.releaseFileSlot(chunks[at].fileSlot);
+        if (at + 1 == extractionChunks.size() || extractionChunks[at + 1].sourceFileSlot != extractionChunks[at].sourceFileSlot) {
+            reader.releaseFileSlot(extractionChunks[at].sourceFileSlot);
         }
         progress.updateProgress();
     }
     writer.close();
-    writeSubBucketCounts(countsPath, subBucketBase, subBucketCounts, manifest);
+    writeSubBucketCounts(subBucketCountsPath, persistedSubBucketCounts, pendingSubBucketCountsByThread, checkpointIndex);
 
-    const std::string nodesTmp = par.db2 + "." + SSTR(node.index) + ".tmp";
-    FILE *nodes = FileUtil::openAndDelete(nodesTmp.c_str(), "w");
-    fprintf(nodes, "nodes\t%u\nbuckets\t%zu\nalphabet\t%d\nkmer\t%d\nranks\t%zu\n",
-            node.count, (size_t) KmerRecord::BUCKET_COUNT, reduced, par.kmerSize,
+    const std::string metadataTmpPath = par.db2 + "." + SSTR(node.index) + ".tmp";
+    FILE *metadataFile = FileUtil::openAndDelete(metadataTmpPath.c_str(), "w");
+    fprintf(metadataFile, "nodes\t%u\nbuckets\t%zu\nalphabet\t%d\nkmer\t%d\nranks\t%zu\n",
+            node.count, (size_t) KmerRecord::BUCKET_COUNT, reducedAlphabetSize, par.kmerSize,
             (size_t) reader.getSize());
-    if (fclose(nodes) != 0) {
-        Debug(Debug::ERROR) << "Cannot close " << nodesTmp << "\n";
+    if (fclose(metadataFile) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << metadataTmpPath << "\n";
         EXIT(EXIT_FAILURE);
     }
-    FileUtil::publishAtomically(nodesTmp, par.db2);
+    FileUtil::publishAtomically(metadataTmpPath, par.db2);
     markNodeDone(par.db2, node.index);
 
-    Debug(Debug::INFO) << "Where the time went: extracting " << (uint64_t) spentExtracting
-                       << "s, ending " << manifest << " chunks " << (uint64_t) spentEndingChunks
+    Debug(Debug::INFO) << "Where the time went: extracting " << (uint64_t) extractionSeconds
+                       << "s, ending " << checkpointIndex << " chunks " << (uint64_t) checkpointFlushSeconds
                        << "s\n";
-    Debug(Debug::INFO) << "Wrote " << written << " k-mer records in " << timer.lap() << "\n";
+    Debug(Debug::INFO) << "Wrote " << writtenRecordCount << " k-mer records in " << timer.lap() << "\n";
     reader.close();
     return EXIT_SUCCESS;
 }
@@ -766,6 +822,10 @@ static void assignGroup(KmerRecord *group, size_t size, const RunDbReader &reade
         const uint32_t queryLen = lengths[round];
         for (size_t i = 0; i < size; i++) {
             const uint64_t member = group[i].rank();
+            // the centre pairs with itself under every coverage mode, and align2clust drops it again
+            if (member == rep) {
+                continue;
+            }
             const uint32_t targetLen = lengths[i];
             const int diagonal = static_cast<int>(repPos) - static_cast<int>(group[i].pos());
             const bool extendable =
@@ -840,7 +900,7 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
     }
     const size_t repRankBlockCount = (size_t) par.lin8RepRankBlocks;
 
-    const uint64_t BYTES_PER_MANIFEST = 4ull * 1024 * 1024 * 1024;
+    const uint64_t CHECKPOINT_BYTE_LIMIT = 4ull * 1024 * 1024 * 1024;
     const std::string prefix = par.db3 + "." + SSTR(node.index);
     const size_t budget = static_cast<size_t>(Util::computeMemory(par.splitMemoryLimit) * 0.95);
     std::vector<uint64_t> keep(repRankBlockCount, 0);
@@ -953,7 +1013,7 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
         pairs += inBucket;
         pending += inBucket * PairRecord::DISK_BYTES;
         const bool last = bucket + node.count >= buckets;
-        if (pending >= BYTES_PER_MANIFEST || last) {
+        if (pending >= CHECKPOINT_BYTE_LIMIT || last) {
             const double put = omp_get_wtime();
             writer.endChunk(par.threads);
             writeBucketManifest(prefix + "." + SSTR(chunk) + ".manifest", writer.chunkCounts(),

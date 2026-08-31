@@ -657,6 +657,7 @@ public:
 
     // linearcluster
     int kmersPerSequence;
+    int syncmerS;
     MultiParam<NuclAA<float>> kmersPerSequenceScale;
     bool includeOnlyExtendable;
     bool ignoreMultiKmer;
@@ -1033,6 +1034,7 @@ public:
 
     // linearcluster
     PARAMETER(PARAM_KMER_PER_SEQ)
+    PARAMETER(PARAM_SYNCMER_S)
     PARAMETER(PARAM_KMER_PER_SEQ_SCALE)
     PARAMETER(PARAM_INCLUDE_ONLY_EXTENDABLE)
     PARAMETER(PARAM_IGNORE_MULTI_KMER)

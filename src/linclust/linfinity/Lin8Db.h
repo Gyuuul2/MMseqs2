@@ -124,23 +124,22 @@ struct __attribute__((packed)) KmerRecord {
     static const unsigned int RANK_HIGH_BITS = 64 - KEY_BITS;
     static const unsigned int RANK_LOW_BITS = RANK_BITS - RANK_HIGH_BITS;
     static const unsigned int POS_SHIFT = RANK_LOW_BITS + POS_BITS;
-    // derived, so a wider key cannot silently drop the adjacency on top of the flag
+    // derived, so a wider key cannot silently drop the adjacency off the end of the word
     static const unsigned int ADJACENT_SHIFT =
-        64 - RANK_LOW_BITS - POS_BITS - 1 - ADJACENT_COUNT * ADJACENT_BITS;
+        64 - RANK_LOW_BITS - POS_BITS - ADJACENT_COUNT * ADJACENT_BITS;
     static const uint64_t ADJACENT_ALL = (uint64_t(1) << (ADJACENT_COUNT * ADJACENT_BITS)) - 1;
 
     static const size_t DISK_BYTES = 16;
     void pack(unsigned char *to) const { memcpy(to, this, DISK_BYTES); }
     void unpack(const unsigned char *from) { memcpy(this, from, DISK_BYTES); }
     // ADJACENT_SHIFT is a subtraction, so an over budget word wraps to a huge shift and still compiles
-    static_assert(RANK_LOW_BITS + POS_BITS + 1 + ADJACENT_COUNT * ADJACENT_BITS <= 64,
+    static_assert(RANK_LOW_BITS + POS_BITS + ADJACENT_COUNT * ADJACENT_BITS <= 64,
                   "the k-mer record's second word is over budget");
 
-    void set(uint64_t key, uint64_t rank, uint64_t pos, bool isIdentity, uint64_t adjacent) {
+    void set(uint64_t key, uint64_t rank, uint64_t pos, uint64_t adjacent) {
         low = (key << RANK_HIGH_BITS) | (rank >> RANK_LOW_BITS);
         high = ((rank & ((uint64_t(1) << RANK_LOW_BITS) - 1)) << (64 - RANK_LOW_BITS))
-               | (pos << (64 - POS_SHIFT)) | (uint64_t(isIdentity ? 1 : 0) << (63 - POS_SHIFT))
-               | (adjacent << ADJACENT_SHIFT);
+               | (pos << (64 - POS_SHIFT)) | (adjacent << ADJACENT_SHIFT);
     }
 
     uint64_t key() const { return low >> RANK_HIGH_BITS; }
@@ -149,7 +148,6 @@ struct __attribute__((packed)) KmerRecord {
                | (high >> (64 - RANK_LOW_BITS));
     }
     uint64_t pos() const { return (high >> (64 - POS_SHIFT)) & POS_MAX; }
-    bool isIdentity() const { return ((high >> (63 - POS_SHIFT)) & 1) != 0; }
     uint64_t adjacent() const { return (high >> ADJACENT_SHIFT) & ADJACENT_ALL; }
     unsigned int adjacentAt(unsigned int slot) const {
         return (high >> (ADJACENT_SHIFT + slot * ADJACENT_BITS)) & ADJACENT_MAX;
