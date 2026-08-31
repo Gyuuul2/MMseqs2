@@ -66,9 +66,14 @@ struct ClusterPair {
     static bool sameMember(const ClusterPair &first, const ClusterPair &second) {
         return first.member == second.member;
     }
+
+    // a member that answers to itself is its own representative, which is how a pair is dropped
+    static bool isSelf(const ClusterPair &pair) {
+        return pair.member == pair.representative;
+    }
 };
 
-static std::pair<size_t, size_t> runsInFileSlot(const RunTable &runs, size_t fileSlot) {
+static std::pair<size_t, size_t> runsInFileSlot(const SequenceLocator &runs, size_t fileSlot) {
     size_t begin = runs.size();
     size_t end = 0;
     for (size_t i = 0; i < runs.size(); i++) {
@@ -91,8 +96,8 @@ static double spentGrouping = 0;
 static double spentComparing = 0;
 static double spentSpilling = 0;
 static double hashingThreadSeconds = 0;   // useThreads x elapsed, so the average parallelism shows
-static uint64_t segmentsSeen = 0;
-static uint64_t segmentsOnOneThread = 0;
+static uint64_t lengthGroupsSeen = 0;
+static uint64_t lengthGroupsOnOneThread = 0;
 
 static uint32_t anchorLength(float identity) {
     if (identity >= 1.0f) {
@@ -459,8 +464,8 @@ static void reduceSequencesOfOneLength(const RunDbReader &reader, uint64_t rankB
         const double took = omp_get_wtime() - mark;
         spentHashing += took;
         hashingThreadSeconds += took * useThreads;
-        segmentsSeen++;
-        segmentsOnOneThread += (useThreads == 1);
+        lengthGroupsSeen++;
+        lengthGroupsOnOneThread += (useThreads == 1);
         reduceEntriesToClusters(reader, entries, length, aa2num, identity, threads, out, crowded);
         return;
     }
@@ -502,8 +507,8 @@ static void reduceSequencesOfOneLength(const RunDbReader &reader, uint64_t rankB
         const double took = omp_get_wtime() - mark;
         spentHashing += took;
         hashingThreadSeconds += took * useThreads;
-        segmentsSeen++;
-        segmentsOnOneThread += (useThreads == 1);
+        lengthGroupsSeen++;
+        lengthGroupsOnOneThread += (useThreads == 1);
     }
     for (size_t at = 0; at < partitions; at++) {
         mark = omp_get_wtime();
@@ -620,7 +625,7 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
     Debug(Debug::INFO) << "Reducing on an alphabet of " << hashMat->alphabetSize << " at identity "
                        << identity << "\n";
     Debug(Debug::INFO) << "Database holds " << reader.getSize() << " sequences in "
-                       << reader.getRunTable().size() << " run segments, budget "
+                       << reader.getSequenceLocator().size() << " run runs, budget "
                        << (budget / (1024 * 1024)) << " MB\n";
 
     const std::string shard = par.db2 + "." + SSTR(node.index);
@@ -639,7 +644,7 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
 
         Timer timer;
         reader.openBatch(par.threads, READ_ARENA_BYTES, budget, RunDbReader::READ_AGAIN);
-        const RunTable &runs = reader.getRunTable();
+        const SequenceLocator &runs = reader.getSequenceLocator();
         const std::vector<size_t> mine = nodeFileSlots(runs, node);
         Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << mine.size()
                            << " of " << runs.filesPerNode() << " lengthBlocks\n";
@@ -648,6 +653,8 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
         uint64_t written = 0;
         size_t oversized = 0;
         size_t crowded = 0;
+        size_t moved = 0;
+        size_t stayed = 0;
         size_t lengths = 0;
         for (size_t at = 0; at < mine.size(); at++) {
             const std::pair<size_t, size_t> span = runsInFileSlot(runs, mine[at]);
@@ -677,17 +684,37 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
                 SORT_PARALLEL(pairs.begin(), pairs.end(), ClusterPair::byMemberAndRepresentative);
                 pairs.erase(std::unique(pairs.begin(), pairs.end(), ClusterPair::sameMember),
                             pairs.end());
+                // hamming is not transitive, so a member moved to the root is compared against it
                 for (size_t i = 0; i < pairs.size(); i++) {
                     ClusterPair want;
                     want.member = pairs[i].representative;
                     want.representative = 0;
                     std::vector<ClusterPair>::iterator at =
-                        std::lower_bound(pairs.begin(), pairs.begin() + i, want,
-                                         ClusterPair::byMember);
-                    if (at != pairs.begin() + i && at->member == pairs[i].representative) {
-                        pairs[i].representative = at->representative;
+                        std::lower_bound(pairs.begin(), pairs.end(), want, ClusterPair::byMember);
+                    if (at == pairs.end() || at->member != pairs[i].representative
+                        || ClusterPair::isSelf(*at)) {
+                        continue;
+                    }
+                    moved++;
+                    const uint64_t root = at->representative;
+                    ClusterPair above;
+                    above.member = root;
+                    above.representative = 0;
+                    std::vector<ClusterPair>::iterator up =
+                        std::lower_bound(pairs.begin(), pairs.end(), above, ClusterPair::byMember);
+                    const bool rootWasRemoved = up != pairs.end() && up->member == root
+                                                && ClusterPair::isSelf(*up) == false;
+                    if (rootWasRemoved == false
+                        && sequencesMatch(reader.getData(pairs[i].member), reader.getData(root),
+                                          length, identity)) {
+                        pairs[i].representative = root;
+                    } else {
+                        pairs[i].representative = pairs[i].member;
+                        stayed++;
                     }
                 }
+                pairs.erase(std::remove_if(pairs.begin(), pairs.end(), ClusterPair::isSelf),
+                            pairs.end());
                 if (pairs.empty() == false) {
                     if (fwrite(pairs.data(), sizeof(ClusterPair), pairs.size(), out) != pairs.size()) {
                         Debug(Debug::ERROR) << "Cannot write cluster pairs to " << pairsTmp << "\n";
@@ -703,6 +730,11 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
         }
         if (oversized > 0) {
             Debug(Debug::INFO) << oversized << " lengths did not fit the budget and were split by hash\n";
+        }
+        if (moved > 0) {
+            Debug(Debug::INFO) << moved << " members answered to a representative that was itself"
+                               << " removed; " << stayed << " of them did not match the one above it"
+                               << " and stayed their own\n";
         }
         if (crowded > 0) {
             Debug(Debug::INFO) << crowded << " anchors were shared by more than " << ANCHOR_BUCKET_MAX
@@ -736,8 +768,8 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
                        << (uint64_t) spentGrouping << "s, comparing " << (uint64_t) spentComparing
                        << "s, spilling " << (uint64_t) spentSpilling << "s\n";
     Debug(Debug::INFO) << "Hashing ran on " << (spentHashing > 0 ? hashingThreadSeconds / spentHashing : 0)
-                       << " threads on average over " << segmentsSeen << " length segments, "
-                       << segmentsOnOneThread << " of which got one thread\n";
+                       << " threads on average over " << lengthGroupsSeen << " length runs, "
+                       << lengthGroupsOnOneThread << " of which got one thread\n";
     Debug(Debug::INFO) << "Kept " << all << " of " << reader.getSize() << " sequences ("
                        << (100.0 * static_cast<double>(reader.getSize() - all)
                            / static_cast<double>(std::max<uint64_t>(reader.getSize(), 1)))
