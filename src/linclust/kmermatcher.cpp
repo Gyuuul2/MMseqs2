@@ -106,38 +106,6 @@ uint64_t hashUInt64(uint64_t in, uint64_t seed) {
     return XXH64(&in, sizeof(uint64_t), seed);
 }
 
-// closed syncmer: the k-mer's minimal hashed s-mer sits at its first or last window (Edgar 2021), content-only
-template <typename R>
-static inline bool isClosedSyncmer(const R *kmer, const int kmerSize, const int smerSize, const uint64_t seed) {
-    const uint64_t smerMask = (1ULL << (5 * smerSize)) - 1;
-    uint64_t smer = 0;
-    uint64_t minHash = UINT64_MAX;
-    uint64_t firstHash = UINT64_MAX;
-    uint64_t lastHash = UINT64_MAX;
-    for (int i = 0; i < kmerSize; i++) {
-        smer = ((smer << 5) | static_cast<uint64_t>(kmer[i])) & smerMask;
-        if (i >= smerSize - 1) {
-            lastHash = hashUInt64(smer, seed);
-            firstHash = (i == smerSize - 1) ? lastHash : firstHash;
-            minHash = std::min(minHash, lastHash);
-        }
-    }
-    return firstHash == minHash || lastHash == minHash;
-}
-
-// same test on a canonical 2-bit packed nucleotide k-mer index
-static inline bool isClosedSyncmerNucl(const size_t kmerIdx, const int kmerSize, const int smerSize, const uint64_t seed) {
-    const uint64_t smerMask = (1ULL << (2 * smerSize)) - 1;
-    uint64_t minHash = UINT64_MAX;
-    uint64_t firstHash = UINT64_MAX;
-    uint64_t lastHash = UINT64_MAX;
-    for (int w = kmerSize - smerSize; w >= 0; w--) {
-        lastHash = hashUInt64((kmerIdx >> (2 * w)) & smerMask, seed);
-        firstHash = (w == kmerSize - smerSize) ? lastHash : firstHash;
-        minHash = std::min(minHash, lastHash);
-    }
-    return firstHash == minHash || lastHash == minHash;
-}
 
 template <typename T, bool includeAdjacency, bool IncludeSeqLen>
 KmerPosition<T, includeAdjacency, IncludeSeqLen> *initKmerPositionMemory(size_t size) {
@@ -452,8 +420,6 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
             generator->setDivideStrategy(&three, &two);
         }
         Indexer idxer(subMat->alphabetSize - 1,  par.kmerSize);
-        const bool syncmerFilter = (par.kmerSelection == 1);
-        size_t syncmerWorkspace[32];
         const unsigned int BUFFER_SIZE = static_cast<unsigned int>(KMER_STAGING_BUFFER_SIZE);
         size_t bufferPos = 0;
         KmerPosition<T, includeAdjacency, IncludeSeqLen> * threadKmerBuffer = NULL;
@@ -517,9 +483,6 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
                         }
                         bool pickReverseKmer = (revkmerIdx<kmerIdx);
                         kmerIdx = (pickReverseKmer) ? revkmerIdx : kmerIdx;
-                        if (syncmerFilter && isClosedSyncmerNucl(kmerIdx, par.kmerSize, par.syncmerS, par.hashShift) == false) {
-                            continue;
-                        }
                         const unsigned short hash = hashUInt64(kmerIdx, par.hashShift);
 
                         if(par.adjustKmerLength) {
@@ -551,12 +514,6 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
                         std::pair<size_t*, size_t>  scoreMat = generator->generateKmerList(kmer, true);
                         for(size_t kmerPos = 0; kmerPos < scoreMat.second && kmerPos < static_cast<size_t >(par.pickNbest); kmerPos++){
                             size_t kmerIdx = scoreMat.first[kmerPos];
-                            if (syncmerFilter) {
-                                idxer.index2int(syncmerWorkspace, kmerIdx, par.kmerSize);
-                                if (isClosedSyncmer(syncmerWorkspace, par.kmerSize, par.syncmerS, par.hashShift) == false) {
-                                    continue;
-                                }
-                            }
                             (kmers + seqKmerCount)->kmer = kmerIdx;
                             (kmers + seqKmerCount)->pos = seq.getCurrentPosition();
                             const unsigned short hash = hashUInt64(kmerIdx, par.hashShift);
@@ -566,9 +523,6 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
                             seqKmerCount++;
                         }
                     } else {
-                        if (syncmerFilter && isClosedSyncmer(kmer, par.kmerSize, par.syncmerS, par.hashShift) == false) {
-                            continue;
-                        }
                         size_t kmerIdx = idxer.int2index(kmer, 0, par.kmerSize);
                         (kmers + seqKmerCount)->kmer = kmerIdx;
                         (kmers + seqKmerCount)->pos = seq.getCurrentPosition();
@@ -1993,13 +1947,6 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     int querySeqType = seqDbr.getDbtype();
 
     setKmerLengthAndAlphabet(par, seqDbr.getAminoAcidDBSize(), querySeqType);
-    if (par.kmerSelection == 1) {
-        const int maxS = Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES) ? 31 : 12;
-        if (par.syncmerS < 1 || par.syncmerS >= par.kmerSize || par.syncmerS > maxS) {
-            Debug(Debug::ERROR) << "--syncmer-s " << par.syncmerS << " must satisfy 0 < s < k (k=" << par.kmerSize << ", max " << maxS << ")\n";
-            EXIT(EXIT_FAILURE);
-        }
-    }
     std::vector<MMseqsParameter *> *params = command.params;
     par.printParameters(command.cmd, argc, argv, *params);
     Debug(Debug::INFO) << "Database size: " << seqDbr.getSize() << " type: " << seqDbr.getDbTypeName() << "\n";
