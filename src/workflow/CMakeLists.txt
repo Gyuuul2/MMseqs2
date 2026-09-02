@@ -1,13 +1,14 @@
 set(workflow_source_files
+        workflow/BatchClustering.cpp
         workflow/Cluster.cpp
         workflow/ClusterUpdate.cpp
         workflow/Databases.cpp
+        workflow/Lin8clust.cpp
         workflow/Linclust.cpp
         workflow/EasySearch.cpp
         workflow/EasyRbh.cpp
         workflow/EasyCluster.cpp
         workflow/EasyLinclust.cpp
-        workflow/BatchClustering.cpp
         workflow/EasyProteomecluster.cpp
         workflow/EasyProteomesearch.cpp
         workflow/Enrich.cpp

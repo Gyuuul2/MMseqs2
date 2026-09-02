@@ -94,6 +94,7 @@ public:
     static const unsigned int DBTYPE_EXTENDED_CONTEXT_PSEUDO_COUNTS = 4;
     static const unsigned int DBTYPE_EXTENDED_GPU = 8;
     static const unsigned int DBTYPE_EXTENDED_SET = 16;
+    static const unsigned int DBTYPE_EXTENDED_RUNS = 32;
 
     // don't forget to add new database types to DBReader::getDbTypeName and Parameters::PARAM_OUTPUT_DBTYPE
 
@@ -282,9 +283,6 @@ public:
     static const int CLUST_LINEAR_DEFAULT_ALPH_SIZE = 13;
     static const int CLUST_LINEAR_DEFAULT_K = 0;
     static const int CLUST_LINEAR_KMER_PER_SEQ = 0;
-    static const int CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE = 2;   // count-table iters (symmetric cov-mode)
-    static const int CLUST_LINEAR_DEFAULT_NUM_ADJACENCY = 3;     // adjacency iters (non-symmetric cov-mode)
-    static const int CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY = 1;   // adjacency iters (symmetric cov-mode)
 
     // cov mode
     static const int COV_MODE_BIDIRECTIONAL  = 0;
@@ -300,6 +298,10 @@ public:
     static const int SEQ_ID_LONG = 2;
 
     // seq. split mode
+    static const int CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE = 2;   // count-table iters (symmetric cov-mode)
+    static const int CLUST_LINEAR_DEFAULT_NUM_ADJACENCY = 3;     // adjacency iters (non-symmetric cov-mode)
+    static const int CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY = 1;   // adjacency iters (symmetric cov-mode)
+
     static const int SEQUENCE_SPLIT_MODE_HARD = 0;
     static const int SEQUENCE_SPLIT_MODE_SOFT = 1;
     static const int SEQUENCE_SPLIT_MODE_GPU = 2;
@@ -531,6 +533,8 @@ public:
     bool batchCompressOutputs;
     int batchMergeSplits;
     int batchMergeSplitJobs;
+    int batchMergeSplitJobsCap;
+    int batchMergeNodes;
     int batchRepFastaSplits;
     size_t batchChunkDiskBudget;
     size_t batchRound0ChunkDiskBudget;
@@ -645,24 +649,23 @@ public:
     float tau;
 
     // createtsv
+    int tsvSplits;
+    int tsvSplitColumn;
     bool firstSeqRepr;
     int idxSeqSrc;
     bool fullHeader;
     size_t targetTsvColumn;
-    int tsvSplits;
-    int tsvSplitColumn;
 
     //result2stats
     std::string stat;
 
     // linearcluster
     int kmersPerSequence;
+    float rescueRecall;
     MultiParam<NuclAA<float>> kmersPerSequenceScale;
     bool includeOnlyExtendable;
     bool ignoreMultiKmer;
     int hashShift;
-    int kmerSelection;
-    int syncmerS;
     int pickNbest;
     int adjustKmerLength;
     int resultDirection;
@@ -697,6 +700,13 @@ public:
     int createdbThreads;
     bool shuffleDatabase;
     int shuffleSplits;
+    std::string linclusterdbNodeList;
+    int linclusterdbNodeId;
+    int linclusterdbNodeCount;
+    int lin8RepRankBlock;
+    int lin8RepRankBlockCount;
+    int lin8RepRankBlockLookahead;
+    int lin8RepRankBlocks;
 
     // splitsequence
     int sequenceOverlap;
@@ -704,8 +714,8 @@ public:
     int headerSplitMode;
 
     // convert2fasta
-    bool useHeaderFile;
     int fastaSplits;
+    bool useHeaderFile;
     int writeLookup;
 
     // result2flat
@@ -1025,23 +1035,22 @@ public:
 
     // createtsv
     PARAMETER(PARAM_TARGET_COLUMN)
+    PARAMETER(PARAM_TSV_SPLITS)
+    PARAMETER(PARAM_TSV_SPLIT_COLUMN)
     PARAMETER(PARAM_FIRST_SEQ_REP_SEQ)
     PARAMETER(PARAM_FULL_HEADER)
     PARAMETER(PARAM_IDX_SEQ_SRC)
-    PARAMETER(PARAM_TSV_SPLITS)
-    PARAMETER(PARAM_TSV_SPLIT_COLUMN)
 
     // result2stat
     PARAMETER(PARAM_STAT)
 
     // linearcluster
     PARAMETER(PARAM_KMER_PER_SEQ)
+    PARAMETER(PARAM_RESCUE_RECALL)
     PARAMETER(PARAM_KMER_PER_SEQ_SCALE)
     PARAMETER(PARAM_INCLUDE_ONLY_EXTENDABLE)
     PARAMETER(PARAM_IGNORE_MULTI_KMER)
     PARAMETER(PARAM_HASH_SHIFT)
-    PARAMETER(PARAM_KMER_SELECTION)
-    PARAMETER(PARAM_SYNCMER_S)
     PARAMETER(PARAM_PICK_N_SIMILAR)
     PARAMETER(PARAM_ADJUST_KMER_LEN)
     PARAMETER(PARAM_RESULT_DIRECTION)
@@ -1111,6 +1120,8 @@ public:
     PARAMETER(PARAM_BATCH_COMPRESS_OUTPUTS)
     PARAMETER(PARAM_BATCH_MERGE_SPLITS)
     PARAMETER(PARAM_BATCH_MERGE_SPLIT_JOBS)
+    PARAMETER(PARAM_BATCH_MERGE_SPLIT_JOBS_CAP)
+    PARAMETER(PARAM_BATCH_MERGE_NODES)
     PARAMETER(PARAM_BATCH_REP_FASTA_SPLITS)
     PARAMETER(PARAM_BATCH_ROUND0_REP_FASTA_SPLITS)
     PARAMETER(PARAM_BATCH_CHUNK_DISK_BUDGET)
@@ -1174,15 +1185,22 @@ public:
     PARAMETER(PARAM_USE_HEADER) // also used by extractorfs
     PARAMETER(PARAM_ID_OFFSET)  // same
     PARAMETER(PARAM_DB_TYPE)
-    PARAMETER(PARAM_CREATEDB_MODE)
     PARAMETER(PARAM_CREATEDB_THREADS)
+    PARAMETER(PARAM_CREATEDB_MODE)
     PARAMETER(PARAM_SHUFFLE)
     PARAMETER(PARAM_SHUFFLE_SPLITS)
+    PARAMETER(PARAM_LINCLUSTERDB_NODE_LIST)
+    PARAMETER(PARAM_LINCLUSTERDB_NODE_ID)
+    PARAMETER(PARAM_LINCLUSTERDB_NODE_COUNT)
+    PARAMETER(PARAM_LIN8_REP_RANK_BLOCKS)
+    PARAMETER(PARAM_LIN8_REP_RANK_BLOCK)
+    PARAMETER(PARAM_LIN8_REP_RANK_BLOCK_COUNT)
+    PARAMETER(PARAM_LIN8_REP_RANK_BLOCK_LOOKAHEAD)
     PARAMETER(PARAM_WRITE_LOOKUP)
 
     // convert2fasta
-    PARAMETER(PARAM_USE_HEADER_FILE)
     PARAMETER(PARAM_FASTA_SPLITS)
+    PARAMETER(PARAM_USE_HEADER_FILE)
 
     // setextendedbtype
     PARAMETER(PARAM_EXTENDED_DBTYPE)
@@ -1401,6 +1419,18 @@ public:
     std::vector<MMseqsParameter*> createlinindex;
     std::vector<MMseqsParameter*> convertalignments;
     std::vector<MMseqsParameter*> createdb;
+    std::vector<MMseqsParameter*> lin8createdb;
+    std::vector<MMseqsParameter*> lin8clusthash;
+    std::vector<MMseqsParameter*> lin8extractkmers;
+    std::vector<MMseqsParameter*> lin8assignedpairs;
+    std::vector<MMseqsParameter*> lin8pref;
+    std::vector<MMseqsParameter*> lin8align2clust;
+    std::vector<MMseqsParameter*> lin8align2clustmulti;
+    std::vector<MMseqsParameter*> lin8mergehashredundancy;
+    std::vector<MMseqsParameter*> lin8createclusterdb;
+    std::vector<MMseqsParameter*> lin8pickrepprofile;
+    std::vector<MMseqsParameter*> lin8createtsv;
+    std::vector<MMseqsParameter*> lin8createrepseqfasta;
     std::vector<MMseqsParameter*> makepaddedseqdb;
     std::vector<MMseqsParameter*> convert2fasta;
     std::vector<MMseqsParameter*> result2flat;
@@ -1415,6 +1445,7 @@ public:
     std::vector<MMseqsParameter*> countkmer;
     std::vector<MMseqsParameter*> easylinclustworkflow;
     std::vector<MMseqsParameter*> linclustworkflow;
+    std::vector<MMseqsParameter*> linclustoneshotworkflow;
     std::vector<MMseqsParameter*> linclustbatchinner;
     std::vector<MMseqsParameter*> clusterbatchinner;
     std::vector<MMseqsParameter*> linclustbatch;
@@ -1530,12 +1561,12 @@ public:
             case DBTYPE_MSA_DB: return "MSA";
             case DBTYPE_GENERIC_DB: return "Generic";
             case DBTYPE_PREFILTER_REV_RES: return "Bi-directional prefilter";
+            case DBTYPE_PREFILTER_LOCAL_RES: return "Local-ID prefilter";
             case DBTYPE_OFFSETDB: return "Offsetted headers";
             case DBTYPE_DIRECTORY: return "Directory";
             case DBTYPE_FLATFILE: return "Flatfile";
             case DBTYPE_STDIN: return "stdin";
             case DBTYPE_URI: return "uri";
-            case DBTYPE_PREFILTER_LOCAL_RES: return "Local-ID prefilter";
 
             default: return "Unknown";
         }

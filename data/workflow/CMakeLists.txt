@@ -10,7 +10,9 @@ set(GENERATED_WORKFLOWS
         workflow/map.sh
         workflow/rbh.sh
         workflow/linclust.sh
+        workflow/lin8clust.sh
         workflow/clustering.sh
+        workflow/batch_clustering.sh
         workflow/cascaded_clustering.sh
         workflow/update_clustering.sh
         workflow/searchtargetprofile.sh
@@ -31,6 +33,5 @@ set(GENERATED_WORKFLOWS
         workflow/nucleotide_clustering.sh
         workflow/iterativepp.sh
         workflow/tsv2exprofiledb.sh
-        workflow/batch_clustering.sh
         PARENT_SCOPE
         )
