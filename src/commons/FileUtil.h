@@ -42,6 +42,7 @@ public:
 
     static std::string getCurrentWorkingDirectory();
 
+    static void publishAtomically(const std::string &tmp, const std::string &path);
     static void symlinkAlias(const std::string &file, const std::string &alias);
     static void symlinkAbs(const std::string &target, const std::string &link);
 
