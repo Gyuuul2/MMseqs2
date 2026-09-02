@@ -23,7 +23,8 @@ usage() {
 Usage:
   batch_clustering.sh prepare <input_manifest> <chunk_dir> <chunk_manifest>
   batch_clustering.sh cluster-chunk <chunk_uri> <result_prefix> <work_dir> [chunk_id] [round] [expected_seqs]
-  batch_clustering.sh propagate <child_tsv_manifest> <parent_tsv_manifest> <out_manifest> <work_dir>
+  batch_clustering.sh propagate <child_tsv_manifest> <parent_tsv_manifest> <out_manifest> <work_dir> [expected_rows]
+  batch_clustering.sh final-join-node <child_manifest> <parent_manifest> <shared_prefix> <work_dir> <node_count> <node_idx> <join|emit>
   batch_clustering.sh finalize <mapping_manifest> <rep_manifest> <result_prefix> <work_dir> [mark_final]
   batch_clustering.sh run-single-node <input_manifest> <work_dir> <result_dir>
   batch_clustering.sh run-multi-node <input_manifest> <work_dir> <result_dir>   (submits the SLURM event chain, then returns)
@@ -34,10 +35,11 @@ Usage:
   batch_clustering.sh aws-driver <input_manifest> <work_s3_prefix> <result_s3_prefix> <round>
   batch_clustering.sh aws-worker <chunk_manifest_s3> <result_s3_prefix> <round>
   batch_clustering.sh aws-merge <input_manifest> <work_s3_prefix> <result_s3_prefix> <round>
+  batch_clustering.sh aws-final-join <work_s3_prefix> <join|emit> <round>
 
 Environment (normally exported by mmseqs from the linclust2-batch/cluster2-batch command line,
 or their -aws variants for the AWS vars; set them directly only when running this script standalone):
-  MMSEQS ROUND0_MMSEQS THREADS ROUND0_THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_SPLITS MERGE_SPLIT_JOBS COMPRESS_RATIO
+  MMSEQS ROUND0_MMSEQS THREADS ROUND0_THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_SPLITS MERGE_SPLIT_JOBS MERGE_SPLIT_JOBS_CAP MERGE_NODES COMPRESS_RATIO
   CHUNK_DISK_BUDGET ROUND0_CHUNK_DISK_BUDGET DISK_POLL_SEC RAM_POLL_SEC
   CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_PAR ROUND0_CLUSTER_PAR CLUSTER_COV_MODE CREATEDB_PAR CREATEDB_SHUFFLE_SPLITS ROUND0_CREATEDB_SHUFFLE_SPLITS BATCH_COMPRESS_KMER_TMP_FILES CREATETSV_PAR COMPRESS_BATCH_OUTPUTS SORT_BUFFER_SIZE SORT_TMP
   MAX_ROUNDS MIN_REDUCTION_RATIO MIN_REDUCTION_COUNT CONVERGENCE_PATIENCE MAX_CHUNK_ATTEMPTS BATCH_REP_FASTA_SPLITS ROUND0_BATCH_REP_FASTA_SPLITS
@@ -77,7 +79,6 @@ RAM_POLL_SEC=${RAM_POLL_SEC:-2}
 S3_CHUNK_PREFIX=${S3_CHUNK_PREFIX:-}
 COMPRESS_BATCH_OUTPUTS=${COMPRESS_BATCH_OUTPUTS:-0}
 [[ "$COMPRESS_BATCH_OUTPUTS" =~ ^[01]$ ]] || fail "COMPRESS_BATCH_OUTPUTS must be 0 or 1 (got '$COMPRESS_BATCH_OUTPUTS')"
-# --createdb-mode 3 sorts by length, which createdb's parallel parse and align2clust's visit order both need
 CREATEDB_SHUFFLE_SPLITS=${CREATEDB_SHUFFLE_SPLITS:-$THREADS}
 ROUND0_CREATEDB_SHUFFLE_SPLITS=${ROUND0_CREATEDB_SHUFFLE_SPLITS:-}
 [[ -z "$ROUND0_CREATEDB_SHUFFLE_SPLITS" || "$ROUND0_CREATEDB_SHUFFLE_SPLITS" =~ ^[1-9][0-9]*$ ]] || fail "ROUND0_CREATEDB_SHUFFLE_SPLITS must be a positive integer (got '$ROUND0_CREATEDB_SHUFFLE_SPLITS')"
@@ -128,7 +129,7 @@ MAX_CHUNK_ATTEMPTS=${MAX_CHUNK_ATTEMPTS:-1}
 COMPRESS_RATIO=${COMPRESS_RATIO:-3}
 # decompressor fan-out; the measure dispatch sets it to 1 because it already runs THREADS workers
 ZSTD_THREADS=${ZSTD_THREADS:-${THREADS:-1}}
-# representative FASTA shards per chunk; above --shuffle-splits it only helps the shuffle, not the parse
+# representative FASTA shards per chunk, so the next round's chunking has more than one file to place
 BATCH_REP_FASTA_SPLITS=${BATCH_REP_FASTA_SPLITS:-32}
 [[ "$BATCH_REP_FASTA_SPLITS" =~ ^[1-9][0-9]*$ ]] || fail "BATCH_REP_FASTA_SPLITS must be a positive integer (got '$BATCH_REP_FASTA_SPLITS')"
 ROUND0_BATCH_REP_FASTA_SPLITS=${ROUND0_BATCH_REP_FASTA_SPLITS:-}
@@ -155,7 +156,7 @@ auto_merge_split_jobs() {
     splits="${MERGE_SPLITS:-1}"
     jobs=$((threads / 8))
     [[ "$jobs" -lt 1 ]] && jobs=1
-    [[ "$jobs" -gt 16 ]] && jobs=16
+    [[ "$jobs" -gt "${MERGE_SPLIT_JOBS_CAP:-16}" ]] && jobs="${MERGE_SPLIT_JOBS_CAP:-16}"
     [[ "$jobs" -gt "$splits" ]] && jobs="$splits"
     printf '%s' "$jobs"
 }
@@ -165,11 +166,18 @@ if [[ -z "${MERGE_SPLITS:-}" || "$MERGE_SPLITS" == "0" ]]; then
 fi
 [[ "$MERGE_SPLITS" =~ ^[1-9][0-9]*$ ]] || fail "MERGE_SPLITS must be a positive integer (got '$MERGE_SPLITS')"
 [[ -z "${ROUND0_MERGE_SPLITS:-}" ]] || fail "ROUND0_MERGE_SPLITS is not supported: round TSVs are written pre-split and propagate joins parent/child split by split, so a per-round split count would break the join and lose cluster members; use one global --merge-splits"
+# cap for the auto-derived MERGE_SPLIT_JOBS (threads/8, at most this many); an explicit MERGE_SPLIT_JOBS wins outright
+MERGE_SPLIT_JOBS_CAP=${MERGE_SPLIT_JOBS_CAP:-16}
+[[ "$MERGE_SPLIT_JOBS_CAP" =~ ^[1-9][0-9]*$ ]] || fail "MERGE_SPLIT_JOBS_CAP must be a positive integer (got '$MERGE_SPLIT_JOBS_CAP')"
 if [[ -z "${MERGE_SPLIT_JOBS:-}" || "$MERGE_SPLIT_JOBS" == "0" ]]; then
     MERGE_SPLIT_JOBS=$(auto_merge_split_jobs)
 fi
 [[ "$MERGE_SPLIT_JOBS" =~ ^[1-9][0-9]*$ ]] || fail "MERGE_SPLIT_JOBS must be a positive integer (got '$MERGE_SPLIT_JOBS')"
 [[ "$MERGE_SPLIT_JOBS" -gt "$MERGE_SPLITS" ]] && MERGE_SPLIT_JOBS="$MERGE_SPLITS"
+# machines the final deferred merge join is distributed across (1 = run it inside the merge job)
+MERGE_NODES=${MERGE_NODES:-1}
+[[ "$MERGE_NODES" =~ ^[1-9][0-9]*$ ]] || fail "MERGE_NODES must be a positive integer (got '$MERGE_NODES')"
+[[ "$MERGE_NODES" -gt "$MERGE_SPLITS" ]] && MERGE_NODES="$MERGE_SPLITS"
 
 # createtsv and the propagate fragment writer each hold one open file per merge split
 check_split_fd_budget() {
@@ -211,7 +219,6 @@ round_cluster_par() {
     else
         base="$CLUSTER_PAR"
     fi
-    # kmermatcher drops the spill when one k-mer partition is enough, so every round can ask for it
     local spill=1
     [[ -n "${BATCH_KMER_WRITE_TO_DISK:-}" ]] && spill="$BATCH_KMER_WRITE_TO_DISK"
     base=$(par_without_flag "$base" --kmer-write-to-disk)
@@ -596,7 +603,6 @@ round_createdb_par() {
     local round="$1" mode par
     mode=$(round_createdb_mode "$round")
     par=$(par_without_flag "$CREATEDB_PAR" --createdb-mode)
-    # mode 3 warns and forces --shuffle 1, so drop the flag rather than let it read as if it applied
     [[ "$mode" == "3" ]] && par=$(par_without_flag "$par" --shuffle)
     if [[ "$round" -eq 0 && -n "${ROUND0_CREATEDB_SHUFFLE_SPLITS:-}" ]]; then
         par="$(par_without_flag "$par" --shuffle-splits) --shuffle-splits $ROUND0_CREATEDB_SHUFFLE_SPLITS"
@@ -725,11 +731,11 @@ materialize_softlink_filelist() {
     local dst="$2"
     local tmp="${dst}.tmp.$$"
     [[ -s "$dst" ]] && return 0
-    local mem cnt count=0
+    local mem _cnt count=0
     mkdir -p "$(dirname "$dst")"
     : > "$tmp"
     # counted filelists carry "path<TAB>seqs"; only the path matters here
-    while IFS=$'\t' read -r mem cnt || [[ -n "${mem:-}" ]]; do
+    while IFS=$'\t' read -r mem _cnt || [[ -n "${mem:-}" ]]; do
         [[ -z "${mem:-}" || "$mem" =~ ^[[:space:]]*# ]] && continue
         append_singleline_fasta "$mem" "$tmp"
         count=$((count + 1))
@@ -1123,7 +1129,6 @@ resolve_chunk_filelist() {
             # the link sits in another directory, so a relative path would resolve against that one
             ln -sf "$(cd -- "$(dirname -- "$mem")" && pwd -P)/$(basename -- "$mem")" "$local_ref"
         fi
-        # a declared count rides along so createdb can parallelise its parse on 32-bit keys too
         if [[ -n "${cnt:-}" ]]; then
             printf '%s\t%s\n' "$local_ref" "$cnt" >> "$out_list"
         else
@@ -1368,7 +1373,7 @@ cluster_chunk() {
     # staged inputs feed only createdb (the DB is a full copy here); reclaim them so S3 downloads stop charging the disk budget
     if [[ "$createdb_input" == "$work_dir/inputs.list.tsv" && -f "$createdb_input" ]]; then
         local staged _cnt
-        while IFS=$'\t' read -r staged _cnt || [[ -n "${staged:-}" ]]; do
+        while read -r staged || [[ -n "${staged:-}" ]]; do
             # only ever unlink what resolve_chunk_filelist staged: a source path here would delete the user's input
             if [[ "$staged" == "$work_dir"/input-* ]]; then rm -f "$staged"; fi
         done < "$createdb_input"
@@ -1381,7 +1386,8 @@ cluster_chunk() {
     run_stage "$cluster_cmd" "$chunk_id" "$round" -- "$mmseqs_bin" "$cluster_cmd" "$db" "$clu" "$work_dir/cluster-tmp" $(round_cluster_par "$round") || fail "${cluster_cmd} failed (chunk ${chunk_id}, rc=$?)"
 
     log "createtsv ${chunk_id}"
-    # round0 TSVs feed the merge join as child (key = rep, col 1); round1+ TSVs as parent (key = member, col 2)
+    # round0 TSVs feed the final join as child (key = rep, col 1); round1+ TSVs join as parent
+    # (key = member, col 2); the chain base (round-1 TSVs) is rebucketed by col 1 when needed
     local split_col=2
     [[ "$round" -eq 0 ]] && split_col=1
     local createtsv_par
@@ -1521,9 +1527,23 @@ stream_split_files() {
 }
 
 run_split_jobs() {
-    local label="$1" splits="$2" jobs="$3" worker="$4"
-    shift 4
-    [[ "$jobs" -gt "$splits" ]] && jobs="$splits"
+    local label="$1" splits="$2" jobs="$3"
+    shift 3
+    run_split_jobs_strided "$label" "$splits" "$jobs" 0 1 "$@"
+}
+
+# run_split_jobs_strided <label> <splits> <jobs> <offset> <stride> <worker> [args...]:
+# process splits b = offset, offset+stride, ... < splits, <jobs> at a time behind a wave
+# barrier. A distributed merge node j of Np passes offset=j stride=Np to take its share.
+run_split_jobs_strided() {
+    local label="$1" splits="$2" jobs="$3" offset="$4" stride="$5" worker="$6"
+    shift 6
+    local tasks=$(( (splits - offset + stride - 1) / stride ))
+    if [[ "$tasks" -le 0 ]]; then
+        log "${label}: no splits assigned (offset ${offset}, stride ${stride}, splits ${splits})"
+        return 0
+    fi
+    [[ "$jobs" -gt "$tasks" ]] && jobs="$tasks"
     [[ "$jobs" -lt 1 ]] && jobs=1
     # each split job runs its own zstd, so THREADS is a budget to divide across the
     # concurrent jobs, not a figure each of them may claim in full
@@ -1532,7 +1552,7 @@ run_split_jobs() {
 
     local pids="" active=0
     local b pid rc=0
-    for ((b = 0; b < splits; b++)); do
+    for ((b = offset; b < splits; b += stride)); do
         "$worker" "$@" "$b" &
         pids="${pids}$! "
         active=$((active + 1))
@@ -1602,7 +1622,9 @@ merge_join() {
     read -r joined_count < "$joined_cnt"
     [[ "$joined_count" -eq "$child_count" ]] ||
         fail "merge_join split ${bb} lost cluster members: child=${child_count} joined=${joined_count}"
-    rm -f "$child_sorted" "$parent_sorted" "$joined_cnt"
+    # keep the per-split joined row count: the conservation checks sum these after the wave
+    mv -f "$joined_cnt" "$frag_dir/joined.split${bb}.rows"
+    rm -f "$child_sorted" "$parent_sorted"
     log "merge_join split ${bb}: ${joined_count} members"
 }
 
@@ -1647,13 +1669,406 @@ finalize_sort_split() {
         > "$out"
 }
 
-# propagate <child_manifest> <parent_manifest> <out_manifest> <work_dir>
+# ---------- deferred final join ----------
+# Rounds no longer propagate the N-row mapping. Each round r >= 2 composes only the chain
+# (rep_r -> round-0 rep, R0 rows) via propagate(); the N-row join of the chain against the
+# round-0 TSVs runs ONCE, at convergence, and is what MERGE_NODES distributes:
+#   - the chain base (round-1 TSVs) is member-bucketed like every parent, so it is
+#     rebucketed by rep (col 1) before the first composition; the finished chain leaves
+#     composition bucketed by col1 (rep_R) but joins the round-0 TSVs on col2 (round-0
+#     rep), so it is rebucketed once more before the final join (both are R0-row shuffles);
+#   - join phase: node j of Np runs merge_join on input buckets b % Np == j against
+#     node-local scratch, then packs its fragments of every output bucket k into ONE pack
+#     object on shared storage (Np*B objects; every joined row crosses shared storage
+#     exactly twice: pack out, emit in);
+#   - emit phase: node j assembles output buckets k % Np == j by concatenating the Np packs
+#     of k (zstd frames concatenate losslessly), verifying each pack's byte size and row
+#     count against the join phase's meta;
+#   - assemble: the decider checks sum(joined rows) == sum(emitted rows) == input sequence
+#     count, then writes the final mapping manifest (which is the step's done marker).
+
+count_seqs_from_metrics_manifest() {
+    local manifest="$1"
+    while IFS= read -r uri || [[ -n "${uri:-}" ]]; do
+        [[ -z "${uri:-}" || "$uri" =~ ^# ]] && continue
+        stream_uri "$uri"
+    done < <(stream_manifest "$manifest") \
+        | awk -F'\t' '$1 == "seq_count" { s += $2 } END { print s + 0 }'
+}
+
+# temp+rename for filesystem targets so a crash mid-copy never leaves a truncated file that
+# looks complete; S3 PUTs are already atomic
+publish_uri() {
+    local src="$1" dst="$2"
+    if is_s3 "$dst"; then
+        copy_out "$src" "$dst"
+    else
+        mkdir -p "$(dirname "$dst")"
+        cp "$src" "${dst}.tmp.$$"
+        mv -f "${dst}.tmp.$$" "$dst"
+    fi
+}
+
+# rebucket_route_split <in_manifest> <frag_dir> <column> <split_b>: re-route one split's rows by hash($column)
+rebucket_route_split() {
+    local in_manifest="$1" frag_dir="$2" column="$3" split_idx="$4"
+    local splits="${MERGE_SPLITS:-1}"
+    local bb; printf -v bb '%05d' "$split_idx"
+    local cnt="$frag_dir/rebucket.split${bb}.rows"
+    stream_split_files "$in_manifest" "$bb" \
+        | awk -F'\t' -v B="$splits" -v col="$column" -v pfx="$frag_dir/rebucket.b${bb}.k" -v cnt="$cnt" \
+              "$SPLIT_HASH_AWK"'
+        BEGIN { for (k = 0; k < B; k++) printf "" > (pfx sprintf("%05d.tsv", k)) }
+        { print > (pfx sprintf("%05d.tsv", split_of($col))) }
+        END { print NR > cnt }
+    '
+}
+
+# rebucket_emit_split <frag_dir> <out_dir> <split_k>: concatenate one target bucket's fragments
+rebucket_emit_split() {
+    local frag_dir="$1" out_dir="$2" split_idx="$3"
+    local splits="${MERGE_SPLITS:-1}"
+    local kk; printf -v kk '%05d' "$split_idx"
+    local out; out="$out_dir/chain_rebucketed.split${kk}.tsv$(batch_compression_suffix)"
+    local tmp="${out}.tmp.$$"
+    local -a frags=()
+    local b frag
+    for ((b = 0; b < splits; b++)); do
+        printf -v frag '%s/rebucket.b%05d.k%s.tsv' "$frag_dir" "$b" "$kk"
+        [[ -e "$frag" ]] || fail "rebucket: missing fragment $frag"
+        frags+=("$frag")
+    done
+    if compress_batch_outputs_enabled; then
+        need_cmd pzstd
+        cat "${frags[@]}" | pzstd -p "$ZSTD_THREADS" -3 -c > "$tmp"
+    else
+        cat "${frags[@]}" > "$tmp"
+    fi
+    mv -f "$tmp" "$out"
+}
+
+# rebucket_manifest <in_manifest> <out_dir> <out_manifest> <work_dir> <column> [expected_rows]:
+# re-route a split TSV set so bucket k holds the rows with hash(column) == k, whatever the
+# input bucketing was (it reads every split fully). A B x B shuffle of the R0-row chain,
+# run on one node; the N-row tables never take this path. Used twice per run: the chain
+# base (round-1 TSVs, member-bucketed like every parent) is rebucketed by col 1 before the
+# first composition, and the finished chain is rebucketed by col 2 before the final join.
+rebucket_manifest() {
+    [[ "$#" -ge 5 && "$#" -le 6 ]] || fail "rebucket_manifest needs <in_manifest> <out_dir> <out_manifest> <work_dir> <column> [expected_rows]"
+    local in_manifest="$1" out_dir="$2" out_manifest="$3" work_dir="$4" column="$5" expected_rows="${6:-}"
+    [[ "$column" == "1" || "$column" == "2" ]] || fail "rebucket_manifest column must be 1 or 2 (got '$column')"
+    local splits="${MERGE_SPLITS:-1}"
+    local done_uri="${out_manifest}.done"
+    if [[ -s "$out_manifest" ]] && done_exists "$done_uri"; then
+        log "rebucket: reusing completed $out_manifest"
+        return 0
+    fi
+    local frag; frag=$(resolve_node_scratch "$work_dir" rebucket-fragments)
+    rm -rf "${frag:?}" "${out_dir:?}"
+    mkdir -p "$work_dir" "$frag" "$out_dir"
+    check_manifest_split_count "$in_manifest" "$splits"
+    log "rebucket: re-routing ${splits} split(s) by column ${column}, ${MERGE_SPLIT_JOBS} at a time"
+    run_split_jobs "rebucket route" "$splits" "$MERGE_SPLIT_JOBS" rebucket_route_split "$in_manifest" "$frag" "$column"
+    local total
+    total=$(awk '{ s += $1 } END { print s + 0 }' "$frag"/rebucket.split*.rows)
+    if [[ -n "$expected_rows" && "$total" -ne "$expected_rows" ]]; then
+        fail "rebucket: row conservation violated: routed ${total} rows, expected ${expected_rows}"
+    fi
+    run_split_jobs "rebucket emit" "$splits" "$MERGE_SPLIT_JOBS" rebucket_emit_split "$frag" "$out_dir"
+    local b split_file
+    : > "${out_manifest}.tmp"
+    for ((b = 0; b < splits; b++)); do
+        printf -v split_file '%s/chain_rebucketed.split%05d.tsv%s' "$out_dir" "$b" "$(batch_compression_suffix)"
+        [[ -e "$split_file" ]] || fail "rebucket: missing split output $split_file"
+        printf '%s\n' "$split_file" >> "${out_manifest}.tmp"
+    done
+    mv "${out_manifest}.tmp" "$out_manifest"
+    mark_done "$done_uri" "$work_dir/rebucket.done"
+    if [[ -n "${REMOVE_TMP:-}" ]]; then
+        rm -rf "$frag"
+    fi
+    log "rebucket: ${total} chain rows re-bucketed into ${splits} split(s) -> $out_manifest"
+}
+
+# merge_pack_bucket <frag_dir> <shared_prefix> <node_count> <node_idx> <k>:
+# publish this node's fragments of output bucket k as one pack object on shared storage
+merge_pack_bucket() {
+    local frag_dir="$1" shared_prefix="$2" node_count="$3" node_idx="$4" split_idx="$5"
+    local splits="${MERGE_SPLITS:-1}"
+    local kk; printf -v kk '%05d' "$split_idx"
+    local -a frags=()
+    local b frag
+    for ((b = node_idx; b < splits; b += node_count)); do
+        printf -v frag '%s/joined.b%05d.k%s.tsv' "$frag_dir" "$b" "$kk"
+        [[ -e "$frag" ]] || fail "final join pack: missing joined fragment $frag"
+        frags+=("$frag")
+    done
+    local rows
+    rows=$(cat "${frags[@]}" | wc -l | tr -d ' ')
+    local suffix; suffix=$(batch_compression_suffix)
+    local tmp="$frag_dir/pack.split${kk}.tsv${suffix}.tmp.$$"
+    if compress_batch_outputs_enabled; then
+        need_cmd pzstd
+        cat "${frags[@]}" | pzstd -p "$ZSTD_THREADS" -3 -c > "$tmp"
+    else
+        cat "${frags[@]}" > "$tmp"
+    fi
+    local bytes
+    bytes=$(file_size_bytes "$tmp")
+    publish_uri "$tmp" "$(join_uri "$shared_prefix" "frag/pack.node${node_idx}.split${kk}.tsv${suffix}")"
+    printf '%s\t%s\n' "$bytes" "$rows" > "$frag_dir/pack.k${kk}.meta"
+    rm -f "$tmp"
+}
+
+# merge_join_node <child_manifest> <parent_manifest> <shared_prefix> <work_dir> <node_count> <node_idx>:
+# join phase of the distributed final join on one machine
+merge_join_node() {
+    [[ "$#" -eq 6 ]] || fail "merge_join_node needs 6 args"
+    local child_manifest="$1" parent_manifest="$2" shared_prefix="$3" work_dir="$4" node_count="$5" node_idx="$6"
+    local splits="${MERGE_SPLITS:-1}"
+    [[ "$node_idx" -lt "$node_count" ]] || fail "final join: node index ${node_idx} out of range (${node_count} nodes)"
+    local done_uri; done_uri=$(join_uri "$shared_prefix" "join.node${node_idx}.done")
+    if done_exists "$done_uri"; then
+        log "final join node ${node_idx}: reusing completed join phase"
+        return 0
+    fi
+    mkdir -p "$work_dir"
+    local sort_tmp; sort_tmp="$(resolve_sort_tmp "$work_dir")/fj-node${node_idx}"
+    local frag; frag=$(resolve_node_scratch "$work_dir" "fj-frag-node${node_idx}")
+    rm -rf "${frag:?}" "${sort_tmp:?}"
+    mkdir -p "$frag" "$sort_tmp"
+    check_manifest_split_count "$child_manifest" "$splits"
+    check_manifest_split_count "$parent_manifest" "$splits"
+    local t0=$SECONDS
+    log "final join node ${node_idx}/${node_count}: joining splits b % ${node_count} == ${node_idx} of ${splits}, ${MERGE_SPLIT_JOBS} at a time"
+    run_split_jobs_strided "final join" "$splits" "$MERGE_SPLIT_JOBS" "$node_idx" "$node_count" \
+        merge_join "$child_manifest" "$parent_manifest" "$frag" "$sort_tmp"
+    local t_join=$((SECONDS - t0))
+    t0=$SECONDS
+    log "final join node ${node_idx}: packing ${splits} output bucket(s) to shared storage"
+    run_split_jobs "final join pack" "$splits" "$MERGE_SPLIT_JOBS" \
+        merge_pack_bucket "$frag" "$shared_prefix" "$node_count" "$node_idx"
+    local t_pack=$((SECONDS - t0))
+
+    # node meta: per-bucket pack bytes+rows, then the joined total; emit and assemble verify both
+    local meta="$work_dir/meta.node${node_idx}.tsv"
+    local k kk pack_rows=0 bytes rows
+    : > "$meta"
+    for ((k = 0; k < splits; k++)); do
+        printf -v kk '%05d' "$k"
+        [[ -e "$frag/pack.k${kk}.meta" ]] || fail "final join: missing pack meta for bucket ${kk}"
+        IFS=$'\t' read -r bytes rows < "$frag/pack.k${kk}.meta"
+        printf 'pack\t%s\t%s\t%s\n' "$kk" "$bytes" "$rows" >> "$meta"
+        pack_rows=$((pack_rows + rows))
+    done
+    local joined_total
+    joined_total=$(awk '{ s += $1 } END { print s + 0 }' "$frag"/joined.split*.rows)
+    [[ "$pack_rows" -eq "$joined_total" ]] ||
+        fail "final join node ${node_idx}: packed ${pack_rows} rows but joined ${joined_total}"
+    printf 'total_rows\t%s\n' "$joined_total" >> "$meta"
+    publish_uri "$meta" "$(join_uri "$shared_prefix" "frag/meta.node${node_idx}.tsv")"
+    mark_done "$done_uri" "$work_dir/join.node${node_idx}.done"
+    log "final join node ${node_idx}: ${joined_total} rows joined (join ${t_join}s, pack ${t_pack}s)"
+    if [[ -n "${REMOVE_TMP:-}" ]]; then
+        rm -rf "$frag" "$sort_tmp"
+    fi
+}
+
+# merge_emit_bucket <shared_prefix> <out_prefix> <staging_root> <meta_dir> <node_count> <k>:
+# assemble one output bucket: fetch every node's pack, verify byte size and row count
+# against the join phase's meta, publish the concatenation as the bucket's shard
+merge_emit_bucket() {
+    local shared_prefix="$1" out_prefix="$2" staging_root="$3" meta_dir="$4" node_count="$5" split_idx="$6"
+    local kk; printf -v kk '%05d' "$split_idx"
+    local suffix; suffix=$(batch_compression_suffix)
+    local stage="$staging_root/k${kk}"
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    local i pack local_pack meta_line want_bytes want_rows got_bytes got_rows rows_total=0
+    local -a packs=()
+    for ((i = 0; i < node_count; i++)); do
+        pack=$(join_uri "$shared_prefix" "frag/pack.node${i}.split${kk}.tsv${suffix}")
+        local_pack="$stage/pack.n${i}${suffix}"
+        copy_in "$pack" "$local_pack"
+        meta_line=$(awk -F'\t' -v k="$kk" '$1 == "pack" && $2 == k { print $3 "\t" $4; exit }' "$meta_dir/meta.node${i}.tsv")
+        [[ -n "$meta_line" ]] || fail "final join emit: no pack meta for node ${i} bucket ${kk}"
+        want_bytes="${meta_line%%$'\t'*}"
+        want_rows="${meta_line##*$'\t'}"
+        got_bytes=$(file_size_bytes "$local_pack")
+        [[ "$got_bytes" -eq "$want_bytes" ]] ||
+            fail "final join emit: pack node${i} bucket ${kk} is ${got_bytes} bytes, meta says ${want_bytes} (truncated transfer?)"
+        if compress_batch_outputs_enabled; then
+            need_cmd pzstd
+            got_rows=$(pzstd -dc -p "$ZSTD_THREADS" "$local_pack" | wc -l | tr -d ' ')
+        else
+            got_rows=$(wc -l < "$local_pack" | tr -d ' ')
+        fi
+        [[ "$got_rows" -eq "$want_rows" ]] ||
+            fail "final join emit: pack node${i} bucket ${kk} has ${got_rows} rows, meta says ${want_rows}"
+        rows_total=$((rows_total + got_rows))
+        packs+=("$local_pack")
+    done
+    # a shard is the byte-concatenation of its packs (zstd frames concatenate losslessly)
+    local shard_tmp="$stage/shard${suffix:-.tsv}"
+    cat "${packs[@]}" > "$shard_tmp"
+    publish_uri "$shard_tmp" "$(join_uri "$out_prefix" "propagated.split${kk}.tsv${suffix}")"
+    printf '%s\t%s\n' "$kk" "$rows_total" > "$staging_root/rows.k${kk}"
+    rm -rf "$stage"
+}
+
+# merge_emit_node <shared_prefix> <work_dir> <node_count> <node_idx>:
+# emit phase of the distributed final join on one machine
+merge_emit_node() {
+    [[ "$#" -eq 4 ]] || fail "merge_emit_node needs 4 args"
+    local shared_prefix="$1" work_dir="$2" node_count="$3" node_idx="$4"
+    local splits="${MERGE_SPLITS:-1}"
+    [[ "$node_idx" -lt "$node_count" ]] || fail "final join: node index ${node_idx} out of range (${node_count} nodes)"
+    local done_uri; done_uri=$(join_uri "$shared_prefix" "emit.node${node_idx}.done")
+    if done_exists "$done_uri"; then
+        log "final join node ${node_idx}: reusing completed emit phase"
+        return 0
+    fi
+    # every pack must exist before any shard is assembled; a missing join marker means a
+    # join node died, and the decider retries it before emit can make progress
+    local i missing=""
+    for ((i = 0; i < node_count; i++)); do
+        done_exists "$(join_uri "$shared_prefix" "join.node${i}.done")" || missing="${missing} ${i}"
+    done
+    [[ -z "$missing" ]] || fail "final join emit node ${node_idx}: join phase incomplete on node(s)${missing}"
+    mkdir -p "$work_dir"
+    local staging; staging=$(resolve_node_scratch "$work_dir" "fj-emit-node${node_idx}")
+    rm -rf "${staging:?}"
+    mkdir -p "$staging/meta"
+    for ((i = 0; i < node_count; i++)); do
+        copy_in "$(join_uri "$shared_prefix" "frag/meta.node${i}.tsv")" "$staging/meta/meta.node${i}.tsv"
+    done
+    local t0=$SECONDS
+    log "final join node ${node_idx}/${node_count}: emitting shards k % ${node_count} == ${node_idx} of ${splits}, ${MERGE_SPLIT_JOBS} at a time"
+    run_split_jobs_strided "final join emit" "$splits" "$MERGE_SPLIT_JOBS" "$node_idx" "$node_count" \
+        merge_emit_bucket "$shared_prefix" "$(join_uri "$shared_prefix" "out/")" "$staging" "$staging/meta" "$node_count"
+    local t_emit=$((SECONDS - t0))
+    local rows_file="$work_dir/rows.node${node_idx}.tsv" total=0 k kk rows
+    : > "$rows_file"
+    for ((k = node_idx; k < splits; k += node_count)); do
+        printf -v kk '%05d' "$k"
+        [[ -e "$staging/rows.k${kk}" ]] || fail "final join emit: missing row count for bucket ${kk}"
+        IFS=$'\t' read -r kk rows < "$staging/rows.k${kk}"
+        printf '%s\t%s\n' "$kk" "$rows" >> "$rows_file"
+        total=$((total + rows))
+    done
+    publish_uri "$rows_file" "$(join_uri "$shared_prefix" "rows.node${node_idx}.tsv")"
+    mark_done "$done_uri" "$work_dir/emit.node${node_idx}.done"
+    log "final join node ${node_idx}: ${total} rows emitted (${t_emit}s)"
+    if [[ -n "${REMOVE_TMP:-}" ]]; then
+        rm -rf "$staging"
+    fi
+}
+
+# space-separated node indexes whose <phase>.node<j>.done marker is missing
+final_join_missing_markers() {
+    local shared_prefix="$1" phase="$2" node_count="$3"
+    local i out=""
+    for ((i = 0; i < node_count; i++)); do
+        done_exists "$(join_uri "$shared_prefix" "${phase}.node${i}.done")" || out="${out}${out:+ }${i}"
+    done
+    printf '%s' "$out"
+}
+
+# final_join_assemble <shared_prefix> <out_manifest> <expected_rows> <node_count>:
+# cross-node conservation check, then write the final mapping manifest (the step's done marker)
+final_join_assemble() {
+    [[ "$#" -eq 4 ]] || fail "final_join_assemble needs 4 args"
+    local shared_prefix="$1" out_manifest="$2" expected_rows="$3" node_count="$4"
+    local splits="${MERGE_SPLITS:-1}"
+    local missing
+    missing=$(final_join_missing_markers "$shared_prefix" emit "$node_count")
+    [[ -z "$missing" ]] || fail "final join assemble: emit phase incomplete on node(s) ${missing}"
+    local i join_total=0 emit_total=0 n
+    for ((i = 0; i < node_count; i++)); do
+        n=$(stream_uri "$(join_uri "$shared_prefix" "frag/meta.node${i}.tsv")" | awk -F'\t' '$1 == "total_rows" { print $2 + 0; exit }')
+        [[ -n "$n" ]] || fail "final join assemble: meta of node ${i} has no total_rows"
+        join_total=$((join_total + n))
+        n=$(stream_uri "$(join_uri "$shared_prefix" "rows.node${i}.tsv")" | awk -F'\t' '{ s += $2 } END { print s + 0 }')
+        emit_total=$((emit_total + n))
+    done
+    [[ "$join_total" -eq "$emit_total" ]] ||
+        fail "final join: conservation violated across nodes: joined ${join_total} rows, emitted ${emit_total}"
+    if [[ -n "$expected_rows" && "$join_total" -ne "$expected_rows" ]]; then
+        fail "final join: conservation violated: joined ${join_total} rows, input had ${expected_rows} sequences"
+    fi
+    local suffix; suffix=$(batch_compression_suffix)
+    local tmp k uri
+    tmp=$(mktemp)
+    for ((k = 0; k < splits; k++)); do
+        uri=$(join_uri "$shared_prefix" "out/propagated.split$(printf '%05d' "$k").tsv${suffix}")
+        uri_exists "$uri" || fail "final join assemble: missing shard $uri"
+        printf '%s\n' "$uri" >> "$tmp"
+    done
+    publish_uri "$tmp" "$out_manifest"
+    rm -f "$tmp"
+    local done_tmp; done_tmp=$(mktemp)
+    mark_done "${out_manifest}.done" "$done_tmp"
+    rm -f "$done_tmp"
+    log "final join: ${join_total} rows conserved across ${node_count} node(s) -> $out_manifest"
+}
+
+# final_join_distributed_local <child_manifest> <parent_manifest> <shared_dir> <work_dir> <out_manifest> <expected_rows> <node_count>:
+# single-machine backend of MERGE_NODES: run the distributed final join as <node_count>
+# separate processes over one shared directory -- each phase is a wave of real child
+# processes running the exact code an AWS/SLURM node runs, with THREADS and
+# MERGE_SPLIT_JOBS divided across them (real deployments give every node its full budget)
+final_join_distributed_local() {
+    [[ "$#" -eq 7 ]] || fail "final_join_distributed_local needs 7 args"
+    local child_manifest="$1" parent_manifest="$2" shared_dir="$3" work_dir="$4" out_manifest="$5" expected_rows="$6" node_count="$7"
+    if [[ -s "$out_manifest" ]] && done_exists "${out_manifest}.done"; then
+        log "final join: reusing completed $out_manifest"
+        return 0
+    fi
+    mkdir -p "$shared_dir" "$work_dir"
+    local node_threads=$(( ${THREADS:-1} / node_count ))
+    [[ "$node_threads" -lt 1 ]] && node_threads=1
+    local node_jobs=$(( ${MERGE_SPLIT_JOBS:-1} / node_count ))
+    [[ "$node_jobs" -lt 1 ]] && node_jobs=1
+    local phase j pid rc pids
+    for phase in join emit; do
+        pids=""
+        rc=0
+        log "final join: ${phase} wave, ${node_count} node process(es), ${node_jobs} split job(s) x ${node_threads} thread(s) each"
+        for ((j = 0; j < node_count; j++)); do
+            env THREADS="$node_threads" MERGE_SPLIT_JOBS="$node_jobs" MERGE_SPLITS="$MERGE_SPLITS" MERGE_NODES="$node_count" \
+                bash "$BATCH_SCRIPT" final-join-node "$child_manifest" "$parent_manifest" "$shared_dir" "$work_dir" "$node_count" "$j" "$phase" &
+            pids="${pids}$! "
+        done
+        for pid in $pids; do
+            wait "$pid" || rc=1
+        done
+        [[ "$rc" -eq 0 ]] || fail "final join: ${phase} wave failed on at least one node"
+    done
+    final_join_assemble "$shared_dir" "$out_manifest" "$expected_rows" "$node_count"
+}
+
+# final-join-node <child_manifest> <parent_manifest> <shared_prefix> <work_dir> <node_count> <node_idx> <join|emit>
+final_join_node() {
+    [[ "$#" -eq 7 ]] || usage
+    local child_manifest="$1" parent_manifest="$2" shared_prefix="$3" work_dir="$4" node_count="$5" node_idx="$6" phase="$7"
+    [[ "$node_count" =~ ^[1-9][0-9]*$ && "$node_idx" =~ ^[0-9]+$ ]] || fail "final-join-node needs numeric <node_count> <node_idx>"
+    case "$phase" in
+        join) merge_join_node "$child_manifest" "$parent_manifest" "$shared_prefix" "$work_dir" "$node_count" "$node_idx" ;;
+        emit) merge_emit_node "$shared_prefix" "$work_dir" "$node_count" "$node_idx" ;;
+        *) fail "final-join-node phase must be join or emit (got '$phase')" ;;
+    esac
+}
+
+# propagate <child_manifest> <parent_manifest> <out_manifest> <work_dir> [expected_rows]
+# Composes parent(rep -> member) with child(member -> x) split by split; with expected_rows
+# set, the joined row total must match it exactly (row conservation) or the step fails.
 propagate() {
-    [[ "$#" -eq 4 ]] || usage
+    [[ "$#" -ge 4 && "$#" -le 5 ]] || usage
     local child_manifest="$1"
     local parent_manifest="$2"
     local out_manifest="$3"
     local work_dir="$4"
+    local expected_rows="${5:-}"
     local done_uri="${out_manifest}.done"
     local splits="${MERGE_SPLITS:-1}"
     local sort_tmp; sort_tmp=$(resolve_sort_tmp "$work_dir")
@@ -1672,11 +2087,20 @@ propagate() {
     check_manifest_split_count "$child_manifest" "$splits"
     check_manifest_split_count "$parent_manifest" "$splits"
     log "propagate: joining ${splits} split(s), ${MERGE_SPLIT_JOBS} at a time"
-    local b
+    local b t0=$SECONDS
     run_split_jobs "propagate join" "$splits" "$MERGE_SPLIT_JOBS" merge_join "$child_manifest" "$parent_manifest" "$frag" "$sort_tmp"
+    local t_join=$((SECONDS - t0))
+
+    local joined_total
+    joined_total=$(awk '{ s += $1 } END { print s + 0 }' "$frag"/joined.split*.rows)
+    if [[ -n "$expected_rows" && "$joined_total" -ne "$expected_rows" ]]; then
+        fail "propagate: row conservation violated: joined ${joined_total} rows, expected ${expected_rows}"
+    fi
 
     log "propagate: assembling ${splits} shard(s), ${MERGE_SPLIT_JOBS} at a time"
+    t0=$SECONDS
     run_split_jobs "propagate shard write" "$splits" "$MERGE_SPLIT_JOBS" merge_emit_shard "$frag" "$shards"
+    local t_emit=$((SECONDS - t0))
 
     local split_file
     : > "${out_manifest}.tmp"
@@ -1690,7 +2114,7 @@ propagate() {
     if [[ -n "${REMOVE_TMP:-}" ]]; then
         rm -rf "$frag" "$sort_tmp"
     fi
-    log "propagated clusters written: ${splits} shard(s) -> $out_manifest"
+    log "propagated clusters written: ${splits} shard(s), ${joined_total} rows -> $out_manifest (join ${t_join}s, shard ${t_emit}s)"
 }
 
 # filenames are deterministic, so the expected list needs no directory listing
@@ -1824,9 +2248,13 @@ write_state_file() {
     local out="$1"
     local prev_reps="$2"
     local low_benefit_rounds="$3"
+    local input_seqs="${4:-}"
     {
         printf 'PREV_REPS=%s\n' "$prev_reps"
         printf 'LOW_BENEFIT_ROUNDS=%s\n' "$low_benefit_rounds"
+        if [[ -n "$input_seqs" ]]; then
+            printf 'INPUT_SEQS=%s\n' "$input_seqs"
+        fi
     } > "$out"
 }
 
@@ -1867,7 +2295,8 @@ pin_merge_splits() {
         copy_out "$tmp" "$store"
         rm -f "$tmp"
     fi
-    export MERGE_SPLITS MERGE_SPLIT_JOBS
+    [[ "$MERGE_NODES" -gt "$MERGE_SPLITS" ]] && MERGE_NODES="$MERGE_SPLITS"
+    export MERGE_SPLITS MERGE_SPLIT_JOBS MERGE_NODES
 }
 
 trim_field() {
@@ -2095,7 +2524,7 @@ write_batch_exports() {
         S3_CHUNK_PREFIX COMPRESS_BATCH_OUTPUTS \
         CREATEDB_PAR ROUND0_CREATEDB_MODE BATCH_DELETE_SOURCE_CHUNK CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_COV_MODE CLUSTER_PAR ROUND0_CLUSTER_PAR CREATETSV_PAR SORT_TMP \
         MAX_ROUNDS MIN_REDUCTION_RATIO CONVERGENCE_PATIENCE MIN_REDUCTION_COUNT \
-        MAX_CHUNK_ATTEMPTS COMPRESS_RATIO MERGE_SPLITS MERGE_SPLIT_JOBS BATCH_BACKEND REMOVE_TMP \
+        MAX_CHUNK_ATTEMPTS COMPRESS_RATIO MERGE_SPLITS MERGE_SPLIT_JOBS MERGE_SPLIT_JOBS_CAP MERGE_NODES BATCH_BACKEND REMOVE_TMP \
         BATCH_KMER_WRITE_TO_DISK BATCH_COMPRESS_KMER_TMP_FILES CREATEDB_SHUFFLE_SPLITS ROUND0_CREATEDB_SHUFFLE_SPLITS \
         BATCH_REP_FASTA_SPLITS ROUND0_BATCH_REP_FASTA_SPLITS \
         NODE_WORK_DIR ROUND0_NODE_WORK_DIR BATCH_SLURM_NODELIST ROUND0_BATCH_SLURM_NODELIST \
@@ -2414,8 +2843,8 @@ aws_submit_batch_job() {
         cmd+=(--depends-on "jobId=${depends_on}")
     fi
 
-    # workers only: an infra kill is retried on a fresh instance so the array still reaches SUCCEEDED
-    if [[ "$subcommand" == "aws-worker" ]]; then
+    # workers and final-join nodes: an infra kill is retried on a fresh instance so the array still reaches SUCCEEDED
+    if [[ "$subcommand" == "aws-worker" || "$subcommand" == "aws-final-join" ]]; then
         local worker_attempts="${BATCH_AWS_WORKER_ATTEMPTS:-2}"   # value already validated in aws_require_submit_env
         cmd+=(--retry-strategy "attempts=${worker_attempts}")
     fi
@@ -2759,7 +3188,9 @@ aws_merge() {
             return 0
         fi
 
-        write_state_file "$local_root/state.env" "$cur_reps" 0
+        local input_seqs0
+        input_seqs0=$(count_seqs_from_metrics_manifest "$local_root/metrics_manifest.txt")
+        write_state_file "$local_root/state.env" "$cur_reps" 0 "$input_seqs0"
         copy_out "$local_root/state.env" "$(join_uri "$round_prefix" "state.env")"
 
         local next_round=1
@@ -2771,30 +3202,59 @@ aws_merge() {
         return 0
     fi
 
-    local child_manifest parent_manifest propagated_manifest prev_state prev_reps low_benefit_rounds
-    if [[ "$round" -eq 1 ]]; then
-        child_manifest=$(join_uri "$(aws_clustered_prefix "$work_prefix" 0)" "tsv_manifest.txt")
-    else
-        child_manifest=$(join_uri "$(aws_round_prefix "$work_prefix" "$((round - 1))")" "propagated_manifest.txt")
-    fi
-    parent_manifest="$tsv_manifest"
-    propagated_manifest=$(join_uri "$round_prefix" "propagated_manifest.txt")
+    local prev_state prev_reps low_benefit_rounds
+    # deferred merge: rounds compose only the chain (rep_r -> round-0 rep, R0 rows) instead of
+    # propagating the N-row mapping; the mapping join runs once at convergence
+    local round0_state="$local_root/round0_state.env" r0_reps input_seqs
+    copy_in "$(join_uri "$(aws_round_prefix "$work_prefix" 0)" "state.env")" "$round0_state"
+    # shellcheck disable=SC1090
+    r0_reps=$(source "$round0_state" && printf '%s' "${PREV_REPS:-0}")
+    # shellcheck disable=SC1090
+    input_seqs=$(source "$round0_state" && printf '%s' "${INPUT_SEQS:-}")
 
-    # upload each split shard so the next round's driver container can read it
-    if done_exists "$propagated_manifest"; then
-        log "aws-merge round ${round}: reusing propagated manifest $propagated_manifest"
+    local chain_manifest
+    if [[ "$round" -eq 1 ]]; then
+        chain_manifest="$tsv_manifest"
     else
-        local local_prop_manifest="$local_root/propagated_manifest.local.txt"
-        with_round_node_work_dir "$round" propagate "$child_manifest" "$parent_manifest" "$local_prop_manifest" "$local_root/propagate"
-        : > "$local_root/propagated_manifest.txt"
-        local shard s3shard
-        while IFS= read -r shard || [[ -n "${shard:-}" ]]; do
-            [[ -z "${shard:-}" || "$shard" =~ ^# ]] && continue
-            s3shard=$(join_uri "$round_prefix" "propagated/$(basename "$shard")")
-            copy_out "$shard" "$s3shard"
-            printf '%s\n' "$s3shard" >> "$local_root/propagated_manifest.txt"
-        done < "$local_prop_manifest"
-        copy_out "$local_root/propagated_manifest.txt" "$propagated_manifest"
+        chain_manifest=$(join_uri "$round_prefix" "chain_manifest.txt")
+        if done_exists "$chain_manifest"; then
+            log "aws-merge round ${round}: reusing chain manifest $chain_manifest"
+        else
+            local chain_prev
+            if [[ "$round" -eq 2 ]]; then
+                # rebucket the chain base (round-1 TSVs) by rep (col 1) so it can serve as child
+                chain_prev=$(join_uri "$round_prefix" "chainbase_manifest.txt")
+                if done_exists "$chain_prev"; then
+                    log "aws-merge round ${round}: reusing chain base $chain_prev"
+                else
+                    local local_cb_manifest="$local_root/chainbase_manifest.local.txt"
+                    with_round_node_work_dir "$round" rebucket_manifest "$(join_uri "$(aws_clustered_prefix "$work_prefix" 1)" "tsv_manifest.txt")" "$local_root/chainbase" "$local_cb_manifest" "$local_root/chainbase-work" 1 "$r0_reps"
+                    : > "$local_root/chainbase_manifest.txt"
+                    local cshard s3cshard
+                    while IFS= read -r cshard || [[ -n "${cshard:-}" ]]; do
+                        [[ -z "${cshard:-}" || "$cshard" =~ ^# ]] && continue
+                        s3cshard=$(join_uri "$round_prefix" "chainbase/$(basename "$cshard")")
+                        copy_out "$cshard" "$s3cshard"
+                        printf '%s\n' "$s3cshard" >> "$local_root/chainbase_manifest.txt"
+                    done < "$local_cb_manifest"
+                    copy_out "$local_root/chainbase_manifest.txt" "$chain_prev"
+                fi
+            else
+                chain_prev=$(join_uri "$(aws_round_prefix "$work_prefix" "$((round - 1))")" "chain_manifest.txt")
+            fi
+            # upload each chain shard so later merge containers can read it
+            local local_chain_manifest="$local_root/chain_manifest.local.txt"
+            with_round_node_work_dir "$round" propagate "$chain_prev" "$tsv_manifest" "$local_chain_manifest" "$local_root/compose" "$r0_reps"
+            : > "$local_root/chain_manifest.txt"
+            local shard s3shard
+            while IFS= read -r shard || [[ -n "${shard:-}" ]]; do
+                [[ -z "${shard:-}" || "$shard" =~ ^# ]] && continue
+                s3shard=$(join_uri "$round_prefix" "chain/$(basename "$shard")")
+                copy_out "$shard" "$s3shard"
+                printf '%s\n' "$s3shard" >> "$local_root/chain_manifest.txt"
+            done < "$local_chain_manifest"
+            copy_out "$local_root/chain_manifest.txt" "$chain_manifest"
+        fi
     fi
 
     prev_state="$local_root/prev_state.env"
@@ -2839,7 +3299,102 @@ aws_merge() {
     fi
 
     if [[ "$converged" -eq 1 ]]; then
-        with_round_node_work_dir "$round" finalize_outputs "$propagated_manifest" "$rep_manifest" "$result_prefix" "$local_root/final" "$mark_final"
+        local fj_prefix child0_manifest fj_parent_manifest final_mapping_manifest
+        fj_prefix=$(join_uri "$round_prefix" "finaljoin/")
+        child0_manifest=$(join_uri "$(aws_clustered_prefix "$work_prefix" 0)" "tsv_manifest.txt")
+        fj_parent_manifest=$(join_uri "$fj_prefix" "parent_manifest.txt")
+        final_mapping_manifest=$(join_uri "$round_prefix" "final_mapping_manifest.txt")
+
+        if done_exists "$final_mapping_manifest"; then
+            log "aws-merge round ${round}: reusing final mapping $final_mapping_manifest"
+        else
+            # the chain leaves composition bucketed by col1 (rep_R); the final join needs col2 (round-0 rep)
+            if done_exists "$fj_parent_manifest"; then
+                log "aws-merge round ${round}: reusing rebucketed chain $fj_parent_manifest"
+            else
+                local local_parent_manifest="$local_root/fj_parent_manifest.local.txt"
+                with_round_node_work_dir "$round" rebucket_manifest "$chain_manifest" "$local_root/fj-parent" "$local_parent_manifest" "$local_root/fj-rebucket" 2 "$r0_reps"
+                : > "$local_root/fj_parent_manifest.txt"
+                local rshard s3rshard
+                while IFS= read -r rshard || [[ -n "${rshard:-}" ]]; do
+                    [[ -z "${rshard:-}" || "$rshard" =~ ^# ]] && continue
+                    s3rshard=$(join_uri "$fj_prefix" "parent/$(basename "$rshard")")
+                    copy_out "$rshard" "$s3rshard"
+                    printf '%s\n' "$s3rshard" >> "$local_root/fj_parent_manifest.txt"
+                done < "$local_parent_manifest"
+                copy_out "$local_root/fj_parent_manifest.txt" "$fj_parent_manifest"
+            fi
+
+            if [[ "${MERGE_NODES:-1}" -le 1 ]]; then
+                # single merge node: run the N-row join inside this job and publish its shards
+                local local_map_manifest="$local_root/final_mapping.local.txt"
+                with_round_node_work_dir "$round" propagate "$child0_manifest" "$fj_parent_manifest" "$local_map_manifest" "$local_root/fj-join" "$input_seqs"
+                : > "$local_root/final_mapping_manifest.txt"
+                local mshard s3mshard
+                while IFS= read -r mshard || [[ -n "${mshard:-}" ]]; do
+                    [[ -z "${mshard:-}" || "$mshard" =~ ^# ]] && continue
+                    s3mshard=$(join_uri "$fj_prefix" "out/$(basename "$mshard")")
+                    copy_out "$mshard" "$s3mshard"
+                    printf '%s\n' "$s3mshard" >> "$local_root/final_mapping_manifest.txt"
+                done < "$local_map_manifest"
+                copy_out "$local_root/final_mapping_manifest.txt" "$final_mapping_manifest"
+            else
+                # distributed final join: node j joins buckets b % Np == j, then emits shards
+                # k % Np == j; the AWS Batch array dependency chain join -> emit is the phase
+                # barrier, and this merge re-enters behind the emit array to reconcile
+                local np="$MERGE_NODES"
+                local missing_emit
+                missing_emit=$(final_join_missing_markers "$fj_prefix" emit "$np")
+                if [[ -z "$missing_emit" ]]; then
+                    final_join_assemble "$fj_prefix" "$final_mapping_manifest" "$input_seqs" "$np"
+                else
+                    local fj_attempt_uri fj_attempts fj_attempt_local
+                    fj_attempt_uri=$(join_uri "$round_prefix" "finaljoin_attempts.txt")
+                    fj_attempts=$(read_counter_uri "$fj_attempt_uri")
+                    local job_prefix="${BATCH_AWS_JOB_PREFIX:-mmseqs-batch}"
+                    local join_job emit_job fj_merge
+                    if [[ "$fj_attempts" -eq 0 ]]; then
+                        # first submission: idempotent via markers, like the round's worker+merge pair
+                        fj_attempt_local="$local_root/finaljoin_attempts.txt"
+                        write_counter_file "$fj_attempt_local" 1
+                        copy_out "$fj_attempt_local" "$fj_attempt_uri"
+                        join_job=$(aws_submit_batch_job_once "$(join_uri "$round_prefix" "submitted_finaljoin_join.txt")" "${job_prefix}-round${round}-fjoin" "$np" "" "$script_uri" \
+                            aws-final-join "$work_prefix" join "$round")
+                        emit_job=$(aws_submit_batch_job_once "$(join_uri "$round_prefix" "submitted_finaljoin_emit.txt")" "${job_prefix}-round${round}-fjemit" "$np" "$join_job" "$script_uri" \
+                            aws-final-join "$work_prefix" emit "$round")
+                        fj_merge=$(aws_submit_batch_job_once "$(join_uri "$round_prefix" "submitted_finaljoin_merge.txt")" "${job_prefix}-round${round}-merge-fjoin" 1 "$emit_job" "$script_uri" \
+                            aws-merge "$input_manifest" "$work_prefix" "$result_prefix" "$round")
+                        log "aws-merge round ${round}: submitted distributed final join over ${np} node(s): join ${join_job} -> emit ${emit_job} -> merge ${fj_merge}"
+                        return 0
+                    fi
+                    if [[ "$fj_attempts" -ge "$MAX_CHUNK_ATTEMPTS" ]]; then
+                        local fj_dead="$local_root/FINALJOIN_DEAD_LETTER.txt"
+                        {
+                            printf 'round\t%s\n' "$round"
+                            printf 'missing_join_nodes\t%s\n' "$(final_join_missing_markers "$fj_prefix" join "$np")"
+                            printf 'missing_emit_nodes\t%s\n' "$missing_emit"
+                            printf 'attempts\t%s\n' "$fj_attempts"
+                        } > "$fj_dead"
+                        copy_out "$fj_dead" "$(join_uri "$round_prefix" "FINALJOIN_DEAD_LETTER.txt")"
+                        fail "round ${round}: final join incomplete after ${fj_attempts} attempt(s); wrote FINALJOIN_DEAD_LETTER.txt"
+                    fi
+                    fj_attempts=$((fj_attempts + 1))
+                    fj_attempt_local="$local_root/finaljoin_attempts.txt"
+                    write_counter_file "$fj_attempt_local" "$fj_attempts"
+                    copy_out "$fj_attempt_local" "$fj_attempt_uri"
+                    # the retry counter is a read-modify-write on S3, so these cannot be made idempotent by a marker
+                    join_job=$(aws_submit_batch_job "${job_prefix}-round${round}-fjoin-retry${fj_attempts}" "$np" "" "$script_uri" \
+                        aws-final-join "$work_prefix" join "$round")
+                    emit_job=$(aws_submit_batch_job "${job_prefix}-round${round}-fjemit-retry${fj_attempts}" "$np" "$join_job" "$script_uri" \
+                        aws-final-join "$work_prefix" emit "$round")
+                    fj_merge=$(aws_submit_batch_job "${job_prefix}-round${round}-merge-fjoin-retry${fj_attempts}" 1 "$emit_job" "$script_uri" \
+                        aws-merge "$input_manifest" "$work_prefix" "$result_prefix" "$round")
+                    log "aws-merge round ${round}: final join retry ${fj_attempts}: join ${join_job} -> emit ${emit_job} -> merge ${fj_merge}"
+                    return 0
+                fi
+            fi
+        fi
+        with_round_node_work_dir "$round" finalize_outputs "$final_mapping_manifest" "$rep_manifest" "$result_prefix" "$local_root/final" "$mark_final"
         # only clean on a final result; a partial MAX_ROUNDS result keeps the work prefix so a re-run can resume
         [[ "$mark_final" -eq 1 ]] && aws_cleanup_work_prefix "$work_prefix"
         return 0
@@ -2857,6 +3412,43 @@ aws_merge() {
 
     if [[ -n "${REMOVE_TMP:-}" ]]; then
         rm -rf "$local_root"
+    fi
+}
+
+# aws-final-join <work_s3_prefix> <join|emit> <round>: one node of the distributed final join.
+# Runs as an AWS Batch array child (node index = AWS_BATCH_JOB_ARRAY_INDEX); the join array
+# and the emit array are chained with a Batch dependency, and the re-entered aws-merge behind
+# the emit array reconciles by done-marker with the same attempts budget the chunks use.
+aws_final_join() {
+    [[ "$#" -eq 3 ]] || usage
+    local work_prefix phase="$2" round="$3"
+    work_prefix=$(normalize_s3_prefix "$1")
+    is_s3 "$work_prefix" || fail "aws-final-join requires an s3:// work prefix"
+    [[ "$phase" == "join" || "$phase" == "emit" ]] || fail "aws-final-join phase must be join or emit (got '$phase')"
+    # adopt the run's pinned split count, so the bucket-wise join stays on one count
+    [[ -n "${BATCH_AWS_DRY_RUN:-}" ]] || pin_merge_splits "$(join_uri "$work_prefix" "merge_splits.txt")"
+    local np="${MERGE_NODES:-1}"
+    local index="${AWS_BATCH_JOB_ARRAY_INDEX:-0}"
+    local node_work_dir
+    node_work_dir=$(round_node_work_dir "$round")
+    local local_root="${node_work_dir:-${BATCH_AWS_LOCAL_DIR:-/tmp/mmseqs-batch}}/${AWS_BATCH_JOB_ID:-manual}-round${round}-fj${phase}-${index}"
+    rm -rf "$local_root"
+    mkdir -p "$local_root"
+
+    # like aws-worker: never fail the array child; a missing done-marker makes the merge retry it
+    AWS_FJ_LOCAL_ROOT="$local_root"
+    trap 'rc=$?; [[ "$rc" -eq 0 ]] || log "aws-final-join soft-fail (rc=$rc): left no done-marker, so the merge will retry it"; [[ -n "${REMOVE_TMP:-}" ]] && rm -rf "${AWS_FJ_LOCAL_ROOT:-}"; exit 0' EXIT
+
+    local round_prefix fj_prefix child0_manifest fj_parent_manifest
+    round_prefix=$(aws_round_prefix "$work_prefix" "$round")
+    fj_prefix=$(join_uri "$round_prefix" "finaljoin/")
+    child0_manifest=$(join_uri "$(aws_clustered_prefix "$work_prefix" 0)" "tsv_manifest.txt")
+    fj_parent_manifest=$(join_uri "$fj_prefix" "parent_manifest.txt")
+    log "aws-final-join round ${round} ${phase}: node ${index}/${np}"
+    if [[ "$phase" == "join" ]]; then
+        merge_join_node "$child0_manifest" "$fj_parent_manifest" "$fj_prefix" "$local_root" "$np" "$index"
+    else
+        merge_emit_node "$fj_prefix" "$local_root" "$np" "$index"
     fi
 }
 
@@ -3059,7 +3651,9 @@ slurm_merge() {
             [[ -n "${REMOVE_TMP:-}" ]] && rm -rf "$work_dir"/round*
             return 0
         fi
-        write_state_file "$round_dir/state.env" "$cur_reps" 0
+        local input_seqs0
+        input_seqs0=$(count_seqs_from_metrics_manifest "$metrics_manifest")
+        write_state_file "$round_dir/state.env" "$cur_reps" 0 "$input_seqs0"
         local nd next_driver_node
         next_driver_node=$(first_slurm_node_for_round 1)
         nd=$(submit_event_step "mmseqs-${CLUSTER_CMD}-${tok}-round1-driver" "$slurm_dir" "" "$next_driver_node" \
@@ -3068,16 +3662,28 @@ slurm_merge() {
         return 0
     fi
 
-    local child_manifest parent_manifest propagated_manifest
+    # deferred merge: rounds compose only the chain (rep_r -> round-0 rep, R0 rows); the
+    # N-row mapping join runs once at convergence, across MERGE_NODES machines when set
+    local r0_reps input_seqs
+    # shellcheck disable=SC1091
+    r0_reps=$(source "$work_dir/round0/state.env" && printf '%s' "${PREV_REPS:-0}")
+    # shellcheck disable=SC1091
+    input_seqs=$(source "$work_dir/round0/state.env" && printf '%s' "${INPUT_SEQS:-}")
+    local chain_manifest
     if [[ "$round" -eq 1 ]]; then
-        child_manifest="$work_dir/round0/clustered/tsv_manifest.txt"
+        chain_manifest="$tsv_manifest"
     else
-        child_manifest="$work_dir/round$((round - 1))/propagated_manifest.txt"
+        local chain_prev
+        if [[ "$round" -eq 2 ]]; then
+            # rebucket the chain base (round-1 TSVs) by rep (col 1) so it can serve as child
+            with_round_node_work_dir "$round" rebucket_manifest "$work_dir/round1/clustered/tsv_manifest.txt" "$round_dir/chainbase" "$round_dir/chainbase_manifest.txt" "$round_dir/chainbase-work" 1 "$r0_reps"
+            chain_prev="$round_dir/chainbase_manifest.txt"
+        else
+            chain_prev="$work_dir/round$((round - 1))/chain_manifest.txt"
+        fi
+        with_round_node_work_dir "$round" propagate "$chain_prev" "$tsv_manifest" "$round_dir/chain_manifest.txt" "$round_dir/compose" "$r0_reps"
+        chain_manifest="$round_dir/chain_manifest.txt"
     fi
-    parent_manifest="$tsv_manifest"
-    propagated_manifest="$round_dir/propagated_manifest.txt"
-
-    with_round_node_work_dir "$round" propagate "$child_manifest" "$parent_manifest" "$propagated_manifest" "$round_dir/propagate"
 
     local prev_reps low_benefit_rounds
     # shellcheck disable=SC1090
@@ -3110,9 +3716,53 @@ slurm_merge() {
     fi
 
     if [[ "$converged" -eq 1 ]]; then
-        with_round_node_work_dir "$round" finalize_outputs "$propagated_manifest" "$rep_manifest" "$result_dir" "$round_dir/final" "$mark_final"
+        local round0_tsv_manifest="$work_dir/round0/clustered/tsv_manifest.txt"
+        local fj_dir="$work_dir/finaljoin-round${round}"
+        local final_mapping_manifest="$fj_dir/final_mapping_manifest.txt"
+        # the chain leaves composition bucketed by col1 (rep_R); the final join needs col2 (round-0 rep)
+        with_round_node_work_dir "$round" rebucket_manifest "$chain_manifest" "$fj_dir/parent" "$fj_dir/parent_manifest.txt" "$fj_dir/rebucket" 2 "$r0_reps"
+        if [[ "${MERGE_NODES:-1}" -le 1 ]]; then
+            with_round_node_work_dir "$round" propagate "$round0_tsv_manifest" "$fj_dir/parent_manifest.txt" "$final_mapping_manifest" "$fj_dir/join" "$input_seqs"
+        elif [[ -s "$final_mapping_manifest" ]] && done_exists "${final_mapping_manifest}.done"; then
+            log "merge round ${round}: reusing completed final join $final_mapping_manifest"
+        else
+            local fj_shared="$fj_dir/shared"
+            mkdir -p "$fj_shared" "$fj_dir/join"
+            local missing_emit
+            missing_emit=$(final_join_missing_markers "$fj_shared" emit "$MERGE_NODES")
+            if [[ -z "$missing_emit" ]]; then
+                final_join_assemble "$fj_shared" "$final_mapping_manifest" "$input_seqs" "$MERGE_NODES"
+            else
+                # submit the join and emit waves as per-node SLURM jobs and re-enter this merge
+                # behind them, on the same attempts budget the chunk retry loop uses
+                local fj_attempt_file="$fj_dir/attempts.txt" fj_attempts
+                fj_attempts=$(read_counter_uri "$fj_attempt_file")
+                if [[ "$fj_attempts" -ge "$MAX_CHUNK_ATTEMPTS" ]]; then
+                    printf 'final join incomplete: emit missing on node(s) %s\n' "$missing_emit" > "$fj_dir/DEAD_LETTER.txt"
+                    fail "round ${round}: final join incomplete after ${fj_attempts} attempt(s); see $fj_dir/DEAD_LETTER.txt"
+                fi
+                fj_attempts=$((fj_attempts + 1))
+                write_counter_file "$fj_attempt_file" "$fj_attempts"
+                local j jid join_ids="" emit_ids="" missing_join fj_node
+                missing_join=$(final_join_missing_markers "$fj_shared" join "$MERGE_NODES")
+                for j in $missing_join; do
+                    fj_node="${SLURM_NODE_ARRAY[$((j % nn))]}"
+                    jid=$(submit_event_step "mmseqs-${CLUSTER_CMD}-${tok}-fjoin${j}-attempt${fj_attempts}" "$slurm_dir" "" "$fj_node"                         final-join-node "$round0_tsv_manifest" "$fj_dir/parent_manifest.txt" "$fj_shared" "$fj_dir/join" "$MERGE_NODES" "$j" join)
+                    join_ids="${join_ids}${join_ids:+:}${jid}"
+                done
+                for j in $missing_emit; do
+                    fj_node="${SLURM_NODE_ARRAY[$((j % nn))]}"
+                    jid=$(submit_event_step "mmseqs-${CLUSTER_CMD}-${tok}-fjemit${j}-attempt${fj_attempts}" "$slurm_dir" "$join_ids" "$fj_node"                         final-join-node "$round0_tsv_manifest" "$fj_dir/parent_manifest.txt" "$fj_shared" "$fj_dir/join" "$MERGE_NODES" "$j" emit)
+                    emit_ids="${emit_ids}${emit_ids:+:}${jid}"
+                done
+                submit_event_step "mmseqs-${CLUSTER_CMD}-${tok}-round${round}-merge-fjoin-attempt${fj_attempts}" "$slurm_dir" "$emit_ids" "${SLURM_NODE_ARRAY[0]}"                     slurm-merge "$input_manifest" "$work_dir" "$result_dir" "$round" >/dev/null
+                log "merge round ${round}: submitted distributed final join over ${MERGE_NODES} node(s) (join wave:${missing_join:- none}; emit wave: ${missing_emit}); merge re-enters behind it"
+                return 0
+            fi
+        fi
+        with_round_node_work_dir "$round" finalize_outputs "$final_mapping_manifest" "$rep_manifest" "$result_dir" "$round_dir/final" "$mark_final"
         # only drop the round scratch on a converged result, so a re-run with a larger --max-rounds can resume
-        [[ "$mark_final" -eq 1 && -n "${REMOVE_TMP:-}" ]] && rm -rf "$work_dir"/round*
+        [[ "$mark_final" -eq 1 && -n "${REMOVE_TMP:-}" ]] && rm -rf "$work_dir"/round* "$work_dir"/finaljoin-*
         return 0
     fi
 
@@ -3148,11 +3798,11 @@ run_workflow() {
 
     cluster_manifest_single "$chunk_manifest" "$work_dir/round${round}/clustered" "$work_dir/round${round}" "$round"
 
-    local current_mapping_manifest="$work_dir/round${round}/clustered/tsv_manifest.txt"
+    local round0_tsv_manifest="$work_dir/round${round}/clustered/tsv_manifest.txt"
     local current_rep_manifest="$work_dir/round${round}/clustered/rep_manifest.txt"
     local current_metrics_manifest="$work_dir/round${round}/clustered/metrics_manifest.txt"
     validate_clustered_outputs "$chunk_manifest" "$work_dir/round${round}/clustered"
-    make_split_tsv_manifest "$chunk_manifest" "$work_dir/round${round}/clustered/tsv" "$current_mapping_manifest"
+    make_split_tsv_manifest "$chunk_manifest" "$work_dir/round${round}/clustered/tsv" "$round0_tsv_manifest"
     make_rep_manifest_with_sizes "$chunk_manifest" "$work_dir/round${round}/clustered" "$current_rep_manifest" "$round"
     make_manifest_from_chunk_ids "$chunk_manifest" "$work_dir/round${round}/clustered/metrics" '.metrics.tsv' "$current_metrics_manifest"
 
@@ -3164,10 +3814,13 @@ run_workflow() {
         log "input fit in one chunk; no representative merge rounds needed"
     fi
 
-    local prev_reps
+    local prev_reps input_seqs
     prev_reps=$(count_reps_from_metrics_manifest "$current_metrics_manifest")
-    log "round 0: ${prev_reps} representatives across ${initial_chunk_count} chunk(s)"
+    input_seqs=$(count_seqs_from_metrics_manifest "$current_metrics_manifest")
+    log "round 0: ${prev_reps} representatives across ${initial_chunk_count} chunk(s) (${input_seqs} sequences)"
 
+    local round0_reps="$prev_reps"
+    local chain_manifest=""
     local low_benefit_rounds=0
     local current_round=0
     for ((round=1; converged == 0 && round<=MAX_ROUNDS; round++)); do
@@ -3190,10 +3843,20 @@ run_workflow() {
         make_rep_manifest_with_sizes "$chunk_manifest" "$work_dir/round${round}/clustered" "$current_rep_manifest" "$round"
         make_manifest_from_chunk_ids "$chunk_manifest" "$work_dir/round${round}/clustered/metrics" '.metrics.tsv' "$round_metrics_manifest"
 
-        # propagate dispatches its split tasks per backend and emits MERGE_SPLITS mapping shards
-        local propagated_manifest="$work_dir/round${round}/propagated_manifest.txt"
-        with_round_node_work_dir "$round" propagate "$current_mapping_manifest" "$parent_manifest" "$propagated_manifest" "$work_dir/round${round}/propagate"
-        current_mapping_manifest="$propagated_manifest"
+        # deferred merge: compose only the chain (rep_r -> round-0 rep, R0 rows); the N-row
+        # mapping join runs once at the end, where MERGE_NODES can distribute it
+        if [[ "$round" -eq 1 ]]; then
+            chain_manifest="$parent_manifest"
+        else
+            if [[ "$round" -eq 2 ]]; then
+                # the chain base (round-1 TSVs) is member-bucketed like every parent; the
+                # composition consumes it as child, so rebucket it by rep (col 1) once
+                with_round_node_work_dir "$round" rebucket_manifest "$chain_manifest" "$work_dir/round2/chainbase" "$work_dir/round2/chainbase_manifest.txt" "$work_dir/round2/chainbase-work" 1 "$round0_reps"
+                chain_manifest="$work_dir/round2/chainbase_manifest.txt"
+            fi
+            with_round_node_work_dir "$round" propagate "$chain_manifest" "$parent_manifest" "$work_dir/round${round}/chain_manifest.txt" "$work_dir/round${round}/compose" "$round0_reps"
+            chain_manifest="$work_dir/round${round}/chain_manifest.txt"
+        fi
 
         local cur_reps
         cur_reps=$(count_reps_from_metrics_manifest "$round_metrics_manifest")
@@ -3233,14 +3896,29 @@ run_workflow() {
         log "WARNING: reached MAX_ROUNDS=${MAX_ROUNDS} while representatives were still reducing; emitting current global clustering (raise MAX_ROUNDS to continue)"
     fi
 
+    # the deferred final join: one N-row join of the chain against the round-0 TSVs.
+    # With MERGE_NODES > 1 it runs as separate node processes over the shared work dir.
+    local final_mapping_manifest="$round0_tsv_manifest"
+    if [[ -n "$chain_manifest" ]]; then
+        local fj_dir="$work_dir/finaljoin-round${current_round}"
+        log "final join: composing the deferred N-row mapping (round ${current_round} chain o round 0)"
+        with_round_node_work_dir "$current_round" rebucket_manifest "$chain_manifest" "$fj_dir/parent" "$fj_dir/parent_manifest.txt" "$fj_dir/rebucket" 2 "$round0_reps"
+        final_mapping_manifest="$fj_dir/final_mapping_manifest.txt"
+        if [[ "${MERGE_NODES:-1}" -le 1 ]]; then
+            with_round_node_work_dir "$current_round" propagate "$round0_tsv_manifest" "$fj_dir/parent_manifest.txt" "$final_mapping_manifest" "$fj_dir/join" "$input_seqs"
+        else
+            with_round_node_work_dir "$current_round" final_join_distributed_local "$round0_tsv_manifest" "$fj_dir/parent_manifest.txt" "$fj_dir/shared" "$fj_dir/join" "$final_mapping_manifest" "$input_seqs" "$MERGE_NODES"
+        fi
+    fi
+
     local mark_final=0
     [[ "$converged" -eq 1 ]] && mark_final=1
     # finalize dispatches its rep-first-sort splits per backend and marks final.done only when mark_final=1
-    with_round_node_work_dir "$current_round" finalize_outputs "$current_mapping_manifest" "$current_rep_manifest" "$result_dir" "$work_dir/finalize" "$mark_final"
+    with_round_node_work_dir "$current_round" finalize_outputs "$final_mapping_manifest" "$current_rep_manifest" "$result_dir" "$work_dir/finalize" "$mark_final"
 
     if [[ "$converged" -eq 1 ]]; then
         if [[ -n "${REMOVE_TMP:-}" ]]; then
-            rm -rf "$work_dir"/round* "$work_dir"/sort-tmp "$work_dir"/finalize
+            rm -rf "$work_dir"/round* "$work_dir"/finaljoin-* "$work_dir"/sort-tmp "$work_dir"/finalize
             rm -f "$work_dir/batch_clustering.sh"
             case "$BATCH_SCRIPT" in
                 "$work_dir"/*|/private"$work_dir"/*) rm -f "$BATCH_SCRIPT" ;;
@@ -3279,6 +3957,7 @@ main() {
                 fail "measure-input received no dispatch environment (BATCH_WORKER_DISPATCH unset). This subcommand is launched by prepare, not run directly."
             measure_input "$@" ;;
         propagate)     propagate "$@" ;;
+        final-join-node) final_join_node "$@" ;;
         finalize)      finalize_outputs "$@" ;;
         run-single-node) run_single_node "$@" ;;
         run-multi-node)  run_multi_node "$@" ;;
@@ -3289,9 +3968,15 @@ main() {
         aws-driver)    aws_driver "$@" ;;
         aws-worker)    aws_worker "$@" ;;
         aws-merge)     aws_merge "$@" ;;
+        aws-final-join) aws_final_join "$@" ;;
         -h|--help|help) usage ;;
         *) fail "unknown mode: $mode" ;;
     esac
 }
+
+# when sourced (function-level tests), expose the functions without running main
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    return 0
+fi
 
 main "$@"
