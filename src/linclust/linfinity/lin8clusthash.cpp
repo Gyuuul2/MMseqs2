@@ -184,7 +184,7 @@ static bool sequencesMatch(const char *left, const char *right, uint32_t length,
 }
 
 static void reduceOneHashBucket(const RunDbReader &reader, const HashEntry *bucket, size_t size,
-                          uint32_t length, const unsigned char *aa2num, float identity,
+                          uint32_t length, float identity,
                           std::vector<char> &claimed, std::vector<ClusterPair> &out) {
     if (size < 2) {
         return;
@@ -315,7 +315,7 @@ static unsigned int threadsWorthStarting(size_t work, unsigned int threads) {
 }
 
 static void reduceEntriesToClusters(const RunDbReader &reader, std::vector<HashEntry> &entries,
-                           uint32_t length, const unsigned char *aa2num, float identity,
+                           uint32_t length, float identity,
                            unsigned int threads, std::vector<ClusterPair> &out, size_t &crowded) {
     double mark = omp_get_wtime();
     SORT_PARALLEL(entries.begin(), entries.end(), HashEntry::byHashAndRank);
@@ -349,7 +349,7 @@ static void reduceEntriesToClusters(const RunDbReader &reader, std::vector<HashE
 #pragma omp for schedule(dynamic, 1)
         for (size_t b = 0; b < bucketStart.size() / 2; b++) {
             reduceOneHashBucket(reader, entries.data() + bucketStart[2 * b],
-                              bucketStart[2 * b + 1] - bucketStart[2 * b], length, aa2num, identity,
+                              bucketStart[2 * b + 1] - bucketStart[2 * b], length, identity,
                               claimed, pairsPerThread[thread]);
         }
     }
@@ -448,7 +448,7 @@ static void reduceSequencesOfOneLength(const RunDbReader &reader, uint64_t rankB
         hashingThreadSeconds += took * useThreads;
         lengthGroupsSeen++;
         lengthGroupsOnOneThread += (useThreads == 1);
-        reduceEntriesToClusters(reader, entries, length, aa2num, identity, threads, out, crowded);
+        reduceEntriesToClusters(reader, entries, length, identity, threads, out, crowded);
         return;
     }
 
@@ -496,7 +496,7 @@ static void reduceSequencesOfOneLength(const RunDbReader &reader, uint64_t rankB
         mark = omp_get_wtime();
         parts.load(at, entries);
         spentSpilling += omp_get_wtime() - mark;
-        reduceEntriesToClusters(reader, entries, length, aa2num, identity, threads, out, crowded);
+        reduceEntriesToClusters(reader, entries, length, identity, threads, out, crowded);
     }
 }
 

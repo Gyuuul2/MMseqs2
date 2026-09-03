@@ -952,7 +952,7 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
             }
         }
         uint64_t inBucket = 0;
-        for (unsigned int thread = 0; thread < par.threads; thread++) {
+        for (int thread = 0; thread < par.threads; thread++) {
             inBucket += made[thread];
             groups += seen[thread];
         }

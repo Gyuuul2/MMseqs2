@@ -622,7 +622,7 @@ int lin8createdb(int argc, const char **argv, const Command &command) {
     }
 
     if (isNodeDone == false) {
-        for (unsigned int file = 0; file < par.threads; file++) {
+        for (int file = 0; file < par.threads; file++) {
             const std::string data = db + "." + SSTR(node.index * par.threads + file);
             if (FileUtil::fileExists(data.c_str()) && FileUtil::getFileSize(data) > 0) {
                 Debug(Debug::ERROR) << data << " holds data but node " << node.index
