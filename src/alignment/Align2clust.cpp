@@ -582,7 +582,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                     ? getCovSeqidQscPercMinDiag()
                                     : getCovSeqidQscPercMinDiagTargetCov();
                                     
-    float scorePerColThreshold = parsePrecisionLib(libraryString, par.seqIdThr, par.covThr, 0.99);
+    float scorePerColThreshold = parsePrecisionLib(libraryString, par.seqIdThr, par.covThr, 0.98);
     Debug(Debug::INFO) << "Score per column threshold for filtering: " << scorePerColThreshold << "\n";
     
     EvalueComputation evaluer(seqDbr->getAminoAcidDBSize(), subMat);
