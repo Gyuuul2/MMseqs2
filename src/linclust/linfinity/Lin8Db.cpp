@@ -8,6 +8,7 @@
 #include "Util.h"
 #include "IndexTypes.h"
 #include <climits>
+#include <ctime>
 #include <unistd.h>
 #include <algorithm>
 #include <cstdio>
@@ -778,8 +779,11 @@ void waitNodeDone(const std::string &path, unsigned int node, unsigned int limit
             Debug(Debug::ERROR) << done << " did not appear within " << limitSeconds << "s\n";
             EXIT(EXIT_FAILURE);
         }
-        if (waited == 30) {
-            Debug(Debug::INFO) << "Waiting for " << done << "\n";
+        static time_t lastWaitLog = 0;
+        const time_t nowSec = time(NULL);
+        if (waited >= 30 && nowSec - lastWaitLog >= 60) {
+            Debug(Debug::INFO) << "Still waiting for " << done << " (" << waited << "s)\n";
+            lastWaitLog = nowSec;
         }
         sleep(1);
         waited++;

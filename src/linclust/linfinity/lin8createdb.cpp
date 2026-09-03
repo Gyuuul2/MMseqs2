@@ -637,8 +637,8 @@ int lin8createdb(int argc, const char **argv, const Command &command) {
                            node.index * par.threads, bytePlan, nodeLocator);
         nodeLocator.setLayout(node.count, par.threads);
         nodeLocator.finish(ranks.sequenceCount);
-        Debug(Debug::INFO) << "Planned " << nodeLocator.size() << " length groups over " << par.threads
-                           << " data files, " << bytePlan.sequenceBytes << " byte\n";
+        Debug(Debug::INFO) << "This node writes " << (bytePlan.sequenceBytes >> 30)
+                           << " GB of sequences\n";
 
         timer.reset();
         std::vector<int> seqFd = openDataFiles(db, node.index * par.threads, par.threads,
@@ -668,8 +668,8 @@ int lin8createdb(int argc, const char **argv, const Command &command) {
         const std::string dbtypeBase = db + ".new" + uniqueTmpSuffix();
         DBWriter::writeDbtypeFile(dbtypeBase.c_str(), dbtype, false);
         FileUtil::publishAtomically(dbtypeBase + ".dbtype", db + ".dbtype");
-        Debug(Debug::INFO) << "Database holds " << ranks.sequenceCount << " sequences in "
-                           << ranks.bytes << " byte\n";
+        Debug(Debug::INFO) << "Database holds " << ranks.sequenceCount << " sequences, "
+                           << (ranks.bytes >> 30) << " GB\n";
     } else {
         Debug(Debug::INFO) << "Wrote the parts of node " << node.index << ", waiting for the other nodes\n";
     }

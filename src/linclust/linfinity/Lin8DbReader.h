@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <ctime>
 
 struct IoRing {
     struct Read {
@@ -240,8 +241,12 @@ public:
                 if (at >= floorRepRankBlock) {
                     break;
                 }
-                if (waited == 30) {
-                    Debug(Debug::INFO) << "Waiting for " << path << "\n";
+                static time_t lastWaitLog = 0;
+                const time_t nowSec = time(NULL);
+                if (waited >= 30 && nowSec - lastWaitLog >= 60) {
+                    Debug(Debug::INFO) << "Still waiting for the decider to publish block " << at
+                                       << " (" << waited << "s)\n";
+                    lastWaitLog = nowSec;
                 }
                 if (waited >= 3600) {
                     Debug(Debug::ERROR) << "Waited " << waited << "s for " << path

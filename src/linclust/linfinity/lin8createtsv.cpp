@@ -75,11 +75,13 @@ int lin8createtsv(int argc, const char **argv, const Command &command) {
     const size_t budget = Util::computeMemory(par.splitMemoryLimit);
     const size_t need = reader.getSize() * (sizeof(uint64_t) + 24);
     if (need > budget) {
-        Debug(Debug::ERROR) << "Naming " << reader.getSize() << " sequences needs about "
-                            << (need >> 30) << " GB of names and the limit is " << (budget >> 30)
-                            << " GB. The cluster database and lin8-createrepseqfasta hold the same answer "
-                            << "without a name for every sequence\n";
-        EXIT(EXIT_FAILURE);
+        // no room to name every sequence, so skip the tsv instead of ending the run
+        Debug(Debug::WARNING) << "Naming " << reader.getSize() << " sequences would need about "
+                              << (need >> 30) << " GB and the limit is " << (budget >> 30)
+                              << " GB, so no tsv was written. Use the cluster database (by rank) or "
+                              << "lin8-createrepseqfasta instead\n";
+        reader.close();
+        return EXIT_SUCCESS;
     }
 
     Timer timer;
