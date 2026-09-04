@@ -24,8 +24,6 @@
 #include <omp.h>
 #endif
 
-static const size_t ARENA_BYTES = 64u << 20;
-
 static void appendDecimalKey(std::string &into, uint64_t key) {
     char buffer[32];
     char *end = Itoa::u64toa_sse2(key, buffer);
@@ -50,8 +48,7 @@ int lin8pickrepprofile(int argc, const char **argv, const Command &command) {
     RunDbReader reader(par.db1);
     reader.open();
     const unsigned int threads = std::max<unsigned int>(1, par.threads);
-    reader.openBatch(threads, ARENA_BYTES, Util::computeMemory(par.splitMemoryLimit),
-                     RunDbReader::READ_ONCE);
+    reader.openBatch(threads, Util::computeMemory(par.splitMemoryLimit));
 
     DBReader<DBKeyType> clusters(par.db3.c_str(), par.db3Index.c_str(), threads,
                                  DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);

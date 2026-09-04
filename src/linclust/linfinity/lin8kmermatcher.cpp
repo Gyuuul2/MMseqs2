@@ -322,7 +322,6 @@ static unsigned int maxSelectedKmersForAnySequence(unsigned int baseKmersPerSequ
 }
 
 static const uint64_t RANKS_PER_READ_BATCH = 2048;
-static const size_t BATCH_READ_ARENA_BYTES = 64u << 20;
 
 static uint64_t extractAndWriteChunkKmers(const RunDbReader &dbReader, const ExtractionChunk &extractionChunk, BucketWriter<KmerRecord> &kmerBucketWriter,
                          const unsigned char *residueToClass, unsigned int kmerLength,
@@ -490,9 +489,9 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
                                                         std::vector<uint64_t>(subBucketCountEntryCount, 0));
 
     Timer timer;
-    reader.openBatch(par.threads, BATCH_READ_ARENA_BYTES, workingMemoryBudgetBytes, RunDbReader::READ_AGAIN);
+    reader.openBatch(par.threads, workingMemoryBudgetBytes);
     BucketWriter<KmerRecord> writer(nodeBucketFilePrefix, KmerRecord::BUCKET_COUNT, par.threads,
-                                    workingMemoryBudgetBytes - (size_t) par.threads * BATCH_READ_ARENA_BYTES);
+                                    workingMemoryBudgetBytes - reader.arenaTotal());
     writer.openAt(existingRecordsPerBucket);
     uint64_t writtenRecordCount = 0;
     Debug::Progress progress(extractionChunks.size() - firstUnprocessedChunk);

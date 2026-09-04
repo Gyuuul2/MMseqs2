@@ -307,7 +307,6 @@ private:
 };
 
 static const size_t HASH_PER_THREAD = 256;
-static const size_t READ_ARENA_BYTES = 64u << 20;
 
 static unsigned int threadsWorthStarting(size_t work, unsigned int threads) {
     const size_t want = work / HASH_PER_THREAD;
@@ -633,7 +632,8 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
         }
 
         Timer timer;
-        reader.openBatch(par.threads, READ_ARENA_BYTES, budget, RunDbReader::READ_AGAIN);
+        reader.openBatch(par.threads, budget);
+        budget -= reader.arenaTotal();
         const SequenceLocator &runs = reader.getSequenceLocator();
         const std::vector<size_t> mine = nodeFileSlots(runs, node);
         Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << mine.size()

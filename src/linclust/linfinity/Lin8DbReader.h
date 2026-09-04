@@ -75,10 +75,9 @@ public:
     uint32_t getSeqLen(uint64_t rank, Cursor &cursor) const;
     const char *getData(uint64_t rank, Cursor &cursor) const;
 
-    static const int READ_ONCE = 0;
-    static const int READ_AGAIN = 1;
-    void openBatch(unsigned int threads, size_t arenaBytes, size_t memoryBudget, int revisit = READ_ONCE);
+    void openBatch(unsigned int threads, size_t memoryBudget);
 
+    size_t arenaTotal() const { return arenaTotalBytes; }
     size_t batchRoomFor(uint32_t seqLen) const;
 
     size_t startBatch(uint64_t queryRank, const uint64_t *members, size_t n, unsigned int thread,
@@ -125,7 +124,7 @@ private:
     mutable std::vector<BatchWorker *> batch;
 
     bool appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor, const char *&at) const;
-    int directOf(uint32_t file) const;
+    int batchFdOf(uint32_t file) const;
     const char *fileData(uint32_t file, uint64_t offset) const;
     void mapFile(uint32_t file) const;
     void mapHeader(uint32_t file) const;
@@ -135,7 +134,7 @@ private:
     SequenceLocator runs;
     mutable std::vector<char *> data;
     mutable std::vector<int> dataFd;
-    mutable std::vector<int> directFd;
+    mutable std::vector<int> batchFd;
     mutable std::vector<int> headerFd;
     std::vector<size_t> dataSize;
     mutable std::vector<char *> headers;
@@ -145,8 +144,9 @@ private:
     size_t validSize;
     size_t validCount;
     bool validLoaded;
-    mutable bool wantDirect;
     bool batchViaMmap;
+    size_t laneBytes;
+    size_t arenaTotalBytes;
 };
 
 class ClusterAssignmentBitmap {

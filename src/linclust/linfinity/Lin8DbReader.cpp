@@ -313,7 +313,7 @@ const char *RunDbReader::KEPT_BITMAP_SUFFIX = ".clusthash_kept";
 RunDbReader::RunDbReader(const std::string &db, bool withHeaders)
     : db(db), withHeaders(withHeaders), valid(NULL),
       validMap(NULL), validSize(0), validCount(0), validLoaded(false),
-      wantDirect(true), batchViaMmap(false) {}
+      batchViaMmap(false), laneBytes(0), arenaTotalBytes(0) {}
 
 RunDbReader::~RunDbReader() {
     close();
@@ -395,10 +395,10 @@ void RunDbReader::close() {
         delete batch[i];
     }
     batch.clear();
-    for (size_t i = 0; i < directFd.size(); i++) {
-        if (directFd[i] >= 0) {
-            ::close(directFd[i]);
-            directFd[i] = -1;
+    for (size_t i = 0; i < batchFd.size(); i++) {
+        if (batchFd[i] >= 0) {
+            ::close(batchFd[i]);
+            batchFd[i] = -1;
         }
     }
     for (size_t i = 0; i < data.size(); i++) {
@@ -546,76 +546,68 @@ bool RunDbReader::HeaderStream::next(const char *&begin, size_t &length) {
 static const size_t DIRECT_BLOCK = 512;
 static const unsigned RING_DEPTH = 1024;
 
-void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
-                            size_t memoryBudget, int revisit) {
-    directFd.assign(data.size(), -1);
-    const size_t arenaTotal = (size_t) threads * (arenaBytes + LANES * DIRECT_BLOCK);
-    if (arenaTotal >= memoryBudget) {
+void RunDbReader::openBatch(unsigned int threads, size_t memoryBudget) {
+    batchFd.assign(data.size(), -1);
+    const uint64_t sequenceBytes = runs.totalBytes();
+    batchViaMmap = sequenceBytes <= memoryBudget;
+    const size_t meanSeqLen = runs.entryCount() ? sequenceBytes / runs.entryCount() : 0;
+    laneBytes = RING_DEPTH * (meanSeqLen + DIRECT_BLOCK);
+    arenaTotalBytes = batchViaMmap ? 0 : (size_t) threads * LANES * (laneBytes + DIRECT_BLOCK);
+    if (arenaTotalBytes >= memoryBudget) {
         Debug(Debug::ERROR) << "Read arenas for " << threads << " thread need "
-                            << (arenaTotal >> 20) << " MB, which is the whole "
+                            << (arenaTotalBytes >> 20) << " MB, which is the whole "
                             << (memoryBudget >> 20) << " MB limit\n";
         EXIT(EXIT_FAILURE);
     }
-    const size_t budget = memoryBudget - arenaTotal;
-    const uint64_t sequenceBytes = runs.totalBytes();
-    batchViaMmap = sequenceBytes <= budget;
-    wantDirect = revisit == READ_ONCE && sequenceBytes > budget / 2;
-    const char *how = batchViaMmap ? "data fits, batch reads via mmap"
-                      : wantDirect ? "data exceeds budget, batch reads via io_uring past the OS cache"
-                                   : "data exceeds budget, batch reads via io_uring through the OS cache";
-    Debug(Debug::INFO) << "Sequence data: " << (sequenceBytes >> 30) << " GB, budget "
-                       << (budget >> 30) << " GB after " << (arenaTotal >> 20)
-                       << " MB read buffer, " << how << "\n";
     for (unsigned int i = 0; i < threads; i++) {
         batch.push_back(new BatchWorker());
     }
-    if (batchViaMmap) {
-        return;
-    }
-    const size_t laneBytes = arenaBytes / LANES;
-    const size_t longest = 2 * ((size_t) runs.maxSeqLen() + DIRECT_BLOCK);
-    if (laneBytes < longest) {
-        Debug(Debug::ERROR) << "A read lane of " << laneBytes << " byte cannot hold two sequences of "
-                            << runs.maxSeqLen() << " byte, which needs " << longest << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    for (unsigned int i = 0; i < threads; i++) {
-        for (unsigned int l = 0; l < LANES; l++) {
-            BatchLane &lane = batch[i]->lane[l];
-            lane.arena.resize(laneBytes + DIRECT_BLOCK);
-            char *at = lane.arena.data();
-            const size_t off = reinterpret_cast<uintptr_t>(at) % DIRECT_BLOCK;
-            lane.aligned = at + (off == 0 ? 0 : DIRECT_BLOCK - off);
-            lane.ring.open(RING_DEPTH);
+    bool ringsOpen = true;
+    if (batchViaMmap == false) {
+        for (unsigned int i = 0; i < threads; i++) {
+            for (unsigned int l = 0; l < LANES; l++) {
+                BatchLane &lane = batch[i]->lane[l];
+                lane.arena.resize(laneBytes + DIRECT_BLOCK);
+                char *at = lane.arena.data();
+                const size_t off = reinterpret_cast<uintptr_t>(at) % DIRECT_BLOCK;
+                lane.aligned = at + (off == 0 ? 0 : DIRECT_BLOCK - off);
+                if (lane.ring.open(RING_DEPTH) == false) {
+                    ringsOpen = false;
+                }
+            }
         }
     }
+    const size_t budget = memoryBudget - arenaTotalBytes;
+    const char *how = batchViaMmap ? "data fits, batch reads via mmap"
+                      : ringsOpen ? "data exceeds budget, batch reads via io_uring"
+                                  : "data exceeds budget, batch reads via pread";
+    Debug(Debug::INFO) << "Sequence data: " << (sequenceBytes >> 30) << " GB, budget "
+                       << (budget >> 30) << " GB after " << (arenaTotalBytes >> 20)
+                       << " MB read buffer, " << how << "\n";
 }
 
-int RunDbReader::directOf(uint32_t file) const {
+int RunDbReader::batchFdOf(uint32_t file) const {
     int fd = -1;
 #pragma omp atomic read
-    fd = directFd[file];
+    fd = batchFd[file];
     if (fd >= 0) {
         return fd;
     }
-#pragma omp critical(rundb_direct)
+#pragma omp critical(rundb_batch_fd)
     {
-        if (directFd[file] < 0) {
+        if (batchFd[file] < 0) {
             const std::string path = db + "." + SSTR(file);
-            int opened = ::open(path.c_str(), wantDirect ? (O_RDONLY | O_DIRECT) : O_RDONLY);
+            const int opened = ::open(path.c_str(), O_RDONLY);
             if (opened < 0) {
-                opened = ::open(path.c_str(), O_RDONLY);
-                if (opened < 0) {
-                    Debug(Debug::ERROR) << "Cannot open " << path << " for reading\n";
-                    EXIT(EXIT_FAILURE);
-                }
+                Debug(Debug::ERROR) << "Cannot open " << path << " for reading\n";
+                EXIT(EXIT_FAILURE);
             }
 #pragma omp atomic write
-            directFd[file] = opened;
+            batchFd[file] = opened;
         }
     }
 #pragma omp atomic read
-    fd = directFd[file];
+    fd = batchFd[file];
     return fd;
 }
 
@@ -628,14 +620,7 @@ const char *RunDbReader::batchAt(unsigned int thread, unsigned int lane, size_t 
 }
 
 size_t RunDbReader::batchRoomFor(uint32_t seqLen) const {
-    if (batch.empty()) {
-        return 0;
-    }
-    if (batchViaMmap) {
-        return runs.entryCount();
-    }
-    const size_t room = batch[0]->lane[0].arena.size() - DIRECT_BLOCK;
-    return room / ((size_t) seqLen + DIRECT_BLOCK);
+    return laneBytes / ((size_t) seqLen + DIRECT_BLOCK);
 }
 
 void RunDbReader::awaitBatch(unsigned int thread, unsigned int lane) const {
@@ -647,7 +632,7 @@ bool RunDbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor
     cursor.at = runs.runOfFrom(rank, cursor.at);
     const uint64_t offset = runs.offsetIn(cursor.at, rank);
     const size_t length = runs[cursor.at].seqLen();
-    const int fd = directOf(runs[cursor.at].fileNum());
+    const int fd = batchFdOf(runs[cursor.at].fileNum());
     const uint64_t blockFrom = offset - offset % DIRECT_BLOCK;
     const uint64_t blockUntil = ((offset + length + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
 

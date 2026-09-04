@@ -27,7 +27,6 @@
 
 static const size_t STREAM_ROWS = 1u << 16;
 static const size_t BATCH_ROWS = 1u << 22;
-static const size_t ARENA_BYTES = 64u << 20;
 
 static const size_t MEMBERS_PER_ALIGN_BATCH = 1024;
 
@@ -424,8 +423,7 @@ int lin8align2clust(int argc, const char **argv, const Command &command) {
         EXIT(EXIT_FAILURE);
     }
     const unsigned int threads = par.threads;
-    reader.openBatch(threads, ARENA_BYTES, Util::computeMemory(par.splitMemoryLimit),
-                     RunDbReader::READ_AGAIN);
+    reader.openBatch(threads, Util::computeMemory(par.splitMemoryLimit));
 
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, par.scoreBias);
     SubstitutionMatrix::FastMatrix fastMatrix = SubstitutionMatrix::createAsciiSubMat(subMat);
