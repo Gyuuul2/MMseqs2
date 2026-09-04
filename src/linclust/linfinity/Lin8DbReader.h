@@ -146,6 +146,7 @@ private:
     size_t validCount;
     bool validLoaded;
     mutable bool wantDirect;
+    bool batchViaMmap;
 };
 
 class ClusterAssignmentBitmap {

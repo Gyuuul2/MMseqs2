@@ -76,7 +76,7 @@ static std::pair<size_t, size_t> runsInFileSlot(const SequenceLocator &runs, siz
     size_t begin = runs.size();
     size_t end = 0;
     for (size_t i = 0; i < runs.size(); i++) {
-        if (runs[i].fileIdx() % runs.filesPerNode() == fileSlot) {
+        if (runs[i].fileNum() % runs.filesPerNode() == fileSlot) {
             begin = std::min(begin, i);
             end = std::max(end, i + 1);
         }
@@ -658,7 +658,7 @@ int lin8clusthash(int argc, const char **argv, const Command &command) {
             const std::pair<size_t, size_t> span = runsInFileSlot(runs, mine[at]);
             for (size_t segment = span.first; segment < span.second;) {
                 const uint32_t length = runs[segment].seqLen();
-                const uint64_t rankBegin = runs[segment].rankBase();
+                const uint64_t rankBegin = runs[segment].startRank();
                 size_t next = segment + 1;
                 while (next < span.second && runs[next].seqLen() == length) {
                     next++;

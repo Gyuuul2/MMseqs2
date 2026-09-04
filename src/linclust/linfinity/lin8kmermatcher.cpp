@@ -285,10 +285,10 @@ static std::vector<ExtractionChunk> planExtractionChunks(const RunDbReader &read
         uint64_t slotFirstRank = 0;
         uint64_t slotEndRankExclusive = 0;
         for (size_t i = 0; i < runs.size(); i++) {
-            if (runs[i].fileIdx() % runs.filesPerNode() != assignedFileSlots[at]) {
+            if (runs[i].fileNum() % runs.filesPerNode() != assignedFileSlots[at]) {
                 continue;
             }
-            slotFirstRank = (slotEndRankExclusive == 0) ? runs[i].rankBase() : std::min(slotFirstRank, runs[i].rankBase());
+            slotFirstRank = (slotEndRankExclusive == 0) ? runs[i].startRank() : std::min(slotFirstRank, runs[i].startRank());
             slotEndRankExclusive = std::max(slotEndRankExclusive, runs.rankEnd(i));
         }
         if (slotEndRankExclusive <= slotFirstRank) {

@@ -41,30 +41,30 @@ void SequenceLocator::reserve(size_t count) {
     byteStarts.reserve(count + 1);
 }
 
-void SequenceLocator::append(uint64_t rankBase, uint32_t len, uint64_t byteBase, uint32_t file,
-                      uint64_t hdrBase) {
-    if (rankBase > MAX_RANK || byteBase > MAX_BYTE || file > MAX_FILE || len > MAX_ENTRY_LEN) {
-        Debug(Debug::ERROR) << "Run table segment out of repRankBlock: rank " << rankBase << " byte "
-                            << byteBase << " file " << file << " length " << len << "\n";
+void SequenceLocator::append(uint64_t startRank, uint32_t len, uint64_t startSeqByte, uint32_t file,
+                      uint64_t startHdrByte) {
+    if (startRank > MAX_RANK || startSeqByte > MAX_BYTE || file > MAX_FILE || len > MAX_ENTRY_LEN) {
+        Debug(Debug::ERROR) << "Run table segment out of repRankBlock: rank " << startRank << " byte "
+                            << startSeqByte << " file " << file << " length " << len << "\n";
         EXIT(EXIT_FAILURE);
     }
-    if (runs.empty() == false && rankBase <= runs.back().rankBase()) {
-        Debug(Debug::ERROR) << "Run table runs must ascend by rank, got " << rankBase
-                            << " after " << runs.back().rankBase() << "\n";
+    if (runs.empty() == false && startRank <= runs.back().startRank()) {
+        Debug(Debug::ERROR) << "Run table runs must ascend by rank, got " << startRank
+                            << " after " << runs.back().startRank() << "\n";
         EXIT(EXIT_FAILURE);
     }
     LengthRun segment;
-    segment.rankAndLen = rankBase | (static_cast<uint64_t>(len) << RANK_BITS);
-    segment.byteAndFile = byteBase | (static_cast<uint64_t>(file) << 48);
-    segment.hdrByte = hdrBase;
+    segment.rankAndLen = startRank | (static_cast<uint64_t>(len) << RANK_BITS);
+    segment.byteAndFile = startSeqByte | (static_cast<uint64_t>(file) << 48);
+    segment.hdrByte = startHdrByte;
     runs.push_back(segment);
     byteStarts.push_back(bytes);
     if (runs.size() > 1) {
         const LengthRun &previous = runs[runs.size() - 2];
-        bytes += (rankBase - previous.rankBase()) * previous.seqLen();
+        bytes += (startRank - previous.startRank()) * previous.seqLen();
         byteStarts.back() = bytes;
     }
-    entries = rankBase;
+    entries = startRank;
 }
 
 void SequenceLocator::checkLengthsDescend() const {
@@ -93,8 +93,8 @@ void SequenceLocator::rebuildByteStarts() {
     bytes = 0;
     for (size_t i = 0; i < runs.size(); i++) {
         byteStarts[i] = bytes;
-        const uint64_t next = (i + 1 < runs.size()) ? runs[i + 1].rankBase() : entries;
-        bytes += (next - runs[i].rankBase()) * runs[i].seqLen();
+        const uint64_t next = (i + 1 < runs.size()) ? runs[i + 1].startRank() : entries;
+        bytes += (next - runs[i].startRank()) * runs[i].seqLen();
     }
 }
 
@@ -107,17 +107,17 @@ size_t SequenceLocator::runOf(uint64_t rank) const {
     size_t high = runs.size() - 1;
     while (low < high) {
         const size_t mid = low + (high - low + 1) / 2;
-        low = (runs[mid].rankBase() <= rank) ? mid : low;
-        high = (runs[mid].rankBase() <= rank) ? high : mid - 1;
+        low = (runs[mid].startRank() <= rank) ? mid : low;
+        high = (runs[mid].startRank() <= rank) ? high : mid - 1;
     }
     return low;
 }
 
 size_t SequenceLocator::runOfFrom(uint64_t rank, size_t cursor) const {
-    if (rank < runs[cursor].rankBase()) {
+    if (rank < runs[cursor].startRank()) {
         return runOf(rank);
     }
-    while (cursor + 1 < runs.size() && runs[cursor + 1].rankBase() <= rank) {
+    while (cursor + 1 < runs.size() && runs[cursor + 1].startRank() <= rank) {
         cursor++;
     }
     return cursor;
@@ -125,7 +125,7 @@ size_t SequenceLocator::runOfFrom(uint64_t rank, size_t cursor) const {
 
 uint64_t SequenceLocator::offsetIn(size_t segment, uint64_t rank) const {
     const LengthRun &at = runs[segment];
-    return at.byteBase() + (rank - at.rankBase()) * at.seqLen();
+    return at.startSeqByte() + (rank - at.startRank()) * at.seqLen();
 }
 
 uint64_t SequenceLocator::byteAtRank(uint64_t rank) const {
@@ -133,7 +133,7 @@ uint64_t SequenceLocator::byteAtRank(uint64_t rank) const {
         return bytes;
     }
     const size_t segment = runOf(rank);
-    return byteStarts[segment] + (rank - runs[segment].rankBase()) * runs[segment].seqLen();
+    return byteStarts[segment] + (rank - runs[segment].startRank()) * runs[segment].seqLen();
 }
 
 uint64_t SequenceLocator::rankAtByte(uint64_t globalByte) const {
@@ -143,7 +143,7 @@ uint64_t SequenceLocator::rankAtByte(uint64_t globalByte) const {
     const size_t segment = static_cast<size_t>(
         std::upper_bound(byteStarts.begin(), byteStarts.end(), globalByte) - byteStarts.begin() - 1);
     const uint64_t inRun = (globalByte - byteStarts[segment]) / runs[segment].seqLen();
-    return runs[segment].rankBase() + inRun;
+    return runs[segment].startRank() + inRun;
 }
 
 void SequenceLocator::write(const std::string &path) const {
@@ -800,11 +800,11 @@ std::vector<size_t> nodeFileSlots(const SequenceLocator &runs, const NodePlaceme
     std::vector<uint64_t> weight(runs.filesPerNode(), 0);
     uint64_t total = 0;
     for (size_t i = 0; i < runs.size(); i++) {
-        const uint64_t ranks = runs.rankEnd(i) - runs[i].rankBase();
+        const uint64_t ranks = runs.rankEnd(i) - runs[i].startRank();
         const uint64_t span = costOfLength
                                   ? ranks * costOfLength(runs[i].seqLen())
                                   : ranks * runs[i].seqLen();
-        weight[runs[i].fileIdx() % runs.filesPerNode()] += span;
+        weight[runs[i].fileNum() % runs.filesPerNode()] += span;
         total += span;
     }
     std::vector<size_t> mine;

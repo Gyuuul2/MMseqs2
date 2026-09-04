@@ -216,7 +216,7 @@ static NodeSequenceDistribution readLengthDistribution(const std::string &path, 
 }
 
 struct RankLayout {
-    std::vector<uint64_t> rankBase;
+    std::vector<uint64_t> startRank;
     uint64_t sequenceCount;
     uint64_t bytes;
     uint64_t headerBytes;
@@ -224,7 +224,7 @@ struct RankLayout {
 
 static RankLayout computeGlobalRankLayout(const std::vector<NodeSequenceDistribution> &nodeDistributions, unsigned int self) {
     RankLayout ranks;
-    ranks.rankBase.assign(LINCLUSTERDB_HISTOGRAM_SIZE, 0);
+    ranks.startRank.assign(LINCLUSTERDB_HISTOGRAM_SIZE, 0);
     ranks.sequenceCount = 0;
     ranks.bytes = 0;
     ranks.headerBytes = 0;
@@ -232,7 +232,7 @@ static RankLayout computeGlobalRankLayout(const std::vector<NodeSequenceDistribu
     for (size_t length = LINCLUSTERDB_MAX_SEQ_LEN; length >= 1; length--) {
         for (size_t node = 0; node < nodeDistributions.size(); node++) {
             if (node == self) {
-                ranks.rankBase[length] = rank;
+                ranks.startRank[length] = rank;
             }
             rank += nodeDistributions[node].sequencesByLength[length];
         }
@@ -307,7 +307,7 @@ static void planDatabaseLayout(const std::vector<NodeSequenceDistribution> &node
             headerByteAt += nodeDistribution.headerBytesAt(length, split);
         }
         if (nodeDistribution.sequencesByLength[length] > 0) {
-            nodeLocator.append(ranks.rankBase[length], static_cast<uint32_t>(length),
+            nodeLocator.append(ranks.startRank[length], static_cast<uint32_t>(length),
                            seqFirst - bytePlan.sequenceFileStart[file], fileBase + file,
                            hdrFirst - bytePlan.headerFileStart[file]);
         }
@@ -516,12 +516,12 @@ static void writeFileManifest(const std::string &db, const SequenceLocator &runs
     std::vector<uint32_t> minLen(files, 0);
     std::vector<uint64_t> entries(files, 0);
     for (size_t i = 0; i < runs.size(); i++) {
-        const uint32_t file = runs[i].fileIdx();
+        const uint32_t file = runs[i].fileNum();
         if (entries[file] == 0) {
             maxLen[file] = runs[i].seqLen();
         }
         minLen[file] = runs[i].seqLen();
-        entries[file] += runs.rankEnd(i) - runs[i].rankBase();
+        entries[file] += runs.rankEnd(i) - runs[i].startRank();
     }
     const std::string tmp = db + ".files.tmp" + uniqueTmpSuffix();
     FILE *out = FileUtil::openAndDelete(tmp.c_str(), "w");
@@ -547,14 +547,14 @@ static SequenceLocator mergeSequenceLocators(const std::string &db, unsigned int
     }
     SORT_SERIAL(all.begin(), all.end(),
                   [](const SequenceLocator::LengthRun &first, const SequenceLocator::LengthRun &second) {
-                      return first.rankBase() < second.rankBase();
+                      return first.startRank() < second.startRank();
                   });
     SequenceLocator merged;
     merged.setLayout(nodeCount, filesPerNode);
     merged.reserve(all.size());
     for (size_t i = 0; i < all.size(); i++) {
-        merged.append(all[i].rankBase(), all[i].seqLen(), all[i].byteBase(), all[i].fileIdx(),
-                      all[i].hdrBase());
+        merged.append(all[i].startRank(), all[i].seqLen(), all[i].startSeqByte(), all[i].fileNum(),
+                      all[i].startHdrByte());
     }
     merged.finish(sequenceCount);
     merged.write(db + ".runs");

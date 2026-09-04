@@ -34,18 +34,18 @@ public:
         uint64_t byteAndFile;
         uint64_t hdrByte;
 
-        uint64_t rankBase() const { return rankAndLen & MAX_RANK; }
+        uint64_t startRank() const { return rankAndLen & MAX_RANK; }
         uint32_t seqLen() const { return static_cast<uint32_t>((rankAndLen >> RANK_BITS) & 0xFFFFu); }
-        uint64_t byteBase() const { return byteAndFile & MAX_BYTE; }
-        uint32_t fileIdx() const { return static_cast<uint32_t>(byteAndFile >> 48); }
-        uint64_t hdrBase() const { return hdrByte; }
+        uint64_t startSeqByte() const { return byteAndFile & MAX_BYTE; }
+        uint32_t fileNum() const { return static_cast<uint32_t>(byteAndFile >> 48); }
+        uint64_t startHdrByte() const { return hdrByte; }
     };
 
     SequenceLocator();
 
     void reserve(size_t runs);
-    void append(uint64_t rankBase, uint32_t seqLen, uint64_t byteBase, uint32_t fileIdx,
-                uint64_t hdrBase);
+    void append(uint64_t startRank, uint32_t seqLen, uint64_t startSeqByte, uint32_t fileNum,
+                uint64_t startHdrByte);
 
     size_t size() const { return runs.size(); }
     uint64_t entryCount() const { return entries; }
@@ -57,11 +57,11 @@ public:
 
     uint32_t seqLen(uint64_t rank) const { return runs[runOf(rank)].seqLen(); }
     uint32_t maxSeqLen() const { return runs.empty() ? 0 : runs[0].seqLen(); }
-    uint32_t fileIdx(uint64_t rank) const { return runs[runOf(rank)].fileIdx(); }
+    uint32_t fileNum(uint64_t rank) const { return runs[runOf(rank)].fileNum(); }
     uint64_t fileOffset(uint64_t rank) const { return offsetIn(runOf(rank), rank); }
     uint64_t offsetIn(size_t segment, uint64_t rank) const;
     uint64_t rankEnd(size_t segment) const {
-        return (segment + 1 < runs.size()) ? runs[segment + 1].rankBase() : entries;
+        return (segment + 1 < runs.size()) ? runs[segment + 1].startRank() : entries;
     }
 
     uint64_t rankAtByte(uint64_t globalByte) const;

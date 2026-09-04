@@ -313,7 +313,7 @@ const char *RunDbReader::KEPT_BITMAP_SUFFIX = ".clusthash_kept";
 RunDbReader::RunDbReader(const std::string &db, bool withHeaders)
     : db(db), withHeaders(withHeaders), valid(NULL),
       validMap(NULL), validSize(0), validCount(0), validLoaded(false),
-      wantDirect(true) {}
+      wantDirect(true), batchViaMmap(false) {}
 
 RunDbReader::~RunDbReader() {
     close();
@@ -465,7 +465,7 @@ const char *RunDbReader::fileData(uint32_t file, uint64_t offset) const {
 
 const char *RunDbReader::getData(uint64_t rank) const {
     const size_t segment = runs.runOf(rank);
-    return fileData(runs[segment].fileIdx(), runs.offsetIn(segment, rank));
+    return fileData(runs[segment].fileNum(), runs.offsetIn(segment, rank));
 }
 
 uint32_t RunDbReader::getSeqLen(uint64_t rank, Cursor &cursor) const {
@@ -475,7 +475,7 @@ uint32_t RunDbReader::getSeqLen(uint64_t rank, Cursor &cursor) const {
 
 const char *RunDbReader::getData(uint64_t rank, Cursor &cursor) const {
     cursor.at = runs.runOfFrom(rank, cursor.at);
-    return fileData(runs[cursor.at].fileIdx(), runs.offsetIn(cursor.at, rank));
+    return fileData(runs[cursor.at].fileNum(), runs.offsetIn(cursor.at, rank));
 }
 
 bool RunDbReader::isValid(uint64_t rank) const {
@@ -518,11 +518,11 @@ bool RunDbReader::HeaderStream::next(const char *&begin, size_t &length) {
         if (segment >= owner.runs.size()) {
             return false;
         }
-        left = owner.runs.rankEnd(segment) - owner.runs[segment].rankBase();
-        at = owner.runs[segment].hdrBase();
+        left = owner.runs.rankEnd(segment) - owner.runs[segment].startRank();
+        at = owner.runs[segment].startHdrByte();
         segment++;
     }
-    const uint32_t file = owner.runs[segment - 1].fileIdx();
+    const uint32_t file = owner.runs[segment - 1].fileNum();
     if (file >= owner.headers.size() || at >= owner.headerSize[file]) {
         Debug(Debug::ERROR) << "Length run " << (segment - 1) << " of " << owner.db
                             << " points past header file " << file << "\n";
@@ -558,11 +558,20 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
     }
     const size_t budget = memoryBudget - arenaTotal;
     const uint64_t sequenceBytes = runs.totalBytes();
+    batchViaMmap = sequenceBytes <= budget;
     wantDirect = revisit == READ_ONCE && sequenceBytes > budget / 2;
+    const char *how = batchViaMmap ? "data fits, batch reads via mmap"
+                      : wantDirect ? "data exceeds budget, batch reads via io_uring past the OS cache"
+                                   : "data exceeds budget, batch reads via io_uring through the OS cache";
     Debug(Debug::INFO) << "Sequence data: " << (sequenceBytes >> 30) << " GB, budget "
                        << (budget >> 30) << " GB after " << (arenaTotal >> 20)
-                       << " MB read buffer, reading "
-                       << (wantDirect ? "past the OS cache" : "through the OS cache") << "\n";
+                       << " MB read buffer, " << how << "\n";
+    for (unsigned int i = 0; i < threads; i++) {
+        batch.push_back(new BatchWorker());
+    }
+    if (batchViaMmap) {
+        return;
+    }
     const size_t laneBytes = arenaBytes / LANES;
     const size_t longest = 2 * ((size_t) runs.maxSeqLen() + DIRECT_BLOCK);
     if (laneBytes < longest) {
@@ -571,16 +580,14 @@ void RunDbReader::openBatch(unsigned int threads, size_t arenaBytes,
         EXIT(EXIT_FAILURE);
     }
     for (unsigned int i = 0; i < threads; i++) {
-        BatchWorker *worker = new BatchWorker();
         for (unsigned int l = 0; l < LANES; l++) {
-            BatchLane &lane = worker->lane[l];
+            BatchLane &lane = batch[i]->lane[l];
             lane.arena.resize(laneBytes + DIRECT_BLOCK);
             char *at = lane.arena.data();
             const size_t off = reinterpret_cast<uintptr_t>(at) % DIRECT_BLOCK;
             lane.aligned = at + (off == 0 ? 0 : DIRECT_BLOCK - off);
             lane.ring.open(RING_DEPTH);
         }
-        batch.push_back(worker);
     }
 }
 
@@ -624,6 +631,9 @@ size_t RunDbReader::batchRoomFor(uint32_t seqLen) const {
     if (batch.empty()) {
         return 0;
     }
+    if (batchViaMmap) {
+        return runs.entryCount();
+    }
     const size_t room = batch[0]->lane[0].arena.size() - DIRECT_BLOCK;
     return room / ((size_t) seqLen + DIRECT_BLOCK);
 }
@@ -637,7 +647,7 @@ bool RunDbReader::appendBatchRead(BatchLane &lane, uint64_t rank, Cursor &cursor
     cursor.at = runs.runOfFrom(rank, cursor.at);
     const uint64_t offset = runs.offsetIn(cursor.at, rank);
     const size_t length = runs[cursor.at].seqLen();
-    const int fd = directOf(runs[cursor.at].fileIdx());
+    const int fd = directOf(runs[cursor.at].fileNum());
     const uint64_t blockFrom = offset - offset % DIRECT_BLOCK;
     const uint64_t blockUntil = ((offset + length + DIRECT_BLOCK - 1) / DIRECT_BLOCK) * DIRECT_BLOCK;
 
@@ -679,8 +689,15 @@ size_t RunDbReader::startBatch(uint64_t queryRank, const uint64_t *members, size
                               unsigned int thread, unsigned int lane) const {
     BatchLane &at = batch[thread]->lane[lane];
     at.memberAt.clear();
-    at.ring.list().clear();
     Cursor cursor;
+    if (batchViaMmap) {
+        at.queryAt = getData(queryRank, cursor);
+        for (size_t i = 0; i < n; i++) {
+            at.memberAt.push_back(getData(members[i], cursor));
+        }
+        return n;
+    }
+    at.ring.list().clear();
     appendBatchRead(at, queryRank, cursor, at.queryAt);
     size_t loaded = 0;
     for (; loaded < n; loaded++) {
