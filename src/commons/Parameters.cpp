@@ -175,6 +175,10 @@ Parameters::Parameters():
         PARAM_NUM_COUNTS(PARAM_NUM_COUNTS_ID, "--num-count-table", "Number of count table based center swapping", "Number of count table based center swapping", typeid(int), (void *) &countTableIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_INCLUDE_ADJACENCY(PARAM_INCLUDE_ADJACENCY_ID, "--include-adjacency", "Include adjacency based center swapping", "Include adjacency based center swapping", typeid(bool), (void *) &includeAdjacency, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_ADJ_MIN_SCORE(PARAM_ADJ_MIN_SCORE_ID, "--adj-min-score", "Minimum adjacency score to keep a pair", "Drop a candidate pair whose six flanking residues score below this against the representative", typeid(int), (void *) &adjMinScore, "^-?[0-9]+$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_KMER_WINDOW(PARAM_KMER_WINDOW_ID, "--kmer-window", "Minimizer window in k-mers", "Keep the lowest hashing k-mer of every window of this many consecutive k-mers instead of the best --kmer-per-seq of the whole sequence", typeid(int), (void *) &kmerWindow, "^[0-9]+$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_STROBE_WINDOW(PARAM_STROBE_WINDOW_ID, "--strobe-window", "Window the second strobe is picked from", "Split the k-mer into two strobes and let a hash pick the second one out of this many offsets, so a mutation costs one strobe instead of the whole k-mer (1 is the plain contiguous k-mer)", typeid(int), (void *) &strobeWindow, "^[0-9]+$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_CONSERVED_SELECT(PARAM_CONSERVED_SELECT_ID, "--conserved-select", "Keep the most conserved k-mers", "Keep the k-mers a homolog is most likely to conserve instead of the ones with the smallest hash", typeid(bool), (void *) &conservedSelect, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
         PARAM_COMPRESS_KMER_TMP_FILES(PARAM_COMPRESS_KMER_TMP_FILES_ID, "--compress-kmer-tmp-files", "Compress k-mer temporary files", "Compress kmermatcher temporary files and stream them during merge: 0: off, 1: zstd", typeid(int), (void *) &compressKmerTmpFiles, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -1029,6 +1033,10 @@ Parameters::Parameters():
     lin8extractkmers.push_back(&PARAM_ALPH_SIZE);
     lin8extractkmers.push_back(&PARAM_KMER_PER_SEQ);
     lin8extractkmers.push_back(&PARAM_KMER_PER_SEQ_SCALE);
+    lin8extractkmers.push_back(&PARAM_KMER_WINDOW);
+    lin8extractkmers.push_back(&PARAM_SPACED_KMER_PATTERN);
+    lin8extractkmers.push_back(&PARAM_STROBE_WINDOW);
+    lin8extractkmers.push_back(&PARAM_CONSERVED_SELECT);
     lin8extractkmers.push_back(&PARAM_MASK_LOWER_CASE);
     lin8extractkmers.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     lin8extractkmers.push_back(&PARAM_SUB_MAT);
@@ -1045,6 +1053,7 @@ Parameters::Parameters():
     lin8assignedpairs.push_back(&PARAM_SUB_MAT);
     lin8assignedpairs.push_back(&PARAM_INCLUDE_ADJACENCY);
     lin8assignedpairs.push_back(&PARAM_NUM_ADJACENCY);
+    lin8assignedpairs.push_back(&PARAM_ADJ_MIN_SCORE);
     lin8assignedpairs.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     lin8assignedpairs.push_back(&PARAM_THREADS);
     lin8assignedpairs.push_back(&PARAM_REMOVE_TMP_FILES);
@@ -1756,6 +1765,11 @@ Parameters::Parameters():
     linclustoneshotworkflow.push_back(&PARAM_INCLUDE_ONLY_EXTENDABLE);
     linclustoneshotworkflow.push_back(&PARAM_INCLUDE_ADJACENCY);
     linclustoneshotworkflow.push_back(&PARAM_NUM_ADJACENCY);
+    linclustoneshotworkflow.push_back(&PARAM_ADJ_MIN_SCORE);
+    linclustoneshotworkflow.push_back(&PARAM_KMER_WINDOW);
+    linclustoneshotworkflow.push_back(&PARAM_SPACED_KMER_PATTERN);
+    linclustoneshotworkflow.push_back(&PARAM_STROBE_WINDOW);
+    linclustoneshotworkflow.push_back(&PARAM_CONSERVED_SELECT);
     linclustoneshotworkflow.push_back(&PARAM_RESCUE_RECALL);
     linclustoneshotworkflow.push_back(&PARAM_INCLUDE_ALIGN_FILES);
     linclustoneshotworkflow.push_back(&PARAM_SWITCH_CONSENSUS_REP);
@@ -3289,6 +3303,10 @@ void Parameters::setDefaults() {
     countTableScale = 0.1;
     includeAdjacency = true;
     adjIteration = 3;
+    adjMinScore = INT_MIN;
+    kmerWindow = 0;
+    strobeWindow = 0;
+    conservedSelect = false;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;
     linclust2Iter = 2;

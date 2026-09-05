@@ -25,7 +25,13 @@
 class KmerExtractor {
 public:
     KmerExtractor(unsigned int kmerLength, unsigned int residueClassCount,
-                  unsigned int mostKmersOneSequenceCanKeep);
+                  unsigned int mostKmersOneSequenceCanKeep, unsigned int minimizerWindow,
+                  const std::string &spacedPattern, unsigned int strobeWindow,
+                  const std::vector<uint32_t> &classConservation);
+    static std::vector<uint32_t> buildClassConservationTable(double **joint, const double *background,
+                                                       unsigned int classes);
+    unsigned int kmerSpan() const { return patternSpan; }
+    const uint16_t *selectedKmerEnds() const { return selectedEnds.data(); }
 
     size_t selectFromSequence(const char *sequence, size_t length, const unsigned char *letterToCode,
                    unsigned int keepPerSequence);
@@ -40,8 +46,23 @@ public:
 
     static const unsigned int SCORE_BITS = 48;
     static const uint64_t SCORE_MASK = (uint64_t(1) << SCORE_BITS) - 1;
+    static const uint32_t WEIGHT_MAX = 0xFFFFu;
 
-    static uint64_t selectionScore(uint64_t mixed) { return mixed & SCORE_MASK; }
+    uint32_t conservationOfClass(unsigned char cls) const {
+        return classConservation.empty() ? 0 : classConservation[cls];
+    }
+
+    // the heap keeps the s smallest scores, so a rarer k-mer has to score lower: the top sixteen bits
+    // are the inverted information content and the rest stays the hash, which both breaks ties by
+    // content and leaves the score bit for bit the old one when no conserved table is loaded
+    uint64_t selectionScore(uint64_t code, uint32_t conserved) const {
+        const uint64_t mixed = mixHash64(code);
+        if (classConservation.empty()) {
+            return mixed & SCORE_MASK;
+        }
+        const uint64_t weight = conserved < WEIGHT_MAX ? conserved : WEIGHT_MAX;
+        return (weight << 32) | (mixed & 0xFFFFFFFFull);
+    }
 
     static const unsigned int CODE_BITS = 51;
     static const uint64_t CODE_MASK = (uint64_t(1) << CODE_BITS) - 1;
@@ -73,11 +94,14 @@ public:
                                 const unsigned char *letterToCode);
 
     uint64_t packedFlankingClassesAt(const char *sequence, size_t length, const unsigned char *letterToCode,
-                        size_t pos) const;
+                        size_t pos, size_t end) const;
     uint64_t packedUnknownFlankingClasses() const;
 
 private:
-    void considerCandidate(uint64_t score, uint64_t key, uint16_t pos);
+    void considerCandidate(uint64_t score, uint64_t key, uint16_t pos, uint16_t end);
+    void considerWindowed(uint64_t score, uint64_t key, uint16_t pos, uint16_t end);
+    size_t selectStrobes(const char *sequence, size_t length, const unsigned char *letterToCode);
+    void resetWindow();
     bool isNoBetterThanSelected(uint64_t score, uint16_t pos, size_t at) const;
     bool isWorseSelected(size_t at, size_t than) const;
     void swapSelected(size_t at, size_t with);
@@ -88,6 +112,24 @@ private:
     unsigned int residueClassCount;
     unsigned int maxSelectedKmers;
     unsigned int selectionLimit;
+    unsigned int window;
+    std::vector<uint64_t> windowScores;
+    std::vector<uint64_t> windowCodes;
+    std::vector<uint16_t> windowPositions;
+    std::vector<uint16_t> windowEnds;
+    size_t windowHead;
+    size_t windowSeen;
+    uint32_t lastEmittedPos;
+    std::vector<uint8_t> patternOffsets;
+    unsigned int patternSpan;
+    unsigned int strobeWindow;
+    unsigned int strobeLen1;
+    unsigned int strobeLen2;
+    uint64_t strobeShift;
+    std::vector<uint16_t> selectedEnds;
+    std::vector<uint32_t> classConservation;
+    std::vector<uint64_t> strobeCode1;
+    std::vector<uint64_t> strobeCode2;
     uint64_t leadingResidueWeight;
     std::vector<uint64_t> selectedScores;
     std::vector<uint64_t> selectedCodes;
@@ -95,9 +137,40 @@ private:
 };
 
 KmerExtractor::KmerExtractor(unsigned int kmerLength, unsigned int residueClassCount,
-                             unsigned int mostKmersOneSequenceCanKeep)
+                             unsigned int mostKmersOneSequenceCanKeep, unsigned int minimizerWindow,
+                             const std::string &spacedPattern, unsigned int strobeWindow,
+                             const std::vector<uint32_t> &classConservation)
     : kmerLength(kmerLength), residueClassCount(residueClassCount),
-      maxSelectedKmers(mostKmersOneSequenceCanKeep), selectionLimit(mostKmersOneSequenceCanKeep) {
+      maxSelectedKmers(mostKmersOneSequenceCanKeep), selectionLimit(mostKmersOneSequenceCanKeep),
+      window(minimizerWindow), windowHead(0), windowSeen(0), lastEmittedPos(0xFFFFFFFFu),
+      patternSpan(kmerLength), strobeWindow(strobeWindow),
+      strobeLen1((kmerLength + 1) / 2), strobeLen2(kmerLength / 2), strobeShift(1),
+      classConservation(classConservation) {
+    if (classConservation.empty() == false && strobeWindow > 0) {
+        Debug(Debug::ERROR) << "Conservation weighted selection does not carry across a strobe pair yet\n";
+        EXIT(EXIT_FAILURE);
+    }
+    for (unsigned int i = 0; i < strobeLen2; i++) {
+        strobeShift *= residueClassCount;
+    }
+    if (strobeWindow > 0 && spacedPattern.empty() == false) {
+        Debug(Debug::ERROR) << "A spaced pattern and a strobe window pick the k-mer in two different "
+                            << "ways, so only one of them can be set\n";
+        EXIT(EXIT_FAILURE);
+    }
+    for (size_t i = 0; i < spacedPattern.size(); i++) {
+        if (spacedPattern[i] == '1') {
+            patternOffsets.push_back(static_cast<uint8_t>(i));
+        }
+    }
+    if (patternOffsets.empty() == false) {
+        if (patternOffsets.size() != kmerLength) {
+            Debug(Debug::ERROR) << "The spaced pattern holds " << patternOffsets.size()
+                                << " informative positions and -k asks for " << kmerLength << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        patternSpan = static_cast<unsigned int>(spacedPattern.size());
+    }
     uint64_t span = 1;
     for (unsigned int i = 0; i < kmerLength; i++) {
         if (span > CODE_MASK / residueClassCount) {
@@ -124,8 +197,23 @@ uint64_t KmerExtractor::fallbackSequenceHash(const char *sequence, size_t length
     return mixHash64(hash) & CODE_MASK;
 }
 
+// min-hash keeps a uniformly random s of the k-mers; scoring by -log2 P(class stays itself) keeps the
+// ones a homolog is most likely to conserve. Rarity is the wrong proxy once the alphabet is reduced,
+// because the merge has already absorbed the common substitutions of the common residues.
+std::vector<uint32_t> KmerExtractor::buildClassConservationTable(double **joint, const double *background,
+                                                           unsigned int classes) {
+    std::vector<uint32_t> table(classes + 1, 0);
+    for (unsigned int i = 0; i < classes; i++) {
+        const double p = background[i] > 1e-9 ? background[i] : 1e-9;
+        const double stays = joint[i][i] / p;
+        const double bits = -log2(stays > 1e-9 ? stays : 1e-9);
+        table[i] = static_cast<uint32_t>(bits * 256.0 + 0.5);
+    }
+    return table;
+}
+
 uint64_t KmerExtractor::packedFlankingClassesAt(const char *sequence, size_t length,
-                                   const unsigned char *letterToCode, size_t pos) const {
+                                   const unsigned char *letterToCode, size_t pos, size_t end) const {
     const unsigned int half = KmerRecord::ADJACENT_COUNT / 2;
     uint64_t packed = 0;
     for (unsigned int slot = 0; slot < KmerRecord::ADJACENT_COUNT; slot++) {
@@ -136,7 +224,7 @@ uint64_t KmerExtractor::packedFlankingClassesAt(const char *sequence, size_t len
                 code = letterToCode[static_cast<unsigned char>(sequence[pos - before])];
             }
         } else {
-            const size_t after = pos + kmerLength + (slot - half);
+            const size_t after = end + (slot - half);
             if (after < length) {
                 code = letterToCode[static_cast<unsigned char>(sequence[after])];
             }
@@ -179,6 +267,7 @@ void KmerExtractor::swapSelected(size_t at, size_t with) {
     std::swap(selectedScores[at], selectedScores[with]);
     std::swap(selectedCodes[at], selectedCodes[with]);
     std::swap(selectedPositions[at], selectedPositions[with]);
+    std::swap(selectedEnds[at], selectedEnds[with]);
 }
 void KmerExtractor::siftWorstDown(size_t at) {
     const size_t size = selectedScores.size();
@@ -204,7 +293,7 @@ void KmerExtractor::buildWorstFirstHeap() {
     }
 }
 
-void KmerExtractor::considerCandidate(uint64_t score, uint64_t key, uint16_t pos) {
+void KmerExtractor::considerCandidate(uint64_t score, uint64_t key, uint16_t pos, uint16_t end) {
     if (selectionLimit == 0) {
         return;
     }
@@ -212,6 +301,7 @@ void KmerExtractor::considerCandidate(uint64_t score, uint64_t key, uint16_t pos
         selectedScores.push_back(score);
         selectedCodes.push_back(key);
         selectedPositions.push_back(pos);
+        selectedEnds.push_back(end);
         if (selectedScores.size() == selectionLimit) {
             buildWorstFirstHeap();
         }
@@ -223,7 +313,117 @@ void KmerExtractor::considerCandidate(uint64_t score, uint64_t key, uint16_t pos
     selectedScores[0] = score;
     selectedCodes[0] = key;
     selectedPositions[0] = pos;
+    selectedEnds[0] = end;
     siftWorstDown(0);
+}
+
+// Shazam pairs two spectral peaks instead of trusting one: an anchor strobe and a second strobe that
+// a hash picks out of a window, so one mutation kills one strobe and the other pairings survive
+size_t KmerExtractor::selectStrobes(const char *sequence, size_t length,
+                                    const unsigned char *letterToCode) {
+    const unsigned char unknownCode = unknownResidueClass();
+    const uint64_t none = UINT64_MAX;
+    strobeCode1.assign(length, none);
+    strobeCode2.assign(length, none);
+    for (unsigned int which = 0; which < 2; which++) {
+        const unsigned int len = which == 0 ? strobeLen1 : strobeLen2;
+        std::vector<uint64_t> &into = which == 0 ? strobeCode1 : strobeCode2;
+        uint64_t code = 0;
+        unsigned int filled = 0;
+        uint64_t leading = 1;
+        for (unsigned int i = 0; i + 1 < len; i++) {
+            leading *= residueClassCount;
+        }
+        for (size_t at = 0; at < length; at++) {
+            const unsigned char in = letterToCode[static_cast<unsigned char>(sequence[at])];
+            if (in >= unknownCode) {
+                code = 0;
+                filled = 0;
+                continue;
+            }
+            if (filled == len) {
+                code -= static_cast<uint64_t>(letterToCode[static_cast<unsigned char>(sequence[at - len])]) * leading;
+                filled--;
+            }
+            code = code * residueClassCount + in;
+            filled++;
+            if (filled == len) {
+                into[at + 1 - len] = code;
+            }
+        }
+    }
+    // an anchor sits wherever a plain k-mer would, and the window shrinks at the end of the sequence,
+    // so a short sequence keeps as many seeds as it had before
+    const size_t lastSecondStart = length - strobeLen2;
+    for (size_t anchor = 0; anchor + strobeLen1 + strobeLen2 <= length; anchor++) {
+        if (strobeCode1[anchor] == none) {
+            continue;
+        }
+        const uint64_t anchorHash = mixHash64(strobeCode1[anchor]);
+        uint64_t bestLink = UINT64_MAX;
+        size_t bestAt = length;
+        const size_t until = std::min(anchor + strobeLen1 + strobeWindow - 1, lastSecondStart);
+        for (size_t at = anchor + strobeLen1; at <= until; at++) {
+            if (strobeCode2[at] == none) {
+                continue;
+            }
+            const uint64_t link = anchorHash + mixHash64(strobeCode2[at]);
+            if (link < bestLink) {
+                bestLink = link;
+                bestAt = at;
+            }
+        }
+        if (bestAt == length) {
+            continue;
+        }
+        const uint64_t code = strobeCode1[anchor] * strobeShift + strobeCode2[bestAt];
+        const uint32_t conserved = 0;
+        const uint16_t end = static_cast<uint16_t>(bestAt + strobeLen2);
+        if (window > 0) {
+            considerWindowed(selectionScore(code, conserved), code, static_cast<uint16_t>(anchor), end);
+        } else {
+            considerCandidate(selectionScore(code, conserved), code, static_cast<uint16_t>(anchor), end);
+        }
+    }
+    return selectedScores.size();
+}
+
+void KmerExtractor::resetWindow() {
+    windowScores.clear();
+    windowCodes.clear();
+    windowPositions.clear();
+    windowEnds.clear();
+    windowHead = 0;
+    windowSeen = 0;
+    lastEmittedPos = 0xFFFFFFFFu;
+}
+
+// keep the lowest-hashing k-mer of every window of `window` consecutive k-mers, so no stretch of the
+// sequence longer than the window can go unrepresented the way a global top-s selection allows
+void KmerExtractor::considerWindowed(uint64_t score, uint64_t key, uint16_t pos, uint16_t end) {
+    while (windowScores.size() > windowHead && windowScores.back() >= score) {
+        windowScores.pop_back();
+        windowCodes.pop_back();
+        windowPositions.pop_back();
+        windowEnds.pop_back();
+    }
+    windowScores.push_back(score);
+    windowCodes.push_back(key);
+    windowPositions.push_back(pos);
+    windowEnds.push_back(end);
+    while (windowPositions[windowHead] + window <= pos) {
+        windowHead++;
+    }
+    windowSeen++;
+    if (windowSeen < window || windowPositions[windowHead] == lastEmittedPos
+        || selectedScores.size() >= selectionLimit) {
+        return;
+    }
+    lastEmittedPos = windowPositions[windowHead];
+    selectedScores.push_back(windowScores[windowHead]);
+    selectedCodes.push_back(windowCodes[windowHead]);
+    selectedPositions.push_back(windowPositions[windowHead]);
+    selectedEnds.push_back(windowEnds[windowHead]);
 }
 
 size_t KmerExtractor::selectFromSequence(const char *sequence, size_t length,
@@ -234,29 +434,73 @@ size_t KmerExtractor::selectFromSequence(const char *sequence, size_t length,
     selectedScores.clear();
     selectedCodes.clear();
     selectedPositions.clear();
-    if (length < kmerLength) {
+    selectedEnds.clear();
+    resetWindow();
+    if (strobeWindow > 0) {
+        return selectStrobes(sequence, length, letterToCode);
+    }
+    if (length < patternSpan) {
         return 0;
+    }
+    if (patternOffsets.empty() == false) {
+        for (size_t start = 0; start + patternSpan <= length; start++) {
+            uint64_t code = 0;
+            uint32_t conserved = 0;
+            bool informative = true;
+            for (size_t j = 0; j < patternOffsets.size(); j++) {
+                const unsigned char in =
+                    letterToCode[static_cast<unsigned char>(sequence[start + patternOffsets[j]])];
+                if (in >= unknownCode) {
+                    informative = false;
+                    break;
+                }
+                code = code * residueClassCount + in;
+                conserved += conservationOfClass(in);
+            }
+            if (informative == false) {
+                resetWindow();
+                continue;
+            }
+            const uint64_t score = selectionScore(code, conserved);
+            if (window > 0) {
+                considerWindowed(score, code, static_cast<uint16_t>(start), static_cast<uint16_t>(start + patternSpan));
+            } else {
+                considerCandidate(score, code, static_cast<uint16_t>(start), static_cast<uint16_t>(start + patternSpan));
+            }
+        }
+        return selectedScores.size();
     }
     uint64_t code = 0;
     unsigned int filled = 0;
+    uint32_t conserved = 0;
     for (size_t at = 0; at < length; at++) {
         const unsigned char in = letterToCode[static_cast<unsigned char>(sequence[at])];
         if (in >= unknownCode) {
             code = 0;
             filled = 0;
+            conserved = 0;
+            resetWindow();
             continue;
         }
         if (filled == kmerLength) {
-            code -= static_cast<uint64_t>(
-                        letterToCode[static_cast<unsigned char>(sequence[at - kmerLength])])
-                    * leadingResidueWeight;
+            const unsigned char out = letterToCode[static_cast<unsigned char>(sequence[at - kmerLength])];
+            code -= static_cast<uint64_t>(out) * leadingResidueWeight;
+            conserved -= conservationOfClass(out);
             filled--;
         }
         code = code * residueClassCount + in;
+        conserved += conservationOfClass(in);
         filled++;
         if (filled == kmerLength) {
             const size_t kmerStart = at + 1 - kmerLength;
-            considerCandidate(selectionScore(mixHash64(code)), code, static_cast<uint16_t>(kmerStart));
+            const uint64_t score = selectionScore(code, conserved);
+            if (window > 0) {
+                considerWindowed(score, code, static_cast<uint16_t>(kmerStart),
+                                 static_cast<uint16_t>(kmerStart + kmerLength));
+            } else {
+                considerCandidate(score, code, static_cast<uint16_t>(kmerStart),
+                                  static_cast<uint16_t>(kmerStart + kmerLength));
+            }
         }
     }
     return selectedScores.size();
@@ -312,13 +556,19 @@ static std::vector<ExtractionChunk> planExtractionChunks(const RunDbReader &read
     return extractionChunks;
 }
 
-static unsigned int selectedKmerLimitForLength(unsigned int baseKmersPerSequence, float kmersPerResidue, uint32_t length) {
+static unsigned int selectedKmerLimitForLength(unsigned int baseKmersPerSequence, float kmersPerResidue,
+                                               uint32_t length, unsigned int minimizerWindow) {
+    if (minimizerWindow > 0) {
+        return length;
+    }
     const double asked = (double) baseKmersPerSequence + (double) kmersPerResidue * (double) length;
     return (unsigned int) (asked < (double) length ? asked : (double) length);
 }
 
-static unsigned int maxSelectedKmersForAnySequence(unsigned int baseKmersPerSequence, float kmersPerResidue) {
-    return selectedKmerLimitForLength(baseKmersPerSequence, kmersPerResidue, SequenceLocator::MAX_SEQ_LEN);
+static unsigned int maxSelectedKmersForAnySequence(unsigned int baseKmersPerSequence, float kmersPerResidue,
+                                                   unsigned int minimizerWindow) {
+    return selectedKmerLimitForLength(baseKmersPerSequence, kmersPerResidue, SequenceLocator::MAX_SEQ_LEN,
+                                      minimizerWindow);
 }
 
 static const uint64_t RANKS_PER_READ_BATCH = 2048;
@@ -326,6 +576,8 @@ static const uint64_t RANKS_PER_READ_BATCH = 2048;
 static uint64_t extractAndWriteChunkKmers(const RunDbReader &dbReader, const ExtractionChunk &extractionChunk, BucketWriter<KmerRecord> &kmerBucketWriter,
                          const unsigned char *residueToClass, unsigned int kmerLength,
                          unsigned int residueClassCount, unsigned int baseKmersPerSequence, float kmersPerResidue,
+                         unsigned int minimizerWindow, const std::string &spacedPattern,
+                         unsigned int strobeWindow, const std::vector<uint32_t> &classConservation,
                          unsigned int threadCount,
                          std::vector<std::vector<uint64_t> > &subBucketCountsByThread) {
     const size_t bucketCount = KmerRecord::BUCKET_COUNT;
@@ -337,7 +589,8 @@ static uint64_t extractAndWriteChunkKmers(const RunDbReader &dbReader, const Ext
         threadIdx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
         KmerExtractor kmerExtractor(kmerLength, residueClassCount,
-                                maxSelectedKmersForAnySequence(baseKmersPerSequence, kmersPerResidue));
+                                maxSelectedKmersForAnySequence(baseKmersPerSequence, kmersPerResidue, minimizerWindow),
+                                minimizerWindow, spacedPattern, strobeWindow, classConservation);
         RunDbReader::Cursor dbCursor;
         KmerRecord kmerRecord;
         std::vector<uint64_t> &threadSubBucketCounts = subBucketCountsByThread[threadIdx];
@@ -369,12 +622,13 @@ static uint64_t extractAndWriteChunkKmers(const RunDbReader &dbReader, const Ext
                     const char *sequence = (sequenceIndexInBatch == 0) ? dbReader.batchQueryAt(threadIdx, 0)
                                                        : dbReader.batchAt(threadIdx, 0, sequenceIndexInBatch - 1);
                     const size_t selectedKmerCount = kmerExtractor.selectFromSequence(sequence, length, residueToClass,
-                                                          selectedKmerLimitForLength(baseKmersPerSequence, kmersPerResidue, length));
+                                                          selectedKmerLimitForLength(baseKmersPerSequence, kmersPerResidue, length, minimizerWindow));
                     for (size_t i = 0; i < selectedKmerCount; i++) {
                         const uint64_t spreadKmerHash = KmerExtractor::spreadKmerCode(kmerExtractor.selectedKmerCodes()[i]);
                         const uint64_t kmerStart = kmerExtractor.selectedKmerPositions()[i];
                         kmerRecord.set(KmerExtractor::recordKeyForKmerHash(spreadKmerHash), rank, kmerStart,
-                                   kmerExtractor.packedFlankingClassesAt(sequence, length, residueToClass, kmerStart));
+                                   kmerExtractor.packedFlankingClassesAt(sequence, length, residueToClass, kmerStart,
+                                                                         kmerExtractor.selectedKmerEnds()[i]));
                         const size_t bucketIndex = KmerExtractor::bucketForKmerHash(spreadKmerHash, bucketCount);
                         kmerBucketWriter.add(threadIdx, kmerRecord, bucketIndex);
                         threadSubBucketCounts[bucketIndex * KmerRecord::SUB_BUCKET_COUNT + kmerRecord.subBucket()]++;
@@ -448,16 +702,30 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
     ReducedMatrix reducedMatrix(fullMatrix.probMatrix, fullMatrix.subMatrixPseudoCounts, fullMatrix.aa2num, fullMatrix.num2aa,
                          fullMatrix.alphabetSize, reducedAlphabetSize, 2.0);
     const unsigned int validResidueClassCount = static_cast<unsigned int>(reducedAlphabetSize) - 1;
+    const std::vector<uint32_t> classConservation =
+        par.conservedSelect ? KmerExtractor::buildClassConservationTable(reducedMatrix.probMatrix, reducedMatrix.pBack,
+                                                                validResidueClassCount)
+                         : std::vector<uint32_t>();
+    if (par.conservedSelect) {
+        double sum = 0;
+        for (unsigned int i = 0; i < validResidueClassCount; i++) {
+            sum += reducedMatrix.pBack[i];
+        }
+        Debug(Debug::INFO) << "Conservation weighted selection over " << validResidueClassCount
+                           << " classes, background sums to " << sum << "\n";
+    }
     const std::vector<unsigned char> letterToCode =
         KmerExtractor::buildResidueToClassTable(reducedMatrix.aa2num, validResidueClassCount, par.maskLowerCaseMode == 1);
 
     const unsigned int baseKmersPerSequence =
         par.kmersPerSequence > 1 ? par.kmersPerSequence - 1 : 1;
     const float kmersPerResidue = par.kmersPerSequenceScale.values.aminoacid();
+    const unsigned int minimizerWindow = (unsigned int) par.kmerWindow;
     const size_t workingMemoryBudgetBytes = static_cast<size_t>(Util::computeMemory(par.splitMemoryLimit) * 0.95);
     // the pass makes one record per selected k-mer, not per byte, so split by that count
     const std::vector<size_t> assignedFileSlots = nodeFileSlots(reader.getSequenceLocator(), node,
-        [=](uint32_t length) { return selectedKmerLimitForLength(baseKmersPerSequence, kmersPerResidue, length); });
+        [=](uint32_t length) { return selectedKmerLimitForLength(baseKmersPerSequence, kmersPerResidue, length,
+                                                                 minimizerWindow); });
     const std::vector<ExtractionChunk> extractionChunks = planExtractionChunks(reader, assignedFileSlots, CHECKPOINT_BYTE_LIMIT);
     Debug(Debug::INFO) << "Node " << node.index << " of " << node.count << " takes " << assignedFileSlots.size()
                        << " length groups in " << extractionChunks.size() << " chunks, k-mer length " << par.kmerSize
@@ -504,7 +772,8 @@ int lin8extractkmers(int argc, const char **argv, const Command &command) {
         pendingCheckpointRecordCount += extractAndWriteChunkKmers(reader, extractionChunks[at], writer, letterToCode.data(), par.kmerSize,
                                        validResidueClassCount, baseKmersPerSequence,
                                        par.kmersPerSequenceScale.values.aminoacid(),
-                                       par.threads, pendingSubBucketCountsByThread);
+                                       minimizerWindow, par.spacedKmerPattern, (unsigned int) par.strobeWindow,
+                                       classConservation, par.threads, pendingSubBucketCountsByThread);
         extractionSeconds += omp_get_wtime() - phaseStartTime;
         if (pendingCheckpointRecordCount * KmerRecord::DISK_BYTES >= CHECKPOINT_BYTE_LIMIT || at + 1 == extractionChunks.size()) {
             phaseStartTime = omp_get_wtime();
@@ -753,7 +1022,7 @@ static void swapCenterSequence(KmerRecord *group, std::vector<uint32_t> &lengths
 
 static void assignGroup(KmerRecord *group, size_t size, const RunDbReader &reader,
                          float covThr, int covMode, bool onlyExtendable, BaseMatrix *subMat,
-                         int adjacentRounds,
+                         int adjacentRounds, int adjMinScore,
                          std::vector<PairRecord> &out,
                          std::vector<uint32_t> &lengths, RunDbReader::Cursor &at) {
     if (size < 2) {
@@ -774,9 +1043,17 @@ static void assignGroup(KmerRecord *group, size_t size, const RunDbReader &reade
         const uint64_t rep = group[round].rank();
         const uint64_t repPos = group[round].pos();
         const uint32_t queryLen = lengths[round];
+        const short *repRow[KmerRecord::ADJACENT_COUNT];
+        for (unsigned int slot = 0; slot < KmerRecord::ADJACENT_COUNT; slot++) {
+            repRow[slot] = subMat->subMatrix[group[round].adjacentAt(slot)];
+        }
         for (size_t i = 0; i < size; i++) {
             const uint64_t member = group[i].rank();
             if (member == rep) {
+                continue;
+            }
+            // the six flanking classes ride along in every record, so extending the seed costs no read
+            if (adjMinScore != INT_MIN && adjacencyScore(group[i], repRow) < adjMinScore) {
                 continue;
             }
             const uint32_t targetLen = lengths[i];
@@ -937,7 +1214,7 @@ int lin8assignedpairs(int argc, const char **argv, const Command &command) {
                     }
                     out.clear();
                     assignGroup(&records[begin], end - begin, reader, par.covThr, par.covMode,
-                                par.includeOnlyExtendable, &subMat, adjacentRounds,
+                                par.includeOnlyExtendable, &subMat, adjacentRounds, par.adjMinScore,
                                 out, lengths, at);
                     for (size_t i = 0; i < out.size(); i++) {
                         const size_t fine = PairRecord::fineOf(out[i].rep(), ranks, repRankBlockCount);

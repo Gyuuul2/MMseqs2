@@ -681,6 +681,10 @@ public:
     float countTableScale;
     bool includeAdjacency;
     int adjIteration;
+    int adjMinScore;
+    int kmerWindow;
+    int strobeWindow;
+    bool conservedSelect;
     bool clustHash;
     int linclustVersion;
     int linclust2Iter;
@@ -1060,6 +1064,10 @@ public:
     PARAMETER(PARAM_NUM_COUNTS)
     PARAMETER(PARAM_INCLUDE_ADJACENCY)
     PARAMETER(PARAM_NUM_ADJACENCY)
+    PARAMETER(PARAM_ADJ_MIN_SCORE)
+    PARAMETER(PARAM_KMER_WINDOW)
+    PARAMETER(PARAM_STROBE_WINDOW)
+    PARAMETER(PARAM_CONSERVED_SELECT)
     PARAMETER(PARAM_USE_PARALLELISM)
     PARAMETER(PARAM_NEED_WRITEBUFFER)
     PARAMETER(PARAM_COMPRESS_KMER_TMP_FILES)
