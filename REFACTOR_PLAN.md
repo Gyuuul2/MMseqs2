@@ -201,3 +201,28 @@ uniprot_32, child 7,913,508행 / parent 7,598,457행, 20 splits, 20 threads
 2. **정수 키가 10.4배를 준다.** 행당 83.4 B(실측) → 8 B 면 1e12 에서 필요 splits 9,948 → 954. `MERGE_DESIGN §3.2`.
 
 **보존 검사가 완전한 이유**(주석에 한 줄로 있음): child 행 하나가 `lower_bound` 를 한 번 하고 최대 한 행을 내므로 `joinedRows <= childRows` 가 루프 구조만으로 성립한다. 따라서 "한 rep 초과 + 다른 rep 누락" 상쇄가 불가능하다. **중복 검사와는 무관하다** — 그건 한 member 가 두 클러스터에 지명된 입력을 거부하는 별개 장치다(뒤집기 전 child 측 해시는 값이 `vector` 라 초과가 가능했고, 그때는 합계 검사가 실제로 취약했다).
+
+## map/set — 배치 경로는 이미 비어 있다 (사용자 지시, 2026-09-26)
+
+지시: **코어 모듈에서는 없애고 싶다(1e12 때문), 배치 파이프라인에는 넣지 말 것.**
+
+배치/linclust 가 실제로 실행하는 모듈을 전수 확인했다(`createdb`, `kmermatcher`, `Align2clust`,
+`mergeclusters`, `clusthashfast`, `createtsv`, `createsubdb`, `convert2fasta`, `DBReader`,
+`DBWriter`, `FileUtil`, `Util`, `KSeqWrapper`, `Linclust`, `ClusteringAlgorithms`,
+`AlignmentSymmetry`). 선언 **3곳**뿐이고 전부 업스트림이며 **서열 수에 비례하지 않는다**:
+
+| 위치 | 언제 채워지나 | 규모 |
+|---|---|---|
+| `createtsv.cpp:70` (2개) | `DBTYPE_EXTENDED_SET` 일 때만. 배치는 평범한 서열 DB 라 항상 빈 채로 남는다 | 0 |
+| `Util::readLookup` | `.source` 를 읽는다 = **입력 파일당 한 줄**(`.lookup` 이 아니다) | 입력 파일 수 |
+
+우리가 추가한 것은 0이다(`git diff 22c2fff5` 로 확인). 마지막 하나였던
+`propagateclusters` 의 `unordered_map` 은 정렬 배열 + `lower_bound` 로 대체됐다(`349f8501`).
+
+트리 전체로는 29 파일 101 선언이지만 나머지 98개는 `taxonomy`, `convertalignments`,
+`summarizetabs` 등 **배치 경로가 부르지 않는** 모듈이다. 거기서 걷어내는 것은 1e12 클러스터링과
+무관한 작업이므로 이 리팩터 범위에 넣지 않는다.
+
+**앞으로의 규칙**: 배치 파이프라인과 그 신규 모듈에는 map/set 을 쓰지 않는다. 키로 조회가
+필요하면 정렬 배열 + `lower_bound`(선례: 이 모듈), 또는 조밀한 정수 인덱스 + 카운트/누적합
+(선례: `AlignmentSymmetry::computeOffsetFromCounts`).
