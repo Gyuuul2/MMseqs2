@@ -70,6 +70,7 @@ void AlignmentSymmetry::readInData(DBReader<DBKeyType>*alnDbr, DBReader<DBKeyTyp
                         Debug(Debug::ERROR) << "Set " << i
                                             << " has more elements than allocated (" << setSize
                                             << ")!\n";
+                        // is it correct? continue does not advance data, so this loops forever
                         continue;
                     }
                     char similarity[255 + 1];
