@@ -401,7 +401,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         par.db1.c_str(), par.db1Index.c_str(), par.threads, 
         DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
     );
-    seqDbr->open(DBReader<DBKeyType>::SORT_BY_LENGTH);
+    seqDbr->open(DBReader<DBKeyType>::NOSORT);
  
     DBReader<DBKeyType> *cluDbr = nullptr;
     DBReader<DBKeyType> *cluSeqDbr = nullptr;
@@ -495,6 +495,38 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     Timer timer;
     timer.reset();
     PrefInfo *prefRepSizePair = nullptr;
+    // GREEDY visits the longest sequence first; NOSORT leaves the db in file order, so the order is
+    // materialised here as 4 byte per sequence instead of the 8 byte SORT_BY_LENGTH keeps resident
+    DBLocalId *lengthOrder = nullptr;
+    if (mode != Parameters::SET_COVER) {
+        bool alreadyDescending = true;
+        for (size_t i = 1; i < dbSize; i++) {
+            if (seqDbr->getSeqLen(i) > seqDbr->getSeqLen(i - 1)) {
+                alreadyDescending = false;
+                break;
+            }
+        }
+        if (alreadyDescending == false) {
+            lengthOrder = new(std::nothrow) DBLocalId[dbSize];
+            Util::checkAllocation(lengthOrder, "Can not allocate lengthOrder memory in align2clust");
+#pragma omp parallel for schedule(static)
+            for (size_t i = 0; i < dbSize; i++) {
+                lengthOrder[i] = static_cast<DBLocalId>(i);
+            }
+            DBReader<DBKeyType> *order = seqDbr;
+            SORT_PARALLEL(lengthOrder, lengthOrder + dbSize,
+                          [order](DBLocalId first, DBLocalId second) {
+                              const size_t firstLen = order->getSeqLen(first);
+                              const size_t secondLen = order->getSeqLen(second);
+                              if (firstLen != secondLen) {
+                                  return firstLen > secondLen;
+                              }
+                              return first < second;
+                          });
+        }
+        Debug(Debug::INFO) << "Length order: " << (lengthOrder == nullptr ? "db is already descending" : "built")
+                           << " (" << timer.lap() << ")\n";
+    }
     
     if (mode == Parameters::SET_COVER) {
         prefRepSizePair = new(std::nothrow) PrefInfo[dbSize];
@@ -573,8 +605,8 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 queryKey = seqDbr->getDbKey(representativeId);
                 clusterResult.prefSize = prefRepSizePair[i].size;   // precomputed in the prefix pass
             } else { // GREEDY || GREEDY_MEM
-                queryKey = seqDbr->getDbKey(i);
-                representativeId = seqDbr->getId(queryKey);
+                representativeId = (lengthOrder != nullptr) ? lengthOrder[i] : static_cast<DBLocalId>(i);
+                queryKey = seqDbr->getDbKey(representativeId);
                 clusterResult.prefSize = 0;                         // greedy has no currentPrefSize gate
             }
             clusterResult.representativeId = representativeId;
@@ -962,6 +994,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     delete[] assignment;
     if (prefRepSizePair != nullptr) {
         delete[] prefRepSizePair;
+    }
+    if (lengthOrder != nullptr) {
+        delete[] lengthOrder;
     }
     delete[] fastMatrix.matrix;
     delete[] fastMatrix.matrixData;
