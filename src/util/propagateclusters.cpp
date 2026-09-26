@@ -7,9 +7,10 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <algorithm>
 #include <fstream>
 #include <mutex>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #ifdef OPENMP
@@ -91,40 +92,50 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
 #pragma omp parallel reduction(+:joinedTotal)
     {
         std::vector<std::string> buffers(splits);
-        std::unordered_map<std::string, std::vector<std::string> > childByRep;
+        // the parent names each representative once, so it is the smaller side and the one to hold;
+        // the child carries a row per sequence and only ever streams past
+        std::vector<std::pair<std::string, std::string> > parentByMember;
         std::string line, first, second;
 
 #pragma omp for schedule(dynamic, 1)
         for (unsigned int b = 0; b < splits; b++) {
             progress.updateProgress();
-            childByRep.clear();
-            size_t childRows = 0;
-            for (size_t f = 0; f < childShards[b].size(); f++) {
-                ZstdReader child(childShards[b][f]);
-                while (child.getLine(line)) {
-                    splitLine(line, first, second);
-                    childByRep[first].push_back(second);
-                    childRows++;
-                }
-            }
-
-            size_t joinedRows = 0;
+            parentByMember.clear();
             for (size_t f = 0; f < parentShards[b].size(); f++) {
                 ZstdReader parent(parentShards[b][f]);
                 while (parent.getLine(line)) {
                     splitLine(line, first, second);
-                    std::unordered_map<std::string, std::vector<std::string> >::const_iterator it = childByRep.find(second);
-                    if (it == childByRep.end()) {
+                    parentByMember.push_back(std::make_pair(second, first));
+                }
+            }
+            std::sort(parentByMember.begin(), parentByMember.end());
+            for (size_t i = 1; i < parentByMember.size(); i++) {
+                if (parentByMember[i].first == parentByMember[i - 1].first) {
+                    Debug(Debug::ERROR) << "The parent names " << parentByMember[i].first
+                                        << " in more than one cluster\n";
+                    EXIT(EXIT_FAILURE);
+                }
+            }
+
+            size_t childRows = 0;
+            size_t joinedRows = 0;
+            for (size_t f = 0; f < childShards[b].size(); f++) {
+                ZstdReader child(childShards[b][f]);
+                while (child.getLine(line)) {
+                    splitLine(line, first, second);
+                    childRows++;
+                    std::vector<std::pair<std::string, std::string> >::const_iterator it =
+                        std::lower_bound(parentByMember.begin(), parentByMember.end(),
+                                         std::make_pair(first, std::string()));
+                    if (it == parentByMember.end() || it->first != first) {
                         continue;
                     }
-                    const unsigned int k = Util::tsvSplitOfKey(first, splits);
-                    for (size_t i = 0; i < it->second.size(); i++) {
-                        buffers[k].append(first);
-                        buffers[k].append(1, '\t');
-                        buffers[k].append(it->second[i]);
-                        buffers[k].append(1, '\n');
-                    }
-                    joinedRows += it->second.size();
+                    const unsigned int k = Util::tsvSplitOfKey(it->second, splits);
+                    buffers[k].append(it->second);
+                    buffers[k].append(1, '\t');
+                    buffers[k].append(second);
+                    buffers[k].append(1, '\n');
+                    joinedRows++;
                     if (buffers[k].size() >= flushSize) {
                         std::lock_guard<std::mutex> guard(locks[k]);
                         writers[k]->write(buffers[k]);
