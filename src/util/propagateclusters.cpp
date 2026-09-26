@@ -196,6 +196,8 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
                     continue;
                 }
 
+                // lower_bound below would resolve a member named by two clusters to whichever sorted
+                // first, so reject it here rather than pick one
                 std::sort(parentByMember.begin(), parentByMember.end());
                 for (size_t i = 1; i < parentByMember.size(); i++) {
                     if (parentByMember[i].first == parentByMember[i - 1].first) {
@@ -233,7 +235,8 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
                 }
             }
 
-            // every child representative is named by exactly one parent row
+            // a child row does one lookup and emits at most one row, so this sum cannot be met by
+            // one representative matching twice while another matches none
             if (joinedRows != childRows) {
                 Debug(Debug::ERROR) << "Split " << b << " lost cluster members: the child has "
                                     << childRows << " row(s), the join produced " << joinedRows << "\n";
