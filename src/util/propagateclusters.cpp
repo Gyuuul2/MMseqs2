@@ -107,8 +107,13 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
         widestBound = std::max(widestBound, bound * (1 + sizeof(std::pair<std::string, std::string>)));
     }
 
+    // A live split also holds one output buffer per split, because any row can route to any of
+    // them, so the buffers are part of what has to fit rather than a separate allowance.
+    const size_t buffersPerSplit = (size_t) splits * Util::TSV_SPLIT_BUFFER_MIN;
+
     unsigned int concurrency = (unsigned int) par.threads;
-    if (mustMeasure || widestBound == 0 || budget / widestBound < (size_t) par.threads) {
+    size_t widestParent = 0;
+    if (mustMeasure || widestBound == 0 || budget / (widestBound + buffersPerSplit) < (size_t) par.threads) {
         std::vector<size_t> parentResident(splits, 0);
 #pragma omp parallel for schedule(dynamic, 1)
         for (unsigned int b = 0; b < splits; b++) {
@@ -124,21 +129,22 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
             }
             parentResident[b] = bytes + rows * sizeof(std::pair<std::string, std::string>);
         }
-        size_t widestParent = 0;
         for (unsigned int b = 0; b < splits; b++) {
             widestParent = std::max(widestParent, parentResident[b]);
         }
-        if (widestParent > 0 && budget / widestParent < concurrency) {
-            concurrency = (unsigned int) std::max((size_t) 1, budget / widestParent);
+        const size_t perSplit = widestParent + buffersPerSplit;
+        if (perSplit > 0 && budget / perSplit < concurrency) {
+            concurrency = (unsigned int) std::max((size_t) 1, budget / perSplit);
         }
         Debug(Debug::INFO) << "Holding the parent of " << concurrency << " split(s) at once, "
                            << (widestParent / (1024 * 1024)) << " MB for the widest\n";
     }
 
     const size_t splitBudget = budget / concurrency;
-
+    const size_t forBuffers = (splitBudget > widestParent) ? splitBudget - widestParent : 0;
     const size_t flushSize = std::max(Util::TSV_SPLIT_BUFFER_MIN,
-                                      Util::TSV_SPLIT_BUFFER_TOTAL / ((size_t) par.threads * splits));
+                                      std::min(Util::TSV_SPLIT_BUFFER_TOTAL / ((size_t) concurrency * splits),
+                                               forBuffers / splits));
     Debug::Progress progress(splits);
     size_t joinedTotal = 0;
 #pragma omp parallel num_threads(concurrency) reduction(+:joinedTotal)
