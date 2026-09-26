@@ -85,15 +85,63 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
         manifest.append(1, '\n');
     }
 
-    // the parent of one split is held in memory, so it is taken in several passes when it does not
-    // fit, streaming the child again for each; the resident set then stays under the budget
-    const size_t budget = Util::computeMemory(par.splitMemoryLimit) / (size_t) par.threads;
+    // The parent of one split is held in memory. Measure each split's parent first, then run only
+    // as many splits at once as the budget allows: re-reading the child in extra passes costs far
+    // more than giving up parallelism, because the child is the larger side. Passes are the last
+    // resort, for a single split that does not fit on its own.
+    const size_t budget = Util::computeMemory(par.splitMemoryLimit);
+    // A plain shard holds at least one byte per row, so its parent costs at most the file size plus
+    // one pair per byte. When even that bound fits, the measuring pass is skipped: it reads the
+    // parent a second time, which is not worth paying on a machine with room to spare.
+    bool mustMeasure = false;
+    size_t widestBound = 0;
+    for (unsigned int b = 0; b < splits; b++) {
+        size_t bound = 0;
+        for (size_t f = 0; f < parentShards[b].size(); f++) {
+            if (Util::endsWith(".zst", parentShards[b][f])) {
+                mustMeasure = true;
+                break;
+            }
+            bound += FileUtil::getFileSize(parentShards[b][f]);
+        }
+        widestBound = std::max(widestBound, bound * (1 + sizeof(std::pair<std::string, std::string>)));
+    }
+
+    unsigned int concurrency = (unsigned int) par.threads;
+    if (mustMeasure || widestBound == 0 || budget / widestBound < (size_t) par.threads) {
+        std::vector<size_t> parentResident(splits, 0);
+#pragma omp parallel for schedule(dynamic, 1)
+        for (unsigned int b = 0; b < splits; b++) {
+            size_t rows = 0;
+            size_t bytes = 0;
+            std::string probe;
+            for (size_t f = 0; f < parentShards[b].size(); f++) {
+                ZstdReader parent(parentShards[b][f]);
+                while (parent.getLine(probe)) {
+                    rows++;
+                    bytes += probe.size();
+                }
+            }
+            parentResident[b] = bytes + rows * sizeof(std::pair<std::string, std::string>);
+        }
+        size_t widestParent = 0;
+        for (unsigned int b = 0; b < splits; b++) {
+            widestParent = std::max(widestParent, parentResident[b]);
+        }
+        if (widestParent > 0 && budget / widestParent < concurrency) {
+            concurrency = (unsigned int) std::max((size_t) 1, budget / widestParent);
+        }
+        Debug(Debug::INFO) << "Holding the parent of " << concurrency << " split(s) at once, "
+                           << (widestParent / (1024 * 1024)) << " MB for the widest\n";
+    }
+
+    const size_t splitBudget = budget / concurrency;
 
     const size_t flushSize = std::max(Util::TSV_SPLIT_BUFFER_MIN,
                                       Util::TSV_SPLIT_BUFFER_TOTAL / ((size_t) par.threads * splits));
     Debug::Progress progress(splits);
     size_t joinedTotal = 0;
-#pragma omp parallel reduction(+:joinedTotal)
+#pragma omp parallel num_threads(concurrency) reduction(+:joinedTotal)
     {
         std::vector<std::string> buffers(splits);
         // the parent names each representative once, so it is the smaller side and the one to hold;
@@ -123,7 +171,7 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
                         }
                         parentByMember.push_back(std::make_pair(second, first));
                         resident += first.size() + second.size() + sizeof(std::pair<std::string, std::string>);
-                        if (resident > budget) {
+                        if (resident > splitBudget) {
                             overBudget = true;
                             break;
                         }
