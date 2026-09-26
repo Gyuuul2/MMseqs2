@@ -1918,19 +1918,19 @@ write_counter_file() {
     printf '%s\n' "$value" > "$out"
 }
 
-# TSVs are written pre-split, so a run must keep ONE split count: pin on first use, adopt on resume.
-pin_merge_splits() {
-    local store="$1" pinned tmp
-    # a pre-rename work area pinned merge_buckets.txt and wrote .bkt TSVs; re-deriving a count here would silently break its join
+# TSVs are written pre-split, so a run keeps ONE split count: settle it on first use, reuse it on resume.
+resolve_merge_splits() {
+    local store="$1" settled tmp
+    # a pre-rename work area settled on merge_buckets.txt and wrote .bkt TSVs; re-deriving a count here would silently break its join
     local legacy="${store%merge_splits.txt}merge_buckets.txt"
     if ! done_exists "$store" && done_exists "$legacy"; then
-        fail "this work area was pinned by an older version ($legacy, .bkt file naming); finish it with that version or start a fresh work dir"
+        fail "this work area was settled by an older version ($legacy, .bkt file naming); finish it with that version or start a fresh work dir"
     fi
-    pinned=$(read_counter_uri "$store")
-    if [[ "$pinned" -gt 0 ]]; then
-        if [[ "$pinned" != "$MERGE_SPLITS" ]]; then
-            log "merge-splits pinned to ${pinned} by an earlier run of this work area (this run derived ${MERGE_SPLITS}); using ${pinned}"
-            MERGE_SPLITS="$pinned"
+    settled=$(read_counter_uri "$store")
+    if [[ "$settled" -gt 0 ]]; then
+        if [[ "$settled" != "$MERGE_SPLITS" ]]; then
+            log "merge-splits settled at ${settled} by an earlier run of this work area (this run derived ${MERGE_SPLITS}); using ${settled}"
+            MERGE_SPLITS="$settled"
             [[ "$MERGE_SPLIT_JOBS" -gt "$MERGE_SPLITS" ]] && MERGE_SPLIT_JOBS="$MERGE_SPLITS"
             check_split_fd_budget
         fi
@@ -2562,8 +2562,8 @@ aws_submit() {
         return 0
     fi
     aws_require_submit_env
-    # dry-run performs no S3 writes, so it cannot pin; the pinned value rides in config.env below
-    pin_merge_splits "$(join_uri "$work_prefix" "merge_splits.txt")"
+    # dry-run performs no S3 writes, so it cannot settle one; the settled value rides in config.env below
+    resolve_merge_splits "$(join_uri "$work_prefix" "merge_splits.txt")"
 
     # the round0 override is a pair: setting only the queue or only the definition mismatches arch and image
     if [[ -n "${ROUND0_BATCH_AWS_JOB_QUEUE:-}" && -z "${ROUND0_BATCH_AWS_JOB_DEFINITION:-}" ]]; then
@@ -2625,8 +2625,8 @@ aws_driver() {
     is_s3 "$work_prefix" || fail "aws-driver requires an s3:// work prefix"
     is_s3 "$result_prefix" || fail "aws-driver requires an s3:// result prefix"
     [[ "$round" -le "$MAX_ROUNDS" ]] || fail "round $round exceeds MAX_ROUNDS=$MAX_ROUNDS"
-    # adopt the run's pinned split count, so no round can write TSVs with a different one
-    pin_merge_splits "$(join_uri "$work_prefix" "merge_splits.txt")"
+    # take the run's settled split count, so no round can write TSVs with a different one
+    resolve_merge_splits "$(join_uri "$work_prefix" "merge_splits.txt")"
 
     local script_uri="${BATCH_AWS_SCRIPT_URI:-${work_prefix}scripts/batch_clustering.sh}"
     local node_work_dir
@@ -2729,8 +2729,8 @@ aws_merge() {
 
     is_s3 "$work_prefix" || fail "aws-merge requires an s3:// work prefix"
     is_s3 "$result_prefix" || fail "aws-merge requires an s3:// result prefix"
-    # adopt the run's pinned split count, so retries and the propagate join stay on one count
-    pin_merge_splits "$(join_uri "$work_prefix" "merge_splits.txt")"
+    # take the run's settled split count, so retries and the propagate join stay on one count
+    resolve_merge_splits "$(join_uri "$work_prefix" "merge_splits.txt")"
 
     local script_uri="${BATCH_AWS_SCRIPT_URI:-${work_prefix}scripts/batch_clustering.sh}"
     local node_work_dir
@@ -3057,8 +3057,8 @@ aws_final_join() {
     work_prefix=$(normalize_s3_prefix "$1")
     is_s3 "$work_prefix" || fail "aws-final-join requires an s3:// work prefix"
     [[ "$phase" == "join" || "$phase" == "emit" ]] || fail "aws-final-join phase must be join or emit (got '$phase')"
-    # adopt the run's pinned split count, so the bucket-wise join stays on one count
-    pin_merge_splits "$(join_uri "$work_prefix" "merge_splits.txt")"
+    # take the run's settled split count, so the bucket-wise join stays on one count
+    resolve_merge_splits "$(join_uri "$work_prefix" "merge_splits.txt")"
     local np="${MERGE_NODES:-1}"
     local index="${AWS_BATCH_JOB_ARRAY_INDEX:-0}"
     local node_work_dir
@@ -3154,7 +3154,7 @@ slurm_submit() {
         log "multi-node: reusing completed result $result_dir/$final_cluster_name"
         return 0
     fi
-    pin_merge_splits "$work_dir/merge_splits.txt"
+    resolve_merge_splits "$work_dir/merge_splits.txt"
     build_slurm_node_array 0
     [[ "${#SLURM_NODE_ARRAY[@]}" -gt 0 ]] || fail "--backend multi-node requires --slurm-nodelist"
     need_cmd sbatch
@@ -3199,8 +3199,8 @@ slurm_driver() {
     local chunks="$round_dir/chunks"
     local chunk_manifest="$round_dir/chunks.tsv"
     mkdir -p "$round_dir" "$clustered" "$slurm_dir"
-    # adopt the work area's pinned split count, so no round can write TSVs with a different one
-    pin_merge_splits "$work_dir/merge_splits.txt"
+    # take the work area's settled split count, so no round can write TSVs with a different one
+    resolve_merge_splits "$work_dir/merge_splits.txt"
 
     if [[ -s "$chunk_manifest" ]] && done_exists "${chunk_manifest}.done"; then
         log "driver round ${round}: reusing prepared chunks ($chunk_manifest)"
@@ -3235,8 +3235,8 @@ slurm_merge() {
     local slurm_dir="$work_dir/logs"
     local chunk_manifest="$round_dir/chunks.tsv"
     mkdir -p "$clustered" "$slurm_dir"
-    # adopt the work area's pinned split count, so retries and the propagate join stay on one count
-    pin_merge_splits "$work_dir/merge_splits.txt"
+    # take the work area's settled split count, so retries and the propagate join stay on one count
+    resolve_merge_splits "$work_dir/merge_splits.txt"
 
     local tok
     tok=$(run_token "$work_dir")
@@ -3420,7 +3420,7 @@ run_workflow() {
         log "single-node: reusing completed result $result_dir/$final_cluster_name"
         return 0
     fi
-    pin_merge_splits "$work_dir/merge_splits.txt"
+    resolve_merge_splits "$work_dir/merge_splits.txt"
 
     local round=0
     local chunks="$work_dir/round${round}/chunks"
