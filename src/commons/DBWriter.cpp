@@ -490,7 +490,11 @@ void DBWriter::writeIndexEntryToFile(FILE *outFile, char *buff1, DBReader<DBKeyT
     tmpBuff = Itoa::u32toa_sse2(sLen,tmpBuff);
     *(tmpBuff-1) = '\n';
     *(tmpBuff) = '\0';
-    fwrite(buff1, sizeof(char), (tmpBuff - buff1), outFile);
+    const size_t len = tmpBuff - buff1;
+    if (fwrite(buff1, sizeof(char), len, outFile) != len) {
+        Debug(Debug::ERROR) << "Can not write index entry\n";
+        EXIT(EXIT_FAILURE);
+    }
 }
 
 template <>
@@ -508,7 +512,11 @@ void DBWriter::writeIndexEntryToFile(FILE *outFile, char *buff1, DBReader<std::s
     tmpBuff = Itoa::u32toa_sse2(sLen,tmpBuff);
     *(tmpBuff-1) = '\n';
     *(tmpBuff) = '\0';
-    fwrite(buff1, sizeof(char), (tmpBuff - buff1), outFile);
+    const size_t len = tmpBuff - buff1;
+    if (fwrite(buff1, sizeof(char), len, outFile) != len) {
+        Debug(Debug::ERROR) << "Can not write index entry\n";
+        EXIT(EXIT_FAILURE);
+    }
 }
 
 template <>
