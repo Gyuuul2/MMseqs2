@@ -44,6 +44,8 @@ set(commons_header_files
         commons/TranslateNucl.h
         commons/Timer.h
         commons/UniprotKB.h
+        commons/ZstdReader.h
+        commons/ZstdWriter.h
         commons/Util.h
         PARENT_SCOPE
         )
@@ -81,6 +83,8 @@ set(commons_source_files
         commons/SubstitutionMatrix.cpp
         commons/Timer.cpp
         commons/UniprotKB.cpp
+        commons/ZstdReader.cpp
+        commons/ZstdWriter.cpp
         commons/Util.cpp
         PARENT_SCOPE
         )

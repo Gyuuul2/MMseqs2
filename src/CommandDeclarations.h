@@ -40,6 +40,7 @@ extern int lndb(int argc, const char **argv, const Command& command);
 extern int aliasdb(int argc, const char **argv, const Command& command);
 extern int createtsv(int argc, const char **argv, const Command& command);
 extern int propagateclusters(int argc, const char **argv, const Command& command);
+extern int splittsv(int argc, const char **argv, const Command& command);
 extern int databases(int argc, const char **argv, const Command& command);
 extern int dbtype(int argc, const char **argv, const Command& command);
 extern int db2tar(int argc, const char **argv, const Command& command);

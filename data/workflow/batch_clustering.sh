@@ -1407,49 +1407,13 @@ publish_uri() {
     fi
 }
 
-# rebucket_route_split <in_manifest> <frag_dir> <column> <split_b>: re-route one split's rows by hash($column)
-rebucket_route_split() {
-    local in_manifest="$1" frag_dir="$2" column="$3" split_idx="$4"
-    local splits="${MERGE_SPLITS:-1}"
-    local bb; printf -v bb '%05d' "$split_idx"
-    local cnt="$frag_dir/rebucket.split${bb}.rows"
-    stream_split_files "$in_manifest" "$bb" \
-        | awk -F'\t' -v B="$splits" -v col="$column" -v pfx="$frag_dir/rebucket.b${bb}.k" -v cnt="$cnt" \
-              "$SPLIT_HASH_AWK"'
-        BEGIN { for (k = 0; k < B; k++) printf "" > (pfx sprintf("%05d.tsv", k)) }
-        { print > (pfx sprintf("%05d.tsv", split_of($col))) }
-        END { print NR > cnt }
-    '
-}
 
-# rebucket_emit_split <frag_dir> <out_dir> <split_k>: concatenate one target bucket's fragments
-rebucket_emit_split() {
-    local frag_dir="$1" out_dir="$2" split_idx="$3"
-    local splits="${MERGE_SPLITS:-1}"
-    local kk; printf -v kk '%05d' "$split_idx"
-    local out; out="$out_dir/chain_rebucketed.split${kk}.tsv$(batch_compression_suffix)"
-    local tmp="${out}.tmp.$$"
-    local -a frags=()
-    local b frag
-    for ((b = 0; b < splits; b++)); do
-        printf -v frag '%s/rebucket.b%05d.k%s.tsv' "$frag_dir" "$b" "$kk"
-        [[ -e "$frag" ]] || fail "rebucket: missing fragment $frag"
-        frags+=("$frag")
-    done
-    if compress_batch_outputs_enabled; then
-        need_cmd pzstd
-        cat "${frags[@]}" | pzstd -p "$ZSTD_THREADS" -3 -c > "$tmp"
-    else
-        cat "${frags[@]}" > "$tmp"
-    fi
-    mv -f "$tmp" "$out"
-}
 
 # rebucket_manifest <in_manifest> <out_dir> <out_manifest> <work_dir> <column> [expected_rows]:
 # re-route a split TSV set so bucket k holds the rows with hash(column) == k; only the R0-row chain takes this path
 rebucket_manifest() {
-    [[ "$#" -ge 5 && "$#" -le 6 ]] || fail "rebucket_manifest needs <in_manifest> <out_dir> <out_manifest> <work_dir> <column> [expected_rows]"
-    local in_manifest="$1" out_dir="$2" out_manifest="$3" work_dir="$4" column="$5" expected_rows="${6:-}"
+    [[ "$#" -eq 5 ]] || fail "rebucket_manifest needs <in_manifest> <out_dir> <out_manifest> <work_dir> <column>"
+    local in_manifest="$1" out_dir="$2" out_manifest="$3" work_dir="$4" column="$5"
     [[ "$column" == "1" || "$column" == "2" ]] || fail "rebucket_manifest column must be 1 or 2 (got '$column')"
     local splits="${MERGE_SPLITS:-1}"
     local done_uri="${out_manifest}.done"
@@ -1457,31 +1421,20 @@ rebucket_manifest() {
         log "rebucket: reusing completed $out_manifest"
         return 0
     fi
-    local frag; frag=$(resolve_node_scratch "$work_dir" rebucket-fragments)
-    rm -rf "${frag:?}" "${out_dir:?}"
-    mkdir -p "$work_dir" "$frag" "$out_dir"
-    check_manifest_split_count "$in_manifest" "$splits"
-    log "rebucket: re-routing ${splits} split(s) by column ${column}, ${MERGE_SPLIT_JOBS} at a time"
-    run_split_jobs "rebucket route" "$splits" "$MERGE_SPLIT_JOBS" rebucket_route_split "$in_manifest" "$frag" "$column"
-    local total
-    total=$(awk '{ s += $1 } END { print s + 0 }' "$frag"/rebucket.split*.rows)
-    if [[ -n "$expected_rows" && "$total" -ne "$expected_rows" ]]; then
-        fail "rebucket: row conservation violated: routed ${total} rows, expected ${expected_rows}"
-    fi
-    run_split_jobs "rebucket emit" "$splits" "$MERGE_SPLIT_JOBS" rebucket_emit_split "$frag" "$out_dir"
-    local b split_file
-    : > "${out_manifest}.tmp"
-    for ((b = 0; b < splits; b++)); do
-        printf -v split_file '%s/chain_rebucketed.split%05d.tsv%s' "$out_dir" "$b" "$(batch_compression_suffix)"
-        [[ -e "$split_file" ]] || fail "rebucket: missing split output $split_file"
-        printf '%s\n' "$split_file" >> "${out_manifest}.tmp"
-    done
-    mv "${out_manifest}.tmp" "$out_manifest"
+    rm -rf "${out_dir:?}"
+    mkdir -p "$work_dir" "$out_dir"
+
+    local in_local
+    in_local=$(stage_local_manifest "$in_manifest" "$work_dir/stage")
+    "$MMSEQS" splittsv "$in_local" "$out_dir/chain_rebucketed" \
+        --tsv-splits "$splits" --tsv-split-column "$column" --threads "$THREADS" \
+        --compressed "$(compress_batch_outputs_enabled && echo 1 || echo 0)" \
+        || fail "splittsv died"
+    rm -rf "$work_dir/stage"
+
+    mv "$out_dir/chain_rebucketed" "$out_manifest"
     mark_done "$done_uri" "$work_dir/rebucket.done"
-    if [[ -n "${REMOVE_TMP:-}" ]]; then
-        rm -rf "$frag"
-    fi
-    log "rebucket: ${total} chain rows re-bucketed into ${splits} split(s) -> $out_manifest"
+    log "rebucket: chain rows re-bucketed by column ${column} into ${splits} split(s) -> $out_manifest"
 }
 
 # merge_pack_bucket <frag_dir> <shared_prefix> <node_count> <node_idx> <k>:
@@ -2907,7 +2860,7 @@ aws_merge() {
                     log "aws-merge round ${round}: reusing chain base $chain_prev"
                 else
                     local local_cb_manifest="$local_root/chainbase_manifest.local.txt"
-                    with_round_node_work_dir "$round" rebucket_manifest "$(join_uri "$(aws_clustered_prefix "$work_prefix" 1)" "tsv_manifest.txt")" "$local_root/chainbase" "$local_cb_manifest" "$local_root/chainbase-work" 1 "$r0_reps"
+                    with_round_node_work_dir "$round" rebucket_manifest "$(join_uri "$(aws_clustered_prefix "$work_prefix" 1)" "tsv_manifest.txt")" "$local_root/chainbase" "$local_cb_manifest" "$local_root/chainbase-work" 1
                     : > "$local_root/chainbase_manifest.txt"
                     local cshard s3cshard
                     while IFS= read -r cshard || [[ -n "${cshard:-}" ]]; do
@@ -2989,7 +2942,7 @@ aws_merge() {
                 log "aws-merge round ${round}: reusing rebucketed chain $fj_parent_manifest"
             else
                 local local_parent_manifest="$local_root/fj_parent_manifest.local.txt"
-                with_round_node_work_dir "$round" rebucket_manifest "$chain_manifest" "$local_root/fj-parent" "$local_parent_manifest" "$local_root/fj-rebucket" 2 "$r0_reps"
+                with_round_node_work_dir "$round" rebucket_manifest "$chain_manifest" "$local_root/fj-parent" "$local_parent_manifest" "$local_root/fj-rebucket" 2
                 : > "$local_root/fj_parent_manifest.txt"
                 local rshard s3rshard
                 while IFS= read -r rshard || [[ -n "${rshard:-}" ]]; do
@@ -3353,7 +3306,7 @@ slurm_merge() {
         local chain_prev
         if [[ "$round" -eq 2 ]]; then
             # rebucket the chain base (round-1 TSVs) by rep (col 1) so it can serve as child
-            with_round_node_work_dir "$round" rebucket_manifest "$work_dir/round1/clustered/tsv_manifest.txt" "$round_dir/chainbase" "$round_dir/chainbase_manifest.txt" "$round_dir/chainbase-work" 1 "$r0_reps"
+            with_round_node_work_dir "$round" rebucket_manifest "$work_dir/round1/clustered/tsv_manifest.txt" "$round_dir/chainbase" "$round_dir/chainbase_manifest.txt" "$round_dir/chainbase-work" 1
             chain_prev="$round_dir/chainbase_manifest.txt"
         else
             chain_prev="$work_dir/round$((round - 1))/chain_manifest.txt"
@@ -3396,7 +3349,7 @@ slurm_merge() {
         local fj_dir="$work_dir/finaljoin-round${round}"
         local final_mapping_manifest="$fj_dir/final_mapping_manifest.txt"
         # the chain leaves composition bucketed by col1 (rep_R); the final join needs col2 (round-0 rep)
-        with_round_node_work_dir "$round" rebucket_manifest "$chain_manifest" "$fj_dir/parent" "$fj_dir/parent_manifest.txt" "$fj_dir/rebucket" 2 "$r0_reps"
+        with_round_node_work_dir "$round" rebucket_manifest "$chain_manifest" "$fj_dir/parent" "$fj_dir/parent_manifest.txt" "$fj_dir/rebucket" 2
         if [[ "${MERGE_NODES:-1}" -le 1 ]]; then
             with_round_node_work_dir "$round" propagate "$round0_tsv_manifest" "$fj_dir/parent_manifest.txt" "$final_mapping_manifest" "$fj_dir/join"
         elif [[ -s "$final_mapping_manifest" ]] && done_exists "${final_mapping_manifest}.done"; then
@@ -3527,7 +3480,7 @@ run_workflow() {
             if [[ "$round" -eq 2 ]]; then
                 # the chain base (round-1 TSVs) is member-bucketed like every parent; the
                 # composition consumes it as child, so rebucket it by rep (col 1) once
-                with_round_node_work_dir "$round" rebucket_manifest "$chain_manifest" "$work_dir/round2/chainbase" "$work_dir/round2/chainbase_manifest.txt" "$work_dir/round2/chainbase-work" 1 "$round0_reps"
+                with_round_node_work_dir "$round" rebucket_manifest "$chain_manifest" "$work_dir/round2/chainbase" "$work_dir/round2/chainbase_manifest.txt" "$work_dir/round2/chainbase-work" 1
                 chain_manifest="$work_dir/round2/chainbase_manifest.txt"
             fi
             with_round_node_work_dir "$round" propagate "$chain_manifest" "$parent_manifest" "$work_dir/round${round}/chain_manifest.txt" "$work_dir/round${round}/compose"
@@ -3575,7 +3528,7 @@ run_workflow() {
     if [[ -n "$chain_manifest" ]]; then
         local fj_dir="$work_dir/finaljoin-round${current_round}"
         log "final join: composing the deferred N-row mapping (round ${current_round} chain o round 0)"
-        with_round_node_work_dir "$current_round" rebucket_manifest "$chain_manifest" "$fj_dir/parent" "$fj_dir/parent_manifest.txt" "$fj_dir/rebucket" 2 "$round0_reps"
+        with_round_node_work_dir "$current_round" rebucket_manifest "$chain_manifest" "$fj_dir/parent" "$fj_dir/parent_manifest.txt" "$fj_dir/rebucket" 2
         final_mapping_manifest="$fj_dir/final_mapping_manifest.txt"
         if [[ "${MERGE_NODES:-1}" -le 1 ]]; then
             with_round_node_work_dir "$current_round" propagate "$round0_tsv_manifest" "$fj_dir/parent_manifest.txt" "$final_mapping_manifest" "$fj_dir/join"

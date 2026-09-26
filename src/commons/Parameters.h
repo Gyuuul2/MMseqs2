@@ -1345,6 +1345,7 @@ public:
     std::vector<MMseqsParameter*> msa2profile;
     std::vector<MMseqsParameter*> createtsv;
     std::vector<MMseqsParameter*> propagateclusters;
+    std::vector<MMseqsParameter*> splittsv;
     std::vector<MMseqsParameter*> result2stats;
     std::vector<MMseqsParameter*> extractorfs;
     std::vector<MMseqsParameter*> extractframes;

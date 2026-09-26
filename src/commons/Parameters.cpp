@@ -718,6 +718,12 @@ Parameters::Parameters():
     propagateclusters.push_back(&PARAM_COMPRESSED);
     propagateclusters.push_back(&PARAM_V);
 
+    splittsv.push_back(&PARAM_TSV_SPLITS);
+    splittsv.push_back(&PARAM_TSV_SPLIT_COLUMN);
+    splittsv.push_back(&PARAM_THREADS);
+    splittsv.push_back(&PARAM_COMPRESSED);
+    splittsv.push_back(&PARAM_V);
+
     //result2stats
     result2stats.push_back(&PARAM_STAT);
     result2stats.push_back(&PARAM_TSV);

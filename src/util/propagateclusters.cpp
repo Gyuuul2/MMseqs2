@@ -1,9 +1,9 @@
 #include "Debug.h"
 #include "FileUtil.h"
 #include "Parameters.h"
+#include "ZstdReader.h"
+#include "ZstdWriter.h"
 #include "Util.h"
-
-#include <zstd.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -15,168 +15,6 @@
 #ifdef OPENMP
 #include <omp.h>
 #endif
-
-// The shards the batch workflow writes are optionally zstd compressed, so read and write both here
-// rather than making the workflow materialise a plain copy of every shard first.
-namespace {
-
-class ShardReader {
-public:
-    ShardReader(const std::string &fileName) : name(fileName), dstream(NULL), pos(0), eof(false) {
-        file = FileUtil::openFileOrDie(fileName.c_str(), "rb", true);
-        if (Util::endsWith(".zst", fileName)) {
-            dstream = ZSTD_createDStream();
-            if (dstream == NULL || ZSTD_isError(ZSTD_initDStream(dstream))) {
-                Debug(Debug::ERROR) << "Cannot start zstd decompression of " << fileName << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            in.resize(ZSTD_DStreamInSize());
-            input.src = in.data();
-            input.size = 0;
-            input.pos = 0;
-        }
-        out.resize(ZSTD_DStreamOutSize());
-    }
-
-    ~ShardReader() {
-        if (dstream != NULL) {
-            ZSTD_freeDStream(dstream);
-        }
-        fclose(file);
-    }
-
-    bool getLine(std::string &line) {
-        line.clear();
-        while (true) {
-            while (pos < buffer.size()) {
-                const char c = buffer[pos++];
-                if (c == '\n') {
-                    if (line.empty() == false && line[line.size() - 1] == '\r') {
-                        line.erase(line.size() - 1);
-                    }
-                    return true;
-                }
-                line.append(1, c);
-            }
-            buffer.clear();
-            pos = 0;
-            if (fill() == false) {
-                return line.empty() == false;
-            }
-        }
-    }
-
-private:
-    bool fill() {
-        if (dstream == NULL) {
-            const size_t n = fread(&out[0], 1, out.size(), file);
-            if (n == 0) {
-                return false;
-            }
-            buffer.assign(&out[0], n);
-            return true;
-        }
-        while (true) {
-            if (input.pos == input.size) {
-                const size_t n = fread(&in[0], 1, in.size(), file);
-                if (n == 0) {
-                    return false;
-                }
-                input.src = in.data();
-                input.size = n;
-                input.pos = 0;
-            }
-            ZSTD_outBuffer output = { &out[0], out.size(), 0 };
-            const size_t code = ZSTD_decompressStream(dstream, &output, &input);
-            if (ZSTD_isError(code)) {
-                Debug(Debug::ERROR) << "Cannot decompress " << name << ": " << ZSTD_getErrorName(code) << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            if (output.pos > 0) {
-                buffer.assign(&out[0], output.pos);
-                return true;
-            }
-        }
-    }
-
-    std::string name;
-    FILE *file;
-    ZSTD_DStream *dstream;
-    ZSTD_inBuffer input;
-    std::vector<char> in;
-    std::vector<char> out;
-    std::string buffer;
-    size_t pos;
-    bool eof;
-};
-
-class ShardWriter {
-public:
-    ShardWriter(const std::string &fileName) : name(fileName), cstream(NULL) {
-        file = FileUtil::openAndDelete(fileName.c_str(), "wb");
-        if (Util::endsWith(".zst", fileName)) {
-            cstream = ZSTD_createCStream();
-            if (cstream == NULL || ZSTD_isError(ZSTD_initCStream(cstream, 3))) {
-                Debug(Debug::ERROR) << "Cannot start zstd compression of " << fileName << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            out.resize(ZSTD_CStreamOutSize());
-        }
-    }
-
-    void write(const std::string &data) {
-        if (cstream == NULL) {
-            if (fwrite(data.c_str(), sizeof(char), data.size(), file) != data.size()) {
-                Debug(Debug::ERROR) << "Cannot write " << name << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            return;
-        }
-        ZSTD_inBuffer input = { data.c_str(), data.size(), 0 };
-        while (input.pos < input.size) {
-            ZSTD_outBuffer output = { &out[0], out.size(), 0 };
-            const size_t code = ZSTD_compressStream(cstream, &output, &input);
-            if (ZSTD_isError(code)) {
-                Debug(Debug::ERROR) << "Cannot compress " << name << ": " << ZSTD_getErrorName(code) << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            flush(output.pos);
-        }
-    }
-
-    void close() {
-        if (cstream != NULL) {
-            ZSTD_outBuffer output = { &out[0], out.size(), 0 };
-            const size_t code = ZSTD_endStream(cstream, &output);
-            if (ZSTD_isError(code) || code != 0) {
-                Debug(Debug::ERROR) << "Cannot finish " << name << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            flush(output.pos);
-            ZSTD_freeCStream(cstream);
-            cstream = NULL;
-        }
-        if (fclose(file) != 0) {
-            Debug(Debug::ERROR) << "Cannot close " << name << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-    }
-
-private:
-    void flush(size_t n) {
-        if (n > 0 && fwrite(&out[0], sizeof(char), n, file) != n) {
-            Debug(Debug::ERROR) << "Cannot write " << name << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-    }
-
-    std::string name;
-    FILE *file;
-    ZSTD_CStream *cstream;
-    std::vector<char> out;
-};
-
-}
 
 // a split is served by every manifest file whose name ends in .split<k>.tsv, with as many chunks
 // contributing to it as the round that wrote them had
@@ -236,12 +74,12 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
     std::vector<std::vector<std::string> > childShards = readManifest(par.db1, splits);
     std::vector<std::vector<std::string> > parentShards = readManifest(par.db2, splits);
 
-    std::vector<ShardWriter *> writers(splits);
+    std::vector<ZstdWriter *> writers(splits);
     std::vector<std::mutex> locks(splits);
     std::string manifest;
     for (unsigned int k = 0; k < splits; k++) {
         const std::string name = Util::tsvSplitName(par.db3, k) + suffix;
-        writers[k] = new ShardWriter(name);
+        writers[k] = new ZstdWriter(name);
         manifest.append(name);
         manifest.append(1, '\n');
     }
@@ -262,7 +100,7 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
             childByRep.clear();
             size_t childRows = 0;
             for (size_t f = 0; f < childShards[b].size(); f++) {
-                ShardReader child(childShards[b][f]);
+                ZstdReader child(childShards[b][f]);
                 while (child.getLine(line)) {
                     splitLine(line, first, second);
                     childByRep[first].push_back(second);
@@ -272,7 +110,7 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
 
             size_t joinedRows = 0;
             for (size_t f = 0; f < parentShards[b].size(); f++) {
-                ShardReader parent(parentShards[b][f]);
+                ZstdReader parent(parentShards[b][f]);
                 while (parent.getLine(line)) {
                     splitLine(line, first, second);
                     std::unordered_map<std::string, std::vector<std::string> >::const_iterator it = childByRep.find(second);

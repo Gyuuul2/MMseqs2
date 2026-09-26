@@ -23,6 +23,7 @@ set(util_source_files
         util/view.cpp
         util/createtsv.cpp
         util/propagateclusters.cpp
+        util/splittsv.cpp
         util/diffseqdbs.cpp
         util/expandaln.cpp
         util/extractalignedregion.cpp
