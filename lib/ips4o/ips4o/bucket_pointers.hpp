@@ -83,7 +83,10 @@ class Sorter<Cfg>::BucketPointers {
     template <bool kAtomic>
     std::pair<diff_t, diff_t> incWrite() {
         if (kAtomic) {
-            const auto p = __atomic_fetch_add(&all_, Cfg::kBlockSize, __ATOMIC_RELAXED);
+            // Acquire pairs with the release in decRead: observing the decremented read
+            // pointer must also make the reader's num_reading_ increment visible, or
+            // isReading() returns false while that reader still copies the block out.
+            const auto p = __atomic_fetch_add(&all_, Cfg::kBlockSize, __ATOMIC_ACQUIRE);
             const diff_t w = p & kMask;
             const diff_t r = (p >> kShift);
             return {w, r};
@@ -103,8 +106,11 @@ class Sorter<Cfg>::BucketPointers {
             // Must not be moved after the following fetch_sub, as that could lead to
             // another thread writing to our block, because isReading() returns false.
             num_reading_.fetch_add(1, std::memory_order_acquire);
+            // Release publishes the num_reading_ increment above to the writer whose
+            // incWrite (acquire) observes this decrement; relaxed lets the two stores
+            // become visible out of order on weakly-ordered CPUs.
             const auto p = __atomic_fetch_sub(&all_,
-                    static_cast<atomic_type>(Cfg::kBlockSize) << kShift, __ATOMIC_RELAXED);
+                    static_cast<atomic_type>(Cfg::kBlockSize) << kShift, __ATOMIC_RELEASE);
             const diff_t w = p & kMask;
             const diff_t r = (p >> kShift) & ~(Cfg::kBlockSize - 1);
             return {w, r};
