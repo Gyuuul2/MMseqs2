@@ -6,6 +6,9 @@
 #include "IndexReader.h"
 #include "FileUtil.h"
 
+#include <mutex>
+#include <vector>
+
 #ifdef OPENMP
 #include <omp.h>
 
@@ -14,6 +17,9 @@
 #ifndef SIZE_T_MAX
 #define SIZE_T_MAX ((size_t) -1)
 #endif
+
+
+
 
 int createtsv(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
@@ -76,8 +82,31 @@ int createtsv(int argc, const char **argv, const Command &command) {
     const std::string& indexFile = hasTargetDB ? par.db4Index : par.db3Index;
     const bool shouldCompress = par.dbOut == true && par.compressed == true;
     const int dbType = par.dbOut == true ? Parameters::DBTYPE_GENERIC_DB : Parameters::DBTYPE_OMIT_FILE;
+    const unsigned int splits = (par.tsvSplits > 0) ? (unsigned int) par.tsvSplits : 0;
+    const bool splitMode = splits > 0;
+    if (splitMode && par.dbOut) {
+        Debug(Debug::ERROR) << "--tsv-splits cannot be combined with --db-output\n";
+        return EXIT_FAILURE;
+    }
+    if (splits > Util::TSV_SPLIT_MAX) {
+        Debug(Debug::ERROR) << "--tsv-splits " << splits << " exceeds " << Util::TSV_SPLIT_MAX
+                            << ", above which the zero padded split names stop sorting in order\n";
+        return EXIT_FAILURE;
+    }
     DBWriter writer(dataFile.c_str(), indexFile.c_str(), par.threads, shouldCompress, dbType);
-    writer.open();
+    std::vector<FILE*> splitFiles(splits);
+    std::vector<std::mutex> splitLocks(splits);
+    if (splitMode) {
+        for (unsigned int b = 0; b < splits; b++) {
+            splitFiles[b] = FileUtil::openAndDelete(Util::tsvSplitName(dataFile, b).c_str(), "w");
+        }
+    } else {
+        writer.open();
+    }
+    const size_t splitFlushSize = splitMode
+                                  ? std::max(Util::TSV_SPLIT_BUFFER_MIN,
+                                             Util::TSV_SPLIT_BUFFER_TOTAL / ((size_t) par.threads * splits))
+                                  : 0;
 
     const size_t targetColumn = (par.targetTsvColumn == 0) ? SIZE_T_MAX :  par.targetTsvColumn - 1;
 #pragma omp parallel
@@ -92,6 +121,9 @@ int createtsv(int argc, const char **argv, const Command &command) {
 
         std::string outputBuffer;
         outputBuffer.reserve(10 * 1024);
+        std::string lineBuffer;
+        lineBuffer.reserve(1024);
+        std::vector<std::string> splitBuffers(splits);
 
 #pragma omp for schedule(dynamic, 1000)
         for (size_t i = 0; i < reader->getSize(); ++i) {
@@ -161,36 +193,59 @@ int createtsv(int argc, const char **argv, const Command &command) {
                     queryHeader = targetAccession;
                 }
 
-                outputBuffer.append(queryHeader);
-                outputBuffer.append("\t");
-                outputBuffer.append(targetAccession);
+                lineBuffer.clear();
+                lineBuffer.append(queryHeader);
+                lineBuffer.append("\t");
+                lineBuffer.append(targetAccession);
 
                 size_t offset = 0;
                 if (targetColumn != 0) {
-                    outputBuffer.append("\t");
+                    lineBuffer.append("\t");
                     offset = 0;
                 } else {
                     offset = strlen(dbKey);
                 }
 
                 char *nextLine = Util::skipLine(data);
-                outputBuffer.append(data + offset, (nextLine - (data + offset)) - 1);
-                outputBuffer.append("\n");
+                lineBuffer.append(data + offset, (nextLine - (data + offset)) - 1);
+                lineBuffer.append("\n");
+                if (splitMode) {
+                    const unsigned int b = Util::tsvSplitOfColumn(lineBuffer, par.tsvSplitColumn, splits);
+                    splitBuffers[b].append(lineBuffer);
+                    if (splitBuffers[b].size() >= splitFlushSize) {
+                        Util::flushSplitBuffer(splitFiles[b], splitLocks[b], splitBuffers[b], Util::tsvSplitName(dataFile, b));
+                    }
+                } else {
+                    outputBuffer.append(lineBuffer);
+                }
                 data = nextLine;
                 entryIndex++;
             }
-            writer.writeData(outputBuffer.c_str(), outputBuffer.length(), queryKey, thread_idx, par.dbOut);
-            outputBuffer.clear();
+            if (splitMode == false) {
+                writer.writeData(outputBuffer.c_str(), outputBuffer.length(), queryKey, thread_idx, par.dbOut);
+                outputBuffer.clear();
+            }
+        }
+        for (unsigned int b = 0; b < splits; b++) {
+            Util::flushSplitBuffer(splitFiles[b], splitLocks[b], splitBuffers[b], Util::tsvSplitName(dataFile, b));
         }
         delete[] dbKey;
     }
-    writer.close(par.dbOut == false);
-
-    if (par.dbOut == false) {
-        if (hasTargetDB) {
-            FileUtil::remove(par.db4Index.c_str());
-        } else {
-            FileUtil::remove(par.db3Index.c_str());
+    if (splitMode) {
+        for (unsigned int b = 0; b < splits; b++) {
+            if (fclose(splitFiles[b]) != 0) {
+                Debug(Debug::ERROR) << "Can not close split file " << b << "\n";
+                return EXIT_FAILURE;
+            }
+        }
+    } else {
+        writer.close(par.dbOut == false);
+        if (par.dbOut == false) {
+            if (hasTargetDB) {
+                FileUtil::remove(par.db4Index.c_str());
+            } else {
+                FileUtil::remove(par.db3Index.c_str());
+            }
         }
     }
 

@@ -1,6 +1,7 @@
 #ifndef UTIL_H
 #define UTIL_H
 
+#include <mutex>
 #include <string>
 #include <cstddef>
 #include <cstring>
@@ -153,6 +154,17 @@ public:
         while (it != s.end() && std::isdigit(*it)) ++it;
         return !s.empty() && it == s.end();
     }
+
+    static unsigned int tsvSplitOfKey(const std::string &key, unsigned int splits);
+    static unsigned int tsvSplitOfColumn(const std::string &line, int column, unsigned int splits);
+    static std::string tsvSplitName(const std::string &prefix, unsigned int split);
+    static void flushSplitBuffer(FILE *file, std::mutex &lock, std::string &buffer, const std::string &name);
+
+    // the shell globs and sorts these names, so the counter is zero padded and capped to stay sortable
+    static const unsigned int TSV_SPLIT_MAX = 99999;
+    // every thread holds one buffer per split, so the per buffer size comes out of a budget
+    static const size_t TSV_SPLIT_BUFFER_TOTAL = 256 * 1024 * 1024;
+    static const size_t TSV_SPLIT_BUFFER_MIN = 4 * 1024;
 
     static bool startWith(const std::string &prefix, const std::string &str, const size_t offset = 0){
         if (str.length() < prefix.length()) {
@@ -339,6 +351,10 @@ public:
     static bool isLastIterator(Iterator iterator, const Container& container) {
         return (iterator != container.end()) && (++iterator == container.end());
     }
+
+    static void resolveIncludeIterationPair(bool includeSet, bool &includeValue,
+                                            bool numSet, int &numValue,
+                                            const char *includeName, const char *numName);
 
     static std::string csvEscape(const std::string &s) {
         size_t n = s.size(), wp = 0;

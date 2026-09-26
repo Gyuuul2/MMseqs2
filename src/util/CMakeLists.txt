@@ -22,6 +22,7 @@ set(util_source_files
         util/createsubdb.cpp
         util/view.cpp
         util/createtsv.cpp
+        util/propagateclusters.cpp
         util/diffseqdbs.cpp
         util/expandaln.cpp
         util/extractalignedregion.cpp

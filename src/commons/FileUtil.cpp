@@ -486,3 +486,23 @@ std::string FileUtil::sanitizeFilename(std::string name){
     }
     return name;
 }
+
+void FileUtil::publishAtomically(const std::string &tmp, const std::string &path) {
+    int fd = open(tmp.c_str(), O_RDONLY);
+    if (fd < 0) {
+        Debug(Debug::ERROR) << "Cannot open " << tmp << " to flush it\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fsync(fd) != 0) {
+        Debug(Debug::ERROR) << "Cannot flush " << tmp << " to storage\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (close(fd) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << tmp << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (rename(tmp.c_str(), path.c_str()) != 0) {
+        Debug(Debug::ERROR) << "Cannot publish " << tmp << " as " << path << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+}

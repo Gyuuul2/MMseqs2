@@ -61,6 +61,7 @@ public:
     static void remove(const char * file);
 
     static void move(const char * src, const char * dst);
+    static void publishAtomically(const std::string &tmp, const std::string &path);
 
     static int parseDbType(const char *name);
 

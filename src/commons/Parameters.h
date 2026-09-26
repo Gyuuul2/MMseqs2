@@ -298,6 +298,10 @@ public:
     static const int SEQUENCE_SPLIT_MODE_HARD = 0;
     static const int SEQUENCE_SPLIT_MODE_SOFT = 1;
     static const int SEQUENCE_SPLIT_MODE_GPU = 2;
+    static const int SEQUENCE_SPLIT_MODE_LENGTH_DESC = 3;
+    static const int CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE = 2;   // count-table iters (symmetric cov-mode)
+    static const int CLUST_LINEAR_DEFAULT_NUM_ADJACENCY = 3;     // adjacency iters (non-symmetric cov-mode)
+    static const int CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY = 1;   // adjacency iters (symmetric cov-mode)
 
     // rescorediagonal
     static const int RESCORE_MODE_HAMMING = 0;
@@ -479,6 +483,64 @@ public:
     // workflow
     std::string runner;
     bool reuseLatest;
+    std::string batchBackend;
+    size_t batchChunkMaxBytes;
+    size_t batchChunkMaxSeqs;
+    std::string batchSlurmNodelist;
+    std::string batchSlurmPartition;
+    std::string batchSlurmTime;
+    std::string batchSlurmMem;
+    std::string batchSlurmExtra;
+    std::string batchNodeWorkDir;
+    std::string batchAwsMachine;
+    std::string batchAwsJobQueue;
+    std::string batchAwsJobDefinition;
+    std::string batchRound0AwsMachine;
+    std::string batchRound0AwsJobQueue;
+    std::string batchRound0AwsJobDefinition;
+    std::string batchAwsMachineTagKey;
+    size_t batchRound0ChunkMaxBytes;
+    size_t batchRound0ChunkMaxSeqs;
+    std::string batchRound0SlurmNodelist;
+    std::string batchRound0SlurmPartition;
+    std::string batchRound0SlurmTime;
+    std::string batchRound0SlurmMem;
+    std::string batchRound0SlurmExtra;
+    std::string batchRound0NodeWorkDir;
+    float batchRound0SeqIdThr;
+    float batchRound0CovThr;
+    int batchRound0CovMode;
+    int batchRound0ClusteringMode;
+    int batchRound0KmersPerSequence;
+    bool batchRound0IncludeCountTable;
+    int batchRound0CountTableIteration;
+    bool batchRound0IncludeAdjacency;
+    int batchRound0AdjIteration;
+    bool batchRound0ClustHash;
+    size_t batchRound0SplitMemoryLimit;
+    int batchRound0PreloadMode;
+    int batchRound0Threads;
+    int batchRound0RepFastaSplits;
+    int batchMaxRounds;
+    float batchMinReductionRatio;
+    int batchConvergencePatience;
+    int batchMaxChunkAttempts;
+    bool batchCompressOutputs;
+    int batchMergeSplits;
+    int batchMergeSplitJobs;
+    int batchMergeNodes;
+    int batchRepFastaSplits;
+    size_t batchChunkDiskBudget;
+    size_t batchRound0ChunkDiskBudget;
+    // former environment-only knobs; they affect results, so they belong on the command line
+    std::string batchRound0Mmseqs;
+    int batchRound0CreatedbMode;
+    std::string batchSortTmpDir;
+    int batchAwsTimeout;
+    int batchAwsWorkerAttempts;
+    bool batchAwsDryRun;
+    bool batchAwsAllowNonS3Input;
+
 
     // CLUSTERING
     int    clusteringMode;
@@ -575,6 +637,8 @@ public:
     int idxSeqSrc;
     bool fullHeader;
     size_t targetTsvColumn;
+    int tsvSplits;
+    int tsvSplitColumn;
 
     //result2stats
     std::string stat;
@@ -608,7 +672,7 @@ public:
     std::string indexDbsuffix;
 
     // createdb
-    int identifierOffset;
+    size_t identifierOffset;
     int dbType;
     int createdbMode;
     bool shuffleDatabase;
@@ -620,6 +684,7 @@ public:
 
     // convert2fasta
     bool useHeaderFile;
+    int fastaSplits;
     int writeLookup;
 
     // result2flat
@@ -939,6 +1004,8 @@ public:
 
     // createtsv
     PARAMETER(PARAM_TARGET_COLUMN)
+    PARAMETER(PARAM_TSV_SPLITS)
+    PARAMETER(PARAM_TSV_SPLIT_COLUMN)
     PARAMETER(PARAM_FIRST_SEQ_REP_SEQ)
     PARAMETER(PARAM_FULL_HEADER)
     PARAMETER(PARAM_IDX_SEQ_SRC)
@@ -969,6 +1036,61 @@ public:
 
     // workflow
     PARAMETER(PARAM_RUNNER)
+    PARAMETER(PARAM_BATCH_CHUNK_MAX_BYTES)
+    PARAMETER(PARAM_BATCH_CHUNK_MAX_SEQS)
+    PARAMETER(PARAM_BATCH_SLURM_NODELIST)
+    PARAMETER(PARAM_BATCH_SLURM_PARTITION)
+    PARAMETER(PARAM_BATCH_SLURM_TIME)
+    PARAMETER(PARAM_BATCH_SLURM_MEM)
+    PARAMETER(PARAM_BATCH_SLURM_EXTRA)
+    PARAMETER(PARAM_BATCH_NODE_WORK_DIR)
+    PARAMETER(PARAM_BATCH_AWS_MACHINE)
+    PARAMETER(PARAM_BATCH_AWS_JOB_QUEUE)
+    PARAMETER(PARAM_BATCH_AWS_JOB_DEFINITION)
+    PARAMETER(PARAM_BATCH_ROUND0_AWS_MACHINE)
+    PARAMETER(PARAM_BATCH_ROUND0_AWS_JOB_QUEUE)
+    PARAMETER(PARAM_BATCH_ROUND0_AWS_JOB_DEFINITION)
+    PARAMETER(PARAM_BATCH_AWS_MACHINE_TAG_KEY)
+    PARAMETER(PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES)
+    PARAMETER(PARAM_BATCH_ROUND0_CHUNK_MAX_SEQS)
+    PARAMETER(PARAM_BATCH_ROUND0_SLURM_NODELIST)
+    PARAMETER(PARAM_BATCH_ROUND0_SLURM_PARTITION)
+    PARAMETER(PARAM_BATCH_ROUND0_SLURM_TIME)
+    PARAMETER(PARAM_BATCH_ROUND0_SLURM_MEM)
+    PARAMETER(PARAM_BATCH_ROUND0_SLURM_EXTRA)
+    PARAMETER(PARAM_BATCH_ROUND0_NODE_WORK_DIR)
+    PARAMETER(PARAM_BATCH_ROUND0_MIN_SEQ_ID)
+    PARAMETER(PARAM_BATCH_ROUND0_C)
+    PARAMETER(PARAM_BATCH_ROUND0_COV_MODE)
+    PARAMETER(PARAM_BATCH_ROUND0_CLUSTER_MODE)
+    PARAMETER(PARAM_BATCH_ROUND0_KMER_PER_SEQ)
+    PARAMETER(PARAM_BATCH_ROUND0_INCLUDE_COUNTTABLE)
+    PARAMETER(PARAM_BATCH_ROUND0_NUM_COUNTS)
+    PARAMETER(PARAM_BATCH_ROUND0_INCLUDE_ADJACENCY)
+    PARAMETER(PARAM_BATCH_ROUND0_NUM_ADJACENCY)
+    PARAMETER(PARAM_BATCH_ROUND0_CLUST_HASH)
+    PARAMETER(PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT)
+    PARAMETER(PARAM_BATCH_ROUND0_PRELOAD_MODE)
+    PARAMETER(PARAM_BATCH_ROUND0_THREADS)
+    PARAMETER(PARAM_BATCH_MAX_ROUNDS)
+    PARAMETER(PARAM_BATCH_MIN_REDUCTION_RATIO)
+    PARAMETER(PARAM_BATCH_CONVERGENCE_PATIENCE)
+    PARAMETER(PARAM_BATCH_MAX_CHUNK_ATTEMPTS)
+    PARAMETER(PARAM_BATCH_COMPRESS_OUTPUTS)
+    PARAMETER(PARAM_BATCH_MERGE_SPLITS)
+    PARAMETER(PARAM_BATCH_MERGE_SPLIT_JOBS)
+    PARAMETER(PARAM_BATCH_MERGE_NODES)
+    PARAMETER(PARAM_BATCH_REP_FASTA_SPLITS)
+    PARAMETER(PARAM_BATCH_ROUND0_REP_FASTA_SPLITS)
+    PARAMETER(PARAM_BATCH_CHUNK_DISK_BUDGET)
+    PARAMETER(PARAM_BATCH_ROUND0_CHUNK_DISK_BUDGET)
+    PARAMETER(PARAM_BATCH_ROUND0_MMSEQS)
+    PARAMETER(PARAM_BATCH_ROUND0_CREATEDB_MODE)
+    PARAMETER(PARAM_BATCH_SORT_TMP_DIR)
+    PARAMETER(PARAM_BATCH_AWS_TIMEOUT)
+    PARAMETER(PARAM_BATCH_AWS_WORKER_ATTEMPTS)
+    PARAMETER(PARAM_BATCH_AWS_DRY_RUN)
+    PARAMETER(PARAM_BATCH_AWS_ALLOW_NONS3_INPUT)
     PARAMETER(PARAM_REUSELATEST)
 
     // search workflow
@@ -1017,6 +1139,7 @@ public:
 
     // convert2fasta
     PARAMETER(PARAM_USE_HEADER_FILE)
+    PARAMETER(PARAM_FASTA_SPLITS)
 
     // setextendedbtype
     PARAMETER(PARAM_EXTENDED_DBTYPE)
@@ -1221,6 +1344,7 @@ public:
     std::vector<MMseqsParameter*> convertmsa;
     std::vector<MMseqsParameter*> msa2profile;
     std::vector<MMseqsParameter*> createtsv;
+    std::vector<MMseqsParameter*> propagateclusters;
     std::vector<MMseqsParameter*> result2stats;
     std::vector<MMseqsParameter*> extractorfs;
     std::vector<MMseqsParameter*> extractframes;
@@ -1248,6 +1372,18 @@ public:
     std::vector<MMseqsParameter*> countkmer;
     std::vector<MMseqsParameter*> easylinclustworkflow;
     std::vector<MMseqsParameter*> linclustworkflow;
+    std::vector<MMseqsParameter*> linclustbatchinner;
+    std::vector<MMseqsParameter*> clusterbatchinner;
+    std::vector<MMseqsParameter*> linclustbatch;
+    std::vector<MMseqsParameter*> linclustbatchaws;
+    std::vector<MMseqsParameter*> linclustbatchall;
+    std::vector<MMseqsParameter*> clusterbatch;
+    std::vector<MMseqsParameter*> clusterbatchaws;
+    std::vector<MMseqsParameter*> clusterbatchall;
+    std::vector<MMseqsParameter*> batchcommon;
+    std::vector<MMseqsParameter*> batchserver;
+    std::vector<MMseqsParameter*> batchaws;
+    std::vector<MMseqsParameter*> batchclustering;
     std::vector<MMseqsParameter*> easysearchworkflow;
     std::vector<MMseqsParameter*> searchworkflow;
     std::vector<MMseqsParameter*> linsearchworkflow;

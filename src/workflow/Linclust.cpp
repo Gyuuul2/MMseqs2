@@ -68,6 +68,7 @@ int linclust(int argc, const char **argv, const Command& command) {
     bool alphabetSizeWasSet = false;
     bool clusterModeSet = false;
     bool includeCountTableSet = false;
+    bool includeAdjacencySet = false;
     for (size_t i = 0; i < par.linclustworkflow.size(); i++) {
         if (par.linclustworkflow[i]->uniqid == par.PARAM_K.uniqid && par.linclustworkflow[i]->wasSet) {
             kmerSizeWasSet = true;
@@ -83,6 +84,12 @@ int linclust(int argc, const char **argv, const Command& command) {
         }
         if (par.linclustworkflow[i]->uniqid == par.PARAM_NUM_COUNTS.uniqid && par.linclustworkflow[i]->wasSet) {
             includeCountTableSet = true;
+        }
+        if (par.linclustworkflow[i]->uniqid == par.PARAM_INCLUDE_ADJACENCY.uniqid && par.linclustworkflow[i]->wasSet) {
+            includeAdjacencySet = true;
+        }
+        if (par.linclustworkflow[i]->uniqid == par.PARAM_NUM_ADJACENCY.uniqid && par.linclustworkflow[i]->wasSet) {
+            includeAdjacencySet = true;
         }
         
     }
@@ -105,6 +112,11 @@ int linclust(int argc, const char **argv, const Command& command) {
         } else {
             par.includeCountTable = true;
         }
+    }
+
+    if (includeAdjacencySet == false) {
+        par.adjIteration = nonSymetric ? Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY
+                                       : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
     }
 
     if (kmerSizeWasSet == false) {
@@ -169,6 +181,7 @@ int linclust(int argc, const char **argv, const Command& command) {
         par.kmerSize = kmerSize;
         bool prevspacedKmer = par.spacedKmer;
         bool prevmaskMode = par.maskMode;
+        MultiParam<NuclAA<float> > prevKmersPerSequenceScale = par.kmersPerSequenceScale;
         par.spacedKmer = false;
         par.maskMode = false;
         cmd.addVariable("KMERMATCHER_PAR", par.createParameterString(par.kmermatcher).c_str());
@@ -183,6 +196,8 @@ int linclust(int argc, const char **argv, const Command& command) {
         
         par.spacedKmer = prevspacedKmer;
         par.maskMode = prevmaskMode;
+        // the 0.1 above is intended for KMERMATCHER_PAR2 only, so it must not leak into later strings
+        par.kmersPerSequenceScale = prevKmersPerSequenceScale;
     }
     float prevSeqId = par.seqIdThr;
     // # 0. clust hash

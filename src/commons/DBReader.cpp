@@ -32,7 +32,7 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
 
 template <typename T>
 DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T lastKey,
-        int dbType, unsigned int maxSeqLen, int threads) :
+        int dbType, size_t maxSeqLen, int threads) :
         threads(threads), dataMode(USE_INDEX), dataFileName(NULL), indexFileName(NULL),
         size(size), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index), sortedByOffset(true),
@@ -220,7 +220,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
         dstream = new ZSTD_DStream*[threads];
         for(int i = 0; i < threads; i++){
             // allocated buffer
-            compressedBufferSizes[i] = std::max(maxSeqLen+2, 1024u);
+            compressedBufferSizes[i] = std::max<size_t>(maxSeqLen+2, 1024);
             compressedBuffers[i] = (char*) malloc(compressedBufferSizes[i]);
             incrementMemory(compressedBufferSizes[i]);
             if(compressedBuffers[i]==NULL){

@@ -16,18 +16,83 @@
 #include "Sequence.h"
 #include "SubstitutionMatrix.h"
 
+#ifdef OPENMP
+#include <omp.h>
+#endif
+
 const char headerStart[] = {'>'};
 const char newline[] = {'\n'};
+
+// shard k of "dir/rep.fa" is "dir/rep.split<k>.fa", so every shard keeps a real FASTA extension
+static std::string splitFastaName(const std::string &out, int split) {
+    const size_t slash = out.find_last_of('/');
+    size_t dot = out.find_last_of('.');
+    if (dot == std::string::npos || (slash != std::string::npos && dot < slash)) {
+        dot = out.size();
+    }
+    char suffix[16];
+    snprintf(suffix, sizeof(suffix), ".split%05d", split);
+    return out.substr(0, dot) + suffix + out.substr(dot);
+}
+
+static void writeFastaEntry(FILE *out, const char *headerData, size_t headerLen,
+                            const char *bodyData, size_t seqLen) {
+    fwrite(headerStart, sizeof(char), 1, out);
+    fwrite(headerData, sizeof(char), headerLen - 2, out);
+    fwrite(newline, sizeof(char), 1, out);
+    fwrite(bodyData, sizeof(char), seqLen, out);
+    fwrite(newline, sizeof(char), 1, out);
+}
 
 int convert2fasta(int argc, const char **argv, const Command& command) {
     Parameters& par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
-    DBReader<DBKeyType> db(par.db1.c_str(), par.db1Index.c_str(), 1, DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_INDEX);
+    DBReader<DBKeyType> db(par.db1.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_INDEX);
     db.open(DBReader<DBKeyType>::NOSORT);
 
-    DBReader<DBKeyType> db_header(par.hdr1.c_str(), par.hdr1Index.c_str(), 1, DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_INDEX);
+    DBReader<DBKeyType> db_header(par.hdr1.c_str(), par.hdr1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_INDEX);
     db_header.open(DBReader<DBKeyType>::NOSORT);
+
+    DBReader<DBKeyType>* order = par.useHeaderFile ? &db_header : &db;
+    // entry i goes to shard i % splits, so a worker owns whole shards and no offset is shared
+    if (par.fastaSplits > 0) {
+        if (Sequence::getAuxInfo(db.getDbtype()) != NULL) {
+            Debug(Debug::ERROR) << "--fasta-splits cannot be combined with an auxiliary sequence database\n";
+            EXIT(EXIT_FAILURE);
+        }
+        const int splits = par.fastaSplits;
+        Debug(Debug::INFO) << "Start writing " << splits << " split files for " << par.db2 << "\n";
+        const int splitThreads = std::min(par.threads, splits);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(splitThreads)
+        for (int split = 0; split < splits; split++) {
+            unsigned int thread_idx = 0;
+#ifdef OPENMP
+            thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+            const std::string name = splitFastaName(par.db2, split);
+            FILE *splitFP = fopen(name.c_str(), "w");
+            if (splitFP == NULL) {
+                perror(name.c_str());
+                EXIT(EXIT_FAILURE);
+            }
+            for (size_t i = split; i < order->getSize(); i += splits) {
+                const DBKeyType key = order->getDbKey(i);
+                const size_t headerKey = db_header.getId(key);
+                const size_t bodyKey = db.getId(key);
+                writeFastaEntry(splitFP, db_header.getData(headerKey, thread_idx),
+                                db_header.getEntryLen(headerKey),
+                                db.getData(bodyKey, thread_idx), db.getEntryLen(bodyKey) - 2);
+            }
+            if (fclose(splitFP) != 0) {
+                Debug(Debug::ERROR) << "Cannot close file " << name << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+        db_header.close();
+        db.close();
+        return EXIT_SUCCESS;
+    }
 
     FILE* fastaFP = fopen(par.db2.c_str(), "w");
     if(fastaFP == NULL) {

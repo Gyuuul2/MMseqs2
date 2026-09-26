@@ -687,7 +687,7 @@ void DBWriter::writeThreadBuffer(unsigned int idx, size_t dataSize) {
     }
 }
 
-void DBWriter::createRenumberedDB(const std::string& dataFile, const std::string& indexFile, const std::string& origData, const std::string& origIndex, int sortMode) {
+void DBWriter::createRenumberedDB(const std::string& dataFile, const std::string& indexFile, const std::string& origData, const std::string& origIndex, int sortMode, size_t idOffset) {
     DBReader<DBKeyType>* lookupReader = NULL;
     FILE *sLookup = NULL;
     if (origData.empty() == false && origIndex.empty() == false) {
@@ -710,7 +710,7 @@ void DBWriter::createRenumberedDB(const std::string& dataFile, const std::string
     }
     for (size_t i = 0; i < reader.getSize(); i++) {
         DBReader<DBKeyType>::Index *idx = (reader.getIndex(i));
-        size_t len = DBWriter::indexToBuffer(buffer, static_cast<DBKeyType>(i), idx->offset, idx->length);
+        size_t len = DBWriter::indexToBuffer(buffer, static_cast<DBKeyType>(idOffset + i), idx->offset, idx->length);
         int written = fwrite(buffer, sizeof(char), len, sIndex);
         if (written != (int) len) {
             Debug(Debug::ERROR) << "Can not write to data file " << indexFile << "_tmp\n";
@@ -719,7 +719,7 @@ void DBWriter::createRenumberedDB(const std::string& dataFile, const std::string
         if (lookupReader != NULL) {
             size_t lookupId = lookupReader->getLookupIdByKey(idx->id);
             DBReader<DBKeyType>::LookupEntry copy = lookup[lookupId];
-            copy.id = static_cast<DBKeyType>(i);
+            copy.id = static_cast<DBKeyType>(idOffset + i);
             copy.entryName = SSTR(idx->id);
             lookupReader->lookupEntryToBuffer(strBuffer, copy);
             written = fwrite(strBuffer.c_str(), sizeof(char), strBuffer.size(), sLookup);

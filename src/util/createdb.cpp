@@ -13,6 +13,11 @@
 #include "FastSort.h"
 #include "Masker.h"
 
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
+#include <cstring>
+
 #ifdef OPENMP
 #include <omp.h>
 #endif
@@ -21,7 +26,8 @@
 int sortWithIndex(const char *dataFileSeq,
                   const char *indexFileSeq,
                   const char *dataFileHeader,
-                  const char *indexFileHeader)
+                  const char *indexFileHeader,
+                  bool lengthDescending)
 {
     DBReader<DBKeyType> reader(dataFileSeq, indexFileSeq, 1, DBReader<DBKeyType>::USE_INDEX);
     reader.open(DBReader<DBKeyType>::HARDNOSORT);
@@ -46,7 +52,9 @@ int sortWithIndex(const char *dataFileSeq,
         index[i].id = i;
     }
 
-    SORT_PARALLEL(index, index + reader.getSize(), DBReader<DBKeyType>::Index::compareByLength);
+    SORT_PARALLEL(index, index + reader.getSize(),
+                  lengthDescending ? DBReader<DBKeyType>::Index::compareByLengthDescending
+                                   : DBReader<DBKeyType>::Index::compareByLength);
 
     FILE *seqOut = FileUtil::openFileOrDie(dataFileSeq, "wb", true);
     setvbuf(seqOut, NULL, _IOFBF, 1024*1024*50);
@@ -120,6 +128,11 @@ int sortWithIndex(const char *dataFileSeq,
     return 0;
 }
 
+static bool isSortedCreatedbMode(int createdbMode) {
+    return createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU
+        || createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LENGTH_DESC;
+}
+
 int mergeSequentialByJointIndex(
         char ** dataFiles,
         char ** indexFiles,
@@ -132,7 +145,10 @@ int mergeSequentialByJointIndex(
         const char * outLookupFile,
         std::vector<unsigned int>* sourceLookup,
         size_t totalEntries,
-        size_t shuffleSplits
+        size_t shuffleSplits,
+        bool gpuLayout,
+        bool lengthDescending,
+        size_t idOffset
 ) {
     struct JointEntry {
         unsigned int fileIdx;
@@ -146,6 +162,13 @@ int mergeSequentialByJointIndex(
                 return length < o.length;
             }
             return id < o.id;
+        }
+
+        static bool compareByLengthDescending(JointEntry const &x, JointEntry const &y) {
+            if (x.length != y.length){
+                return x.length > y.length;
+            }
+            return x.id < y.id;
         }
     };
 
@@ -168,7 +191,11 @@ int mergeSequentialByJointIndex(
         reader.close();
     }
 
-    SORT_PARALLEL(joint.begin(), joint.end());
+    if (lengthDescending) {
+        SORT_PARALLEL(joint.begin(), joint.end(), JointEntry::compareByLengthDescending);
+    } else {
+        SORT_PARALLEL(joint.begin(), joint.end());
+    }
 
     // 4) Open each data file once (no fseek later)
     std::vector<FILE*> inFileSeq(shuffleSplits);
@@ -239,8 +266,9 @@ int mergeSequentialByJointIndex(
             EXIT(EXIT_FAILURE);
         }
         size_t written = fwrite(scratch.data(), 1, qe.length, fout);
-        const size_t sequencepadding = (qe.length % ALIGN == 0) ? 0 : ALIGN - qe.length % ALIGN;
-        written +=  fwrite(pad_buffer, 1, sequencepadding, fout);
+        // GPU entries are written without the \n\0, so the padding stands in for it
+        const size_t sequencepadding = gpuLayout ? ((qe.length % ALIGN == 0) ? 0 : ALIGN - qe.length % ALIGN) : 0;
+        written += fwrite(pad_buffer, 1, sequencepadding, fout);
         if (UNLIKELY(written != qe.length + sequencepadding)) {
             Debug(Debug::ERROR) << "Can not write to data file " << outDataFile << "\n";
             EXIT(EXIT_FAILURE);
@@ -256,7 +284,7 @@ int mergeSequentialByJointIndex(
             writeHeaderBuf.push_back(ch);
         } while (ch != '\0');
 
-        lookupEntry.id = i;
+        lookupEntry.id = idOffset + i;
         lookupEntry.entryName = Util::parseFastaHeader(writeHeaderBuf.data());
         if (lookupEntry.entryName.empty()) {
             Debug(Debug::WARNING) << "Cannot extract identifier from entry " << lookupEntry.id  << "\n";
@@ -277,8 +305,8 @@ int mergeSequentialByJointIndex(
 
         entry.offset = mergedOffset;
         // + 2 is needed for newline and null character
-        entry.length = qe.length + 2;
-        entry.id = i;
+        entry.length = gpuLayout ? qe.length + 2 : qe.length;
+        entry.id = idOffset + i;
         DBWriter::writeIndexEntryToFile(idxOut, indexBuffer, entry);
         entry.length = writeHeaderBuf.size();
         entry.offset = mergedOffsetHeader;
@@ -371,15 +399,33 @@ int createdb(int argc, const char **argv, const Command& command) {
 	    char* line = NULL;
 	    size_t len = 0;
 	    ssize_t read;
+	    size_t declaredCounts = 0;
 	    while ((read = getline(&line, &len, file)) != -1) {
 		    if (line[read - 1] == '\n') {
 			    line[read - 1] = '\0';
 			    read--;
 		    }
+		    // optional second column: the file's sequence count, a hint for callers that pre-assign key ranges
+		    char* tab = strchr(line, '\t');
+		    if (tab != NULL) {
+			    *tab = '\0';
+			    char* end = NULL;
+			    errno = 0;
+			    strtoull(tab + 1, &end, 10);
+			    if (isdigit(static_cast<unsigned char>(tab[1])) == 0 || errno != 0 || *end != '\0') {
+				    Debug(Debug::ERROR) << "Invalid sequence count \"" << (tab + 1) << "\" for " << line << " in " << tsv << "\n";
+				    EXIT(EXIT_FAILURE);
+			    }
+			    declaredCounts++;
+		    }
 		    filenames.push_back(line);
 	    }
 	    free(line);
 	    fclose(file);
+	    if (declaredCounts != 0 && declaredCounts != filenames.size()) {
+		    Debug(Debug::ERROR) << "The tsv " << tsv << " mixes rows with and without a sequence count: all rows need one, or none\n";
+		    EXIT(EXIT_FAILURE);
+	    }
     }
 
     // consistent order
@@ -648,7 +694,8 @@ int createdb(int argc, const char **argv, const Command& command) {
                 // +2 to emulate the \n\0
                 hdrWriter.writeIndexEntry(id, headerFileOffset + e.headerOffset, (e.sequenceOffset-e.headerOffset)+1, 0);
                 seqWriter.writeIndexEntry(id, seqFileOffset + e.sequenceOffset, e.sequence.l+2, 0);
-            } else if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_HARD) {
+            } else if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_HARD
+                       || par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LENGTH_DESC) {
                 hdrWriter.writeData(header.c_str(), header.length(), id, splitIdx);
                 seqWriter.writeStart(splitIdx);
                 seqWriter.writeAdd(e.sequence.s, e.sequence.l, splitIdx);
@@ -687,7 +734,7 @@ int createdb(int argc, const char **argv, const Command& command) {
             header.clear();
         }
 
-        if(par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU && batchPos > 0){
+        if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU && batchPos > 0) {
             if(subMat == NULL){
                 if (isNuclCnt == sampleCount) {
                     subMat = new NucleotideMatrix(par.scoringMatrixFile.values.nucleotide().c_str(), 2.0, -0.0f);
@@ -721,13 +768,14 @@ int createdb(int argc, const char **argv, const Command& command) {
     // sort
     bool gpuCompatibleDB = false;
     Timer timer;
-    if(par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU){
-        gpuCompatibleDB = true;
+    if (isSortedCreatedbMode(par.createdbMode)) {
+        gpuCompatibleDB = par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_GPU;
         hdrWriter.closeFiles();
         seqWriter.closeFiles();
         for(unsigned int i = 0; i < shuffleSplits; i++){
             sortWithIndex(seqWriter.getDataFileNames()[i], seqWriter.getIndexFileNames()[i],
-                          hdrWriter.getDataFileNames()[i], hdrWriter.getIndexFileNames()[i]);
+                          hdrWriter.getDataFileNames()[i], hdrWriter.getIndexFileNames()[i],
+                          par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LENGTH_DESC);
         }
         Debug(Debug::INFO) << "Sort single files in " << timer.lap() << "\n";
         std::string lookupFile = dataFile + ".lookup";
@@ -737,7 +785,10 @@ int createdb(int argc, const char **argv, const Command& command) {
                                     hdrWriter.getDataFileNames(), hdrWriter.getIndexFileNames(),
                                     seqWriter.getDataFileName(), seqWriter.getIndexFileName(),
                                     hdrWriter.getDataFileName(), hdrWriter.getIndexFileName(),
-                                    lookupFile.c_str(), sourceLookup, entries_num, shuffleSplits);
+                                    lookupFile.c_str(), sourceLookup, entries_num, shuffleSplits,
+                                    gpuCompatibleDB,
+                                    par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LENGTH_DESC,
+                                    par.identifierOffset);
         Debug(Debug::INFO) << "Merge all files " << timer.lap() << "\n";
         hdrWriter.clearMemory();
         seqWriter.clearMemory();
@@ -746,8 +797,8 @@ int createdb(int argc, const char **argv, const Command& command) {
         hdrWriter.close(true, false);
         seqWriter.close(true, false);
         if (par.shuffleDatabase == true) {
-            DBWriter::createRenumberedDB(dataFile, indexFile, "", "", DBReader<DBKeyType>::LINEAR_ACCCESS);
-            DBWriter::createRenumberedDB(hdrDataFile, hdrIndexFile, "", "", DBReader<DBKeyType>::LINEAR_ACCCESS);
+            DBWriter::createRenumberedDB(dataFile, indexFile, "", "", DBReader<DBKeyType>::LINEAR_ACCCESS, par.identifierOffset);
+            DBWriter::createRenumberedDB(hdrDataFile, hdrIndexFile, "", "", DBReader<DBKeyType>::LINEAR_ACCCESS, par.identifierOffset);
         }
         if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT) {
             if (filenames.size() == 1) {

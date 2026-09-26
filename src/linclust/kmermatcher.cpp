@@ -538,6 +538,7 @@ size_t assignGroup(KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair
                     // find member with lowest adj score → swap to prevHashStart
                     size_t bestPos = prevHashStart;
                     int minAdjScore = INT_MAX;
+                    T bestLen = 0;
                     for (size_t i = prevHashStart; i < elementIdx; i++) {
                         if (i > prevHashStart && sequenceWeights != nullptr &&
                             sequenceWeights->getWeightById(hashSeqPair[i].id) > weightThr) {
@@ -557,7 +558,12 @@ size_t assignGroup(KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair
                             for (size_t j = 0; j < 6; j++) {
                                 currAdjScore += subMatPos[j][hashSeqPair[i].getAdjacentSeq(j)];
                             }
-                            if (currAdjScore <= minAdjScore) {
+                            // greedy incremental wants the longer sequence as the centre, so an equal
+                            // adjacency score goes to the longer member instead of to array order
+                            const T currLen = hashSeqPair[i].sl.getSeqLen(hashSeqPair[i].id);
+                            if (currAdjScore < minAdjScore
+                                || (currAdjScore == minAdjScore && currLen > bestLen)) {
+                                bestLen = currLen;
                                 minAdjScore = currAdjScore;
                                 bestPos = i;
                             }

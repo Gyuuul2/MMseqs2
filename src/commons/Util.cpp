@@ -738,3 +738,71 @@ template<>
 std::string SSTR(float x, int precision) {
     return fmt::format("{:.{}f}", x, precision);
 }
+
+void Util::resolveIncludeIterationPair(bool includeSet, bool &includeValue,
+                                       bool numSet, int &numValue,
+                                       const char *includeName, const char *numName) {
+    if (includeSet && numSet) {
+        if (includeValue && numValue == 0) {
+            Debug(Debug::ERROR) << includeName << " 1 conflicts with " << numName
+                                << " 0. Use " << includeName << " 0 to disable it.\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (includeValue == false && numValue > 0) {
+            Debug(Debug::ERROR) << includeName << " 0 conflicts with " << numName
+                                << " " << numValue << ". Disable with count 0, or enable both.\n";
+            EXIT(EXIT_FAILURE);
+        }
+        return;
+    }
+    if (includeSet) {
+        if (includeValue == false) {
+            numValue = 0;
+        }
+        return;
+    }
+    if (numSet) {
+        includeValue = (numValue > 0);
+    }
+}
+
+// Must stay byte-identical to split_of() in batch_clustering.sh: bytes are read unsigned, the shell
+// runs under LC_ALL=C, and h stays below splits so awk keeps every intermediate exact in a double.
+unsigned int Util::tsvSplitOfKey(const std::string &key, unsigned int splits) {
+    uint64_t h = 0;
+    for (size_t i = 0; i < key.size(); i++) {
+        const unsigned char byte = key[i];
+        if (byte == '\t' || byte == '\n') {
+            break;
+        }
+        h = (h * 131 + byte) % splits;
+    }
+    return (unsigned int) h;
+}
+
+unsigned int Util::tsvSplitOfColumn(const std::string &line, int column, unsigned int splits) {
+    size_t start = 0;
+    for (int c = 1; c < column; c++) {
+        const size_t tab = line.find('\t', start);
+        start = (tab == std::string::npos) ? line.size() : tab + 1;
+    }
+    return tsvSplitOfKey(line.substr(start), splits);
+}
+
+std::string Util::tsvSplitName(const std::string &prefix, unsigned int split) {
+    char suffix[32];
+    snprintf(suffix, sizeof(suffix), ".split%05u.tsv", split);
+    return prefix + suffix;
+}
+
+void Util::flushSplitBuffer(FILE *file, std::mutex &lock, std::string &buffer, const std::string &name) {
+    if (buffer.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> guard(lock);
+    if (fwrite(buffer.c_str(), sizeof(char), buffer.size(), file) != buffer.size()) {
+        Debug(Debug::ERROR) << "Cannot write " << name << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    buffer.clear();
+}

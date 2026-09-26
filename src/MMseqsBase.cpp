@@ -280,6 +280,91 @@ std::vector<Command> baseCommands = {
                                           {"targetDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
                                           {"alignmentDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb },
                                           {"tmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory }}},
+        {"easy-linclust2-batch",       linclustbatch,        &par.linclustbatch,        COMMAND_EASY,
+                "Batch linclust: chunk a huge input, linclust each chunk, hierarchically merge representatives",
+                "mmseqs easy-linclust2-batch part_00.fa.zst part_01.fa.zst resultDir sharedTmp --min-seq-id 0.9 -c 0.9 --cov-mode 1 --chunk-max-bytes 5G --threads 128\n\n"
+                "mmseqs easy-linclust2-batch part_00.fa.zst part_01.fa.zst resultDir sharedTmp --slurm-nodelist super001,super002 --threads 128 --chunk-max-bytes 5G --node-work-dir /scratch/mmseqs-batch\n\n"
+                "# Read the input paths from a file instead of the command line (one path per line, optional second column: its sequence count)\n"
+                "mmseqs easy-linclust2-batch inputs.tsv resultDir sharedTmp --chunk-max-bytes 5G --threads 128\n\n"
+                "# Output: resultDir/final_cluster_manifest.txt listing resultDir/final_cluster_shards/final.split*.tsv[.zst], plus resultDir/final_rep_seq.fasta[.zst]\n"
+                "# --slurm-nodelist submits SLURM jobs and requires shared input/result/tmp paths\n"
+                "# For AWS Batch use easy-linclust2-batch-aws\n",
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
+                "<i:fastaFile1[.gz|.zst]> ... <i:fastaFileN[.gz|.zst]>|<i:fileList.tsv> <o:resultDir> <o:sharedTmpDir>",
+                CITATION_MMSEQS2|CITATION_LINCLUST, {{"fastaFile[.gz|.zst]|fileList.tsv", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA|DbType::VARIADIC, &DbValidator::flatfileStdinGenericUri },
+                                                            {"resultDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"sharedTmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri }}},
+        {"easy-linclust2-batch-aws",   linclustbatchaws,     &par.linclustbatchaws,     COMMAND_EASY,
+                "Batch linclust on AWS Batch: chunk a huge S3 input, linclust each chunk, hierarchically merge representatives",
+                "mmseqs easy-linclust2-batch-aws s3://bucket/part_00.fa.zst s3://bucket/part_01.fa.zst s3://bucket/result/run1 s3://bucket/work/run1 --aws-machine i4i.metal --round0-aws-machine x2gd.metal --node-work-dir /scratch/mmseqs --threads 64\n\n"
+                "# Read the s3:// input paths from a local file instead of the command line\n"
+                "mmseqs easy-linclust2-batch-aws inputs.tsv s3://bucket/result/run1 s3://bucket/work/run1 --aws-machine i4i.metal --node-work-dir /scratch/mmseqs --threads 64\n\n"
+                "# Output: resultDir/final_cluster_manifest.txt listing resultDir/final_cluster_shards/final.split*.tsv[.zst], plus resultDir/final_rep_seq.fasta[.zst]\n"
+                "# Submits AWS Batch jobs; <resultDir> and <sharedTmpDir> must be s3:// prefixes\n",
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
+                "<i:fastaFile1[.gz|.zst]> ... <i:fastaFileN[.gz|.zst]>|<i:fileList.tsv> <o:resultDir> <o:sharedTmpDir>",
+                CITATION_MMSEQS2|CITATION_LINCLUST, {{"fastaFile[.gz|.zst]|fileList.tsv", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA|DbType::VARIADIC, &DbValidator::flatfileStdinGenericUri },
+                                                            {"resultDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"sharedTmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri }}},
+        {"easy-cluster2-batch",        clusterbatch,         &par.clusterbatch,         COMMAND_EASY,
+                "Batch cluster: chunk a huge input, cluster each chunk, hierarchically merge representatives",
+                "mmseqs easy-cluster2-batch part_00.fa.zst part_01.fa.zst resultDir sharedTmp --backend single-node --min-seq-id 0.5 -c 0.8 --cov-mode 1 --chunk-max-bytes 5G --threads 128\n\n"
+                "mmseqs easy-cluster2-batch part_00.fa.zst part_01.fa.zst resultDir sharedTmp --slurm-nodelist super001,super002 --threads 128 --chunk-max-bytes 5G --node-work-dir /scratch/mmseqs-batch\n\n"
+                "# Read the input paths from a file instead of the command line (one path per line, optional second column: its sequence count)\n"
+                "mmseqs easy-cluster2-batch inputs.tsv resultDir sharedTmp --chunk-max-bytes 5G --threads 128\n\n"
+                "# Output: resultDir/final_cluster_manifest.txt listing resultDir/final_cluster_shards/final.split*.tsv[.zst], plus resultDir/final_rep_seq.fasta[.zst]\n"
+                "# --slurm-nodelist submits SLURM jobs and requires shared input/result/tmp paths\n"
+                "# For AWS Batch use easy-cluster2-batch-aws\n",
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
+                "<i:fastaFile1[.gz|.zst]> ... <i:fastaFileN[.gz|.zst]>|<i:fileList.tsv> <o:resultDir> <o:sharedTmpDir>",
+                CITATION_MMSEQS2|CITATION_LINCLUST, {{"fastaFile[.gz|.zst]|fileList.tsv", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA|DbType::VARIADIC, &DbValidator::flatfileStdinGenericUri },
+                                                            {"resultDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"sharedTmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri }}},
+        {"easy-cluster2-batch-aws",    clusterbatchaws,      &par.clusterbatchaws,      COMMAND_EASY,
+                "Batch cluster on AWS Batch: chunk a huge S3 input, cluster each chunk, hierarchically merge representatives",
+                "mmseqs easy-cluster2-batch-aws s3://bucket/part_00.fa.zst s3://bucket/part_01.fa.zst s3://bucket/result/run1 s3://bucket/work/run1 --aws-machine i4i.metal --round0-aws-machine x2gd.metal --node-work-dir /scratch/mmseqs --threads 64\n\n"
+                "# Read the s3:// input paths from a local file instead of the command line\n"
+                "mmseqs easy-cluster2-batch-aws inputs.tsv s3://bucket/result/run1 s3://bucket/work/run1 --aws-machine i4i.metal --node-work-dir /scratch/mmseqs --threads 64\n\n"
+                "# Output: resultDir/final_cluster_manifest.txt listing resultDir/final_cluster_shards/final.split*.tsv[.zst], plus resultDir/final_rep_seq.fasta[.zst]\n"
+                "# Submits AWS Batch jobs; <resultDir> and <sharedTmpDir> must be s3:// prefixes\n",
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
+                "<i:fastaFile1[.gz|.zst]> ... <i:fastaFileN[.gz|.zst]>|<i:fileList.tsv> <o:resultDir> <o:sharedTmpDir>",
+                CITATION_MMSEQS2|CITATION_LINCLUST, {{"fastaFile[.gz|.zst]|fileList.tsv", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA|DbType::VARIADIC, &DbValidator::flatfileStdinGenericUri },
+                                                            {"resultDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"sharedTmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri }}},
+        {"batch-clustering-prepare", batchclusteringprepare, &par.batchclustering, COMMAND_HIDDEN,
+                "Prepare chunked batch-clustering FASTA chunks",
+                NULL,
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
+                "<i:inputManifest> <o:chunkDir> <o:chunkManifest>",
+                CITATION_MMSEQS2|CITATION_LINCLUST, {{"inputManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"chunkDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory },
+                                                            {"chunkManifest", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfile }}},
+        {"linclust2-batch-worker", linclustbatchworker, &par.linclustbatchall, COMMAND_HIDDEN,
+                "Cluster one prepared easy-linclust2-batch chunk",
+                NULL,
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
+                "<i:chunkFasta[.gz|.zst]|uri> <o:resultPrefix> <tmpDir>",
+                CITATION_MMSEQS2|CITATION_LINCLUST, {{"chunkFasta", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"resultPrefix", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"tmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory }}},
+        {"cluster2-batch-worker", clusterbatchworker, &par.clusterbatchall, COMMAND_HIDDEN,
+                "Cluster one prepared easy-cluster2-batch chunk",
+                NULL,
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
+                "<i:chunkFasta[.gz|.zst]|uri> <o:resultPrefix> <tmpDir>",
+                CITATION_MMSEQS2|CITATION_LINCLUST, {{"chunkFasta", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"resultPrefix", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"tmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory }}},
+        {"batch-clustering-merge", batchclusteringmerge, &par.batchclustering, COMMAND_HIDDEN,
+                "Propagate child batch-clustering assignments through parent representative clusters",
+                NULL,
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
+                "<i:childTsvManifest> <i:parentTsvManifest> <o:outManifest> <tmpDir>",
+                CITATION_MMSEQS2|CITATION_LINCLUST, {{"childTsvManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"parentTsvManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"outManifest", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri },
+                                                            {"tmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory }}},
         {"linclust",          linclust,          &par.linclustworkflow,           COMMAND_MAIN,
                 "Fast, less sensitive clustering",
                 "# Linear-time clustering of FASTA file\n"
@@ -390,6 +475,14 @@ std::vector<Command> baseCommands = {
                 "Martin Steinegger <martin.steinegger@snu.ac.kr>",
                 "<i:queryDB> [<i:targetDB>] <i:resultDB> <o:tsvFile>",
                 CITATION_MMSEQS2,{{"",DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, NULL}}},
+        {"propagateclusters",    propagateclusters,    &par.propagateclusters,    COMMAND_CLUSTER | COMMAND_EXPERT,
+                "Compose a chain of cluster assignments held as hash split TSV files",
+                NULL,
+                "Gyuri Kim <kyu2All@protonmail.com>",
+                "<i:childManifest> <i:parentManifest> <o:tsvFile>",
+                CITATION_MMSEQS2, {{"childManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfile },
+                                                           {"parentManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfile },
+                                                           {"tsvFile", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfile }}},
         {"convert2fasta",        convert2fasta,        &par.convert2fasta,        COMMAND_FORMAT_CONVERSION,
                 "Convert sequence DB to FASTA format",
                 NULL,

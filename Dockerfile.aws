@@ -1,0 +1,21 @@
+# AWS Batch runtime image for `mmseqs {linclust,cluster}2-batch-aws`.
+# Build the base image first, then this layer per CPU architecture you route to
+# (--aws-machine / --round0-aws-machine may mix ARM and x86):
+#   docker build -t mmseqs2:latest .
+#   docker build -f Dockerfile.aws --build-arg MMSEQS_IMAGE=mmseqs2:latest -t <registry>/mmseqs-batch:<arch> .
+ARG MMSEQS_IMAGE=mmseqs2:latest
+FROM ${MMSEQS_IMAGE}
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        zstd unzip ca-certificates \
+    && wget -q "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -O /tmp/awscliv2.zip \
+    && unzip -q /tmp/awscliv2.zip -d /tmp \
+    && /tmp/aws/install \
+    && rm -rf /tmp/aws /tmp/awscliv2.zip \
+    && apt-get purge -y --auto-remove unzip \
+    && rm -rf /var/lib/apt/lists/* \
+    && aws --version && zstd --version && mmseqs version
+
+# containerOverrides.command replaces CMD but not ENTRYPOINT, so the mmseqs entrypoint has to go
+ENTRYPOINT []
+CMD ["bash"]
