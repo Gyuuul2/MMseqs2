@@ -222,7 +222,7 @@ Parameters::Parameters():
         PARAM_BATCH_MAX_CHUNK_ATTEMPTS(PARAM_BATCH_MAX_CHUNK_ATTEMPTS_ID, "--max-chunk-attempts", "Max chunk attempts", "Maximum attempts for missing or failed chunk workers before reporting a dead-letter failure", typeid(int), (void *) &batchMaxChunkAttempts, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_COMPRESS_OUTPUTS(PARAM_BATCH_COMPRESS_OUTPUTS_ID, "--compress-batch-outputs", "Compress batch outputs", "Store per-round and final batch FASTA/TSV outputs as zstd files", typeid(bool), (void *) &batchCompressOutputs, "^[0-1]{1}$", MMseqsParameter::COMMAND_COMMON),
         // pinned per work area on first use (pin_merge_splits): round TSVs are written pre-split, so one count must cover every round
-        PARAM_BATCH_MERGE_SPLITS(PARAM_BATCH_MERGE_SPLITS_ID, "--merge-splits", "Merge splits", "Number of hash splits the representative merge is processed in. 0: auto from --threads", typeid(int), (void *) &batchMergeSplits, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
+        PARAM_BATCH_MERGE_SPLITS(PARAM_BATCH_MERGE_SPLITS_ID, "--merge-splits", "Merge splits", "Number of hash splits the representative merge is processed in, and the parallelism limit of the merge and propagate steps, which work one split at a time. 0: auto from --threads", typeid(int), (void *) &batchMergeSplits, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_MERGE_SPLIT_JOBS(PARAM_BATCH_MERGE_SPLIT_JOBS_ID, "--merge-split-jobs", "Merge split jobs", "Number of merge splits to sort and join concurrently. 0: auto from --threads", typeid(int), (void *) &batchMergeSplitJobs, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_MERGE_NODES(PARAM_BATCH_MERGE_NODES_ID, "--merge-nodes", "Merge nodes", "Number of machines the final deferred merge join is distributed across. 1: run it inside the merge job", typeid(int), (void *) &batchMergeNodes, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
         PARAM_BATCH_REP_FASTA_SPLITS(PARAM_BATCH_REP_FASTA_SPLITS_ID, "--rep-fasta-splits", "Representative FASTA splits", "Number of FASTA files each chunk's representatives are sharded into", typeid(int), (void *) &batchRepFastaSplits, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_COMMON),
@@ -714,6 +714,7 @@ Parameters::Parameters():
     createtsv.push_back(&PARAM_V);
 
     propagateclusters.push_back(&PARAM_TSV_SPLITS);
+    propagateclusters.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     propagateclusters.push_back(&PARAM_THREADS);
     propagateclusters.push_back(&PARAM_COMPRESSED);
     propagateclusters.push_back(&PARAM_V);

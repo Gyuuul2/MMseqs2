@@ -1092,6 +1092,9 @@ cluster_chunk() {
     log "createdb ${chunk_id}"
     # shellcheck disable=SC2046,SC2086
     run_stage createdb "$chunk_id" "$round" -- "$mmseqs_bin" createdb "$createdb_input" "$db" $(round_createdb_par "$round") || fail "createdb failed (chunk ${chunk_id}, rc=$?)"
+    # the unchecked index fwrite that let createdb report success on a full disk is fixed in
+    # DBWriter::writeIndexEntryToFile; this still catches a missing output for any other reason
+    [[ -s "${db}.index" ]] || fail "createdb reported success but wrote no index for ${chunk_id}"
     local actual_seqs
     actual_seqs=$(wc -l < "${db}.index" | tr -d ' ')
     if [[ "${expected_seqs:-0}" =~ ^[1-9][0-9]*$ && "$actual_seqs" -ne "$expected_seqs" ]]; then

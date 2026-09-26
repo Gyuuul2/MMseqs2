@@ -85,6 +85,10 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
         manifest.append(1, '\n');
     }
 
+    // the parent of one split is held in memory, so it is taken in several passes when it does not
+    // fit, streaming the child again for each; the resident set then stays under the budget
+    const size_t budget = Util::computeMemory(par.splitMemoryLimit) / (size_t) par.threads;
+
     const size_t flushSize = std::max(Util::TSV_SPLIT_BUFFER_MIN,
                                       Util::TSV_SPLIT_BUFFER_TOTAL / ((size_t) par.threads * splits));
     Debug::Progress progress(splits);
@@ -100,46 +104,77 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
 #pragma omp for schedule(dynamic, 1)
         for (unsigned int b = 0; b < splits; b++) {
             progress.updateProgress();
-            parentByMember.clear();
-            for (size_t f = 0; f < parentShards[b].size(); f++) {
-                ZstdReader parent(parentShards[b][f]);
-                while (parent.getLine(line)) {
-                    splitLine(line, first, second);
-                    parentByMember.push_back(std::make_pair(second, first));
-                }
-            }
-            std::sort(parentByMember.begin(), parentByMember.end());
-            for (size_t i = 1; i < parentByMember.size(); i++) {
-                if (parentByMember[i].first == parentByMember[i - 1].first) {
-                    Debug(Debug::ERROR) << "The parent names " << parentByMember[i].first
-                                        << " in more than one cluster\n";
-                    EXIT(EXIT_FAILURE);
-                }
-            }
-
             size_t childRows = 0;
             size_t joinedRows = 0;
-            for (size_t f = 0; f < childShards[b].size(); f++) {
-                ZstdReader child(childShards[b][f]);
-                while (child.getLine(line)) {
-                    splitLine(line, first, second);
-                    childRows++;
-                    std::vector<std::pair<std::string, std::string> >::const_iterator it =
-                        std::lower_bound(parentByMember.begin(), parentByMember.end(),
-                                         std::make_pair(first, std::string()));
-                    if (it == parentByMember.end() || it->first != first) {
-                        continue;
+
+            // Util::hash is a different function from the one that assigned the split, so a pass
+            // holds its share of the parent rather than all or none of it
+            unsigned int passes = 1;
+            for (unsigned int pass = 0; pass < passes; pass++) {
+                parentByMember.clear();
+                size_t resident = 0;
+                bool overBudget = false;
+                for (size_t f = 0; f < parentShards[b].size() && overBudget == false; f++) {
+                    ZstdReader parent(parentShards[b][f]);
+                    while (parent.getLine(line)) {
+                        splitLine(line, first, second);
+                        if (passes > 1 && Util::hash(second.c_str(), second.size()) % passes != pass) {
+                            continue;
+                        }
+                        parentByMember.push_back(std::make_pair(second, first));
+                        resident += first.size() + second.size() + sizeof(std::pair<std::string, std::string>);
+                        if (resident > budget) {
+                            overBudget = true;
+                            break;
+                        }
                     }
-                    const unsigned int k = Util::tsvSplitOfKey(it->second, splits);
-                    buffers[k].append(it->second);
-                    buffers[k].append(1, '\t');
-                    buffers[k].append(second);
-                    buffers[k].append(1, '\n');
-                    joinedRows++;
-                    if (buffers[k].size() >= flushSize) {
-                        std::lock_guard<std::mutex> guard(locks[k]);
-                        writers[k]->write(buffers[k]);
-                        buffers[k].clear();
+                }
+                if (overBudget) {
+                    if (passes > splits * 1024) {
+                        Debug(Debug::ERROR) << "Split " << b << " does not fit --split-memory-limit "
+                                            << "even taken in " << passes << " passes\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    passes *= 2;
+                    pass = (unsigned int) -1;
+                    childRows = 0;
+                    joinedRows = 0;
+                    continue;
+                }
+
+                std::sort(parentByMember.begin(), parentByMember.end());
+                for (size_t i = 1; i < parentByMember.size(); i++) {
+                    if (parentByMember[i].first == parentByMember[i - 1].first) {
+                        Debug(Debug::ERROR) << "The parent names " << parentByMember[i].first
+                                            << " in more than one cluster\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                }
+
+                for (size_t f = 0; f < childShards[b].size(); f++) {
+                    ZstdReader child(childShards[b][f]);
+                    while (child.getLine(line)) {
+                        splitLine(line, first, second);
+                        if (pass == 0) {
+                            childRows++;
+                        }
+                        std::vector<std::pair<std::string, std::string> >::const_iterator it =
+                            std::lower_bound(parentByMember.begin(), parentByMember.end(),
+                                             std::make_pair(first, std::string()));
+                        if (it == parentByMember.end() || it->first != first) {
+                            continue;
+                        }
+                        const unsigned int k = Util::tsvSplitOfKey(it->second, splits);
+                        buffers[k].append(it->second);
+                        buffers[k].append(1, '\t');
+                        buffers[k].append(second);
+                        buffers[k].append(1, '\n');
+                        joinedRows++;
+                        if (buffers[k].size() >= flushSize) {
+                            std::lock_guard<std::mutex> guard(locks[k]);
+                            writers[k]->write(buffers[k]);
+                            buffers[k].clear();
+                        }
                     }
                 }
             }
