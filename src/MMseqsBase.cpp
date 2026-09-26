@@ -308,7 +308,7 @@ std::vector<Command> baseCommands = {
                                                             {"sharedTmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfileStdinGenericUri }}},
         {"easy-cluster2-batch",        clusterbatch,         &par.clusterbatch,         COMMAND_EASY,
                 "Batch cluster: chunk a huge input, cluster each chunk, hierarchically merge representatives",
-                "mmseqs easy-cluster2-batch part_00.fa.zst part_01.fa.zst resultDir sharedTmp --backend single-node --min-seq-id 0.5 -c 0.8 --cov-mode 1 --chunk-max-bytes 5G --threads 128\n\n"
+                "mmseqs easy-cluster2-batch part_00.fa.zst part_01.fa.zst resultDir sharedTmp --min-seq-id 0.5 -c 0.8 --cov-mode 1 --chunk-max-bytes 5G --threads 128\n\n"
                 "mmseqs easy-cluster2-batch part_00.fa.zst part_01.fa.zst resultDir sharedTmp --slurm-nodelist super001,super002 --threads 128 --chunk-max-bytes 5G --node-work-dir /scratch/mmseqs-batch\n\n"
                 "# Read the input paths from a file instead of the command line (one path per line, optional second column: its sequence count)\n"
                 "mmseqs easy-cluster2-batch inputs.tsv resultDir sharedTmp --chunk-max-bytes 5G --threads 128\n\n"
@@ -478,14 +478,14 @@ std::vector<Command> baseCommands = {
         {"splittsv",             splittsv,             &par.splittsv,             COMMAND_FORMAT_CONVERSION | COMMAND_EXPERT,
                 "Route the rows of hash split TSV files into new splits by one column",
                 NULL,
-                "Gyuri Kim <kyu2All@protonmail.com>",
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
                 "<i:tsvManifest> <o:tsvFile>",
                 CITATION_MMSEQS2, {{"tsvManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfile },
                                                            {"tsvFile", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::flatfile }}},
         {"propagateclusters",    propagateclusters,    &par.propagateclusters,    COMMAND_CLUSTER | COMMAND_EXPERT,
                 "Compose a chain of cluster assignments held as hash split TSV files",
                 NULL,
-                "Gyuri Kim <kyu2All@protonmail.com>",
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
                 "<i:childManifest> <i:parentManifest> <o:tsvFile>",
                 CITATION_MMSEQS2, {{"childManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfile },
                                                            {"parentManifest", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::flatfile },
@@ -882,6 +882,13 @@ std::vector<Command> baseCommands = {
                 "<i:sequenceDB> <o:alignmentDB>",
                 CITATION_MMSEQS2, {{"sequenceDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
                                                           {"alignmentDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::alignmentDb }}},
+        {"clusthashfast",        clusthashfast,        &par.clusthashfast,        COMMAND_CLUSTER,
+                "Hash-based clustering of equal length sequences, writes the clustering directly",
+                NULL,
+                "Gyuri Kim <gyuribio@snu.ac.kr>",
+                "<i:sequenceDB> <o:clusterDB>",
+                CITATION_MMSEQS2, {{"sequenceDB", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA, &DbValidator::sequenceDb },
+                                   {"clusterDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::clusterDb }}},
         {"mergeclusters",        mergeclusters,        &par.threadsandcompression,COMMAND_CLUSTER,
                 "Merge multiple cascaded clustering steps",
                 NULL,

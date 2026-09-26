@@ -7,7 +7,7 @@ ARG MMSEQS_IMAGE=mmseqs2:latest
 FROM ${MMSEQS_IMAGE}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        zstd unzip ca-certificates \
+        unzip ca-certificates \
     && wget -q "https://awscli.amazonaws.com/awscli-exe-linux-$(uname -m).zip" -O /tmp/awscliv2.zip \
     && unzip -q /tmp/awscliv2.zip -d /tmp \
     && /tmp/aws/install \

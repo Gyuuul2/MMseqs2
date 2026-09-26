@@ -60,7 +60,7 @@ ARG GPU
 COPY --from=builder /opt/build/${APP} /usr/local/bin/
 
 RUN apt-get update && apt-get install -y \
-  gawk bash grep wget tar aria2 \
+  gawk bash grep wget tar aria2 zstd \
   && rm -rf /var/lib/apt/lists/*;
 
 RUN echo "#!/bin/sh\nexec /usr/local/bin/$APP \"\${@}\"" > /usr/local/bin/entrypoint && chmod +x /usr/local/bin/entrypoint
