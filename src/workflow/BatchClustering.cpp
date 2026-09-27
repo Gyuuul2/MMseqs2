@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -89,7 +90,21 @@ static std::string withoutTrailingSlash(const std::string &path) {
     return path.substr(0, end);
 }
 
+// a bucket root has no key to scope the recursive cleanup to, so it would take the bucket
+static void rejectS3BucketRoot(const std::string &path, const char *what) {
+    if (isS3Uri(path) == false) {
+        return;
+    }
+    const std::string key = withoutTrailingSlash(path).substr(strlen("s3://"));
+    if (key.find('/') == std::string::npos) {
+        Debug(Debug::ERROR) << what << " " << path << " is a bucket root; give a prefix inside the bucket\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
 static void validateBatchTmpPolicy(const Parameters &par) {
+    rejectS3BucketRoot(par.db2, "<resultDir>");
+    rejectS3BucketRoot(par.db3, "<tmpDir>");
     const std::string resultDir = withoutTrailingSlash(par.db2);
     const std::string tmpDir = withoutTrailingSlash(par.db3);
     if (resultDir == tmpDir || Util::startWith(tmpDir + "/", resultDir)) {
@@ -462,10 +477,10 @@ static std::string resolveBatchInputManifest(const Parameters &par, const std::s
 }
 
 static int runBatchClustering(Parameters &par, const Command &command, const std::string &clusterCmd,
-                       const std::string &clusterPar, const std::string &round0ClusterPar) {
+                       const std::string &clusterPar, const std::string &round0ClusterPar,
+                       std::string hash) {
     std::string mode = "run-single-node";
     std::string workDir;
-    std::string hash = SSTR(par.hashParameter(command.databases, par.filenames, *command.params));
     if (par.batchBackend == "aws-batch") {
         if (isS3Uri(par.db2) == false || isS3Uri(par.db3) == false) {
             Debug(Debug::ERROR)
@@ -551,9 +566,10 @@ static int dobatchclustering(int argc, const char **argv, const Command &command
     const std::string clusterCmd = cascaded ? "cluster" : "linclust";
     std::string clusterPar = buildInnerClusterParFromCurrent(par, clusterCmd);
     par.printParameters(command.cmd, argc, argv, *command.params);
-    // round 0 rewrites par, so it is built after the values the user asked for have been printed
+    // taken before round 0 rewrites par, so the work directory names what the user asked for
+    const std::string hash = SSTR(par.hashParameter(command.databases, par.filenames, *command.params));
     std::string round0ClusterPar = buildRound0ClusterPar(par, "linclust", cascaded);
-    return runBatchClustering(par, command, clusterCmd, clusterPar, round0ClusterPar);
+    return runBatchClustering(par, command, clusterCmd, clusterPar, round0ClusterPar, hash);
 }
 
 int linclustbatch(int argc, const char **argv, const Command &command) {
