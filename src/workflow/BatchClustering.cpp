@@ -385,6 +385,10 @@ static int execBatchEngine(Parameters &par, const std::string &programDir,
         EXIT(EXIT_FAILURE);
     }
 
+    // the work directory is named after the parameter hash, so its name identifies this run and
+    // keeps two runs that share a node from colliding in node-local scratch
+    cmd.addVariable("RUN_ID", FileUtil::baseName(programDir).c_str());
+
     std::string program = programDir + "/batch_clustering.sh";
     FileUtil::writeFile(program, batch_clustering_sh, batch_clustering_sh_len);
 

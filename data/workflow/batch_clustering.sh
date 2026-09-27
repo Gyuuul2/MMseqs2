@@ -81,6 +81,8 @@ COMPRESS_BATCH_OUTPUTS=${COMPRESS_BATCH_OUTPUTS:-0}
 # names here keeps -h and the standalone subcommands working without a second set of defaults
 CREATEDB_PAR=${CREATEDB_PAR:-}
 CREATETSV_PAR=${CREATETSV_PAR:-}
+# names this run so two runs sharing a node keep their node-local scratch apart; mmseqs exports it
+RUN_ID=${RUN_ID:-standalone}
 createdb_mode_from_par() {
     local par=" ${CREATEDB_PAR} "
     if [[ "$par" =~ [[:space:]]--createdb-mode=([0-9]+) ]]; then
@@ -285,8 +287,9 @@ fi
 resolve_node_scratch() {
     local work_dir="$1" name="${2:-}"
     if [[ -n "${NODE_WORK_DIR:-}" ]]; then
-        # NODE_WORK_DIR already carries the user, and the round is what has to stay distinct
-        printf '%s/mmseqs-batch/%s/%s' "$NODE_WORK_DIR" "${NODE_SCRATCH_SCOPE:-run}" "$name"
+        # the work dir is named after the parameter hash, so carrying it keeps two runs sharing this
+        # node from setting up and tearing down the same scratch
+        printf '%s/mmseqs-batch/%s/%s/%s' "$NODE_WORK_DIR" "$RUN_ID" "${NODE_SCRATCH_SCOPE:-run}" "$name"
     else
         printf '%s/%s' "$work_dir" "$name"
     fi
@@ -1992,7 +1995,7 @@ make_chunk_work_dir() {
     local node_work_dir
     node_work_dir=$(round_value "$round" "${NODE_WORK_DIR:-}" "${ROUND0_NODE_WORK_DIR:-}")
     if [[ -n "$node_work_dir" ]]; then
-        base="$node_work_dir/mmseqs-batch/round${round}"
+        base="$node_work_dir/mmseqs-batch/$RUN_ID/round${round}"
     else
         base="$round_work_dir/chunk-work"
     fi
@@ -2167,7 +2170,7 @@ write_batch_exports() {
         MMSEQS ROUND0_MMSEQS THREADS ROUND0_THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS ROUND0_CHUNK_MAX_BYTES ROUND0_CHUNK_MAX_SEQS \
         CHUNK_DISK_BUDGET ROUND0_CHUNK_DISK_BUDGET DISK_POLL_SEC \
         S3_CHUNK_PREFIX COMPRESS_BATCH_OUTPUTS \
-        CREATEDB_PAR ROUND0_CREATEDB_MODE BATCH_DELETE_SOURCE_CHUNK CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_COV_MODE CLUSTER_PAR ROUND0_CLUSTER_PAR CREATETSV_PAR SORT_TMP \
+        RUN_ID CREATEDB_PAR ROUND0_CREATEDB_MODE BATCH_DELETE_SOURCE_CHUNK CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_COV_MODE CLUSTER_PAR ROUND0_CLUSTER_PAR CREATETSV_PAR SORT_TMP \
         MAX_ROUNDS MIN_REDUCTION_RATIO CONVERGENCE_PATIENCE \
         MAX_CHUNK_ATTEMPTS MERGE_SPLITS MERGE_SPLIT_JOBS MERGE_SPLIT_JOBS_CAP MERGE_NODES BATCH_BACKEND REMOVE_TMP \
         BATCH_REP_FASTA_SPLITS ROUND0_BATCH_REP_FASTA_SPLITS \
