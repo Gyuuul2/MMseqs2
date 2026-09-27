@@ -162,13 +162,40 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
             size_t joinedRows = 0;
 
             // Util::hash is a different function from the one that assigned the split, so a pass
-            // holds its share of the parent rather than all or none of it
+            // holds its share of the parent rather than all or none of it. The count is settled by
+            // reading the parent, never by retrying a pass that has already written rows: the
+            // writers are shared by every split, so a retry has no output of its own to take back.
             unsigned int passes = 1;
+            while (true) {
+                std::vector<size_t> perPass(passes, 0);
+                for (size_t f = 0; f < parentShards[b].size(); f++) {
+                    ZstdReader parent(parentShards[b][f]);
+                    while (parent.getLine(line)) {
+                        splitLine(line, first, second);
+                        const unsigned int slot = (passes == 1)
+                            ? 0 : (unsigned int) (Util::hash(second.c_str(), second.size()) % passes);
+                        perPass[slot] += first.size() + second.size()
+                                       + sizeof(std::pair<std::string, std::string>);
+                    }
+                }
+                size_t widest = 0;
+                for (unsigned int pass = 0; pass < passes; pass++) {
+                    widest = std::max(widest, perPass[pass]);
+                }
+                if (widest <= splitBudget) {
+                    break;
+                }
+                if (passes > splits * 1024) {
+                    Debug(Debug::ERROR) << "Split " << b << " does not fit --split-memory-limit "
+                                        << "even taken in " << passes << " passes\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                passes *= 2;
+            }
+
             for (unsigned int pass = 0; pass < passes; pass++) {
                 parentByMember.clear();
-                size_t resident = 0;
-                bool overBudget = false;
-                for (size_t f = 0; f < parentShards[b].size() && overBudget == false; f++) {
+                for (size_t f = 0; f < parentShards[b].size(); f++) {
                     ZstdReader parent(parentShards[b][f]);
                     while (parent.getLine(line)) {
                         splitLine(line, first, second);
@@ -176,24 +203,7 @@ int propagateclusters(int argc, const char **argv, const Command &command) {
                             continue;
                         }
                         parentByMember.push_back(std::make_pair(second, first));
-                        resident += first.size() + second.size() + sizeof(std::pair<std::string, std::string>);
-                        if (resident > splitBudget) {
-                            overBudget = true;
-                            break;
-                        }
                     }
-                }
-                if (overBudget) {
-                    if (passes > splits * 1024) {
-                        Debug(Debug::ERROR) << "Split " << b << " does not fit --split-memory-limit "
-                                            << "even taken in " << passes << " passes\n";
-                        EXIT(EXIT_FAILURE);
-                    }
-                    passes *= 2;
-                    pass = (unsigned int) -1;
-                    childRows = 0;
-                    joinedRows = 0;
-                    continue;
                 }
 
                 // lower_bound below would resolve a member named by two clusters to whichever sorted
