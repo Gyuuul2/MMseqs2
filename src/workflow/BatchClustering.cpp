@@ -237,6 +237,7 @@ static void applyRound0IncludePair(bool includeSet, bool includeValue, bool numS
     Util::resolveIncludeIterationPair(includeSet, includeOut, numSet, iterationOut, includeName, numName);
 }
 
+// an override only reaches the inner command if its own parameter is marked as given
 static void applyRound0ClusterOverrides(Parameters &par) {
     if (par.PARAM_BATCH_ROUND0_MIN_SEQ_ID.wasSet) {
         par.seqIdThr = par.batchRound0SeqIdThr;
@@ -246,9 +247,11 @@ static void applyRound0ClusterOverrides(Parameters &par) {
     }
     if (par.PARAM_BATCH_ROUND0_COV_MODE.wasSet) {
         par.covMode = par.batchRound0CovMode;
+        par.PARAM_COV_MODE.wasSet = true;
     }
     if (par.PARAM_BATCH_ROUND0_CLUSTER_MODE.wasSet) {
         par.clusteringMode = par.batchRound0ClusteringMode;
+        par.PARAM_CLUSTER_MODE.wasSet = true;
     }
     if (par.PARAM_BATCH_ROUND0_KMER_PER_SEQ.wasSet) {
         par.kmersPerSequence = par.batchRound0KmersPerSequence;
@@ -270,9 +273,11 @@ static void applyRound0ClusterOverrides(Parameters &par) {
     }
     if (par.PARAM_BATCH_ROUND0_SPLIT_MEMORY_LIMIT.wasSet) {
         par.splitMemoryLimit = par.batchRound0SplitMemoryLimit;
+        par.PARAM_SPLIT_MEMORY_LIMIT.wasSet = true;
     }
     if (par.PARAM_BATCH_ROUND0_PRELOAD_MODE.wasSet) {
         par.preloadMode = par.batchRound0PreloadMode;
+        par.PARAM_PRELOAD_MODE.wasSet = true;
     }
 }
 
