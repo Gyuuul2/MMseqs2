@@ -332,8 +332,20 @@ done_exists() {
 mark_done() {
     local done_uri="$1"
     local tmp_done="$2"
-    printf 'done\n' > "$tmp_done"
+    printf '%s\n' "${3:-done}" > "$tmp_done"
     copy_out "$tmp_done" "$done_uri"
+}
+
+# the result directory lives outside the run work directory, so the final marker names the run that
+# filled it: a rerun with other inputs or options gets another run id and must not reuse the result
+final_done_matches() {
+    local done_uri="$1"
+    local body="" seen
+    done_exists "$done_uri" || return 1
+    seen=$(mktemp) || return 1
+    copy_in "$done_uri" "$seen" >/dev/null 2>&1 && read -r body < "$seen"
+    rm -f "$seen"
+    [[ "$body" == "$RUN_ID" ]]
 }
 
 normalize_s3_prefix() {
@@ -2026,7 +2038,7 @@ finalize_outputs() {
     local final_result
     final_result="${prefix}$(final_cluster_file_name)"
 
-    if [[ "$mark_final" == "1" ]] && done_exists "$final_done" && done_exists "$final_result"; then
+    if [[ "$mark_final" == "1" ]] && final_done_matches "$final_done" && done_exists "$final_result"; then
         log "finalize: reusing completed result $final_result"
         return 0
     fi
@@ -2077,7 +2089,7 @@ finalize_outputs() {
     [[ -n "${REMOVE_TMP:-}" ]] && rm -rf "$sorted" "${sort_tmp:?}"
 
     if [[ "$mark_final" == "1" ]]; then
-        mark_done "$final_done" "$work_dir/final.done"
+        mark_done "$final_done" "$work_dir/final.done" "$RUN_ID"
         log "final clusters written: $final_result"
     else
         log "partial clusters written without final marker: $final_result"
@@ -2560,7 +2572,7 @@ aws_submit() {
     is_s3 "$work_prefix" || fail "aws-submit requires an s3:// work prefix"
     is_s3 "$result_prefix" || fail "aws-submit requires an s3:// result prefix"
     # AWS cannot cheaply detect a live chain, so never launch a second aws-submit on one work prefix
-    if done_exists "${result_prefix}final.done"; then
+    if final_done_matches "${result_prefix}final.done"; then
         log "aws-submit: reusing completed result ${result_prefix}$(final_cluster_file_name)"
         return 0
     fi
@@ -3153,7 +3165,7 @@ slurm_submit() {
     mkdir -p "$work_dir" "$result_dir"
     local final_cluster_name
     final_cluster_name=$(final_cluster_file_name)
-    if [[ -s "$result_dir/$final_cluster_name" && -f "$result_dir/final.done" ]]; then
+    if [[ -s "$result_dir/$final_cluster_name" ]] && final_done_matches "$result_dir/final.done"; then
         log "multi-node: reusing completed result $result_dir/$final_cluster_name"
         return 0
     fi
@@ -3419,7 +3431,7 @@ run_workflow() {
     mkdir -p "$work_dir" "$result_dir"
     local final_cluster_name
     final_cluster_name=$(final_cluster_file_name)
-    if [[ -s "$result_dir/$final_cluster_name" && -f "$result_dir/final.done" ]]; then
+    if [[ -s "$result_dir/$final_cluster_name" ]] && final_done_matches "$result_dir/final.done"; then
         log "single-node: reusing completed result $result_dir/$final_cluster_name"
         return 0
     fi
