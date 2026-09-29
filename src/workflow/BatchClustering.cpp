@@ -563,6 +563,9 @@ static int dobatchclustering(int argc, const char **argv, const Command &command
     }
     par.parseParameters(argc, argv, command, false, Parameters::PARSE_VARIADIC, 0);
     setBatchMustPassAlong(&par, cascaded);
+    // taken while the result and tmp directories are still in the list, so two runs that differ only
+    // in where they write get their own work directory and their own node local scratch
+    const std::string hash = SSTR(par.hashParameter(command.databases, par.filenames, *command.params));
     // the last two arguments are always the result dir and the shared tmp dir; the rest are inputs
     par.db3 = par.filenames.back(); par.filenames.pop_back();
     par.db2 = par.filenames.back(); par.filenames.pop_back();
@@ -576,8 +579,6 @@ static int dobatchclustering(int argc, const char **argv, const Command &command
     const std::string clusterCmd = cascaded ? "cluster" : "linclust";
     std::string clusterPar = buildInnerClusterParFromCurrent(par, clusterCmd);
     par.printParameters(command.cmd, argc, argv, *command.params);
-    // taken before round 0 rewrites par, so the work directory names what the user asked for
-    const std::string hash = SSTR(par.hashParameter(command.databases, par.filenames, *command.params));
     std::string round0ClusterPar = buildRound0ClusterPar(par, "linclust", cascaded);
     return runBatchClustering(par, command, clusterCmd, clusterPar, round0ClusterPar, hash);
 }
