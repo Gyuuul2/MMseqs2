@@ -1,4 +1,5 @@
 #include "Parameters.h"
+#include "ByteParser.h"
 #include "FileUtil.h"
 #include "CommandCaller.h"
 #include "Debug.h"
@@ -309,6 +310,7 @@ static void addBatchEngineVariables(CommandCaller &cmd, Parameters &par,
     cmd.addVariable("CREATEDB_PAR", buildCreatedbPar(par).c_str());
     cmd.addVariable("CREATETSV_PAR", buildCreatetsvPar(par).c_str());
     cmd.addVariable("THREADS", SSTR(par.threads).c_str());
+    cmd.addVariable("SPLIT_MEMORY_LIMIT", par.PARAM_SPLIT_MEMORY_LIMIT.wasSet ? ByteParser::format(par.splitMemoryLimit, 'a', 'h').c_str() : NULL);
     cmd.addVariable("CHUNK_MAX_BYTES", SSTR(par.batchChunkMaxBytes).c_str());
     cmd.addVariable("CHUNK_MAX_SEQS", SSTR(par.batchChunkMaxSeqs).c_str());
     cmd.addVariable("ROUND0_CHUNK_MAX_BYTES", par.PARAM_BATCH_ROUND0_CHUNK_MAX_BYTES.wasSet ? SSTR(par.batchRound0ChunkMaxBytes).c_str() : NULL);

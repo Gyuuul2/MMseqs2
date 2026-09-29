@@ -40,7 +40,7 @@ CHUNK_MAX_BYTES/CHUNK_MAX_SEQS, several paths are bin-packed whole by CHUNK_MAX_
 
 Environment (normally exported by mmseqs from the easy-linclust2-batch/easy-cluster2-batch command line,
 or their -aws variants for the AWS vars; set them directly only when running this script standalone):
-  MMSEQS ROUND0_MMSEQS THREADS ROUND0_THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_SPLITS MERGE_SPLIT_JOBS MERGE_NODES
+  MMSEQS ROUND0_MMSEQS THREADS ROUND0_THREADS SPLIT_MEMORY_LIMIT CHUNK_MAX_BYTES CHUNK_MAX_SEQS MERGE_SPLITS MERGE_SPLIT_JOBS MERGE_NODES
   CHUNK_DISK_BUDGET ROUND0_CHUNK_DISK_BUDGET
   CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_PAR ROUND0_CLUSTER_PAR CLUSTER_COV_MODE CREATEDB_PAR CREATETSV_PAR COMPRESS_BATCH_OUTPUTS SORT_TMP
   MAX_ROUNDS MIN_REDUCTION_RATIO CONVERGENCE_PATIENCE MAX_CHUNK_ATTEMPTS BATCH_REP_FASTA_SPLITS ROUND0_BATCH_REP_FASTA_SPLITS
@@ -81,6 +81,7 @@ COMPRESS_BATCH_OUTPUTS=${COMPRESS_BATCH_OUTPUTS:-0}
 # names here keeps -h and the standalone subcommands working without a second set of defaults
 CREATEDB_PAR=${CREATEDB_PAR:-}
 CREATETSV_PAR=${CREATETSV_PAR:-}
+SPLIT_MEMORY_LIMIT=${SPLIT_MEMORY_LIMIT:-}
 # names this run so two runs sharing a node keep their node-local scratch apart; mmseqs exports it
 RUN_ID=${RUN_ID:-standalone}
 createdb_mode_from_par() {
@@ -1769,6 +1770,7 @@ propagate() {
 
     "$MMSEQS" propagateclusters "$child_local" "$parent_local" "$shards/propagated" \
         --tsv-splits "$splits" --threads "$THREADS" --compressed "$(compress_batch_outputs_enabled && echo 1 || echo 0)" \
+        ${SPLIT_MEMORY_LIMIT:+--split-memory-limit "$SPLIT_MEMORY_LIMIT"} \
         || fail "propagateclusters died"
     rm -rf "$work_dir/stage"
 
@@ -2179,7 +2181,7 @@ write_batch_exports() {
     local out="$1"
     local name
     for name in \
-        MMSEQS ROUND0_MMSEQS THREADS ROUND0_THREADS CHUNK_MAX_BYTES CHUNK_MAX_SEQS ROUND0_CHUNK_MAX_BYTES ROUND0_CHUNK_MAX_SEQS \
+        MMSEQS ROUND0_MMSEQS THREADS ROUND0_THREADS SPLIT_MEMORY_LIMIT CHUNK_MAX_BYTES CHUNK_MAX_SEQS ROUND0_CHUNK_MAX_BYTES ROUND0_CHUNK_MAX_SEQS \
         CHUNK_DISK_BUDGET ROUND0_CHUNK_DISK_BUDGET DISK_POLL_SEC \
         S3_CHUNK_PREFIX COMPRESS_BATCH_OUTPUTS \
         RUN_ID CREATEDB_PAR ROUND0_CREATEDB_MODE BATCH_DELETE_SOURCE_CHUNK CLUSTER_CMD ROUND0_CLUSTER_CMD CLUSTER_COV_MODE CLUSTER_PAR ROUND0_CLUSTER_PAR CREATETSV_PAR SORT_TMP \
