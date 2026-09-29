@@ -2857,10 +2857,8 @@ aws_merge() {
     local prev_state prev_reps low_benefit_rounds
     # deferred merge: rounds compose only the chain (rep_r -> round-0 rep, R0 rows) instead of
     # propagating the N-row mapping; the mapping join runs once at convergence
-    local round0_state="$local_root/round0_state.env" r0_reps input_seqs
+    local round0_state="$local_root/round0_state.env" input_seqs
     copy_in "$(join_uri "$(aws_round_prefix "$work_prefix" 0)" "state.env")" "$round0_state"
-    # shellcheck disable=SC1090
-    r0_reps=$(source "$round0_state" && printf '%s' "${PREV_REPS:-0}")
     # shellcheck disable=SC1090
     input_seqs=$(source "$round0_state" && printf '%s' "${INPUT_SEQS:-}")
 
@@ -3314,9 +3312,7 @@ slurm_merge() {
 
     # deferred merge: rounds compose only the chain (rep_r -> round-0 rep, R0 rows); the
     # N-row mapping join runs once at convergence, across MERGE_NODES machines when set
-    local r0_reps input_seqs
-    # shellcheck disable=SC1091
-    r0_reps=$(source "$work_dir/round0/state.env" && printf '%s' "${PREV_REPS:-0}")
+    local input_seqs
     # shellcheck disable=SC1091
     input_seqs=$(source "$work_dir/round0/state.env" && printf '%s' "${INPUT_SEQS:-}")
     local chain_manifest
@@ -3468,7 +3464,6 @@ run_workflow() {
     input_seqs=$(count_seqs_from_metrics_manifest "$current_metrics_manifest")
     log "round 0: ${prev_reps} representatives across ${initial_chunk_count} chunk(s) (${input_seqs} sequences)"
 
-    local round0_reps="$prev_reps"
     local chain_manifest=""
     local low_benefit_rounds=0
     local current_round=0
