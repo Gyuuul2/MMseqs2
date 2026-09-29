@@ -182,8 +182,12 @@ int linclust(int argc, const char **argv, const Command& command) {
         bool prevspacedKmer = par.spacedKmer;
         bool prevmaskMode = par.maskMode;
         MultiParam<NuclAA<float> > prevKmersPerSequenceScale = par.kmersPerSequenceScale;
-        par.spacedKmer = false;
-        par.maskMode = false;
+        if (par.PARAM_SPACED_KMER_MODE.wasSet == false) {
+            par.spacedKmer = false;
+        }
+        if (par.PARAM_MASK_RESIDUES.wasSet == false) {
+            par.maskMode = false;
+        }
         cmd.addVariable("KMERMATCHER_PAR", par.createParameterString(par.kmermatcher).c_str());
         
         cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
