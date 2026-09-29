@@ -95,9 +95,10 @@ static void rejectS3BucketRoot(const std::string &path, const char *what) {
     if (isS3Uri(path) == false) {
         return;
     }
-    const std::string key = withoutTrailingSlash(path).substr(strlen("s3://"));
-    if (key.find('/') == std::string::npos) {
-        Debug(Debug::ERROR) << what << " " << path << " is a bucket root; give a prefix inside the bucket\n";
+    const std::string rest = withoutTrailingSlash(path.substr(strlen("s3://")));
+    const size_t slash = rest.find('/');
+    if (slash == std::string::npos || slash == 0) {
+        Debug(Debug::ERROR) << what << " " << path << " is a bucket root; give s3://bucket/prefix\n";
         EXIT(EXIT_FAILURE);
     }
 }
