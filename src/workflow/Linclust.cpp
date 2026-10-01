@@ -195,7 +195,13 @@ int linclust(int argc, const char **argv, const Command& command) {
         cmd.addVariable("CLUSTER_PAR", par.createParameterString(par.clust).c_str());
         
         par.spacedKmer = true;
-        par.kmersPerSequenceScale = 0.1;
+        if (par.iter2ScaleAdditive) {
+            par.kmersPerSequenceScale = MultiParam<NuclAA<float>>(NuclAA<float>(
+                prevKmersPerSequenceScale.values.aminoacid() + 0.1f,
+                prevKmersPerSequenceScale.values.nucleotide() + 0.1f));
+        } else {
+            par.kmersPerSequenceScale = 0.1;
+        }
         cmd.addVariable("KMERMATCHER_PAR2", par.createParameterString(par.kmermatcher).c_str());
         
         par.spacedKmer = prevspacedKmer;

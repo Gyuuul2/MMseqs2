@@ -35,6 +35,10 @@
 // zero turns the seed diagonal bound off
 static float diagCovScale = 0.0f;
 
+// the adjacent residues are stored and scored in this matrix and this many per side
+static BaseMatrix *adjSubMat = NULL;
+static int adjFlank = 3;
+
 // residues the alignment has to span for Util::hasCoverage to accept it
 static inline float requiredOverlap(int covMode, float covThr, float queryLen, float targetLen) {
     switch (covMode) {
@@ -103,7 +107,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
     size_t offset = 0;
     int querySeqType  =  seqDbr.getDbtype();
     size_t longestKmer = par.kmerSize;
-    const unsigned char xIndex = subMat->aa2num[static_cast<int>('X')];
+    const unsigned char xIndex = adjSubMat->aa2num[static_cast<int>('X')];
 
 
     ScoreMatrix two;
@@ -164,7 +168,8 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
                 memset(scoreDist, 0, sizeof(unsigned short) * 65536);
                 memset(hierarchicalScoreDist, 0, sizeof(unsigned int) * 128);
 
-                seq.mapSequence(id, seqDbr.getDbKey(id), seqDbr.getData(id, thread_idx), seqDbr.getSeqLen(id));
+                const char *seqData = seqDbr.getData(id, thread_idx);
+                seq.mapSequence(id, seqDbr.getDbKey(id), seqData, seqDbr.getSeqLen(id));
 
                 size_t seqHash =  SIZE_T_MAX;
                 //TODO, how to handle this in reverse?
@@ -350,30 +355,20 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, includeAdjacency
                             if (includeAdjacency) {
                                 unsigned int startPos = (kmers + kmerIdx)->pos;
                                 unsigned int endPos = (kmers + kmerIdx)->pos + seq.getEffectiveKmerSize() - 1;
-                                for (size_t i = 0; i < 6; i++) {
+                                for (int i = 0; i < 2 * adjFlank; i++) {
                                     threadKmerBuffer[bufferPos].setAdjacentSeq(i, xIndex);
                                 }
-
-                                if (startPos >= 3) {
-                                    threadKmerBuffer[bufferPos].setAdjacentSeq(0, seq.numSequence[startPos - 3]);
-                                    threadKmerBuffer[bufferPos].setAdjacentSeq(1, seq.numSequence[startPos - 2]);
-                                    threadKmerBuffer[bufferPos].setAdjacentSeq(2, seq.numSequence[startPos - 1]);
-                                } else if (startPos == 2) {
-                                    threadKmerBuffer[bufferPos].setAdjacentSeq(1, seq.numSequence[startPos - 2]);
-                                    threadKmerBuffer[bufferPos].setAdjacentSeq(2, seq.numSequence[startPos - 1]);
-                                } else if (startPos == 1) {
-                                    threadKmerBuffer[bufferPos].setAdjacentSeq(2, seq.numSequence[startPos - 1]);
-                                }
-
-                                if (endPos + 3 <= static_cast<unsigned int>(seq.L) - 1) {
-                                    threadKmerBuffer[bufferPos].setAdjacentSeq(3, seq.numSequence[endPos + 1]);
-                                    threadKmerBuffer[bufferPos].setAdjacentSeq(4, seq.numSequence[endPos + 2]);
-                                    threadKmerBuffer[bufferPos].setAdjacentSeq(5, seq.numSequence[endPos + 3]);
-                                } else if (endPos + 2 == static_cast<unsigned int>(seq.L) - 1) {
-                                    threadKmerBuffer[bufferPos].setAdjacentSeq(3, seq.numSequence[endPos + 1]);
-                                    threadKmerBuffer[bufferPos].setAdjacentSeq(4, seq.numSequence[endPos + 2]);
-                                } else if (endPos + 1 == static_cast<unsigned int>(seq.L) - 1) {
-                                    threadKmerBuffer[bufferPos].setAdjacentSeq(3, seq.numSequence[endPos + 1]);
+                                for (int o = 0; o < adjFlank; o++) {
+                                    const int before = static_cast<int>(startPos) - adjFlank + o;
+                                    if (before >= 0) {
+                                        threadKmerBuffer[bufferPos].setAdjacentSeq(o,
+                                            adjSubMat->aa2num[static_cast<int>(seqData[before])]);
+                                    }
+                                    const unsigned int after = endPos + 1 + o;
+                                    if (after <= static_cast<unsigned int>(seq.L) - 1) {
+                                        threadKmerBuffer[bufferPos].setAdjacentSeq(adjFlank + o,
+                                            adjSubMat->aa2num[static_cast<int>(seqData[after])]);
+                                    }
                                 }
                             }
                             bufferPos++;
@@ -537,8 +532,8 @@ size_t assignGroup(KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair
 
         // prepare subMatPos for adj mode
         if (useAdjacentSeq && hashSeqPair[prevHashStart].getAdjacentSeq(0) != UCHAR_MAX) {
-            for (size_t i = 0; i < 6; i++) {
-                subMatPos[i] = subMat->subMatrix[hashSeqPair[prevHashStart].getAdjacentSeq(i)];
+            for (int i = 0; i < 2 * adjFlank; i++) {
+                subMatPos[i] = adjSubMat->subMatrix[hashSeqPair[prevHashStart].getAdjacentSeq(i)];
             }
         }
 
@@ -571,7 +566,7 @@ size_t assignGroup(KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair
                         }
                         if (hashSeqPair[i].getAdjacentSeq(0) != UCHAR_MAX) {
                             int currAdjScore = 0;
-                            for (size_t j = 0; j < 6; j++) {
+                            for (int j = 0; j < 2 * adjFlank; j++) {
                                 currAdjScore += subMatPos[j][hashSeqPair[i].getAdjacentSeq(j)];
                             }
                             if (currAdjScore <= minAdjScore) {
@@ -755,8 +750,8 @@ size_t assignGroup(KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair
                 repSeq_i_pos = hashSeqPair[elementIdx].pos;
 
                 if (useAdjacentSeq && hashSeqPair[prevHashStart].getAdjacentSeq(0) != UCHAR_MAX) {
-                    for (size_t i = 0; i < 6; i++) {
-                        subMatPos[i] = subMat->subMatrix[hashSeqPair[prevHashStart].getAdjacentSeq(i)];
+                    for (int i = 0; i < 2 * adjFlank; i++) {
+                        subMatPos[i] = adjSubMat->subMatrix[hashSeqPair[prevHashStart].getAdjacentSeq(i)];
                     }
                 } else {
                     for (size_t i = 0; i < 6; i++) {
@@ -1218,6 +1213,18 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
         }
     }
 
+    adjFlank = par.adjacencyFlank;
+    adjSubMat = subMat;
+    if (par.adjacencyAlphabetSize > 0
+        && Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES) == false
+        && par.adjacencyAlphabetSize != par.alphabetSize.values.aminoacid()) {
+        if (par.adjacencyAlphabetSize == 21) {
+            adjSubMat = new SubstitutionMatrix(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, 0.0);
+        } else {
+            SubstitutionMatrix aMat(par.scoringMatrixFile.values.aminoacid().c_str(), 8.0, -0.2f);
+            adjSubMat = new ReducedMatrix(aMat.probMatrix, aMat.subMatrixPseudoCounts, aMat.aa2num, aMat.num2aa, aMat.alphabetSize, par.adjacencyAlphabetSize, 2.0);
+        }
+    }
     diagCovScale = (par.includeCoverableByDiag && par.linclustVersion == Parameters::LINCLUST_VERSION2)
                    ? Parameters::CLUST_LINEAR_DIAG_COV_SCALE : 0.0f;
 

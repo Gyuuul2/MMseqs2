@@ -663,6 +663,9 @@ public:
     bool includeAdjacency;
     int adjIteration;
     bool includeCoverableByDiag;
+    bool iter2ScaleAdditive;
+    int adjacencyFlank;
+    int adjacencyAlphabetSize;
     bool clustHash;
     int linclustVersion;
     int clusterVersion;
@@ -1031,6 +1034,9 @@ public:
     PARAMETER(PARAM_INCLUDE_ADJACENCY)
     PARAMETER(PARAM_NUM_ADJACENCY)
     PARAMETER(PARAM_INCLUDE_COVERABLE_BY_DIAG)
+    PARAMETER(PARAM_ITER2_SCALE_ADDITIVE)
+    PARAMETER(PARAM_ADJACENCY_FLANK)
+    PARAMETER(PARAM_ADJACENCY_ALPH_SIZE)
     PARAMETER(PARAM_USE_PARALLELISM)
     PARAMETER(PARAM_NEED_WRITEBUFFER)
     PARAMETER(PARAM_CLUST_HASH)

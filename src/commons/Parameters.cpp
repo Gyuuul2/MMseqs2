@@ -174,6 +174,9 @@ Parameters::Parameters():
         PARAM_INCLUDE_ADJACENCY(PARAM_INCLUDE_ADJACENCY_ID, "--include-adjacency", "Include adjacency based center swapping", "Include adjacency based center swapping", typeid(bool), (void *) &includeAdjacency, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_INCLUDE_COVERABLE_BY_DIAG(PARAM_INCLUDE_COVERABLE_BY_DIAG_ID, "--include-coverable-by-diag", "Keep only candidates their seed diagonal can cover", "Keep only candidates whose seed diagonal can still reach the coverage threshold (linclust version 2 only)", typeid(bool), (void *) &includeCoverableByDiag, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_ITER2_SCALE_ADDITIVE(PARAM_ITER2_SCALE_ADDITIVE_ID, "--iter2-scale-additive", "Add the refinement round k-mer scale instead of replacing it", "Give the refinement round --kmer-per-seq-scale plus 0.1 instead of a flat 0.1", typeid(bool), (void *) &iter2ScaleAdditive, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_ADJACENCY_FLANK(PARAM_ADJACENCY_FLANK_ID, "--adjacency-flank", "Adjacent residues taken on each side of the k-mer", "Adjacent residues taken on each side of the k-mer, 2 or 3", typeid(int), (void *) &adjacencyFlank, "^[23]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_ADJACENCY_ALPH_SIZE(PARAM_ADJACENCY_ALPH_SIZE_ID, "--adjacency-alph-size", "Alphabet the adjacent residues are stored in", "Alphabet size the adjacent residues are stored and scored in, 0 keeps --alph-size", typeid(int), (void *) &adjacencyAlphabetSize, "^(0|[2-9]|1[0-9]|2[01])$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -1196,6 +1199,8 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_INCLUDE_ADJACENCY);
     kmermatcher.push_back(&PARAM_NUM_ADJACENCY);
     kmermatcher.push_back(&PARAM_INCLUDE_COVERABLE_BY_DIAG);
+    kmermatcher.push_back(&PARAM_ADJACENCY_FLANK);
+    kmermatcher.push_back(&PARAM_ADJACENCY_ALPH_SIZE);
     kmermatcher.push_back(&PARAM_USE_PARALLELISM);
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
     kmermatcher.push_back(&PARAM_LINCLUST_VERSION);
@@ -1588,6 +1593,7 @@ Parameters::Parameters():
     linclustworkflow = combineList(linclustworkflow, rescorediagonal);
     linclustworkflow = combineList(linclustworkflow, align2clust);
     linclustworkflow = combineList(linclustworkflow, clusthash);
+    linclustworkflow.push_back(&PARAM_ITER2_SCALE_ADDITIVE);
     linclustworkflow.push_back(&PARAM_SWITCH_CONSENSUS_REP);
     linclustworkflow.push_back(&PARAM_CLUST_HASH);
     linclustworkflow.push_back(&PARAM_REMOVE_TMP_FILES);
@@ -1685,6 +1691,8 @@ Parameters::Parameters():
     linclustbatchinner.push_back(&PARAM_INCLUDE_ADJACENCY);
     linclustbatchinner.push_back(&PARAM_NUM_ADJACENCY);
     linclustbatchinner.push_back(&PARAM_INCLUDE_COVERABLE_BY_DIAG);
+    linclustbatchinner.push_back(&PARAM_ADJACENCY_FLANK);
+    linclustbatchinner.push_back(&PARAM_ADJACENCY_ALPH_SIZE);
     linclustbatchinner.push_back(&PARAM_SWITCH_CONSENSUS_REP);
     linclustbatchinner.push_back(&PARAM_REMOVE_TMP_FILES);
     linclustbatchinner.push_back(&PARAM_THREADS);
@@ -1707,6 +1715,8 @@ Parameters::Parameters():
     clusterbatchinner.push_back(&PARAM_INCLUDE_ADJACENCY);
     clusterbatchinner.push_back(&PARAM_NUM_ADJACENCY);
     clusterbatchinner.push_back(&PARAM_INCLUDE_COVERABLE_BY_DIAG);
+    clusterbatchinner.push_back(&PARAM_ADJACENCY_FLANK);
+    clusterbatchinner.push_back(&PARAM_ADJACENCY_ALPH_SIZE);
     clusterbatchinner.push_back(&PARAM_SWITCH_CONSENSUS_REP);
     clusterbatchinner.push_back(&PARAM_REMOVE_TMP_FILES);
     clusterbatchinner.push_back(&PARAM_THREADS);
@@ -3058,6 +3068,9 @@ void Parameters::setDefaults() {
     includeAdjacency = true;
     adjIteration = 3;
     includeCoverableByDiag = true;
+    iter2ScaleAdditive = false;
+    adjacencyFlank = 3;
+    adjacencyAlphabetSize = 0;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;
     clusterVersion = CLUSTER_VERSION1;
