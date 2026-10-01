@@ -1289,7 +1289,7 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
         countTable.assign(dbKeySize, 0);
         size_t countTableTotalKmers = static_cast<size_t>(totalKmers * par.countTableScale);
         // hashSeqPair + writeSeqPair for the count-table fill
-        size_t countTableTotalSizeNeeded = computeMemoryNeededLinearfilter<T, false, false>(countTableTotalKmers) * 2;
+        size_t countTableTotalSizeNeeded = computeMemoryNeededLinearfilter<T, false, true>(countTableTotalKmers) * 2;
 
         size_t countTableSplits = std::max(static_cast<size_t>(1), static_cast<size_t>(
             std::ceil(static_cast<double>(countTableTotalSizeNeeded) / splitMemoryLimit)
@@ -1299,12 +1299,12 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
             static_cast<size_t>(1024 + 1),
             static_cast<size_t>(
                 std::min(countTableTotalSizeNeeded, splitMemoryLimit) /
-                (sizeof(KmerPosition<T, false, false>) * 2)
+                (sizeof(KmerPosition<T, false, true>) * 2)
             ) + 1
         );
 
         std::vector<std::pair<size_t, size_t>> countTableHashRanges;
-        countTableHashRanges = setupCountTable<T, false, false>( 
+        countTableHashRanges = setupCountTable<T, false, true>( 
             par, subMat, seqDbr,
             countTableSplits, countTableKmersPerSplit,
             static_cast<size_t>(totalKmers * par.countTableScale)
@@ -1312,7 +1312,7 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
         for (size_t split = 0; split < countTableHashRanges.size(); split++) {
             Debug(Debug::INFO) << "Fill count table for " << (split + 1) << " split\n";
 
-            doComputation<T, false, false>(
+            doComputation<T, false, true>(
                 countTableKmersPerSplit,
                 countTableHashRanges[split].first,
                 countTableHashRanges[split].second,
@@ -1558,18 +1558,18 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     
     if (seqDbr.getMaxSeqLen() < SHRT_MAX) {
         if (par.includeAdjacency) { 
-            kmermatcherInner<short, true, false>(par, seqDbr);
+            kmermatcherInner<short, true, true>(par, seqDbr);
         }
         else {
-            kmermatcherInner<short, false, false>(par, seqDbr);
+            kmermatcherInner<short, false, true>(par, seqDbr);
         }
     }
     else {
         if (par.includeAdjacency) {
-            kmermatcherInner<int, true, false>(par, seqDbr);
+            kmermatcherInner<int, true, true>(par, seqDbr);
         }
         else {
-            kmermatcherInner<int, false, false>(par, seqDbr);
+            kmermatcherInner<int, false, true>(par, seqDbr);
         }
     }
 
