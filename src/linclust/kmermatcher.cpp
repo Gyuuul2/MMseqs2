@@ -32,6 +32,23 @@
 #define SIZE_T_MAX ((size_t) -1)
 #endif
 
+// zero turns the seed diagonal bound off
+static float diagCovScale = 0.0f;
+
+// residues the alignment has to span for Util::hasCoverage to accept it
+static inline float requiredOverlap(int covMode, float covThr, float queryLen, float targetLen) {
+    switch (covMode) {
+        case Parameters::COV_MODE_BIDIRECTIONAL:
+            return covThr * std::max(queryLen, targetLen);
+        case Parameters::COV_MODE_QUERY:
+            return covThr * queryLen;
+        case Parameters::COV_MODE_TARGET:
+            return covThr * targetLen;
+        default:
+            return 0.0f;
+    }
+}
+
 uint64_t hashUInt64(uint64_t in, uint64_t seed) {
 #if SIMDE_ENDIAN_ORDER == SIMDE_ENDIAN_BIG
     in = __builtin_bswap64(in);
@@ -538,7 +555,6 @@ size_t assignGroup(KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair
                     // find member with lowest adj score → swap to prevHashStart
                     size_t bestPos = prevHashStart;
                     int minAdjScore = INT_MAX;
-                    T bestLen = 0;
                     for (size_t i = prevHashStart; i < elementIdx; i++) {
                         if (i > prevHashStart && sequenceWeights != nullptr &&
                             sequenceWeights->getWeightById(hashSeqPair[i].id) > weightThr) {
@@ -558,12 +574,7 @@ size_t assignGroup(KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair
                             for (size_t j = 0; j < 6; j++) {
                                 currAdjScore += subMatPos[j][hashSeqPair[i].getAdjacentSeq(j)];
                             }
-                            // greedy incremental wants the longer sequence as the centre, so an equal
-                            // adjacency score goes to the longer member instead of to array order
-                            const T currLen = hashSeqPair[i].sl.getSeqLen(hashSeqPair[i].id);
-                            if (currAdjScore < minAdjScore
-                                || (currAdjScore == minAdjScore && currLen > bestLen)) {
-                                bestLen = currLen;
+                            if (currAdjScore <= minAdjScore) {
                                 minAdjScore = currAdjScore;
                                 bestPos = i;
                             }
@@ -673,8 +684,16 @@ size_t assignGroup(KmerPosition<T, includeAdjacency, IncludeSeqLen> *hashSeqPair
                             T targetLen = hashSeqPair[i].sl.getSeqLen(hashSeqPair[i].id);
                             bool canBeExtended = (diagonal < 0) || (diagonal > (queryLen - targetLen));
                             bool canBeCovered = Util::canBeCovered(covThr, covMode, static_cast<float>(queryLen), static_cast<float>(targetLen));
+                            bool canBeCoveredOnDiagonal = true;
+                            if (diagCovScale > 0.0f) {
+                                const int overlap = std::min(static_cast<int>(queryLen), static_cast<int>(targetLen) + diagonal)
+                                                  - std::max(0, diagonal);
+                                canBeCoveredOnDiagonal = static_cast<float>(overlap)
+                                    >= requiredOverlap(covMode, diagCovScale * covThr,
+                                                       static_cast<float>(queryLen), static_cast<float>(targetLen));
+                            }
 
-                            if ((includeOnlyExtendable == false && canBeCovered) ||
+                            if ((includeOnlyExtendable == false && canBeCovered && canBeCoveredOnDiagonal) ||
                                 (canBeExtended && includeOnlyExtendable == true)) {
                                 if (isSetupCountTable) {
                                     if (countTable != NULL) {
@@ -1198,6 +1217,9 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
             subMat = new ReducedMatrix(sMat.probMatrix, sMat.subMatrixPseudoCounts, sMat.aa2num, sMat.num2aa, sMat.alphabetSize, par.alphabetSize.values.aminoacid(), 2.0);
         }
     }
+
+    diagCovScale = (par.includeCoverableByDiag && par.linclustVersion == Parameters::LINCLUST_VERSION2)
+                   ? Parameters::CLUST_LINEAR_DIAG_COV_SCALE : 0.0f;
 
     size_t memoryLimit=Util::computeMemory(par.splitMemoryLimit);
 
@@ -2067,6 +2089,9 @@ void setKmerLengthAndAlphabet(Parameters &parameters, size_t aaDbSize, int seqTy
             }else{
                 parameters.kmerSize = std::max(10, static_cast<int>(log(static_cast<float>(aaDbSize))/log(8.7)));
                 parameters.alphabetSize = 13;
+                if (parameters.seqIdThr < 0.5 && parameters.linclustVersion == Parameters::LINCLUST_VERSION2) {
+                    parameters.alphabetSize = 11;
+                }
             }
             parameters.spacedKmerPattern = "";
         }
@@ -2074,6 +2099,11 @@ void setKmerLengthAndAlphabet(Parameters &parameters, size_t aaDbSize, int seqTy
             parameters.kmersPerSequence = 20;
         }
     }
+    Debug(Debug::INFO) << "k-mer length " << parameters.kmerSize
+                       << ", alphabet size " << ((Parameters::isEqualDbtype(seqTyp, Parameters::DBTYPE_NUCLEOTIDES))
+                                                 ? parameters.alphabetSize.values.nucleotide()
+                                                 : parameters.alphabetSize.values.aminoacid())
+                       << ", k-mers per sequence " << parameters.kmersPerSequence << "\n";
 }
 
 // Existing explicit instantiations (IncludeSeqLen defaults to false)

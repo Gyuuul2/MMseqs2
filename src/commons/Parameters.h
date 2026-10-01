@@ -302,6 +302,7 @@ public:
     static const int CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE = 2;   // count-table iters (symmetric cov-mode)
     static const int CLUST_LINEAR_DEFAULT_NUM_ADJACENCY = 3;     // adjacency iters (non-symmetric cov-mode)
     static const int CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY = 1;   // adjacency iters (symmetric cov-mode)
+    static constexpr float CLUST_LINEAR_DIAG_COV_SCALE = 0.9f;
 
     // rescorediagonal
     static const int RESCORE_MODE_HAMMING = 0;
@@ -661,6 +662,7 @@ public:
     float countTableScale;
     bool includeAdjacency;
     int adjIteration;
+    bool includeCoverableByDiag;
     bool clustHash;
     int linclustVersion;
     int clusterVersion;
@@ -1028,6 +1030,7 @@ public:
     PARAMETER(PARAM_NUM_COUNTS)
     PARAMETER(PARAM_INCLUDE_ADJACENCY)
     PARAMETER(PARAM_NUM_ADJACENCY)
+    PARAMETER(PARAM_INCLUDE_COVERABLE_BY_DIAG)
     PARAMETER(PARAM_USE_PARALLELISM)
     PARAMETER(PARAM_NEED_WRITEBUFFER)
     PARAMETER(PARAM_CLUST_HASH)
