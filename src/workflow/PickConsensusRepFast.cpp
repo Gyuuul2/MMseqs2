@@ -6,9 +6,8 @@
 // Include the embedded shell script.
 #include "pickconsensusrepfast.sh.h"
 
-// Fast profile-guided representative selection: reuses the clustering alignments
-// (${clusterDB}_aln, produced with --include-align-files) to pick the best observed
-// member per cluster and rewrite the cluster DB, without profile-vs-member realignment.
+// Picks the best observed member per cluster from the clustering alignments
+// (${clusterDB}_aln), without realigning profile against member.
 int pickconsensusrepfast(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);

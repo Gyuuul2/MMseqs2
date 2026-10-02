@@ -38,6 +38,12 @@ static float diagCovScale = 0.0f;
 // the adjacent residues are stored and scored in this matrix and this many per side
 static BaseMatrix *adjSubMat = NULL;
 
+static inline unsigned char adjacentResidue(const Sequence &seq, const char *seqData, size_t pos,
+                                            unsigned char maskedIndex, unsigned char xIndex) {
+    return (seq.numSequence[pos] == maskedIndex)
+           ? xIndex : adjSubMat->aa2num[static_cast<int>(seqData[pos])];
+}
+
 // residues the alignment has to span for Util::hasCoverage to accept it
 static inline float requiredOverlap(int covMode, float covThr, float queryLen, float targetLen) {
     switch (covMode) {
@@ -75,15 +81,7 @@ KmerPosition<T, Flank, L> *initKmerPositionMemory(size_t size) {
     return hashSeqPair;
 }
 
-static inline unsigned char adjacentResidue(const Sequence &seq, const char *seqData, size_t pos,
-                                            unsigned char maskedIndex, unsigned char xIndex) {
-    return (seq.numSequence[pos] == maskedIndex)
-           ? xIndex : adjSubMat->aa2num[static_cast<int>(seqData[pos])];
-}
-
-// Per-thread staging buffer size for fillKmerPositionArray. Only a contention/memory
-// trade-off (batches the atomic reservation into the shared array); a small batch already
-// makes the atomic overhead negligible, so keep it small to bound the per-thread scratch.
+// Staging batch for fillKmerPositionArray: a contention/memory trade-off, not correctness.
 static const size_t KMER_STAGING_BUFFER_SIZE = 65536;
 
 template <typename T, int Flank, typename L>
@@ -147,10 +145,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, Flank, L> * kmer
             generator->setDivideStrategy(&three, &two);
         }
         Indexer idxer(subMat->alphabetSize - 1,  par.kmerSize);
-        // Thread-local staging buffer: batches the atomic reservation into the shared
-        // k-mer array. Only a contention/memory trade-off (not a correctness requirement);
-        // a small batch already makes the atomic overhead negligible, so keep it small so
-        // the per-thread scratch does not blow up at high thread counts.
+        // batches the atomic reservation into the shared k-mer array
         const unsigned int BUFFER_SIZE = static_cast<unsigned int>(KMER_STAGING_BUFFER_SIZE);
         size_t bufferPos = 0;
         KmerPosition<T, Flank, L> * threadKmerBuffer = NULL;
@@ -176,7 +171,6 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, Flank, L> * kmer
             const size_t blockEnd = start + bucketSize;
             const bool releaseAfterBlock = (blockEnd / releaseEvery) != (start / releaseEvery)
                                         || blockEnd >= seqDbr.getSize();
-
 
 #pragma omp for schedule(dynamic, 100)
             for (size_t id = start; id < (start + bucketSize); id++) {
@@ -1167,7 +1161,6 @@ std::vector<std::pair<size_t, size_t>> setupCountTable(
 
     if (splits > 1) {
         Debug(Debug::INFO) << "Not enough memory to process at once need to split for initiating count table\n";
-        seqDbr.releaseDataPages();
         size_t maxBucketSize = 0;
         for(size_t i = 0; i < (USHRT_MAX+1); i++) {
             if(maxBucketSize < hashDist[i]){

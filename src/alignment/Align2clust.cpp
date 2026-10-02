@@ -48,9 +48,7 @@ struct PrefInfo {
     }
 };
 
-// Lightweight entry stored in the set-cover ready queue. Instead of carrying the
-// member id vector (as ClusterResult does) it only references the members, which
-// are kept in a single shared pool (setCoverMemberPool), by offset and count.
+// Set-cover ready queue entry: references its members in setCoverMemberPool, by offset and count.
 struct SetCoverCandidate {
     DBLocalId representativeId;
     size_t memberCount;
@@ -78,9 +76,8 @@ struct SetCoverComparator {
 static std::mutex clusterMutex;
 static std::condition_variable clusterCondition;
 static std::condition_variable reorderSpaceCondition;
-// Reorders out-of-order worker results back to sequenceIdx order for the consumer,
-// indexed by sequenceIdx % reorderCapacity. The next-in-order slot is always free,
-// so producers never deadlock.
+// Reorders worker results back to sequenceIdx order, indexed by sequenceIdx % reorderCapacity.
+// The next-in-order slot is always free, so producers never deadlock.
 static std::vector<ClusterResult> reorderSlots;    // slot storage, size == reorderCapacity
 static std::vector<unsigned char> reorderFilled;   // 1 == slot holds an unconsumed result
 static size_t reorderCapacity = 0;                 // max out-of-order window
@@ -151,9 +148,8 @@ static size_t getReorderBufferLimitFromEnv() {
     return static_cast<size_t>(parsedValue);
 }
 
-// Size the reorder buffer from free memory: subtract the resident per-sequence arrays,
-// keep 10% headroom, divide by the worst-case result size. Capped by
-// MMSEQS_ALIGN2CLUST_REORDER_LIMIT and by the number of results produced.
+// Sizes the reorder buffer from free memory, less the resident arrays and 10% headroom.
+// Capped by MMSEQS_ALIGN2CLUST_REORDER_LIMIT and by the number of results produced.
 static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int mode, size_t resultCount) {
     const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
 
@@ -337,9 +333,8 @@ void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
             }
         }
 
-        // Compaction only touches consumer-private structures (setCoverCandidates,
-        // setCoverMemberPool, setCoverLiveMemberCount), never shared state, so release
-        // the mutex during the copy so worker threads can keep pushing results.
+        // compaction only touches consumer-private structures, so workers keep pushing
+        // while the mutex is released
         lock.unlock();
         compactSetCoverMemberPool();
         lock.lock();
@@ -468,9 +463,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         return EXIT_FAILURE;
     }
 
-    // Ring size = out-of-order window, sized from the memory budget (OOM-aware) and
-    // capped by the result count. sequenceIdx runs over [0, endRange); every index
-    // publishes exactly one result.
+    // ring size = out-of-order window; every sequenceIdx in [0, endRange) publishes one result
     const size_t align2clustResultCount = (mode == Parameters::SET_COVER) ? dbSize : alnDbr.getSize();
     const size_t reorderCapacityChosen = computeReorderCapacity(par, dbSize, mode, align2clustResultCount);
     {
@@ -611,10 +604,8 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             }
             clusterResult.representativeId = representativeId;
 
-            // Representative already assigned to another cluster: this cluster is discarded
-            // by the cluster thread anyway, so skip parsing and aligning it entirely. prefSize
-            // is already set (precomputed for set-cover), so the currentPrefSize gate stays
-            // correct.
+            // the cluster thread discards a cluster whose representative is assigned, and
+            // prefSize is precomputed, so skipping here keeps the currentPrefSize gate correct
             if (loadAssignedCluster(assignedCluster, representativeId) != DB_LOCAL_ID_INVALID) {
                 pushClusterResult(std::move(clusterResult));
                 continue;
@@ -646,11 +637,8 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             clusterResult.prefSize = prefSize;   // exact parsed count for the aligned path
 
             for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
-                // Representative assigned meanwhile: the cluster thread discards clusters
-                // whose representative is assigned, so this result (partial or empty) is
-                // never used; stop aligning the rest. Safe in set-cover too: prefSize is
-                // already fully counted, so this is just the k-th-target form of the
-                // (k=0) rep-skip above.
+                // representative assigned meanwhile, so this result is never used; prefSize is
+                // already counted, which makes this the k-th-target form of the rep-skip above
                 if (loadAssignedCluster(assignedCluster, representativeId) != DB_LOCAL_ID_INVALID) {
                     break;
                 }
@@ -663,9 +651,8 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 if (isIdentity) {
                     clusterResult.memberIds.push_back(queryId);
                     if (includeAlignFiles) {
-                        // Identity hit: no alignment needed. mmseqs forces coverage/seqId to
-                        // 1.0 for identity (see Alignment.cpp), so emit a full-length self
-                        // record directly instead of running Smith-Waterman.
+                        // mmseqs forces coverage/seqId to 1.0 for identity (Alignment.cpp), so
+                        // emit the self record instead of running Smith-Waterman
                         std::string backtrace = par.addBacktrace ? std::string(query.L, 'M') : std::string();
                         Matcher::result_t selfResult(queryKey, query.L, 1.0f, 1.0f, 1.0f, 0.0,
                             query.L, 0, query.L - 1, query.L, 0, query.L - 1, query.L, backtrace);
@@ -674,9 +661,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     continue;
                 }
 
-                // Skip the (expensive) alignment if the target was assigned meanwhile.
-                // Safe in set-cover too: an assigned target is monotonic, so it would be
-                // dropped by the cluster thread's re-evaluation anyway.
+                // an assigned target is monotonic, so the cluster thread would drop it anyway
                 if (loadAssignedCluster(assignedCluster, targetId) != DB_LOCAL_ID_INVALID) {
                     continue;
                 }
