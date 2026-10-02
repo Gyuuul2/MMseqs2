@@ -75,6 +75,12 @@ KmerPosition<T, Flank, L> *initKmerPositionMemory(size_t size) {
     return hashSeqPair;
 }
 
+static inline unsigned char adjacentResidue(const Sequence &seq, const char *seqData, size_t pos,
+                                            unsigned char maskedIndex, unsigned char xIndex) {
+    return (seq.numSequence[pos] == maskedIndex)
+           ? xIndex : adjSubMat->aa2num[static_cast<int>(seqData[pos])];
+}
+
 // Per-thread staging buffer size for fillKmerPositionArray. Only a contention/memory
 // trade-off (batches the atomic reservation into the shared array); a small batch already
 // makes the atomic overhead negligible, so keep it small to bound the per-thread scratch.
@@ -107,6 +113,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, Flank, L> * kmer
     int querySeqType  =  seqDbr.getDbtype();
     size_t longestKmer = par.kmerSize;
     const unsigned char xIndex = adjSubMat->aa2num[static_cast<int>('X')];
+    const unsigned char maskedIndex = subMat->aa2num[static_cast<int>('X')];
 
     ScoreMatrix two;
     ScoreMatrix three;
@@ -361,12 +368,12 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, Flank, L> * kmer
                                     const int before = static_cast<int>(startPos) - Flank + o;
                                     if (before >= 0) {
                                         threadKmerBuffer[bufferPos].setAdjacentSeq(o,
-                                            adjSubMat->aa2num[static_cast<int>(seqData[before])]);
+                                            adjacentResidue(seq, seqData, before, maskedIndex, xIndex));
                                     }
                                     const unsigned int after = endPos + 1 + o;
                                     if (after <= static_cast<unsigned int>(seq.L) - 1) {
                                         threadKmerBuffer[bufferPos].setAdjacentSeq(Flank + o,
-                                            adjSubMat->aa2num[static_cast<int>(seqData[after])]);
+                                            adjacentResidue(seq, seqData, after, maskedIndex, xIndex));
                                     }
                                 }
                             }
