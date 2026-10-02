@@ -177,6 +177,7 @@ Parameters::Parameters():
         PARAM_ITER2_SCALE_ADDITIVE(PARAM_ITER2_SCALE_ADDITIVE_ID, "--iter2-scale-additive", "Add the refinement round k-mer scale instead of replacing it", "Give the refinement round --kmer-per-seq-scale plus 0.1 instead of a flat 0.1", typeid(bool), (void *) &iter2ScaleAdditive, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJACENCY_FLANK(PARAM_ADJACENCY_FLANK_ID, "--adjacency-flank", "Adjacent residues taken on each side of the k-mer", "Adjacent residues taken on each side of the k-mer, 2 or 3", typeid(int), (void *) &adjacencyFlank, "^[23]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_INDEX_WINDOW(PARAM_INDEX_WINDOW_ID, "--index-window", "Index entries kept in memory", "Index entries kept resident; the rest stay in a binary sidecar on disk (0 keeps the whole index in memory)", typeid(size_t), (void *) &indexWindow, "^[0-9]+$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LINCLUST_ITERATIONS(PARAM_LINCLUST_ITERATIONS_ID, "--linclust-iterations", "Linclust iterations", "k-mer matching rounds linclust2 runs: 2 reclusters the first round representatives, 1 stops after the first round", typeid(int), (void *) &linclustIterations, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJACENCY_ALPH_SIZE(PARAM_ADJACENCY_ALPH_SIZE_ID, "--adjacency-alph-size", "Alphabet the adjacent residues are stored in", "Alphabet size the adjacent residues are stored and scored in, 0 keeps --alph-size", typeid(int), (void *) &adjacencyAlphabetSize, "^(0|[2-9]|1[0-9]|2[01])$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
@@ -1599,6 +1600,7 @@ Parameters::Parameters():
     linclustworkflow.push_back(&PARAM_SWITCH_CONSENSUS_REP);
     linclustworkflow.push_back(&PARAM_CLUST_HASH);
     linclustworkflow.push_back(&PARAM_REMOVE_TMP_FILES);
+    linclustworkflow.push_back(&PARAM_LINCLUST_ITERATIONS);
     linclustworkflow.push_back(&PARAM_REUSELATEST);
     linclustworkflow.push_back(&PARAM_RUNNER);
 
@@ -3073,6 +3075,7 @@ void Parameters::setDefaults() {
     iter2ScaleAdditive = false;
     adjacencyFlank = 3;
     indexWindow = 0;
+    linclustIterations = 2;
     adjacencyAlphabetSize = 0;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;

@@ -53,7 +53,7 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
     fi
     RESULTDB="${TMP_PATH}/pref"
 
-    # 2. Alignment + clustering (ungapped / gapped banded-block aligner)
+    # 2. Alignment + clustering
     if notExists "${TMP_PATH}/clu.dbtype"; then
         # shellcheck disable=SC2086
         $RUNNER "$MMSEQS" align2clust "$INPUT" "$RESULTDB" "${TMP_PATH}/clu" ${ALIGN2CLUST_PAR} \
@@ -74,39 +74,41 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
     fi
 
     # 3. Refinement pass: re-cluster representative sequences
-    if notExists "${TMP_PATH}/input_rep.dbtype"; then
+    if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
+        if notExists "${TMP_PATH}/input_rep.dbtype"; then
+            # shellcheck disable=SC2086
+            "$MMSEQS" createsubdb "$CLUDB" "$INPUT" "${TMP_PATH}/input_rep" ${VERBOSITY} --subdb-mode 1 \
+                || fail "createsubdb (representatives) died"
+        fi
+
+        if notExists "${TMP_PATH}/pref_rep.dbtype"; then
+            # shellcheck disable=SC2086
+            $RUNNER "$MMSEQS" kmermatcher "${TMP_PATH}/input_rep" "${TMP_PATH}/pref_rep" ${KMERMATCHER_PAR2} \
+                || fail "kmermatcher (representatives) died"
+        fi
+
+        if notExists "${TMP_PATH}/clu_rep.dbtype"; then
+            # shellcheck disable=SC2086
+            $RUNNER "$MMSEQS" align2clust "${TMP_PATH}/input_rep" "${TMP_PATH}/pref_rep" "${TMP_PATH}/clu_rep" \
+                ${ALIGN2CLUST_PAR} \
+                --filter-cludb-file "$CLUDB" \
+                --filter-seqdb-file "$SOURCE" \
+                || fail "align2clust (representatives) died"
+        fi
+
+        if notExists "$2.dbtype"; then
+            # shellcheck disable=SC2086
+            "$MMSEQS" mergeclusters "$SOURCE" "$2" \
+                "$CLUDB" "${TMP_PATH}/clu_rep" $MERGECLU_PAR \
+                || fail "mergeclusters died"
+        fi
+    elif notExists "$2.dbtype"; then
         # shellcheck disable=SC2086
-        "$MMSEQS" createsubdb "$CLUDB" "$INPUT" "${TMP_PATH}/input_rep" ${VERBOSITY} --subdb-mode 1 \
-            || fail "createsubdb (representatives) died"
+        "$MMSEQS" mvdb "$CLUDB" "$2" ${VERBOSITY} \
+            || fail "mvdb (first round clustering) died"
     fi
 
-    if notExists "${TMP_PATH}/pref_rep.dbtype"; then
-        # shellcheck disable=SC2086
-        $RUNNER "$MMSEQS" kmermatcher "${TMP_PATH}/input_rep" "${TMP_PATH}/pref_rep" ${KMERMATCHER_PAR2} \
-            || fail "kmermatcher (representatives) died"
-    fi
-
-    if notExists "${TMP_PATH}/clu_rep.dbtype"; then
-        # shellcheck disable=SC2086
-        $RUNNER "$MMSEQS" align2clust "${TMP_PATH}/input_rep" "${TMP_PATH}/pref_rep" "${TMP_PATH}/clu_rep" \
-            ${ALIGN2CLUST_PAR} \
-            --filter-cludb-file "$CLUDB" \
-            --filter-seqdb-file "$SOURCE" \
-            || fail "align2clust (representatives) died"
-    fi
-
-    if notExists "$2.dbtype"; then
-        # shellcheck disable=SC2086
-        "$MMSEQS" mergeclusters "$SOURCE" "$2" \
-            "$CLUDB" "${TMP_PATH}/clu_rep" $MERGECLU_PAR \
-            || fail "mergeclusters died"
-    fi
-
-    # Expose alignment results (only produced when --include-align-files is set).
-    # The two align2clust passes each emit their own alignments; union them keyed by the
-    # final representatives ($2) and keep only lines whose target is a member of that
-    # final cluster (--merge-filter-target), so the result has exactly one entry per
-    # cluster containing exactly that cluster's rep->member alignments.
+    # 4. Alignments of both passes, keyed by the final representatives
     if [ -f "${TMP_PATH}/clu_aln.dbtype" ]; then
         if [ -f "${TMP_PATH}/clu_rep_aln.dbtype" ]; then
             # shellcheck disable=SC2086
@@ -121,8 +123,7 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
         fi
     fi
 
-    # Optionally replace representatives by the most profile-consistent observed member,
-    # reusing the alignments in ${2}_aln (no profile-vs-member realignment).
+    # 5. Replace representatives by the most profile-consistent member
     if [ -n "$SWITCH_CONSENSUS_REP" ]; then
         # shellcheck disable=SC2086
         "$MMSEQS" pickconsensusrepfast "$1" "$2" "${TMP_PATH}/clu_switched" "${TMP_PATH}/switch_tmp" ${PICKREP_PAR} \
@@ -264,7 +265,6 @@ if [ -n "$REMOVE_TMP" ]; then
         "$MMSEQS" rmdb "${TMP_PATH}/pref_rep" ${VERBOSITY}
         # shellcheck disable=SC2086
         "$MMSEQS" rmdb "${TMP_PATH}/clu_rep" ${VERBOSITY}
-        # align intermediates (only present with --include-align-files)
         if [ -f "${TMP_PATH}/clu_aln.dbtype" ]; then
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/clu_aln" ${VERBOSITY}

@@ -193,17 +193,14 @@ int linclust(int argc, const char **argv, const Command& command) {
         cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
         cmd.addVariable("ALIGN2CLUST_PAR", par.createParameterString(par.align2clust).c_str());
         cmd.addVariable("CLUSTER_PAR", par.createParameterString(par.clust).c_str());
-        
-        par.spacedKmer = true;
-        if (par.iter2ScaleAdditive) {
-            par.kmersPerSequenceScale = MultiParam<NuclAA<float>>(NuclAA<float>(
-                prevKmersPerSequenceScale.values.aminoacid() + 0.1f,
-                prevKmersPerSequenceScale.values.nucleotide() + 0.1f));
-        } else {
+        cmd.addVariable("LINCLUST_ITERATIONS", SSTR(par.linclustIterations).c_str());
+
+        if (par.linclustIterations > 1) {
+            par.spacedKmer = true;
             par.kmersPerSequenceScale = 0.1;
+            cmd.addVariable("KMERMATCHER_PAR2", par.createParameterString(par.kmermatcher).c_str());
         }
-        cmd.addVariable("KMERMATCHER_PAR2", par.createParameterString(par.kmermatcher).c_str());
-        
+
         par.spacedKmer = prevspacedKmer;
         par.maskMode = prevmaskMode;
         // the 0.1 above is intended for KMERMATCHER_PAR2 only, so it must not leak into later strings

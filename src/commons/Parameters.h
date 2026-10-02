@@ -666,6 +666,7 @@ public:
     bool iter2ScaleAdditive;
     int adjacencyFlank;
     size_t indexWindow;
+    int linclustIterations;
     int adjacencyAlphabetSize;
     bool clustHash;
     int linclustVersion;
@@ -1038,6 +1039,7 @@ public:
     PARAMETER(PARAM_ITER2_SCALE_ADDITIVE)
     PARAMETER(PARAM_ADJACENCY_FLANK)
     PARAMETER(PARAM_INDEX_WINDOW)
+    PARAMETER(PARAM_LINCLUST_ITERATIONS)
     PARAMETER(PARAM_ADJACENCY_ALPH_SIZE)
     PARAMETER(PARAM_USE_PARALLELISM)
     PARAMETER(PARAM_NEED_WRITEBUFFER)

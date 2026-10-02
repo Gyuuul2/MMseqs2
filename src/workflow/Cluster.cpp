@@ -277,9 +277,12 @@ int clusteringworkflow(int argc, const char **argv, const Command& command) {
             // build the inner linclust parameters without propagating the rep switch,
             // so the switch happens only once on the final cascaded clustering
             bool prevSwitch = par.switchConsensusRep;
+            int prevIterations = par.linclustIterations;
             par.switchConsensusRep = false;
+            par.linclustIterations = 1;
             cmd.addVariable("LINCLUST_PAR", par.createParameterString(par.linclustworkflow).c_str());
             par.switchConsensusRep = prevSwitch;
+            par.linclustIterations = prevIterations;
             cmd.addVariable("PREFILTER_PAR", par.createParameterString(par.prefilter).c_str());
             cmd.addVariable("ALIGN2CLUST_PAR", par.createParameterString(par.align2clust).c_str());
             cmd.addVariable("SWITCH_CONSENSUS_REP", par.switchConsensusRep ? "TRUE" : NULL);
