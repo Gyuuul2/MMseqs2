@@ -578,6 +578,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                  -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
         std::vector<std::pair<DBKeyType, unsigned short>> targetsWithDiagonal;
         targetsWithDiagonal.reserve(1000);
+        // a compressed reader hands every getData of a thread the same buffer, so the query has
+        // to be held somewhere the target decompression cannot reach
+        std::string querySeqBuffer;
+        querySeqBuffer.reserve(db_maxseqlen + 1);
 
         const bool includeAlignFiles = (alnWriter != nullptr);
         std::string alnResultBuffer;
@@ -622,8 +626,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             const size_t alignmentId = alnDbr.getId(queryKey);
             char *alignmentData = alnDbr.getData(alignmentId, threadIdx);
             size_t queryId = representativeId;
-            char *querySequence = seqDbr->getData(queryId, threadIdx);
             size_t queryLength = seqDbr->getSeqLen(queryId);
+            querySeqBuffer.assign(seqDbr->getData(queryId, threadIdx), queryLength);
+            const char *querySequence = querySeqBuffer.c_str();
             query.mapSequence(queryId, queryKey, querySequence, queryLength);
             blockAligner.initQuery(&query);
             matcher.initQuery(&query);
