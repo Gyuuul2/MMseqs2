@@ -110,7 +110,8 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, Flank, L> * kmer
     size_t offset = 0;
     int querySeqType  =  seqDbr.getDbtype();
     size_t longestKmer = par.kmerSize;
-    const unsigned char xIndex = adjSubMat->aa2num[static_cast<int>('X')];
+    // adjSubMat is only set up by kmermatcher; kmersearch and kmerindexdb reach this with Flank 0
+    const unsigned char xIndex = (Flank != 0) ? adjSubMat->aa2num[static_cast<int>('X')] : 0;
     const unsigned char maskedIndex = subMat->aa2num[static_cast<int>('X')];
 
     ScoreMatrix two;
