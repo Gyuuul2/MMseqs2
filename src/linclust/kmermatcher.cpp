@@ -17,6 +17,7 @@
 #include "FastSort.h"
 #include "SequenceWeights.h"
 #include "Masker.h"
+#include "MemoryMapped.h"
 
 #include <sys/stat.h>
 #include <sys/mman.h>
@@ -1484,6 +1485,85 @@ int kmermatcherByFlank(Parameters &par, DBReader<DBKeyType> &seqDbr) {
     return kmermatcherInner<T, 3, L>(par, seqDbr);
 }
 
+
+static DBReader<DBKeyType> *openReaderWithMappedIndex(Parameters &par, MemoryMapped &indexMap,
+                                                     const std::string &binIndex, bool &sortedByOffset) {
+    MemoryMapped textIndex(par.db1Index, MemoryMapped::WholeFile, MemoryMapped::SequentialScan);
+    if (textIndex.isValid() == false) {
+        Debug(Debug::ERROR) << "Cannot open index file " << par.db1Index << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    char *pos = (char *) textIndex.getData();
+    char *end = pos + textIndex.size();
+    size_t size = Util::ompCountLines(pos, textIndex.size(), par.threads);
+
+    FILE *out = fopen(binIndex.c_str(), "w");
+    if (out == NULL) {
+        Debug(Debug::ERROR) << "Cannot create binary index " << binIndex << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+
+    const size_t stageEntries = 1024 * 1024;
+    DBReader<DBKeyType>::Index *stage = new(std::nothrow) DBReader<DBKeyType>::Index[stageEntries];
+    Util::checkAllocation(stage, "Can not allocate index staging buffer in kmermatcher");
+
+    const char *cols[3];
+    size_t prevOffset = 0;
+    size_t dataSize = 0;
+    size_t maxSeqLen = 0;
+    DBKeyType lastKey = 0;
+    sortedByOffset = true;
+    for (size_t written = 0; written < size; ) {
+        size_t chunk = std::min(stageEntries, size - written);
+        for (size_t i = 0; i < chunk; i++) {
+            if (pos >= end) {
+                Debug(Debug::ERROR) << "Index file " << par.db1Index << " ended after "
+                                    << (written + i) << " of " << size << " entries\n";
+                EXIT(EXIT_FAILURE);
+            }
+            Util::getWordsOfLine(pos, cols, 3);
+            stage[i].id = Util::fast_atoi<DBKeyType>(cols[0]);
+            stage[i].offset = Util::fast_atoi<size_t>(cols[1]);
+            stage[i].length = Util::fast_atoi<size_t>(cols[2]);
+            lastKey = std::max(lastKey, stage[i].id);
+            dataSize += stage[i].length;
+            maxSeqLen = std::max(maxSeqLen, stage[i].length);
+            sortedByOffset = sortedByOffset && stage[i].offset >= prevOffset;
+            prevOffset = stage[i].offset;
+            pos = Util::skipLine(pos);
+        }
+        if (fwrite(stage, sizeof(DBReader<DBKeyType>::Index), chunk, out) != chunk) {
+            Debug(Debug::ERROR) << "Cannot write binary index " << binIndex
+                                << ", the file system is probably full\n";
+            EXIT(EXIT_FAILURE);
+        }
+        written += chunk;
+    }
+    delete[] stage;
+    if (pos != end) {
+        Debug(Debug::ERROR) << "Index file " << par.db1Index << " has a trailing line without a newline\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fclose(out) != 0) {
+        Debug(Debug::ERROR) << "Cannot close binary index " << binIndex << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    textIndex.close();
+
+    if (indexMap.open(binIndex, MemoryMapped::WholeFile, MemoryMapped::SequentialScan) == false) {
+        Debug(Debug::ERROR) << "Cannot map binary index " << binIndex << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    FileUtil::remove(binIndex.c_str());
+
+    DBReader<DBKeyType> *reader = new DBReader<DBKeyType>(
+        (DBReader<DBKeyType>::Index *) indexMap.getData(), size, dataSize, lastKey,
+        FileUtil::parseDbType(par.db1.c_str()), maxSeqLen, par.threads);
+    reader->setDataFile(par.db1.c_str());
+    reader->open(DBReader<DBKeyType>::NOSORT);
+    return reader;
+}
+
 int kmermatcher(int argc, const char **argv, const Command &command) {
     MMseqsMPI::init(argc, argv);
 
@@ -1491,11 +1571,13 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     setLinearFilterDefault(&par);
     par.parseParameters(argc, argv, command, true, 0, MMseqsParameter::COMMAND_CLUSTLINEAR);
 
-    DBReader<DBKeyType> seqDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads,
-                                  DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
-    std::string mappedIndex = par.db2 + "_index";
-    seqDbr.openWithMappedIndex(mappedIndex.c_str());
-    if (seqDbr.isSortedByOffset()) {
+    MemoryMapped indexMap;
+    bool sortedByOffset = true;
+    DBReader<DBKeyType> *seqDbrPtr =
+        openReaderWithMappedIndex(par, indexMap,
+                                  par.db2 + "_index_" + SSTR(MMseqsMPI::rank), sortedByOffset);
+    DBReader<DBKeyType> &seqDbr = *seqDbrPtr;
+    if (sortedByOffset) {
         seqDbr.setSequentialAdvice();
     }
     int querySeqType = seqDbr.getDbtype();
@@ -1543,6 +1625,8 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     }
 
     seqDbr.close();
+    delete seqDbrPtr;
+    indexMap.close();
 
     return EXIT_SUCCESS;
 }

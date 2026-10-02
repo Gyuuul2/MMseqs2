@@ -578,8 +578,6 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                  -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
         std::vector<std::pair<DBKeyType, unsigned short>> targetsWithDiagonal;
         targetsWithDiagonal.reserve(1000);
-        // a compressed reader hands every getData of a thread the same buffer, so the query has
-        // to be held somewhere the target decompression cannot reach
         std::string querySeqBuffer;
         querySeqBuffer.reserve(db_maxseqlen + 1);
 

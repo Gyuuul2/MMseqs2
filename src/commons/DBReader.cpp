@@ -10,7 +10,6 @@
 #include <sys/stat.h>
 
 #include <fcntl.h>
-#include <unistd.h>
 
 #include "MemoryMapped.h"
 #include "Debug.h"
@@ -27,8 +26,7 @@ DBReader<T>::DBReader(const char* dataFileName_, const char* indexFileName_, int
 threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         indexFileName(strdup(indexFileName_)), size(0), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
-        compressedBuffers(NULL), compressedBufferSizes(NULL), index(NULL),
-        mappedIndexPath(NULL), id2local(NULL), local2id(NULL),
+        compressedBuffers(NULL), compressedBufferSizes(NULL), index(NULL), id2local(NULL), local2id(NULL),
         dataMapped(false), accessType(0), externalData(false), didMlock(false)
 {}
 
@@ -37,8 +35,7 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         int dbType, size_t maxSeqLen, int threads) :
         threads(threads), dataMode(USE_INDEX), dataFileName(NULL), indexFileName(NULL),
         size(size), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
-        maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index),
-        mappedIndexPath(NULL), sortedByOffset(true),
+        maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index), sortedByOffset(true),
         id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
 {}
 
@@ -191,32 +188,30 @@ template <typename T> bool DBReader<T>::open(int accessType){
         size_t indexDataSize = indexData.size();
         size = Util::ompCountLines(indexDataChar, indexDataSize, threads);
 
-        if (mappedIndexPath != NULL && writeAndMapIndex(indexDataChar, indexDataSize)) {
-            indexData.close();
-        } else {
-            index = new(std::nothrow) Index[size];
-            Util::checkAllocation(index, "Cannot allocate index memory in DBReader");
-            incrementMemory(sizeof(Index) * size);
+        index = new(std::nothrow) Index[size];
+        Util::checkAllocation(index, "Cannot allocate index memory in DBReader");
+        incrementMemory(sizeof(Index) * size);
 
-            bool isSortedById = readIndex(indexDataChar, indexDataSize, index, dataSize);
-            indexData.close();
+        bool isSortedById = readIndex(indexDataChar, indexDataSize, index, dataSize);
+        indexData.close();
 
-            // sortIndex also handles access modes that don't require sorting
-            sortIndex(isSortedById);
+        // sortIndex also handles access modes that don't require sorting
+        sortIndex(isSortedById);
 
-            size_t prevOffset = 0; // makes 0 or empty string
-            sortedByOffset = true;
-            for (size_t i = 0; i < size; i++) {
-                sortedByOffset = sortedByOffset && index[i].offset >= prevOffset;
-                prevOffset = index[i].offset;
-            }
+        size_t prevOffset = 0; // makes 0 or empty string
+        sortedByOffset = true;
+        for (size_t i = 0; i < size; i++) {
+            sortedByOffset = sortedByOffset && index[i].offset >= prevOffset;
+            prevOffset = index[i].offset;
         }
     }
 
     compression = isCompressed(dbtype);
     padded = (getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_GPU);
-    // DBTYPE_EXTENDED_AUX_SEQ packs two alphabets into one byte, so values run past 20 and
-    // getUnpadded()'s numeric->ASCII re-encoding, which assumes 0..20, has to be skipped
+    // A DB may pack two alphabets into a single byte (primary * auxAlphabetSize + aux, so
+    // values run past 20); such a DB is flagged with Parameters::DBTYPE_EXTENDED_AUX_SEQ and
+    // stores those raw bytes on disk whether it is padded or not. getUnpadded()'s numeric->ASCII
+    // re-encoding assumes single-alphabet codes in 0..20 and must be skipped for that layout.
     packedAlphabet = (getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_AUX_SEQ) != 0;
 
     if(compression == COMPRESSED || padded){
@@ -341,9 +336,7 @@ template <typename T> void DBReader<T>::close(){
         delete [] dstream;
     }
 
-    if (indexMap.isValid()) {
-        discardMappedIndex();
-    } else if (externalData == false && index != NULL) {
+    if(externalData == false) {
         delete[] index;
         decrementMemory(size*sizeof(Index));
     }
@@ -363,8 +356,10 @@ template <typename T> char* DBReader<T>::getUnpadded(size_t id, int thrIdx) {
     size_t seqLen = getSeqLen(id);
 
     if (packedAlphabet) {
-        // packed bytes reach up to 251 and are decoded downstream by Sequence's remap tables;
-        // CODE_TO_CHAR below would index its 21-entry table out of bounds, so hand them back raw
+        // Packed two-alphabet bytes (up to 251) are the on-disk representation of the unpadded DB
+        // as well, and are decoded downstream by Sequence's remap tables. Hand them back verbatim;
+        // running them through CODE_TO_CHAR below would index a 21-entry table out of bounds.
+        // Only the trailing SIMD padding is dropped, which getSeqLen() already excludes.
         memcpy(compressedBuffers[thrIdx], data, seqLen);
         compressedBuffers[thrIdx][seqLen + 0] = '\n';
         compressedBuffers[thrIdx][seqLen + 1] = '\0';
@@ -455,7 +450,11 @@ template <typename T> char* DBReader<T>::getDataUncompressed(size_t id){
     }
 
 
-    return getDataByOffset(indexEntry(id).offset);
+    if (local2id != NULL) {
+        return getDataByOffset(index[local2id[id]].offset);
+    }else{
+        return getDataByOffset(index[id].offset);
+    }
 }
 
 template <typename T> char* DBReader<T>::getDataByOffset(size_t offset) {
@@ -517,7 +516,10 @@ template <typename T> T DBReader<T>::getDbKey (size_t id){
         Debug(Debug::ERROR) << "getDbKey: local id (" << id << ") >= db size (" << size << ")\n";
         EXIT(EXIT_FAILURE);
     }
-    return indexEntry(id).id;
+    if (local2id != NULL) {
+        id = local2id[id];
+    }
+    return index[id].id;
 }
 
 template <typename T> size_t DBReader<T>::getLookupIdByKey(T dbKey) {
@@ -768,109 +770,6 @@ bool DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size
     return isSortedById;
 }
 
-template <typename T>
-void DBReader<T>::openWithMappedIndex(const char *path) {
-    mappedIndexPath = path;
-    open(NOSORT);
-}
-
-template <typename T>
-bool DBReader<T>::writeAndMapIndex(char *indexDataChar, size_t indexDataSize) {
-    if (size == 0) {
-        return false;
-    }
-
-    std::string binIndex = std::string(mappedIndexPath);
-    FILE *out = fopen(binIndex.c_str(), "w");
-    if (out == NULL) {
-        Debug(Debug::ERROR) << "Cannot create binary index " << binIndex << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-
-    const size_t stageEntries = 1024 * 1024;
-    Index *stage = new(std::nothrow) Index[stageEntries];
-    Util::checkAllocation(stage, "Cannot allocate index staging buffer in DBReader");
-
-    const char *cols[3];
-    char *pos = indexDataChar;
-    char *end = indexDataChar + indexDataSize;
-    size_t prevOffset = 0;
-    DBKeyType prevKey = 0;
-    DBKeyType localLastKey = 0;
-    unsigned int localMaxSeqLen = 0;
-    size_t localDataSize = 0;
-    sortedByOffset = true;
-
-    for (size_t written = 0; written < size; ) {
-        size_t chunk = std::min(stageEntries, size - written);
-        for (size_t i = 0; i < chunk; i++) {
-            if (pos >= end) {
-                Debug(Debug::ERROR) << "Index file " << indexFileName << " ended after "
-                                    << (written + i) << " of " << size << " entries\n";
-                EXIT(EXIT_FAILURE);
-            }
-            Util::getWordsOfLine(pos, cols, 3);
-            readIndexId(&stage[i].id, pos, cols);
-            DBKeyType key = indexIdToNum(&stage[i].id);
-            if ((written + i) > 0 && key < prevKey) {
-                Debug(Debug::WARNING) << "Index " << indexFileName << " is not sorted by key, "
-                                      << "keeping the whole index in memory instead\n";
-                fclose(out);
-                delete[] stage;
-                discardMappedIndex();
-                return false;
-            }
-            prevKey = key;
-            localLastKey = std::max(localLastKey, key);
-            stage[i].offset = Util::fast_atoi<size_t>(cols[1]);
-            stage[i].length = Util::fast_atoi<size_t>(cols[2]);
-            localDataSize += stage[i].length;
-            localMaxSeqLen = std::max(localMaxSeqLen, static_cast<unsigned int>(stage[i].length));
-            sortedByOffset = sortedByOffset && stage[i].offset >= prevOffset;
-            prevOffset = stage[i].offset;
-            pos = Util::skipLine(pos);
-        }
-        if (fwrite(stage, sizeof(Index), chunk, out) != chunk) {
-            Debug(Debug::ERROR) << "Cannot write binary index " << binIndex
-                                << ", the file system is probably full\n";
-            EXIT(EXIT_FAILURE);
-        }
-        written += chunk;
-    }
-    delete[] stage;
-    if (fclose(out) != 0) {
-        Debug(Debug::ERROR) << "Cannot close binary index " << binIndex << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-
-    dataSize = localDataSize;
-    maxSeqLen = localMaxSeqLen;
-    lastKey = localLastKey;
-
-    if (indexMap.open(binIndex, MemoryMapped::WholeFile, MemoryMapped::SequentialScan) == false) {
-        Debug(Debug::ERROR) << "Cannot map binary index " << binIndex << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    // the mapping keeps the file alive, so nothing is left behind if the process dies
-    FileUtil::remove(binIndex.c_str());
-    index = (Index *) indexMap.getData();
-    return true;
-}
-
-template <typename T>
-void DBReader<T>::discardMappedIndex() {
-    if (indexMap.isValid()) {
-        indexMap.close();
-    }
-    index = NULL;
-}
-
-template<>
-void DBReader<std::string>::openWithMappedIndex(const char *) {
-    Debug(Debug::ERROR) << "A mapped index is only supported for numeric database keys\n";
-    EXIT(EXIT_FAILURE);
-}
-
 template<typename T> T DBReader<T>::getLastKey() {
     return lastKey;
 }
@@ -1003,7 +902,10 @@ size_t DBReader<T>::getOffset(size_t id) {
         Debug(Debug::ERROR) << "getOffset: local id (" << id << ") >= db size (" << size << ")\n";
         EXIT(EXIT_FAILURE);
     }
-    return indexEntry(id).offset;
+    if (local2id != NULL) {
+        id = local2id[id];
+    }
+    return index[id].offset;
 }
 
 template<typename T>
@@ -1254,7 +1156,6 @@ void DBReader<T>::decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize,
         return;
     }
 
-    const Index *entries = index;
     size_t chunkSize = ceil(static_cast<double>(dataSize) / static_cast<double>(worldSize));
 
     size_t *entriesPerWorker = (size_t*)calloc(worldSize, sizeof(size_t));
@@ -1266,7 +1167,7 @@ void DBReader<T>::decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize,
             sumCharsAssignedToCurrRank = 0;
             currentRank++;
         }
-        sumCharsAssignedToCurrRank += entries[i].length;
+        sumCharsAssignedToCurrRank += index[i].length;
         entriesPerWorker[currentRank] += 1;
     }
 

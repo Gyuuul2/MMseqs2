@@ -6,7 +6,6 @@
 // Manages DB read access.
 //
 #include "MemoryTracker.h"
-#include "MemoryMapped.h"
 #include <cstddef>
 #include <utility>
 #include <vector>
@@ -254,7 +253,12 @@ public:
             Debug(Debug::ERROR) << "getSeqLen: local id (" << id << ") >= db size (" << size << ")\n";
             EXIT(EXIT_FAILURE);
         }
-        size_t length = indexEntry(id).length;
+        size_t length;
+        if (local2id != NULL) {
+            length=index[local2id[id]].length;
+        }else{
+            length=index[id].length;
+        }
 
         if(Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_HMM_PROFILE ) ){
             // -1 null byte
@@ -271,7 +275,11 @@ public:
             Debug(Debug::ERROR) << "getEntryLen: local id (" << id << ") >= db size (" << size << ")\n";
             EXIT(EXIT_FAILURE);
         }
-        return indexEntry(id).length;
+        if (local2id != NULL) {
+            return index[local2id[id]].length;
+        }else{
+            return index[id].length;
+        }
     }
 
     size_t maxCount(char c);
@@ -388,20 +396,11 @@ public:
         return index;
     }
 
-
     Index* getIndex(size_t id) {
         if (local2id != NULL) {
             return index + local2id[id];
         }
         return index + id;
-    }
-
-
-
-
-
-    const Index& indexEntry(size_t id) {
-        return index[(local2id != NULL) ? local2id[id] : id];
     }
 
 
@@ -496,12 +495,6 @@ public:
         }
     };
 
-    bool writeAndMapIndex(char *indexData, size_t indexDataSize);
-
-    void discardMappedIndex();
-
-
-
     void setData(char *data, size_t dataSize);
 
     void setMode(const int mode);
@@ -515,8 +508,6 @@ public:
     }
 
     static int isCompressed(int dbtype);
-
-    void openWithMappedIndex(const char *path);
 
     void setSequentialAdvice();
 
@@ -566,9 +557,6 @@ private:
     ZSTD_DStream ** dstream;
 
     Index * index;
-    MemoryMapped indexMap;
-    const char * mappedIndexPath;
-
     size_t lookupSize;
     LookupEntry * lookup;
     size_t sourceSize;
