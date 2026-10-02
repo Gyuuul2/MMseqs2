@@ -930,6 +930,20 @@ int DBReader<T>::isCompressed(int dbtype) {
 }
 
 
+template <typename T> void DBReader<T>::releaseDataPages() {
+#ifdef MADV_DONTNEED
+    // Util::madviseLogged goes through posix_madvise, which glibc turns into a no-op for
+    // POSIX_MADV_DONTNEED, so this has to call madvise itself
+    if (dataMapped == false || (dataMode & USE_FREAD) || (dataMode & USE_WRITABLE)) {
+        return;
+    }
+    for (size_t i = 0; i < dataFileCnt; i++) {
+        madvise(dataFiles[i], dataSizeOffset[i + 1] - dataSizeOffset[i], MADV_DONTNEED);
+    }
+#endif
+}
+
+
 template<typename T>
 void DBReader<T>::setSequentialAdvice() {
     for(size_t i = 0; i < dataFileCnt; i++){

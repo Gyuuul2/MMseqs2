@@ -393,7 +393,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, Flank, L> * kmer
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
             if (thread_idx == 0) {
-                seqDbr.remapData();
+                seqDbr.releaseDataPages();
             }
 #pragma omp barrier
         }
@@ -1146,11 +1146,11 @@ std::vector<std::pair<size_t, size_t>> setupCountTable(
         fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, Flank, L>(NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
     }
 
-    seqDbr.remapData();
+    seqDbr.releaseDataPages();
 
     if (splits > 1) {
         Debug(Debug::INFO) << "Not enough memory to process at once need to split for initiating count table\n";
-        seqDbr.remapData();
+        seqDbr.releaseDataPages();
         size_t maxBucketSize = 0;
         for(size_t i = 0; i < (USHRT_MAX+1); i++) {
             if(maxBucketSize < hashDist[i]){
@@ -1447,7 +1447,7 @@ std::vector<std::pair<size_t, size_t>> setupKmerSplits(Parameters &par, BaseMatr
         }else{
             fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, Flank, L>(NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
         }
-        seqDbr.remapData();
+        seqDbr.releaseDataPages();
         size_t maxBucketSize = 0;
         for(size_t i = 0; i < (USHRT_MAX+1); i++) {
             if(maxBucketSize < hashDist[i]){

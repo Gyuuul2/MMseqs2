@@ -511,6 +511,10 @@ public:
 
     void setSequentialAdvice();
 
+    // Gives the resident pages of the data files back without tearing the mapping down, so the
+    // pointers and the kernel advice survive and a page that is read again just faults back in.
+    void releaseDataPages();
+
     void decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize, size_t *startEntry, size_t *numEntries);
 
 private:
