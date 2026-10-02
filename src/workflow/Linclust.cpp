@@ -134,6 +134,13 @@ int linclust(int argc, const char **argv, const Command& command) {
         EXIT(EXIT_FAILURE);
     }
     
+    if (par.linclustVersion == 2
+        && Parameters::isEqualDbtype(dbType, Parameters::DBTYPE_AMINO_ACIDS) == false) {
+        Debug(Debug::ERROR) << "linclust version 2 clusters amino acid databases only. "
+                            << "Use --linclust-version 1 for nucleotide or profile input.\n";
+        EXIT(EXIT_FAILURE);
+    }
+
     if (par.linclustVersion == 1) {
         cmd.addVariable("ALIGN_MODULE", isUngappedMode ? "rescorediagonal" : "align");
         // filter by diagonal in case of AA (do not filter for nucl, profiles, ...)
