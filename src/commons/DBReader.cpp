@@ -791,11 +791,14 @@ bool DBReader<T>::buildIndexSidecar(char *indexDataChar, size_t indexDataSize) {
     if (size == 0) {
         return false;
     }
-    indexWindowSize = std::min(indexWindowSize, size);
+    if (indexWindowSize >= size) {
+        return false;
+    }
 
     static int sidecarCounter = 0;
     std::string sidecar = std::string(indexFileName) + ".window."
-                        + SSTR(static_cast<size_t>(getpid())) + "." + SSTR(sidecarCounter++);
+                        + SSTR(static_cast<size_t>(getpid())) + "."
+                        + SSTR(__sync_fetch_and_add(&sidecarCounter, 1));
     FILE *out = fopen(sidecar.c_str(), "w");
     if (out == NULL) {
         Debug(Debug::WARNING) << "Cannot create index window file " << sidecar
@@ -906,7 +909,7 @@ void DBReader<T>::indexWindowOutOfRange(size_t id) {
 }
 
 template <typename T>
-void DBReader<T>::rejectWindowedIndex(const char *caller) {
+void DBReader<T>::rejectWindowedIndex(const char *caller) const {
     Debug(Debug::ERROR) << caller << " needs the whole index resident, but " << indexFileName
                         << " was opened with a window\n";
     EXIT(EXIT_FAILURE);
@@ -1033,7 +1036,7 @@ char* DBReader<DBKeyType>::serialize(const DBReader<DBKeyType> &idx) {
     p += sizeof(int);
     memcpy(p, &idx.maxSeqLen, sizeof(unsigned int));
     p += sizeof(unsigned int);
-    memcpy(p, idx.index, idx.size * sizeof(DBReader<DBKeyType>::Index));
+    memcpy(p, idx.indexEntries(), idx.size * sizeof(DBReader<DBKeyType>::Index));
     p += idx.size * sizeof(DBReader<DBKeyType>::Index);
     return data;
 }
@@ -1339,6 +1342,7 @@ void DBReader<T>::decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize,
         return;
     }
 
+    const Index *entries = indexEntries();
     size_t chunkSize = ceil(static_cast<double>(dataSize) / static_cast<double>(worldSize));
 
     size_t *entriesPerWorker = (size_t*)calloc(worldSize, sizeof(size_t));
@@ -1350,7 +1354,7 @@ void DBReader<T>::decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize,
             sumCharsAssignedToCurrRank = 0;
             currentRank++;
         }
-        sumCharsAssignedToCurrRank += index[i].length;
+        sumCharsAssignedToCurrRank += entries[i].length;
         entriesPerWorker[currentRank] += 1;
     }
 

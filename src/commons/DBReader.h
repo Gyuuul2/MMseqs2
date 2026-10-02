@@ -390,6 +390,13 @@ public:
         return index;
     }
 
+    const Index* indexEntries() const {
+        if (indexWindow != NULL) {
+            rejectWindowedIndex("indexEntries");
+        }
+        return index;
+    }
+
     Index* getIndex(size_t id) {
         if (indexWindow != NULL) {
             rejectWindowedIndex("getIndex");
@@ -521,7 +528,7 @@ public:
 
     void indexWindowOutOfRange(size_t id);
 
-    void rejectWindowedIndex(const char *caller);
+    void rejectWindowedIndex(const char *caller) const;
 
     void setData(char *data, size_t dataSize);
 
