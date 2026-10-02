@@ -33,12 +33,19 @@ struct ClusterResult {
 
 struct PrefInfo {
     DBLocalId id;
+    // the sequence length the id used to carry: SORT_BY_LENGTH made the id a rank in
+    // (length descending, file order ascending), and NOSORT leaves it in file order
+    DBLocalId len;
     size_t size;
 
     static bool compareBySizeAndId(const PrefInfo &first, const PrefInfo &second){
         if(first.size > second.size)
             return true;
         if(second.size > first.size)
+            return false;
+        if(first.len > second.len)
+            return true;
+        if(second.len > first.len)
             return false;
         if(first.id < second.id)
             return true;
@@ -538,6 +545,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 const char *data = alnDbr.getData(alnId, thread_idx);
                 const size_t dataSize = alnDbr.getEntryLen(alnId);
                 prefRepSizePair[i].id = seqDbr->getId(clusterId);
+                prefRepSizePair[i].len = static_cast<DBLocalId>(seqDbr->getSeqLen(prefRepSizePair[i].id));
                 prefRepSizePair[i].size = (*data == '\0') ? 1 : Util::countLines(data, dataSize);
             }
         }
