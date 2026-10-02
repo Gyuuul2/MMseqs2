@@ -787,10 +787,14 @@ bool DBReader<T>::buildIndexSidecar(char *indexDataChar, size_t indexDataSize) {
     if (size == 0) {
         return false;
     }
-    // half the index, never more than the cap, so the budget scales with the database
-    // instead of with a window the caller has to guess
+    // the resident index competes with whatever the caller is splitting, so the derived
+    // budget follows both the database and the machine and keeps an absolute ceiling
+    const size_t halfIndex = size / 2 * sizeof(Index);
+    const size_t machineShare = Util::getTotalSystemMemory() / 10;
     const size_t residentCap = 100ULL * 1024 * 1024 * 1024;
-    const size_t budget = (indexMemoryLimit > 0) ? indexMemoryLimit : std::min(size / 2 * sizeof(Index), residentCap);
+    const size_t budget = (indexMemoryLimit > 0)
+                              ? indexMemoryLimit
+                              : std::min(halfIndex, std::min(machineShare, residentCap));
     indexWindowSize = std::max(static_cast<size_t>(1), budget / sizeof(Index));
     if (indexWindowSize >= size) {
         return false;
