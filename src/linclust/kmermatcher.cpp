@@ -161,11 +161,21 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, Flank, L> * kmer
         SequencePosition * kmers = (SequencePosition *) malloc((par.pickNbest * (par.maxSeqLen + 1) + 1) * sizeof(SequencePosition) * 2);
         Util::checkAllocation(kmers, "Can not allocate kmers memory in fillKmerPositionArray");
         size_t kmersArraySize = par.maxSeqLen;
-        const size_t flushSize = 100000000;
+        const size_t flushSize = seqDbr.indexIsWindowed() ? seqDbr.getIndexWindowSize() : 100000000;
+        const size_t releaseEvery = 100000000;
         size_t iterations = static_cast<size_t>(ceil(static_cast<double>(seqDbr.getSize()) / static_cast<double>(flushSize)));
         for (size_t i = 0; i < iterations; i++) {
             size_t start = (i * flushSize);
             size_t bucketSize = std::min(seqDbr.getSize() - (i * flushSize), flushSize);
+
+            if (seqDbr.indexIsWindowed()) {
+#pragma omp barrier
+#pragma omp single
+                seqDbr.setIndexWindow(start);
+            }
+            const size_t blockEnd = start + bucketSize;
+            const bool releaseAfterBlock = (blockEnd / releaseEvery) != (start / releaseEvery)
+                                        || blockEnd >= seqDbr.getSize();
 
 
 #pragma omp for schedule(dynamic, 100)
@@ -392,7 +402,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, Flank, L> * kmer
 #ifdef OPENMP
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-            if (thread_idx == 0) {
+            if (thread_idx == 0 && releaseAfterBlock) {
                 seqDbr.releaseDataPages();
             }
 #pragma omp barrier
@@ -1112,10 +1122,17 @@ void setLinearFilterDefault(Parameters *p) {
 
 size_t computeKmerCount(DBReader<DBKeyType> &reader, size_t KMER_SIZE, size_t chooseTopKmer, float chooseTopKmerScale) {
     size_t totalKmers = 0;
-    for(size_t id = 0; id < reader.getSize(); id++ ){
-        int seqLen = static_cast<int>(reader.getSeqLen(id));
-        int kmerAdjustedSeqLen = std::max(1, seqLen  - static_cast<int>(KMER_SIZE ) + 2) ;
-        totalKmers += std::min(kmerAdjustedSeqLen, static_cast<int>( chooseTopKmer + (chooseTopKmerScale * seqLen)));
+    const size_t window = reader.indexIsWindowed() ? reader.getIndexWindowSize() : reader.getSize();
+    for (size_t start = 0; start < reader.getSize(); start += window) {
+        if (reader.indexIsWindowed()) {
+            reader.setIndexWindow(start);
+        }
+        const size_t end = std::min(reader.getSize(), start + window);
+        for (size_t id = start; id < end; id++) {
+            int seqLen = static_cast<int>(reader.getSeqLen(id));
+            int kmerAdjustedSeqLen = std::max(1, seqLen  - static_cast<int>(KMER_SIZE ) + 2) ;
+            totalKmers += std::min(kmerAdjustedSeqLen, static_cast<int>( chooseTopKmer + (chooseTopKmerScale * seqLen)));
+        }
     }
     return totalKmers;
 }
@@ -1412,16 +1429,23 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
 #ifdef OPENMP
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-            for (size_t id = 0; id < seqDbr.getSize(); id++) {
-                char buffer[100];
-                DBKeyType dbKey = seqDbr.getDbKey(id);
-                if (repSequence[dbKey] == false) {
-                    hit_t h;
-                    h.prefScore = 0;
-                    h.diagonal = 0;
-                    h.seqId = dbKey;
-                    int len = QueryMatcher::prefilterHitToBuffer(buffer, h);
-                    dbw.writeData(buffer, len, dbKey, thread_idx);
+            const size_t window = seqDbr.indexIsWindowed() ? seqDbr.getIndexWindowSize() : seqDbr.getSize();
+            for (size_t start = 0; start < seqDbr.getSize(); start += window) {
+                if (seqDbr.indexIsWindowed()) {
+                    seqDbr.setIndexWindow(start);
+                }
+                const size_t end = std::min(seqDbr.getSize(), start + window);
+                for (size_t id = start; id < end; id++) {
+                    char buffer[100];
+                    DBKeyType dbKey = seqDbr.getDbKey(id);
+                    if (repSequence[dbKey] == false) {
+                        hit_t h;
+                        h.prefScore = 0;
+                        h.diagonal = 0;
+                        h.seqId = dbKey;
+                        int len = QueryMatcher::prefilterHitToBuffer(buffer, h);
+                        dbw.writeData(buffer, len, dbKey, thread_idx);
+                    }
                 }
             }
         }
@@ -1496,7 +1520,14 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
 
     DBReader<DBKeyType> seqDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads,
                                   DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
-    seqDbr.open(DBReader<DBKeyType>::NOSORT);
+    if (par.indexWindow > 0) {
+        seqDbr.openWindowedIndex(par.indexWindow);
+    } else {
+        seqDbr.open(DBReader<DBKeyType>::NOSORT);
+    }
+    if (seqDbr.isSortedByOffset()) {
+        seqDbr.setSequentialAdvice();
+    }
     int querySeqType = seqDbr.getDbtype();
 
     setKmerLengthAndAlphabet(par, seqDbr.getAminoAcidDBSize(), querySeqType);

@@ -665,6 +665,7 @@ public:
     bool includeCoverableByDiag;
     bool iter2ScaleAdditive;
     int adjacencyFlank;
+    size_t indexWindow;
     int adjacencyAlphabetSize;
     bool clustHash;
     int linclustVersion;
@@ -1036,6 +1037,7 @@ public:
     PARAMETER(PARAM_INCLUDE_COVERABLE_BY_DIAG)
     PARAMETER(PARAM_ITER2_SCALE_ADDITIVE)
     PARAMETER(PARAM_ADJACENCY_FLANK)
+    PARAMETER(PARAM_INDEX_WINDOW)
     PARAMETER(PARAM_ADJACENCY_ALPH_SIZE)
     PARAMETER(PARAM_USE_PARALLELISM)
     PARAMETER(PARAM_NEED_WRITEBUFFER)

@@ -253,12 +253,7 @@ public:
             Debug(Debug::ERROR) << "getSeqLen: local id (" << id << ") >= db size (" << size << ")\n";
             EXIT(EXIT_FAILURE);
         }
-        size_t length;
-        if (local2id != NULL) {
-            length=index[local2id[id]].length;
-        }else{
-            length=index[id].length;
-        }
+        size_t length = indexEntry(id).length;
 
         if(Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_HMM_PROFILE ) ){
             // -1 null byte
@@ -275,11 +270,7 @@ public:
             Debug(Debug::ERROR) << "getEntryLen: local id (" << id << ") >= db size (" << size << ")\n";
             EXIT(EXIT_FAILURE);
         }
-        if (local2id != NULL) {
-            return index[local2id[id]].length;
-        }else{
-            return index[id].length;
-        }
+        return indexEntry(id).length;
     }
 
     size_t maxCount(char c);
@@ -393,14 +384,43 @@ public:
 
 
     Index* getIndex() {
+        if (indexWindow != NULL) {
+            rejectWindowedIndex("getIndex");
+        }
         return index;
     }
 
     Index* getIndex(size_t id) {
+        if (indexWindow != NULL) {
+            rejectWindowedIndex("getIndex");
+        }
         if (local2id != NULL) {
             return index + local2id[id];
         }
         return index + id;
+    }
+
+    void openWindowedIndex(size_t windowSize);
+
+    void setIndexWindow(size_t start);
+
+    bool indexIsWindowed() const {
+        return indexWindow != NULL;
+    }
+
+    size_t getIndexWindowSize() const {
+        return indexWindowSize;
+    }
+
+    const Index& indexEntry(size_t id) {
+        if (indexWindow != NULL) {
+            const size_t local = id - indexWindowStart;
+            if (id < indexWindowStart || local >= indexWindowCount) {
+                indexWindowOutOfRange(id);
+            }
+            return indexWindow[local];
+        }
+        return index[(local2id != NULL) ? local2id[id] : id];
     }
 
 
@@ -495,6 +515,14 @@ public:
         }
     };
 
+    bool buildIndexSidecar(char *indexData, size_t indexDataSize);
+
+    void discardIndexSidecar();
+
+    void indexWindowOutOfRange(size_t id);
+
+    void rejectWindowedIndex(const char *caller);
+
     void setData(char *data, size_t dataSize);
 
     void setMode(const int mode);
@@ -557,6 +585,13 @@ private:
     ZSTD_DStream ** dstream;
 
     Index * index;
+    Index * indexWindow;
+    size_t indexWindowSize;
+    size_t indexWindowStart;
+    size_t indexWindowCount;
+    int indexWindowFd;
+    char * indexWindowFileName;
+
     size_t lookupSize;
     LookupEntry * lookup;
     size_t sourceSize;
