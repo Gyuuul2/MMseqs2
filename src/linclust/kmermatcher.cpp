@@ -296,7 +296,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPosition<T, Flank, L> * kmer
                         threadKmerBuffer[bufferPos].pos = 0;
                         threadKmerBuffer[bufferPos].seqLen = static_cast<L>(seq.L);
                         if (Flank != 0) {
-                            for (size_t i = 0; i < 6; i++) {
+                            for (int i = 0; i < 2 * Flank; i++) {
                                 threadKmerBuffer[bufferPos].setAdjacentSeq(i, xIndex);
                             }
                         }
