@@ -1220,7 +1220,8 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
     }
 
     adjSubMat = subMat;
-    if (par.adjacencyAlphabetSize > 0
+    if (par.includeAdjacency
+        && par.adjacencyAlphabetSize > 0
         && Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES) == false
         && par.adjacencyAlphabetSize != par.alphabetSize.values.aminoacid()) {
         if (par.adjacencyAlphabetSize == 21) {
@@ -1451,6 +1452,10 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
         }
         dbw.close(false, false);
     }
+    if (adjSubMat != subMat) {
+        delete adjSubMat;
+    }
+    adjSubMat = NULL;
     delete subMat;
     if(hashSeqPair){
         delete [] hashSeqPair;

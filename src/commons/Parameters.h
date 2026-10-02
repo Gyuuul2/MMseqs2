@@ -300,7 +300,7 @@ public:
     static const int SEQUENCE_SPLIT_MODE_GPU = 2;
     static const int SEQUENCE_SPLIT_MODE_LENGTH_DESC = 3;
     static const int CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE = 2;   // count-table iters (symmetric cov-mode)
-    static const int CLUST_LINEAR_DEFAULT_NUM_ADJACENCY = 3;     // adjacency iters (non-symmetric cov-mode)
+    static const int CLUST_LINEAR_DEFAULT_NUM_ADJACENCY = 5;     // adjacency iters (non-symmetric cov-mode)
     static const int CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY = 1;   // adjacency iters (symmetric cov-mode)
     static constexpr float CLUST_LINEAR_DIAG_COV_SCALE = 0.9f;
 

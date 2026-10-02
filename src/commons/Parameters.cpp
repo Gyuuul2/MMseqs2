@@ -3076,7 +3076,7 @@ void Parameters::setDefaults() {
     adjacencyFlank = 3;
     indexWindow = 0;
     linclustIterations = 2;
-    adjacencyAlphabetSize = 0;
+    adjacencyAlphabetSize = 21;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;
     clusterVersion = CLUSTER_VERSION1;

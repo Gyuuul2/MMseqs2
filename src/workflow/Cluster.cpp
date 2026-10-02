@@ -91,10 +91,17 @@ void setClusterAutomagicParameters(Parameters& par) {
     if (par.PARAM_INCLUDE_COUNTTABLE.wasSet == false) {
         if (nonsymetric) {
             par.includeCountTable = false;
+            par.countTableIteration = 0;
         } else {
             par.includeCountTable = true;
         }
         par.PARAM_INCLUDE_COUNTTABLE.wasSet = true;
+    }
+    // createParameterString writes every parameter out, so the inner linclust sees these as given
+    // and skips its own cov-mode defaults; they have to be settled here to reach it
+    if (par.PARAM_INCLUDE_ADJACENCY.wasSet == false && par.PARAM_NUM_ADJACENCY.wasSet == false) {
+        par.adjIteration = nonsymetric ? Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY
+                                       : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
     }
     if (nonsymetric && par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
         Debug(Debug::WARNING) << "Combining cluster mode " << par.clusteringMode
