@@ -43,3 +43,9 @@ NCBI_Bacteria_Orfs/
 build.old/
 .vscode/
 vsc.code-workspace
+test.sh
+MERGE_DESIGN.md
+gpt-sol-review.md
+.claude/agents/prompt-expander.md
+PORTING.md
+PORT_STATUS.md
