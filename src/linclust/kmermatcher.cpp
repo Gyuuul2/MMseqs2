@@ -713,7 +713,6 @@ size_t assignGroup(KmerPosition<T, Flank, L> *hashSeqPair, KmerPosition<T, 0, L>
                                     if (writeSeqPair != NULL) {
                                         writeSeqPair[localWritePos[thread]].kmer = rId;
                                         writeSeqPair[localWritePos[thread]].pos = diagonal;
-                                        writeSeqPair[localWritePos[thread]].seqLen = targetLen;
                                         writeSeqPair[localWritePos[thread]].id = hashSeqPair[i].id;
                                     } else {
                                         hashSeqPair[localWritePos[thread]].kmer = rId;
@@ -1271,8 +1270,7 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
     if (par.includeCountTable) {
         countTable.assign(dbKeySize, 0);
         size_t countTableTotalKmers = static_cast<size_t>(totalKmers * par.countTableScale);
-        // hashSeqPair + writeSeqPair for the count-table fill
-        size_t countTableTotalSizeNeeded = computeMemoryNeededLinearfilter<T, 0, L>(countTableTotalKmers) * 2;
+        size_t countTableTotalSizeNeeded = computeMemoryNeededLinearfilter<T, 0, L>(countTableTotalKmers);
 
         size_t countTableSplits = std::max(static_cast<size_t>(1), static_cast<size_t>(
             std::ceil(static_cast<double>(countTableTotalSizeNeeded) / splitMemoryLimit)
@@ -1282,7 +1280,7 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
             static_cast<size_t>(1024 + 1),
             static_cast<size_t>(
                 std::min(countTableTotalSizeNeeded, splitMemoryLimit) /
-                (sizeof(KmerPosition<T, 0, L>) * 2)
+                sizeof(KmerPosition<T, 0, L>)
             ) + 1
         );
 

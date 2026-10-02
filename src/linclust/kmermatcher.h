@@ -28,9 +28,9 @@ inline bool hasFeature(AssignGroupMask mask, AssignGroupMask feature) {
 }
 
 struct SequencePosition{
-    unsigned short score;
     size_t kmer;
     unsigned int pos;
+    unsigned short score;
     static bool compareByScore(const SequencePosition &first, const SequencePosition &second){
         if(first.score < second.score)
             return true;
