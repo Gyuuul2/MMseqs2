@@ -487,7 +487,7 @@ template <int TYPE, typename T, int Flank, typename L>
 size_t assignGroup(KmerPosition<T, Flank, L> *hashSeqPair, KmerPosition<T, 0, L> *writeSeqPair,
                     bool includeOnlyExtendable, int covMode, float covThr,
                     SequenceWeights *sequenceWeights, float weightThr, int threads,
-                    std::vector<size_t> &threadOffsets, BaseMatrix *subMat,
+                    std::vector<size_t> &threadOffsets,
                     AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable) {
 
     // Current assign group mode based on assignGroupMask
@@ -801,14 +801,14 @@ size_t assignGroup(KmerPosition<T, Flank, L> *hashSeqPair, KmerPosition<T, 0, L>
     return writePos;
 }
 
-template size_t assignGroup<0, short, 0, short>(KmerPosition<short, 0, short> *kmers, KmerPosition<short, 0, short> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
-template size_t assignGroup<0, int, 0, int>(KmerPosition<int, 0, int> *kmers, KmerPosition<int, 0, int> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
-template size_t assignGroup<1, short, 0, short>(KmerPosition<short, 0, short> *kmers, KmerPosition<short, 0, short> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
-template size_t assignGroup<1, int, 0, int>(KmerPosition<int, 0, int> *kmers, KmerPosition<int, 0, int> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
-template size_t assignGroup<0, short, 3, short>(KmerPosition<short, 3, short> *kmers, KmerPosition<short, 0, short> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
-template size_t assignGroup<0, int, 3, int>(KmerPosition<int, 3, int> *kmers, KmerPosition<int, 0, int> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
-template size_t assignGroup<1, short, 3, short>(KmerPosition<short, 3, short> *kmers, KmerPosition<short, 0, short> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
-template size_t assignGroup<1, int, 3, int>(KmerPosition<int, 3, int> *kmers, KmerPosition<int, 0, int> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, BaseMatrix *subMat, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
+template size_t assignGroup<0, short, 0, short>(KmerPosition<short, 0, short> *kmers, KmerPosition<short, 0, short> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
+template size_t assignGroup<0, int, 0, int>(KmerPosition<int, 0, int> *kmers, KmerPosition<int, 0, int> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
+template size_t assignGroup<1, short, 0, short>(KmerPosition<short, 0, short> *kmers, KmerPosition<short, 0, short> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
+template size_t assignGroup<1, int, 0, int>(KmerPosition<int, 0, int> *kmers, KmerPosition<int, 0, int> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
+template size_t assignGroup<0, short, 3, short>(KmerPosition<short, 3, short> *kmers, KmerPosition<short, 0, short> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
+template size_t assignGroup<0, int, 3, int>(KmerPosition<int, 3, int> *kmers, KmerPosition<int, 0, int> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
+template size_t assignGroup<1, short, 3, short>(KmerPosition<short, 3, short> *kmers, KmerPosition<short, 0, short> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
+template size_t assignGroup<1, int, 3, int>(KmerPosition<int, 3, int> *kmers, KmerPosition<int, 0, int> *writeSeqPair, bool includeOnlyExtendable, int covMode, float covThr, SequenceWeights *sequenceWeights, float weightThr, int threads, std::vector<size_t>& threadOffsets, AssignGroupMask assignGroupMask, ComputationPhase phase, unsigned short *countTable);
 
 template <typename T, int Flank, typename L>
 static void runIteration(
@@ -817,7 +817,7 @@ static void runIteration(
     KmerPosition<T, Flank, L> *hashSeqPair,
     KmerPosition<T, 0, L> *writeSeqPair,
     DBReader<DBKeyType> &seqDbr, Parameters &par,
-    BaseMatrix *subMat, unsigned short *countTable,
+    unsigned short *countTable,
     SequenceWeights *sequenceWeights,
     std::vector<size_t> &threadOffsets, Timer &timer) {
 
@@ -827,14 +827,14 @@ static void runIteration(
             hashSeqPair, writeSeqPair,
             par.includeOnlyExtendable, par.covMode, par.covThr,
             sequenceWeights, par.weightThr,
-            par.threads, threadOffsets, subMat,
+            par.threads, threadOffsets,
             mask, ComputationPhase::Main, countTable);
     } else {
         writePos = assignGroup<Parameters::DBTYPE_AMINO_ACIDS, T, Flank, L>(
             hashSeqPair, writeSeqPair,
             par.includeOnlyExtendable, par.covMode, par.covThr,
             sequenceWeights, par.weightThr,
-            par.threads, threadOffsets, subMat,
+            par.threads, threadOffsets,
             mask, ComputationPhase::Main, countTable);
     }
     Debug(Debug::INFO) << "Time for assign: " << timer.lap() << "\n";
@@ -1035,7 +1035,7 @@ KmerPosition<T, Flank, L> *doComputation(
                 hashSeqPair, NULL,
                 par.includeOnlyExtendable, par.covMode, par.covThr,
                 sequenceWeights, par.weightThr,
-                par.threads, threadOffsets, subMat,
+                par.threads, threadOffsets,
                 AssignGroupFeature::Default,
                 ComputationPhase::SetupCountTable, countTable);
         } else {
@@ -1043,7 +1043,7 @@ KmerPosition<T, Flank, L> *doComputation(
                 hashSeqPair, NULL,
                 par.includeOnlyExtendable, par.covMode, par.covThr,
                 sequenceWeights, par.weightThr,
-                par.threads, threadOffsets, subMat,
+                par.threads, threadOffsets,
                 AssignGroupFeature::Default,
                 ComputationPhase::SetupCountTable, countTable);
         }
@@ -1064,7 +1064,7 @@ KmerPosition<T, Flank, L> *doComputation(
     runIteration<T, Flank, L>(
         AssignGroupFeature::Default, iteration, writePos,
         hashEndRange, splitFile, hashSeqPair, writeSeqPair,
-        seqDbr, par, subMat, countTable,
+        seqDbr, par, countTable,
         sequenceWeights, threadOffsets, timer);
 
     if (hasFeature(assignGroupMask, AssignGroupFeature::AdjacentSeq)) {
@@ -1072,7 +1072,7 @@ KmerPosition<T, Flank, L> *doComputation(
             runIteration<T, Flank, L>(
                 AssignGroupFeature::AdjacentSeq, iteration, writePos,
                 hashEndRange, splitFile, hashSeqPair, writeSeqPair,
-                seqDbr, par, subMat, countTable,
+                seqDbr, par, countTable,
                 sequenceWeights, threadOffsets, timer);
         }
     }
@@ -1082,7 +1082,7 @@ KmerPosition<T, Flank, L> *doComputation(
             runIteration<T, Flank, L>(
                 AssignGroupFeature::CountTable, iteration, writePos,
                 hashEndRange, splitFile, hashSeqPair, writeSeqPair,
-                seqDbr, par, subMat, countTable,
+                seqDbr, par, countTable,
                 sequenceWeights, threadOffsets, timer);
         }
     }
