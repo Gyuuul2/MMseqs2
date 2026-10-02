@@ -662,8 +662,6 @@ public:
     float countTableScale;
     bool includeAdjacency;
     int adjIteration;
-    bool includeCoverableByDiag;
-    bool iter2ScaleAdditive;
     int adjacencyFlank;
     size_t indexWindow;
     int linclustIterations;
@@ -1035,8 +1033,6 @@ public:
     PARAMETER(PARAM_NUM_COUNTS)
     PARAMETER(PARAM_INCLUDE_ADJACENCY)
     PARAMETER(PARAM_NUM_ADJACENCY)
-    PARAMETER(PARAM_INCLUDE_COVERABLE_BY_DIAG)
-    PARAMETER(PARAM_ITER2_SCALE_ADDITIVE)
     PARAMETER(PARAM_ADJACENCY_FLANK)
     PARAMETER(PARAM_INDEX_WINDOW)
     PARAMETER(PARAM_LINCLUST_ITERATIONS)

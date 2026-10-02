@@ -1231,7 +1231,7 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
             adjSubMat = new ReducedMatrix(aMat.probMatrix, aMat.subMatrixPseudoCounts, aMat.aa2num, aMat.num2aa, aMat.alphabetSize, par.adjacencyAlphabetSize, 2.0);
         }
     }
-    diagCovScale = (par.includeCoverableByDiag && par.linclustVersion == Parameters::LINCLUST_VERSION2)
+    diagCovScale = (par.linclustVersion == Parameters::LINCLUST_VERSION2)
                    ? Parameters::CLUST_LINEAR_DIAG_COV_SCALE : 0.0f;
 
     size_t memoryLimit=Util::computeMemory(par.splitMemoryLimit);
