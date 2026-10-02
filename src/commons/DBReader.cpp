@@ -28,8 +28,7 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         indexFileName(strdup(indexFileName_)), size(0), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), index(NULL),
-        indexWindow(NULL), indexWindowSize(0), indexMemoryLimit(0), indexWindowStart(0), indexWindowCount(0),
-        indexWindowFd(-1), indexWindowFileName(NULL), id2local(NULL), local2id(NULL),
+        mappedIndexPath(NULL), id2local(NULL), local2id(NULL),
         dataMapped(false), accessType(0), externalData(false), didMlock(false)
 {}
 
@@ -39,8 +38,7 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         threads(threads), dataMode(USE_INDEX), dataFileName(NULL), indexFileName(NULL),
         size(size), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index),
-        indexWindow(NULL), indexWindowSize(0), indexMemoryLimit(0), indexWindowStart(0), indexWindowCount(0),
-        indexWindowFd(-1), indexWindowFileName(NULL), sortedByOffset(true),
+        mappedIndexPath(NULL), sortedByOffset(true),
         id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
 {}
 
@@ -193,10 +191,9 @@ template <typename T> bool DBReader<T>::open(int accessType){
         size_t indexDataSize = indexData.size();
         size = Util::ompCountLines(indexDataChar, indexDataSize, threads);
 
-        if (indexWindowSize > 0 && buildIndexSidecar(indexDataChar, indexDataSize)) {
+        if (mappedIndexPath != NULL && writeAndMapIndex(indexDataChar, indexDataSize)) {
             indexData.close();
         } else {
-            indexWindowSize = 0;
             index = new(std::nothrow) Index[size];
             Util::checkAllocation(index, "Cannot allocate index memory in DBReader");
             incrementMemory(sizeof(Index) * size);
@@ -344,11 +341,9 @@ template <typename T> void DBReader<T>::close(){
         delete [] dstream;
     }
 
-    if (indexWindow != NULL) {
-        discardIndexSidecar();
-    }
-
-    if (externalData == false && index != NULL) {
+    if (indexMap.isValid()) {
+        discardMappedIndex();
+    } else if (externalData == false && index != NULL) {
         delete[] index;
         decrementMemory(size*sizeof(Index));
     }
@@ -646,9 +641,6 @@ template <typename T> void DBReader<T>::sortSourceByFileName(){
 }
 
 template <typename T> size_t DBReader<T>::getId (T dbKey){
-    if (indexWindow != NULL) {
-        rejectWindowedIndex("getId");
-    }
     size_t id = bsearch(index, size, dbKey);
     if (id2local != NULL) {
         return (id < size && index[id].id == dbKey) ? id2local[id] : DB_ENTRY_NOT_FOUND;
@@ -777,44 +769,27 @@ bool DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size
 }
 
 template <typename T>
-void DBReader<T>::openWindowedIndex(size_t memoryLimit) {
-    indexMemoryLimit = memoryLimit;
+void DBReader<T>::openWithMappedIndex(const char *path) {
+    mappedIndexPath = path;
     open(NOSORT);
 }
 
 template <typename T>
-bool DBReader<T>::buildIndexSidecar(char *indexDataChar, size_t indexDataSize) {
+bool DBReader<T>::writeAndMapIndex(char *indexDataChar, size_t indexDataSize) {
     if (size == 0) {
         return false;
     }
-    // the resident index competes with whatever the caller is splitting, so the derived
-    // budget follows both the database and the machine and keeps an absolute ceiling
-    const size_t halfIndex = size / 2 * sizeof(Index);
-    const size_t machineShare = Util::getTotalSystemMemory() / 10;
-    const size_t residentCap = 100ULL * 1024 * 1024 * 1024;
-    const size_t budget = (indexMemoryLimit > 0)
-                              ? indexMemoryLimit
-                              : std::min(halfIndex, std::min(machineShare, residentCap));
-    indexWindowSize = std::max(static_cast<size_t>(1), budget / sizeof(Index));
-    if (indexWindowSize >= size) {
-        return false;
-    }
 
-    static int sidecarCounter = 0;
-    std::string sidecar = std::string(indexFileName) + ".window."
-                        + SSTR(static_cast<size_t>(getpid())) + "."
-                        + SSTR(__sync_fetch_and_add(&sidecarCounter, 1));
-    FILE *out = fopen(sidecar.c_str(), "w");
+    std::string binIndex = std::string(mappedIndexPath);
+    FILE *out = fopen(binIndex.c_str(), "w");
     if (out == NULL) {
-        Debug(Debug::WARNING) << "Cannot create index window file " << sidecar
-                              << ", keeping the whole index in memory instead\n";
-        return false;
+        Debug(Debug::ERROR) << "Cannot create binary index " << binIndex << "\n";
+        EXIT(EXIT_FAILURE);
     }
-    indexWindowFileName = strdup(sidecar.c_str());
 
-    indexWindow = new(std::nothrow) Index[indexWindowSize];
-    Util::checkAllocation(indexWindow, "Cannot allocate index window in DBReader");
-    incrementMemory(sizeof(Index) * indexWindowSize);
+    const size_t stageEntries = 1024 * 1024;
+    Index *stage = new(std::nothrow) Index[stageEntries];
+    Util::checkAllocation(stage, "Cannot allocate index staging buffer in DBReader");
 
     const char *cols[3];
     char *pos = indexDataChar;
@@ -827,7 +802,7 @@ bool DBReader<T>::buildIndexSidecar(char *indexDataChar, size_t indexDataSize) {
     sortedByOffset = true;
 
     for (size_t written = 0; written < size; ) {
-        size_t chunk = std::min(indexWindowSize, size - written);
+        size_t chunk = std::min(stageEntries, size - written);
         for (size_t i = 0; i < chunk; i++) {
             if (pos >= end) {
                 Debug(Debug::ERROR) << "Index file " << indexFileName << " ended after "
@@ -835,34 +810,36 @@ bool DBReader<T>::buildIndexSidecar(char *indexDataChar, size_t indexDataSize) {
                 EXIT(EXIT_FAILURE);
             }
             Util::getWordsOfLine(pos, cols, 3);
-            readIndexId(&indexWindow[i].id, pos, cols);
-            DBKeyType key = indexIdToNum(&indexWindow[i].id);
+            readIndexId(&stage[i].id, pos, cols);
+            DBKeyType key = indexIdToNum(&stage[i].id);
             if ((written + i) > 0 && key < prevKey) {
                 Debug(Debug::WARNING) << "Index " << indexFileName << " is not sorted by key, "
                                       << "keeping the whole index in memory instead\n";
                 fclose(out);
-                discardIndexSidecar();
+                delete[] stage;
+                discardMappedIndex();
                 return false;
             }
             prevKey = key;
             localLastKey = std::max(localLastKey, key);
-            indexWindow[i].offset = Util::fast_atoi<size_t>(cols[1]);
-            indexWindow[i].length = Util::fast_atoi<size_t>(cols[2]);
-            localDataSize += indexWindow[i].length;
-            localMaxSeqLen = std::max(localMaxSeqLen, static_cast<unsigned int>(indexWindow[i].length));
-            sortedByOffset = sortedByOffset && indexWindow[i].offset >= prevOffset;
-            prevOffset = indexWindow[i].offset;
+            stage[i].offset = Util::fast_atoi<size_t>(cols[1]);
+            stage[i].length = Util::fast_atoi<size_t>(cols[2]);
+            localDataSize += stage[i].length;
+            localMaxSeqLen = std::max(localMaxSeqLen, static_cast<unsigned int>(stage[i].length));
+            sortedByOffset = sortedByOffset && stage[i].offset >= prevOffset;
+            prevOffset = stage[i].offset;
             pos = Util::skipLine(pos);
         }
-        if (fwrite(indexWindow, sizeof(Index), chunk, out) != chunk) {
-            Debug(Debug::ERROR) << "Cannot write index window file " << indexWindowFileName
+        if (fwrite(stage, sizeof(Index), chunk, out) != chunk) {
+            Debug(Debug::ERROR) << "Cannot write binary index " << binIndex
                                 << ", the file system is probably full\n";
             EXIT(EXIT_FAILURE);
         }
         written += chunk;
     }
+    delete[] stage;
     if (fclose(out) != 0) {
-        Debug(Debug::ERROR) << "Cannot close index window file " << indexWindowFileName << "\n";
+        Debug(Debug::ERROR) << "Cannot close binary index " << binIndex << "\n";
         EXIT(EXIT_FAILURE);
     }
 
@@ -870,91 +847,27 @@ bool DBReader<T>::buildIndexSidecar(char *indexDataChar, size_t indexDataSize) {
     maxSeqLen = localMaxSeqLen;
     lastKey = localLastKey;
 
-    indexWindowFd = ::open(indexWindowFileName, O_RDONLY);
-    if (indexWindowFd == -1) {
-        Debug(Debug::ERROR) << "Cannot open index window file " << indexWindowFileName << "\n";
+    if (indexMap.open(binIndex, MemoryMapped::WholeFile, MemoryMapped::SequentialScan) == false) {
+        Debug(Debug::ERROR) << "Cannot map binary index " << binIndex << "\n";
         EXIT(EXIT_FAILURE);
     }
-    FileUtil::remove(indexWindowFileName);
-    free(indexWindowFileName);
-    indexWindowFileName = NULL;
-
-    indexWindowStart = SIZE_MAX;
-    setIndexWindow(0);
+    // the mapping keeps the file alive, so nothing is left behind if the process dies
+    FileUtil::remove(binIndex.c_str());
+    index = (Index *) indexMap.getData();
     return true;
 }
 
 template <typename T>
-void DBReader<T>::discardIndexSidecar() {
-    if (indexWindow != NULL) {
-        delete[] indexWindow;
-        decrementMemory(sizeof(Index) * indexWindowSize);
-        indexWindow = NULL;
+void DBReader<T>::discardMappedIndex() {
+    if (indexMap.isValid()) {
+        indexMap.close();
     }
-    if (indexWindowFd != -1) {
-        ::close(indexWindowFd);
-        indexWindowFd = -1;
-    }
-    if (indexWindowFileName != NULL) {
-        FileUtil::remove(indexWindowFileName);
-        free(indexWindowFileName);
-        indexWindowFileName = NULL;
-    }
-    indexWindowSize = 0;
-    indexWindowStart = 0;
-    indexWindowCount = 0;
-}
-
-template <typename T>
-void DBReader<T>::indexWindowOutOfRange(size_t id) {
-    Debug(Debug::ERROR) << "Index window holds entries [" << indexWindowStart << ", "
-                        << (indexWindowStart + indexWindowCount) << ") of " << indexFileName
-                        << " but entry " << id << " was asked for\n";
-    EXIT(EXIT_FAILURE);
-}
-
-template <typename T>
-void DBReader<T>::rejectWindowedIndex(const char *caller) const {
-    Debug(Debug::ERROR) << caller << " needs the whole index resident, but " << indexFileName
-                        << " was opened with a window\n";
-    EXIT(EXIT_FAILURE);
-}
-
-template <typename T>
-void DBReader<T>::setIndexWindow(size_t start) {
-    if (indexWindow == NULL) {
-        Debug(Debug::ERROR) << "setIndexWindow called on a reader without a windowed index\n";
-        EXIT(EXIT_FAILURE);
-    }
-    if (start >= size) {
-        Debug(Debug::ERROR) << "Index window start " << start << " is past the end of "
-                            << indexFileName << " (" << size << " entries)\n";
-        EXIT(EXIT_FAILURE);
-    }
-    if (start == indexWindowStart) {
-        return;
-    }
-    size_t count = std::min(indexWindowSize, size - start);
-    size_t bytes = sizeof(Index) * count;
-    char *dst = (char *) indexWindow;
-    size_t done = 0;
-    while (done < bytes) {
-        ssize_t got = pread(indexWindowFd, dst + done, bytes - done,
-                            (off_t) (sizeof(Index) * start + done));
-        if (got <= 0) {
-            Debug(Debug::ERROR) << "Cannot read index window at entry " << start << " from "
-                                << indexWindowFileName << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        done += (size_t) got;
-    }
-    indexWindowStart = start;
-    indexWindowCount = count;
+    index = NULL;
 }
 
 template<>
-void DBReader<std::string>::openWindowedIndex(size_t) {
-    Debug(Debug::ERROR) << "A windowed index is only supported for numeric database keys\n";
+void DBReader<std::string>::openWithMappedIndex(const char *) {
+    Debug(Debug::ERROR) << "A mapped index is only supported for numeric database keys\n";
     EXIT(EXIT_FAILURE);
 }
 
@@ -1008,9 +921,6 @@ template <typename T> void DBReader<T>::unmapData() {
 }
 
 template <typename T>  size_t DBReader<T>::getDataOffset(T i) {
-    if (indexWindow != NULL) {
-        rejectWindowedIndex("getDataOffset");
-    }
     size_t id = bsearch(index, size, i);
     return index[id].offset;
 }
@@ -1041,7 +951,7 @@ char* DBReader<DBKeyType>::serialize(const DBReader<DBKeyType> &idx) {
     p += sizeof(int);
     memcpy(p, &idx.maxSeqLen, sizeof(unsigned int));
     p += sizeof(unsigned int);
-    memcpy(p, idx.indexEntries(), idx.size * sizeof(DBReader<DBKeyType>::Index));
+    memcpy(p, idx.index, idx.size * sizeof(DBReader<DBKeyType>::Index));
     p += idx.size * sizeof(DBReader<DBKeyType>::Index);
     return data;
 }
@@ -1098,9 +1008,6 @@ size_t DBReader<T>::getOffset(size_t id) {
 
 template<typename T>
 size_t DBReader<T>::findNextOffsetid(size_t id) {
-    if (indexWindow != NULL) {
-        rejectWindowedIndex("findNextOffsetid");
-    }
     size_t idOffset = getOffset(id);
     size_t nextOffset = SIZE_MAX;
     for(size_t i = 0; i < size; i++){
@@ -1347,7 +1254,7 @@ void DBReader<T>::decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize,
         return;
     }
 
-    const Index *entries = indexEntries();
+    const Index *entries = index;
     size_t chunkSize = ceil(static_cast<double>(dataSize) / static_cast<double>(worldSize));
 
     size_t *entriesPerWorker = (size_t*)calloc(worldSize, sizeof(size_t));

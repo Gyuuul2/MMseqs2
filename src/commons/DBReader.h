@@ -6,6 +6,7 @@
 // Manages DB read access.
 //
 #include "MemoryTracker.h"
+#include "MemoryMapped.h"
 #include <cstddef>
 #include <utility>
 #include <vector>
@@ -384,50 +385,22 @@ public:
 
 
     Index* getIndex() {
-        if (indexWindow != NULL) {
-            rejectWindowedIndex("getIndex");
-        }
         return index;
     }
 
-    const Index* indexEntries() const {
-        if (indexWindow != NULL) {
-            rejectWindowedIndex("indexEntries");
-        }
-        return index;
-    }
 
     Index* getIndex(size_t id) {
-        if (indexWindow != NULL) {
-            rejectWindowedIndex("getIndex");
-        }
         if (local2id != NULL) {
             return index + local2id[id];
         }
         return index + id;
     }
 
-    // memoryLimit is a byte budget for the resident index; 0 derives one
-    void openWindowedIndex(size_t memoryLimit);
 
-    void setIndexWindow(size_t start);
 
-    bool indexIsWindowed() const {
-        return indexWindow != NULL;
-    }
 
-    size_t getIndexWindowSize() const {
-        return indexWindowSize;
-    }
 
     const Index& indexEntry(size_t id) {
-        if (indexWindow != NULL) {
-            const size_t local = id - indexWindowStart;
-            if (id < indexWindowStart || local >= indexWindowCount) {
-                indexWindowOutOfRange(id);
-            }
-            return indexWindow[local];
-        }
         return index[(local2id != NULL) ? local2id[id] : id];
     }
 
@@ -523,13 +496,11 @@ public:
         }
     };
 
-    bool buildIndexSidecar(char *indexData, size_t indexDataSize);
+    bool writeAndMapIndex(char *indexData, size_t indexDataSize);
 
-    void discardIndexSidecar();
+    void discardMappedIndex();
 
-    void indexWindowOutOfRange(size_t id);
 
-    void rejectWindowedIndex(const char *caller) const;
 
     void setData(char *data, size_t dataSize);
 
@@ -544,6 +515,8 @@ public:
     }
 
     static int isCompressed(int dbtype);
+
+    void openWithMappedIndex(const char *path);
 
     void setSequentialAdvice();
 
@@ -593,13 +566,8 @@ private:
     ZSTD_DStream ** dstream;
 
     Index * index;
-    Index * indexWindow;
-    size_t indexWindowSize;
-    size_t indexMemoryLimit;
-    size_t indexWindowStart;
-    size_t indexWindowCount;
-    int indexWindowFd;
-    char * indexWindowFileName;
+    MemoryMapped indexMap;
+    const char * mappedIndexPath;
 
     size_t lookupSize;
     LookupEntry * lookup;
