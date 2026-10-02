@@ -547,6 +547,7 @@ size_t assignGroup(KmerPosition<T, Flank, L> *hashSeqPair, KmerPosition<T, 0, L>
                     // find member with lowest adj score → swap to prevHashStart
                     size_t bestPos = prevHashStart;
                     int minAdjScore = INT_MAX;
+                    L bestLen = 0;
                     for (size_t i = prevHashStart; i < elementIdx; i++) {
                         if (i > prevHashStart && sequenceWeights != nullptr &&
                             sequenceWeights->getWeightById(hashSeqPair[i].id) > weightThr) {
@@ -566,8 +567,11 @@ size_t assignGroup(KmerPosition<T, Flank, L> *hashSeqPair, KmerPosition<T, 0, L>
                             for (int j = 0; j < 2 * Flank; j++) {
                                 currAdjScore += subMatPos[j][hashSeqPair[i].getAdjacentSeq(j)];
                             }
-                            if (currAdjScore <= minAdjScore) {
+                            const L currLen = hashSeqPair[i].seqLen;
+                            if (currAdjScore < minAdjScore
+                                || (currAdjScore == minAdjScore && currLen > bestLen)) {
                                 minAdjScore = currAdjScore;
+                                bestLen = currLen;
                                 bestPos = i;
                             }
                         }
@@ -581,6 +585,7 @@ size_t assignGroup(KmerPosition<T, Flank, L> *hashSeqPair, KmerPosition<T, 0, L>
                     // find member with highest count → swap to prevHashStart
                     size_t bestPos = prevHashStart;
                     int maxCount = -1;
+                    L bestLen = 0;
                     for (size_t i = prevHashStart + 1; i < elementIdx; i++) {
                         if (sequenceWeights != nullptr &&
                             sequenceWeights->getWeightById(hashSeqPair[i].id) > weightThr) {
@@ -595,9 +600,11 @@ size_t assignGroup(KmerPosition<T, Flank, L> *hashSeqPair, KmerPosition<T, 0, L>
                         const size_t memid = hashSeqPair[i].id;
                         if (memid != repSeqKey) {
                             int cnt = countTable[memid];
-                            if (cnt >= maxCount) {
+                            const L currLen = hashSeqPair[i].seqLen;
+                            if (cnt > maxCount || (cnt == maxCount && currLen > bestLen)) {
                                 if (Flank == 0 || hashSeqPair[i].getAdjacentSeq(0) != UCHAR_MAX) {
                                     maxCount = cnt;
+                                    bestLen = currLen;
                                     bestPos = i;
                                 }
                             }
