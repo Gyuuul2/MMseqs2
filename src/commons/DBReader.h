@@ -407,7 +407,8 @@ public:
         return index + id;
     }
 
-    void openWindowedIndex(size_t windowSize);
+    // memoryLimit is a byte budget for the resident index; 0 derives one
+    void openWindowedIndex(size_t memoryLimit);
 
     void setIndexWindow(size_t start);
 
@@ -594,6 +595,7 @@ private:
     Index * index;
     Index * indexWindow;
     size_t indexWindowSize;
+    size_t indexMemoryLimit;
     size_t indexWindowStart;
     size_t indexWindowCount;
     int indexWindowFd;

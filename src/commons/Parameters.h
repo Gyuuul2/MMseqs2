@@ -663,7 +663,7 @@ public:
     bool includeAdjacency;
     int adjIteration;
     int adjacencyFlank;
-    size_t indexWindow;
+    size_t indexMemoryLimit;      // Maximum memory in bytes the resident index may use
     int linclustIterations;
     int adjacencyAlphabetSize;
     bool clustHash;
@@ -1034,7 +1034,7 @@ public:
     PARAMETER(PARAM_INCLUDE_ADJACENCY)
     PARAMETER(PARAM_NUM_ADJACENCY)
     PARAMETER(PARAM_ADJACENCY_FLANK)
-    PARAMETER(PARAM_INDEX_WINDOW)
+    PARAMETER(PARAM_INDEX_MEMORY_LIMIT)
     PARAMETER(PARAM_LINCLUST_ITERATIONS)
     PARAMETER(PARAM_ADJACENCY_ALPH_SIZE)
     PARAMETER(PARAM_USE_PARALLELISM)

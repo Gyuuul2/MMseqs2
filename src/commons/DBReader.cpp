@@ -28,7 +28,7 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         indexFileName(strdup(indexFileName_)), size(0), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), index(NULL),
-        indexWindow(NULL), indexWindowSize(0), indexWindowStart(0), indexWindowCount(0),
+        indexWindow(NULL), indexWindowSize(0), indexMemoryLimit(0), indexWindowStart(0), indexWindowCount(0),
         indexWindowFd(-1), indexWindowFileName(NULL), id2local(NULL), local2id(NULL),
         dataMapped(false), accessType(0), externalData(false), didMlock(false)
 {}
@@ -39,7 +39,7 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         threads(threads), dataMode(USE_INDEX), dataFileName(NULL), indexFileName(NULL),
         size(size), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), index(index),
-        indexWindow(NULL), indexWindowSize(0), indexWindowStart(0), indexWindowCount(0),
+        indexWindow(NULL), indexWindowSize(0), indexMemoryLimit(0), indexWindowStart(0), indexWindowCount(0),
         indexWindowFd(-1), indexWindowFileName(NULL), sortedByOffset(true),
         id2local(NULL), local2id(NULL), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
 {}
@@ -777,12 +777,8 @@ bool DBReader<T>::readIndex(char *data, size_t indexDataSize, Index *index, size
 }
 
 template <typename T>
-void DBReader<T>::openWindowedIndex(size_t windowSize) {
-    if (windowSize == 0) {
-        Debug(Debug::ERROR) << "A windowed index needs a window of at least one entry\n";
-        EXIT(EXIT_FAILURE);
-    }
-    indexWindowSize = windowSize;
+void DBReader<T>::openWindowedIndex(size_t memoryLimit) {
+    indexMemoryLimit = memoryLimit;
     open(NOSORT);
 }
 
@@ -791,6 +787,11 @@ bool DBReader<T>::buildIndexSidecar(char *indexDataChar, size_t indexDataSize) {
     if (size == 0) {
         return false;
     }
+    // half the index, never more than the cap, so the budget scales with the database
+    // instead of with a window the caller has to guess
+    const size_t residentCap = 100ULL * 1024 * 1024 * 1024;
+    const size_t budget = (indexMemoryLimit > 0) ? indexMemoryLimit : std::min(size / 2 * sizeof(Index), residentCap);
+    indexWindowSize = std::max(static_cast<size_t>(1), budget / sizeof(Index));
     if (indexWindowSize >= size) {
         return false;
     }

@@ -174,7 +174,7 @@ Parameters::Parameters():
         PARAM_INCLUDE_ADJACENCY(PARAM_INCLUDE_ADJACENCY_ID, "--include-adjacency", "Include adjacency based center swapping", "Include adjacency based center swapping", typeid(bool), (void *) &includeAdjacency, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJACENCY_FLANK(PARAM_ADJACENCY_FLANK_ID, "--adjacency-flank", "Adjacent residues taken on each side of the k-mer", "Adjacent residues taken on each side of the k-mer, 2 or 3", typeid(int), (void *) &adjacencyFlank, "^[23]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_INDEX_WINDOW(PARAM_INDEX_WINDOW_ID, "--index-window", "Index entries kept in memory", "Index entries kept resident; the rest stay in a binary sidecar on disk (0 keeps the whole index in memory)", typeid(size_t), (void *) &indexWindow, "^[0-9]+$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_INDEX_MEMORY_LIMIT(PARAM_INDEX_MEMORY_LIMIT_ID, "--index-memory-limit", "Index memory limit", "Max memory the resident index may use; the rest spills to a sidecar on disk. E.g. 800B, 5K, 10M, 1G. Default (0) keeps half the index resident, capped at 100G", typeid(ByteParser), (void *) &indexMemoryLimit, "^(0|[1-9]{1}[0-9]*(B|K|M|G|T)?)$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_ITERATIONS(PARAM_LINCLUST_ITERATIONS_ID, "--linclust-iterations", "Linclust iterations", "k-mer matching rounds linclust2 runs: 2 reclusters the first round representatives, 1 stops after the first round", typeid(int), (void *) &linclustIterations, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJACENCY_ALPH_SIZE(PARAM_ADJACENCY_ALPH_SIZE_ID, "--adjacency-alph-size", "Alphabet the adjacent residues are stored in", "Alphabet size the adjacent residues are stored and scored in, 0 keeps --alph-size", typeid(int), (void *) &adjacencyAlphabetSize, "^(0|[2-9]|1[0-9]|2[01])$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -1199,7 +1199,7 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_INCLUDE_ADJACENCY);
     kmermatcher.push_back(&PARAM_NUM_ADJACENCY);
     kmermatcher.push_back(&PARAM_ADJACENCY_FLANK);
-    kmermatcher.push_back(&PARAM_INDEX_WINDOW);
+    kmermatcher.push_back(&PARAM_INDEX_MEMORY_LIMIT);
     kmermatcher.push_back(&PARAM_ADJACENCY_ALPH_SIZE);
     kmermatcher.push_back(&PARAM_USE_PARALLELISM);
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
@@ -3066,7 +3066,7 @@ void Parameters::setDefaults() {
     includeAdjacency = true;
     adjIteration = 3;
     adjacencyFlank = 3;
-    indexWindow = 0;
+    indexMemoryLimit = 0;
     linclustIterations = 2;
     adjacencyAlphabetSize = 21;
     clustHash = false;

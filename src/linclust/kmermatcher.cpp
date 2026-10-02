@@ -1518,11 +1518,7 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
 
     DBReader<DBKeyType> seqDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads,
                                   DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
-    if (par.indexWindow > 0) {
-        seqDbr.openWindowedIndex(par.indexWindow);
-    } else {
-        seqDbr.open(DBReader<DBKeyType>::NOSORT);
-    }
+    seqDbr.openWindowedIndex(par.indexMemoryLimit);
     if (seqDbr.isSortedByOffset()) {
         seqDbr.setSequentialAdvice();
     }
