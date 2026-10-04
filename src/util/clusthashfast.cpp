@@ -360,9 +360,19 @@ struct HashPartitions {
         }
     }
 
-    // a shift of 64 is undefined, so the single partition case must not reach the shift at all
+    // Util::hash is a base-31 polynomial over a three letter alphabet, so a sequence shorter than
+    // about fourteen residues leaves the top bits zero and every such sequence would land in one
+    // partition. Mixing first spreads them; it is a pure function of the hash, so a run still
+    // cannot straddle a partition.
     unsigned int partitionOf(size_t hash) const {
-        return (bits == 0) ? 0u : static_cast<unsigned int>(hash >> (64 - bits));
+        if (bits == 0) {
+            return 0u;
+        }
+        size_t mixed = hash + 0x9e3779b97f4a7c15ULL;
+        mixed = (mixed ^ (mixed >> 30)) * 0xbf58476d1ce4e5b9ULL;
+        mixed = (mixed ^ (mixed >> 27)) * 0x94d049bb133111ebULL;
+        mixed ^= mixed >> 31;
+        return static_cast<unsigned int>(mixed >> (sizeof(size_t) * 8 - bits));
     }
 };
 
