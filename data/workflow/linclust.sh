@@ -27,16 +27,7 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
                 || fail "clusthashfast died"
         fi
 
-        awk '{print $1}' "${TMP_PATH}/input_clusthash_clust.index" \
-            > "${TMP_PATH}/order_clusthash_redundancy"
-
-        if notExists "${TMP_PATH}/input_clusthash_redundancy.dbtype"; then
-            # shellcheck disable=SC2086
-            "$MMSEQS" createsubdb "${TMP_PATH}/order_clusthash_redundancy" "$SOURCE" \
-                "${TMP_PATH}/input_clusthash_redundancy" ${VERBOSITY} --subdb-mode 1 \
-                || fail "createsubdb (clusthash representatives) died"
-        fi
-        INPUT="${TMP_PATH}/input_clusthash_redundancy"
+        INPUT="${TMP_PATH}/input_clusthash_clust_redundancy"
     fi
 
     # 1. k-mer matching
@@ -271,10 +262,11 @@ if [ -n "$REMOVE_TMP" ]; then
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust" ${VERBOSITY}
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_redundancy" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust_redundancy" ${VERBOSITY}
+            # shellcheck disable=SC2086
+            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust_redundancy_h" ${VERBOSITY}
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/clu_merged" ${VERBOSITY}
-            rm -f "${TMP_PATH}/order_clusthash_redundancy"
         fi
         rm -f "${TMP_PATH}/linclust.sh"
     elif [ "$LINCLUST_MODULE" = "linclust1" ]; then
