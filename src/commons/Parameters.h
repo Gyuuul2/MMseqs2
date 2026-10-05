@@ -1249,6 +1249,7 @@ public:
     std::vector<MMseqsParameter*> pickconsensusrepfast;
     std::vector<MMseqsParameter*> gff2db;
     std::vector<MMseqsParameter*> clusthash;
+    std::vector<MMseqsParameter*> clusthashfast;
     std::vector<MMseqsParameter*> kmermatcher;
     std::vector<MMseqsParameter*> kmersearch;
     std::vector<MMseqsParameter*> countkmer;
