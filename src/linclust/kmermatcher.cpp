@@ -877,7 +877,8 @@ static void runIteration(
         size_t qSplitSize = seqDbr.getSize() / par.threads;
         threadQueryOffsets[0] = 0;
 
-        const bool isNucleotide = Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES);
+        const bool isNucleotide =
+            Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES);
         if (par.needWriteBuffer) {
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
             for (int thread = 1; thread < par.threads; thread++) {
@@ -1651,7 +1652,9 @@ void writeKmerMatcherResult(DBWriter & dbw,
             int bestReverMask = reverMask;
             while(lastTargetId != targetId
                   && kmerPos+kmerOffset < threadOffsets[thread+1]
-                  && (TYPE == Parameters::DBTYPE_NUCLEOTIDES ? BIT_CLEAR(hashSeqPair[kmerPos+kmerOffset].kmer, 63) : hashSeqPair[kmerPos+kmerOffset].kmer) == repSeqId
+                  && (TYPE == Parameters::DBTYPE_NUCLEOTIDES
+                          ? BIT_CLEAR(hashSeqPair[kmerPos+kmerOffset].kmer, 63)
+                          : hashSeqPair[kmerPos+kmerOffset].kmer) == repSeqId
                   && hashSeqPair[kmerPos+kmerOffset].id == targetId){
                 if(prevDiagonal == hashSeqPair[kmerPos+kmerOffset].pos){
                     diagonalCnt++;
@@ -2023,7 +2026,10 @@ void writeKmersToDisk(std::string tmpFile, KmerPosition<seqLenType, includeAdjac
                         reverse += (isReverse == true);
                     }
                     kmerPos++;
-                } while (repSeqId == (TYPE == Parameters::DBTYPE_NUCLEOTIDES ? BIT_CLEAR(hashSeqPair[kmerPos].kmer, 63) : hashSeqPair[kmerPos].kmer) &&
+                } while (diagonalScore < UCHAR_MAX &&
+                        repSeqId == (TYPE == Parameters::DBTYPE_NUCLEOTIDES
+                                         ? BIT_CLEAR(hashSeqPair[kmerPos].kmer, 63)
+                                         : hashSeqPair[kmerPos].kmer) &&
                         targetId == hashSeqPair[kmerPos].id &&
                         hashSeqPair[kmerPos].pos == diagonal &&
                         kmerPos < endIdx && hashSeqPair[kmerPos].kmer != SIZE_T_MAX);
