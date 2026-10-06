@@ -1942,7 +1942,7 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
                             Debug(Debug::ERROR) << "Error in argument " << par[parIdx]->name << "\n";
                             EXIT(EXIT_FAILURE);
                         }else{
-                            *((size_t *) par[parIdx]->value) = atoi(pargv[argIdx+1]);
+                            *((size_t *) par[parIdx]->value) = strtoull(pargv[argIdx+1], NULL, 10);
                             par[parIdx]->wasSet = true;
                         }
                         argIdx++;
