@@ -132,7 +132,8 @@ int mergeSequentialByJointIndex(
         const char * outLookupFile,
         std::vector<unsigned int>* sourceLookup,
         size_t totalEntries,
-        size_t shuffleSplits
+        size_t shuffleSplits,
+        size_t idOffset
 ) {
     struct JointEntry {
         unsigned int fileIdx;
@@ -256,7 +257,7 @@ int mergeSequentialByJointIndex(
             writeHeaderBuf.push_back(ch);
         } while (ch != '\0');
 
-        lookupEntry.id = i;
+        lookupEntry.id = idOffset + i;
         lookupEntry.entryName = Util::parseFastaHeader(writeHeaderBuf.data());
         if (lookupEntry.entryName.empty()) {
             Debug(Debug::WARNING) << "Cannot extract identifier from entry " << lookupEntry.id  << "\n";
@@ -278,7 +279,7 @@ int mergeSequentialByJointIndex(
         entry.offset = mergedOffset;
         // + 2 is needed for newline and null character
         entry.length = qe.length + 2;
-        entry.id = i;
+        entry.id = idOffset + i;
         DBWriter::writeIndexEntryToFile(idxOut, indexBuffer, entry);
         entry.length = writeHeaderBuf.size();
         entry.offset = mergedOffsetHeader;
@@ -737,7 +738,8 @@ int createdb(int argc, const char **argv, const Command& command) {
                                     hdrWriter.getDataFileNames(), hdrWriter.getIndexFileNames(),
                                     seqWriter.getDataFileName(), seqWriter.getIndexFileName(),
                                     hdrWriter.getDataFileName(), hdrWriter.getIndexFileName(),
-                                    lookupFile.c_str(), sourceLookup, entries_num, shuffleSplits);
+                                    lookupFile.c_str(), sourceLookup, entries_num, shuffleSplits,
+                                    par.identifierOffset);
         Debug(Debug::INFO) << "Merge all files " << timer.lap() << "\n";
         hdrWriter.clearMemory();
         seqWriter.clearMemory();
@@ -746,8 +748,8 @@ int createdb(int argc, const char **argv, const Command& command) {
         hdrWriter.close(true, false);
         seqWriter.close(true, false);
         if (par.shuffleDatabase == true) {
-            DBWriter::createRenumberedDB(dataFile, indexFile, "", "", DBReader<DBKeyType>::LINEAR_ACCCESS);
-            DBWriter::createRenumberedDB(hdrDataFile, hdrIndexFile, "", "", DBReader<DBKeyType>::LINEAR_ACCCESS);
+            DBWriter::createRenumberedDB(dataFile, indexFile, "", "", DBReader<DBKeyType>::LINEAR_ACCCESS, par.identifierOffset);
+            DBWriter::createRenumberedDB(hdrDataFile, hdrIndexFile, "", "", DBReader<DBKeyType>::LINEAR_ACCCESS, par.identifierOffset);
         }
         if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT) {
             if (filenames.size() == 1) {
@@ -778,7 +780,7 @@ int createdb(int argc, const char **argv, const Command& command) {
                     splitCounter = 0;
                 }
                 char *header = readerHeader.getData(id, 0);
-                entry.id = id;
+                entry.id = readerHeader.getDbKey(id);
                 entry.entryName = Util::parseFastaHeader(header);
                 if (entry.entryName.empty()) {
                     Debug(Debug::WARNING) << "Cannot extract identifier from entry " << entries_num << "\n";
