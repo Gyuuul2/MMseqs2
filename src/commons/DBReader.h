@@ -15,6 +15,7 @@
 #include "Parameters.h"
 #include "FileUtil.h"
 #include "Debug.h"
+#include "BatchReader.h"
 
 #define ZSTD_STATIC_LINKING_ONLY // ZSTD_findDecompressedSize
 #include <zstd.h>
@@ -243,6 +244,13 @@ public:
         size_t length;
         if (local2id != NULL) {
             length=index[local2id[id]].length;
+        }else if (index2dbfile != NULL) {
+            if (headerOffsetsFileNames.empty() == false) {
+                const size_t headerOffsetsPos = findLoadedHeaderOffsetsPos(id);
+                length=loadedBuffer.headerOffsets[headerOffsetsPos + 1] - loadedBuffer.headerOffsets[headerOffsetsPos];
+            } else {
+                length=index[findIdRange(id)].length;
+            }
         }else{
             length=index[id].length;
         }
@@ -264,6 +272,12 @@ public:
         }
         if (local2id != NULL) {
             return index[local2id[id]].length;
+        }else if (index2dbfile != NULL) {
+            if (headerOffsetsFileNames.empty() == false) {
+                const size_t headerOffsetsPos = findLoadedHeaderOffsetsPos(id);
+                return loadedBuffer.headerOffsets[headerOffsetsPos + 1] - loadedBuffer.headerOffsets[headerOffsetsPos];
+            }
+            return index[findIdRange(id)].length;
         }else{
             return index[id].length;
         }
@@ -272,6 +286,12 @@ public:
     size_t maxCount(char c);
 
     void remapData();
+
+    // --createdb-mode 3: reads keys [keyBegin, keyEnd) into memory for getData
+    void loadData(size_t keyBegin, size_t keyEnd);
+    void prefetchData(size_t keyBegin, size_t keyEnd);
+    size_t getBufferSizeToLoad(size_t keyBegin, size_t keyEnd);
+    char *getDataFromLoadedBuffer(size_t key);
 
     size_t bsearch(const Index * index, size_t size, T value);
 
@@ -316,6 +336,10 @@ public:
     static const unsigned int USE_LOOKUP_REV = 16;
     static const unsigned int USE_SOURCE     = 32;
     static const unsigned int USE_SOURCE_REV = 64;
+    static const unsigned int USE_LINFINITY  = 128;
+    static const unsigned int USE_BUFFERED_IO = 256;
+    static const unsigned int USE_DIRECT_IO   = 512;
+    static const unsigned int USE_IO_URING    = 1024;
 
 
     // compressed
@@ -380,7 +404,19 @@ public:
 
 
     Index* getIndex() {
+        if (headerOffsetsFileNames.empty() == false) {
+            Debug(Debug::ERROR) << "Call of getIndex is not allowed for the headers of a --createdb-mode 3 database " << dataFileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
         return index;
+    }
+
+    size_t getIndexSize() const {
+        return indexSize;
+    }
+
+    unsigned int getIndexFile(size_t row) const {
+        return index2dbfile[row];
     }
 
     Index* getIndex(size_t id) {
@@ -501,8 +537,15 @@ public:
     void releaseDataPages();
     void decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize, size_t *startEntry, size_t *numEntries);
 
+    // --createdb-mode 3: data file f holds the keys [offsets[f], offsets[f + 1]), the data files follow in key order
+    std::vector<size_t> getFileKeyOffsets(size_t fileCount);
+    size_t findIdRange(size_t id);
+
 private:
     void checkClosed() const;
+    size_t findLoadedHeaderOffsetsPos(size_t id);
+    size_t planReadRequests(size_t keyBegin, size_t keyEnd, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &headerOffsets, std::vector<size_t> &keys, std::vector<BatchReader::ReadRequest> &compressedReadRequests);
+    void decompressLoadedBuffer();
 
     int threads;
 
@@ -540,6 +583,7 @@ private:
     size_t * compressedBufferSizes;
     ZSTD_DStream ** dstream;
 
+    size_t indexSize;
     Index * index;
     size_t lookupSize;
     LookupEntry * lookup;
@@ -551,6 +595,30 @@ private:
     // 64-bit under MMSEQS_INT64_IDS, so this stays 4 bytes/entry in the default build.
     DBLocalId * id2local;
     DBLocalId * local2id;
+
+    // --createdb-mode 3: row i holds keys index[i].id .. index[i + 1].id - 1 of one length, from index[i].offset in <db>.<index2dbfile[i]>
+    unsigned int * index2dbfile;
+    // headers: <db>_h.index.<file> holds uint64 name starts in <db>_h.<file> and its size; their fds follow the data fds
+    std::vector<std::string> headerOffsetsFileNames;
+    // cluster database of a node: <clu>.index.<node> holds uint64 (key, offset) per entry, then (DB_KEY_INVALID, data size); it is read like the header offsets
+    bool clusterIndex;
+    // zstd seekable headers: compressed start of each frame of <db>_h.<file> and its end, frames of frameSizes[file] decompressed bytes
+    std::vector<std::vector<size_t> > frameOffsets;
+    std::vector<size_t> frameSizes;
+    std::vector<int> dataFds;
+    BatchReader * batchReader;
+    struct BufferInfo {
+        char *buffer;
+        size_t allocatedBytes;
+        size_t keyBegin;
+        size_t keyEnd;
+        std::vector<BatchReader::ReadRequest> readRequests;
+        std::vector<size_t> headerOffsets;
+        std::vector<size_t> keys;
+        std::vector<BatchReader::ReadRequest> compressedReadRequests;
+    };
+    BufferInfo loadedBuffer, prefetchBuffer;
+    bool prepareBufferToLoad(BufferInfo &bufferToLoadInto, size_t keyBegin, size_t keyEnd);
 
     bool dataMapped;
     int accessType;
