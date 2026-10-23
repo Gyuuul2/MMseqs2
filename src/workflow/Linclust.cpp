@@ -117,7 +117,7 @@ int linclust(int argc, const char **argv, const Command& command) {
     }
 
     if (includeCountTableSet == false) {
-        if (nonSymetric) {
+        if (nonSymetric || par.diagonalMode == Parameters::DIAGONAL_MODE_UNGAPPED) {
             par.includeCountTable = false;
             par.countTableIteration = 0;
         } else {
@@ -143,7 +143,12 @@ int linclust(int argc, const char **argv, const Command& command) {
         Debug(Debug::ERROR) << "Cannot use ungapped alignment mode with profile databases.\n";
         EXIT(EXIT_FAILURE);
     }
-    
+
+    if (DBReader<DBKeyType>::getExtendedDbtype(dbType) & Parameters::DBTYPE_EXTENDED_LINFINITY) {
+        Debug(Debug::ERROR) << "--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases are clustered with lin8clust.\n";
+        EXIT(EXIT_FAILURE);
+    }
+
     if (par.linclustVersion == 2
         && Parameters::isEqualDbtype(dbType, Parameters::DBTYPE_AMINO_ACIDS) == false) {
         Debug(Debug::ERROR) << "linclust version 2 clusters amino acid databases only. "
