@@ -171,9 +171,10 @@ Parameters::Parameters():
         PARAM_NUM_COUNTS(PARAM_NUM_COUNTS_ID, "--num-count-table", "Number of count table based center swapping", "Number of count table based center swapping", typeid(int), (void *) &countTableIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_INCLUDE_ADJACENCY(PARAM_INCLUDE_ADJACENCY_ID, "--include-adjacency", "Include adjacency based center swapping", "Include adjacency based center swapping", typeid(bool), (void *) &includeAdjacency, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_ADJACENCY_FLANK(PARAM_ADJACENCY_FLANK_ID, "--adjacency-flank", "Adjacent residues taken on each side of the k-mer", "Adjacent residues taken on each side of the k-mer, 2 or 3", typeid(int), (void *) &adjacencyFlank, "^[23]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_ITERATIONS(PARAM_LINCLUST_ITERATIONS_ID, "--linclust-iterations", "Linclust iterations", "k-mer matching rounds linclust2 runs: 2 reclusters the first round representatives, 1 stops after the first round", typeid(int), (void *) &linclustIterations, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJACENCY_ALPH_SIZE(PARAM_ADJACENCY_ALPH_SIZE_ID, "--adjacency-alph-size", "Alphabet the adjacent residues are stored in", "Alphabet size the adjacent residues are stored and scored in, 0 keeps --alph-size", typeid(int), (void *) &adjacencyAlphabetSize, "^(0|[2-9]|1[0-9]|2[01])$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: take the alignment diagonal from the k-mer match\n1: find the best diagonal by an ungapped scan in align2clust", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_KMER_POS_FILTER(PARAM_KMER_POS_FILTER_ID, "--kmer-pos-filter", "K-mer position filter", "Drop k-mer matches whose diagonal cannot reach the coverage", typeid(bool), (void *) &kmerPosFilter, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -181,6 +182,7 @@ Parameters::Parameters():
         PARAM_CLUSTER_VERSION(PARAM_CLUSTER_VERSION_ID, "--cluster-version", "Cluster version", "Cluster version: 1: Cluster1, 2: Cluster2", typeid(int), (void *) &clusterVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         // workflow
         PARAM_RUNNER(PARAM_RUNNER_ID, "--mpi-runner", "MPI runner", "Use MPI on compute cluster with this MPI command (e.g. \"mpirun -np 42\")", typeid(std::string), (void *) &runner, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_NODE_RUNNER(PARAM_NODE_RUNNER_ID, "--node-runner", "Node runner", "Command that starts one process per node for the multi-node steps of --createdb-mode 3 (e.g. \"srun --kill-on-bad-exit=1 -N 4 --ntasks-per-node=1 -c 64\")", typeid(std::string), (void *) &nodeRunner, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_REUSELATEST(PARAM_REUSELATEST_ID, "--force-reuse", "Force restart with latest tmp", "Reuse tmp filse in tmp/latest folder ignoring parameters and version changes", typeid(bool), (void *) &reuseLatest, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         // search workflow
         PARAM_NUM_ITERATIONS(PARAM_NUM_ITERATIONS_ID, "--num-iterations", "Search iterations", "Number of iterative profile search iterations", typeid(int), (void *) &numIterations, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_PROFILE),
@@ -480,6 +482,7 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_FILTER_CLUDB_FILE);
     align2clust.push_back(&PARAM_FILTER_SEQDB_FILE);
     align2clust.push_back(&PARAM_INCLUDE_ALIGN_FILES);
+    align2clust.push_back(&PARAM_DIAGONAL_MODE);
 
     // prefilter
     prefilter.push_back(&PARAM_SUB_MAT);
@@ -942,6 +945,7 @@ Parameters::Parameters():
 
     // result2flat
     result2flat.push_back(&PARAM_USE_HEADER);
+    result2flat.push_back(&PARAM_THREADS);
     result2flat.push_back(&PARAM_V);
 
     // result2repseq
@@ -1132,8 +1136,9 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_NUM_COUNTS);
     kmermatcher.push_back(&PARAM_INCLUDE_ADJACENCY);
     kmermatcher.push_back(&PARAM_NUM_ADJACENCY);
-    kmermatcher.push_back(&PARAM_ADJACENCY_FLANK);
     kmermatcher.push_back(&PARAM_ADJACENCY_ALPH_SIZE);
+    kmermatcher.push_back(&PARAM_DIAGONAL_MODE);
+    kmermatcher.push_back(&PARAM_KMER_POS_FILTER);
     kmermatcher.push_back(&PARAM_USE_PARALLELISM);
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
     kmermatcher.push_back(&PARAM_LINCLUST_VERSION);
@@ -1545,6 +1550,18 @@ Parameters::Parameters():
 
     // easylinclustworkflow
     easylinclustworkflow = combineList(linclustworkflow, createdb);
+
+    // lin8clust workflow
+    lin8clustworkflow = removeParameter(linclustworkflow, PARAM_RUNNER);
+    lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_LINCLUST_ITERATIONS);
+    lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_DIAGONAL_MODE);
+    lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_LINCLUST_VERSION);
+    lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_KMER_POS_FILTER);
+    lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_INCLUDE_COUNTTABLE);
+    lin8clustworkflow.push_back(&PARAM_NODE_RUNNER);
+
+    // easylin8clustworkflow
+    easylin8clustworkflow = combineList(lin8clustworkflow, createdb);
 
     // clustering workflow
     clusterworkflow = combineList(prefilter, align);
@@ -2632,6 +2649,7 @@ void Parameters::setDefaults() {
     } else {
         runner = "";
     }
+    nodeRunner = "";
     reuseLatest = false;
     // Clustering workflow
     removeTmpFiles = false;
@@ -2828,9 +2846,10 @@ void Parameters::setDefaults() {
     countTableScale = 0.1;
     includeAdjacency = true;
     adjIteration = 3;
-    adjacencyFlank = 3;
     linclustIterations = 2;
     adjacencyAlphabetSize = 21;
+    diagonalMode = DIAGONAL_MODE_KMER;
+    kmerPosFilter = true;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;
     clusterVersion = CLUSTER_VERSION1;

@@ -18,6 +18,7 @@
 #include "FileUtil.h"
 #include "itoa.h"
 #include "BatchReader.h"
+#include "zstd/contrib/seekable_format/zstd_seekable.h"
 
 #ifdef OPENMP
 #include <omp.h>
@@ -114,7 +115,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
         }
         dbtype = FileUtil::parseDbType(dbtypeName.c_str());
         isLinfinity = getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_LINFINITY;
-        clusterIndex = isLinfinity && Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_CLUSTER_RES);
+        clusterIndex = isLinfinity && (Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_CLUSTER_RES) || Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_PREFILTER_RES));
         if (isLinfinity && (dataMode & USE_LINFINITY) == 0) {
             Debug(Debug::ERROR) << "Database " << dataFileName << " was created with --createdb-mode 3, which this command does not support\n";
             EXIT(EXIT_FAILURE);
@@ -269,14 +270,14 @@ template <typename T> bool DBReader<T>::open(int accessType){
             Util::checkAllocation(index2dbfile, "Cannot allocate index memory in DBReader");
             incrementMemory(indexSize * sizeof(unsigned int));
 
-            const char *cols[5];
+            const char *cols[6];
             fileBytes.assign(dataFileNames.size() + (isHeader ? indexSize : 0), 0);
             size = 0;
             dataSize = 0;
             maxSeqLen = 0;
             sortedByOffset = false;
             for (size_t i = 0; i < indexSize; i++) {
-                Util::getWordsOfLine(indexDataChar, cols, 5);
+                const size_t columns = Util::getWordsOfLine(indexDataChar, cols, 6);
                 readIndexId(&index[i].id, indexDataChar, cols);
                 index[i].offset = isHeader ? 0 : Util::fast_atoi<size_t>(cols[1]);
                 index[i].length = isHeader ? 0 : Util::fast_atoi<size_t>(cols[2]);
@@ -301,6 +302,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
                 if (dataMode & USE_DATA) {
                     fileBytes[index2dbfile[i]] += count * index[i].length;
                 }
+                rangeRepresentativeCounts.push_back((columns > 5) ? Util::fast_atoi<size_t>(cols[5]) : count);
                 size += count;
                 dataSize += count * index[i].length;
                 maxSeqLen = std::max(maxSeqLen, index[i].length);
@@ -341,7 +343,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
             }
             dataFds.push_back(fd);
         }
-        batchReader = new BatchReader(threads, dataFds[0], dataMode & USE_IO_URING);
+        batchReader = new BatchReader(threads, dataFds[0]);
         if (isCompressed(dbtype) == COMPRESSED) {
             frameOffsets.resize(dataFileNames.size());
             frameSizes.resize(dataFileNames.size());
@@ -500,6 +502,7 @@ template <typename T> void DBReader<T>::close(){
     }
     dataFds.clear();
     headerOffsetsFileNames.clear();
+    rangeRepresentativeCounts.clear();
     for (size_t fileIdx = 0; fileIdx < frameOffsets.size(); fileIdx++) {
         decrementMemory(frameOffsets[fileIdx].size() * sizeof(size_t));
     }
@@ -896,6 +899,65 @@ template <typename T> size_t DBReader<T>::findIdRange(size_t id) {
     return (range < indexSize && index[range].id == key) ? range : range - 1;
 }
 
+template <typename T> size_t DBReader<T>::findEntryByCell(size_t column, size_t value) {
+    if (clusterIndex == false || (column == 1 && value > dataSize)) {
+        Debug(Debug::ERROR) << ((column == 0) ? "Key " : "Offset ") << value << " is not in the --createdb-mode 3 cluster or prefilter database " << dataFileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    // the first of the (key, offset) cells of the entries and the end cell whose cell[column] is not smaller
+    const int fd = dataFds[dataFileNames.size()];
+    // the index may be open with O_DIRECT, so a cell is taken from its whole page read into a page aligned buffer
+    const size_t pageSize = Util::getPageSize();
+    char *page = NULL;
+    if (posix_memalign(reinterpret_cast<void **>(&page), pageSize, pageSize) != 0) {
+        Debug(Debug::ERROR) << "Cannot allocate " << pageSize << " bytes to read " << indexFileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    size_t pageOffset = SIZE_MAX;
+    size_t entry = 0;
+    for (size_t cells = size + 1; cells > 0;) {
+        const size_t half = cells / 2;
+        uint64_t cell[2];
+        const size_t cellOffset = (entry + half) * sizeof(cell);
+        if (cellOffset / pageSize * pageSize != pageOffset) {
+            pageOffset = cellOffset / pageSize * pageSize;
+            ssize_t count;
+            do {
+                count = pread(fd, page, pageSize, pageOffset);
+            } while (count < 0 && errno == EINTR);
+            if (count < static_cast<ssize_t>(cellOffset + sizeof(cell) - pageOffset)) {
+                Debug(Debug::ERROR) << "Cannot read " << indexFileName << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+        memcpy(cell, page + cellOffset - pageOffset, sizeof(cell));
+        if (cell[column] < value) {
+            entry += half + 1;
+            cells -= half + 1;
+        } else {
+            cells = half;
+        }
+    }
+    free(page);
+    return entry;
+}
+
+template <typename T> size_t DBReader<T>::getNamesSize(size_t fileIdx) {
+    if (clusterIndex || fileIdx >= headerOffsetsFileNames.size()) {
+        Debug(Debug::ERROR) << "Call of getNamesSize is only allowed for the data files of the headers of a --createdb-mode 3 database " << dataFileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    // the last header offset of a data file is the size of its names
+    const std::string &headerOffsetsFile = headerOffsetsFileNames[fileIdx];
+    uint64_t namesSize = 0;
+    FILE *headerOffsets = FileUtil::openFileOrDie(headerOffsetsFile.c_str(), "r", true);
+    if (fseek(headerOffsets, -static_cast<long>(sizeof(uint64_t)), SEEK_END) != 0 || fread(&namesSize, sizeof(uint64_t), 1, headerOffsets) != 1 || fclose(headerOffsets) != 0) {
+        Debug(Debug::ERROR) << "Cannot read " << headerOffsetsFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return namesSize;
+}
+
 template <typename T> size_t DBReader<T>::findLoadedHeaderOffsetsPos(size_t id) {
     if (id < loadedBuffer.keyBegin || id >= loadedBuffer.keyEnd || loadedBuffer.headerOffsets.empty()) {
         Debug(Debug::ERROR) << "getData: local id (" << id << ") was not read by loadData from " << dataFileName << "\n";
@@ -905,13 +967,14 @@ template <typename T> size_t DBReader<T>::findLoadedHeaderOffsetsPos(size_t id) 
     return id - loadedBuffer.keyBegin + findIdRange(id) - findIdRange(loadedBuffer.keyBegin);
 }
 
-template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size_t keyEnd, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &headerOffsets, std::vector<size_t> &keys, std::vector<BatchReader::ReadRequest> &compressedReadRequests) {
+template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size_t keyEnd, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &headerOffsets, std::vector<size_t> &keys, std::vector<BatchReader::ReadRequest> &compressedReadRequests, std::vector<size_t> &requestFirstKeys) {
     // headers: without read requests plan reading the offsets, with the read offsets plan reading the names
     std::vector<BatchReader::ReadRequest> offsetsRequests;
     offsetsRequests.swap(readRequests);
     headerOffsets.clear();
     keys.clear();
     compressedReadRequests.clear();
+    requestFirstKeys.clear();
     const size_t offsetBytes = (clusterIndex ? 2 : 1) * sizeof(uint64_t);
     if (batchReader == NULL || keyBegin >= keyEnd) {
         return 0;
@@ -954,7 +1017,7 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
         const bool isCompressedNames = frameOffsets.empty() == false && offsetsRequests.empty() == false;
         if (isCompressedNames && frameOffsets[fileIdx].empty()) {
             FILE *file = FileUtil::openFileOrDie(dataFileNames[fileIdx].c_str(), "r", true);
-            const size_t footerSize = 9;
+            const size_t footerSize = ZSTD_seekTableFooterSize;
             char footer[footerSize];
             bool isValid = fseek(file, -static_cast<long>(footerSize), SEEK_END) == 0 && fread(footer, sizeof(char), footerSize, file) == footerSize;
             const size_t fileSize = isValid ? ftell(file) : 0;
@@ -965,7 +1028,7 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
                 memcpy(&magic, footer + 5, sizeof(uint32_t));
             }
             const size_t seekTableSize = 8 + static_cast<size_t>(frameCount) * 8 + footerSize;
-            isValid = isValid && magic == 0x8F92EAB1 && (footer[4] & 0xFC) == 0 && seekTableSize <= fileSize;
+            isValid = isValid && magic == ZSTD_SEEKABLE_MAGICNUMBER && (footer[4] & 0xFC) == 0 && seekTableSize <= fileSize;
             std::vector<uint32_t> seekTable(isValid ? 2 + 2 * static_cast<size_t>(frameCount) : 0);
             isValid = isValid && fseek(file, fileSize - seekTableSize, SEEK_SET) == 0 && fread(seekTable.data(), sizeof(uint32_t), seekTable.size(), file) == seekTable.size()
                       && seekTable[0] == (ZSTD_MAGIC_SKIPPABLE_START | 0xE) && seekTable[1] == seekTableSize - 8;
@@ -991,6 +1054,7 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
             const char *fileName = (fileIdx < dataFileNames.size()) ? dataFileNames[fileIdx].c_str() : headerOffsetsFileNames[fileIdx - dataFileNames.size()].c_str();
             BatchReader::ReadRequest request = { fd, fileName, NULL, begin / alignment * alignment, 0, 0 };
             readRequests.push_back(request);
+            requestFirstKeys.push_back(std::max(keyBegin, firstId));
         }
         BatchReader::ReadRequest &request = readRequests.back();
         request.minBytesToRead = end - request.fileOffset;
@@ -1027,17 +1091,60 @@ template <typename T> size_t DBReader<T>::getBufferSizeToLoad(size_t keyBegin, s
     std::vector<size_t> headerOffsets;
     std::vector<size_t> keys;
     std::vector<BatchReader::ReadRequest> compressedReadRequests;
-    return planReadRequests(keyBegin, keyEnd, readRequests, headerOffsets, keys, compressedReadRequests);
+    std::vector<size_t> requestFirstKeys;
+    return planReadRequests(keyBegin, keyEnd, readRequests, headerOffsets, keys, compressedReadRequests, requestFirstKeys);
 }
 
-template <typename T> bool DBReader<T>::prepareBufferToLoad(BufferInfo &bufferToLoadInto, size_t keyBegin, size_t keyEnd) {
+template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys) {
+    readRequests.clear();
+    requestFirstKeys.clear();
+    if (headerOffsetsFileNames.empty() == false || clusterIndex) {
+        Debug(Debug::ERROR) << "Call of loadData with keys is not allowed for the headers or clusters of a --createdb-mode 3 database " << dataFileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (batchReader == NULL) {
+        return 0;
+    }
+    const size_t pageSize = Util::getPageSize();
+    size_t bytes = 0;
+    for (size_t i = 0; i < keys.size(); i++) {
+        if (keys[i] >= size || (i > 0 && keys[i] <= keys[i - 1])) {
+            Debug(Debug::ERROR) << "loadData: keys are not ascending keys of " << dataFileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        const size_t range = findIdRange(keys[i]);
+        const size_t begin = index[range].offset + (keys[i] - indexIdToNum(&index[range].id)) * index[range].length;
+        const size_t end = begin + index[range].length;
+        const int fd = dataFds[index2dbfile[range]];
+        if (readRequests.empty() || readRequests.back().fileToRead != fd || begin < readRequests.back().fileOffset
+            || begin > readRequests.back().fileOffset + readRequests.back().minBytesToRead + READ_MERGE_GAP) {
+            if (readRequests.empty() == false) {
+                bytes += readRequests.back().bytesToRead;
+            }
+            const BatchReader::ReadRequest request = { fd, dataFileNames[index2dbfile[range]].c_str(), NULL, begin / pageSize * pageSize, 0, 0 };
+            readRequests.push_back(request);
+            requestFirstKeys.push_back(keys[i]);
+        }
+        BatchReader::ReadRequest &request = readRequests.back();
+        request.minBytesToRead = std::max(request.minBytesToRead, end - request.fileOffset);
+        request.bytesToRead = (request.fileOffset + request.minBytesToRead + pageSize - 1) / pageSize * pageSize - request.fileOffset;
+    }
+    if (readRequests.empty() == false) {
+        bytes += readRequests.back().bytesToRead;
+    }
+    return bytes;
+}
+
+template <typename T> bool DBReader<T>::prepareBufferToLoad(BufferInfo &bufferToLoadInto, size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys) {
     std::vector<BatchReader::ReadRequest> readRequests;
     std::vector<size_t> headerOffsets;
-    std::vector<size_t> keys;
+    std::vector<size_t> clusterKeys;
     std::vector<BatchReader::ReadRequest> compressedReadRequests;
+    std::vector<size_t> requestFirstKeys;
     // headers: the first pass reads the offsets of the names into the buffer
     for (bool readOffsets = headerOffsetsFileNames.empty() == false; ; readOffsets = false) {
-        const size_t bytes = planReadRequests(keyBegin, keyEnd, readRequests, headerOffsets, keys, compressedReadRequests);
+        const size_t bytes = (keys != NULL) ? planKeyReadRequests(*keys, readRequests, requestFirstKeys)
+                                            : planReadRequests(keyBegin, keyEnd, readRequests, headerOffsets, clusterKeys, compressedReadRequests, requestFirstKeys);
         if (readRequests.empty()) {
             return false;
         }
@@ -1069,26 +1176,56 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(BufferInfo &bufferTo
     }
     bufferToLoadInto.readRequests.swap(readRequests);
     bufferToLoadInto.headerOffsets.swap(headerOffsets);
-    bufferToLoadInto.keys.swap(keys);
+    bufferToLoadInto.keys.swap(clusterKeys);
     bufferToLoadInto.compressedReadRequests.swap(compressedReadRequests);
+    bufferToLoadInto.requestFirstKeys.swap(requestFirstKeys);
+    if (keys != NULL) {
+        bufferToLoadInto.requestedKeys = *keys;
+    } else {
+        bufferToLoadInto.requestedKeys.clear();
+    }
+    bufferToLoadInto.isPrefetched = false;
     bufferToLoadInto.keyBegin = keyBegin;
     bufferToLoadInto.keyEnd = keyEnd;
     return true;
 }
 
-template <typename T> void DBReader<T>::loadData(size_t keyBegin, size_t keyEnd) {
-    if (prefetchBuffer.readRequests.empty() == false && prefetchBuffer.keyBegin == keyBegin && prefetchBuffer.keyEnd == keyEnd) {
+template <typename T> void DBReader<T>::loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys) {
+    if (prefetchBuffer.isPrefetched && prefetchBuffer.keyBegin == keyBegin && prefetchBuffer.keyEnd == keyEnd
+        && (keys != NULL ? prefetchBuffer.requestedKeys == *keys : prefetchBuffer.requestedKeys.empty())) {
         batchReader->waitAsyncRead();
+        prefetchBuffer.isPrefetched = false;
         std::swap(loadedBuffer, prefetchBuffer);
-    } else if (prepareBufferToLoad(loadedBuffer, keyBegin, keyEnd)) {
+    } else if (prepareBufferToLoad(loadedBuffer, keyBegin, keyEnd, keys)) {
         batchReader->readSync(frameOffsets.empty() ? loadedBuffer.readRequests : loadedBuffer.compressedReadRequests);
     }
     decompressLoadedBuffer();
 }
 
-template <typename T> void DBReader<T>::prefetchData(size_t keyBegin, size_t keyEnd) {
-    if (prepareBufferToLoad(prefetchBuffer, keyBegin, keyEnd)) {
+template <typename T> void DBReader<T>::prefetchKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys) {
+    if (prepareBufferToLoad(prefetchBuffer, keyBegin, keyEnd, keys)) {
         batchReader->readAsync(frameOffsets.empty() ? prefetchBuffer.readRequests : prefetchBuffer.compressedReadRequests);
+        prefetchBuffer.isPrefetched = true;
+    }
+}
+
+template <typename T> void DBReader<T>::loadData(size_t keyBegin, size_t keyEnd) {
+    loadKeys(keyBegin, keyEnd, NULL);
+}
+
+template <typename T> void DBReader<T>::prefetchData(size_t keyBegin, size_t keyEnd) {
+    prefetchKeys(keyBegin, keyEnd, NULL);
+}
+
+template <typename T> void DBReader<T>::loadData(const std::vector<DBKeyType> &keys) {
+    if (keys.empty() == false) {
+        loadKeys(keys.front(), keys.back() + 1, &keys);
+    }
+}
+
+template <typename T> void DBReader<T>::prefetchData(const std::vector<DBKeyType> &keys) {
+    if (keys.empty() == false) {
+        prefetchKeys(keys.front(), keys.back() + 1, &keys);
     }
 }
 
@@ -1096,7 +1233,7 @@ template <typename T> void DBReader<T>::decompressLoadedBuffer() {
     if (frameOffsets.empty() || loadedBuffer.readRequests.empty()) {
         return;
     }
-    // header read requests are one per <db>.nodeinfo row
+    // header read requests are one per <db>.nodeinfo range
     const size_t firstRange = findIdRange(loadedBuffer.keyBegin);
     std::vector<std::pair<size_t, size_t> > requestFrames;
     for (size_t i = 0; i < loadedBuffer.readRequests.size(); i++) {
@@ -1142,8 +1279,9 @@ template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key) {
             length = loadedBuffer.headerOffsets[headerOffsetsPos + 1] - fileOffset;
         }
         const int fd = dataFds[index2dbfile[range]];
-        for (size_t i = 0; i < loadedBuffer.readRequests.size(); i++) {
-            const BatchReader::ReadRequest &request = loadedBuffer.readRequests[i];
+        const size_t requestEnd = std::upper_bound(loadedBuffer.requestFirstKeys.begin(), loadedBuffer.requestFirstKeys.end(), key) - loadedBuffer.requestFirstKeys.begin();
+        if (requestEnd > 0) {
+            const BatchReader::ReadRequest &request = loadedBuffer.readRequests[requestEnd - 1];
             if (request.fileToRead == fd && fileOffset >= request.fileOffset && fileOffset + length <= request.fileOffset + request.minBytesToRead) {
                 return request.destination + (fileOffset - request.fileOffset);
             }
@@ -1498,6 +1636,9 @@ void DBReader<T>::moveDb(const std::string &srcDbName, const std::string &dstDbN
     if (FileUtil::fileExists((srcDbName + ".nodeinfo").c_str())) {
         FileUtil::move((srcDbName + ".nodeinfo").c_str(), (dstDbName + ".nodeinfo").c_str());
     }
+    if (FileUtil::fileExists((srcDbName + ".partitions").c_str())) {
+        FileUtil::move((srcDbName + ".partitions").c_str(), (dstDbName + ".partitions").c_str());
+    }
 }
 
 template<typename T>
@@ -1528,6 +1669,10 @@ void DBReader<T>::removeDb(const std::string &databaseName){
     std::string lookupFile = databaseName + ".lookup";
     if (FileUtil::fileExists(lookupFile.c_str())) {
         FileUtil::remove(lookupFile.c_str());
+    }
+    std::string partitionsFile = databaseName + ".partitions";
+    if (FileUtil::fileExists(partitionsFile.c_str())) {
+        FileUtil::remove(partitionsFile.c_str());
     }
     std::string nodeInfoFile = databaseName + ".nodeinfo";
     if (FileUtil::fileExists(nodeInfoFile.c_str())) {
@@ -1613,19 +1758,43 @@ void DBReader<T>::copyDb(const std::string &databaseName, const std::string &out
 
 template<typename T>
 std::vector<size_t> DBReader<T>::getFileKeyOffsets(size_t fileCount) {
-    // the files hold ascending keys, so the last row is in the last file
+    // the files hold ascending keys, so the last range is in the last file
     const size_t databaseFiles = (indexSize == 0) ? 0 : index2dbfile[indexSize - 1] + 1;
     if (databaseFiles != fileCount) {
         Debug(Debug::ERROR) << "Database " << dataFileName << " has " << databaseFiles << " data files, but runs on " << fileCount << " nodes\n";
         EXIT(EXIT_FAILURE);
     }
     std::vector<size_t> offsets(fileCount + 1, 0);
-    for (size_t row = 0; row < indexSize; row++) {
-        offsets[index2dbfile[row] + 1] = (row + 1 < indexSize) ? indexIdToNum(&index[row + 1].id) : size;
+    for (size_t range = 0; range < indexSize; range++) {
+        offsets[index2dbfile[range] + 1] = (range + 1 < indexSize) ? indexIdToNum(&index[range + 1].id) : size;
     }
     for (size_t file = 0; file < fileCount; file++) {
         offsets[file + 1] = std::max(offsets[file + 1], offsets[file]);
     }
+    return offsets;
+}
+
+template<typename T>
+std::vector<size_t> DBReader<T>::getSplitKeyOffsets(size_t keyBegin, size_t keyEnd, size_t splitBytes, size_t keyBytes) {
+    if (headerOffsetsFileNames.empty() == false) {
+        Debug(Debug::ERROR) << "Call of getSplitKeyOffsets is not allowed for the headers or clusters of a --createdb-mode 3 database " << dataFileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    std::vector<size_t> offsets(1, keyBegin);
+    size_t splitFill = 0;
+    for (size_t key = keyBegin; key < keyEnd;) {
+        const size_t range = findIdRange(key);
+        const size_t rangeEnd = std::min(keyEnd, (range + 1 < indexSize) ? indexIdToNum(&index[range + 1].id) : size);
+        const size_t rangeKeyBytes = index[range].length + keyBytes;
+        if (splitFill > 0 && splitFill + rangeKeyBytes > splitBytes) {
+            offsets.push_back(key);
+            splitFill = 0;
+        }
+        const size_t keys = std::min(rangeEnd - key, std::max<size_t>(1, (splitBytes - splitFill) / rangeKeyBytes));
+        key += keys;
+        splitFill += keys * rangeKeyBytes;
+    }
+    offsets.push_back(keyEnd);
     return offsets;
 }
 
@@ -1656,16 +1825,16 @@ void DBReader<T>::decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize,
         size_t sumCharsAssigned = 0;
         *startEntry = 0;
         *numEntries = 0;
-        for (size_t row = 0; row < indexSize; row++) {
-            const size_t rowEntries = ((row + 1 < indexSize) ? indexIdToNum(&index[row + 1].id) : dbEntries) - indexIdToNum(&index[row].id);
-            if (row > 0 && index[row].length != index[row - 1].length && sumCharsAssigned >= (currentRank + 1) * chunkSize) {
+        for (size_t range = 0; range < indexSize; range++) {
+            const size_t rangeEntries = ((range + 1 < indexSize) ? indexIdToNum(&index[range + 1].id) : dbEntries) - indexIdToNum(&index[range].id);
+            if (range > 0 && index[range].length != index[range - 1].length && sumCharsAssigned >= (currentRank + 1) * chunkSize) {
                 currentRank++;
             }
-            sumCharsAssigned += rowEntries * index[row].length;
+            sumCharsAssigned += rangeEntries * index[range].length;
             if (currentRank < worldRank) {
-                *startEntry += rowEntries;
+                *startEntry += rangeEntries;
             } else if (currentRank == worldRank) {
-                *numEntries += rowEntries;
+                *numEntries += rangeEntries;
             }
         }
         return;
