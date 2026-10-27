@@ -8,6 +8,7 @@
 #include <vector>
 
 class DBWriter;
+template <typename T> class DBReader;
 
 // a member of a cluster with its representative, the record of most exchanges between nodes
 struct ClusterPair {
@@ -130,6 +131,8 @@ public:
     static void readKeyBits(int fd, const std::string &fileName, size_t fileOffset, size_t fileFirstKey, size_t from, size_t to, size_t firstKey, uint64_t *bits);
     // the representative bits of keys [firstKey, firstKey + keyCount) from the files <db>.bits.<node>, each {firstKey, keyCount} then its bits
     static uint64_t *readRepresentativeBits(const std::string &db, const std::vector<size_t> &nodeKeyOffsets, size_t firstKey, size_t keyCount);
+    // writes the representative bits of this node as <db>.bits.<node> and its ranges with their representative counts as <db>.index.<node>, gathered by the master
+    static void writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount);
     // --createdb-mode 3 cluster databases: <clu>.index.<node> holds uint64 (key, offset) per entry in key order, then (DB_KEY_INVALID, data size)
     static void writeClusterIndexEntry(FILE *file, const std::string &fileName, DBKeyType key, size_t offset);
     // closes writer of <db>.<node> of a --createdb-mode 3 result and removes its text index; ends and closes indexFile, the cluster database index

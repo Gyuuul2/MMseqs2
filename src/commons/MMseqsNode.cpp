@@ -545,6 +545,35 @@ uint64_t *MMseqsNode::readRepresentativeBits(const std::string &db, const std::v
     return bits;
 }
 
+void MMseqsNode::writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount) {
+    // the bits are on disk before the index part that tells the master this node is done
+    const std::string bitsFile = db + ".bits." + SSTR(rank);
+    FILE *file = FileUtil::openAndDelete(bitsFile.c_str(), "w");
+    const uint64_t header[2] = { firstKey, keyCount };
+    const size_t words = (keyCount + 63) / 64;
+    if (fwrite(header, sizeof(uint64_t), 2, file) != 2 || fwrite(bits, sizeof(uint64_t), words, file) != words
+        || fflush(file) != 0 || fsync(fileno(file)) != 0 || fclose(file) != 0) {
+        Debug(Debug::ERROR) << "Cannot write " << bitsFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    // the ranges of this node in the sequence index, with the number of its representatives as a sixth column
+    const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
+    std::string representativeIndex;
+    for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {
+        if (seqDbr.getIndexFile(range) != rank) {
+            continue;
+        }
+        const size_t rangeEndKey = (range + 1 < seqDbr.getIndexSize()) ? index[range + 1].id : seqDbr.getSize();
+        const size_t rangeRepresentatives = Util::countSetBits(bits, index[range].id - firstKey, rangeEndKey - firstKey);
+        representativeIndex += SSTR(index[range].id) + "\t" + SSTR(index[range].offset) + "\t" + SSTR(index[range].length) + "\t"
+                             + SSTR(rangeEndKey - index[range].id) + "\t" + SSTR(rank) + "\t" + SSTR(rangeRepresentatives) + "\n";
+    }
+    publishRunFile(db + ".index." + SSTR(rank), representativeIndex);
+    if (isMaster()) {
+        publishFile(db + ".index", gatherRunFiles(db + ".index."));
+    }
+}
+
 void MMseqsNode::writeClusterIndexEntry(FILE *file, const std::string &fileName, DBKeyType key, size_t offset) {
     const uint64_t cell[2] = { static_cast<uint64_t>(key), static_cast<uint64_t>(offset) };
     if (fwrite(cell, sizeof(uint64_t), 2, file) != 2) {

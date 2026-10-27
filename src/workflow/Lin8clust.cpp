@@ -15,7 +15,6 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     Parameters& par = Parameters::getInstance();
     setLinclustWorkflowDefaults(&par);
     par.clustHash = true;
-    par.linclustIterations = 1;
     par.diagonalMode = Parameters::DIAGONAL_MODE_UNGAPPED;
     par.clusteringMode = Parameters::GREEDY;
     par.PARAM_ADD_BACKTRACE.addCategory(MMseqsParameter::COMMAND_EXPERT);
@@ -60,6 +59,13 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     cmd.addVariable("ALIGN2CLUST_PAR", par.createParameterString(par.align2clust).c_str());
     cmd.addVariable("MERGECLU_PAR", par.createParameterString(par.mergeclusters).c_str());
     cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
+    cmd.addVariable("LINCLUST_ITERATIONS", SSTR(par.linclustIterations).c_str());
+    // the second iteration matches the representatives with spaced k-mers, a tenth as many per sequence (see linclust)
+    if (par.linclustIterations > 1) {
+        par.spacedKmer = true;
+        par.kmersPerSequenceScale = 0.1;
+        cmd.addVariable("KMERMATCHER_PAR2", par.createParameterString(par.kmermatcher).c_str());
+    }
 
     // # 0. clust hash
     par.seqIdThr = std::max(0.9f, par.seqIdThr);
