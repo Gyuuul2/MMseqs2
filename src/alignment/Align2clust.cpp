@@ -302,30 +302,29 @@ static bool canBeCoveredOnDiagonals(const Parameters &par, int queryLength, int 
     return minDiag <= maxDiag;
 }
 
-// whether every other --filter-cludb-file member of the cluster of targetKey meets the clustering criteria against the query, from startDiagonal
+// the keys of the other members of the cluster of targetKey in --filter-cludb-file
+static void getClusterMembers(DBReader<DBKeyType> *cluDbr, DBKeyType targetKey, unsigned int threadIdx, std::vector<DBKeyType> &memberKeys) {
+    memberKeys.clear();
+    char buffer[1024];
+    for (char *cluData = cluDbr->getData(cluDbr->getId(targetKey), threadIdx); *cluData != '\0'; cluData = Util::skipLine(cluData)) {
+        Util::parseKey(cluData, buffer);
+        const DBKeyType key = Util::fast_atoi<DBKeyType>(buffer);
+        if (key != targetKey) {
+            memberKeys.push_back(key);
+        }
+    }
+}
+
+// whether every --filter-cludb-file member of the cluster of the target, memberKeys, meets the clustering criteria against the query, from startDiagonal
 static bool alignClusterMembers(const Parameters &par, BlockAligner &blockAligner, Matcher &matcher, bool &matcherInitialized, Sequence &query, Sequence &element,
-                                DBReader<DBKeyType> *cluDbr, DBReader<DBKeyType> *cluSeqDbr, DBKeyType targetKey, short startDiagonal, unsigned int swMode,
+                                const std::vector<DBKeyType> &memberKeys, DBReader<DBKeyType> *cluSeqDbr, short startDiagonal, unsigned int swMode,
                                 unsigned int threadIdx, std::string *pendingMemberAln, char *alnLineBuffer) {
     const char *querySequence = query.getSeqData();
-    const size_t cluId = cluDbr->getId(targetKey);
-    char *cluData = cluDbr->getData(cluId, threadIdx);
-    const size_t cluDataSize = cluDbr->getEntryLen(cluId);
-    size_t numClu = Util::countLines(cluData, cluDataSize);
-    char buffer[1024];
     if (pendingMemberAln != NULL) {
         pendingMemberAln->clear();
     }
-    if (numClu <= 1) { // singleton
-        return true;
-    }
-    while (*cluData != '\0') {
-        Util::parseKey(cluData, buffer);
-
-        const DBKeyType elementKey = Util::fast_atoi<DBKeyType>(buffer);
-        if (elementKey == targetKey) {
-            cluData = Util::skipLine(cluData);
-            continue;
-        }
+    for (size_t i = 0; i < memberKeys.size(); i++) {
+        const DBKeyType elementKey = memberKeys[i];
         const size_t elementId = cluSeqDbr->getId(elementKey);
         char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
         size_t elementLength = cluSeqDbr->getSeqLen(elementId);
@@ -382,14 +381,13 @@ static bool alignClusterMembers(const Parameters &par, BlockAligner &blockAligne
                 elementUngappedAlignment.tStart, elementUngappedAlignment.tEnd, elementLength, elementBacktrace);
             appendAlignmentResult(*pendingMemberAln, alnLineBuffer, elementResult, par.addBacktrace);
         }
-        cluData = Util::skipLine(cluData);
     }
     return true;
 }
 
 // whether the target meets the clustering criteria against the query of blockAligner, with its --filter-cludb-file members if cluDbr is given
 static bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockAlignerInitialized, Matcher *matcher, bool &matcherInitialized,
-                        Sequence &query, Sequence &target, Sequence *element, DBReader<DBKeyType> *cluDbr, DBReader<DBKeyType> *cluSeqDbr,
+                        Sequence &query, Sequence &target, Sequence *element, DBReader<DBKeyType> *cluDbr, DBReader<DBKeyType> *cluSeqDbr, std::vector<DBKeyType> *memberKeys,
                         float scorePerColThreshold, unsigned int swMode, unsigned short diagonal, unsigned int threadIdx,
                         const ClusterAssignment *assignedCluster, size_t targetId,
                         std::string *alnResultBuffer, std::string *pendingMemberAln, char *alnLineBuffer) {
@@ -435,9 +433,12 @@ static bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool 
         if (isAssigned()) {
             return false;
         }
-        if (cluDbr != NULL && alignClusterMembers(par, blockAligner, *matcher, matcherInitialized, query, *element, cluDbr, cluSeqDbr,
-                                                  target.getDbKey(), diagonal, swMode, threadIdx, pendingMemberAln, alnLineBuffer) == false) {
-            return false;
+        if (cluDbr != NULL) {
+            getClusterMembers(cluDbr, target.getDbKey(), threadIdx, *memberKeys);
+            if (alignClusterMembers(par, blockAligner, *matcher, matcherInitialized, query, *element, *memberKeys, cluSeqDbr,
+                                    diagonal, swMode, threadIdx, pendingMemberAln, alnLineBuffer) == false) {
+                return false;
+            }
         }
         if (alnResultBuffer != NULL) {
             std::string backtrace = par.addBacktrace ? std::string(ungappedAlignment.alnLen, 'M') : std::string();
@@ -517,9 +518,12 @@ static bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool 
     if (isAssigned()) {
         return false;
     }
-    if (cluDbr != NULL && alignClusterMembers(par, blockAligner, *matcher, matcherInitialized, query, *element, cluDbr, cluSeqDbr,
-                                              target.getDbKey(), 0, swMode, threadIdx, pendingMemberAln, alnLineBuffer) == false) {
-        return false;
+    if (cluDbr != NULL) {
+        getClusterMembers(cluDbr, target.getDbKey(), threadIdx, *memberKeys);
+        if (alignClusterMembers(par, blockAligner, *matcher, matcherInitialized, query, *element, *memberKeys, cluSeqDbr,
+                                0, swMode, threadIdx, pendingMemberAln, alnLineBuffer) == false) {
+            return false;
+        }
     }
     if (alnResultBuffer != NULL) {
         appendAlignmentResult(*alnResultBuffer, alnLineBuffer, result, par.addBacktrace);
@@ -669,7 +673,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
  
     DBReader<DBKeyType> *cluDbr = nullptr;
     DBReader<DBKeyType> *cluSeqDbr = nullptr;
-    if (par.filterCluDBFile.empty()== false && par.filterSeqDBFile.empty()== false) {
+    if (par.filterCluDBFile.empty() == false) {
         std::string cluIndex = par.filterCluDBFile + ".index";
         cluDbr = new DBReader<DBKeyType>(
             par.filterCluDBFile.c_str(), cluIndex.c_str(), par.threads, 
@@ -684,11 +688,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         );
             
         cluSeqDbr->open(DBReader<DBKeyType>::LINEAR_ACCCESS);
-    } else if (par.filterCluDBFile.empty() != par.filterSeqDBFile.empty()) {
-        Debug(Debug::ERROR)<< "Error: Both filterCluDBFile and filterSeqDBFile should be provided together.\n";
-        EXIT(EXIT_FAILURE);
     }
-
 
     const size_t dbSize = seqDbr->getSize();
 
@@ -822,6 +822,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                  -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
         std::vector<std::pair<size_t, unsigned short>> targetsWithDiagonal;
         targetsWithDiagonal.reserve(1000);
+        std::vector<DBKeyType> memberKeys;
         std::string querySeqBuffer;
         querySeqBuffer.reserve(db_maxseqlen + 1);
 
@@ -916,7 +917,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 char *targetSequence = seqDbr->getData(targetId, threadIdx);
                 size_t targetLength = seqDbr->getSeqLen(targetId);
                 target.mapSequence(targetId, targetKey, targetSequence, targetLength);
-                if (alignTarget(par, blockAligner, blockAlignerInitialized, &matcher, matcherInitialized, query, target, &element, cluDbr, cluSeqDbr,
+                if (alignTarget(par, blockAligner, blockAlignerInitialized, &matcher, matcherInitialized, query, target, &element, cluDbr, cluSeqDbr, &memberKeys,
                                 scoring.scorePerColThreshold, swMode, targetsWithDiagonal[targetIdx].second, threadIdx, assignedCluster, targetId,
                                 includeAlignFiles ? &alnResultBuffer : NULL, includeAlignFiles ? &pendingMemberAln : NULL, alnLineBuffer.data())) {
                     clusterResult.memberIds.push_back(targetId);
@@ -1040,6 +1041,19 @@ struct SendRecord {
 // --createdb-mode 3: the targets are cut into blocks of blockKeys keys, which the nodes take in turn
 static size_t getAlignNode(size_t blockKeys, size_t targetKey) {
     return (targetKey / blockKeys) % MMseqsNode::count;
+}
+
+// --filter-cludb-file: the block keys of this run for compareByAlignNodeAndRep, as sendClusterPairs takes a plain function
+static size_t memberBlockKeys = 0;
+static bool compareByAlignNodeAndRep(const ClusterPair &first, const ClusterPair &second) {
+    const size_t firstNode = getAlignNode(memberBlockKeys, first.repKey);
+    const size_t secondNode = getAlignNode(memberBlockKeys, second.repKey);
+    return (firstNode != secondNode) ? firstNode < secondNode : ClusterPair::compareByRep(first, second);
+}
+
+// --createdb-mode 3: the order of the records of a chunk, by rep then first target
+static bool compareOrderByRep(const std::pair<ClusterPair, size_t> &first, const std::pair<ClusterPair, size_t> &second) {
+    return ClusterPair::compareByRep(first.first, second.first);
 }
 
 // the pref partitions of all nodes are cut by cost into this many groups per node, which go to the nodes in turn
@@ -1330,10 +1344,14 @@ static const size_t BLOCKS_PER_DISTANCE = 8;
 
 // --createdb-mode 3: a node aligns its records in rep order, a window at a time, logs accepted pairs, and skips reps and targets the master assigned
 static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t blockKeys, size_t lagKeys, size_t memoryLimit, size_t representativeResidues,
-                            const std::string &repTargetsIndex, const std::string &repTargets, const std::string &accepted, const std::string &assignedChanges) {
+                            const std::string &repTargetsIndex, const std::string &repTargets, const std::string &accepted, const std::string &assignedChanges,
+                            const std::vector<ClusterPair> &members, DBReader<DBKeyType> *memberDbr) {
     const size_t dbSize = seqDbr.getSize();
     const size_t maxSeqLen = seqDbr.getMaxSeqLen();
+    // a scattered entry is read as at least one page
+    const size_t pageSize = Util::getPageSize();
     AlignmentScoring scoring(par, representativeResidues);
+    const unsigned int swMode = Alignment::initSWMode(par.alignmentMode, par.covThr, par.seqIdThr);
     std::vector<MMseqsNode::ExchangeBlock> repBlocks;
     std::vector<FILE *> repFiles;
     MMseqsNode::openExchange(repTargetsIndex, repTargets, repBlocks, repFiles);
@@ -1460,13 +1478,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                         Debug(Debug::ERROR) << "Cannot read " << repTargets << ": a record has a target of another node\n";
                         EXIT(EXIT_FAILURE);
                     }
-                    targetBytes += seqDbr.getEntryLen(targetKey);
+                    targetBytes += std::max(seqDbr.getEntryLen(targetKey), pageSize);
                 }
                 chunkTargetBytes[chunk][i] = targetBytes;
             }
-            SORT_PARALLEL(chunkOrder[chunk].begin(), chunkOrder[chunk].end(), [](const std::pair<ClusterPair, size_t> &first, const std::pair<ClusterPair, size_t> &second) {
-                return ClusterPair::compareByRep(first.first, second.first);
-            });
+            SORT_PARALLEL(chunkOrder[chunk].begin(), chunkOrder[chunk].end(), compareOrderByRep);
             chunkPos[chunk] = 0;
         }
         windowChunk = chunk;
@@ -1575,6 +1591,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     std::vector<DBKeyType> nextKeys;
     std::vector<unsigned char> batchDone;
     std::vector<std::vector<ClusterPair> > batchPairs;
+    std::vector<ClusterPair> windowPairs;
+    std::vector<size_t> memberStarts;
+    std::vector<size_t> partOffsets;
+    std::vector<unsigned char> membersPassed;
+    std::vector<DBKeyType> partKeys;
     getWindowKeys(windowChunk, windowBegin, windowEnd, keys);
     while (windowEnd > windowBegin) {
         // the reps of a window are checked in the ring, which the master fills to lagKeys after the clustered key
@@ -1613,8 +1634,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
             BlockAligner blockAligner(Parameters::DBTYPE_AMINO_ACIDS, maxSeqLen, scoring.subMat, &scoring.fastMatrix,
                                      &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
                                      -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
+            Sequence *element = NULL;
+            Matcher *matcher = NULL;
+            if (memberDbr != NULL) {
+                element = new Sequence(maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection);
+                matcher = new Matcher(Parameters::DBTYPE_AMINO_ACIDS, maxSeqLen, scoring.subMat, &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
+                                      par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop);
+            }
             std::string querySeqBuffer;
             std::vector<ClusterPair> pairs;
+            std::vector<DBKeyType> memberKeys;
 #pragma omp for schedule(dynamic, 1)
             for (size_t batch = 0; batch < batchCount; batch++) {
                 pairs.clear();
@@ -1639,7 +1668,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                             continue;
                         }
                         target.mapSequence(targetKey, targetKey, seqDbr.getData(targetKey, thread_idx), seqDbr.getSeqLen(targetKey));
-                        if (alignTarget(par, blockAligner, blockAlignerInitialized, NULL, matcherInitialized, query, target, NULL, NULL, NULL,
+                        if (alignTarget(par, blockAligner, blockAlignerInitialized, NULL, matcherInitialized, query, target, NULL, NULL, NULL, NULL,
                                         scoring.scorePerColThreshold, 0, 0, thread_idx, NULL, 0, NULL, NULL, NULL)) {
                             const ClusterPair pair = { header.pair.repKey, targetKey };
                             pairs.push_back(pair);
@@ -1650,6 +1679,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                 std::lock_guard<std::mutex> lock(acceptedMutex);
                 batchPairs[batch].swap(pairs);
                 batchDone[batch] = 1;
+                // with --filter-cludb-file the pairs go to the log once the members of their targets are aligned
+                if (memberDbr != NULL) {
+                    continue;
+                }
                 for (; firstUnfinishedBatch < batchCount && batchDone[firstUnfinishedBatch]; firstUnfinishedBatch++) {
                     std::vector<ClusterPair> &donePairs = batchPairs[firstUnfinishedBatch];
                     if (fwrite(donePairs.data(), sizeof(ClusterPair), donePairs.size(), acceptedHandle) != donePairs.size()) {
@@ -1669,6 +1702,91 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                         readAssignedChanges();
                     }
                 }
+            }
+            // --filter-cludb-file: the members of the targets of the accepted pairs are read in parts that fit a 16th of the memory, a target in one part
+            if (memberDbr != NULL) {
+#pragma omp single
+                {
+                    windowPairs.clear();
+                    for (size_t batch = 0; batch < batchCount; batch++) {
+                        windowPairs.insert(windowPairs.end(), batchPairs[batch].begin(), batchPairs[batch].end());
+                    }
+                    memberStarts.resize(windowPairs.size());
+                    partOffsets.assign(1, 0);
+                    for (size_t i = 0, partBytes = 0; i < windowPairs.size(); i++) {
+                        const ClusterPair target = { windowPairs[i].memberKey, windowPairs[i].memberKey };
+                        memberStarts[i] = std::lower_bound(members.begin(), members.end(), target, ClusterPair::compareByRep) - members.begin();
+                        size_t targetBytes = 0;
+                        for (size_t member = memberStarts[i]; member < members.size() && members[member].repKey == target.repKey; member++) {
+                            targetBytes += std::max(memberDbr->getEntryLen(members[member].memberKey), pageSize);
+                        }
+                        if (i > partOffsets.back() && partBytes + targetBytes > memoryLimit / 16) {
+                            partOffsets.push_back(i);
+                            partBytes = 0;
+                        }
+                        partBytes += targetBytes;
+                    }
+                    partOffsets.push_back(windowPairs.size());
+                    membersPassed.assign(windowPairs.size(), 0);
+                }
+                for (size_t part = 0; part + 1 < partOffsets.size(); part++) {
+#pragma omp single
+                    {
+                        partKeys.clear();
+                        for (size_t i = partOffsets[part]; i < partOffsets[part + 1]; i++) {
+                            for (size_t member = memberStarts[i]; member < members.size() && members[member].repKey == windowPairs[i].memberKey; member++) {
+                                partKeys.push_back(members[member].memberKey);
+                            }
+                        }
+                        std::sort(partKeys.begin(), partKeys.end());
+                        partKeys.erase(std::unique(partKeys.begin(), partKeys.end()), partKeys.end());
+                        memberDbr->loadData(partKeys);
+                    }
+#pragma omp for schedule(dynamic, 1)
+                    for (size_t i = partOffsets[part]; i < partOffsets[part + 1]; i++) {
+                        const ClusterPair &pair = windowPairs[i];
+                        if (isAssigned(pair.repKey) || isAssigned(pair.memberKey)) {
+                            continue;
+                        }
+                        memberKeys.clear();
+                        for (size_t member = memberStarts[i]; member < members.size() && members[member].repKey == pair.memberKey; member++) {
+                            memberKeys.push_back(members[member].memberKey);
+                        }
+                        // the sequence of the rep is in its first record of the window
+                        const std::pair<ClusterPair, size_t> repFirst = std::make_pair(ClusterPair{ pair.repKey, pair.repKey }, static_cast<size_t>(0));
+                        const size_t repOrder = std::lower_bound(order.begin() + windowBegin, order.begin() + windowEnd, repFirst, compareOrderByRep) - order.begin();
+                        const char *record = chunkRecords[windowChunk].data() + chunkRecordOffsets[windowChunk][order[repOrder].second];
+                        RepTargets header;
+                        memcpy(&header, record, sizeof(RepTargets));
+                        querySeqBuffer.assign(record + sizeof(RepTargets), header.repLength);
+                        query.mapSequence(pair.repKey, pair.repKey, querySeqBuffer.c_str(), header.repLength);
+                        blockAligner.setQuery(&query);
+                        bool matcherInitialized = false;
+                        membersPassed[i] = alignClusterMembers(par, blockAligner, *matcher, matcherInitialized, query, *element, memberKeys, memberDbr, 0, swMode, thread_idx, NULL, NULL);
+                    }
+                }
+            }
+            delete matcher;
+            delete element;
+        }
+        if (memberDbr != NULL) {
+            // the pairs whose members passed go to the log in window order
+            size_t acceptedCount = 0;
+            for (size_t i = 0; i < windowPairs.size(); i++) {
+                if (membersPassed[i]) {
+                    windowPairs[acceptedCount++] = windowPairs[i];
+                }
+            }
+            if (fwrite(windowPairs.data(), sizeof(ClusterPair), acceptedCount, acceptedHandle) != acceptedCount) {
+                Debug(Debug::ERROR) << "Cannot write " << acceptedLog << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            acceptedBytes += acceptedCount * sizeof(ClusterPair);
+            MMseqsNode::publishLog(acceptedHandle, acceptedLog, nextRepKey, acceptedBytes);
+            publishedBytes = acceptedBytes;
+            publishTime = time(NULL);
+            if (nextRepKey < dbSize) {
+                readAssignedChanges();
             }
         }
         keys.swap(nextKeys);
@@ -2163,8 +2281,56 @@ static int align2clustLinfinity(Parameters &par) {
         }
     }
 
+    // --filter-cludb-file: the members of the clusters of the targets go to the nodes that align the targets, which keep them in memory
+    std::vector<ClusterPair> members;
+    DBReader<DBKeyType> *memberDbr = NULL;
+    const std::string membersExchange = par.db3 + "_swap_3";
+    if (par.filterCluDBFile.empty() == false) {
+        memberBlockKeys = blockKeys;
+        // node * blockKeys is the smallest key the node aligns, where writePairs cuts its pairs
+        std::vector<size_t> alignNodeKeyOffsets(MMseqsNode::count + 1, dbSize);
+        for (size_t node = 0; node < MMseqsNode::count; node++) {
+            alignNodeKeyOffsets[node] = node * blockKeys;
+        }
+        const std::string membersIndex = MMseqsNode::sendClusterPairs(par.filterCluDBFile, false, compareByAlignNodeAndRep, alignNodeKeyOffsets, membersExchange);
+        std::vector<MMseqsNode::ExchangeBlock> memberBlocks;
+        std::vector<FILE *> memberFiles;
+        MMseqsNode::openExchange(membersIndex, membersExchange, memberBlocks, memberFiles);
+        std::vector<size_t> blockOffsets(memberBlocks.size() + 1, 0);
+        for (size_t i = 0; i < memberBlocks.size(); i++) {
+            blockOffsets[i + 1] = blockOffsets[i] + memberBlocks[i].end - memberBlocks[i].pos;
+        }
+        if (blockOffsets.back() % sizeof(ClusterPair) != 0) {
+            Debug(Debug::ERROR) << "Cannot read " << membersExchange << ": a record ends after its block\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (blockOffsets.back() > smallestMemoryLimit / 4) {
+            Debug(Debug::ERROR) << "An aligning node needs " << blockOffsets.back() << " bytes for the members of the clusters of its targets, more than a quarter of the smallest memory limit of "
+                                << smallestMemoryLimit << " bytes. Run on more nodes\n";
+            EXIT(EXIT_FAILURE);
+        }
+        members.resize(blockOffsets.back() / sizeof(ClusterPair));
+#pragma omp parallel for schedule(dynamic, 1)
+        for (size_t i = 0; i < memberBlocks.size(); i++) {
+            FileUtil::preadAll(fileno(memberBlocks[i].file), membersExchange.c_str(), reinterpret_cast<char *>(members.data()) + blockOffsets[i], blockOffsets[i + 1] - blockOffsets[i], memberBlocks[i].pos);
+        }
+        MMseqsNode::closeExchangeFiles(memberFiles, membersExchange);
+        SORT_PARALLEL(members.begin(), members.end(), ClusterPair::compareByRep);
+        memberDbr = new DBReader<DBKeyType>(par.filterSeqDBFile.c_str(), (par.filterSeqDBFile + ".index").c_str(), par.threads,
+                                            DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
+        memberDbr->open(DBReader<DBKeyType>::NOSORT);
+        Debug(Debug::INFO) << "Time for sending the cluster members: " << timer.lap() << "\n";
+    }
+
     const std::string repTargets = par.db3 + "_swap_0";
     const std::string repTargetsIndex = sendRepTargets(par, seqDbr, nodeKeyOffsets, splitKeyOffsets, blockKeys, memoryLimit, repTargets);
+    // every node read its members before it sent its records
+    if (memberDbr != NULL) {
+        FileUtil::remove((membersExchange + "." + SSTR(MMseqsNode::rank)).c_str());
+        if (MMseqsNode::isMaster()) {
+            FileUtil::remove((membersExchange + ".index").c_str());
+        }
+    }
     Debug(Debug::INFO) << "Time for sending the rep targets: " << timer.lap() << "\n";
     Timer phaseTimer;
 
@@ -2179,7 +2345,7 @@ static int align2clustLinfinity(Parameters &par) {
             memberCount = clusterAcceptedPairs(clusterThreads, dbSize, memoryLimit, blockKeys, lagKeys, accepted, assignedChanges, taken, assignedKeys);
         });
     }
-    alignRepTargets(par, seqDbr, blockKeys, lagKeys, memoryLimit, representativeResidues, repTargetsIndex, repTargets, accepted, assignedChanges);
+    alignRepTargets(par, seqDbr, blockKeys, lagKeys, memoryLimit, representativeResidues, repTargetsIndex, repTargets, accepted, assignedChanges, members, memberDbr);
 
     // every node sends the taken pairs of its log to the nodes of their reps once the master has clustered all
     size_t takenKey;
@@ -2241,6 +2407,10 @@ static int align2clustLinfinity(Parameters &par) {
     const std::string clustersIndex = clustersWriter.close();
     // every node has aligned the records of every node
     FileUtil::remove((repTargets + "." + SSTR(MMseqsNode::rank)).c_str());
+    if (memberDbr != NULL) {
+        memberDbr->close();
+        delete memberDbr;
+    }
     if (MMseqsNode::isMaster()) {
         FileUtil::remove((repTargets + ".index").c_str());
     }
@@ -2285,16 +2455,16 @@ static int align2clustLinfinity(Parameters &par) {
 int align2clust(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
+    if (par.filterCluDBFile.empty() != par.filterSeqDBFile.empty()) {
+        Debug(Debug::ERROR)<< "Error: Both filterCluDBFile and filterSeqDBFile should be provided together.\n";
+        EXIT(EXIT_FAILURE);
+    }
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
         MMseqsNode::init();
         if (par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
             Debug(Debug::ERROR) << "align2clust supports only --cluster-mode " << Parameters::GREEDY << " and " << Parameters::GREEDY_MEM
                                 << " for --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
-            EXIT(EXIT_FAILURE);
-        }
-        if (par.filterCluDBFile.empty() == false || par.filterSeqDBFile.empty() == false) {
-            Debug(Debug::ERROR) << "--filter-cludb-file and --filter-seqdb-file are not supported for --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
             EXIT(EXIT_FAILURE);
         }
         const int prefDbtype = FileUtil::parseDbType(par.db2.c_str());

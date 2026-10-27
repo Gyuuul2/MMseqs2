@@ -583,27 +583,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
 
     if (isLinfinity) {
         MMseqsNode::closeClusterWriter(resultWriter, resultIndexFile, resultIndex);
-        // the bits are on disk before the index part that tells the master this node is done
-        const std::string bitsFile = representativeDb + ".bits." + SSTR(MMseqsNode::rank);
-        FILE *bits = FileUtil::openAndDelete(bitsFile.c_str(), "w");
-        const uint64_t header[2] = { localFirstKey, localKeySize };
-        if (fwrite(header, sizeof(uint64_t), 2, bits) != 2 || fwrite(representativeBits, sizeof(uint64_t), representativeBitsSize, bits) != representativeBitsSize
-            || fflush(bits) != 0 || fsync(fileno(bits)) != 0 || fclose(bits) != 0) {
-            Debug(Debug::ERROR) << "Cannot write " << bitsFile << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        // the ranges of this node in the sequence index, with the number of its representatives as a sixth column
-        std::string representativeIndex;
-        for (size_t i = 0; i + 1 < nodeSeqRange.size(); i++) {
-            const size_t rangeEndKey = nodeSeqRange[i + 1].startKey;
-            const size_t rangeRepresentatives = Util::countSetBits(representativeBits, nodeSeqRange[i].startKey - localFirstKey, rangeEndKey - localFirstKey);
-            representativeIndex += SSTR(nodeSeqRange[i].startKey) + "\t" + SSTR(nodeSeqRange[i].offset) + "\t" + SSTR(nodeSeqRange[i].entryLength) + "\t"
-                                 + SSTR(rangeEndKey - nodeSeqRange[i].startKey) + "\t" + SSTR(MMseqsNode::rank) + "\t" + SSTR(rangeRepresentatives) + "\n";
-        }
-        MMseqsNode::publishRunFile(representativeDb + ".index." + SSTR(MMseqsNode::rank), representativeIndex);
-        if (MMseqsNode::isMaster()) {
-            MMseqsNode::publishFile(representativeDb + ".index", MMseqsNode::gatherRunFiles(representativeDb + ".index."));
-        }
+        MMseqsNode::writeRepresentativeBits(representativeDb, reader, representativeBits, localFirstKey, localKeySize);
     } else {
         // clusters are written in key order unless a length was split into hash ranges
         resultWriter.close(false, needsSort);
