@@ -1423,14 +1423,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
         while (changesBytes + headerWords * sizeof(uint64_t) <= publishedBytes) {
             readChanges(changesBytes, headerWords);
             const size_t stepClusteredKey = changes[0];
-            const size_t sliceFirstWord = changes[1];
-            const size_t sliceWords = changes[2];
+            const size_t enteringFirstWord = changes[1];
+            const size_t enteringWords = changes[2];
             const size_t lagKeyCount = changes[3];
             const size_t nodeKeyOffset = changes[4 + MMseqsNode::rank];
             const size_t nodeKeyEnd = changes[5 + MMseqsNode::rank];
             const size_t commonStart = changesBytes + headerWords * sizeof(uint64_t);
-            const size_t ownStart = commonStart + (sliceWords + lagKeyCount + nodeKeyOffset) * sizeof(uint64_t);
-            changesBytes = commonStart + (sliceWords + lagKeyCount + changes[4 + MMseqsNode::count]) * sizeof(uint64_t);
+            const size_t ownStart = commonStart + (enteringWords + lagKeyCount + nodeKeyOffset) * sizeof(uint64_t);
+            changesBytes = commonStart + (enteringWords + lagKeyCount + changes[4 + MMseqsNode::count]) * sizeof(uint64_t);
             if (changesBytes > publishedBytes || stepClusteredKey < clusteredKey || nodeKeyEnd < nodeKeyOffset) {
                 Debug(Debug::ERROR) << "Cannot read " << assignedChanges << "\n";
                 EXIT(EXIT_FAILURE);
@@ -1442,13 +1442,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
             }
             __atomic_store_n(&ringFirstWord, firstWord, __ATOMIC_RELEASE);
             clusteredKey = stepClusteredKey;
-            readChanges(commonStart, sliceWords + lagKeyCount);
-            for (size_t i = 0; i < sliceWords; i++) {
-                if (sliceFirstWord + i >= firstWord && sliceFirstWord + i - firstWord < ring.size()) {
-                    __atomic_fetch_or(&ring[(sliceFirstWord + i) % ring.size()], changes[i], __ATOMIC_RELEASE);
+            readChanges(commonStart, enteringWords + lagKeyCount);
+            for (size_t i = 0; i < enteringWords; i++) {
+                if (enteringFirstWord + i >= firstWord && enteringFirstWord + i - firstWord < ring.size()) {
+                    __atomic_fetch_or(&ring[(enteringFirstWord + i) % ring.size()], changes[i], __ATOMIC_RELEASE);
                 }
             }
-            for (size_t i = sliceWords; i < changes.size(); i++) {
+            for (size_t i = enteringWords; i < changes.size(); i++) {
                 for (size_t orderKey = changes[i]; orderKey < orderKeyEnd; orderKey += paddedDbSize) {
                     setRingKey(orderKey);
                 }
@@ -2257,8 +2257,8 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             const size_t orderKey = key + ((clusteredKey > key) ? (clusteredKey - key + paddedDbSize - 1) / paddedDbSize * paddedDbSize : 0);
             return orderKey < orderKeyEnd && orderKey < clusteredBefore + lagKeys;
         };
-        const size_t sliceFirstWord = std::min(orderWords, std::max(clusteredBefore + lagKeys, clusteredKey) / 64);
-        const size_t sliceWords = std::min(orderWords, (clusteredKey + lagKeys + 63) / 64) - sliceFirstWord;
+        const size_t enteringFirstWord = std::min(orderWords, std::max(clusteredBefore + lagKeys, clusteredKey) / 64);
+        const size_t enteringWords = std::min(orderWords, (clusteredKey + lagKeys + 63) / 64) - enteringFirstWord;
 #pragma omp parallel for schedule(static)
         for (int thread = 0; thread < threads; thread++) {
             std::vector<size_t> &sectionCounts = threadSectionCounts[thread];
@@ -2280,25 +2280,25 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             }
         }
         const size_t headerWords = 4 + MMseqsNode::count + 1;
-        record.resize(headerWords + sliceWords + sectionOffsets[MMseqsNode::count + 1]);
+        record.resize(headerWords + enteringWords + sectionOffsets[MMseqsNode::count + 1]);
         record[0] = clusteredKey;
-        record[1] = sliceFirstWord;
-        record[2] = sliceWords;
+        record[1] = enteringFirstWord;
+        record[2] = enteringWords;
         record[3] = sectionOffsets[1];
         for (size_t node = 0; node <= MMseqsNode::count; node++) {
             record[4 + node] = sectionOffsets[node + 1] - sectionOffsets[1];
         }
-        for (size_t i = 0; i < sliceWords; i++) {
-            record[headerWords + i] = assigned[(sliceFirstWord + i) % assignedWords];
+        for (size_t i = 0; i < enteringWords; i++) {
+            record[headerWords + i] = assigned[(enteringFirstWord + i) % assignedWords];
         }
 #pragma omp parallel for schedule(static)
         for (int thread = 0; thread < threads; thread++) {
             std::vector<size_t> &sectionPositions = threadSectionCounts[thread];
             for (size_t i = 0; i < threadAssignedKeys[thread].size(); i++) {
                 const DBKeyType key = threadAssignedKeys[thread][i];
-                record[headerWords + sliceWords + sectionPositions[getAlignNode(blockKeys, key) + 1]++] = key;
+                record[headerWords + enteringWords + sectionPositions[getAlignNode(blockKeys, key) + 1]++] = key;
                 if (isRingKey(key)) {
-                    record[headerWords + sliceWords + sectionPositions[0]++] = key;
+                    record[headerWords + enteringWords + sectionPositions[0]++] = key;
                 }
             }
             threadAssignedKeys[thread].clear();

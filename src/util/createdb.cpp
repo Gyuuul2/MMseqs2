@@ -373,7 +373,7 @@ struct InputPiece {
     size_t end;
 };
 
-std::vector<LengthBin> makeLengthBins(const std::vector<size_t> &sequenceCount, const std::vector<size_t> &headerSize) {
+static std::vector<LengthBin> makeLengthBins(const std::vector<size_t> &sequenceCount, const std::vector<size_t> &headerSize) {
     std::vector<LengthBin> histogram;
     for (size_t length = sequenceCount.size(); length-- > 0; ) {
         if (sequenceCount[length] > 0) {
@@ -384,7 +384,7 @@ std::vector<LengthBin> makeLengthBins(const std::vector<size_t> &sequenceCount, 
     return histogram;
 }
 
-std::vector<LengthBin> mergeLengthHistograms(const std::vector<std::vector<LengthBin>> &histograms) {
+static std::vector<LengthBin> mergeLengthHistograms(const std::vector<std::vector<LengthBin>> &histograms) {
     size_t maxLength = 0;
     for (size_t i = 0; i < histograms.size(); i++) {
         if (histograms[i].empty() == false) {
@@ -402,7 +402,7 @@ std::vector<LengthBin> mergeLengthHistograms(const std::vector<std::vector<Lengt
     return makeLengthBins(sequenceCount, headerSize);
 }
 
-std::vector<LengthBin> getLengthToBin(const std::vector<LengthBin> &histogram) {
+static std::vector<LengthBin> getLengthToBin(const std::vector<LengthBin> &histogram) {
     std::vector<LengthBin> lengthToBin(histogram.empty() ? 0 : histogram[0].length + 1);
     for (size_t i = 0; i < histogram.size(); i++) {
         lengthToBin[histogram[i].length] = histogram[i];
@@ -410,7 +410,7 @@ std::vector<LengthBin> getLengthToBin(const std::vector<LengthBin> &histogram) {
     return lengthToBin;
 }
 
-void splitStarts(const std::vector<LengthBin> &starts, std::vector<std::vector<LengthBin>> &splits) {
+static void splitStarts(const std::vector<LengthBin> &starts, std::vector<std::vector<LengthBin>> &splits) {
     std::vector<LengthBin> lengthToStart = getLengthToBin(starts);
     for (size_t i = 0; i < splits.size(); i++) {
         for (size_t j = 0; j < splits[i].size(); j++) {
@@ -429,7 +429,7 @@ void splitStarts(const std::vector<LengthBin> &starts, std::vector<std::vector<L
     }
 }
 
-void flushBufferToDisk(const std::vector<int> &dataFileFds, const std::string &dataFile, const char *buffer, size_t bufferPos, char *sortedBuffer, std::vector<LengthBin> &lengthToBin) {
+static void flushBufferToDisk(const std::vector<int> &dataFileFds, const std::string &dataFile, const char *buffer, size_t bufferPos, char *sortedBuffer, std::vector<LengthBin> &lengthToBin) {
     const size_t lengthCount = lengthToBin.size();
     std::vector<size_t> startPos(DATA_FILE_TYPES * lengthCount + 1, 0);
     for (size_t pos = 0; pos < bufferPos; ) {
@@ -471,7 +471,7 @@ void flushBufferToDisk(const std::vector<int> &dataFileFds, const std::string &d
 }
 
 template <typename T>
-std::vector<T> readLinfinityFile(const std::string &file) {
+static std::vector<T> readLinfinityFile(const std::string &file) {
     const std::string linfinityData = MMseqsNode::waitForRunFile(file);
     char *linfinityDataChar = (char *) linfinityData.c_str();
     const size_t linfinityDataSize = linfinityData.size();
@@ -494,7 +494,7 @@ std::vector<T> readLinfinityFile(const std::string &file) {
     return entries;
 }
 
-int createdbLinfinity(Parameters &par, const std::vector<std::string> &filenames, const std::string &dataFile) {
+static int createdbLinfinity(Parameters &par, const std::vector<std::string> &filenames, const std::string &dataFile) {
     const std::string planPrefix = dataFile + ".splitplan.";
     if (MMseqsNode::isMaster()) {
         std::vector<size_t> fileSizes(filenames.size());
@@ -1024,6 +1024,7 @@ int createdb(int argc, const char **argv, const Command& command) {
     }
 
     if(par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) {
+        delete subMat;
         return createdbLinfinity(par, filenames, dataFile);
     }
 
