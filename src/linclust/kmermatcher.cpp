@@ -1707,6 +1707,12 @@ static void writeKmerMatcherOutput(Parameters &par, DBReader<DBKeyType> &seqDbr,
 
 template <typename KmerPositionType, typename T, bool includeAdjacency, typename L>
 static void kmermatcherWithoutDiagonalInner(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, size_t memoryLimit, size_t totalKmers) {
+#ifdef HAVE_MPI
+    // one rank writes the prefilter database, the splits are not distributed
+    if (MMseqsMPI::rank != 0) {
+        return;
+    }
+#endif
     const size_t kmerMemory = sizeof(KmerPositionType) + sizeof(KmerGroupRepSeq);
     const size_t totalSizeNeeded = kmerMemory * totalKmers;
     const size_t splitMemoryLimit = static_cast<size_t>(static_cast<double>(memoryLimit) * 0.95);
@@ -1836,7 +1842,7 @@ static size_t readRowTable(FILE *file, const std::string &fileName, std::vector<
     }
     const size_t tableEnd = sb.st_size - sizeof(uint64_t);
     FileUtil::preadAll(fileno(file), fileName.c_str(), reinterpret_cast<char *>(&tableOffset), sizeof(uint64_t), tableEnd);
-    if (tableOffset >= tableEnd || (tableEnd - tableOffset) % sizeof(Row) != 0) {
+    if (tableOffset > tableEnd || (tableEnd - tableOffset) % sizeof(Row) != 0) {
         Debug(Debug::ERROR) << "Cannot read " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }

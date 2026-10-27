@@ -1545,6 +1545,7 @@ Parameters::Parameters():
     lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_LINCLUST_VERSION);
     lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_KMER_POS_FILTER);
     lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_INCLUDE_COUNTTABLE);
+    lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_SWITCH_CONSENSUS_REP);
     lin8clustworkflow.push_back(&PARAM_NODE_RUNNER);
 
     // easylin8clustworkflow

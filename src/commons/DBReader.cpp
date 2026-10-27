@@ -1756,9 +1756,9 @@ void DBReader<T>::copyDb(const std::string &databaseName, const std::string &out
 
 template<typename T>
 std::vector<size_t> DBReader<T>::getFileKeyOffsets(size_t fileCount) {
-    // the files hold ascending keys, so the last range is in the last file
+    // the files hold ascending keys, so the last range is in the last file with keys; the files after it are empty when there are fewer lengths than files
     const size_t databaseFiles = (indexSize == 0) ? 0 : index2dbfile[indexSize - 1] + 1;
-    if (databaseFiles != fileCount) {
+    if (databaseFiles > fileCount) {
         Debug(Debug::ERROR) << "Database " << dataFileName << " has " << databaseFiles << " data files, but runs on " << fileCount << " nodes\n";
         EXIT(EXIT_FAILURE);
     }
