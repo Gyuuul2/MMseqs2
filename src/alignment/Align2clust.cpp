@@ -120,23 +120,24 @@ static void appendAlignmentResult(std::string &alnResultBuffer, char *lineBuffer
 // Compact setCoverMemberPool when over half is dead. Only offsets change, so heap order holds.
 static const size_t ALIGN2CLUST_MIN_COMPACTION_DEAD_MEMBERS = 16 * 1024 * 1024 / sizeof(DBLocalId);
 
-static void compactSetCoverMemberPool() {
-    const size_t deadMemberCount = setCoverMemberPool.size() - setCoverLiveMemberCount;
-    if (setCoverMemberPool.empty() ||
+template <typename T>
+static void compactSetCoverMemberPool(std::vector<SetCoverCandidate> &candidates, std::vector<T> &memberPool, size_t liveMemberCount) {
+    const size_t deadMemberCount = memberPool.size() - liveMemberCount;
+    if (memberPool.empty() ||
         deadMemberCount < ALIGN2CLUST_MIN_COMPACTION_DEAD_MEMBERS ||
-        deadMemberCount * 2 <= setCoverMemberPool.size()) {
+        deadMemberCount * 2 <= memberPool.size()) {
         return;
     }
-    std::vector<DBLocalId> compactedPool;
-    compactedPool.reserve(setCoverLiveMemberCount);
-    for (SetCoverCandidate &candidate : setCoverCandidates) {
+    std::vector<T> compactedPool;
+    compactedPool.reserve(liveMemberCount);
+    for (SetCoverCandidate &candidate : candidates) {
         const size_t newOffset = compactedPool.size();
         compactedPool.insert(compactedPool.end(),
-                             setCoverMemberPool.begin() + candidate.memberOffset,
-                             setCoverMemberPool.begin() + candidate.memberOffset + candidate.memberCount);
+                             memberPool.begin() + candidate.memberOffset,
+                             memberPool.begin() + candidate.memberOffset + candidate.memberCount);
         candidate.memberOffset = newOffset;
     }
-    setCoverMemberPool.swap(compactedPool);
+    memberPool.swap(compactedPool);
 }
 
 // Env override for the reorder-buffer size; 0 (unset/invalid) means size from memory.
@@ -609,7 +610,7 @@ void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
         }
 
         lock.unlock();
-        compactSetCoverMemberPool();
+        compactSetCoverMemberPool(setCoverCandidates, setCoverMemberPool, setCoverLiveMemberCount);
         lock.lock();
 
         if (allCalculationsDone &&
@@ -1061,7 +1062,7 @@ static const size_t PUSH_GROUPS_PER_NODE = 4;
 
 // --createdb-mode 3: the nodes send the pref partitions in groups of equal cost in turn, a rep with its targets of a node in a split to that node
 static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<size_t> &nodeKeyOffsets, const std::vector<size_t> &splitKeyOffsets,
-                                  size_t blockKeys, size_t memoryLimit, const std::string &repTargets) {
+                                  size_t blockKeys, size_t memoryLimit, size_t paddedDbSize, size_t prefSizeBits, const std::string &repTargets) {
     const size_t dbSize = seqDbr.getSize();
     // the targets of a record: those from first on of its node (the targets of an entry are grouped by node) in the split of the first one, at most maxRecordTargets
     const size_t batchBytes = std::max<size_t>(1, memoryLimit / 16);
@@ -1268,10 +1269,11 @@ static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                     const DBKeyType *targets = splitTargets.data() + entryTargetOffsets[entry];
                     const size_t targetCount = entryTargetOffsets[entry + 1] - entryTargetOffsets[entry];
                     size_t record = entryRecordOffsets[entry] - firstRecord;
+                    const size_t prefSizeBit = (targetCount > 0) ? std::min<size_t>(prefSizeBits - 1, 63 - __builtin_clzll(targetCount)) : 0;
                     for (size_t first = 0, last; first < targetCount; first = last, record++) {
                         last = getRecordEnd(targets, first, targetCount);
                         RepTargets &header = records[record].header;
-                        header.pair.repKey = entryRepKeys[entry];
+                        header.pair.repKey = (prefSizeBits - 1 - prefSizeBit) * paddedDbSize + entryRepKeys[entry];
                         header.pair.memberKey = targets[first];
                         header.repLength = static_cast<unsigned int>(seqDbr.getSeqLen(entryRepKeys[entry]));
                         header.targetCount = static_cast<unsigned int>(last - first);
@@ -1298,7 +1300,7 @@ static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                         const RepTargets &header = records[record].header;
                         char *data = flushBuffer.data() + recordOffsets[record];
                         memcpy(data, &header, sizeof(RepTargets));
-                        memcpy(data + sizeof(RepTargets), seqDbr.getData(header.pair.repKey, thread_idx), header.repLength);
+                        memcpy(data + sizeof(RepTargets), seqDbr.getData(header.pair.repKey % paddedDbSize, thread_idx), header.repLength);
                         memcpy(data + sizeof(RepTargets) + header.repLength, splitTargets.data() + records[record].targetOffset, header.targetCount * sizeof(DBKeyType));
                     }
                 }
@@ -1344,9 +1346,10 @@ static const size_t BLOCKS_PER_DISTANCE = 8;
 
 // --createdb-mode 3: a node aligns its records in rep order, a window at a time, logs accepted pairs, and skips reps and targets the master assigned
 static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t blockKeys, size_t lagKeys, size_t memoryLimit, size_t representativeResidues,
-                            const std::string &repTargetsIndex, const std::string &repTargets, const std::string &accepted, const std::string &assignedChanges,
-                            const std::vector<ClusterPair> &members, DBReader<DBKeyType> *memberDbr) {
+                            size_t paddedDbSize, size_t prefSizeBits, const std::string &repTargetsIndex, const std::string &repTargets, const std::string &accepted,
+                            const std::string &assignedChanges, const std::vector<ClusterPair> &members, DBReader<DBKeyType> *memberDbr) {
     const size_t dbSize = seqDbr.getSize();
+    const size_t walkEnd = (prefSizeBits - 1) * paddedDbSize + dbSize;
     const size_t maxSeqLen = seqDbr.getMaxSeqLen();
     // a scattered entry is read as at least one page
     const size_t pageSize = Util::getPageSize();
@@ -1359,7 +1362,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     FILE *acceptedHandle = FileUtil::openAndDelete(acceptedLog.c_str(), "w");
     size_t acceptedBytes = 0;
 
-    // the assigned bit ownKey(key) of ownWords for a target of this node, of a rep in ring word key / 64 modulo the ring size, as sent by the master
+    // the assigned bit ownKey(key) of ownWords for a key of this node, else of a rep in ring word walk key / 64 modulo the ring size, as sent by the master
     const size_t blockCount = (dbSize + blockKeys - 1) / blockKeys;
     const size_t ownBlocks = (blockCount > MMseqsNode::rank) ? (blockCount - MMseqsNode::rank + MMseqsNode::count - 1) / MMseqsNode::count : 0;
     std::vector<uint64_t> ownWords(ownBlocks * (blockKeys / 64), 0);
@@ -1369,19 +1372,20 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     const auto getOwnKey = [&](size_t key) {
         return key / blockKeys / MMseqsNode::count * blockKeys + key % blockKeys;
     };
-    const auto isAssigned = [&](size_t key) {
+    const auto isAssigned = [&](size_t walkKey) {
+        const size_t key = walkKey % paddedDbSize;
         if (getAlignNode(blockKeys, key) == MMseqsNode::rank) {
             const size_t ownKey = getOwnKey(key);
             return ((__atomic_load_n(&ownWords[ownKey / 64], __ATOMIC_RELAXED) >> (ownKey % 64)) & 1) != 0;
         }
-        const size_t word = key / 64;
+        const size_t word = walkKey / 64;
         const size_t firstWord = __atomic_load_n(&ringFirstWord, __ATOMIC_ACQUIRE);
         if (word < firstWord || word - firstWord >= ring.size()) {
             return false;
         }
         const uint64_t bits = __atomic_load_n(&ring[word % ring.size()], __ATOMIC_ACQUIRE);
         // the slot may hold a later word once the ring moved on meanwhile
-        return __atomic_load_n(&ringFirstWord, __ATOMIC_ACQUIRE) == firstWord && ((bits >> (key % 64)) & 1) != 0;
+        return __atomic_load_n(&ringFirstWord, __ATOMIC_ACQUIRE) == firstWord && ((bits >> (walkKey % 64)) & 1) != 0;
     };
     const auto setRingKey = [&](size_t key) {
         const size_t word = key / 64;
@@ -1389,7 +1393,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
             __atomic_fetch_or(&ring[word % ring.size()], 1ULL << (key % 64), __ATOMIC_RELEASE);
         }
     };
-    // a step of the master appends its clustered key, first and count of entering ring words, ring key count, node key offsets, then those words and keys
+    // a step of the master appends its clustered walk key, first and count of entering ring words, ring key count, node key offsets, then those words and keys
     const size_t headerWords = 4 + MMseqsNode::count + 1;
     size_t changesBytes = 0;
     std::vector<uint64_t> changes;
@@ -1434,7 +1438,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                 }
             }
             for (size_t i = sliceWords; i < changes.size(); i++) {
-                setRingKey(changes[i]);
+                for (size_t walkKey = changes[i]; walkKey < walkEnd; walkKey += paddedDbSize) {
+                    setRingKey(walkKey);
+                }
             }
             readChanges(ownStart, nodeKeyEnd - nodeKeyOffset);
             for (size_t i = 0; i < changes.size(); i++) {
@@ -1582,7 +1588,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     size_t windowBegin;
     size_t windowEnd;
     readWindow(windowChunk, windowBegin, windowEnd);
-    const size_t firstRepKey = (windowEnd > windowBegin) ? static_cast<size_t>(chunkOrder[windowChunk][windowBegin].first.repKey) : dbSize;
+    const size_t firstRepKey = (windowEnd > windowBegin) ? static_cast<size_t>(chunkOrder[windowChunk][windowBegin].first.repKey) : walkEnd;
     MMseqsNode::publishLog(acceptedHandle, acceptedLog, firstRepKey, 0);
     size_t publishedBytes = 0;
     time_t publishTime = time(NULL);
@@ -1616,7 +1622,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
         readWindow(nextChunk, nextBegin, nextEnd);
         getWindowKeys(nextChunk, nextBegin, nextEnd, nextKeys);
         readBand(nextKeys, true);
-        const size_t nextRepKey = (nextEnd > nextBegin) ? static_cast<size_t>(chunkOrder[nextChunk][nextBegin].first.repKey) : dbSize;
+        const size_t nextRepKey = (nextEnd > nextBegin) ? static_cast<size_t>(chunkOrder[nextChunk][nextBegin].first.repKey) : walkEnd;
         const std::vector<std::pair<ClusterPair, size_t> > &order = chunkOrder[windowChunk];
         const size_t recordCount = windowEnd - windowBegin;
         const size_t batchCount = std::min(recordCount, par.threads * ALIGN_BATCHES_PER_THREAD);
@@ -1655,7 +1661,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                         continue;
                     }
                     querySeqBuffer.assign(record + sizeof(RepTargets), header.repLength);
-                    query.mapSequence(header.pair.repKey, header.pair.repKey, querySeqBuffer.c_str(), header.repLength);
+                    const size_t repKey = header.pair.repKey % paddedDbSize;
+                    query.mapSequence(repKey, repKey, querySeqBuffer.c_str(), header.repLength);
                     blockAligner.setQuery(&query);
                     bool blockAlignerInitialized = false;
                     bool matcherInitialized = false;
@@ -1698,7 +1705,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                     MMseqsNode::publishLog(acceptedHandle, acceptedLog, doneRepKey, acceptedBytes);
                     publishedBytes = acceptedBytes;
                     publishTime = now;
-                    if (doneRepKey < dbSize) {
+                    if (doneRepKey < walkEnd) {
                         readAssignedChanges();
                     }
                 }
@@ -1759,7 +1766,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                         RepTargets header;
                         memcpy(&header, record, sizeof(RepTargets));
                         querySeqBuffer.assign(record + sizeof(RepTargets), header.repLength);
-                        query.mapSequence(pair.repKey, pair.repKey, querySeqBuffer.c_str(), header.repLength);
+                        const size_t repKey = pair.repKey % paddedDbSize;
+                        query.mapSequence(repKey, repKey, querySeqBuffer.c_str(), header.repLength);
                         blockAligner.setQuery(&query);
                         bool matcherInitialized = false;
                         membersPassed[i] = alignClusterMembers(par, blockAligner, *matcher, matcherInitialized, query, *element, memberKeys, memberDbr, 0, swMode, thread_idx, NULL, NULL);
@@ -1785,7 +1793,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
             MMseqsNode::publishLog(acceptedHandle, acceptedLog, nextRepKey, acceptedBytes);
             publishedBytes = acceptedBytes;
             publishTime = time(NULL);
-            if (nextRepKey < dbSize) {
+            if (nextRepKey < walkEnd) {
                 readAssignedChanges();
             }
         }
@@ -1801,7 +1809,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
             EXIT(EXIT_FAILURE);
         }
     }
-    MMseqsNode::publishLog(acceptedHandle, acceptedLog, dbSize, acceptedBytes);
+    MMseqsNode::publishLog(acceptedHandle, acceptedLog, walkEnd, acceptedBytes);
     if (fclose(acceptedHandle) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << acceptedLog << "\n";
         EXIT(EXIT_FAILURE);
@@ -1853,10 +1861,18 @@ static void appendTakenBits(TakenBits &taken, const uint64_t *bits, size_t bitCo
     taken.bytes += words.size() * sizeof(uint64_t);
 }
 
-// --createdb-mode 3: the master follows the logs of accepted pairs and clusters them greedily in key order; returns the number of taken pairs
-static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimit, size_t blockKeys, size_t lagKeys,
+// --cluster-mode 0 on --createdb-mode 3: a key of a set with the bit of its pair in the taken bits of the node that aligned it
+struct SetCoverMember {
+    DBKeyType key;
+    size_t takenBit;
+};
+
+// --createdb-mode 3: the master follows the logs of accepted pairs and clusters them in walk key order, greedily or by set cover; returns the number of taken pairs
+static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimit, size_t blockKeys, size_t lagKeys, int mode, size_t paddedDbSize, size_t prefSizeBits,
                                    const std::string &accepted, const std::string &assignedChanges, const std::string &taken, const std::string &assignedKeys) {
     const size_t assignedWords = (dbSize + 63) / 64;
+    const size_t walkEnd = (prefSizeBits - 1) * paddedDbSize + dbSize;
+    const size_t walkWords = (walkEnd + 63) / 64;
     uint64_t *assigned = new(std::nothrow) uint64_t[assignedWords];
     Util::checkAllocation(assigned, "Can not allocate assigned memory in align2clust");
     memset(assigned, 0, assignedWords * sizeof(uint64_t));
@@ -1901,15 +1917,19 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     std::vector<uint64_t> record;
     std::vector<std::vector<size_t> > threadSectionCounts(threads, std::vector<size_t>(MMseqsNode::count + 1));
     std::vector<size_t> sectionOffsets(MMseqsNode::count + 2);
+    // --cluster-mode 0: the sets that are not taken yet, each its rep then its free members, in a heap as in clusterThreadFuncSetcover
+    std::vector<SetCoverCandidate> candidates;
+    std::vector<SetCoverMember> memberPool;
+    size_t liveMemberCount = 0;
     size_t memberCount = 0;
     unsigned int polls = 0;
-    for (size_t walkedKey = 0; walkedKey < dbSize;) {
+    for (size_t walkedKey = 0; walkedKey < walkEnd;) {
         bool hasNewProgress = false;
         for (size_t node = 0; node < MMseqsNode::count; node++) {
             const std::string log = accepted + "." + SSTR(node);
             size_t repKey;
             size_t logBytes;
-            if ((nodeHasProgress[node] && nodeRepKeys[node] == dbSize) || MMseqsNode::readLogProgress(log, repKey, logBytes) == false
+            if ((nodeHasProgress[node] && nodeRepKeys[node] == walkEnd) || MMseqsNode::readLogProgress(log, repKey, logBytes) == false
                 || (nodeHasProgress[node] && repKey == nodeRepKeys[node] && logBytes == nodeLogBytes[node])) {
                 continue;
             }
@@ -1922,7 +1942,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             nodeRepKeys[node] = repKey;
             nodeLogBytes[node] = logBytes;
         }
-        size_t doneRepKey = dbSize;
+        size_t doneRepKey = walkEnd;
         for (size_t node = 0; node < MMseqsNode::count; node++) {
             doneRepKey = std::min(doneRepKey, nodeHasProgress[node] ? nodeRepKeys[node] : 0);
         }
@@ -1973,7 +1993,12 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             const size_t nodeEnd = std::lower_bound(readPairs.begin() + nodeFirstPairs[node], readPairs.begin() + nodeFirstPairs[node + 1], firstNotDone, AcceptedPair::compareByRepKey) - readPairs.begin();
             nodeTakenCounts[node] = nodeEnd - nodeFirstPairs[node];
             nodeReadBytes[node] += nodeTakenCounts[node] * sizeof(ClusterPair);
-            nodeTakenBits[node].assign((nodeTakenCounts[node] + 63) / 64, 0);
+            // set cover takes pairs of a step in later steps too, so it keeps the taken bits of the whole log
+            if (mode == Parameters::SET_COVER) {
+                nodeTakenBits[node].resize((nodeReadBytes[node] / sizeof(ClusterPair) + 63) / 64, 0);
+            } else {
+                nodeTakenBits[node].assign((nodeTakenCounts[node] + 63) / 64, 0);
+            }
             if (pairCount != nodeFirstPairs[node]) {
                 memmove(&readPairs[pairCount], &readPairs[nodeFirstPairs[node]], nodeTakenCounts[node] * sizeof(AcceptedPair));
             }
@@ -2007,7 +2032,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         repKeyOffsets.assign(repCount + 1, 0);
 #pragma omp parallel for schedule(dynamic, 1024)
         for (size_t rep = 0; rep < repCount; rep++) {
-            const bool repIsFree = isAssigned(pairs[repOffsets[rep]].pair.repKey) == false;
+            const bool repIsFree = isAssigned(pairs[repOffsets[rep]].pair.repKey % paddedDbSize) == false;
             size_t freeCount = 0;
             for (size_t i = repOffsets[rep]; i < repOffsets[rep + 1]; i++) {
                 pairIsFree[i] = repIsFree && isAssigned(pairs[i].pair.memberKey) == false;
@@ -2018,79 +2043,149 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         for (size_t rep = 0; rep < repCount; rep++) {
             repKeyOffsets[rep + 1] += repKeyOffsets[rep];
         }
-        keyReps.resize(repKeyOffsets[repCount]);
+        if (mode == Parameters::SET_COVER) {
+            // a free rep with free members is a set of itself and them, which waits in the heap until no rep that is not walked yet can have a larger one
+            const size_t poolOffset = memberPool.size();
+            memberPool.resize(poolOffset + repKeyOffsets[repCount]);
 #pragma omp parallel for schedule(dynamic, 1024)
-        for (size_t rep = 0; rep < repCount; rep++) {
-            size_t key = repKeyOffsets[rep];
-            if (key == repKeyOffsets[rep + 1]) {
-                continue;
-            }
-            keyReps[key++] = std::make_pair(pairs[repOffsets[rep]].pair.repKey, rep);
-            for (size_t i = repOffsets[rep]; i < repOffsets[rep + 1]; i++) {
-                if (pairIsFree[i]) {
-                    keyReps[key++] = std::make_pair(pairs[i].pair.memberKey, rep);
-                }
-            }
-        }
-        // every rep after the first of a key shares it with an earlier rep of the step
-        SORT_PARALLEL(keyReps.begin(), keyReps.end());
-        repSharesKey.assign(repCount, 0);
-#pragma omp parallel for schedule(static)
-        for (size_t i = 1; i < keyReps.size(); i++) {
-            if (keyReps[i].first == keyReps[i - 1].first) {
-                __atomic_store_n(&repSharesKey[keyReps[i].second], 1, __ATOMIC_RELAXED);
-            }
-        }
-        // no earlier rep of the step takes a key of the others, so they take all their free members at once
-#pragma omp parallel
-        {
-            unsigned int thread_idx = 0;
-#ifdef OPENMP
-            thread_idx = static_cast<unsigned int>(omp_get_thread_num());
-#endif
-#pragma omp for schedule(dynamic, 1024) reduction(+:memberCount)
             for (size_t rep = 0; rep < repCount; rep++) {
-                if (repKeyOffsets[rep + 1] == repKeyOffsets[rep] || repSharesKey[rep]) {
+                size_t member = poolOffset + repKeyOffsets[rep];
+                if (member == poolOffset + repKeyOffsets[rep + 1]) {
                     continue;
                 }
-                setAssigned(pairs[repOffsets[rep]].pair.repKey, threadAssignedKeys[thread_idx]);
+                const SetCoverMember repMember = { pairs[repOffsets[rep]].pair.repKey % paddedDbSize, 0 };
+                memberPool[member++] = repMember;
                 for (size_t i = repOffsets[rep]; i < repOffsets[rep + 1]; i++) {
                     if (pairIsFree[i]) {
-                        setAssigned(pairs[i].pair.memberKey, threadAssignedKeys[thread_idx]);
-                        __sync_fetch_and_or(&nodeTakenBits[pairs[i].node][pairs[i].takenBit / 64], 1ULL << (pairs[i].takenBit % 64));
+                        const size_t node = pairs[i].node;
+                        const SetCoverMember setMember = { pairs[i].pair.memberKey, nodeReadBytes[node] / sizeof(ClusterPair) - nodeTakenCounts[node] + pairs[i].takenBit };
+                        memberPool[member++] = setMember;
+                    }
+                }
+            }
+            for (size_t rep = 0; rep < repCount; rep++) {
+                if (repKeyOffsets[rep + 1] > repKeyOffsets[rep]) {
+                    const SetCoverCandidate candidate = { pairs[repOffsets[rep]].pair.repKey % paddedDbSize, repKeyOffsets[rep + 1] - repKeyOffsets[rep], poolOffset + repKeyOffsets[rep] };
+                    candidates.push_back(candidate);
+                    std::push_heap(candidates.begin(), candidates.end(), setCoverComparator);
+                }
+            }
+            liveMemberCount += repKeyOffsets[repCount];
+            // a rep from walk key stepRepKey on has fewer than 2^(prefSizeBit + 1) targets for prefSizeBit = prefSizeBits - 1 - stepRepKey / paddedDbSize, so its set is at most that large
+            const size_t maxSetSize = (stepRepKey < walkEnd) ? static_cast<size_t>(2) << (prefSizeBits - 1 - stepRepKey / paddedDbSize) : 0;
+            while (candidates.empty() == false && candidates.front().memberCount > maxSetSize) {
+                std::pop_heap(candidates.begin(), candidates.end(), setCoverComparator);
+                SetCoverCandidate candidate = candidates.back();
+                candidates.pop_back();
+                liveMemberCount -= candidate.memberCount;
+                if (isAssigned(candidate.representativeId)) {
+                    continue;
+                }
+                SetCoverMember *members = memberPool.data() + candidate.memberOffset;
+                size_t validCount = 0;
+                for (size_t i = 0; i < candidate.memberCount; i++) {
+                    if (isAssigned(members[i].key) == false) {
+                        members[validCount++] = members[i];
+                    }
+                }
+                if (validCount <= 1) {
+                    continue;
+                }
+                if (validCount != candidate.memberCount) {
+                    candidate.memberCount = validCount;
+                    liveMemberCount += validCount;
+                    candidates.push_back(candidate);
+                    std::push_heap(candidates.begin(), candidates.end(), setCoverComparator);
+                    continue;
+                }
+                for (size_t i = 0; i < candidate.memberCount; i++) {
+                    setAssigned(members[i].key, threadAssignedKeys[0]);
+                    if (members[i].key != candidate.representativeId) {
+                        nodeTakenBits[getAlignNode(blockKeys, members[i].key)][members[i].takenBit / 64] |= 1ULL << (members[i].takenBit % 64);
                         memberCount++;
                     }
                 }
             }
-        }
-        // the reps that share a key with an earlier one take in key order, and a later rep that does not share has no key of theirs
-        for (size_t rep = 0; rep < repCount; rep++) {
-            const DBKeyType repKey = pairs[repOffsets[rep]].pair.repKey;
-            if (repKeyOffsets[rep + 1] == repKeyOffsets[rep] || repSharesKey[rep] == 0 || isAssigned(repKey)) {
-                continue;
+            compactSetCoverMemberPool(candidates, memberPool, liveMemberCount);
+        } else {
+            keyReps.resize(repKeyOffsets[repCount]);
+#pragma omp parallel for schedule(dynamic, 1024)
+            for (size_t rep = 0; rep < repCount; rep++) {
+                size_t key = repKeyOffsets[rep];
+                if (key == repKeyOffsets[rep + 1]) {
+                    continue;
+                }
+                keyReps[key++] = std::make_pair(pairs[repOffsets[rep]].pair.repKey, rep);
+                for (size_t i = repOffsets[rep]; i < repOffsets[rep + 1]; i++) {
+                    if (pairIsFree[i]) {
+                        keyReps[key++] = std::make_pair(pairs[i].pair.memberKey, rep);
+                    }
+                }
             }
-            for (size_t i = repOffsets[rep]; i < repOffsets[rep + 1]; i++) {
-                if (i + PREFETCH_PAIRS < pairCount) {
-                    __builtin_prefetch(&assigned[pairs[i + PREFETCH_PAIRS].pair.memberKey / 64]);
+            // every rep after the first of a key shares it with an earlier rep of the step
+            SORT_PARALLEL(keyReps.begin(), keyReps.end());
+            repSharesKey.assign(repCount, 0);
+#pragma omp parallel for schedule(static)
+            for (size_t i = 1; i < keyReps.size(); i++) {
+                if (keyReps[i].first == keyReps[i - 1].first) {
+                    __atomic_store_n(&repSharesKey[keyReps[i].second], 1, __ATOMIC_RELAXED);
                 }
-                const DBKeyType memberKey = pairs[i].pair.memberKey;
-                if (pairIsFree[i] && isAssigned(memberKey) == false) {
-                    setAssigned(repKey, threadAssignedKeys[0]);
-                    setAssigned(memberKey, threadAssignedKeys[0]);
-                    nodeTakenBits[pairs[i].node][pairs[i].takenBit / 64] |= 1ULL << (pairs[i].takenBit % 64);
-                    memberCount++;
+            }
+            // no earlier rep of the step takes a key of the others, so they take all their free members at once
+#pragma omp parallel
+            {
+                unsigned int thread_idx = 0;
+#ifdef OPENMP
+                thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+#pragma omp for schedule(dynamic, 1024) reduction(+:memberCount)
+                for (size_t rep = 0; rep < repCount; rep++) {
+                    if (repKeyOffsets[rep + 1] == repKeyOffsets[rep] || repSharesKey[rep]) {
+                        continue;
+                    }
+                    setAssigned(pairs[repOffsets[rep]].pair.repKey, threadAssignedKeys[thread_idx]);
+                    for (size_t i = repOffsets[rep]; i < repOffsets[rep + 1]; i++) {
+                        if (pairIsFree[i]) {
+                            setAssigned(pairs[i].pair.memberKey, threadAssignedKeys[thread_idx]);
+                            __sync_fetch_and_or(&nodeTakenBits[pairs[i].node][pairs[i].takenBit / 64], 1ULL << (pairs[i].takenBit % 64));
+                            memberCount++;
+                        }
+                    }
                 }
+            }
+            // the reps that share a key with an earlier one take in key order, and a later rep that does not share has no key of theirs
+            for (size_t rep = 0; rep < repCount; rep++) {
+                const DBKeyType repKey = pairs[repOffsets[rep]].pair.repKey;
+                if (repKeyOffsets[rep + 1] == repKeyOffsets[rep] || repSharesKey[rep] == 0 || isAssigned(repKey)) {
+                    continue;
+                }
+                for (size_t i = repOffsets[rep]; i < repOffsets[rep + 1]; i++) {
+                    if (i + PREFETCH_PAIRS < pairCount) {
+                        __builtin_prefetch(&assigned[pairs[i + PREFETCH_PAIRS].pair.memberKey / 64]);
+                    }
+                    const DBKeyType memberKey = pairs[i].pair.memberKey;
+                    if (pairIsFree[i] && isAssigned(memberKey) == false) {
+                        setAssigned(repKey, threadAssignedKeys[0]);
+                        setAssigned(memberKey, threadAssignedKeys[0]);
+                        nodeTakenBits[pairs[i].node][pairs[i].takenBit / 64] |= 1ULL << (pairs[i].takenBit % 64);
+                        memberCount++;
+                    }
+                }
+            }
+            for (size_t node = 0; node < MMseqsNode::count; node++) {
+                appendTakenBits(nodeTaken[node], nodeTakenBits[node].data(), nodeTakenCounts[node], words, taken + "." + SSTR(node));
             }
         }
         const size_t walkedBefore = walkedKey;
         walkedKey = stepRepKey;
-        for (size_t node = 0; node < MMseqsNode::count; node++) {
-            appendTakenBits(nodeTaken[node], nodeTakenBits[node].data(), nodeTakenCounts[node], words, taken + "." + SSTR(node));
-        }
 
-        // the keys of the step by block node, after those in the ring of every node, [walkedKey, walkedBefore + lagKeys), and the entering ring words
-        const size_t sliceFirstWord = std::min(assignedWords, std::max(walkedBefore + lagKeys, walkedKey) / 64);
-        const size_t sliceWords = std::min(assignedWords, (walkedKey + lagKeys + 63) / 64) - sliceFirstWord;
+        // the keys of the step by block node, after those in the ring of every node, a walk key of it in [walkedKey, walkedBefore + lagKeys), and the entering ring words
+        const auto isRingKey = [&](size_t key) {
+            const size_t walkKey = key + ((walkedKey > key) ? (walkedKey - key + paddedDbSize - 1) / paddedDbSize * paddedDbSize : 0);
+            return walkKey < walkEnd && walkKey < walkedBefore + lagKeys;
+        };
+        const size_t sliceFirstWord = std::min(walkWords, std::max(walkedBefore + lagKeys, walkedKey) / 64);
+        const size_t sliceWords = std::min(walkWords, (walkedKey + lagKeys + 63) / 64) - sliceFirstWord;
 #pragma omp parallel for schedule(static)
         for (int thread = 0; thread < threads; thread++) {
             std::vector<size_t> &sectionCounts = threadSectionCounts[thread];
@@ -2098,7 +2193,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             for (size_t i = 0; i < threadAssignedKeys[thread].size(); i++) {
                 const DBKeyType key = threadAssignedKeys[thread][i];
                 sectionCounts[getAlignNode(blockKeys, key) + 1]++;
-                sectionCounts[0] += (key >= walkedKey && key < walkedBefore + lagKeys);
+                sectionCounts[0] += isRingKey(key);
             }
         }
         // a count becomes where the keys of a thread start in its section, the ring section first
@@ -2120,14 +2215,16 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         for (size_t node = 0; node <= MMseqsNode::count; node++) {
             record[4 + node] = sectionOffsets[node + 1] - sectionOffsets[1];
         }
-        memcpy(record.data() + headerWords, assigned + sliceFirstWord, sliceWords * sizeof(uint64_t));
+        for (size_t i = 0; i < sliceWords; i++) {
+            record[headerWords + i] = assigned[(sliceFirstWord + i) % assignedWords];
+        }
 #pragma omp parallel for schedule(static)
         for (int thread = 0; thread < threads; thread++) {
             std::vector<size_t> &sectionPositions = threadSectionCounts[thread];
             for (size_t i = 0; i < threadAssignedKeys[thread].size(); i++) {
                 const DBKeyType key = threadAssignedKeys[thread][i];
                 record[headerWords + sliceWords + sectionPositions[getAlignNode(blockKeys, key) + 1]++] = key;
-                if (key >= walkedKey && key < walkedBefore + lagKeys) {
+                if (isRingKey(key)) {
                     record[headerWords + sliceWords + sectionPositions[0]++] = key;
                 }
             }
@@ -2162,6 +2259,9 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     for (size_t node = 0; node < MMseqsNode::count; node++) {
         FileUtil::remove((accepted + "." + SSTR(node) + ".progress").c_str());
         const std::string takenFile = taken + "." + SSTR(node);
+        if (mode == Parameters::SET_COVER) {
+            appendTakenBits(nodeTaken[node], nodeTakenBits[node].data(), nodeReadBytes[node] / sizeof(ClusterPair), words, takenFile);
+        }
         if (nodeTaken[node].carryBits > 0 && fwrite(&nodeTaken[node].carry, sizeof(uint64_t), 1, nodeTaken[node].file) != 1) {
             Debug(Debug::ERROR) << "Cannot write " << takenFile << "\n";
             EXIT(EXIT_FAILURE);
@@ -2175,7 +2275,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     return memberCount;
 }
 
-// --createdb-mode 3: the nodes of the targets align the reps that the pref partitions send, and the master clusters the accepted pairs greedily
+// --createdb-mode 3: the nodes of the targets align the reps that the pref partitions send, and the master clusters the accepted pairs
 static int align2clustLinfinity(Parameters &par) {
     Timer timer;
     // the dbtype of an earlier result must not mark this one as done before it is
@@ -2208,6 +2308,9 @@ static int align2clustLinfinity(Parameters &par) {
                             << smallestMemoryLimit << " bytes. Run on nodes with more memory\n";
         EXIT(EXIT_FAILURE);
     }
+    // --cluster-mode 0 walks a rep at walk key (prefSizeBits - 1 - prefSizeBit) * paddedDbSize + its key, prefSizeBit = the highest bit of its target count
+    const size_t paddedDbSize = assignedWords * 64;
+    const size_t prefSizeBits = (par.clusteringMode == Parameters::SET_COVER) ? 64 - __builtin_clzll(dbSize | 1) : 1;
     const size_t splitBytes = std::max<size_t>(1, smallestMemoryLimit / 8);
     const size_t lagKeys = std::max<size_t>(64, smallestMemoryLimit / 256 * 8 / 64 * 64);
     std::vector<size_t> splitKeyOffsets;
@@ -2323,7 +2426,7 @@ static int align2clustLinfinity(Parameters &par) {
     }
 
     const std::string repTargets = par.db3 + "_swap_0";
-    const std::string repTargetsIndex = sendRepTargets(par, seqDbr, nodeKeyOffsets, splitKeyOffsets, blockKeys, memoryLimit, repTargets);
+    const std::string repTargetsIndex = sendRepTargets(par, seqDbr, nodeKeyOffsets, splitKeyOffsets, blockKeys, memoryLimit, paddedDbSize, prefSizeBits, repTargets);
     // every node read its members before it sent its records
     if (memberDbr != NULL) {
         FileUtil::remove((membersExchange + "." + SSTR(MMseqsNode::rank)).c_str());
@@ -2342,10 +2445,11 @@ static int align2clustLinfinity(Parameters &par) {
 #ifdef OPENMP
             omp_set_num_threads(clusterThreads);
 #endif
-            memberCount = clusterAcceptedPairs(clusterThreads, dbSize, memoryLimit, blockKeys, lagKeys, accepted, assignedChanges, taken, assignedKeys);
+            memberCount = clusterAcceptedPairs(clusterThreads, dbSize, memoryLimit, blockKeys, lagKeys, par.clusteringMode, paddedDbSize, prefSizeBits,
+                                               accepted, assignedChanges, taken, assignedKeys);
         });
     }
-    alignRepTargets(par, seqDbr, blockKeys, lagKeys, memoryLimit, representativeResidues, repTargetsIndex, repTargets, accepted, assignedChanges, members, memberDbr);
+    alignRepTargets(par, seqDbr, blockKeys, lagKeys, memoryLimit, representativeResidues, paddedDbSize, prefSizeBits, repTargetsIndex, repTargets, accepted, assignedChanges, members, memberDbr);
 
     // every node sends the taken pairs of its log to the nodes of their reps once the master has clustered all
     size_t takenKey;
@@ -2394,7 +2498,8 @@ static int align2clustLinfinity(Parameters &par) {
             size_t pairOffset = __sync_fetch_and_add(&clustersWriter.pairCount, __builtin_popcountll(bits));
             for (; bits != 0; bits &= bits - 1) {
                 const ClusterPair &pair = acceptedPairs[word * 64 + __builtin_ctzll(bits)];
-                clustersWriter.pairs[pairOffset++] = pair;
+                const ClusterPair takenPair = { pair.repKey % paddedDbSize, pair.memberKey };
+                clustersWriter.pairs[pairOffset++] = takenPair;
             }
         }
     }
@@ -2462,8 +2567,8 @@ int align2clust(int argc, const char **argv, const Command &command) {
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
         MMseqsNode::init();
-        if (par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
-            Debug(Debug::ERROR) << "align2clust supports only --cluster-mode " << Parameters::GREEDY << " and " << Parameters::GREEDY_MEM
+        if (par.clusteringMode != Parameters::SET_COVER && par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
+            Debug(Debug::ERROR) << "align2clust supports only --cluster-mode " << Parameters::SET_COVER << ", " << Parameters::GREEDY << " and " << Parameters::GREEDY_MEM
                                 << " for --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
             EXIT(EXIT_FAILURE);
         }
