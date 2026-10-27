@@ -16,7 +16,6 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     setLinclustWorkflowDefaults(&par);
     par.clustHash = true;
     par.diagonalMode = Parameters::DIAGONAL_MODE_UNGAPPED;
-    par.clusteringMode = Parameters::GREEDY;
     par.PARAM_ADD_BACKTRACE.addCategory(MMseqsParameter::COMMAND_EXPERT);
     par.PARAM_ALT_ALIGNMENT.addCategory(MMseqsParameter::COMMAND_EXPERT);
     par.PARAM_ZDROP.addCategory(MMseqsParameter::COMMAND_EXPERT);
@@ -44,6 +43,15 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     }
 
     const bool nonSymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
+    if (par.PARAM_CLUSTER_MODE.wasSet == false) {
+        if (nonSymetric) {
+            par.clusteringMode = Parameters::GREEDY_MEM;
+        } else {
+            par.clusteringMode = Parameters::SET_COVER;
+        }
+        std::string cluMode = (par.clusteringMode == Parameters::GREEDY_MEM) ? "GREEDY MEM" : "SET COVER";
+        Debug(Debug::INFO) << "Set cluster mode " << cluMode << ".\n";
+    }
     par.includeCountTable = false;
     par.countTableIteration = 0;
     if (par.PARAM_INCLUDE_ADJACENCY.wasSet == false && par.PARAM_NUM_ADJACENCY.wasSet == false) {
