@@ -192,7 +192,6 @@ int linclust(int argc, const char **argv, const Command& command) {
         cmd.addVariable("MERGECLU_PAR", par.createParameterString(par.threadsandcompression).c_str());
 
     } else if (par.linclustVersion == 2) {
-        par.alphabetSize = alphabetSize;
         par.kmerSize = kmerSize;
         bool prevspacedKmer = par.spacedKmer;
         bool prevmaskMode = par.maskMode;
@@ -219,6 +218,7 @@ int linclust(int argc, const char **argv, const Command& command) {
         par.spacedKmer = prevspacedKmer;
         par.maskMode = prevmaskMode;
         par.kmersPerSequenceScale = prevKmersPerSequenceScale;
+        par.alphabetSize = alphabetSize;
     }
     float prevSeqId = par.seqIdThr;
     // # 0. clust hash
