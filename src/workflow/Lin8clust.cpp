@@ -52,6 +52,9 @@ int lin8clust(int argc, const char **argv, const Command& command) {
         std::string cluMode = (par.clusteringMode == Parameters::GREEDY_MEM) ? "GREEDY MEM" : "SET COVER";
         Debug(Debug::INFO) << "Set cluster mode " << cluMode << ".\n";
     }
+    if (par.PARAM_ALPH_SIZE.wasSet == false) {
+        par.alphabetSize = MultiParam<NuclAA<int>>(NuclAA<int>(Parameters::CLUST_LINEAR_DEFAULT_ALPH_SIZE, 5));
+    }
     par.includeCountTable = false;
     par.countTableIteration = 0;
     if (par.PARAM_INCLUDE_ADJACENCY.wasSet == false && par.PARAM_NUM_ADJACENCY.wasSet == false) {
