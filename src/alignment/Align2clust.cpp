@@ -1665,7 +1665,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                     MMseqsNode::publishLog(acceptedHandle, acceptedLog, doneRepKey, acceptedBytes);
                     publishedBytes = acceptedBytes;
                     publishTime = now;
-                    readAssignedChanges();
+                    if (doneRepKey < dbSize) {
+                        readAssignedChanges();
+                    }
                 }
             }
         }
