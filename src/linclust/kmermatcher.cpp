@@ -2969,7 +2969,11 @@ static void receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const Kme
                 openReceivedFile(receivedFiles[sender * exchange.hashRangesPerNode + passFirstHashSubRange / exchange.rowsPerHashRange]);
             }
             codeBuffer = passBuffer + outputBytes;
-            windowBytes = std::max<size_t>(1, 2 * passLimit / (hashSubRangeReads[passFirstHashSubRange] * KMER_CODE_COUNT));
+            windowBytes = 2 * passLimit / (hashSubRangeReads[passFirstHashSubRange] * KMER_CODE_COUNT);
+            if (windowBytes == 0) {
+                Debug(Debug::ERROR) << "Not enough memory to receive the k-mers. Raise --split-memory-limit.\n";
+                EXIT(EXIT_FAILURE);
+            }
             getPassRows(exchange, receivedFiles, passFirstHashSubRange, passHashSubRangeOffsets[pass + 1], passRows[pass % 2], passRowOffsets[pass % 2]);
         } else {
             // only the files of this pass and the prefetched next one stay open
@@ -3579,7 +3583,11 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                 const size_t partitionKeys = getPartitionFirstKey(exchange, MMseqsNode::rank, partition + 1) - partitionFirstKey;
                 const size_t partitionRowCount = partitionPassRowOffsets[passPartition + 1] - partitionPassRowOffsets[passPartition];
                 // a windowed pass reads the codes of every row in windows beside the key offsets
-                const size_t windowBytes = isWindowedPass ? std::max<size_t>(1, (pairPassLimit - std::min(pairPassLimit, (partitionKeys + 1) * sizeof(size_t))) / (std::max<size_t>(1, partitionRowCount) * PAIR_CODE_COUNT)) : 0;
+                const size_t windowBytes = isWindowedPass ? (pairPassLimit - std::min(pairPassLimit, (partitionKeys + 1) * sizeof(size_t))) / (std::max<size_t>(1, partitionRowCount) * PAIR_CODE_COUNT) : 0;
+                if (isWindowedPass && windowBytes == 0) {
+                    Debug(Debug::ERROR) << "Not enough memory to merge the pairs. Raise --split-memory-limit.\n";
+                    EXIT(EXIT_FAILURE);
+                }
                 partitionMerges.resize(1);
                 PartitionMerge &merge = partitionMerges[0];
                 countPartitionTargets(exchange, receivedPairFiles, partitionPassRows.data() + partitionPassRowOffsets[passPartition], partitionRowCount, codeBuffer, windowBytes,
@@ -3637,7 +3645,11 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                                     targetPos += targetBytes;
                                 }
                             }
-                            const size_t mergeWindowBytes = std::max<size_t>(1, pairPassLimit / std::max<size_t>(1, recordReads.size()));
+                            const size_t mergeWindowBytes = pairPassLimit / std::max<size_t>(1, recordReads.size());
+                            if (mergeWindowBytes == 0) {
+                                Debug(Debug::ERROR) << "Not enough memory to merge the pairs. Raise --split-memory-limit.\n";
+                                EXIT(EXIT_FAILURE);
+                            }
                             TargetIdQueue targetQueue;
                             for (size_t record = 0; record < recordReads.size(); record++) {
                                 recordReads[record].buffer = pairPassBuffer + pairPassLimit + record * mergeWindowBytes;
