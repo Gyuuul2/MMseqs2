@@ -1915,12 +1915,19 @@ static void putBytes(KmerCodeWriter &kmerCodeWrite, const char *bytes, size_t co
     }
 }
 
-// a pref line: the key and a newline
-static inline void putKeyLine(KmerCodeWriter &kmerCodeWrite, uint64_t key) {
-    char buffer[32];
-    char *end = Itoa::u64toa_sse2(key, buffer);
-    *(end - 1) = '\n';
-    putBytes(kmerCodeWrite, buffer, end - buffer);
+// a pref key: 7 bits a byte, the high bit set on all bytes but the last
+static inline void putPrefKey(KmerCodeWriter &kmerCodeWrite, uint64_t key) {
+    char buffer[10];
+    size_t bytes = 0;
+    for (; key >= 0x80; key >>= 7) {
+        buffer[bytes++] = static_cast<char>(key | 0x80);
+    }
+    buffer[bytes++] = static_cast<char>(key);
+    putBytes(kmerCodeWrite, buffer, bytes);
+}
+
+static inline size_t getPrefKeyBytes(uint64_t key) {
+    return (std::max(1u, getBitWidth(key)) + 6) / 7;
 }
 
 static inline uint64_t getBits(KmerCodeReader &kmerCodeRead, unsigned int width) {
@@ -2410,9 +2417,9 @@ static void getPairPassRows(const std::vector<std::vector<std::pair<size_t, size
 static void writePrefEntry(size_t key, const DBKeyType *keyTargets, const DBKeyType *keyTargetsEnd, KmerCodeWriter &dataWrite, KmerCodeWriter &indexWrite) {
     const uint64_t indexCell[2] = {static_cast<uint64_t>(key), static_cast<uint64_t>(dataWrite.writePos + dataWrite.bufferPos)};
     putBytes(indexWrite, reinterpret_cast<const char *>(indexCell), sizeof(indexCell));
-    putKeyLine(dataWrite, key);
-    for (; keyTargets < keyTargetsEnd && *keyTargets != DB_KEY_INVALID; keyTargets++) {
-        putKeyLine(dataWrite, *keyTargets);
+    putPrefKey(dataWrite, key);
+    for (DBKeyType prevKey = 0; keyTargets < keyTargetsEnd && *keyTargets != DB_KEY_INVALID; prevKey = *keyTargets, keyTargets++) {
+        putPrefKey(dataWrite, *keyTargets - prevKey);
     }
     putBytes(dataWrite, "", 1);
 }
@@ -2505,16 +2512,15 @@ static void mergePartitionTargets(const KmerExchange &exchange, DBReader<DBKeyTy
     std::vector<size_t> keyChunkCosts(keyChunks, 0);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
     for (size_t keyChunk = 0; keyChunk < keyChunks; keyChunk++) {
-        char keyLine[32];
         for (size_t key = merge.keyChunkOffsets[keyChunk]; key < merge.keyChunkOffsets[keyChunk + 1]; key++) {
             if (isRepresentative(partitionFirstKey + key) == false) {
                 continue;
             }
             DBKeyType *keyTargets = targets.data() + ((key > 0) ? keyOffsets[key - 1] : 0);
             const size_t keyTargetCount = sortKeyTargets(keyTargets, targets.data() + keyOffsets[key]);
-            size_t entryBytes = Itoa::u64toa_sse2(partitionFirstKey + key, keyLine) - keyLine + 1;
+            size_t entryBytes = getPrefKeyBytes(partitionFirstKey + key) + 1;
             for (size_t target = 0; target < keyTargetCount; target++) {
-                entryBytes += Itoa::u64toa_sse2(keyTargets[target], keyLine) - keyLine;
+                entryBytes += getPrefKeyBytes(keyTargets[target] - ((target > 0) ? keyTargets[target - 1] : 0));
             }
             merge.keyChunkDataOffsets[keyChunk + 1] += entryBytes;
             merge.keyChunkEntryOffsets[keyChunk + 1]++;
@@ -3644,14 +3650,14 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                             }
                             const uint64_t indexCell[2] = {static_cast<uint64_t>(repKey), static_cast<uint64_t>(windowedDataWrite.writePos + windowedDataWrite.bufferPos)};
                             putBytes(windowedIndexWrite, reinterpret_cast<const char *>(indexCell), sizeof(indexCell));
-                            putKeyLine(windowedDataWrite, repKey);
+                            putPrefKey(windowedDataWrite, repKey);
                             size_t targetCount = 0;
                             DBKeyType prevTargetId = DB_KEY_INVALID;
                             while (targetQueue.empty() == false) {
                                 const FileTargetId target = targetQueue.top();
                                 targetQueue.pop();
                                 if (target.targetId != prevTargetId) {
-                                    putKeyLine(windowedDataWrite, target.targetId);
+                                    putPrefKey(windowedDataWrite, target.targetId - ((prevTargetId == DB_KEY_INVALID) ? 0 : prevTargetId));
                                     targetCount++;
                                     prevTargetId = target.targetId;
                                 }

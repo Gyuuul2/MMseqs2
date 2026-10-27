@@ -1066,6 +1066,18 @@ static bool compareOrderByRep(const std::pair<ClusterPair, size_t> &first, const
     return ClusterPair::compareByRep(first.first, second.first);
 }
 
+// a pref key: 7 bits a byte, the high bit set on all bytes but the last
+static inline DBKeyType getPrefKey(const char *&data) {
+    DBKeyType key = 0;
+    for (unsigned int shift = 0;; shift += 7) {
+        const unsigned char byte = static_cast<unsigned char>(*data++);
+        key |= static_cast<DBKeyType>(byte & 0x7F) << shift;
+        if (byte < 0x80) {
+            return key;
+        }
+    }
+}
+
 // the pref partitions of all nodes are cut by cost into this many groups per node, which go to the nodes in turn
 static const size_t PUSH_GROUPS_PER_NODE = 4;
 
@@ -1169,9 +1181,9 @@ static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, 
         // the entries of the partition in splits that end where an entry starts after prefSplitBytes more bytes
         const size_t prefEnd = partition.prefOffset + partition.prefBytes;
         const size_t partitionEndEntry = prefDb->findEntryByOffset(prefEnd);
-        // a pref byte is read into two buffers and its targets, an entry also takes 64 bytes of offsets and keys
+        // a pref byte is read into two buffers and becomes up to 8 bytes of targets, an entry also takes 64 bytes of offsets and keys
         const double entriesPerByte = static_cast<double>(partitionEndEntry - prefDb->findEntryByOffset(partition.prefOffset)) / std::max<size_t>(1, partition.prefBytes);
-        const size_t prefSplitBytes = std::max<size_t>(1, static_cast<size_t>(static_cast<double>(memoryLimit / 16) / (3.0 + 64.0 * entriesPerByte)));
+        const size_t prefSplitBytes = std::max<size_t>(1, static_cast<size_t>(static_cast<double>(memoryLimit / 16) / (10.0 + 64.0 * entriesPerByte)));
         prefSplitOffsets.clear();
         for (size_t offset = partition.prefOffset; offset < prefEnd; offset += prefSplitBytes) {
             const size_t entry = prefDb->findEntryByOffset(offset);
@@ -1196,12 +1208,12 @@ static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, 
 #pragma omp parallel for schedule(dynamic, 100)
             for (size_t entry = 0; entry < entryCount; entry++) {
                 const char *data = prefDb->getData(splitBegin + entry, 0);
-                const size_t lines = std::count(data, data + prefDb->getEntryLen(splitBegin + entry), '\n');
-                if (lines == 0) {
+                const size_t keys = std::count_if(data, data + prefDb->getEntryLen(splitBegin + entry) - 1, [](char byte) { return static_cast<unsigned char>(byte) < 0x80; });
+                if (keys == 0) {
                     Debug(Debug::ERROR) << prefFile << " has an entry without its key\n";
                     EXIT(EXIT_FAILURE);
                 }
-                entryTargetOffsets[entry + 1] = lines - 1;
+                entryTargetOffsets[entry + 1] = keys - 1;
             }
             for (size_t entry = 0; entry < entryCount; entry++) {
                 entryTargetOffsets[entry + 1] += entryTargetOffsets[entry];
@@ -1210,14 +1222,13 @@ static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             splitTargets.resize(entryTargetOffsets[entryCount]);
 #pragma omp parallel for schedule(dynamic, 100)
             for (size_t entry = 0; entry < entryCount; entry++) {
-                char *data = prefDb->getData(splitBegin + entry, 0);
-                const DBKeyType repKey = Util::fast_atoi<DBKeyType>(data);
+                const char *data = prefDb->getData(splitBegin + entry, 0);
+                const DBKeyType repKey = getPrefKey(data);
                 entryRepKeys[entry] = repKey;
                 DBKeyType *targets = splitTargets.data() + entryTargetOffsets[entry];
                 const size_t targetCount = entryTargetOffsets[entry + 1] - entryTargetOffsets[entry];
-                data = Util::skipLine(data);
-                for (size_t target = 0; target < targetCount; target++, data = Util::skipLine(data)) {
-                    targets[target] = Util::fast_atoi<DBKeyType>(data);
+                for (size_t target = 0; target < targetCount; target++) {
+                    targets[target] = ((target > 0) ? targets[target - 1] : 0) + getPrefKey(data);
                     if (targets[target] >= dbSize || targets[target] == repKey || (target > 0 && targets[target] <= targets[target - 1])) {
                         Debug(Debug::ERROR) << "Entry " << repKey << " of " << prefFile << " has the target " << targets[target] << " twice, out of order or not in " << par.db1 << "\n";
                         EXIT(EXIT_FAILURE);
@@ -2416,11 +2427,11 @@ static int align2clustLinfinity(Parameters &par) {
                 prefDb.loadData(0, entryCount);
             }
             for (size_t entry = 0; entry < entryCount; entry++) {
-                char *data = prefDb.getData(entry, 0);
-                const char *dataEnd = data + prefDb.getEntryLen(entry);
-                const DBKeyType repKey = Util::fast_atoi<DBKeyType>(data);
-                for (data = Util::skipLine(data); data < dataEnd && *data != '\0'; data = Util::skipLine(data)) {
-                    const DBKeyType targetKey = Util::fast_atoi<DBKeyType>(data);
+                const char *data = prefDb.getData(entry, 0);
+                const char *dataEnd = data + prefDb.getEntryLen(entry) - 1;
+                const DBKeyType repKey = getPrefKey(data);
+                for (DBKeyType targetKey = 0; data < dataEnd;) {
+                    targetKey += getPrefKey(data);
                     distances.push_back((targetKey > repKey) ? targetKey - repKey : repKey - targetKey);
                 }
             }
