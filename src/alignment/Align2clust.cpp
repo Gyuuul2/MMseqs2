@@ -1349,7 +1349,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                             size_t paddedDbSize, size_t prefSizeBits, const std::string &repTargetsIndex, const std::string &repTargets, const std::string &accepted,
                             const std::string &assignedChanges, const std::vector<ClusterPair> &members, DBReader<DBKeyType> *memberDbr) {
     const size_t dbSize = seqDbr.getSize();
-    const size_t walkEnd = (prefSizeBits - 1) * paddedDbSize + dbSize;
+    const size_t orderKeyEnd = (prefSizeBits - 1) * paddedDbSize + dbSize;
     const size_t maxSeqLen = seqDbr.getMaxSeqLen();
     // a scattered entry is read as at least one page
     const size_t pageSize = Util::getPageSize();
@@ -1362,30 +1362,30 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     FILE *acceptedHandle = FileUtil::openAndDelete(acceptedLog.c_str(), "w");
     size_t acceptedBytes = 0;
 
-    // the assigned bit ownKey(key) of ownWords for a key of this node, else of a rep in ring word walk key / 64 modulo the ring size, as sent by the master
+    // the assigned bit ownKey(key) of ownWords for a key of this node, else of a rep in ring word order key / 64 modulo the ring size, as sent by the master
     const size_t blockCount = (dbSize + blockKeys - 1) / blockKeys;
     const size_t ownBlocks = (blockCount > MMseqsNode::rank) ? (blockCount - MMseqsNode::rank + MMseqsNode::count - 1) / MMseqsNode::count : 0;
     std::vector<uint64_t> ownWords(ownBlocks * (blockKeys / 64), 0);
     std::vector<uint64_t> ring(lagKeys / 64 + 1, 0);
     size_t ringFirstWord = 0;
-    size_t walkedKey = 0;
+    size_t clusteredKey = 0;
     const auto getOwnKey = [&](size_t key) {
         return key / blockKeys / MMseqsNode::count * blockKeys + key % blockKeys;
     };
-    const auto isAssigned = [&](size_t walkKey) {
-        const size_t key = walkKey % paddedDbSize;
+    const auto isAssigned = [&](size_t orderKey) {
+        const size_t key = orderKey % paddedDbSize;
         if (getAlignNode(blockKeys, key) == MMseqsNode::rank) {
             const size_t ownKey = getOwnKey(key);
             return ((__atomic_load_n(&ownWords[ownKey / 64], __ATOMIC_RELAXED) >> (ownKey % 64)) & 1) != 0;
         }
-        const size_t word = walkKey / 64;
+        const size_t word = orderKey / 64;
         const size_t firstWord = __atomic_load_n(&ringFirstWord, __ATOMIC_ACQUIRE);
         if (word < firstWord || word - firstWord >= ring.size()) {
             return false;
         }
         const uint64_t bits = __atomic_load_n(&ring[word % ring.size()], __ATOMIC_ACQUIRE);
         // the slot may hold a later word once the ring moved on meanwhile
-        return __atomic_load_n(&ringFirstWord, __ATOMIC_ACQUIRE) == firstWord && ((bits >> (walkKey % 64)) & 1) != 0;
+        return __atomic_load_n(&ringFirstWord, __ATOMIC_ACQUIRE) == firstWord && ((bits >> (orderKey % 64)) & 1) != 0;
     };
     const auto setRingKey = [&](size_t key) {
         const size_t word = key / 64;
@@ -1393,7 +1393,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
             __atomic_fetch_or(&ring[word % ring.size()], 1ULL << (key % 64), __ATOMIC_RELEASE);
         }
     };
-    // a step of the master appends its clustered walk key, first and count of entering ring words, ring key count, node key offsets, then those words and keys
+    // a step of the master appends its clustered order key, first and count of entering ring words, ring key count, node key offsets, then those words and keys
     const size_t headerWords = 4 + MMseqsNode::count + 1;
     size_t changesBytes = 0;
     std::vector<uint64_t> changes;
@@ -1411,7 +1411,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
         }
         while (changesBytes + headerWords * sizeof(uint64_t) <= publishedBytes) {
             readChanges(changesBytes, headerWords);
-            const size_t stepWalkedKey = changes[0];
+            const size_t stepClusteredKey = changes[0];
             const size_t sliceFirstWord = changes[1];
             const size_t sliceWords = changes[2];
             const size_t lagKeyCount = changes[3];
@@ -1420,17 +1420,17 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
             const size_t commonStart = changesBytes + headerWords * sizeof(uint64_t);
             const size_t ownStart = commonStart + (sliceWords + lagKeyCount + nodeKeyOffset) * sizeof(uint64_t);
             changesBytes = commonStart + (sliceWords + lagKeyCount + changes[4 + MMseqsNode::count]) * sizeof(uint64_t);
-            if (changesBytes > publishedBytes || stepWalkedKey < walkedKey || nodeKeyEnd < nodeKeyOffset) {
+            if (changesBytes > publishedBytes || stepClusteredKey < clusteredKey || nodeKeyEnd < nodeKeyOffset) {
                 Debug(Debug::ERROR) << "Cannot read " << assignedChanges << "\n";
                 EXIT(EXIT_FAILURE);
             }
             // the words before the clustered key leave the ring, cleared before the release of ringFirstWord, and their slots take the words that enter it
-            const size_t firstWord = stepWalkedKey / 64;
+            const size_t firstWord = stepClusteredKey / 64;
             for (size_t word = ringFirstWord; word < std::min(firstWord, ringFirstWord + ring.size()); word++) {
                 __atomic_store_n(&ring[word % ring.size()], 0, __ATOMIC_RELAXED);
             }
             __atomic_store_n(&ringFirstWord, firstWord, __ATOMIC_RELEASE);
-            walkedKey = stepWalkedKey;
+            clusteredKey = stepClusteredKey;
             readChanges(commonStart, sliceWords + lagKeyCount);
             for (size_t i = 0; i < sliceWords; i++) {
                 if (sliceFirstWord + i >= firstWord && sliceFirstWord + i - firstWord < ring.size()) {
@@ -1438,8 +1438,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                 }
             }
             for (size_t i = sliceWords; i < changes.size(); i++) {
-                for (size_t walkKey = changes[i]; walkKey < walkEnd; walkKey += paddedDbSize) {
-                    setRingKey(walkKey);
+                for (size_t orderKey = changes[i]; orderKey < orderKeyEnd; orderKey += paddedDbSize) {
+                    setRingKey(orderKey);
                 }
             }
             readChanges(ownStart, nodeKeyEnd - nodeKeyOffset);
@@ -1588,7 +1588,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     size_t windowBegin;
     size_t windowEnd;
     readWindow(windowChunk, windowBegin, windowEnd);
-    const size_t firstRepKey = (windowEnd > windowBegin) ? static_cast<size_t>(chunkOrder[windowChunk][windowBegin].first.repKey) : walkEnd;
+    const size_t firstRepKey = (windowEnd > windowBegin) ? static_cast<size_t>(chunkOrder[windowChunk][windowBegin].first.repKey) : orderKeyEnd;
     MMseqsNode::publishLog(acceptedHandle, acceptedLog, firstRepKey, 0);
     size_t publishedBytes = 0;
     time_t publishTime = time(NULL);
@@ -1606,10 +1606,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     while (windowEnd > windowBegin) {
         // the reps of a window are checked in the ring, which the master fills to lagKeys after the clustered key
         const size_t windowRepKey = chunkOrder[windowChunk][windowBegin].first.repKey;
-        if (windowRepKey >= walkedKey + lagKeys) {
+        if (windowRepKey >= clusteredKey + lagKeys) {
             MMseqsNode::publishLog(acceptedHandle, acceptedLog, windowRepKey, acceptedBytes);
             publishedBytes = acceptedBytes;
-            for (unsigned int polls = 0; windowRepKey >= walkedKey + lagKeys; polls++) {
+            for (unsigned int polls = 0; windowRepKey >= clusteredKey + lagKeys; polls++) {
                 MMseqsNode::sleepBeforePoll(polls);
                 readAssignedChanges();
             }
@@ -1622,7 +1622,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
         readWindow(nextChunk, nextBegin, nextEnd);
         getWindowKeys(nextChunk, nextBegin, nextEnd, nextKeys);
         readBand(nextKeys, true);
-        const size_t nextRepKey = (nextEnd > nextBegin) ? static_cast<size_t>(chunkOrder[nextChunk][nextBegin].first.repKey) : walkEnd;
+        const size_t nextRepKey = (nextEnd > nextBegin) ? static_cast<size_t>(chunkOrder[nextChunk][nextBegin].first.repKey) : orderKeyEnd;
         const std::vector<std::pair<ClusterPair, size_t> > &order = chunkOrder[windowChunk];
         const size_t recordCount = windowEnd - windowBegin;
         const size_t batchCount = std::min(recordCount, par.threads * ALIGN_BATCHES_PER_THREAD);
@@ -1705,7 +1705,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                     MMseqsNode::publishLog(acceptedHandle, acceptedLog, doneRepKey, acceptedBytes);
                     publishedBytes = acceptedBytes;
                     publishTime = now;
-                    if (doneRepKey < walkEnd) {
+                    if (doneRepKey < orderKeyEnd) {
                         readAssignedChanges();
                     }
                 }
@@ -1793,7 +1793,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
             MMseqsNode::publishLog(acceptedHandle, acceptedLog, nextRepKey, acceptedBytes);
             publishedBytes = acceptedBytes;
             publishTime = time(NULL);
-            if (nextRepKey < walkEnd) {
+            if (nextRepKey < orderKeyEnd) {
                 readAssignedChanges();
             }
         }
@@ -1809,7 +1809,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
             EXIT(EXIT_FAILURE);
         }
     }
-    MMseqsNode::publishLog(acceptedHandle, acceptedLog, walkEnd, acceptedBytes);
+    MMseqsNode::publishLog(acceptedHandle, acceptedLog, orderKeyEnd, acceptedBytes);
     if (fclose(acceptedHandle) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << acceptedLog << "\n";
         EXIT(EXIT_FAILURE);
@@ -1867,12 +1867,12 @@ struct SetCoverMember {
     size_t takenBit;
 };
 
-// --createdb-mode 3: the master follows the logs of accepted pairs and clusters them in walk key order, greedily or by set cover; returns the number of taken pairs
+// --createdb-mode 3: the master follows the logs of accepted pairs and clusters them in order key order, greedily or by set cover; returns the number of taken pairs
 static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimit, size_t blockKeys, size_t lagKeys, int mode, size_t paddedDbSize, size_t prefSizeBits,
                                    const std::string &accepted, const std::string &assignedChanges, const std::string &taken, const std::string &assignedKeys) {
     const size_t assignedWords = (dbSize + 63) / 64;
-    const size_t walkEnd = (prefSizeBits - 1) * paddedDbSize + dbSize;
-    const size_t walkWords = (walkEnd + 63) / 64;
+    const size_t orderKeyEnd = (prefSizeBits - 1) * paddedDbSize + dbSize;
+    const size_t orderWords = (orderKeyEnd + 63) / 64;
     uint64_t *assigned = new(std::nothrow) uint64_t[assignedWords];
     Util::checkAllocation(assigned, "Can not allocate assigned memory in align2clust");
     memset(assigned, 0, assignedWords * sizeof(uint64_t));
@@ -1923,13 +1923,13 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     size_t liveMemberCount = 0;
     size_t memberCount = 0;
     unsigned int polls = 0;
-    for (size_t walkedKey = 0; walkedKey < walkEnd;) {
+    for (size_t clusteredKey = 0; clusteredKey < orderKeyEnd;) {
         bool hasNewProgress = false;
         for (size_t node = 0; node < MMseqsNode::count; node++) {
             const std::string log = accepted + "." + SSTR(node);
             size_t repKey;
             size_t logBytes;
-            if ((nodeHasProgress[node] && nodeRepKeys[node] == walkEnd) || MMseqsNode::readLogProgress(log, repKey, logBytes) == false
+            if ((nodeHasProgress[node] && nodeRepKeys[node] == orderKeyEnd) || MMseqsNode::readLogProgress(log, repKey, logBytes) == false
                 || (nodeHasProgress[node] && repKey == nodeRepKeys[node] && logBytes == nodeLogBytes[node])) {
                 continue;
             }
@@ -1942,11 +1942,11 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             nodeRepKeys[node] = repKey;
             nodeLogBytes[node] = logBytes;
         }
-        size_t doneRepKey = walkEnd;
+        size_t doneRepKey = orderKeyEnd;
         for (size_t node = 0; node < MMseqsNode::count; node++) {
             doneRepKey = std::min(doneRepKey, nodeHasProgress[node] ? nodeRepKeys[node] : 0);
         }
-        if (doneRepKey <= walkedKey) {
+        if (doneRepKey <= clusteredKey) {
             if (hasNewProgress == false) {
                 MMseqsNode::sleepBeforePoll(polls++);
             }
@@ -2044,7 +2044,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             repKeyOffsets[rep + 1] += repKeyOffsets[rep];
         }
         if (mode == Parameters::SET_COVER) {
-            // a free rep with free members is a set of itself and them, which waits in the heap until no rep that is not walked yet can have a larger one
+            // a free rep with free members is a set of itself and them, which waits in the heap until no rep that is not clustered yet can have a larger one
             const size_t poolOffset = memberPool.size();
             memberPool.resize(poolOffset + repKeyOffsets[repCount]);
 #pragma omp parallel for schedule(dynamic, 1024)
@@ -2071,8 +2071,8 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                 }
             }
             liveMemberCount += repKeyOffsets[repCount];
-            // a rep from walk key stepRepKey on has fewer than 2^(prefSizeBit + 1) targets for prefSizeBit = prefSizeBits - 1 - stepRepKey / paddedDbSize, so its set is at most that large
-            const size_t maxSetSize = (stepRepKey < walkEnd) ? static_cast<size_t>(2) << (prefSizeBits - 1 - stepRepKey / paddedDbSize) : 0;
+            // a rep from order key stepRepKey on has fewer than 2^(prefSizeBit + 1) targets for prefSizeBit = prefSizeBits - 1 - stepRepKey / paddedDbSize, so its set is at most that large
+            const size_t maxSetSize = (stepRepKey < orderKeyEnd) ? static_cast<size_t>(2) << (prefSizeBits - 1 - stepRepKey / paddedDbSize) : 0;
             while (candidates.empty() == false && candidates.front().memberCount > maxSetSize) {
                 std::pop_heap(candidates.begin(), candidates.end(), setCoverComparator);
                 SetCoverCandidate candidate = candidates.back();
@@ -2176,16 +2176,16 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                 appendTakenBits(nodeTaken[node], nodeTakenBits[node].data(), nodeTakenCounts[node], words, taken + "." + SSTR(node));
             }
         }
-        const size_t walkedBefore = walkedKey;
-        walkedKey = stepRepKey;
+        const size_t clusteredBefore = clusteredKey;
+        clusteredKey = stepRepKey;
 
-        // the keys of the step by block node, after those in the ring of every node, a walk key of it in [walkedKey, walkedBefore + lagKeys), and the entering ring words
+        // the keys of the step by block node, after those in the ring of every node, an order key of it in [clusteredKey, clusteredBefore + lagKeys), and the entering ring words
         const auto isRingKey = [&](size_t key) {
-            const size_t walkKey = key + ((walkedKey > key) ? (walkedKey - key + paddedDbSize - 1) / paddedDbSize * paddedDbSize : 0);
-            return walkKey < walkEnd && walkKey < walkedBefore + lagKeys;
+            const size_t orderKey = key + ((clusteredKey > key) ? (clusteredKey - key + paddedDbSize - 1) / paddedDbSize * paddedDbSize : 0);
+            return orderKey < orderKeyEnd && orderKey < clusteredBefore + lagKeys;
         };
-        const size_t sliceFirstWord = std::min(walkWords, std::max(walkedBefore + lagKeys, walkedKey) / 64);
-        const size_t sliceWords = std::min(walkWords, (walkedKey + lagKeys + 63) / 64) - sliceFirstWord;
+        const size_t sliceFirstWord = std::min(orderWords, std::max(clusteredBefore + lagKeys, clusteredKey) / 64);
+        const size_t sliceWords = std::min(orderWords, (clusteredKey + lagKeys + 63) / 64) - sliceFirstWord;
 #pragma omp parallel for schedule(static)
         for (int thread = 0; thread < threads; thread++) {
             std::vector<size_t> &sectionCounts = threadSectionCounts[thread];
@@ -2208,7 +2208,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         }
         const size_t headerWords = 4 + MMseqsNode::count + 1;
         record.resize(headerWords + sliceWords + sectionOffsets[MMseqsNode::count + 1]);
-        record[0] = walkedKey;
+        record[0] = clusteredKey;
         record[1] = sliceFirstWord;
         record[2] = sliceWords;
         record[3] = sectionOffsets[1];
@@ -2235,7 +2235,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             EXIT(EXIT_FAILURE);
         }
         changesBytes += record.size() * sizeof(uint64_t);
-        MMseqsNode::publishLog(changesHandle, assignedChanges, walkedKey, changesBytes);
+        MMseqsNode::publishLog(changesHandle, assignedChanges, clusteredKey, changesBytes);
     }
     // every node is done, so it reads neither the log of changes nor writes its log of accepted pairs any more
     if (fclose(changesHandle) != 0) {
@@ -2308,7 +2308,7 @@ static int align2clustLinfinity(Parameters &par) {
                             << smallestMemoryLimit << " bytes. Run on nodes with more memory\n";
         EXIT(EXIT_FAILURE);
     }
-    // --cluster-mode 0 walks a rep at walk key (prefSizeBits - 1 - prefSizeBit) * paddedDbSize + its key, prefSizeBit = the highest bit of its target count
+    // --cluster-mode 0 orders a rep by order key (prefSizeBits - 1 - prefSizeBit) * paddedDbSize + its key, prefSizeBit = the highest bit of its target count
     const size_t paddedDbSize = assignedWords * 64;
     const size_t prefSizeBits = (par.clusteringMode == Parameters::SET_COVER) ? 64 - __builtin_clzll(dbSize | 1) : 1;
     const size_t splitBytes = std::max<size_t>(1, smallestMemoryLimit / 8);
