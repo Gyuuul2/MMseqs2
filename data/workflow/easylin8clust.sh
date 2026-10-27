@@ -36,6 +36,7 @@ if notExists "${TMP_PATH}/result2flat.done"; then
 fi
 
 for FILE in "${TMP_PATH}/cluster.tsv".* "${TMP_PATH}/rep_seq.fasta".*; do
+    [ -e "$FILE" ] || continue
     NAME="${FILE##*/}"
     mv "$FILE" "${RESULTS}_${NAME}"
 done

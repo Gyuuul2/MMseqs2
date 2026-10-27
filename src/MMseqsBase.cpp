@@ -168,7 +168,9 @@ std::vector<Command> baseCommands = {
                 "# Create a seqDB from stdin\n"
                 "cat seq.fasta | mmseqs createdb stdin sequenceDB\n\n"
                 "# Create a seqDB by indexing existing FASTA/Q (for single line fasta entries only)\n"
-                "mmseqs createdb seq.fasta sequenceDB --createdb-mode 1\n",
+                "mmseqs createdb seq.fasta sequenceDB --createdb-mode 1\n\n"
+                "# Create a length-sorted seqDB on several nodes (split large .zst input into frames with pzstd)\n"
+                "srun -N 4 --ntasks-per-node=1 mmseqs createdb seq.fasta.zst sequenceDB --createdb-mode 3\n",
                 "Martin Steinegger <martin.steinegger@snu.ac.kr>",
                 "<i:fastaFile1[.gz|.bz2|.zst]> ... <i:fastaFileN[.gz|.bz2|.zst]>|<i:stdin> <o:sequenceDB>",
                 CITATION_MMSEQS2, {{"fast[a|q]File[.gz|.bz2|.zst]|stdin", DbType::ACCESS_MODE_INPUT, DbType::NEED_DATA | DbType::VARIADIC, &DbValidator::flatfileStdinAndGeneric },

@@ -15,9 +15,7 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     Parameters& par = Parameters::getInstance();
     setLinclustWorkflowDefaults(&par);
     par.clustHash = true;
-    par.linclustIterations = 1;
     par.diagonalMode = Parameters::DIAGONAL_MODE_UNGAPPED;
-    par.clusteringMode = Parameters::GREEDY;
     par.PARAM_ADD_BACKTRACE.addCategory(MMseqsParameter::COMMAND_EXPERT);
     par.PARAM_ALT_ALIGNMENT.addCategory(MMseqsParameter::COMMAND_EXPERT);
     par.PARAM_ZDROP.addCategory(MMseqsParameter::COMMAND_EXPERT);
@@ -45,6 +43,18 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     }
 
     const bool nonSymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
+    if (par.PARAM_CLUSTER_MODE.wasSet == false) {
+        if (nonSymetric) {
+            par.clusteringMode = Parameters::GREEDY_MEM;
+        } else {
+            par.clusteringMode = Parameters::SET_COVER;
+        }
+        std::string cluMode = (par.clusteringMode == Parameters::GREEDY_MEM) ? "GREEDY MEM" : "SET COVER";
+        Debug(Debug::INFO) << "Set cluster mode " << cluMode << ".\n";
+    }
+    if (par.PARAM_ALPH_SIZE.wasSet == false) {
+        par.alphabetSize = MultiParam<NuclAA<int>>(NuclAA<int>(Parameters::CLUST_LINEAR_DEFAULT_ALPH_SIZE, 5));
+    }
     par.includeCountTable = false;
     par.countTableIteration = 0;
     if (par.PARAM_INCLUDE_ADJACENCY.wasSet == false && par.PARAM_NUM_ADJACENCY.wasSet == false) {
@@ -60,6 +70,13 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     cmd.addVariable("ALIGN2CLUST_PAR", par.createParameterString(par.align2clust).c_str());
     cmd.addVariable("MERGECLU_PAR", par.createParameterString(par.mergeclusters).c_str());
     cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
+    cmd.addVariable("LINCLUST_ITERATIONS", SSTR(par.linclustIterations).c_str());
+    // the second iteration matches the representatives with spaced k-mers, a tenth as many per sequence (see linclust)
+    if (par.linclustIterations > 1) {
+        par.spacedKmer = true;
+        par.kmersPerSequenceScale = 0.1;
+        cmd.addVariable("KMERMATCHER_PAR2", par.createParameterString(par.kmermatcher).c_str());
+    }
 
     // # 0. clust hash
     par.seqIdThr = std::max(0.9f, par.seqIdThr);

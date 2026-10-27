@@ -52,7 +52,7 @@ int easylin8clust(int argc, const char **argv, const Command &command) {
     cmd.addVariable("CREATEDB_PAR", par.createParameterString(par.createdb, true).c_str());
     cmd.addVariable("CLUSTER_PAR", par.createParameterString(par.lin8clustworkflow, true).c_str());
     cmd.addVariable("CREATETSV_PAR", par.createParameterString(par.createtsv).c_str());
-    cmd.addVariable("RESULT2FLAT_PAR", par.createParameterString(par.onlythreads).c_str());
+    cmd.addVariable("RESULT2FLAT_PAR", par.createParameterString(par.result2flat).c_str());
     cmd.addVariable("VERBOSITY_PAR", par.createParameterString(par.onlyverbosity).c_str());
 
     std::string program = tmpDir + "/easylin8clust.sh";
