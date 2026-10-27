@@ -1110,6 +1110,11 @@ static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             Debug(Debug::ERROR) << partitionsFile << " has a partition of key " << partition.firstKey << ", which is not in " << par.db1 << "\n";
             EXIT(EXIT_FAILURE);
         }
+        // the flushes of a node are read as one block in rep order (alignRepTargets), so the partitions must be in key order
+        if (partitions.empty() == false && partition.firstKey < partitions.back().firstKey) {
+            Debug(Debug::ERROR) << partitionsFile << " has the partition of key " << partition.firstKey << " out of key order\n";
+            EXIT(EXIT_FAILURE);
+        }
         partitions.push_back(partition);
         totalCost += partition.cost;
     }
@@ -1362,7 +1367,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     const unsigned int swMode = Alignment::initSWMode(par.alignmentMode, par.covThr, par.seqIdThr);
     std::vector<MMseqsNode::ExchangeBlock> repBlocks;
     std::vector<FILE *> repFiles;
-    MMseqsNode::openExchange(repTargetsIndex, repTargets, repBlocks, repFiles);
+    // a node sends its partitions in key order, so its flushes are in rep order and read as one block (see sendRepTargets); set cover orders reps by order key
+    MMseqsNode::openExchange(repTargetsIndex, repTargets, repBlocks, repFiles, par.clusteringMode != Parameters::SET_COVER);
     const std::string acceptedLog = accepted + "." + SSTR(MMseqsNode::rank);
     FILE *acceptedHandle = FileUtil::openAndDelete(acceptedLog.c_str(), "w");
     size_t acceptedBytes = 0;
@@ -1821,7 +1827,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     }
     // readExchangeRange stops at a block that is out of order, so every block must be read to its end
     for (size_t i = 0; i < repBlocks.size(); i++) {
-        if (repBlocks[i].pos != repBlocks[i].end || repBlocks[i].bufferPos != repBlocks[i].bufferEnd) {
+        if (repBlocks[i].pos != repBlocks[i].end || repBlocks[i].partsBytes != 0 || repBlocks[i].bufferPos != repBlocks[i].bufferEnd) {
             Debug(Debug::ERROR) << "Cannot read " << repTargets << ": its records are not in rep order\n";
             EXIT(EXIT_FAILURE);
         }
