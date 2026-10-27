@@ -2089,7 +2089,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         }
 
         // the keys of the step by block node, after those in the ring of every node, [walkedKey, walkedBefore + lagKeys), and the entering ring words
-        const size_t sliceFirstWord = std::min(assignedWords, (walkedBefore + lagKeys) / 64);
+        const size_t sliceFirstWord = std::min(assignedWords, std::max(walkedBefore + lagKeys, walkedKey) / 64);
         const size_t sliceWords = std::min(assignedWords, (walkedKey + lagKeys + 63) / 64) - sliceFirstWord;
 #pragma omp parallel for schedule(static)
         for (int thread = 0; thread < threads; thread++) {
