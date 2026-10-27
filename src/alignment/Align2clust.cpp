@@ -2288,7 +2288,7 @@ static int align2clustLinfinity(Parameters &par) {
     const size_t dbSize = seqDbr.getSize();
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     // the master clusters with half of its memory and a few more threads, which mostly wait for pairs, while it aligns like every node
-    const size_t memoryLimit = Util::computeMemory(0) / (MMseqsNode::isMaster() ? 2 : 1);
+    const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit) / (MMseqsNode::isMaster() ? 2 : 1);
     const int clusterThreads = std::min(CLUSTER_THREADS, std::max(1, par.threads / 4));
 
     // a clusthashfast subset: its representatives are the bits of every node and the sixth column of its index, the residues of the e-values
