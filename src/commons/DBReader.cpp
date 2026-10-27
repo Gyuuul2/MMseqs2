@@ -120,10 +120,9 @@ template <typename T> bool DBReader<T>::open(int accessType){
             Debug(Debug::ERROR) << "Database " << dataFileName << " was created with --createdb-mode 3, which this command does not support\n";
             EXIT(EXIT_FAILURE);
         }
-        // a mode 3 database is only read in key order
         if (isLinfinity && accessType != NOSORT && accessType != HARDNOSORT && accessType != LINEAR_ACCCESS) {
-            accessType = NOSORT;
-            this->accessType = NOSORT;
+            Debug(Debug::ERROR) << "Database " << dataFileName << " was created with --createdb-mode 3 and is read in key order only\n";
+            EXIT(EXIT_FAILURE);
         }
     }
     if (dataMode & USE_DATA) {
@@ -1105,6 +1104,9 @@ template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<
     }
     const size_t pageSize = Util::getPageSize();
     size_t bytes = 0;
+    // the gaps read with the entries stay below the bytes of the entries, so the buffer is at most about twice them
+    size_t entryBytes = 0;
+    size_t gapBytes = 0;
     for (size_t i = 0; i < keys.size(); i++) {
         if (keys[i] >= size || (i > 0 && keys[i] <= keys[i - 1])) {
             Debug(Debug::ERROR) << "loadData: keys are not ascending keys of " << dataFileName << "\n";
@@ -1114,14 +1116,18 @@ template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<
         const size_t begin = index[range].offset + (keys[i] - indexIdToNum(&index[range].id)) * index[range].length;
         const size_t end = begin + index[range].length;
         const int fd = dataFds[index2dbfile[range]];
+        entryBytes += index[range].length;
+        const size_t gap = readRequests.empty() ? 0 : begin - std::min(begin, readRequests.back().fileOffset + readRequests.back().minBytesToRead);
         if (readRequests.empty() || readRequests.back().fileToRead != fd || begin < readRequests.back().fileOffset
-            || begin > readRequests.back().fileOffset + readRequests.back().minBytesToRead + READ_MERGE_GAP) {
+            || gap > READ_MERGE_GAP || gapBytes + gap > entryBytes) {
             if (readRequests.empty() == false) {
                 bytes += readRequests.back().bytesToRead;
             }
             const BatchReader::ReadRequest request = { fd, dataFileNames[index2dbfile[range]].c_str(), NULL, begin / pageSize * pageSize, 0, 0 };
             readRequests.push_back(request);
             requestFirstKeys.push_back(keys[i]);
+        } else {
+            gapBytes += gap;
         }
         BatchReader::ReadRequest &request = readRequests.back();
         request.minBytesToRead = std::max(request.minBytesToRead, end - request.fileOffset);
@@ -1756,9 +1762,9 @@ void DBReader<T>::copyDb(const std::string &databaseName, const std::string &out
 
 template<typename T>
 std::vector<size_t> DBReader<T>::getFileKeyOffsets(size_t fileCount) {
-    // the files hold ascending keys, so the last range is in the last file with keys; the files after it are empty when there are fewer lengths than files
-    const size_t databaseFiles = (indexSize == 0) ? 0 : index2dbfile[indexSize - 1] + 1;
-    if (databaseFiles > fileCount) {
+    // the files hold ascending keys, so the files after the last one with keys are empty when there are fewer lengths than files
+    const size_t databaseFiles = FileUtil::findDatafiles(dataFileName).size();
+    if (databaseFiles != fileCount) {
         Debug(Debug::ERROR) << "Database " << dataFileName << " has " << databaseFiles << " data files, but runs on " << fileCount << " nodes\n";
         EXIT(EXIT_FAILURE);
     }

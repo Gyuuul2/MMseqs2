@@ -284,17 +284,12 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     std::vector<LengthRange> nodeSeqRange;
     if (isLinfinity) {
         MMseqsNode::init();
-        if (reader.getDataFileCnt() != MMseqsNode::count) {
-            Debug(Debug::ERROR) << "Database " << par.db1 << " has " << reader.getDataFileCnt() << " data files, but clusthashfast runs on " << MMseqsNode::count << " nodes\n";
-            EXIT(EXIT_FAILURE);
-        }
+        const size_t endKey = reader.getFileKeyOffsets(MMseqsNode::count)[MMseqsNode::rank + 1];
         const DBReader<DBKeyType>::Index *index = reader.getIndex();
-        size_t endKey = reader.getSize();
         size_t endOffset = 0;
         for (size_t range = 0; range < reader.getIndexSize(); range++) {
             if (reader.getIndexFile(range) == MMseqsNode::rank) {
                 nodeSeqRange.push_back({index[range].id, index[range].offset, index[range].length});
-                endKey = (range + 1 < reader.getIndexSize()) ? index[range + 1].id : reader.getSize();
                 endOffset = index[range].offset + (endKey - index[range].id) * index[range].length;
             }
         }
