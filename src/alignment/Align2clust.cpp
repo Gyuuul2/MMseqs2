@@ -1593,12 +1593,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     size_t publishedBytes = 0;
     time_t publishTime = time(NULL);
     std::mutex acceptedMutex;
+    std::mutex assignedChangesMutex;
     std::vector<DBKeyType> keys;
     std::vector<DBKeyType> nextKeys;
     std::vector<unsigned char> batchDone;
     std::vector<std::vector<ClusterPair> > batchPairs;
     std::vector<ClusterPair> windowPairs;
     std::vector<size_t> memberStarts;
+    std::vector<size_t> memberBytes;
     std::vector<size_t> partOffsets;
     std::vector<unsigned char> membersPassed;
     std::vector<DBKeyType> partKeys;
@@ -1640,16 +1642,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
             BlockAligner blockAligner(Parameters::DBTYPE_AMINO_ACIDS, maxSeqLen, scoring.subMat, &scoring.fastMatrix,
                                      &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
                                      -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
-            Sequence *element = NULL;
-            Matcher *matcher = NULL;
-            if (memberDbr != NULL) {
-                element = new Sequence(maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection);
-                matcher = new Matcher(Parameters::DBTYPE_AMINO_ACIDS, maxSeqLen, scoring.subMat, &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
-                                      par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop);
-            }
             std::string querySeqBuffer;
             std::vector<ClusterPair> pairs;
-            std::vector<DBKeyType> memberKeys;
 #pragma omp for schedule(dynamic, 1)
             for (size_t batch = 0; batch < batchCount; batch++) {
                 pairs.clear();
@@ -1683,72 +1677,94 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                     }
                 }
                 // the pairs of the batches go to the log in batch order, so the reps before the first unfinished batch are done and their pairs are in the log
-                std::lock_guard<std::mutex> lock(acceptedMutex);
-                batchPairs[batch].swap(pairs);
-                batchDone[batch] = 1;
-                // with --filter-cludb-file the pairs go to the log once the members of their targets are aligned
-                if (memberDbr != NULL) {
-                    continue;
-                }
-                for (; firstUnfinishedBatch < batchCount && batchDone[firstUnfinishedBatch]; firstUnfinishedBatch++) {
-                    std::vector<ClusterPair> &donePairs = batchPairs[firstUnfinishedBatch];
-                    if (fwrite(donePairs.data(), sizeof(ClusterPair), donePairs.size(), acceptedHandle) != donePairs.size()) {
-                        Debug(Debug::ERROR) << "Cannot write " << acceptedLog << "\n";
-                        EXIT(EXIT_FAILURE);
+                bool hasPublished = false;
+                {
+                    std::lock_guard<std::mutex> lock(acceptedMutex);
+                    batchPairs[batch].swap(pairs);
+                    batchDone[batch] = 1;
+                    // with --filter-cludb-file the pairs go to the log once the members of their targets are aligned
+                    if (memberDbr != NULL) {
+                        continue;
                     }
-                    acceptedBytes += donePairs.size() * sizeof(ClusterPair);
-                    std::vector<ClusterPair>().swap(donePairs);
+                    for (; firstUnfinishedBatch < batchCount && batchDone[firstUnfinishedBatch]; firstUnfinishedBatch++) {
+                        std::vector<ClusterPair> &donePairs = batchPairs[firstUnfinishedBatch];
+                        if (fwrite(donePairs.data(), sizeof(ClusterPair), donePairs.size(), acceptedHandle) != donePairs.size()) {
+                            Debug(Debug::ERROR) << "Cannot write " << acceptedLog << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        acceptedBytes += donePairs.size() * sizeof(ClusterPair);
+                        std::vector<ClusterPair>().swap(donePairs);
+                    }
+                    const time_t now = time(NULL);
+                    if (acceptedBytes - publishedBytes >= PUBLISH_BYTES || now - publishTime >= PUBLISH_SECONDS) {
+                        const size_t doneRepKey = (firstUnfinishedBatch < batchCount) ? static_cast<size_t>(order[windowBegin + recordCount * firstUnfinishedBatch / batchCount].first.repKey) : nextRepKey;
+                        MMseqsNode::publishLog(acceptedHandle, acceptedLog, doneRepKey, acceptedBytes);
+                        publishedBytes = acceptedBytes;
+                        publishTime = now;
+                        hasPublished = doneRepKey < orderKeyEnd;
+                    }
                 }
-                const time_t now = time(NULL);
-                if (acceptedBytes - publishedBytes >= PUBLISH_BYTES || now - publishTime >= PUBLISH_SECONDS) {
-                    const size_t doneRepKey = (firstUnfinishedBatch < batchCount) ? static_cast<size_t>(order[windowBegin + recordCount * firstUnfinishedBatch / batchCount].first.repKey) : nextRepKey;
-                    MMseqsNode::publishLog(acceptedHandle, acceptedLog, doneRepKey, acceptedBytes);
-                    publishedBytes = acceptedBytes;
-                    publishTime = now;
-                    if (doneRepKey < orderKeyEnd) {
+                // the changes are read while the other threads write their pairs, by one thread at a time
+                if (hasPublished) {
+                    std::unique_lock<std::mutex> changesLock(assignedChangesMutex, std::try_to_lock);
+                    if (changesLock.owns_lock()) {
                         readAssignedChanges();
                     }
                 }
             }
-            // --filter-cludb-file: the members of the targets of the accepted pairs are read in parts that fit a 16th of the memory, a target in one part
-            if (memberDbr != NULL) {
-#pragma omp single
-                {
-                    windowPairs.clear();
-                    for (size_t batch = 0; batch < batchCount; batch++) {
-                        windowPairs.insert(windowPairs.end(), batchPairs[batch].begin(), batchPairs[batch].end());
-                    }
-                    memberStarts.resize(windowPairs.size());
-                    partOffsets.assign(1, 0);
-                    for (size_t i = 0, partBytes = 0; i < windowPairs.size(); i++) {
-                        const ClusterPair target = { windowPairs[i].memberKey, windowPairs[i].memberKey };
-                        memberStarts[i] = std::lower_bound(members.begin(), members.end(), target, ClusterPair::compareByRep) - members.begin();
-                        size_t targetBytes = 0;
-                        for (size_t member = memberStarts[i]; member < members.size() && members[member].repKey == target.repKey; member++) {
-                            targetBytes += std::max(memberDbr->getEntryLen(members[member].memberKey), pageSize);
-                        }
-                        if (i > partOffsets.back() && partBytes + targetBytes > memoryLimit / 16) {
-                            partOffsets.push_back(i);
-                            partBytes = 0;
-                        }
-                        partBytes += targetBytes;
-                    }
-                    partOffsets.push_back(windowPairs.size());
-                    membersPassed.assign(windowPairs.size(), 0);
+        }
+        // --filter-cludb-file: the members of the targets of the accepted pairs are read in parts that fit a 16th of the memory, a target in one part
+        if (memberDbr != NULL) {
+            windowPairs.clear();
+            for (size_t batch = 0; batch < batchCount; batch++) {
+                windowPairs.insert(windowPairs.end(), batchPairs[batch].begin(), batchPairs[batch].end());
+            }
+            memberStarts.resize(windowPairs.size());
+            memberBytes.resize(windowPairs.size());
+#pragma omp parallel for schedule(dynamic, 1024)
+            for (size_t i = 0; i < windowPairs.size(); i++) {
+                const ClusterPair target = { windowPairs[i].memberKey, windowPairs[i].memberKey };
+                memberStarts[i] = std::lower_bound(members.begin(), members.end(), target, ClusterPair::compareByRep) - members.begin();
+                memberBytes[i] = 0;
+                for (size_t member = memberStarts[i]; member < members.size() && members[member].repKey == target.repKey; member++) {
+                    memberBytes[i] += std::max(memberDbr->getEntryLen(members[member].memberKey), pageSize);
                 }
-                for (size_t part = 0; part + 1 < partOffsets.size(); part++) {
-#pragma omp single
-                    {
-                        partKeys.clear();
-                        for (size_t i = partOffsets[part]; i < partOffsets[part + 1]; i++) {
-                            for (size_t member = memberStarts[i]; member < members.size() && members[member].repKey == windowPairs[i].memberKey; member++) {
-                                partKeys.push_back(members[member].memberKey);
-                            }
-                        }
-                        std::sort(partKeys.begin(), partKeys.end());
-                        partKeys.erase(std::unique(partKeys.begin(), partKeys.end()), partKeys.end());
-                        memberDbr->loadData(partKeys);
+            }
+            partOffsets.assign(1, 0);
+            for (size_t i = 0, partBytes = 0; i < windowPairs.size(); i++) {
+                if (i > partOffsets.back() && partBytes + memberBytes[i] > memoryLimit / 16) {
+                    partOffsets.push_back(i);
+                    partBytes = 0;
+                }
+                partBytes += memberBytes[i];
+            }
+            partOffsets.push_back(windowPairs.size());
+            membersPassed.assign(windowPairs.size(), 0);
+            for (size_t part = 0; part + 1 < partOffsets.size(); part++) {
+                partKeys.clear();
+                for (size_t i = partOffsets[part]; i < partOffsets[part + 1]; i++) {
+                    for (size_t member = memberStarts[i]; member < members.size() && members[member].repKey == windowPairs[i].memberKey; member++) {
+                        partKeys.push_back(members[member].memberKey);
                     }
+                }
+                SORT_PARALLEL(partKeys.begin(), partKeys.end());
+                partKeys.erase(std::unique(partKeys.begin(), partKeys.end()), partKeys.end());
+                memberDbr->loadData(partKeys);
+#pragma omp parallel
+                {
+                    unsigned int thread_idx = 0;
+#ifdef OPENMP
+                    thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+                    Sequence query(maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection);
+                    Sequence element(maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection);
+                    BlockAligner blockAligner(Parameters::DBTYPE_AMINO_ACIDS, maxSeqLen, scoring.subMat, &scoring.fastMatrix,
+                                             &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
+                                             -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
+                    Matcher matcher(Parameters::DBTYPE_AMINO_ACIDS, maxSeqLen, scoring.subMat, &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
+                                    par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop);
+                    std::string querySeqBuffer;
+                    std::vector<DBKeyType> memberKeys;
 #pragma omp for schedule(dynamic, 1)
                     for (size_t i = partOffsets[part]; i < partOffsets[part + 1]; i++) {
                         const ClusterPair &pair = windowPairs[i];
@@ -1770,14 +1786,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                         query.mapSequence(repKey, repKey, querySeqBuffer.c_str(), header.repLength);
                         blockAligner.setQuery(&query);
                         bool matcherInitialized = false;
-                        membersPassed[i] = alignClusterMembers(par, blockAligner, *matcher, matcherInitialized, query, *element, memberKeys, memberDbr, 0, swMode, thread_idx, NULL, NULL);
+                        membersPassed[i] = alignClusterMembers(par, blockAligner, matcher, matcherInitialized, query, element, memberKeys, memberDbr, 0, swMode, thread_idx, NULL, NULL);
                     }
                 }
             }
-            delete matcher;
-            delete element;
-        }
-        if (memberDbr != NULL) {
             // the pairs whose members passed go to the log in window order
             size_t acceptedCount = 0;
             for (size_t i = 0; i < windowPairs.size(); i++) {

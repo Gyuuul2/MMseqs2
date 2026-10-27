@@ -4348,6 +4348,10 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
         if (isLinfinity == false
             && (par.linclustVersion != Parameters::LINCLUST_VERSION2
                 || Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_AMINO_ACIDS) == false)) {
+            if (par.PARAM_DIAGONAL_MODE.wasSet) {
+                Debug(Debug::WARNING) << "--diagonal-mode 1 cannot be combined with --linclust-version 1 or nucleotide databases\n";
+                Debug(Debug::WARNING) << "We recompute with --diagonal-mode 0\n";
+            }
             par.diagonalMode = Parameters::DIAGONAL_MODE_KMER;
         } else {
             if (par.includeCountTable && par.PARAM_INCLUDE_COUNTTABLE.wasSet) {

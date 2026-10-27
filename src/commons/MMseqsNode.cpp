@@ -687,6 +687,11 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
             previousRepKey = pairs[writeCount - 1].repKey;
         } while (pairCount > 0);
     }
+    const ClusterPair lastPair = { DB_KEY_INVALID, DB_KEY_INVALID };
+    if (readExchangeRange(repBlocks, memoryLimit / 8, ClusterPair::recordSize, ClusterPair::compareByRep, lastPair, records, NULL, prefix) > 0) {
+        Debug(Debug::ERROR) << "Key " << reinterpret_cast<ClusterPair *>(records.data())->repKey << " of " << prefix << " is no key of node " << rank << "\n";
+        EXIT(EXIT_FAILURE);
+    }
     if (previousRepKey != DB_KEY_INVALID) {
         dbw.writeAdd("\0", 1, 0);
     }
