@@ -57,7 +57,7 @@ private:
                    int *bestScores, int *bestRows, int *bestColumns, int *startRows, int *startColumns, std::string *backtraces, uint32_t *identities);
 
     void runBanded(std::vector<BandJob> &jobs, bool reverse, bool trace, const unsigned char *const *targets, const int *targetLengths,
-                   const int *diagonals, int *bandWidths, s_align *aligns, std::string *backtraces, const int *minScores);
+                   int *bandWidths, s_align *aligns, std::string *backtraces, const int *minScores);
 
     BaseMatrix *subMat;
     int alphabetSize;
@@ -99,7 +99,6 @@ private:
     size_t traceCapacity;
 
     std::vector<size_t> jobBuffer;
-    std::vector<size_t> nextBuffer;
     std::vector<BandJob> bandJobs;
     std::vector<int> bestScores;
     std::vector<int> bestRows;
@@ -107,7 +106,6 @@ private:
     std::vector<int> startRows;
     std::vector<int> startColumns;
     std::vector<uint32_t> identities;
-    std::vector<unsigned char> ungappedRows;
 
     void resize(size_t length);
 };

@@ -37,7 +37,7 @@ struct SwipeLanes<int16_t> {
 
 static const int SWIPE_MAX_LANES = VECSIZE_INT * 4;
 static const unsigned char SWIPE_ZERO_INDEX = 0x80;
-static const size_t SWIPE_MAX_TRACE_CELLS = 4 * 1024 * 1024;
+static const size_t SWIPE_MAX_TRACE_CELLS = 16 * 1024 * 1024 / sizeof(simd_int);
 
 // shuffle indices of the lane letters into the 0-15 and 16-31 score tables, the high byte of 16 bit lanes reads 0
 template <typename T>
@@ -110,7 +110,6 @@ SwipeAligner::SwipeAligner(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorr
         scoreLo16[a] = simdi_loadu(reinterpret_cast<const simd_int *>(lo16));
         scoreHi16[a] = simdi_loadu(reinterpret_cast<const simd_int *>(hi16));
     }
-    resize(maxSeqLen + 1);
 }
 
 SwipeAligner::~SwipeAligner() {
@@ -212,8 +211,10 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
         const size_t id = laneJob[l];
         s_align &a = aligns[id];
         if (Reverse) {
-            a.dbStartPos1 = a.dbEndPos1 - laneBestColumn[l];
-            a.qStartPos1 = Lq - 1 - laneBestRow[l];
+            if (laneBest[l] >= static_cast<int>(a.score1)) {
+                a.dbStartPos1 = a.dbEndPos1 - laneBestColumn[l];
+                a.qStartPos1 = Lq - 1 - laneBestRow[l];
+            }
         } else {
             a.score1 = laneBest[l];
             a.dbEndPos1 = laneBestColumn[l];
@@ -584,7 +585,7 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
 }
 
 void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool reverse, bool doTrace, const unsigned char *const *targets, const int *targetLengths,
-                             const int *diagonals, int *bandWidths, s_align *aligns, std::string *backtraces, const int *minScores) {
+                             int *bandWidths, s_align *aligns, std::string *backtraces, const int *minScores) {
     const int Lq = queryLength;
     std::vector<BandJob> pending;
     while (jobs.empty() == false) {
@@ -675,6 +676,9 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool reverse, bool doTr
                 const int row = bestRows[l];
                 const int column = row + job.offset + bestColumns[l];
                 if (reverse) {
+                    if (best < static_cast<int>(a.score1)) {
+                        continue;
+                    }
                     a.qStartPos1 = Lq - 1 - row;
                     a.dbStartPos1 = targetLengths[job.id] - 1 - column;
                 } else if (doTrace) {
@@ -694,7 +698,6 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool reverse, bool doTr
         }
         jobs.swap(pending);
     }
-    (void) diagonals;
 }
 
 void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals, int *bandWidths,
@@ -733,7 +736,7 @@ void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets
         job.rowEnd = std::min(Lq, job.columnEnd - job.offset);
         bandJobs.push_back(job);
     }
-    runBanded(bandJobs, false, doTrace, targets, targetLengths, diagonals, bandWidths, aligns, backtraces, minScores);
+    runBanded(bandJobs, false, doTrace, targets, targetLengths, bandWidths, aligns, backtraces, minScores);
 }
 
 void SwipeAligner::alignBandedBackward(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals, int *bandWidths, s_align *aligns) {
@@ -761,7 +764,7 @@ void SwipeAligner::alignBandedBackward(size_t count, const unsigned char *const 
         job.rowEnd = std::min(Lq, job.columnEnd - job.offset);
         bandJobs.push_back(job);
     }
-    runBanded(bandJobs, true, false, targets, targetLengths, diagonals, bandWidths, aligns, NULL, NULL);
+    runBanded(bandJobs, true, false, targets, targetLengths, bandWidths, aligns, NULL, NULL);
 }
 
 bool SwipeAligner::canAlignUngapped(int targetLength) const {
