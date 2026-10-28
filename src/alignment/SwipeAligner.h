@@ -28,8 +28,6 @@ public:
     // and a lane stops once its row maximum falls more than xDrop (if > 0) below its best
     void alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals, int *bandWidths,
                      s_align *aligns, std::string *backtraces, const int *columnEnds, const int *minScores, int xDrop);
-    // qStartPos1 and dbStartPos1 from the results of alignBanded
-    void alignBandedBackward(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals, int *bandWidths, s_align *aligns);
 
     // whether ungappedAlign fits a target of this length in 16 bit lanes
     bool canAlignUngapped(int targetLength) const;
@@ -47,17 +45,16 @@ private:
         int rowEnd;
         int columnBegin;
         int columnEnd;
-        int rowStart;
     };
 
     template <typename T, bool Reverse>
     void alignFull(const std::vector<size_t> &jobs, const unsigned char *const *targets, const int *targetLengths, s_align *aligns);
 
-    template <typename T, bool Reverse, bool Trace>
+    template <typename T, bool Trace>
     void alignBand(const BandJob *jobs, size_t jobCount, const unsigned char *const *targets, const int *targetLengths,
                    int *bestScores, int *bestRows, int *bestColumns, int *startRows, int *startColumns, std::string *backtraces, uint32_t *identities, int xDrop);
 
-    void runBanded(std::vector<BandJob> &jobs, bool reverse, bool trace, const unsigned char *const *targets, const int *targetLengths,
+    void runBanded(std::vector<BandJob> &jobs, bool trace, const unsigned char *const *targets, const int *targetLengths,
                    int *bandWidths, s_align *aligns, std::string *backtraces, const int *minScores, int xDrop);
 
     BaseMatrix *subMat;
