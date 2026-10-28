@@ -903,7 +903,7 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
     }
     size_t processed = targets.size();
     // targets in batches of growing size, a rep that got assigned meanwhile skips the rest
-    for (size_t chunkStart = 0, chunkSize = SWIPE_MIN_TARGETS; chunkStart < processed; chunkStart += chunkSize, chunkSize *= 2) {
+    for (size_t chunkStart = 0, chunkSize = 4 * SWIPE_MIN_TARGETS; chunkStart < processed; chunkStart += chunkSize, chunkSize *= 2) {
         const size_t chunkEnd = std::min(targets.size(), chunkStart + chunkSize);
         swipe.clear();
         // 1. ungapped alignment of the targets that are not assigned yet
