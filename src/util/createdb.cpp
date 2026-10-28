@@ -750,16 +750,17 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
 
     const size_t activeThreads = std::max<size_t>(1, std::min<size_t>(par.threads, nodePieces.size()));
     size_t maxPieceSize = 0;
+    size_t writtenBytes = 0;
     for (size_t i = 0; i < pieceHistograms.size(); i++) {
         size_t pieceSize = 0;
         for (size_t j = 0; j < pieceHistograms[i].size(); j++) {
             pieceSize += pieceHistograms[i][j].sequenceCount * (pieceHistograms[i][j].length + 2 + sizeof(uint64_t)) + pieceHistograms[i][j].headerSize;
         }
         maxPieceSize = std::max(maxPieceSize, pieceSize);
+        writtenBytes += pieceSize;
     }
     const size_t bufferSize = std::min(maxPieceSize, static_cast<size_t>(Util::computeMemory(0) * 0.95) / (2 * activeThreads));
-    size_t writtenBytes = 0;
-#pragma omp parallel num_threads(activeThreads) reduction(+:writtenBytes)
+#pragma omp parallel num_threads(activeThreads)
     {
         char *buffer = new(std::nothrow) char[bufferSize];
         Util::checkAllocation(buffer, "Can not allocate buffer memory in createdb");
@@ -784,7 +785,6 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                         EXIT(EXIT_FAILURE);
                     }
                     flushBufferToDisk(dataFileFds, dataFile, buffer, bufferPos, sortedBuffer, lengthToBin);
-                    writtenBytes += bufferPos + entryCount * sizeof(uint64_t);
                     bufferPos = 0;
                     entryCount = 0;
                 }
@@ -801,7 +801,6 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             }
             if (bufferPos > 0) {
                 flushBufferToDisk(dataFileFds, dataFile, buffer, bufferPos, sortedBuffer, lengthToBin);
-                writtenBytes += bufferPos + entryCount * sizeof(uint64_t);
             }
             delete kseq;
         }
@@ -819,6 +818,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     MMseqsNode::addPhaseValue(phaseValues, "Bytes written", SSTR(writtenBytes));
     if (par.compressHeaders) {
         MMseqsNode::barrier(dataFile + ".written");
+        MMseqsNode::addPhaseTime(phaseValues, "waiting for the sequences of all nodes", timer);
         const std::string hdrDataFile = dataFile + "_h." + SSTR(MMseqsNode::rank);
         FILE *hdrFile = FileUtil::openFileOrDie(hdrDataFile.c_str(), "r", true);
         const size_t headerFileSize = FileUtil::getFileSize(hdrDataFile);

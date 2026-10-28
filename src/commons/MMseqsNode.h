@@ -142,8 +142,7 @@ public:
     // the representative of entry p becomes the one received for p in the exchange receivedIndex, receivedPrefix if given
     static std::string sendClusterPairs(const std::string &clu, bool withRepresentative, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                                         const std::string &exchange, const std::string &receivedIndex = "", const std::string &receivedPrefix = "");
-    // --filter-cludb-file: a request { key, requesting node } of the exchange requestsIndex, requests gets the other members of the entry of key in <clu>.<node>
-    // as { key, member } through the exchange <members>.<node>
+    // --filter-cludb-file: a request { key, requesting node } of the exchange requestsIndex, requests gets the other members of key in <clu>.<node> as { key, member } through <members>.<node>
     static std::string sendClusterMembers(const std::string &clu, const std::string &requestsIndex, const std::string &requests, const std::string &members);
     // once every node has read lastExchange, a node removes its file of it; the master removes the indexes of exchanges and prints phaseValues
     static void removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues = "");

@@ -25,8 +25,9 @@ unsigned int MMseqsNode::count = 1;
 const size_t MMseqsNode::EXCHANGE_BUFFER_SIZE;
 // the first line of every barrier file, so a file that a killed run left is told apart from one of this run
 static std::string runId;
-// the exchange bytes that this node sent, reported by removeExchanges
+// the exchange bytes that this node sent, all of them and those for other nodes, reported by removeExchanges
 static size_t sentExchangeBytes = 0;
+static size_t sentOtherNodeExchangeBytes = 0;
 
 void MMseqsNode::init() {
     // mpirun (Open MPI, then PMI of MPICH/Intel MPI) before SLURM, whose variables mpirun tasks inherit from the allocation
@@ -281,6 +282,7 @@ void MMseqsNode::addExchangeFlush(std::string &indexData, size_t &writtenBytes, 
     indexData += "\n";
     writtenBytes += nodeOffsets.back();
     sentExchangeBytes += nodeOffsets.back();
+    sentOtherNodeExchangeBytes += nodeOffsets.back() - (nodeOffsets[rank + 1] - nodeOffsets[rank]);
 }
 
 std::string MMseqsNode::closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData) {
@@ -965,6 +967,7 @@ void MMseqsNode::closeClusterWriter(DBWriter &writer, FILE *indexFile, const std
 
 void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues) {
     addPhaseValue(phaseValues, "Exchange bytes sent", SSTR(sentExchangeBytes));
+    addPhaseValue(phaseValues, "Exchange bytes sent to other nodes", SSTR(sentOtherNodeExchangeBytes));
     printPhaseValues(barrier(prefix + ".merged", phaseValues));
     FileUtil::remove((lastExchange + "." + SSTR(rank)).c_str());
     publishFile(prefix + ".done." + SSTR(rank), runId);

@@ -10,6 +10,7 @@
 #include "MMseqsNode.h"
 #include "itoa.h"
 #include "FileUtil.h"
+#include "Timer.h"
 
 #include <limits>
 
@@ -372,6 +373,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     ReducedMatrix subMat(sMat.probMatrix, sMat.subMatrixPseudoCounts, sMat.aa2num, sMat.num2aa, sMat.alphabetSize, par.alphabetSize.values.aminoacid(), 2.0);
 
     Debug(Debug::INFO) << "Hashing " << localKeySize << " sequences in " << loadOffsets.size() - 1 << " loads\n";
+    Timer timer;
     Debug::Progress progress(loadOffsets.size() - 1);
     for (size_t load = 0; load + 1 < loadOffsets.size(); load++) {
         progress.updateProgress();
@@ -577,6 +579,10 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     }
 
     if (isLinfinity) {
+        std::string phaseValues;
+        MMseqsNode::addPhaseTime(phaseValues, "hashing the sequences", timer);
+        MMseqsNode::addPhaseValue(phaseValues, "Sequences hashed", SSTR(localKeySize));
+        MMseqsNode::publishRunFile(par.db2 + ".phases." + SSTR(MMseqsNode::rank), phaseValues);
         MMseqsNode::closeClusterWriter(resultWriter, resultIndexFile, resultIndex);
         MMseqsNode::writeRepresentativeBits(representativeDb, reader, representativeBits, localFirstKey, localKeySize);
     } else {
@@ -594,6 +600,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                 clusters += representativeReader.getRangeRepresentativeCount(range);
             }
             representativeReader.close();
+            MMseqsNode::printPhaseValues(MMseqsNode::gatherRunFiles(par.db2 + ".phases."));
             // a mode 3 subset only feeds the next pipeline steps, which read no headers, lookup or source
             DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_CLUSTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
         } else {
