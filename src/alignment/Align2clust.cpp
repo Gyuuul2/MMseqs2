@@ -2005,7 +2005,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             size_t repKey;
             size_t logBytes;
             if ((nodeHasProgress[node] && nodeRepKeys[node] == orderKeyEnd) || MMseqsNode::readLogProgress(log, repKey, logBytes) == false
-                || (nodeHasProgress[node] && repKey == nodeRepKeys[node] && logBytes == nodeLogBytes[node])) {
+                || (nodeHasProgress[node] && repKey <= nodeRepKeys[node] && logBytes <= nodeLogBytes[node])) {
                 continue;
             }
             if (logBytes % sizeof(ClusterPair) != 0 || logBytes < nodeLogBytes[node] || repKey < nodeRepKeys[node]) {
