@@ -74,7 +74,7 @@ static inline void setLaneValue(simd_int *v, int lane, T value) {
 SwipeAligner::SwipeAligner(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend)
     : subMat(subMat), alphabetSize(subMat->alphabetSize), aaBiasCorrection(aaBiasCorrection), aaBiasCorrectionScale(aaBiasCorrectionScale),
       gapOpen(gapOpen), gapExtend(gapExtend), queryLength(0), capacity(0), rowBias8(NULL), rowBias16(NULL), rowBiasRev8(NULL),
-      rowBiasRev16(NULL), rowIndex(NULL), hColumn(NULL), eColumn(NULL), rowMask(NULL), ring(NULL), ringCapacity(0), bandH(NULL), bandF(NULL), bandCapacity(0), bandReverse(false),
+      rowBiasRev16(NULL), rowIndex(NULL), hColumn(NULL), eColumn(NULL), rowMask(NULL), ring(NULL), ringCapacity(0), bandH(NULL), bandF(NULL), bandCapacity(0),
       trace(NULL), traceCapacity(0) {
     if (alphabetSize > 32) {
         Debug(Debug::ERROR) << "SWIPE supports alphabets of at most 32 letters\n";
@@ -82,12 +82,6 @@ SwipeAligner::SwipeAligner(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorr
     }
     tmpBias = new float[maxSeqLen + 1];
     columnScores = malloc_simd_int(alphabetSize * sizeof(simd_int));
-    maxSubScore = 1;
-    for (int a = 0; a < alphabetSize; a++) {
-        for (int b = 0; b < alphabetSize; b++) {
-            maxSubScore = std::max(maxSubScore, static_cast<int>(subMat->subMatrix[a][b]));
-        }
-    }
     scoreLo8 = malloc_simd_int(alphabetSize * sizeof(simd_int));
     scoreHi8 = malloc_simd_int(alphabetSize * sizeof(simd_int));
     scoreLo16 = malloc_simd_int(alphabetSize * sizeof(simd_int));
@@ -378,9 +372,9 @@ void SwipeAligner::alignBackward(size_t count, const unsigned char *const *targe
     }
 }
 
-template <typename T, bool Trace, bool Anchored>
+template <typename T, bool Trace>
 void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigned char *const *targets, const int *targetLengths,
-                             int *bests, int *rows, int *columns, int *firstRows, int *firstColumns, int *edges, std::string *backtraces, uint32_t *ids, int xDrop) {
+                             int *bests, int *rows, int *columns, int *firstRows, int *firstColumns, std::string *backtraces, uint32_t *ids) {
     typedef SwipeLanes<T> V;
     const int lanes = V::COUNT;
     const int width = jobs[0].width;
@@ -404,14 +398,11 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
         bandH = malloc_simd_int(bandCapacity * sizeof(simd_int));
         bandF = malloc_simd_int(bandCapacity * sizeof(simd_int));
     }
-    const unsigned char *rowLetters = bandReverse ? queryRev.data() : query.data();
-    const simd_int *rowBias = bandReverse ? ((sizeof(T) == 1) ? rowBiasRev8 : rowBiasRev16) : ((sizeof(T) == 1) ? rowBias8 : rowBias16);
+    const unsigned char *rowLetters = query.data();
+    const simd_int *rowBias = (sizeof(T) == 1) ? rowBias8 : rowBias16;
     const simd_int *scoreLo = (sizeof(T) == 1) ? scoreLo8 : scoreLo16;
     const simd_int *scoreHi = (sizeof(T) == 1) ? scoreHi8 : scoreHi16;
     const simd_int vZero = simdi_setzero();
-    // an extension from a seed has no local start, the cells it cannot reach hold vNeg
-    const simd_int vNeg = V::set(-V::MAX);
-    const simd_int vStart = Anchored ? vNeg : vZero;
     const simd_int vGapO = V::set(-gapOpen);
     const simd_int vGapE = V::set(-gapExtend);
 
@@ -438,8 +429,8 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
     simd_int *hRow = bandH;
     simd_int *fRow = bandF;
     for (int k = 0; k <= width; k++) {
-        hRow[k] = vStart;
-        fRow[k] = vStart;
+        hRow[k] = vZero;
+        fRow[k] = vZero;
     }
 
     unsigned char letters[SWIPE_MAX_LANES];
@@ -455,7 +446,7 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
             const int j = m + job.offset;
             if (j >= job.columnBegin && j < job.columnEnd) {
                 const unsigned char *t = targets[job.id];
-                letters[l] = bandReverse ? t[targetLengths[job.id] - 1 - j] : t[j];
+                letters[l] = t[j];
                 valid[l] = static_cast<T>(-1);
             }
         }
@@ -468,19 +459,7 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
     }
 
     T rowMax[SWIPE_MAX_LANES];
-    T rowValid[SWIPE_MAX_LANES];
-    T seedLanes[SWIPE_MAX_LANES];
-    const int center = (width - 1) / 2;
-    T laneUsed[SWIPE_MAX_LANES];
-    for (int l = 0; l < lanes; l++) {
-        laneUsed[l] = (static_cast<size_t>(l) < jobCount) ? static_cast<T>(-1) : 0;
-    }
-    const int usedMask = simdi8_movemask(simdi_loadu(reinterpret_cast<const simd_int *>(laneUsed)));
-    const bool useXDrop = (xDrop > 0);
-    const simd_int vXDrop = V::set(std::min(xDrop, static_cast<int>(V::MAX)));
-    simd_int vDropped = vZero;
     simd_int vBest = vZero;
-    simd_int vEdge = vStart;
     const simd_int vOne = V::set(1);
     const simd_int vTwo = V::set(2);
     const simd_int vEight = V::set(8);
@@ -491,43 +470,22 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
         const simd_int tLo = scoreLo[rowLetters[r]];
         const simd_int tHi = scoreHi[rowLetters[r]];
         const simd_int rb = rowBias[r];
-        simd_int vRowValid = simdi8_eq(vZero, vZero);
-        simd_int vSeedLanes = vZero;
-        bool seedRow = false;
-        if (Anchored) {
-            for (int l = 0; l < lanes; l++) {
-                const bool used = static_cast<size_t>(l) < jobCount;
-                rowValid[l] = (used && r >= jobs[l].seedRow) ? static_cast<T>(-1) : 0;
-                seedLanes[l] = (used && r == jobs[l].seedRow) ? static_cast<T>(-1) : 0;
-                seedRow |= (used && r == jobs[l].seedRow);
-            }
-            vRowValid = simdi_loadu(reinterpret_cast<const simd_int *>(rowValid));
-            vSeedLanes = simdi_loadu(reinterpret_cast<const simd_int *>(seedLanes));
-        }
-        simd_int vHl = vStart;
-        simd_int vE = vStart;
-        simd_int vRowMax = vStart;
+        simd_int vHl = vZero;
+        simd_int vE = vZero;
+        simd_int vRowMax = vZero;
         simd_int *traceRow = Trace ? trace + static_cast<size_t>(r - rowLo) * width : NULL;
         for (int k = 0; k < width; k++) {
             const int slot = (r + k) & ringMask;
             const simd_int s = V::addBias(laneScores(tLo, tHi, ringLo[slot], ringHi[slot]), rb);
-            simd_int diag = V::adds(hRow[k], s);
-            // the seed cell starts the extension
-            if (Anchored && seedRow && k == center) {
-                diag = simdi8_blend(diag, s, vSeedLanes);
-            }
+            const simd_int diag = V::adds(hRow[k], s);
             const simd_int eo = V::adds(vHl, vGapO);
             const simd_int ee = V::adds(vE, vGapE);
             vE = V::max(eo, ee);
             const simd_int fo = V::adds(hRow[k + 1], vGapO);
             const simd_int fe = V::adds(fRow[k + 1], vGapE);
             const simd_int f = V::max(fo, fe);
-            simd_int h;
-            if (Anchored) {
-                h = simdi8_blend(vNeg, V::max(V::max(diag, vE), f), simdi_and(ringValid[slot], vRowValid));
-            } else {
-                h = simdi_and(V::max(V::max(diag, vE), V::max(f, vZero)), ringValid[slot]);
-            }
+            simd_int h = V::max(V::max(diag, vE), V::max(f, vZero));
+            h = simdi_and(h, ringValid[slot]);
             if (Trace) {
                 simd_int code = simdi_and(V::eq(h, vZero), vThirtyTwo);
                 code = simdi_or(code, simdi_and(V::eq(h, diag), vOne));
@@ -540,10 +498,6 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
             fRow[k] = f;
             vHl = h;
             vRowMax = V::max(vRowMax, h);
-        }
-        if (useXDrop) {
-            vRowMax = simdi_andnot(vDropped, vRowMax);
-            vEdge = V::max(vEdge, simdi_andnot(vDropped, V::max(hRow[0], hRow[width - 1])));
         }
         if (simdi8_movemask(V::gt(vRowMax, vBest)) != 0) {
             simdi_storeu(reinterpret_cast<simd_int *>(rowMax), vRowMax);
@@ -560,17 +514,8 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
             }
             vBest = V::max(vBest, vRowMax);
         }
-        if (useXDrop) {
-            vDropped = simdi_or(vDropped, simdi_and(V::gt(vBest, V::adds(vRowMax, vXDrop)), V::gt(vBest, vZero)));
-            if ((simdi8_movemask(vDropped) & usedMask) == usedMask) {
-                break;
-            }
-        }
     }
 
-    for (size_t l = 0; l < jobCount; l++) {
-        edges[l] = laneValue<T>(&vEdge, l);
-    }
     if (Trace) {
         for (size_t l = 0; l < jobCount; l++) {
             std::string &backtrace = backtraces[jobs[l].id];
@@ -585,51 +530,36 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
             int k = columns[l];
             int state = 0;
             uint32_t identities = 0;
-            const int lowestRow = Anchored ? jobs[l].seedRow : rowLo;
-            bool complete = false;
             const size_t maxSteps = static_cast<size_t>(rowHi - rowLo) + width + targetLengths[jobs[l].id] + 1;
             while (backtrace.size() <= maxSteps) {
                 const T code = laneValue<T>(trace + static_cast<size_t>(r - rowLo) * width + k, l);
                 if (state == 0) {
                     if (code & 1) {
                         backtrace.push_back('M');
-                        const int j = r + offset + k;
-                        if (j < 0 || j >= targetLengths[jobs[l].id]) {
-                            break;
-                        }
-                        identities += (rowLetters[r] == (bandReverse ? t[targetLengths[jobs[l].id] - 1 - j] : t[j]));
-                        if (Anchored ? (r == jobs[l].seedRow && k == center)
-                                     : (r == rowLo || (laneValue<T>(trace + static_cast<size_t>(r - 1 - rowLo) * width + k, l) & 32))) {
-                            complete = true;
+                        identities += (rowLetters[r] == t[r + offset + k]);
+                        if (r == rowLo || (laneValue<T>(trace + static_cast<size_t>(r - 1 - rowLo) * width + k, l) & 32)) {
                             break;
                         }
                         r--;
-                    } else {
-                        state = (code & 2) ? 1 : 2;
+                        continue;
                     }
+                    state = (code & 2) ? 1 : 2;
                 }
                 if (state == 1) {
                     backtrace.push_back('D');
                     state = (code & 8) ? 1 : 0;
                     k--;
-                } else if (state == 2) {
+                } else {
                     backtrace.push_back('I');
                     state = (code & 16) ? 2 : 0;
                     r--;
                     k++;
                 }
-                if (r < lowestRow || k < 0 || k >= width) {
+                if (r < rowLo || k < 0 || k >= width) {
                     break;
                 }
             }
-            // a path that does not end at the seed (saturated cells) gives no backtrace, its pair aligns one at a time
-            if (Anchored && complete == false) {
-                backtrace.clear();
-            }
-            // a backward extension walks from its start to the seed, which is already the forward order
-            if (bandReverse == false) {
-                std::reverse(backtrace.begin(), backtrace.end());
-            }
+            std::reverse(backtrace.begin(), backtrace.end());
             ids[l] = identities;
             firstRows[l] = r;
             firstColumns[l] = k;
@@ -638,7 +568,7 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
 }
 
 void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const unsigned char *const *targets, const int *targetLengths,
-                             int *bandWidths, s_align *aligns, std::string *backtraces, const int *minScores, int xDrop) {
+                             int *bandWidths, s_align *aligns, std::string *backtraces, const int *minScores) {
     const int Lq = queryLength;
     std::vector<BandJob> pending;
     while (jobs.empty() == false) {
@@ -673,7 +603,6 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const uns
             identities.resize(n);
             startRows.resize(n);
             startColumns.resize(n);
-            edgeScores.resize(n);
             const size_t traceCells = static_cast<size_t>(Lq + 1) * jobs[start].width;
             const bool canTrace = traceCells <= SWIPE_MAX_TRACE_CELLS;
             if (doTrace && canTrace == false) {
@@ -683,20 +612,11 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const uns
                 start = end;
                 continue;
             }
-#define SWIPE_BAND(T, TR, A) alignBand<T, TR, A>(&jobs[start], n, targets, targetLengths, bestScores.data(), bestRows.data(), bestColumns.data(), startRows.data(), startColumns.data(), edgeScores.data(), backtraces, identities.data(), xDrop)
-            const bool anchored = (jobs[start].seedRow >= 0);
+#define SWIPE_BAND(T, TR) alignBand<T, TR>(&jobs[start], n, targets, targetLengths, bestScores.data(), bestRows.data(), bestColumns.data(), startRows.data(), startColumns.data(), backtraces, identities.data())
             if (word == 0) {
-                if (anchored) {
-                    if (doTrace) { SWIPE_BAND(int8_t, true, true); } else { SWIPE_BAND(int8_t, false, true); }
-                } else {
-                    if (doTrace) { SWIPE_BAND(int8_t, true, false); } else { SWIPE_BAND(int8_t, false, false); }
-                }
+                if (doTrace) { SWIPE_BAND(int8_t, true); } else { SWIPE_BAND(int8_t, false); }
             } else {
-                if (anchored) {
-                    if (doTrace) { SWIPE_BAND(int16_t, true, true); } else { SWIPE_BAND(int16_t, false, true); }
-                } else {
-                    if (doTrace) { SWIPE_BAND(int16_t, true, false); } else { SWIPE_BAND(int16_t, false, false); }
-                }
+                if (doTrace) { SWIPE_BAND(int16_t, true); } else { SWIPE_BAND(int16_t, false); }
             }
 #undef SWIPE_BAND
             for (size_t l = 0; l < n; l++) {
@@ -715,15 +635,13 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const uns
                 const int center = job.offset + w;
                 const bool fullBand = (center - w <= job.columnBegin - (Lq - 1)) && (center + w >= job.columnEnd - 1);
                 const int k = bestColumns[l];
-                // with an X-drop the band also grows while the alignment reaches its edge within the X-drop of the best score
-                const bool grow = (best > 0 && doTrace == false && (k <= 1 || k >= job.width - 2 || (xDrop > 0 && best >= 2 * xDrop && edgeScores[l] >= best - xDrop)))
-                                  || (minScores != NULL && best < minScores[job.id]);
+                const bool grow = (best > 0 && doTrace == false && (k <= 1 || k >= job.width - 2)) || (minScores != NULL && best < minScores[job.id]);
                 if (grow && fullBand == false) {
                     BandJob wider = job;
                     const int w2 = 2 * w;
                     wider.offset = center - w2;
                     wider.width = 2 * w2 + 1;
-                    wider.rowBegin = std::max(std::max(0, job.seedRow), job.columnBegin - wider.offset - (wider.width - 1));
+                    wider.rowBegin = std::max(0, job.columnBegin - wider.offset - (wider.width - 1));
                     wider.rowEnd = std::min(Lq, job.columnEnd - wider.offset);
                     bandWidths[job.id] = w2;
                     pending.push_back(wider);
@@ -735,12 +653,7 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const uns
                 }
                 const int row = bestRows[l];
                 const int column = row + job.offset + bestColumns[l];
-                if (bandReverse) {
-                    a.score1 = best;
-                    a.qStartPos1 = Lq - 1 - row;
-                    a.dbStartPos1 = targetLengths[job.id] - 1 - column;
-                    a.identicalAACnt = identities[l];
-                } else if (doTrace) {
+                if (doTrace) {
                     a.score1 = best;
                     a.qEndPos1 = row;
                     a.dbEndPos1 = column;
@@ -760,7 +673,7 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const uns
 }
 
 void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals, int *bandWidths,
-                               s_align *aligns, std::string *backtraces, const int *columnEnds, const int *minScores, int xDrop) {
+                               s_align *aligns, std::string *backtraces, const int *columnEnds, const int *minScores) {
     const int Lq = queryLength;
     const bool doTrace = (backtraces != NULL);
     bandJobs.clear();
@@ -790,139 +703,9 @@ void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets
         job.offset = diagonals[i] - bandWidths[i];
         job.columnBegin = 0;
         job.columnEnd = (columnEnds != NULL) ? columnEnds[i] : targetLengths[i];
-        job.seedRow = -1;
         job.rowBegin = std::max(0, job.columnBegin - job.offset - (job.width - 1));
         job.rowEnd = std::min(Lq, job.columnEnd - job.offset);
         bandJobs.push_back(job);
     }
-    bandReverse = false;
-    runBanded(bandJobs, doTrace, targets, targetLengths, bandWidths, aligns, backtraces, minScores, xDrop);
-}
-
-void SwipeAligner::extendBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *seedQuery, const int *seedTarget,
-                                bool backward, int *bandWidths, s_align *aligns, std::string *backtraces, int xDrop) {
-    const int Lq = queryLength;
-    const bool doTrace = (backtraces != NULL);
-    bandJobs.clear();
-    for (size_t i = 0; i < count; i++) {
-        s_align &a = aligns[i];
-        if (doTrace == false) {
-            a.score1 = 0;
-            a.word = (a.word == 1) ? 1 : 0;
-            if (backward) {
-                a.qStartPos1 = -1;
-                a.dbStartPos1 = -1;
-            } else {
-                a.qEndPos1 = -1;
-                a.dbEndPos1 = -1;
-            }
-        } else if (a.score1 >= static_cast<uint32_t>(SwipeLanes<int8_t>::MAX)) {
-            a.word = 1;
-        }
-        a.score2 = 0;
-        a.ref_end2 = -1;
-        a.cigar = NULL;
-        a.cigarLen = 0;
-        a.identicalAACnt = 0;
-        if (bandWidths[i] <= 0) {
-            bandWidths[i] = MIN_BAND_WIDTH;
-        }
-        const int Lt = targetLengths[i];
-        const int seedRow = backward ? Lq - 1 - seedQuery[i] : seedQuery[i];
-        const int seedColumn = backward ? Lt - 1 - seedTarget[i] : seedTarget[i];
-        BandJob job;
-        job.id = i;
-        job.width = 2 * bandWidths[i] + 1;
-        job.offset = seedColumn - seedRow - bandWidths[i];
-        job.columnBegin = 0;
-        job.columnEnd = Lt;
-        job.seedRow = seedRow;
-        job.rowBegin = std::max(seedRow, job.columnBegin - job.offset - (job.width - 1));
-        job.rowEnd = std::min(Lq, job.columnEnd - job.offset);
-        bandJobs.push_back(job);
-    }
-    bandReverse = backward;
-    runBanded(bandJobs, doTrace, targets, targetLengths, bandWidths, aligns, backtraces, NULL, xDrop);
-    bandReverse = false;
-}
-
-bool SwipeAligner::canAlignUngapped(int targetLength) const {
-    return std::max(queryLength, targetLength) < 32768 && std::min(queryLength, targetLength) * maxSubScore < INT16_MAX;
-}
-
-void SwipeAligner::ungappedAlign(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals,
-                                 int *scores, int *queryStarts, int *queryEnds) {
-    typedef SwipeLanes<int16_t> V;
-    const int lanes = V::COUNT;
-    const int Lq = queryLength;
-    const simd_int *scoreLo = scoreLo16;
-    const simd_int *scoreHi = scoreHi16;
-    const simd_int vZero = simdi_setzero();
-    const simd_int vOne = V::set(1);
-    const simd_int vMinus64 = V::set(-64);
-    unsigned char letters[SWIPE_MAX_LANES];
-    int16_t outScore[SWIPE_MAX_LANES];
-    int16_t outStart[SWIPE_MAX_LANES];
-    int16_t outEnd[SWIPE_MAX_LANES];
-    int16_t laneStart[SWIPE_MAX_LANES];
-    for (size_t start = 0; start < count; start += lanes) {
-        const size_t n = std::min(count - start, static_cast<size_t>(lanes));
-        int rowLo = INT_MAX;
-        int rowHi = 0;
-        for (int l = 0; l < lanes; l++) {
-            laneStart[l] = 0;
-            if (static_cast<size_t>(l) >= n) {
-                continue;
-            }
-            const int d = diagonals[start + l];
-            const int b = std::max(0, d);
-            const int e = std::min(Lq, d + targetLengths[start + l]);
-            laneStart[l] = static_cast<int16_t>(b);
-            rowLo = std::min(rowLo, b);
-            rowHi = std::max(rowHi, e);
-        }
-        simd_int vScore = vZero;
-        simd_int vMax = vZero;
-        simd_int vEnd = simdi_loadu(reinterpret_cast<const simd_int *>(laneStart));
-        simd_int vBegin = vEnd;
-        simd_int vMin = V::adds(vEnd, V::set(-1));
-        for (int i = rowLo; i < rowHi; i++) {
-            simd_int vValid;
-            int16_t validLane[SWIPE_MAX_LANES];
-            for (int l = 0; l < lanes; l++) {
-                letters[l] = 0;
-                validLane[l] = 0;
-                if (static_cast<size_t>(l) >= n) {
-                    continue;
-                }
-                const int j = i - diagonals[start + l];
-                if (j >= 0 && j < targetLengths[start + l]) {
-                    letters[l] = targets[start + l][j];
-                    validLane[l] = -1;
-                }
-            }
-            vValid = simdi_loadu(reinterpret_cast<const simd_int *>(validLane));
-            simd_int indexLo, indexHi;
-            laneIndices<int16_t>(letters, indexLo, indexHi);
-            simd_int s = V::addBias(laneScores(scoreLo[query[i]], scoreHi[query[i]], indexLo, indexHi), vMinus64);
-            s = simdi_and(s, vValid);
-            const simd_int vi = V::set(i);
-            vScore = V::adds(vScore, s);
-            const simd_int notPositive = V::gt(vOne, vScore);
-            vScore = simdi_andnot(notPositive, vScore);
-            vMin = simdi8_blend(vMin, vi, simdi_and(notPositive, vValid));
-            const simd_int better = V::gt(vScore, vMax);
-            vEnd = simdi8_blend(vEnd, vi, better);
-            vBegin = simdi8_blend(vBegin, V::adds(vMin, vOne), better);
-            vMax = V::max(vMax, vScore);
-        }
-        simdi_storeu(reinterpret_cast<simd_int *>(outScore), vMax);
-        simdi_storeu(reinterpret_cast<simd_int *>(outStart), vBegin);
-        simdi_storeu(reinterpret_cast<simd_int *>(outEnd), vEnd);
-        for (size_t l = 0; l < n; l++) {
-            scores[start + l] = outScore[l];
-            queryStarts[start + l] = outStart[l];
-            queryEnds[start + l] = outEnd[l];
-        }
-    }
+    runBanded(bandJobs, doTrace, targets, targetLengths, bandWidths, aligns, backtraces, minScores);
 }
