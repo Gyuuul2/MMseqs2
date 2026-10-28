@@ -1006,7 +1006,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     return 0;
 }
 
-// --createdb-mode 3: a rep with its targets in a split: { rep, first target }, rep length, target count, then the rep residues and the target keys
+// --createdb-mode 3: a rep with its targets of a node: { rep, first target }, rep length, target count, then the rep residues and the target keys
 struct RepTargets {
     ClusterPair pair;
     unsigned int repLength;
@@ -1081,21 +1081,20 @@ static inline DBKeyType getPrefKey(const char *&data) {
 // the pref partitions of all nodes are cut by cost into this many groups per node, which go to the nodes in turn
 static const size_t PUSH_GROUPS_PER_NODE = 4;
 
-// --createdb-mode 3: the nodes send the pref partitions in groups of equal cost in turn, a rep with its targets of a node in a split to that node
-static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<size_t> &nodeKeyOffsets, const std::vector<size_t> &splitKeyOffsets,
+// --createdb-mode 3: the nodes send the pref partitions in groups of equal cost in turn, a rep with its targets of a node to that node
+static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<size_t> &nodeKeyOffsets, size_t splitBytes,
                                   size_t blockKeys, size_t alignNodes, size_t memoryLimit, size_t paddedDbSize, size_t prefSizeBits, const std::string &repTargets) {
     const size_t dbSize = seqDbr.getSize();
-    // the targets of a record: those from first on of its node (the targets of an entry are grouped by node) in the split of the first one, at most maxRecordTargets
+    // the targets of a record: those from first on of its node (the targets of an entry are grouped by node), at most maxRecordTargets, which fit splitBytes when read as pages
     const size_t batchBytes = std::max<size_t>(1, memoryLimit / 16);
-    const size_t maxRecordTargets = std::min<size_t>(UINT_MAX, std::max<size_t>(1, batchBytes / 2 / sizeof(DBKeyType)));
+    const size_t maxRecordTargets = std::min<size_t>(UINT_MAX, std::max<size_t>(1, std::min(batchBytes / 2 / sizeof(DBKeyType), splitBytes / std::max<size_t>(seqDbr.getMaxSeqLen() + 2, Util::getPageSize()))));
     const auto getRecordEnd = [&](const DBKeyType *targets, size_t first, size_t targetCount) {
-        const size_t splitEnd = *std::upper_bound(splitKeyOffsets.begin(), splitKeyOffsets.end(), static_cast<size_t>(targets[first]));
         size_t nodeEnd = targetCount;
         if (alignNodes > 1) {
             const size_t node = getAlignNode(blockKeys, targets[first]);
             nodeEnd = std::partition_point(targets + first, targets + targetCount, [&](DBKeyType key) { return getAlignNode(blockKeys, key) == node; }) - targets;
         }
-        return static_cast<size_t>(std::lower_bound(targets + first, targets + std::min(nodeEnd, first + maxRecordTargets), static_cast<DBKeyType>(splitEnd)) - targets);
+        return std::min(nodeEnd, first + maxRecordTargets);
     };
 
     const std::string partitionsFile = par.db2 + ".partitions";
@@ -1490,7 +1489,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     size_t chunkPos[2] = { 0, 0 };
     size_t chunk = 0;
     const ClusterPair lastRecord = { DB_KEY_INVALID, DB_KEY_INVALID };
-    // a window takes records while their targets fit into an eighth of the memory, at least one record, whose targets are in one split
+    // a window takes records while their targets fit into an eighth of the memory, at least one record
     const auto readWindow = [&](size_t &windowChunk, size_t &windowBegin, size_t &windowEnd) {
         if (chunkPos[chunk] == chunkOrder[chunk].size()) {
             chunk = 1 - chunk;
@@ -2405,12 +2404,6 @@ static int align2clustLinfinity(Parameters &par) {
     const size_t prefSizeBits = (par.clusteringMode == Parameters::SET_COVER) ? 64 - __builtin_clzll(dbSize | 1) : 1;
     const size_t splitBytes = std::max<size_t>(1, smallestMemoryLimit / 8);
     const size_t lagKeys = std::max<size_t>(64, smallestMemoryLimit / 256 * 8 / 64 * 64);
-    std::vector<size_t> splitKeyOffsets;
-    for (size_t node = 0; node < MMseqsNode::count; node++) {
-        const std::vector<size_t> nodeSplitKeyOffsets = seqDbr.getSplitKeyOffsets(nodeKeyOffsets[node], nodeKeyOffsets[node + 1], splitBytes, 0);
-        splitKeyOffsets.insert(splitKeyOffsets.end(), nodeSplitKeyOffsets.begin(), nodeSplitKeyOffsets.end() - 1);
-    }
-    splitKeyOffsets.push_back(dbSize);
 
     // the master cuts the targets into blocks of keys, which the aligning nodes take in turn (see BLOCK_BYTES)
     const size_t alignNodes = MMseqsNode::count - getFirstAlignNode();
@@ -2519,7 +2512,7 @@ static int align2clustLinfinity(Parameters &par) {
     }
 
     const std::string repTargets = par.db3 + "_swap_0";
-    const std::string repTargetsIndex = sendRepTargets(par, seqDbr, nodeKeyOffsets, splitKeyOffsets, blockKeys, alignNodes, memoryLimit, paddedDbSize, prefSizeBits, repTargets);
+    const std::string repTargetsIndex = sendRepTargets(par, seqDbr, nodeKeyOffsets, splitBytes, blockKeys, alignNodes, memoryLimit, paddedDbSize, prefSizeBits, repTargets);
     // every node read its members before it sent its records
     if (memberDbr != NULL) {
         FileUtil::remove((membersExchange + "." + SSTR(MMseqsNode::rank)).c_str());
