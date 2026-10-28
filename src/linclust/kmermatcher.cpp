@@ -2258,7 +2258,7 @@ static size_t getPassLimit(size_t memory) {
 
 // --createdb-mode 3: the hash ranges and partitions that every node cuts the same, and the limits of this node
 struct KmerExchange {
-    std::vector<size_t> nodeKeyOffsets;
+    std::vector<size_t> senderKeyOffsets;
     size_t memoryLimit;
     size_t loadMemoryLimit;
     // the open files besides the k-mer and pair files, and their soft limit
@@ -2279,9 +2279,9 @@ struct KmerExchange {
     unsigned int partitionKeyBits;
 };
 
-// every node cuts the key range of every node into the same partitions, the pairs of a representative go to its partition
+// every node cuts the send range of every node into the same partitions, the pairs of a representative go to its partition
 static size_t getPartitionFirstKey(const KmerExchange &exchange, size_t node, size_t partition) {
-    return exchange.nodeKeyOffsets[node] + (partition * (exchange.nodeKeyOffsets[node + 1] - exchange.nodeKeyOffsets[node]) + exchange.partitionsPerNode - 1) / exchange.partitionsPerNode;
+    return exchange.senderKeyOffsets[node] + (partition * (exchange.senderKeyOffsets[node + 1] - exchange.senderKeyOffsets[node]) + exchange.partitionsPerNode - 1) / exchange.partitionsPerNode;
 }
 
 // a pair file per representative node and partition group
@@ -3314,8 +3314,8 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                 const DBReader<DBKeyType>::Index *coveredEndRange = std::partition_point(index + repRange, index + seqDbr.getIndexSize(), isCovered);
                                 const size_t coveredFrom = coveredFirstRange->id;
                                 const size_t coveredTo = (coveredEndRange < index + seqDbr.getIndexSize()) ? static_cast<size_t>(coveredEndRange->id) : seqDbr.getSize();
-                                const size_t repNode = std::upper_bound(exchange.nodeKeyOffsets.begin(), exchange.nodeKeyOffsets.end(), static_cast<size_t>(repId)) - exchange.nodeKeyOffsets.begin() - 1;
-                                const size_t repPartition = (repId - exchange.nodeKeyOffsets[repNode]) * exchange.partitionsPerNode / (exchange.nodeKeyOffsets[repNode + 1] - exchange.nodeKeyOffsets[repNode]);
+                                const size_t repNode = std::upper_bound(exchange.senderKeyOffsets.begin(), exchange.senderKeyOffsets.end(), static_cast<size_t>(repId)) - exchange.senderKeyOffsets.begin() - 1;
+                                const size_t repPartition = (repId - exchange.senderKeyOffsets[repNode]) * exchange.partitionsPerNode / (exchange.senderKeyOffsets[repNode + 1] - exchange.senderKeyOffsets[repNode]);
                                 const size_t repPartitionKey = repId - getPartitionFirstKey(exchange, repNode, repPartition);
                                 AssignedPairRecord record = {repNode * exchange.partitionsPerNode + repPartition, 0, {0, 0}, {0, 0}};
                                 const auto startRecord = [&]() {
@@ -3417,7 +3417,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     return receivedBytes;
 }
 
-// --createdb-mode 3 rep node: merges its partitions into <pref>.<node>; returns firstKey, prefOffset, prefBytes, rep lengths times targets per partition
+// --createdb-mode 3 rep node: merges its partitions into <pref>.<node>; returns firstKey, prefOffset, prefBytes, rep lengths times targets and node per partition
 static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     // a file per partition group and receiving node
@@ -3517,10 +3517,10 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     size_t prefIndexBytes = 0;
     prefFiles.writeBuffers = new(std::nothrow) char[par.threads * 2 * KMER_FILE_BUFFER_SIZE];
     Util::checkAllocation(prefFiles.writeBuffers, "Can not allocate prefWriteBuffer memory in mergeAssignedPairs");
-    // a row per partition: firstKey, prefOffset, prefBytes and the representative lengths times their target counts
+    // a row per partition: firstKey, prefOffset, prefBytes, the representative lengths times their target counts and the node of its pref file
     std::string partitionsData;
     const auto addPartitionRow = [&](size_t partitionFirstKey, size_t prefOffset, size_t prefBytes, size_t cost) {
-        partitionsData += SSTR(partitionFirstKey) + "\t" + SSTR(prefOffset) + "\t" + SSTR(prefBytes) + "\t" + SSTR(cost) + "\n";
+        partitionsData += SSTR(partitionFirstKey) + "\t" + SSTR(prefOffset) + "\t" + SSTR(prefBytes) + "\t" + SSTR(cost) + "\t" + SSTR(MMseqsNode::rank) + "\n";
     };
     std::vector<PartitionMerge> partitionMerges;
     bool isPrefetched = false;
@@ -3781,8 +3781,7 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     const float kmersPerSequenceScale = par.kmersPerSequenceScale.values.aminoacid();
     KmerExchange exchange;
-    exchange.nodeKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
-    const std::vector<size_t> &nodeKeyOffsets = exchange.nodeKeyOffsets;
+    const std::vector<size_t> nodeKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
     exchange.memoryLimit = memoryLimit;
     // every node cuts the same hash ranges and partitions, sized by the k-mers of all representatives of the database
     size_t globalKmers = 0;
@@ -3792,8 +3791,9 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
         globalKmers += seqDbr.getRangeRepresentativeCount(range) * computeSeqKmerCount(static_cast<int>(index[range].length - 2), par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
         globalBytes += rangeKeys * index[range].length;
     }
-    // every node sends the same key ranges, cut by the rule of decomposeDomainByAminoAcid on sequence bytes plus SEND_KMER_BYTES per k-mer
-    std::vector<size_t> senderKeyOffsets(MMseqsNode::count + 1, seqDbr.getSize());
+    // every node sends the same key ranges, cut by the rule of decomposeDomainByAminoAcid on sequence bytes plus SEND_KMER_BYTES per k-mer, and merges the pairs of their representatives
+    std::vector<size_t> &senderKeyOffsets = exchange.senderKeyOffsets;
+    senderKeyOffsets.assign(MMseqsNode::count + 1, seqDbr.getSize());
     senderKeyOffsets[0] = 0;
     const size_t nodeCost = std::max<size_t>(1, (globalKmers * SEND_KMER_BYTES + globalBytes + MMseqsNode::count - 1) / MMseqsNode::count);
     size_t costBefore = 0;
@@ -3829,9 +3829,8 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     }
     const size_t dbFrom = senderKeyOffsets[MMseqsNode::rank];
     const size_t dbSize = senderKeyOffsets[MMseqsNode::rank + 1] - dbFrom;
-    // the representative bits of the keys to send; those of the keys of this node come back after sending
-    uint64_t *nodeRepresentativeBits = representativeBits;
-    if (nodeRepresentativeBits != NULL) {
+    // a clusthashfast subset: the representative bits of the keys to send and merge
+    if (FileUtil::fileExists((par.db1 + ".bits." + SSTR(MMseqsNode::rank)).c_str())) {
         representativeBits = MMseqsNode::readRepresentativeBits(par.db1, nodeKeyOffsets, dbFrom, dbSize);
     }
     localFirstKey = dbFrom;
@@ -3862,8 +3861,7 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
         }
     }
 
-    const size_t nodeKeys = nodeKeyOffsets[MMseqsNode::rank + 1] - nodeKeyOffsets[MMseqsNode::rank];
-    const size_t representativeBitsMemory = (representativeBits != NULL) ? ((dbSize + 63) / 64 + (nodeKeys + 63) / 64 + 2) * sizeof(uint64_t) : 0;
+    const size_t representativeBitsMemory = (representativeBits != NULL) ? ((dbSize + 63) / 64 + 1) * sizeof(uint64_t) : 0;
     exchange.loadMemoryLimit = (representativeBitsMemory < memoryLimit) ? static_cast<size_t>(static_cast<double>(memoryLimit - representativeBitsMemory) * 0.95) : 0;
 
     // keys are in length descending order, so a record needs no length, and no position as the diagonal comes later
@@ -3902,11 +3900,6 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     const size_t sentBytes = sendKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, dbFrom, dbSize, representativeBitsMemory);
     MMseqsNode::addPhaseTime(sendValues, "sending k-mers", phaseTimer);
     MMseqsNode::addPhaseValue(sendValues, "K-mer bytes sent", SSTR(sentBytes));
-    // the representative bits of the keys of this node
-    delete[] representativeBits;
-    representativeBits = nodeRepresentativeBits;
-    localFirstKey = nodeKeyOffsets[MMseqsNode::rank];
-    localKeySize = nodeKeys;
     MMseqsNode::printPhaseValues(MMseqsNode::barrier(par.db2 + ".kmers.done", sendValues));
     // every node has read the memory limits
     if (MMseqsNode::isMaster()) {
@@ -4322,18 +4315,11 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
 
     size_t aminoAcidDBSize = seqDbr.getAminoAcidDBSize();
     if (isLinfinity) {
-        const std::vector<size_t> nodeKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
-        localFirstKey = nodeKeyOffsets[MMseqsNode::rank];
-        localKeySize = nodeKeyOffsets[MMseqsNode::rank + 1] - localFirstKey;
-
         // a clusthashfast subset: its representatives are the bits of every node and the sixth column of its index
         const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
         aminoAcidDBSize = 0;
         for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {
             aminoAcidDBSize += seqDbr.getRangeRepresentativeCount(range) * (index[range].length - 2);
-        }
-        if (FileUtil::fileExists((par.db1 + ".bits." + SSTR(MMseqsNode::rank)).c_str())) {
-            representativeBits = MMseqsNode::readRepresentativeBits(par.db1, nodeKeyOffsets, localFirstKey, localKeySize);
         }
     }
     const bool autoKmerSize = (par.kmerSize == 0);
