@@ -588,7 +588,11 @@ struct SwipeBatch {
     std::vector<size_t> gappedTargets;
     std::vector<Matcher::result_t> gappedResults;
     std::vector<size_t> laneGapped;
-    std::vector<size_t> passed;
+    std::vector<int> seedQueries;
+    std::vector<int> seedTargets;
+    std::vector<int> backWidths;
+    std::vector<s_align> backAligns;
+    std::vector<std::string> backTraces;
     // alignClusterMembersSwipe
     std::vector<std::string> records;
     std::vector<size_t> gapped;
@@ -1040,6 +1044,26 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
         const int32_t xDrop = (MIN_SIZE * par.gapExtend.values.aminoacid() + par.gapOpen.values.aminoacid());
         std::vector<size_t> &laneGapped = swipe.laneGapped;
         laneGapped.clear();
+        // the gapped alignment of mode 0, extended from the seed in both directions
+        const auto alignFromSeed = [&](size_t t) {
+            std::string gappedBacktrace;
+            if (blockAlignerInitialized == false) {
+                blockAligner.initQuery(&query);
+                blockAlignerInitialized = true;
+            }
+            target.mapSequence(targets[t].id, targets[t].key, targets[t].sequence, targets[t].length);
+            s_align gappedAlignment = blockAligner.bandedalign(&target, seedQuery[t], seedTarget[t], gappedBacktrace, xDrop, par.covThr, par.covMode);
+            if (gappedAlignment.evalue < 0 || gappedBacktrace.empty()) {
+                status[t] = REJECTED;
+                return;
+            }
+            unsigned int gappedAlnLength = gappedBacktrace.size();
+            double gappedSeqId = Util::computeSeqId(par.seqIdMode, gappedAlignment.identicalAACnt, query.L, target.L, gappedAlnLength);
+            gappedResults[t] = Matcher::result_t(target.getDbKey(), gappedAlignment.score1, gappedAlignment.qCov, gappedAlignment.tCov,
+                gappedSeqId, gappedAlignment.evalue, gappedAlnLength, gappedAlignment.qStartPos1, gappedAlignment.qEndPos1, query.L,
+                gappedAlignment.dbStartPos1, gappedAlignment.dbEndPos1, target.L, gappedBacktrace);
+            status[t] = Alignment::checkCriteria(gappedResults[t], false, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr) ? GAPPED_PASS : REJECTED;
+        };
         for (size_t g = 0; g < gappedTargets.size(); g++) {
             const size_t t = gappedTargets[g];
             if (repAssigned() || targetAssigned(targets[t])) {
@@ -1051,49 +1075,38 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
                 continue;
             }
             swipe.singlePairs[0]++;
-            std::string gappedBacktrace;
-            if (blockAlignerInitialized == false) {
-                blockAligner.initQuery(&query);
-                blockAlignerInitialized = true;
-            }
-            target.mapSequence(targets[t].id, targets[t].key, targets[t].sequence, targets[t].length);
-            s_align gappedAlignment = blockAligner.bandedalign(&target, seedQuery[t], seedTarget[t], gappedBacktrace, xDrop, par.covThr, par.covMode);
-            if (gappedAlignment.evalue < 0 || gappedBacktrace.empty()) {
-                status[t] = REJECTED;
-                continue;
-            }
-            unsigned int gappedAlnLength = gappedBacktrace.size();
-            double gappedSeqId = Util::computeSeqId(par.seqIdMode, gappedAlignment.identicalAACnt, query.L, target.L, gappedAlnLength);
-            gappedResults[t] = Matcher::result_t(target.getDbKey(), gappedAlignment.score1, gappedAlignment.qCov, gappedAlignment.tCov,
-                gappedSeqId, gappedAlignment.evalue, gappedAlnLength, gappedAlignment.qStartPos1, gappedAlignment.qEndPos1, query.L,
-                gappedAlignment.dbStartPos1, gappedAlignment.dbEndPos1, target.L, gappedBacktrace);
-            status[t] = Alignment::checkCriteria(gappedResults[t], false, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr) ? GAPPED_PASS : REJECTED;
+            alignFromSeed(t);
         }
         if (laneGapped.empty() == false) {
+            // the extension to the right of the seed in the lanes, whose end bounds the coverage as in bandedalign
             swipe.setQuery(query);
             swipe.entries.resize(laneGapped.size());
             for (size_t g = 0; g < laneGapped.size(); g++) {
                 swipe.entries[g] = entryOf[laneGapped[g]];
             }
             swipe.select(laneGapped.size(), swipe.targetWord);
-        swipe.countLanes(0, laneGapped.size(), swipe.targetWord);
+            swipe.countLanes(0, laneGapped.size(), swipe.targetWord);
             swipe.columnEnds.resize(laneGapped.size());
+            swipe.seedQueries.resize(laneGapped.size());
+            swipe.seedTargets.resize(laneGapped.size());
             for (size_t g = 0; g < laneGapped.size(); g++) {
-                swipe.diagonals[g] = seedTarget[laneGapped[g]] - seedQuery[laneGapped[g]];
                 swipe.columnEnds[g] = targets[laneGapped[g]].length;
+                swipe.seedQueries[g] = seedQuery[laneGapped[g]];
+                swipe.seedTargets[g] = seedTarget[laneGapped[g]];
             }
-            swipe.aligner.alignBanded(laneGapped.size(), swipe.targets.data(), swipe.columnEnds.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
-                                      swipe.aligns.data(), NULL, NULL, NULL, xDrop);
+            swipe.aligner.extendBanded(laneGapped.size(), swipe.targets.data(), swipe.columnEnds.data(), swipe.seedQueries.data(), swipe.seedTargets.data(),
+                                       false, swipe.bandWidths.data(), swipe.aligns.data(), NULL, xDrop);
             swipe.updateWord(swipe.targetWord, laneGapped.size());
-            // the forward passes that can meet the criteria, moved to the front for the backward pass or traceback
             size_t passedCount = 0;
             for (size_t g = 0; g < laneGapped.size(); g++) {
-                const s_align &alignment = swipe.aligns[g];
-                if (alignment.word >= 2 || swipeForwardPasses(par, evaluer, alignment, query.L, swipe.columnEnds[g])) {
+                const s_align &forward = swipe.aligns[g];
+                if (forward.word >= 2 || (forward.dbEndPos1 >= 0 && Util::hasCoverage(par.covThr, par.covMode, SmithWaterman::computeCov(0, forward.qEndPos1, query.L),
+                                                                                      SmithWaterman::computeCov(0, forward.dbEndPos1, swipe.columnEnds[g])))) {
                     laneGapped[passedCount] = laneGapped[g];
                     swipe.targets[passedCount] = swipe.targets[g];
                     swipe.columnEnds[passedCount] = swipe.columnEnds[g];
-                    swipe.diagonals[passedCount] = swipe.diagonals[g];
+                    swipe.seedQueries[passedCount] = swipe.seedQueries[g];
+                    swipe.seedTargets[passedCount] = swipe.seedTargets[g];
                     swipe.bandWidths[passedCount] = swipe.bandWidths[g];
                     swipe.aligns[passedCount] = swipe.aligns[g];
                     passedCount++;
@@ -1101,49 +1114,46 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
                     status[laneGapped[g]] = REJECTED;
                 }
             }
-            // banded_sw of mode 1 traces from corner to corner and can leave its band on a band-limited score, so mode 1 traces in the lanes too
-            if (par.alignerMode != Parameters::ALIGNER_MODE_SWIPE_BLOCK) {
-                swipe.backtraces.resize(passedCount);
-                swipe.aligner.alignBanded(passedCount, swipe.targets.data(), swipe.columnEnds.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
-                                          swipe.aligns.data(), swipe.backtraces.data(), NULL, NULL, xDrop);
-            }
-            for (size_t g = 0; g < passedCount; g++) {
-                const size_t t = laneGapped[g];
-                const SwipeTarget &current = targets[t];
-                target.mapSequence(current.id, current.key, current.sequence, current.length);
-                const s_align &alignment = swipe.aligns[g];
-                std::string gappedBacktrace;
-                if (alignment.word >= 2) {
-                    if (blockAlignerInitialized == false) {
-                        blockAligner.initQuery(&query);
-                        blockAlignerInitialized = true;
-                    }
-                    s_align gappedAlignment = blockAligner.bandedalign(&target, seedQuery[t], seedTarget[t], gappedBacktrace, xDrop, par.covThr, par.covMode);
-                    if (gappedAlignment.evalue < 0 || gappedBacktrace.empty()) {
-                        status[t] = REJECTED;
-                        continue;
-                    }
-                    double gappedSeqId = Util::computeSeqId(par.seqIdMode, gappedAlignment.identicalAACnt, query.L, target.L, gappedBacktrace.size());
-                    gappedResults[t] = Matcher::result_t(target.getDbKey(), gappedAlignment.score1, gappedAlignment.qCov, gappedAlignment.tCov,
-                        gappedSeqId, gappedAlignment.evalue, gappedBacktrace.size(), gappedAlignment.qStartPos1, gappedAlignment.qEndPos1, query.L,
-                        gappedAlignment.dbStartPos1, gappedAlignment.dbEndPos1, target.L, gappedBacktrace);
-                } else if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_BLOCK) {
-                    if (blockAlignerInitialized == false) {
-                        blockAligner.initQuery(&query);
-                        blockAlignerInitialized = true;
-                    }
-                    s_align backward = blockAligner.bandedalignBackward(&target, alignment.qEndPos1, alignment.dbEndPos1, gappedBacktrace, xDrop);
-                    if (backward.evalue < 0 || gappedBacktrace.empty()) {
-                        status[t] = REJECTED;
-                        continue;
-                    }
-                    backward.qEndPos1 = alignment.qEndPos1;
-                    backward.dbEndPos1 = alignment.dbEndPos1;
-                    gappedResults[t] = swipeResult(par, evaluer, current.key, backward.score1, backward, query.L, target.L, gappedBacktrace);
-                } else {
-                    gappedResults[t] = swipeResult(par, evaluer, current.key, alignment.score1, alignment, query.L, target.L, swipe.backtraces[g]);
+            if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_BLOCK) {
+                for (size_t g = 0; g < passedCount; g++) {
+                    alignFromSeed(laneGapped[g]);
                 }
-                status[t] = Alignment::checkCriteria(gappedResults[t], false, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr) ? GAPPED_PASS : REJECTED;
+            } else {
+                // both extensions with their backtraces in the lanes, joined at the seed as bandedalign does
+                swipe.backtraces.resize(passedCount);
+                swipe.aligner.extendBanded(passedCount, swipe.targets.data(), swipe.columnEnds.data(), swipe.seedQueries.data(), swipe.seedTargets.data(),
+                                           false, swipe.bandWidths.data(), swipe.aligns.data(), swipe.backtraces.data(), xDrop);
+                swipe.backWidths.assign(passedCount, 0);
+                swipe.backAligns.resize(passedCount);
+                swipe.backTraces.resize(passedCount);
+                for (size_t g = 0; g < passedCount; g++) {
+                    swipe.backAligns[g].word = swipe.targetWord;
+                }
+                swipe.aligner.extendBanded(passedCount, swipe.targets.data(), swipe.columnEnds.data(), swipe.seedQueries.data(), swipe.seedTargets.data(),
+                                           true, swipe.backWidths.data(), swipe.backAligns.data(), NULL, xDrop);
+                swipe.aligner.extendBanded(passedCount, swipe.targets.data(), swipe.columnEnds.data(), swipe.seedQueries.data(), swipe.seedTargets.data(),
+                                           true, swipe.backWidths.data(), swipe.backAligns.data(), swipe.backTraces.data(), xDrop);
+                for (size_t g = 0; g < passedCount; g++) {
+                    const size_t t = laneGapped[g];
+                    const s_align &forward = swipe.aligns[g];
+                    const s_align &backward = swipe.backAligns[g];
+                    if (forward.word >= 2 || backward.word >= 2 || swipe.backtraces[g].empty() || swipe.backTraces[g].empty()) {
+                        alignFromSeed(t);
+                        continue;
+                    }
+                    // the seed cell is in both extensions
+                    const int rawScore = static_cast<int>(forward.score1) + static_cast<int>(backward.score1)
+                                         - swipe.aligner.cellScore(seedQuery[t], swipe.targets[g][seedTarget[t]]);
+                    std::string gappedBacktrace = swipe.backTraces[g];
+                    gappedBacktrace.pop_back();
+                    gappedBacktrace += swipe.backtraces[g];
+                    s_align joined = forward;
+                    joined.qStartPos1 = backward.qStartPos1;
+                    joined.dbStartPos1 = backward.dbStartPos1;
+                    joined.identicalAACnt = forward.identicalAACnt + backward.identicalAACnt - 1;
+                    gappedResults[t] = swipeResult(par, evaluer, targets[t].key, rawScore, joined, query.L, targets[t].length, gappedBacktrace);
+                    status[t] = Alignment::checkCriteria(gappedResults[t], false, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr) ? GAPPED_PASS : REJECTED;
+                }
             }
         }
 

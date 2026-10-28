@@ -3,11 +3,11 @@
 
 #include "StripedSmithWaterman.h"
 #include "simd.h"
+#include "BaseMatrix.h"
 
 #include <string>
 #include <vector>
 
-class BaseMatrix;
 class Sequence;
 
 // Smith-Waterman of one query against several targets at once, one target in every SIMD lane (SWIPE)
@@ -29,6 +29,17 @@ public:
     void alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals, int *bandWidths,
                      s_align *aligns, std::string *backtraces, const int *columnEnds, const int *minScores, int xDrop);
 
+    // banded extension from a seed cell (seedQuery, seedTarget) around its diagonal, to the right or, if backward, to the left, with an
+    // X-drop as BlockAligner::bandedalign: score1 of the best alignment that starts (ends) at the seed and its end (start), with backtraces
+    // also the alignment from the seed (to the seed); bandWidths grow while the best cell is at the band edge
+    void extendBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *seedQuery, const int *seedTarget,
+                      bool backward, int *bandWidths, s_align *aligns, std::string *backtraces, int xDrop);
+
+    // the score of a query position against a target letter, with the composition bias of the query
+    int cellScore(int queryPos, unsigned char targetLetter) const {
+        return subMat->subMatrix[targetLetter][query[queryPos]] + bias[queryPos];
+    }
+
     // whether ungappedAlign fits a target of this length in 16 bit lanes
     bool canAlignUngapped(int targetLength) const;
     // ungapped score, query start and end on a diagonal (query - target position) per target, without composition bias
@@ -45,14 +56,15 @@ private:
         int rowEnd;
         int columnBegin;
         int columnEnd;
+        int seedRow;
     };
 
     template <typename T, bool Reverse>
     void alignFull(const std::vector<size_t> &jobs, const unsigned char *const *targets, const int *targetLengths, s_align *aligns);
 
-    template <typename T, bool Trace>
+    template <typename T, bool Trace, bool Anchored>
     void alignBand(const BandJob *jobs, size_t jobCount, const unsigned char *const *targets, const int *targetLengths,
-                   int *bestScores, int *bestRows, int *bestColumns, int *startRows, int *startColumns, std::string *backtraces, uint32_t *identities, int xDrop);
+                   int *bestScores, int *bestRows, int *bestColumns, int *startRows, int *startColumns, int *edgeScores, std::string *backtraces, uint32_t *identities, int xDrop);
 
     void runBanded(std::vector<BandJob> &jobs, bool trace, const unsigned char *const *targets, const int *targetLengths,
                    int *bandWidths, s_align *aligns, std::string *backtraces, const int *minScores, int xDrop);
@@ -93,6 +105,7 @@ private:
     simd_int *bandH;
     simd_int *bandF;
     size_t bandCapacity;
+    bool bandReverse;
     simd_int *trace;
     size_t traceCapacity;
 
@@ -103,6 +116,7 @@ private:
     std::vector<int> bestColumns;
     std::vector<int> startRows;
     std::vector<int> startColumns;
+    std::vector<int> edgeScores;
     std::vector<uint32_t> identities;
 
     void resize(size_t length);
