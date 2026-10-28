@@ -1579,7 +1579,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 swipeAlnResults.resize(swipeTargets.size());
                 const size_t processed = alignTargetsSwipe(par, scoring.evaluer, blockAligner, blockAlignerInitialized, &matcher, matcherInitialized, swipe,
                     query, target, &element, cluDbr, cluSeqDbr, &memberKeys, scoring.scorePerColThreshold, swMode, clusterResult.prefSize, threadIdx,
-                    swipeTargets, includeAlignFiles ? &swipeAlnResults : NULL, &pendingMemberAln, alnLineBuffer.data(),
+                    swipeTargets, includeAlignFiles ? &swipeAlnResults : NULL, includeAlignFiles ? &pendingMemberAln : NULL, alnLineBuffer.data(),
                     [&]() { return loadAssignedCluster(assignedCluster, representativeId) != DB_LOCAL_ID_INVALID; },
                     [&](const SwipeTarget &swipeTarget) { return loadAssignedCluster(assignedCluster, swipeTarget.id) != DB_LOCAL_ID_INVALID; });
                 for (size_t targetIdx = 0; targetIdx < processed; targetIdx++) {
