@@ -148,7 +148,19 @@ bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &by
     if (FileUtil::fileExists(file.c_str()) == false) {
         return false;
     }
-    const std::string content = waitForFile(file);
+    // NFS may fail to read a progress file that was just replaced; the next poll reads it again
+    FILE *handle = fopen(file.c_str(), "r");
+    if (handle == NULL) {
+        return false;
+    }
+    char buffer[256];
+    const size_t size = fread(buffer, sizeof(char), sizeof(buffer) - 1, handle);
+    const bool hasError = ferror(handle) != 0;
+    fclose(handle);
+    if (hasError) {
+        return false;
+    }
+    const std::string content(buffer, size);
     if (content.compare(0, runId.size(), runId) != 0) {
         return false;
     }
