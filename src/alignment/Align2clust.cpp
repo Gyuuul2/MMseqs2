@@ -1025,13 +1025,14 @@ struct RepTargets {
     }
 };
 
-// --createdb-mode 3: a row of <pref>.partitions, the entries from firstKey on in <pref>.<node>
+// --createdb-mode 3: a row of <pref>.partitions, the entries of keys [firstKey, endKey) in <pref>.<node>, endKey = firstKey of the next row
 struct PrefPartition {
     size_t firstKey;
     size_t prefOffset;
     size_t prefBytes;
     size_t cost;
     size_t node;
+    size_t endKey;
 };
 
 // --createdb-mode 3: a record to send, where its targets start in the split and its aligning node
@@ -1129,7 +1130,7 @@ static const size_t LOG_PART_MEMORY_DIVISOR = 64;     // a part of a log read at
 static const size_t CLUSTERS_MEMORY_DIVISOR = 16;     // the cluster pairs that a node sends at once
 
 // --createdb-mode 3: send every rep with its targets to the nodes that align them
-static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<size_t> &nodeKeyOffsets, size_t splitBytes,
+static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t splitBytes,
                                   size_t blockKeys, size_t memoryLimit, size_t paddedDbSize, size_t prefSizeBits, const std::string &repTargets) {
     const size_t dbSize = seqDbr.getSize();
     const size_t alignNodes = MMseqsNode::count - getFirstAlignNode();
@@ -1154,8 +1155,8 @@ static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     std::vector<PrefPartition> partitions;
     size_t totalCost = 0;
     for (char *line = (char *) partitionsData.c_str(); *line != '\0'; line = Util::skipLine(line)) {
-        const char *columns[4];
-        if (Util::getWordsOfLine(line, columns, 4) < 4) {
+        const char *columns[5];
+        if (Util::getWordsOfLine(line, columns, 5) < 5) {
             Debug(Debug::ERROR) << "Cannot read " << partitionsFile << "\n";
             EXIT(EXIT_FAILURE);
         }
@@ -1164,7 +1165,11 @@ static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, 
         partition.prefOffset = Util::fast_atoi<size_t>(columns[1]);
         partition.prefBytes = Util::fast_atoi<size_t>(columns[2]);
         partition.cost = Util::fast_atoi<size_t>(columns[3]);
-        partition.node = std::upper_bound(nodeKeyOffsets.begin(), nodeKeyOffsets.end(), partition.firstKey) - nodeKeyOffsets.begin() - 1;
+        partition.node = Util::fast_atoi<size_t>(columns[4]);
+        partition.endKey = dbSize;
+        if (partitions.empty() == false) {
+            partitions.back().endKey = std::min(partitions.back().endKey, partition.firstKey);
+        }
         // a partition without targets has nothing to align
         if (partition.cost == 0) {
             continue;
@@ -1296,7 +1301,7 @@ static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             // a batch takes entries while their reps and records fit, at least one
             batchEntryOffsets.assign(1, 0);
             for (size_t entry = 0, repBytes = 0, recordBytes = 0; entry < entryCount; entry++) {
-                if (entryRepKeys[entry] < nextRepKey || entryRepKeys[entry] >= nodeKeyOffsets[partition.node + 1]) {
+                if (entryRepKeys[entry] < nextRepKey || entryRepKeys[entry] >= partition.endKey) {
                     Debug(Debug::ERROR) << prefFile << " has the entry " << entryRepKeys[entry] << " out of key order or outside its partition\n";
                     EXIT(EXIT_FAILURE);
                 }
@@ -2529,7 +2534,7 @@ static int align2clustLinfinity(Parameters &par) {
     }
 
     const std::string repTargets = par.db3 + "_swap_0";
-    const std::string repTargetsIndex = sendRepTargets(par, seqDbr, nodeKeyOffsets, splitBytes, blockKeys, memoryLimit, paddedDbSize, prefSizeBits, repTargets);
+    const std::string repTargetsIndex = sendRepTargets(par, seqDbr, splitBytes, blockKeys, memoryLimit, paddedDbSize, prefSizeBits, repTargets);
     // every node read its members before it sent its records
     if (memberDbr != NULL) {
         FileUtil::remove((membersExchange + "." + SSTR(MMseqsNode::rank)).c_str());
