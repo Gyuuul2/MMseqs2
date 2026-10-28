@@ -1358,8 +1358,9 @@ static std::string sendRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, 
 // a node publishes its log after this many bytes or seconds since it published last
 static const size_t PUBLISH_BYTES = 4 * 1024 * 1024;
 static const time_t PUBLISH_SECONDS = 10;
+static const time_t READ_SECONDS = 1;
 // the records that a node aligns at once are cut into this many batches per thread, which the threads take in rep order
-static const size_t ALIGN_BATCHES_PER_THREAD = 16;
+static const size_t ALIGN_BATCHES_PER_THREAD = 64;
 // the master prefetches the assigned word of the pair this many pairs ahead as it takes pairs one by one
 static const size_t PREFETCH_PAIRS = 16;
 // the master on one node clusters with at most this many threads, a quarter of its threads if fewer, besides the threads it aligns with
@@ -1619,6 +1620,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     MMseqsNode::publishLog(acceptedHandle, acceptedLog, firstRepKey, 0);
     size_t publishedBytes = 0;
     time_t publishTime = time(NULL);
+    time_t changesTime = publishTime;
     std::mutex acceptedMutex;
     std::mutex assignedChangesMutex;
     std::vector<DBKeyType> keys;
@@ -1688,7 +1690,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                     bool blockAlignerInitialized = false;
                     bool matcherInitialized = false;
                     const char *targetKeys = record + sizeof(RepTargets) + header.repLength;
-                    for (unsigned int j = 0; j < header.targetCount; j++) {
+                    for (unsigned int j = 0; j < header.targetCount && isAssigned(header.pair.repKey) == false; j++) {
                         DBKeyType targetKey;
                         memcpy(&targetKey, targetKeys + j * sizeof(DBKeyType), sizeof(DBKeyType));
                         // a target of an assigned rep is not loaded, though the ring may have moved past the rep since
@@ -1704,7 +1706,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                     }
                 }
                 // the pairs of the batches go to the log in batch order, so the reps before the first unfinished batch are done and their pairs are in the log
-                bool hasPublished = false;
+                bool readsChanges = false;
                 {
                     std::lock_guard<std::mutex> lock(acceptedMutex);
                     batchPairs[batch].swap(pairs);
@@ -1728,11 +1730,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                         MMseqsNode::publishLog(acceptedHandle, acceptedLog, doneRepKey, acceptedBytes);
                         publishedBytes = acceptedBytes;
                         publishTime = now;
-                        hasPublished = doneRepKey < orderKeyEnd;
+                        readsChanges = doneRepKey < orderKeyEnd;
+                    }
+                    if (readsChanges || now - changesTime >= READ_SECONDS) {
+                        readsChanges = true;
+                        changesTime = now;
                     }
                 }
                 // the changes are read while the other threads write their pairs, by one thread at a time
-                if (hasPublished) {
+                if (readsChanges) {
                     std::unique_lock<std::mutex> changesLock(assignedChangesMutex, std::try_to_lock);
                     if (changesLock.owns_lock()) {
                         readAssignedChanges();
