@@ -1101,10 +1101,8 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
                     status[laneGapped[g]] = REJECTED;
                 }
             }
-            if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE) {
-                swipe.aligner.alignBandedBackward(passedCount, swipe.targets.data(), swipe.columnEnds.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
-                                                  swipe.aligns.data());
-            } else if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK) {
+            // banded_sw of mode 1 traces from corner to corner and can leave its band on a band-limited score, so mode 1 traces in the lanes too
+            if (par.alignerMode != Parameters::ALIGNER_MODE_SWIPE_BLOCK) {
                 swipe.backtraces.resize(passedCount);
                 swipe.aligner.alignBanded(passedCount, swipe.targets.data(), swipe.columnEnds.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
                                           swipe.aligns.data(), swipe.backtraces.data(), NULL, NULL, xDrop);
@@ -1129,12 +1127,6 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
                     gappedResults[t] = Matcher::result_t(target.getDbKey(), gappedAlignment.score1, gappedAlignment.qCov, gappedAlignment.tCov,
                         gappedSeqId, gappedAlignment.evalue, gappedBacktrace.size(), gappedAlignment.qStartPos1, gappedAlignment.qEndPos1, query.L,
                         gappedAlignment.dbStartPos1, gappedAlignment.dbEndPos1, target.L, gappedBacktrace);
-                } else if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE) {
-                    if (matcherInitialized == false) {
-                        matcher->initQuery(&query);
-                        matcherInitialized = true;
-                    }
-                    gappedResults[t] = matcher->getSWResult(&target, 0, false, par.covMode, par.covThr, par.evalThr, Matcher::SCORE_COV_SEQID, par.seqIdMode, false, false, &alignment);
                 } else if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_BLOCK) {
                     if (blockAlignerInitialized == false) {
                         blockAligner.initQuery(&query);
