@@ -262,16 +262,21 @@ int createtsv(int argc, const char **argv, const Command &command) {
         DBReader<DBKeyType> headers(par.hdr1.c_str(), (par.db1 + ".nodeinfo").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
         headers.open(DBReader<DBKeyType>::NOSORT);
         const std::vector<size_t> nodeKeyOffsets = headers.getFileKeyOffsets(MMseqsNode::count);
+        std::string phaseValues;
+        Timer timer;
         const std::string sortedByMember = par.db4 + "_swap_0";
         const std::string sortedByMemberIndex = MMseqsNode::sendClusterPairs(par.db3, true, ClusterPair::compareByMember, nodeKeyOffsets, sortedByMember);
+        MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", timer);
         const std::string sortedByRep = par.db4 + "_swap_1";
         const std::string sortedByRepIndex = readMemberAccessions(sortedByMemberIndex, sortedByMember, headers, nodeKeyOffsets, Util::computeMemory(par.splitMemoryLimit), sortedByRep);
+        MMseqsNode::addPhaseTime(phaseValues, "sending the member accessions", timer);
         FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
         writeRepresentativeEntries(sortedByRepIndex, sortedByRep, par.db4, par);
+        MMseqsNode::addPhaseTime(phaseValues, "writing the tsv", timer);
         std::vector<std::string> exchanges;
         exchanges.push_back(sortedByMember);
         exchanges.push_back(sortedByRep);
-        MMseqsNode::removeExchanges(sortedByRep, sortedByRep, exchanges);
+        MMseqsNode::removeExchanges(sortedByRep, sortedByRep, exchanges, phaseValues);
         headers.close();
         return EXIT_SUCCESS;
     }

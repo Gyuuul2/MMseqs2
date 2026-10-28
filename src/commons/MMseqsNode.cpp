@@ -7,6 +7,7 @@
 #include "DBReader.h"
 #include "DBWriter.h"
 #include "itoa.h"
+#include "Timer.h"
 
 #include <cstdio>
 #include <cstring>
@@ -23,6 +24,8 @@ unsigned int MMseqsNode::rank = 0;
 unsigned int MMseqsNode::count = 1;
 // the first line of every barrier file, so a file that a killed run left is told apart from one of this run
 static std::string runId;
+// the exchange bytes that this node sent, reported by removeExchanges
+static size_t sentExchangeBytes = 0;
 
 void MMseqsNode::init() {
     // mpirun (Open MPI, then PMI of MPICH/Intel MPI) before SLURM, whose variables mpirun tasks inherit from the allocation
@@ -197,6 +200,59 @@ std::string MMseqsNode::barrier(const std::string &file, const std::string &cont
     return waitForRunFile(file);
 }
 
+void MMseqsNode::addPhaseValue(std::string &content, const std::string &name, const std::string &value) {
+    content += name + "\t" + SSTR(rank) + "\t" + value + "\n";
+}
+
+void MMseqsNode::addPhaseTime(std::string &content, const std::string &phase, Timer &timer) {
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%.3f s", timer.getTimediff());
+    addPhaseValue(content, "Time for " + phase, buffer);
+    timer.reset();
+}
+
+void MMseqsNode::printPhaseValues(const std::string &values) {
+    if (isMaster() == false) {
+        return;
+    }
+    std::vector<std::string> names;
+    std::vector<std::string> maxValues;
+    std::vector<std::string> maxNodes;
+    std::vector<std::string> minValues;
+    std::vector<size_t> lineCounts;
+    for (char *line = (char *) values.c_str(); *line != '\0'; line = Util::skipLine(line)) {
+        const char *columns[3];
+        if (Util::getFieldsOfLine(line, columns, 3) < 3) {
+            Debug(Debug::ERROR) << "Cannot read the phase values\n";
+            EXIT(EXIT_FAILURE);
+        }
+        const std::string name(columns[0], columns[1] - 1);
+        const std::string node(columns[1], columns[2] - 1);
+        const std::string value(columns[2], strchr(columns[2], '\n'));
+        const size_t i = std::find(names.begin(), names.end(), name) - names.begin();
+        if (i == names.size()) {
+            names.push_back(name);
+            maxValues.push_back(value);
+            maxNodes.push_back(node);
+            minValues.push_back(value);
+            lineCounts.push_back(0);
+        } else if (strtod(value.c_str(), NULL) > strtod(maxValues[i].c_str(), NULL)) {
+            maxValues[i] = value;
+            maxNodes[i] = node;
+        } else if (strtod(value.c_str(), NULL) < strtod(minValues[i].c_str(), NULL)) {
+            minValues[i] = value;
+        }
+        lineCounts[i]++;
+    }
+    for (size_t i = 0; i < names.size(); i++) {
+        if (lineCounts[i] == 1) {
+            Debug(Debug::INFO) << names[i] << ": " << maxValues[i] << ((count > 1) ? " (node " + maxNodes[i] + ")" : "") << "\n";
+        } else {
+            Debug(Debug::INFO) << names[i] << ": max " << maxValues[i] << " (node " << maxNodes[i] << ") min " << minValues[i] << "\n";
+        }
+    }
+}
+
 size_t MMseqsNode::getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads) {
     const std::string nodeLimits = barrier(file, SSTR(memoryLimit) + ((threads > 0) ? "\t" + SSTR(threads) : "") + "\n");
     size_t smallestMemoryLimit = memoryLimit;
@@ -219,6 +275,7 @@ void MMseqsNode::addExchangeFlush(std::string &indexData, size_t &writtenBytes, 
     }
     indexData += "\n";
     writtenBytes += nodeOffsets.back();
+    sentExchangeBytes += nodeOffsets.back();
 }
 
 std::string MMseqsNode::closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData) {
@@ -741,8 +798,9 @@ void MMseqsNode::closeClusterWriter(DBWriter &writer, FILE *indexFile, const std
     FileUtil::remove(writer.getIndexFileName());
 }
 
-void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges) {
-    barrier(prefix + ".merged");
+void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues) {
+    addPhaseValue(phaseValues, "Exchange bytes sent", SSTR(sentExchangeBytes));
+    printPhaseValues(barrier(prefix + ".merged", phaseValues));
     FileUtil::remove((lastExchange + "." + SSTR(rank)).c_str());
     publishFile(prefix + ".done." + SSTR(rank), runId);
     if (isMaster()) {

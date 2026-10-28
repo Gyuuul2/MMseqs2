@@ -29,21 +29,25 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         const std::vector<size_t> nodeKeyOffsets = dbr.getFileKeyOffsets(MMseqsNode::count);
         dbr.close();
         const bool hasSecondClustering = par.filenames.size() > 3;
+        std::string phaseValues;
+        Timer timer;
         const std::string sortedByMember = par.db2 + "_swap_0";
         const std::string sortedByMemberIndex = hasSecondClustering ? MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, nodeKeyOffsets, sortedByMember) : "";
         const std::string sortedByRep = par.db2 + "_swap_1";
         const std::string sortedByRepIndex = MMseqsNode::sendClusterPairs(par.filenames[2], true, ClusterPair::compareByRep, nodeKeyOffsets, sortedByRep,
                                                                           sortedByMemberIndex, hasSecondClustering ? sortedByMember : "");
+        MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", timer);
         if (hasSecondClustering) {
             FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
         }
         MMseqsNode::writeClusterPairs(sortedByRepIndex, sortedByRep, par.db2, NULL, nodeKeyOffsets[MMseqsNode::rank], nodeKeyOffsets[MMseqsNode::rank + 1] - nodeKeyOffsets[MMseqsNode::rank]);
+        MMseqsNode::addPhaseTime(phaseValues, "writing the clusters", timer);
         std::vector<std::string> exchanges;
         exchanges.push_back(sortedByRep);
         if (hasSecondClustering) {
             exchanges.push_back(sortedByMember);
         }
-        MMseqsNode::removeExchanges(par.db2, sortedByRep, exchanges);
+        MMseqsNode::removeExchanges(par.db2, sortedByRep, exchanges, phaseValues);
         if (MMseqsNode::isMaster()) {
             DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_CLUSTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
         }

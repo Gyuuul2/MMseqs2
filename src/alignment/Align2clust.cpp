@@ -2552,7 +2552,12 @@ static int align2clustLinfinity(Parameters &par) {
                                                accepted, assignedChanges, taken, assignedKeys);
         });
     }
+    std::string phaseValues;
+    Timer phaseValueTimer;
     alignRepTargets(par, seqDbr, blockKeys, lagKeys, memoryLimit, representativeResidues, paddedDbSize, prefSizeBits, repTargetsIndex, repTargets, accepted, assignedChanges, members, memberDbr);
+    if (MMseqsNode::rank >= getFirstAlignNode()) {
+        MMseqsNode::addPhaseTime(phaseValues, "aligning the rep targets", phaseValueTimer);
+    }
 
     // once the master is done, every node sends the taken pairs of its log to their rep nodes
     const std::string takenFile = taken + "." + SSTR(MMseqsNode::rank);
@@ -2564,6 +2569,7 @@ static int align2clustLinfinity(Parameters &par) {
         Debug(Debug::INFO) << "Number of clusters: " << representatives - memberCount << "\n";
     }
     Debug(Debug::INFO) << "Time for aligning: " << phaseTimer.lap() << "\n";
+    phaseValueTimer.reset();
     const size_t nodeFirstKey = nodeKeyOffsets[MMseqsNode::rank];
     const size_t nodeKeys = nodeKeyOffsets[MMseqsNode::rank + 1] - nodeFirstKey;
     const size_t nodeWords = (nodeKeys + 63) / 64;
@@ -2631,6 +2637,7 @@ static int align2clustLinfinity(Parameters &par) {
     FileUtil::remove(acceptedFile.c_str());
     FileUtil::remove((acceptedFile + ".progress").c_str());
     const std::string clustersIndex = clustersWriter.close();
+    MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", phaseValueTimer);
     // every node has aligned the records of every node
     FileUtil::remove((repTargets + "." + SSTR(MMseqsNode::rank)).c_str());
     if (memberDbr != NULL) {
@@ -2666,7 +2673,8 @@ static int align2clustLinfinity(Parameters &par) {
     std::vector<uint64_t>().swap(assignedBits);
     MMseqsNode::writeClusterPairs(clustersIndex, clusters, par.db3, singletonBits, nodeFirstKey, nodeKeys);
     delete[] singletonBits;
-    MMseqsNode::removeExchanges(par.db3, clusters, std::vector<std::string>(1, clusters));
+    MMseqsNode::addPhaseTime(phaseValues, "writing the clusters", phaseValueTimer);
+    MMseqsNode::removeExchanges(par.db3, clusters, std::vector<std::string>(1, clusters), phaseValues);
     if (MMseqsNode::isMaster()) {
         FileUtil::remove((par.db3 + ".memory").c_str());
         FileUtil::remove(blocksFile.c_str());
