@@ -286,7 +286,8 @@ struct AlignmentScoring {
 
     AlignmentScoring(const Parameters &par, size_t dbResidues)
         : subMat(new SubstitutionMatrix(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, 0.0)), fastMatrix(SubstitutionMatrix::createAsciiSubMat(*subMat)),
-          scorePerColThreshold(getScorePerColThreshold(par)), evaluer(dbResidues, subMat) {}
+          scorePerColThreshold(getScorePerColThreshold(par)),
+          evaluer(dbResidues, subMat, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid()) {}
 
     ~AlignmentScoring() {
         delete[] fastMatrix.matrix;
