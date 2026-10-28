@@ -79,7 +79,7 @@ void MMseqsNode::publishFile(const std::string &file, const std::string &content
 }
 
 void MMseqsNode::sleepBeforePoll(unsigned int polls) {
-    usleep(10000u << std::min(polls, 6u));
+    usleep(10000u << std::min(polls, 4u));
 }
 
 std::string MMseqsNode::waitForFile(const std::string &file) {
