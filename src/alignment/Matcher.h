@@ -153,9 +153,9 @@ public:
 
     ~Matcher();
 
-    // run SSE2 parallelized Smith-Waterman alignment calculation and traceback
+    // run SSE2 parallelized Smith-Waterman alignment calculation and traceback, from the forward pass result if given
     result_t getSWResult(Sequence* dbSeq, const int diagonal, bool isReverse, const int covMode, const float covThr, const double evalThr,
-                         unsigned int alignmentMode, unsigned int seqIdMode, bool isIdentical, bool wrappedScoring=false);
+                         unsigned int alignmentMode, unsigned int seqIdMode, bool isIdentical, bool wrappedScoring=false, const s_align *forward=NULL);
 
     // need for sorting the results
     static bool compareHits(const result_t &first, const result_t &second) {

@@ -861,16 +861,16 @@ s_align SmithWaterman::ssw_align (
         const double  evalueThr,
         EvalueComputation * evaluer,
         const int covMode, const float covThr, const float correlationScoreWeight,
-        const int32_t maskLen) {
+        const int32_t maskLen, const s_align *forward) {
     resizeTarget(db_length);
     s_align alignment;
     // check if both query and target are profiles
 	if (profile->isProfile) {
         alignment = ssw_align_private<SmithWaterman::PROFILE_SEQ>(db_num_sequence, db_length, backtrace, gap_open,
-                                                                  gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen);
+                                                                  gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen, forward);
     } else {
         alignment = ssw_align_private<SmithWaterman::SEQ_SEQ>(db_num_sequence, db_length, backtrace, gap_open,
-                                                              gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen);
+                                                              gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen, forward);
     }
     return alignment;
 }
@@ -887,12 +887,12 @@ s_align SmithWaterman::ssw_align_private (
 	const double  evalueThr,
 	EvalueComputation * evaluer,
 	const int covMode, const float covThr, const float correlationScoreWeight,
-	const int32_t maskLen) {
+	const int32_t maskLen, const s_align *forward) {
 
 	int32_t query_length = profile->query_length;
 
-	// find the alignment position
-	s_align align = alignScoreEndPos<type>(db_sequence, db_length, gap_open, gap_extend, maskLen);
+	// find the alignment position, unless the forward pass of several targets at once (SWIPE) found it
+	s_align align = (forward != NULL) ? *forward : alignScoreEndPos<type>(db_sequence, db_length, gap_open, gap_extend, maskLen);
 
 	// no residue could be aligned
 	if (align.dbEndPos1 == -1) {
@@ -910,8 +910,8 @@ s_align SmithWaterman::ssw_align_private (
 		return align;
 	}
 
-	// byte SW is faster than the block aligner on the short alignments it can score
-	if (align.word == 0) {
+	// byte SW is faster than the block aligner on the short alignments it can score, a SWIPE start goes to the banded traceback
+	if (forward == NULL ? align.word == 0 : align.dbStartPos1 != -1) {
 		return alignStartPosBacktrace<type>(db_sequence, db_length, gap_open, gap_extend, alignmentMode, backtrace, align, evaluer, covMode, covThr, correlationScoreWeight, maskLen);
 	}
 
@@ -925,6 +925,9 @@ s_align SmithWaterman::ssw_align_private (
 
 	if (blockAlignFailed) {
 		Debug(Debug::WARNING) << "Block alignment failed, falling back to Smith-Waterman\n";
+		if (forward != NULL) {
+			align = alignScoreEndPos<type>(db_sequence, db_length, gap_open, gap_extend, maskLen);
+		}
 		align = alignStartPosBacktrace<type>(db_sequence, db_length, gap_open, gap_extend, alignmentMode, backtrace, align, evaluer, covMode, covThr, correlationScoreWeight, maskLen);
 	}
 
@@ -1193,69 +1196,71 @@ s_align SmithWaterman::alignStartPosBacktrace (
 
 	std::pair<alignment_end, alignment_end> bests_reverse = {};
 
-    // Find the beginning position of the best alignment.
-    if (r.word == 0) {
-        if (type == PROFILE_SEQ) { // or type == PROFILE_SEQ
-            createQueryProfile<int8_t, VECSIZE_INT * 4, PROFILE>(profile->profile_rev_byte, profile->query_rev_sequence, NULL, profile->mat_rev,
-																 r.qEndPos1 + 1, profile->alphabetSize, profile->bias, queryOffset, profile->query_length);
-		} else if (type == SEQ_SEQ) { // or type == SEQ_SEQ
-			createQueryProfile<int8_t, VECSIZE_INT * 4, SUBSTITUTIONMATRIX>(profile->profile_rev_byte, profile->query_rev_sequence, profile->composition_bias_rev, profile->mat,
-																 r.qEndPos1 + 1, profile->alphabetSize, profile->bias, queryOffset, 0);
+    // Find the beginning position of the best alignment, unless the backward pass of several targets at once (SWIPE) found it.
+    if (r.dbStartPos1 == -1) {
+        if (r.word == 0) {
+            if (type == PROFILE_SEQ) { // or type == PROFILE_SEQ
+                createQueryProfile<int8_t, VECSIZE_INT * 4, PROFILE>(profile->profile_rev_byte, profile->query_rev_sequence, NULL, profile->mat_rev,
+																	 r.qEndPos1 + 1, profile->alphabetSize, profile->bias, queryOffset, profile->query_length);
+			} else if (type == SEQ_SEQ) { // or type == SEQ_SEQ
+				createQueryProfile<int8_t, VECSIZE_INT * 4, SUBSTITUTIONMATRIX>(profile->profile_rev_byte, profile->query_rev_sequence, profile->composition_bias_rev, profile->mat,
+																	 r.qEndPos1 + 1, profile->alphabetSize, profile->bias, queryOffset, 0);
+			} else {
+				fprintf(stderr, "Unknown type in alignStartPosBacktrace: %d\n", type);
+				EXIT(EXIT_FAILURE);
+			}
+			bests_reverse = sw_sse2_byte<type>(db_sequence, 1, r.dbEndPos1 + 1, r.qEndPos1 + 1, gap_open,
+											   gap_extend, profile->profile_rev_byte,
+											   r.score1, profile->bias, maskLen, simdData);
+        } else if (r.word == 1) {
+            if (type == PROFILE_SEQ) {
+                createQueryProfile<int16_t, VECSIZE_INT * 2, PROFILE>(profile->profile_rev_word, profile->query_rev_sequence, NULL, profile->mat_rev,
+																	  r.qEndPos1 + 1, profile->alphabetSize, 0, queryOffset, profile->query_length);
+			} else if (type == SEQ_SEQ) {
+				createQueryProfile<int16_t, VECSIZE_INT * 2, SUBSTITUTIONMATRIX>(profile->profile_rev_word, profile->query_rev_sequence, profile->composition_bias_rev, profile->mat,
+																	  r.qEndPos1 + 1, profile->alphabetSize, 0, queryOffset, 0);
+			} else {
+				fprintf(stderr, "Unknown type in alignStartPosBacktrace: %d\n", type);
+				EXIT(EXIT_FAILURE);
+			}
+			bests_reverse = sw_sse2_word<type>(db_sequence, 1, r.dbEndPos1 + 1, r.qEndPos1 + 1, gap_open,
+											   gap_extend, profile->profile_rev_word,
+											   r.score1, maskLen, simdData);
+		} else if (r.word == 2) {
+            if ((type == PROFILE_SEQ)) {
+				createQueryProfile<int32_t, VECSIZE_INT * 1, PROFILE>(profile->profile_rev_int, profile->query_rev_sequence, NULL, profile->mat_rev,
+																		r.qEndPos1 + 1, profile->alphabetSize, 0, queryOffset, profile->query_length);
+			}  else if (type == SEQ_SEQ) {
+				createQueryProfile<int32_t, VECSIZE_INT * 1, SUBSTITUTIONMATRIX>(profile->profile_rev_int, profile->query_rev_sequence, profile->composition_bias_rev, profile->mat,
+																		r.qEndPos1 + 1, profile->alphabetSize, 0, queryOffset, 0);
+			}
+			bests_reverse = sw_sse2_int<type>(db_sequence, 1, r.dbEndPos1 + 1, r.qEndPos1 + 1, gap_open,
+												gap_extend, profile->profile_rev_int,
+												r.score1, maskLen, simdData);
 		} else {
-			fprintf(stderr, "Unknown type in alignStartPosBacktrace: %d\n", type);
+			Debug(Debug::ERROR) << "Unknown precision in alignStartPosBacktrace: " << r.word << "\n";
 			EXIT(EXIT_FAILURE);
 		}
-		bests_reverse = sw_sse2_byte<type>(db_sequence, 1, r.dbEndPos1 + 1, r.qEndPos1 + 1, gap_open,
-										   gap_extend, profile->profile_rev_byte,
-										   r.score1, profile->bias, maskLen, simdData);
-    } else if (r.word == 1) {
-        if (type == PROFILE_SEQ) {
-            createQueryProfile<int16_t, VECSIZE_INT * 2, PROFILE>(profile->profile_rev_word, profile->query_rev_sequence, NULL, profile->mat_rev,
-																  r.qEndPos1 + 1, profile->alphabetSize, 0, queryOffset, profile->query_length);
-		} else if (type == SEQ_SEQ) {
-			createQueryProfile<int16_t, VECSIZE_INT * 2, SUBSTITUTIONMATRIX>(profile->profile_rev_word, profile->query_rev_sequence, profile->composition_bias_rev, profile->mat,
-																  r.qEndPos1 + 1, profile->alphabetSize, 0, queryOffset, 0);
-		} else {
-			fprintf(stderr, "Unknown type in alignStartPosBacktrace: %d\n", type);
-			EXIT(EXIT_FAILURE);
-		}
-		bests_reverse = sw_sse2_word<type>(db_sequence, 1, r.dbEndPos1 + 1, r.qEndPos1 + 1, gap_open,
-										   gap_extend, profile->profile_rev_word,
-										   r.score1, maskLen, simdData);
-	} else if (r.word == 2) {
-        if ((type == PROFILE_SEQ)) {
-			createQueryProfile<int32_t, VECSIZE_INT * 1, PROFILE>(profile->profile_rev_int, profile->query_rev_sequence, NULL, profile->mat_rev,
-																	r.qEndPos1 + 1, profile->alphabetSize, 0, queryOffset, profile->query_length);
-		}  else if (type == SEQ_SEQ) {
-			createQueryProfile<int32_t, VECSIZE_INT * 1, SUBSTITUTIONMATRIX>(profile->profile_rev_int, profile->query_rev_sequence, profile->composition_bias_rev, profile->mat,
-																	r.qEndPos1 + 1, profile->alphabetSize, 0, queryOffset, 0);
-		}
-		bests_reverse = sw_sse2_int<type>(db_sequence, 1, r.dbEndPos1 + 1, r.qEndPos1 + 1, gap_open,
-											gap_extend, profile->profile_rev_int,
-											r.score1, maskLen, simdData);
-	} else {
-		Debug(Debug::ERROR) << "Unknown precision in alignStartPosBacktrace: " << r.word << "\n";
-		EXIT(EXIT_FAILURE);
-	}
 
-    if(bests_reverse.first.score != r.score1){
-		Debug(Debug::ERROR) << "r.word: " << r.word << "\n";
-        Debug(Debug::ERROR) << "bests_reverse.first.score: " << bests_reverse.first.score << "\n";
-		Debug(Debug::ERROR) << "r.score1: " << r.score1 << "\n";
-		Debug(Debug::ERROR) << "Score of forward/backward SW differ. This should not happen.\n";
-        Debug(Debug::ERROR) << "Start: Q: " << (r.qEndPos1 - bests_reverse.first.read) << ", T: " << bests_reverse.first.ref << ". End: Q: " << r.qEndPos1 << ", T " << r.dbEndPos1 << "\n";
-		//  if qry is not a profile, just exit
-        if (!(type == PROFILE_SEQ)) {
+        if(bests_reverse.first.score != r.score1){
+			Debug(Debug::ERROR) << "r.word: " << r.word << "\n";
+            Debug(Debug::ERROR) << "bests_reverse.first.score: " << bests_reverse.first.score << "\n";
+			Debug(Debug::ERROR) << "r.score1: " << r.score1 << "\n";
+			Debug(Debug::ERROR) << "Score of forward/backward SW differ. This should not happen.\n";
+            Debug(Debug::ERROR) << "Start: Q: " << (r.qEndPos1 - bests_reverse.first.read) << ", T: " << bests_reverse.first.ref << ". End: Q: " << r.qEndPos1 << ", T " << r.dbEndPos1 << "\n";
+			//  if qry is not a profile, just exit
+            if (!(type == PROFILE_SEQ)) {
+                EXIT(EXIT_FAILURE);
+            }
+        }
+
+        r.dbStartPos1 = bests_reverse.first.ref;
+        r.qStartPos1 = r.qEndPos1 - bests_reverse.first.read;
+
+        if (r.dbStartPos1 == -1) {
+            fprintf(stderr, "Target start position is -1. This should not happen.\n");
             EXIT(EXIT_FAILURE);
         }
-    }
-
-    r.dbStartPos1 = bests_reverse.first.ref;
-    r.qStartPos1 = r.qEndPos1 - bests_reverse.first.read;
-
-    if (r.dbStartPos1 == -1) {
-        fprintf(stderr, "Target start position is -1. This should not happen.\n");
-        EXIT(EXIT_FAILURE);
     }
 
     r.qCov = computeCov(r.qStartPos1, r.qEndPos1, query_length);
@@ -1308,9 +1313,9 @@ s_align SmithWaterman::alignStartPosBacktrace (
 }
 
 template
-s_align SmithWaterman::ssw_align_private<SmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t);
+s_align SmithWaterman::ssw_align_private<SmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t, const s_align*);
 template
-s_align SmithWaterman::ssw_align_private<SmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t);
+s_align SmithWaterman::ssw_align_private<SmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t, const s_align*);
 
 template
 s_align SmithWaterman::alignScoreEndPos<SmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const int32_t);
