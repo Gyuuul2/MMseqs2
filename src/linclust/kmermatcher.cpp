@@ -1765,6 +1765,8 @@ static const size_t MIN_HASH_RANGES_PER_NODE = 4;
 static const size_t PARTITIONS_PER_THREAD = 4;
 // the partitions of a rep node go in this many groups with a file each, so it removes the files of the first groups before its last pass
 static const size_t PARTITION_GROUPS = 4;
+// sending a k-mer takes about as long as reading this many bytes of sequence
+static const size_t SEND_KMER_BYTES = 12;
 
 // the codes of a row of a k-mer file, one after the other
 enum { KMER_MEMBER_CODES, KMER_REP_CANDIDATE_CODES, KMER_INDEX_CODES, KMER_CODE_COUNT };
@@ -3790,20 +3792,20 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
         globalKmers += seqDbr.getRangeRepresentativeCount(range) * computeSeqKmerCount(static_cast<int>(index[range].length - 2), par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
         globalBytes += rangeKeys * index[range].length;
     }
-    // every node sends the same key ranges, cut by the rule of decomposeDomainByAminoAcid on k-mers plus sequence bytes in average k-mers
+    // every node sends the same key ranges, cut by the rule of decomposeDomainByAminoAcid on sequence bytes plus SEND_KMER_BYTES per k-mer
     std::vector<size_t> senderKeyOffsets(MMseqsNode::count + 1, seqDbr.getSize());
     senderKeyOffsets[0] = 0;
-    const KmerPositionBit::uint128 nodeCost = std::max<KmerPositionBit::uint128>(1, (2 * static_cast<KmerPositionBit::uint128>(globalKmers) * globalBytes + MMseqsNode::count - 1) / MMseqsNode::count);
-    KmerPositionBit::uint128 costBefore = 0;
+    const size_t nodeCost = std::max<size_t>(1, (globalKmers * SEND_KMER_BYTES + globalBytes + MMseqsNode::count - 1) / MMseqsNode::count);
+    size_t costBefore = 0;
     for (size_t range = 0, node = 1; range < seqDbr.getIndexSize(); range++) {
         const size_t rangeKeys = ((range + 1 < seqDbr.getIndexSize()) ? static_cast<size_t>(index[range + 1].id) : seqDbr.getSize()) - index[range].id;
         const size_t rangeKmers = seqDbr.getRangeRepresentativeCount(range) * computeSeqKmerCount(static_cast<int>(index[range].length - 2), par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
-        const KmerPositionBit::uint128 rangeCost = static_cast<KmerPositionBit::uint128>(rangeKmers) * globalBytes + static_cast<KmerPositionBit::uint128>(rangeKeys * index[range].length) * globalKmers;
+        const size_t rangeCost = rangeKmers * SEND_KMER_BYTES + rangeKeys * index[range].length;
         for (; node < MMseqsNode::count && costBefore + rangeCost >= node * nodeCost; node++) {
             // ceil(nodeRangeCost * rangeKeys / rangeCost) bit by bit over rangeKeys, so no value exceeds rangeCost
-            const KmerPositionBit::uint128 nodeRangeCost = node * nodeCost - costBefore;
+            const size_t nodeRangeCost = node * nodeCost - costBefore;
             size_t keys = 0;
-            KmerPositionBit::uint128 remainder = 0;
+            size_t remainder = 0;
             for (int bit = std::numeric_limits<size_t>::digits - 1; bit >= 0; bit--) {
                 keys *= 2;
                 if (remainder >= rangeCost - remainder) {
