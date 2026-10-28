@@ -711,7 +711,7 @@ void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets
             a.score1 = 0;
             a.qEndPos1 = -1;
             a.dbEndPos1 = -1;
-            a.word = 0;
+            a.word = (a.word == 1) ? 1 : 0;
         } else {
             a.word = (minScores != NULL && minScores[i] >= SwipeLanes<int8_t>::MAX) ? 1 : ((a.score1 >= static_cast<uint32_t>(SwipeLanes<int8_t>::MAX)) ? 1 : 0);
         }

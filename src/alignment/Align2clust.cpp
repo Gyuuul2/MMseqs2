@@ -544,6 +544,9 @@ static bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool 
 struct SwipeBatch {
     SwipeAligner aligner;
     bool initialized;
+    // 8 bit (0) or 16 bit (1) lanes first for the members and the targets of the current rep
+    int memberWord;
+    int targetWord;
     std::vector<unsigned char> sequences;
     std::vector<size_t> offsets;
     std::vector<const unsigned char *> targets;
@@ -557,10 +560,37 @@ struct SwipeBatch {
     std::vector<int> scores;
     std::vector<int> queryStarts;
     std::vector<int> queryEnds;
+    std::vector<size_t> entries;
+    // alignTargetsSwipe
+    std::vector<size_t> ungappedEntries;
+    std::vector<size_t> ungappedTargets;
+    std::vector<BlockAligner::UngappedAln_res> ungapped;
+    std::vector<size_t> laneTargets;
+    std::vector<int> status;
+    std::vector<float> seqIds;
+    std::vector<BlockAligner::UngappedAln_res> ungappedOf;
+    std::vector<int> seedQuery;
+    std::vector<int> seedTarget;
+    std::vector<size_t> entryOf;
+    std::vector<size_t> gappedTargets;
+    std::vector<Matcher::result_t> gappedResults;
+    std::vector<size_t> laneGapped;
+    std::vector<size_t> passed;
+    // alignClusterMembersSwipe
+    std::vector<std::string> records;
+    std::vector<size_t> gapped;
+    std::vector<size_t> elementIds;
 
     SwipeBatch(const Parameters &par, BaseMatrix *subMat, size_t maxSeqLen)
         : aligner(subMat, maxSeqLen, par.compBiasCorrection, par.compBiasCorrectionScale, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid()),
-          initialized(false) {}
+          initialized(false), memberWord(1), targetWord(0) {}
+
+    // most members of a cluster are similar enough to saturate 8 bit, most targets are not
+    void startRep() {
+        initialized = false;
+        memberWord = 1;
+        targetWord = 0;
+    }
 
     void clear() {
         sequences.clear();
@@ -575,14 +605,15 @@ struct SwipeBatch {
         return offsets.size() - 1;
     }
 
-    // the target pointers of the entries in order, once all are added
-    void select(const std::vector<size_t> &entries) {
-        targets.resize(entries.size());
-        diagonals.resize(entries.size());
-        bandWidths.assign(entries.size(), 0);
-        aligns.resize(entries.size());
-        for (size_t i = 0; i < entries.size(); i++) {
+    // the entries in order, with the lanes starting at word
+    void select(size_t count, int word) {
+        targets.resize(count);
+        diagonals.resize(count);
+        bandWidths.assign(count, 0);
+        aligns.resize(count);
+        for (size_t i = 0; i < count; i++) {
             targets[i] = sequences.data() + offsets[entries[i]];
+            aligns[i].word = word;
         }
     }
 
@@ -590,6 +621,21 @@ struct SwipeBatch {
         if (initialized == false) {
             aligner.initQuery(&query);
             initialized = true;
+        }
+    }
+
+    // 16 bit lanes first once most 8 bit lanes of the rep saturate, 8 bit again once all 16 bit scores fit
+    void updateWord(int &word, size_t count) {
+        size_t wide = 0;
+        size_t fitting = 0;
+        for (size_t i = 0; i < count; i++) {
+            wide += (aligns[i].word >= 1);
+            fitting += (aligns[i].score1 < static_cast<uint32_t>(INT8_MAX));
+        }
+        if (word == 0 && 2 * wide > count) {
+            word = 1;
+        } else if (word == 1 && fitting == count) {
+            word = 0;
         }
     }
 };
@@ -618,8 +664,8 @@ static bool swipeForwardPasses(const Parameters &par, EvalueComputation &evaluer
     return Util::hasCoverage(par.covThr, par.covMode, qCov, tCov) && evaluer.computeEvalue(alignment.score1, queryLength) <= par.evalThr;
 }
 
-// alignClusterMembers of a cluster with at least SWIPE_MIN_TARGETS members, the gapped alignments in SWIPE lanes (--aligner-mode 1-3);
-// members go in batches of 1, 2, 4, ... so that a failing member stops the gate as early as one at a time
+// alignClusterMembers with the gapped alignments in SWIPE lanes (--aligner-mode 1-3); members go in batches of 1, 2, 4, ... that stop
+// the gate at the first failing member, and the gapped alignments of a batch with at least SWIPE_MIN_TARGETS members share the lanes
 static bool alignClusterMembersSwipe(const Parameters &par, EvalueComputation &evaluer, BlockAligner &blockAligner, Matcher &matcher, bool &matcherInitialized,
                                      SwipeBatch &swipe, Sequence &query, Sequence &element, const std::vector<DBKeyType> &memberKeys,
                                      DBReader<DBKeyType> *cluSeqDbr, short startDiagonal, unsigned int swMode, unsigned int threadIdx,
@@ -632,9 +678,9 @@ static bool alignClusterMembersSwipe(const Parameters &par, EvalueComputation &e
     if (pendingMemberAln != NULL) {
         pendingMemberAln->clear();
     }
-    std::vector<std::string> records;
-    std::vector<size_t> gapped;
-    std::vector<size_t> elementIds;
+    std::vector<std::string> &records = swipe.records;
+    std::vector<size_t> &gapped = swipe.gapped;
+    std::vector<size_t> &elementIds = swipe.elementIds;
     for (size_t batchStart = 0, batchSize = 1; batchStart < memberKeys.size(); batchStart += batchSize, batchSize *= 2) {
         const size_t batchEnd = std::min(memberKeys.size(), batchStart + batchSize);
         records.assign(batchEnd - batchStart, std::string());
@@ -686,52 +732,52 @@ static bool alignClusterMembersSwipe(const Parameters &par, EvalueComputation &e
             }
         }
         if (gapped.empty() == false) {
-            std::vector<size_t> entries(gapped.size());
-            for (size_t g = 0; g < gapped.size(); g++) {
-                entries[g] = g;
-            }
-            swipe.select(entries);
-            swipe.setQuery(query);
             if (matcherInitialized == false) {
                 matcher.initQuery(&query);
                 matcherInitialized = true;
             }
-            for (size_t g = 0; g < gapped.size(); g++) {
-                swipe.aligns[g].word = 1;
-            }
-            swipe.aligner.alignForward(gapped.size(), swipe.targets.data(), swipe.lengths.data(), swipe.aligns.data());
-            for (size_t g = 0; g < gapped.size(); g++) {
-                const s_align &alignment = swipe.aligns[g];
-                if (alignment.word < 2 && swipeForwardPasses(par, evaluer, alignment, query.L, swipe.lengths[g]) == false) {
-                    return false;
-                }
-            }
-            if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE) {
-                swipe.aligner.alignBackward(gapped.size(), swipe.targets.data(), swipe.aligns.data());
-            } else if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK) {
-                swipe.backtraces.resize(gapped.size());
-                swipe.columnEnds.resize(gapped.size());
-                swipe.minScores.resize(gapped.size());
+            const bool useLanes = (gapped.size() >= SWIPE_MIN_TARGETS);
+            if (useLanes) {
+                swipe.entries.resize(gapped.size());
                 for (size_t g = 0; g < gapped.size(); g++) {
-                    swipe.diagonals[g] = swipe.aligns[g].dbEndPos1 - swipe.aligns[g].qEndPos1;
-                    swipe.columnEnds[g] = swipe.aligns[g].dbEndPos1 + 1;
-                    swipe.minScores[g] = (swipe.aligns[g].word < 2) ? swipe.aligns[g].score1 : INT_MAX;
+                    swipe.entries[g] = g;
                 }
-                swipe.aligner.alignBanded(gapped.size(), swipe.targets.data(), swipe.lengths.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
-                                          swipe.aligns.data(), swipe.backtraces.data(), swipe.columnEnds.data(), swipe.minScores.data());
+                swipe.select(gapped.size(), swipe.memberWord);
+                swipe.setQuery(query);
+                swipe.aligner.alignForward(gapped.size(), swipe.targets.data(), swipe.lengths.data(), swipe.aligns.data());
+                swipe.updateWord(swipe.memberWord, gapped.size());
+                for (size_t g = 0; g < gapped.size(); g++) {
+                    const s_align &alignment = swipe.aligns[g];
+                    if (alignment.word < 2 && swipeForwardPasses(par, evaluer, alignment, query.L, swipe.lengths[g]) == false) {
+                        return false;
+                    }
+                }
+                if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE) {
+                    swipe.aligner.alignBackward(gapped.size(), swipe.targets.data(), swipe.aligns.data());
+                } else if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK) {
+                    swipe.backtraces.resize(gapped.size());
+                    swipe.columnEnds.resize(gapped.size());
+                    swipe.minScores.resize(gapped.size());
+                    for (size_t g = 0; g < gapped.size(); g++) {
+                        swipe.diagonals[g] = swipe.aligns[g].dbEndPos1 - swipe.aligns[g].qEndPos1;
+                        swipe.columnEnds[g] = swipe.aligns[g].dbEndPos1 + 1;
+                        swipe.minScores[g] = swipe.aligns[g].score1;
+                    }
+                    swipe.aligner.alignBanded(gapped.size(), swipe.targets.data(), swipe.lengths.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
+                                              swipe.aligns.data(), swipe.backtraces.data(), swipe.columnEnds.data(), swipe.minScores.data());
+                }
             }
             for (size_t g = 0; g < gapped.size(); g++) {
                 const size_t i = batchStart + gapped[g];
                 const size_t elementId = elementIds[gapped[g]];
                 element.mapSequence(elementId, memberKeys[i], cluSeqDbr->getData(elementId, threadIdx), cluSeqDbr->getSeqLen(elementId));
-                const s_align &alignment = swipe.aligns[g];
                 Matcher::result_t res_element;
-                if (alignment.word >= 2) {
+                if (useLanes == false || swipe.aligns[g].word >= 2) {
                     res_element = matcher.getSWResult(&element, 0, false, par.covMode, par.covThr, par.evalThr, swMode, par.seqIdMode, false);
                 } else if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK) {
-                    res_element = swipeResult(par, evaluer, memberKeys[i], swipe.minScores[g], alignment, query.L, element.L, swipe.backtraces[g]);
+                    res_element = swipeResult(par, evaluer, memberKeys[i], swipe.minScores[g], swipe.aligns[g], query.L, element.L, swipe.backtraces[g]);
                 } else {
-                    res_element = matcher.getSWResult(&element, 0, false, par.covMode, par.covThr, par.evalThr, swMode, par.seqIdMode, false, false, &alignment);
+                    res_element = matcher.getSWResult(&element, 0, false, par.covMode, par.covThr, par.evalThr, swMode, par.seqIdMode, false, false, &swipe.aligns[g]);
                 }
                 if (Alignment::checkCriteria(res_element, false, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr) == false) {
                     return false;
@@ -762,8 +808,10 @@ struct SwipeTarget {
     bool accepted;
 };
 
-// alignTarget for the targets of a rep in order, the ungapped and banded gapped alignments of a rep with at least SWIPE_MIN_TARGETS targets
-// in SWIPE lanes (--aligner-mode 1-3); returns how many targets were looked at before the rep was assigned
+// alignTarget for the targets of a rep in order (--aligner-mode 1-3): the ungapped alignments of at least SWIPE_MIN_TARGETS targets and
+// the banded gapped alignments of a rep with at least SWIPE_MIN_TARGETS pref targets share the SWIPE lanes, the latter counted
+// before the assigned targets are left out so that the lanes do not depend on the other threads; returns how many targets were
+// looked at before the rep was assigned
 template <typename RepAssigned, typename TargetAssigned>
 static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evaluer, BlockAligner &blockAligner, bool &blockAlignerInitialized,
                                 Matcher *matcher, bool &matcherInitialized, SwipeBatch &swipe, Sequence &query, Sequence &target, Sequence *element,
@@ -771,16 +819,15 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
                                 float scorePerColThreshold, unsigned int swMode, size_t prefSize, unsigned int threadIdx,
                                 std::vector<SwipeTarget> &targets, std::vector<std::string> *alnResults, std::string *pendingMemberAln, char *alnLineBuffer,
                                 RepAssigned repAssigned, TargetAssigned targetAssigned) {
-    const bool useLanes = (prefSize >= SWIPE_MIN_TARGETS);
+    const bool gappedLanes = (prefSize >= SWIPE_MIN_TARGETS);
     const char *querySequence = query.getSeqData();
-    swipe.initialized = false;
+    swipe.startRep();
     swipe.clear();
-    if (useLanes) {
-        swipe.setQuery(query);
-    }
     // 1. ungapped alignment of the targets that are not assigned yet
-    std::vector<size_t> ungappedEntries;
-    std::vector<size_t> ungappedTargets;
+    std::vector<size_t> &ungappedEntries = swipe.ungappedEntries;
+    std::vector<size_t> &ungappedTargets = swipe.ungappedTargets;
+    ungappedEntries.clear();
+    ungappedTargets.clear();
     size_t processed = targets.size();
     for (size_t t = 0; t < targets.size(); t++) {
         SwipeTarget &current = targets[t];
@@ -806,36 +853,47 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
         ungappedEntries.push_back(swipe.add(target));
         ungappedTargets.push_back(t);
     }
-    std::vector<BlockAligner::UngappedAln_res> ungapped(ungappedTargets.size());
-    std::vector<size_t> laneEntries;
-    std::vector<size_t> laneTargets;
-    for (size_t u = 0; u < ungappedTargets.size(); u++) {
-        const SwipeTarget &current = targets[ungappedTargets[u]];
-        if (useLanes && swipe.aligner.canAlignUngapped(current.length)) {
-            laneEntries.push_back(ungappedEntries[u]);
-            laneTargets.push_back(u);
-        } else {
-            target.mapSequence(current.id, current.key, current.sequence, current.length);
-            ungapped[u] = blockAligner.ungappedAlign(&target, current.diagonal);
+    std::vector<BlockAligner::UngappedAln_res> &ungapped = swipe.ungapped;
+    ungapped.resize(ungappedTargets.size());
+    std::vector<size_t> &laneTargets = swipe.laneTargets;
+    laneTargets.clear();
+    if (ungappedTargets.size() >= SWIPE_MIN_TARGETS) {
+        swipe.setQuery(query);
+        for (size_t u = 0; u < ungappedTargets.size(); u++) {
+            if (swipe.aligner.canAlignUngapped(targets[ungappedTargets[u]].length)) {
+                laneTargets.push_back(u);
+            }
         }
     }
-    if (laneEntries.empty() == false) {
-        swipe.select(laneEntries);
-        swipe.setQuery(query);
-        swipe.scores.resize(laneEntries.size());
-        swipe.queryStarts.resize(laneEntries.size());
-        swipe.queryEnds.resize(laneEntries.size());
-        std::vector<int> laneLengths(laneEntries.size());
-        for (size_t l = 0; l < laneEntries.size(); l++) {
+    for (size_t u = 0, l = 0; u < ungappedTargets.size(); u++) {
+        if (l < laneTargets.size() && laneTargets[l] == u) {
+            l++;
+            continue;
+        }
+        const SwipeTarget &current = targets[ungappedTargets[u]];
+        target.mapSequence(current.id, current.key, current.sequence, current.length);
+        ungapped[u] = blockAligner.ungappedAlign(&target, current.diagonal);
+    }
+    if (laneTargets.empty() == false) {
+        swipe.entries.resize(laneTargets.size());
+        for (size_t l = 0; l < laneTargets.size(); l++) {
+            swipe.entries[l] = ungappedEntries[laneTargets[l]];
+        }
+        swipe.select(laneTargets.size(), 1);
+        swipe.scores.resize(laneTargets.size());
+        swipe.queryStarts.resize(laneTargets.size());
+        swipe.queryEnds.resize(laneTargets.size());
+        swipe.columnEnds.resize(laneTargets.size());
+        for (size_t l = 0; l < laneTargets.size(); l++) {
             const unsigned short diagonal = targets[ungappedTargets[laneTargets[l]]].diagonal;
             swipe.diagonals[l] = (diagonal < query.L) ? diagonal : static_cast<int>(diagonal) - 65536;
-            laneLengths[l] = swipe.lengths[laneEntries[l]];
+            swipe.columnEnds[l] = swipe.lengths[swipe.entries[l]];
         }
-        swipe.aligner.ungappedAlign(laneEntries.size(), swipe.targets.data(), laneLengths.data(), swipe.diagonals.data(),
+        swipe.aligner.ungappedAlign(laneTargets.size(), swipe.targets.data(), swipe.columnEnds.data(), swipe.diagonals.data(),
                                     swipe.scores.data(), swipe.queryStarts.data(), swipe.queryEnds.data());
-        for (size_t l = 0; l < laneEntries.size(); l++) {
+        for (size_t l = 0; l < laneTargets.size(); l++) {
             const int d = swipe.diagonals[l];
-            const int targetLength = laneLengths[l];
+            const int targetLength = swipe.columnEnds[l];
             const int qStart = swipe.queryStarts[l];
             const int qEnd = swipe.queryEnds[l];
             const int score = swipe.scores[l];
@@ -849,13 +907,20 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
 
     // 2. the criteria of the ungapped alignment, else the seed of the gapped alignment
     enum { REJECTED, UNGAPPED_PASS, GAPPED, GAPPED_PASS };
-    std::vector<int> status(targets.size(), REJECTED);
-    std::vector<float> seqIds(targets.size(), 0.0f);
-    std::vector<BlockAligner::UngappedAln_res> ungappedOf(targets.size());
-    std::vector<int> seedQuery(targets.size(), 0);
-    std::vector<int> seedTarget(targets.size(), 0);
-    std::vector<size_t> entryOf(targets.size(), 0);
-    std::vector<size_t> gappedTargets;
+    std::vector<int> &status = swipe.status;
+    std::vector<float> &seqIds = swipe.seqIds;
+    std::vector<BlockAligner::UngappedAln_res> &ungappedOf = swipe.ungappedOf;
+    std::vector<int> &seedQuery = swipe.seedQuery;
+    std::vector<int> &seedTarget = swipe.seedTarget;
+    std::vector<size_t> &entryOf = swipe.entryOf;
+    std::vector<size_t> &gappedTargets = swipe.gappedTargets;
+    status.assign(targets.size(), REJECTED);
+    seqIds.resize(targets.size());
+    ungappedOf.resize(targets.size());
+    seedQuery.resize(targets.size());
+    seedTarget.resize(targets.size());
+    entryOf.resize(targets.size());
+    gappedTargets.clear();
     for (size_t u = 0; u < ungappedTargets.size(); u++) {
         const size_t t = ungappedTargets[u];
         const SwipeTarget &current = targets[t];
@@ -908,16 +973,18 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
     }
 
     // 3. gapped alignment from the seed
-    std::vector<Matcher::result_t> gappedResults(targets.size());
+    std::vector<Matcher::result_t> &gappedResults = swipe.gappedResults;
+    gappedResults.resize(targets.size());
     const int32_t xDrop = (MIN_SIZE * par.gapExtend.values.aminoacid() + par.gapOpen.values.aminoacid());
-    std::vector<size_t> laneGapped;
+    std::vector<size_t> &laneGapped = swipe.laneGapped;
+    laneGapped.clear();
     for (size_t g = 0; g < gappedTargets.size(); g++) {
         const size_t t = gappedTargets[g];
         if (repAssigned() || targetAssigned(targets[t])) {
             status[t] = REJECTED;
             continue;
         }
-        if (useLanes) {
+        if (gappedLanes) {
             laneGapped.push_back(t);
             continue;
         }
@@ -940,38 +1007,45 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
         status[t] = Alignment::checkCriteria(gappedResults[t], false, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr) ? GAPPED_PASS : REJECTED;
     }
     if (laneGapped.empty() == false) {
-        std::vector<size_t> entries(laneGapped.size());
-        for (size_t g = 0; g < laneGapped.size(); g++) {
-            entries[g] = entryOf[laneGapped[g]];
-        }
-        swipe.select(entries);
         swipe.setQuery(query);
-        std::vector<int> gappedLengths(laneGapped.size());
+        swipe.entries.resize(laneGapped.size());
+        for (size_t g = 0; g < laneGapped.size(); g++) {
+            swipe.entries[g] = entryOf[laneGapped[g]];
+        }
+        swipe.select(laneGapped.size(), swipe.targetWord);
+        swipe.columnEnds.resize(laneGapped.size());
         for (size_t g = 0; g < laneGapped.size(); g++) {
             swipe.diagonals[g] = seedTarget[laneGapped[g]] - seedQuery[laneGapped[g]];
-            gappedLengths[g] = targets[laneGapped[g]].length;
+            swipe.columnEnds[g] = targets[laneGapped[g]].length;
         }
-        swipe.aligner.alignBanded(laneGapped.size(), swipe.targets.data(), gappedLengths.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
+        swipe.aligner.alignBanded(laneGapped.size(), swipe.targets.data(), swipe.columnEnds.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
                                   swipe.aligns.data(), NULL, NULL, NULL);
-        std::vector<size_t> passed;
+        swipe.updateWord(swipe.targetWord, laneGapped.size());
+        // the forward passes that can meet the criteria, moved to the front for the backward pass or traceback
+        size_t passedCount = 0;
         for (size_t g = 0; g < laneGapped.size(); g++) {
             const s_align &alignment = swipe.aligns[g];
-            if (alignment.word >= 2 || swipeForwardPasses(par, evaluer, alignment, query.L, gappedLengths[g])) {
-                passed.push_back(g);
+            if (alignment.word >= 2 || swipeForwardPasses(par, evaluer, alignment, query.L, swipe.columnEnds[g])) {
+                laneGapped[passedCount] = laneGapped[g];
+                swipe.targets[passedCount] = swipe.targets[g];
+                swipe.columnEnds[passedCount] = swipe.columnEnds[g];
+                swipe.diagonals[passedCount] = swipe.diagonals[g];
+                swipe.bandWidths[passedCount] = swipe.bandWidths[g];
+                swipe.aligns[passedCount] = swipe.aligns[g];
+                passedCount++;
             } else {
                 status[laneGapped[g]] = REJECTED;
             }
         }
         if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE) {
-            swipe.aligner.alignBandedBackward(laneGapped.size(), swipe.targets.data(), gappedLengths.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
+            swipe.aligner.alignBandedBackward(passedCount, swipe.targets.data(), swipe.columnEnds.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
                                               swipe.aligns.data());
         } else if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK) {
-            swipe.backtraces.resize(laneGapped.size());
-            swipe.aligner.alignBanded(laneGapped.size(), swipe.targets.data(), gappedLengths.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
+            swipe.backtraces.resize(passedCount);
+            swipe.aligner.alignBanded(passedCount, swipe.targets.data(), swipe.columnEnds.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
                                       swipe.aligns.data(), swipe.backtraces.data(), NULL, NULL);
         }
-        for (size_t p = 0; p < passed.size(); p++) {
-            const size_t g = passed[p];
+        for (size_t g = 0; g < passedCount; g++) {
             const size_t t = laneGapped[g];
             const SwipeTarget &current = targets[t];
             target.mapSequence(current.id, current.key, current.sequence, current.length);
@@ -2338,7 +2412,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
                         blockAligner.setQuery(&query);
                         bool matcherInitialized = false;
                         if (swipeLanes) {
-                            swipe.initialized = false;
+                            swipe.startRep();
                             membersPassed[i] = alignClusterMembersSwipe(par, scoring.evaluer, blockAligner, matcher, matcherInitialized, swipe, query, element, memberKeys, memberDbr, 0, swMode, thread_idx, NULL, NULL);
                         } else {
                             membersPassed[i] = alignClusterMembers(par, blockAligner, matcher, matcherInitialized, query, element, memberKeys, memberDbr, 0, swMode, thread_idx, NULL, NULL);

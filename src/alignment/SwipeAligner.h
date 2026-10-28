@@ -23,7 +23,8 @@ public:
     // qStartPos1 and dbStartPos1 from the forward results of alignForward
     void alignBackward(size_t count, const unsigned char *const *targets, s_align *aligns);
 
-    // banded around diagonals (target - query position): score1 and the end, or with backtraces the whole alignment;
+    // banded around diagonals (target - query position): score1 and the end, starting with the lanes of word as alignForward,
+    // or with backtraces the whole alignment;
     // bandWidths are grown while the best cell is at the band edge or below minScores
     void alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals, int *bandWidths,
                      s_align *aligns, std::string *backtraces, const int *columnEnds, const int *minScores);
