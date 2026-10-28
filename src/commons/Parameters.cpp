@@ -174,6 +174,7 @@ Parameters::Parameters():
         PARAM_LINCLUST_ITERATIONS(PARAM_LINCLUST_ITERATIONS_ID, "--linclust-iterations", "Linclust iterations", "k-mer matching rounds linclust2 and lin8clust run: 2 reclusters the first round representatives, 1 stops after the first round", typeid(int), (void *) &linclustIterations, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJACENCY_ALPH_SIZE(PARAM_ADJACENCY_ALPH_SIZE_ID, "--adjacency-alph-size", "Alphabet the adjacent residues are stored in", "Alphabet size the adjacent residues are stored and scored in, 0 keeps --alph-size", typeid(int), (void *) &adjacencyAlphabetSize, "^(0|[2-9]|1[0-9]|2[01])$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: take the alignment diagonal from the k-mer match\n1: find the best diagonal by an ungapped scan in align2clust", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_ALIGNER_MODE(PARAM_ALIGNER_MODE_ID, "--aligner-mode", "Aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: forward and backward passes of several targets at once (SWIPE), then banded traceback\n2: forward pass of several targets at once (SWIPE), then block aligner backward pass and traceback\n3: forward pass and traceback of several targets at once (SWIPE)", typeid(int), (void *) &alignerMode, "^[0-3]{1}$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_KMER_POS_FILTER(PARAM_KMER_POS_FILTER_ID, "--kmer-pos-filter", "K-mer position filter", "Drop k-mer matches whose diagonal cannot reach the coverage", typeid(bool), (void *) &kmerPosFilter, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
@@ -481,6 +482,7 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_FILTER_SEQDB_FILE);
     align2clust.push_back(&PARAM_INCLUDE_ALIGN_FILES);
     align2clust.push_back(&PARAM_DIAGONAL_MODE);
+    align2clust.push_back(&PARAM_ALIGNER_MODE);
 
     // prefilter
     prefilter.push_back(&PARAM_SUB_MAT);
@@ -2837,6 +2839,7 @@ void Parameters::setDefaults() {
     linclustIterations = 2;
     adjacencyAlphabetSize = 21;
     diagonalMode = DIAGONAL_MODE_KMER;
+    alignerMode = ALIGNER_MODE_DEFAULT;
     kmerPosFilter = true;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;

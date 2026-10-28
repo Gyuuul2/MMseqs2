@@ -310,6 +310,12 @@ public:
     static const int DIAGONAL_MODE_KMER = 0;
     static const int DIAGONAL_MODE_UNGAPPED = 1;
 
+    // aligner mode
+    static const int ALIGNER_MODE_DEFAULT = 0;
+    static const int ALIGNER_MODE_SWIPE = 1;
+    static const int ALIGNER_MODE_SWIPE_BLOCK = 2;
+    static const int ALIGNER_MODE_SWIPE_TRACEBACK = 3;
+
     // rescorediagonal
     static const int RESCORE_MODE_HAMMING = 0;
     static const int RESCORE_MODE_SUBSTITUTION = 1;
@@ -612,6 +618,7 @@ public:
     int linclustIterations;
     int adjacencyAlphabetSize;
     int diagonalMode;
+    int alignerMode;
     bool kmerPosFilter;
     bool clustHash;
     int linclustVersion;
@@ -981,6 +988,7 @@ public:
     PARAMETER(PARAM_LINCLUST_ITERATIONS)
     PARAMETER(PARAM_ADJACENCY_ALPH_SIZE)
     PARAMETER(PARAM_DIAGONAL_MODE)
+    PARAMETER(PARAM_ALIGNER_MODE)
     PARAMETER(PARAM_KMER_POS_FILTER)
     PARAMETER(PARAM_USE_PARALLELISM)
     PARAMETER(PARAM_NEED_WRITEBUFFER)
