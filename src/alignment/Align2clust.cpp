@@ -540,6 +540,19 @@ static bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool 
     return true;
 }
 
+// banded target [0] and member [1] gapped alignments in SWIPE lanes, the lane slots they took and the ones aligned one pair at a time
+static std::atomic<size_t> swipeLanePairs[2];
+static std::atomic<size_t> swipeLaneSlots[2];
+static std::atomic<size_t> swipeSinglePairs[2];
+
+static void printSwipeLanes() {
+    for (int site = 0; site < 2; site++) {
+        Debug(Debug::INFO) << "SWIPE " << (site == 0 ? "target" : "member") << " gapped alignments: " << swipeLanePairs[site].load() << " in lanes ("
+                           << swipeLanePairs[site].load() * 100 / std::max<size_t>(1, swipeLaneSlots[site].load()) << "% lane fill), "
+                           << swipeSinglePairs[site].load() << " one pair at a time\n";
+    }
+}
+
 // per thread buffers of --aligner-mode 1-3: the targets or members of a rep that go through the SWIPE lanes
 struct SwipeBatch {
     SwipeAligner aligner;
@@ -582,10 +595,27 @@ struct SwipeBatch {
     std::vector<size_t> elementIds;
     std::vector<size_t> order;
     std::vector<int> memberLengths;
+    size_t lanePairs[2];
+    size_t laneSlots[2];
+    size_t singlePairs[2];
 
     SwipeBatch(const Parameters &par, BaseMatrix *subMat, size_t maxSeqLen)
         : aligner(subMat, maxSeqLen, par.compBiasCorrection, par.compBiasCorrectionScale, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid()),
-          initialized(false), memberWord(1), targetWord(0) {}
+          initialized(false), memberWord(1), targetWord(0), lanePairs(), laneSlots(), singlePairs() {}
+
+    ~SwipeBatch() {
+        for (int site = 0; site < 2; site++) {
+            swipeLanePairs[site] += lanePairs[site];
+            swipeLaneSlots[site] += laneSlots[site];
+            swipeSinglePairs[site] += singlePairs[site];
+        }
+    }
+
+    void countLanes(int site, size_t count, int word) {
+        const size_t lanes = (word == 0) ? VECSIZE_INT * 4 : VECSIZE_INT * 2;
+        lanePairs[site] += count;
+        laneSlots[site] += (count + lanes - 1) / lanes * lanes;
+    }
 
     // most members of a cluster are similar enough to saturate 8 bit, most targets are not
     void startRep() {
@@ -761,7 +791,10 @@ static bool alignClusterMembersSwipe(const Parameters &par, EvalueComputation &e
                 matcherInitialized = true;
             }
             const bool useLanes = (gapped.size() >= SWIPE_MIN_TARGETS);
-            if (useLanes) {
+            if (useLanes == false) {
+                swipe.singlePairs[1] += gapped.size();
+            } else {
+                swipe.countLanes(1, gapped.size(), swipe.memberWord);
                 swipe.entries.resize(gapped.size());
                 for (size_t g = 0; g < gapped.size(); g++) {
                     swipe.entries[g] = g;
@@ -1017,6 +1050,7 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
                 laneGapped.push_back(t);
                 continue;
             }
+            swipe.singlePairs[0]++;
             std::string gappedBacktrace;
             if (blockAlignerInitialized == false) {
                 blockAligner.initQuery(&query);
@@ -1042,6 +1076,7 @@ static size_t alignTargetsSwipe(const Parameters &par, EvalueComputation &evalue
                 swipe.entries[g] = entryOf[laneGapped[g]];
             }
             swipe.select(laneGapped.size(), swipe.targetWord);
+        swipe.countLanes(0, laneGapped.size(), swipe.targetWord);
             swipe.columnEnds.resize(laneGapped.size());
             for (size_t g = 0; g < laneGapped.size(); g++) {
                 swipe.diagonals[g] = seedTarget[laneGapped[g]] - seedQuery[laneGapped[g]];
@@ -1604,6 +1639,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             }
             pushClusterResult(std::move(clusterResult));
         }
+    }
+    if (par.alignerMode != Parameters::ALIGNER_MODE_DEFAULT) {
+        printSwipeLanes();
     }
 
     {
@@ -3212,6 +3250,9 @@ static int align2clustLinfinity(Parameters &par) {
         MMseqsNode::addPhaseTime(phaseValues, "aligning the rep targets", phaseValueTimer);
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the master", waitSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Aligned pairs", SSTR(alignedPairs));
+        if (par.alignerMode != Parameters::ALIGNER_MODE_DEFAULT) {
+            printSwipeLanes();
+        }
     }
 
     // once the master is done, every node sends the taken pairs of its log to their rep nodes
