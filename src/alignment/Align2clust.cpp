@@ -2595,8 +2595,8 @@ static int align2clustLinfinity(Parameters &par) {
         std::vector<uint64_t> takenBits(takenBytes / sizeof(uint64_t));
         MMseqsNode::readLog(takenFile, 0, takenBits.size() * sizeof(uint64_t), reinterpret_cast<char *>(takenBits.data()));
         FILE *acceptedHandle = FileUtil::openFileOrDie(acceptedFile.c_str(), "r", true);
-        // a chunk of pairs takes whole words of taken bits and fits into the writer
-        const size_t chunkPairs = clustersWriter.pairCapacity / 64 * 64;
+        // a chunk of pairs takes whole words of taken bits, at most those of the log, and fits into the writer
+        const size_t chunkPairs = std::min(clustersWriter.pairCapacity, std::max<size_t>(1, takenBits.size()) * 64) / 64 * 64;
         std::vector<ClusterPair> acceptedPairs(chunkPairs);
         for (size_t pairCount, firstWord = 0; (pairCount = fread(acceptedPairs.data(), sizeof(ClusterPair), chunkPairs, acceptedHandle)) > 0; firstWord += chunkPairs / 64) {
             const size_t wordCount = (pairCount + 63) / 64;
