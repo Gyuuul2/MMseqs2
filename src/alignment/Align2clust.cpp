@@ -1061,10 +1061,25 @@ static bool compareByAlignNodeAndRep(const ClusterPair &first, const ClusterPair
     return (firstNode != secondNode) ? firstNode < secondNode : ClusterPair::compareByRep(first, second);
 }
 
-// --createdb-mode 3: the order of the records of a chunk, by rep then first target
-static bool compareOrderByRep(const std::pair<ClusterPair, size_t> &first, const std::pair<ClusterPair, size_t> &second) {
-    return ClusterPair::compareByRep(first.first, second.first);
-}
+// --createdb-mode 3: a record that a node aligns, where its rep residues start in its chunk, where its targets start in the targets of the chunk and their bytes to read
+struct ReceivedRecord {
+    RepTargets header;
+    size_t repOffset;
+    size_t targetOffset;
+    size_t targetBytes;
+
+    static bool compareByRep(const ReceivedRecord &first, const ReceivedRecord &second) {
+        return ClusterPair::compareByRep(first.header.pair, second.header.pair);
+    }
+};
+
+// --createdb-mode 3: the records [begin, end) of a chunk that a node aligns at once and the targets it reads for them
+struct RepWindow {
+    size_t chunk;
+    size_t begin;
+    size_t end;
+    std::vector<DBKeyType> targetKeys;
+};
 
 // a pref key: 7 bits a byte, the high bit set on all bytes but the last
 static inline DBKeyType getPrefKey(const char *&data) {
@@ -1482,56 +1497,57 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     };
 
     // a chunk holds the records that every block buffers in rep order, read into the chunk that the window before the current one does not use
-    std::vector<char> chunkRecords[2];
-    std::vector<size_t> chunkRecordOffsets[2];
-    std::vector<std::pair<ClusterPair, size_t> > chunkOrder[2];
-    std::vector<size_t> chunkTargetBytes[2];
+    std::vector<char> chunkData[2];
+    std::vector<ReceivedRecord> chunkRecords[2];
+    std::vector<DBKeyType> chunkTargets[2];
+    std::vector<size_t> recordOffsets;
     size_t chunkPos[2] = { 0, 0 };
     size_t chunk = 0;
     const ClusterPair lastRecord = { DB_KEY_INVALID, DB_KEY_INVALID };
-    // a window takes records while their targets fit into an eighth of the memory, at least one record
-    const auto readWindow = [&](size_t &windowChunk, size_t &windowBegin, size_t &windowEnd) {
-        if (chunkPos[chunk] == chunkOrder[chunk].size()) {
+    std::vector<std::vector<DBKeyType> > threadKeys(par.threads);
+    // a window takes records while their targets fit into an eighth of the memory, at least one record, and lists the target keys to load without those whose rep or target is assigned
+    const auto readWindow = [&](RepWindow &window) {
+        if (chunkPos[chunk] == chunkRecords[chunk].size()) {
             chunk = 1 - chunk;
-            const size_t recordCount = MMseqsNode::readExchangeRange(repBlocks, memoryLimit / 16, RepTargets::recordSize, ClusterPair::compareByRep, lastRecord,
-                                                                     chunkRecords[chunk], &chunkRecordOffsets[chunk], repTargets);
-            chunkOrder[chunk].resize(recordCount);
-            chunkTargetBytes[chunk].resize(recordCount);
+            const size_t recordCount = MMseqsNode::readExchangeRange(repBlocks, memoryLimit / 32, RepTargets::recordSize, ClusterPair::compareByRep, lastRecord,
+                                                                     chunkData[chunk], &recordOffsets, repTargets);
+            std::vector<ReceivedRecord> &records = chunkRecords[chunk];
+            records.resize(recordCount);
+            size_t targetCount = 0;
+            for (size_t i = 0; i < recordCount; i++) {
+                memcpy(&records[i].header, chunkData[chunk].data() + recordOffsets[i], sizeof(RepTargets));
+                records[i].repOffset = recordOffsets[i] + sizeof(RepTargets);
+                records[i].targetOffset = targetCount;
+                targetCount += records[i].header.targetCount;
+            }
+            chunkTargets[chunk].resize(targetCount);
 #pragma omp parallel for schedule(dynamic, 100)
             for (size_t i = 0; i < recordCount; i++) {
-                const char *record = chunkRecords[chunk].data() + chunkRecordOffsets[chunk][i];
-                RepTargets header;
-                memcpy(&header, record, sizeof(RepTargets));
-                chunkOrder[chunk][i] = std::make_pair(header.pair, i);
-                size_t targetBytes = 0;
-                for (unsigned int j = 0; j < header.targetCount; j++) {
-                    DBKeyType targetKey;
-                    memcpy(&targetKey, record + sizeof(RepTargets) + header.repLength + j * sizeof(DBKeyType), sizeof(DBKeyType));
-                    if (j == 0 && getAlignNode(blockKeys, targetKey) != MMseqsNode::rank) {
+                ReceivedRecord &record = records[i];
+                DBKeyType *targets = chunkTargets[chunk].data() + record.targetOffset;
+                memcpy(targets, chunkData[chunk].data() + record.repOffset + record.header.repLength, record.header.targetCount * sizeof(DBKeyType));
+                record.targetBytes = 0;
+                for (unsigned int j = 0; j < record.header.targetCount; j++) {
+                    if (j == 0 && getAlignNode(blockKeys, targets[j]) != MMseqsNode::rank) {
                         Debug(Debug::ERROR) << "Cannot read " << repTargets << ": a record has a target of another node\n";
                         EXIT(EXIT_FAILURE);
                     }
-                    targetBytes += std::max(seqDbr.getEntryLen(targetKey), pageSize);
+                    record.targetBytes += std::max(seqDbr.getEntryLen(targets[j]), pageSize);
                 }
-                chunkTargetBytes[chunk][i] = targetBytes;
             }
-            SORT_PARALLEL(chunkOrder[chunk].begin(), chunkOrder[chunk].end(), compareOrderByRep);
+            SORT_PARALLEL(records.begin(), records.end(), ReceivedRecord::compareByRep);
             chunkPos[chunk] = 0;
         }
-        windowChunk = chunk;
-        windowBegin = chunkPos[chunk];
-        windowEnd = windowBegin;
-        for (size_t windowBytes = 0; windowEnd < chunkOrder[chunk].size(); windowEnd++) {
-            windowBytes += chunkTargetBytes[chunk][chunkOrder[chunk][windowEnd].second];
-            if (windowEnd > windowBegin && windowBytes > memoryLimit / 8) {
+        window.chunk = chunk;
+        window.begin = chunkPos[chunk];
+        window.end = window.begin;
+        for (size_t windowBytes = 0; window.end < chunkRecords[chunk].size(); window.end++) {
+            windowBytes += chunkRecords[chunk][window.end].targetBytes;
+            if (window.end > window.begin && windowBytes > memoryLimit / 8) {
                 break;
             }
         }
-        chunkPos[chunk] = windowEnd;
-    };
-    // the targets to read for a window, without those whose rep or target is assigned
-    std::vector<std::vector<DBKeyType> > threadKeys(par.threads);
-    const auto getWindowKeys = [&](size_t windowChunk, size_t windowBegin, size_t windowEnd, std::vector<DBKeyType> &keys) {
+        chunkPos[chunk] = window.end;
 #pragma omp parallel
         {
             unsigned int thread_idx = 0;
@@ -1540,28 +1556,31 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
 #endif
             threadKeys[thread_idx].clear();
 #pragma omp for schedule(dynamic, 100)
-            for (size_t i = windowBegin; i < windowEnd; i++) {
-                const char *record = chunkRecords[windowChunk].data() + chunkRecordOffsets[windowChunk][chunkOrder[windowChunk][i].second];
-                RepTargets header;
-                memcpy(&header, record, sizeof(RepTargets));
-                if (isAssigned(header.pair.repKey)) {
+            for (size_t i = window.begin; i < window.end; i++) {
+                const ReceivedRecord &record = chunkRecords[window.chunk][i];
+                if (isAssigned(record.header.pair.repKey)) {
                     continue;
                 }
-                for (unsigned int j = 0; j < header.targetCount; j++) {
-                    DBKeyType targetKey;
-                    memcpy(&targetKey, record + sizeof(RepTargets) + header.repLength + j * sizeof(DBKeyType), sizeof(DBKeyType));
-                    if (isAssigned(targetKey) == false) {
-                        threadKeys[thread_idx].push_back(targetKey);
+                const DBKeyType *targets = chunkTargets[window.chunk].data() + record.targetOffset;
+                for (unsigned int j = 0; j < record.header.targetCount; j++) {
+                    if (isAssigned(targets[j]) == false) {
+                        threadKeys[thread_idx].push_back(targets[j]);
                     }
                 }
             }
         }
-        keys.clear();
+        window.targetKeys.clear();
         for (int thread = 0; thread < par.threads; thread++) {
-            keys.insert(keys.end(), threadKeys[thread].begin(), threadKeys[thread].end());
+            window.targetKeys.insert(window.targetKeys.end(), threadKeys[thread].begin(), threadKeys[thread].end());
         }
-        SORT_PARALLEL(keys.begin(), keys.end());
-        keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
+        SORT_PARALLEL(window.targetKeys.begin(), window.targetKeys.end());
+        window.targetKeys.erase(std::unique(window.targetKeys.begin(), window.targetKeys.end()), window.targetKeys.end());
+    };
+    const auto getFirstRepKey = [&](const RepWindow &window) {
+        return (window.end > window.begin) ? static_cast<size_t>(chunkRecords[window.chunk][window.begin].header.pair.repKey) : orderKeyEnd;
+    };
+    const auto getRepSequence = [&](const RepWindow &window, const ReceivedRecord &record) {
+        return chunkData[window.chunk].data() + record.repOffset;
     };
 
     // the windows read bands of keys from their first key on that fit an eighth of the memory: whole on one aligning node, the own blocks on several
@@ -1611,19 +1630,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
         }
     };
 
-    size_t windowChunk;
-    size_t windowBegin;
-    size_t windowEnd;
-    readWindow(windowChunk, windowBegin, windowEnd);
-    const size_t firstRepKey = (windowEnd > windowBegin) ? static_cast<size_t>(chunkOrder[windowChunk][windowBegin].first.repKey) : orderKeyEnd;
-    MMseqsNode::publishLog(acceptedHandle, acceptedLog, firstRepKey, 0);
+    RepWindow window;
+    RepWindow nextWindow;
+    readWindow(window);
+    MMseqsNode::publishLog(acceptedHandle, acceptedLog, getFirstRepKey(window), 0);
     size_t publishedBytes = 0;
     time_t publishTime = time(NULL);
     time_t changesTime = publishTime;
     std::mutex acceptedMutex;
     std::mutex assignedChangesMutex;
-    std::vector<DBKeyType> keys;
-    std::vector<DBKeyType> nextKeys;
     std::vector<unsigned char> batchDone;
     std::vector<std::vector<ClusterPair> > batchPairs;
     std::vector<ClusterPair> windowPairs;
@@ -1632,10 +1647,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
     std::vector<size_t> partOffsets;
     std::vector<unsigned char> membersPassed;
     std::vector<DBKeyType> partKeys;
-    getWindowKeys(windowChunk, windowBegin, windowEnd, keys);
-    while (windowEnd > windowBegin) {
+    while (window.end > window.begin) {
         // the reps of a window are checked in the ring, which the master fills to lagKeys after the clustered key
-        const size_t windowRepKey = chunkOrder[windowChunk][windowBegin].first.repKey;
+        const size_t windowRepKey = getFirstRepKey(window);
         if (windowRepKey >= clusteredKey + lagKeys) {
             MMseqsNode::publishLog(acceptedHandle, acceptedLog, windowRepKey, acceptedBytes);
             publishedBytes = acceptedBytes;
@@ -1645,16 +1659,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
             }
             publishTime = time(NULL);
         }
-        readBand(keys, false);
-        size_t nextChunk;
-        size_t nextBegin;
-        size_t nextEnd;
-        readWindow(nextChunk, nextBegin, nextEnd);
-        getWindowKeys(nextChunk, nextBegin, nextEnd, nextKeys);
-        readBand(nextKeys, true);
-        const size_t nextRepKey = (nextEnd > nextBegin) ? static_cast<size_t>(chunkOrder[nextChunk][nextBegin].first.repKey) : orderKeyEnd;
-        const std::vector<std::pair<ClusterPair, size_t> > &order = chunkOrder[windowChunk];
-        const size_t recordCount = windowEnd - windowBegin;
+        readBand(window.targetKeys, false);
+        readWindow(nextWindow);
+        readBand(nextWindow.targetKeys, true);
+        const size_t nextRepKey = getFirstRepKey(nextWindow);
+        const std::vector<ReceivedRecord> &records = chunkRecords[window.chunk];
+        const size_t recordCount = window.end - window.begin;
         const size_t batchCount = std::min(recordCount, par.threads * ALIGN_BATCHES_PER_THREAD);
         batchDone.assign(batchCount, 0);
         batchPairs.assign(batchCount, std::vector<ClusterPair>());
@@ -1675,25 +1685,22 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
 #pragma omp for schedule(dynamic, 1)
             for (size_t batch = 0; batch < batchCount; batch++) {
                 pairs.clear();
-                for (size_t i = windowBegin + recordCount * batch / batchCount; i < windowBegin + recordCount * (batch + 1) / batchCount; i++) {
-                    const char *record = chunkRecords[windowChunk].data() + chunkRecordOffsets[windowChunk][order[i].second];
-                    RepTargets header;
-                    memcpy(&header, record, sizeof(RepTargets));
+                for (size_t i = window.begin + recordCount * batch / batchCount; i < window.begin + recordCount * (batch + 1) / batchCount; i++) {
+                    const RepTargets &header = records[i].header;
                     if (isAssigned(header.pair.repKey)) {
                         continue;
                     }
-                    querySeqBuffer.assign(record + sizeof(RepTargets), header.repLength);
+                    querySeqBuffer.assign(getRepSequence(window, records[i]), header.repLength);
                     const size_t repKey = header.pair.repKey % paddedDbSize;
                     query.mapSequence(repKey, repKey, querySeqBuffer.c_str(), header.repLength);
                     blockAligner.setQuery(&query);
                     bool blockAlignerInitialized = false;
                     bool matcherInitialized = false;
-                    const char *targetKeys = record + sizeof(RepTargets) + header.repLength;
+                    const DBKeyType *targets = chunkTargets[window.chunk].data() + records[i].targetOffset;
                     for (unsigned int j = 0; j < header.targetCount && isAssigned(header.pair.repKey) == false; j++) {
-                        DBKeyType targetKey;
-                        memcpy(&targetKey, targetKeys + j * sizeof(DBKeyType), sizeof(DBKeyType));
+                        const DBKeyType targetKey = targets[j];
                         // a target of an assigned rep is not loaded, though the ring may have moved past the rep since
-                        if (isAssigned(targetKey) || std::binary_search(keys.begin(), keys.end(), targetKey) == false) {
+                        if (isAssigned(targetKey) || std::binary_search(window.targetKeys.begin(), window.targetKeys.end(), targetKey) == false) {
                             continue;
                         }
                         target.mapSequence(targetKey, targetKey, seqDbr.getData(targetKey, thread_idx), seqDbr.getSeqLen(targetKey));
@@ -1725,7 +1732,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                     }
                     const time_t now = time(NULL);
                     if (acceptedBytes - publishedBytes >= PUBLISH_BYTES || now - publishTime >= PUBLISH_SECONDS) {
-                        const size_t doneRepKey = (firstUnfinishedBatch < batchCount) ? static_cast<size_t>(order[windowBegin + recordCount * firstUnfinishedBatch / batchCount].first.repKey) : nextRepKey;
+                        const size_t doneRepKey = (firstUnfinishedBatch < batchCount) ? static_cast<size_t>(records[window.begin + recordCount * firstUnfinishedBatch / batchCount].header.pair.repKey) : nextRepKey;
                         MMseqsNode::publishLog(acceptedHandle, acceptedLog, doneRepKey, acceptedBytes);
                         publishedBytes = acceptedBytes;
                         publishTime = now;
@@ -1807,15 +1814,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                         for (size_t member = memberStarts[i]; member < members.size() && members[member].repKey == pair.memberKey; member++) {
                             memberKeys.push_back(members[member].memberKey);
                         }
-                        // the sequence of the rep is in its first record of the window
-                        const std::pair<ClusterPair, size_t> repFirst = std::make_pair(ClusterPair{ pair.repKey, pair.repKey }, static_cast<size_t>(0));
-                        const size_t repOrder = std::lower_bound(order.begin() + windowBegin, order.begin() + windowEnd, repFirst, compareOrderByRep) - order.begin();
-                        const char *record = chunkRecords[windowChunk].data() + chunkRecordOffsets[windowChunk][order[repOrder].second];
-                        RepTargets header;
-                        memcpy(&header, record, sizeof(RepTargets));
-                        querySeqBuffer.assign(record + sizeof(RepTargets), header.repLength);
+                        const ReceivedRecord repFirst = { { { pair.repKey, pair.repKey }, 0, 0 }, 0, 0, 0 };
+                        const ReceivedRecord &record = *std::lower_bound(records.begin() + window.begin, records.begin() + window.end, repFirst, ReceivedRecord::compareByRep);
+                        querySeqBuffer.assign(getRepSequence(window, record), record.header.repLength);
                         const size_t repKey = pair.repKey % paddedDbSize;
-                        query.mapSequence(repKey, repKey, querySeqBuffer.c_str(), header.repLength);
+                        query.mapSequence(repKey, repKey, querySeqBuffer.c_str(), record.header.repLength);
                         blockAligner.setQuery(&query);
                         bool matcherInitialized = false;
                         membersPassed[i] = alignClusterMembers(par, blockAligner, matcher, matcherInitialized, query, element, memberKeys, memberDbr, 0, swMode, thread_idx, NULL, NULL);
@@ -1841,10 +1844,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t
                 readAssignedChanges();
             }
         }
-        keys.swap(nextKeys);
-        windowChunk = nextChunk;
-        windowBegin = nextBegin;
-        windowEnd = nextEnd;
+        std::swap(window, nextWindow);
     }
     // readExchangeRange stops at a block that is out of order, so every block must be read to its end
     for (size_t i = 0; i < repBlocks.size(); i++) {
