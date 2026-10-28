@@ -290,7 +290,7 @@ public:
     // --createdb-mode 3: reads keys [keyBegin, keyEnd) into memory for getData
     void loadData(size_t keyBegin, size_t keyEnd);
     void prefetchData(size_t keyBegin, size_t keyEnd);
-    // --createdb-mode 3 sequences: reads the ascending keys, entries closer than READ_MERGE_GAP in one request; loadData takes the keys that prefetchData read before it
+    // --createdb-mode 3 sequences: reads the ascending keys, entries at most 64 KiB apart in one request; loadData takes the keys that prefetchData read before it
     void loadData(const std::vector<DBKeyType> &keys);
     void prefetchData(const std::vector<DBKeyType> &keys);
     size_t getBufferSizeToLoad(size_t keyBegin, size_t keyEnd);
@@ -339,9 +339,6 @@ public:
     static const int SORT_BY_ID_OFFSET = 7;
     static const int SORT_BY_OFFSET = 8; // only offset sorting saves memory and does not support random access
     static const int SORT_BY_WEIGHTS= 9;
-
-    // entries of a load by keys that are at most this far apart are read in one request
-    static const size_t READ_MERGE_GAP = 64 * 1024;
 
 
     static const unsigned int USE_INDEX      = 0;

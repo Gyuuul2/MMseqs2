@@ -47,9 +47,8 @@ unsigned int KmerPositionBit::seqLenShift = 0;
 unsigned int KmerPositionBit::idShift = 0;
 size_t KmerPositionBit::maxSeqLen = 0;
 
-// --createdb-mode 3: keys [localFirstKey, localFirstKey + localKeySize) of this node, only those set in representativeBits unless NULL
+// --createdb-mode 3: the first key of the send range of this node, only the keys set in representativeBits unless NULL
 static size_t localFirstKey = 0;
-static size_t localKeySize = SIZE_T_MAX;
 static uint64_t *representativeBits = NULL;
 
 static inline bool isRepresentative(size_t id) {
@@ -2258,6 +2257,7 @@ static size_t getPassLimit(size_t memory) {
 
 // --createdb-mode 3: the hash ranges and partitions that every node cuts the same, and the limits of this node
 struct KmerExchange {
+    // the keys that a node sends and whose representative pairs it merges
     std::vector<size_t> senderKeyOffsets;
     size_t memoryLimit;
     size_t loadMemoryLimit;
@@ -2899,11 +2899,11 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
         }
     }
 
-    // a pass and the prefetched next one fit their limit; a bigger hash sub range is a pass that reads its codes in windows
     size_t receivedBytes = 0;
     for (size_t nodeHashSubRange = 0; nodeHashSubRange < nodeHashSubRangeCount; nodeHashSubRange++) {
         receivedBytes += hashSubRangeCodeBytes[nodeHashSubRange];
     }
+    // a pass and the prefetched next one fit their limit; a bigger hash sub range is a pass that reads its codes in windows
     std::vector<size_t> passHashSubRangeOffsets;
     std::vector<size_t> passBytes;
     const size_t passLimit = getPassLimit(exchange.loadMemoryLimit);
@@ -3791,7 +3791,7 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
         globalKmers += seqDbr.getRangeRepresentativeCount(range) * computeSeqKmerCount(static_cast<int>(index[range].length - 2), par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
         globalBytes += rangeKeys * index[range].length;
     }
-    // every node sends the same key ranges, cut by the rule of decomposeDomainByAminoAcid on sequence bytes plus SEND_KMER_BYTES per k-mer, and merges the pairs of their representatives
+    // cut like decomposeDomainByAminoAcid, on sequence bytes plus SEND_KMER_BYTES a k-mer
     std::vector<size_t> &senderKeyOffsets = exchange.senderKeyOffsets;
     senderKeyOffsets.assign(MMseqsNode::count + 1, seqDbr.getSize());
     senderKeyOffsets[0] = 0;
@@ -3834,7 +3834,6 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
         representativeBits = MMseqsNode::readRepresentativeBits(par.db1, nodeKeyOffsets, dbFrom, dbSize);
     }
     localFirstKey = dbFrom;
-    localKeySize = dbSize;
     // a result is complete once the master writes its dbtype
     if (MMseqsNode::isMaster() && FileUtil::fileExists((par.db2 + ".dbtype").c_str())) {
         FileUtil::remove((par.db2 + ".dbtype").c_str());
@@ -4315,7 +4314,7 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
 
     size_t aminoAcidDBSize = seqDbr.getAminoAcidDBSize();
     if (isLinfinity) {
-        // a clusthashfast subset: its representatives are the bits of every node and the sixth column of its index
+        // a clusthashfast subset counts its representatives in the sixth column of its index
         const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
         aminoAcidDBSize = 0;
         for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {
