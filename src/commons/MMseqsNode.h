@@ -8,6 +8,7 @@
 #include <vector>
 
 class DBWriter;
+class Timer;
 template <typename T> class DBReader;
 
 // a member of a cluster with its representative, the record of most exchanges between nodes
@@ -65,6 +66,12 @@ public:
     static void readLog(const std::string &log, size_t from, size_t to, char *data);
     // every node publishes content as file + "." + node; returns all contents in node order, gathered by the master into file
     static std::string barrier(const std::string &file, const std::string &content = "");
+    // phase values that a node appends to the content of a barrier as lines name<TAB>node<TAB>value, for the master to print
+    static void addPhaseValue(std::string &content, const std::string &name, const std::string &value);
+    // the seconds since timer started, which then starts again
+    static void addPhaseTime(std::string &content, const std::string &phase, Timer &timer);
+    // the master prints every name of the gathered phase values with its largest value and node, and its smallest value
+    static void printPhaseValues(const std::string &values);
     // a barrier that returns the smallest memoryLimit of all nodes, so they all cut the same splits; with threads all nodes must run with as many
     static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0);
 
@@ -132,8 +139,8 @@ public:
     // the representative of entry p becomes the one received for p in the exchange receivedIndex, receivedPrefix if given
     static std::string sendClusterPairs(const std::string &clu, bool withRepresentative, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                                         const std::string &exchange, const std::string &receivedIndex = "", const std::string &receivedPrefix = "");
-    // once every node has read lastExchange, a node removes its file of it; the master waits for all nodes and removes the indexes of exchanges
-    static void removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges);
+    // once every node has read lastExchange, a node removes its file of it; the master removes the indexes of exchanges and prints phaseValues
+    static void removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues = "");
     // ORs the bits of keys [from, to) of a file, bit k at fileOffset = key fileFirstKey + k, into bit key - firstKey of bits, a word longer than its keys
     static void readKeyBits(int fd, const std::string &fileName, size_t fileOffset, size_t fileFirstKey, size_t from, size_t to, size_t firstKey, uint64_t *bits);
     // the representative bits of keys [firstKey, firstKey + keyCount) from the files <db>.bits.<node>, each {firstKey, keyCount} then its bits

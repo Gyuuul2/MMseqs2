@@ -585,6 +585,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     Debug(Debug::INFO) << "Node " << MMseqsNode::rank << " reads" << nodeFileNames << "\n";
 
     Debug(Debug::INFO) << "Converting sequences\n";
+    std::string phaseValues;
+    Timer timer;
     std::vector<std::vector<LengthBin>> pieceHistograms(nodePieces.size());
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
     for (size_t i = 0; i < nodePieces.size(); i++) {
@@ -619,6 +621,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         histogramData += SSTR(localNodeHistogram[i].length) + "\t" + SSTR(localNodeHistogram[i].sequenceCount) + "\t" + SSTR(localNodeHistogram[i].headerSize) + "\n";
     }
     MMseqsNode::publishRunFile(histogramPrefix + SSTR(MMseqsNode::rank), histogramData);
+    MMseqsNode::addPhaseTime(phaseValues, "counting the lengths", timer);
     if (MMseqsNode::isMaster()) {
         std::vector<std::vector<LengthBin>> nodeHistograms(MMseqsNode::count);
         for (unsigned int node = 0; node < MMseqsNode::count; node++) {
@@ -715,6 +718,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     const std::string startsFile = startsPrefix + SSTR(MMseqsNode::rank);
     const std::vector<LengthBin> localNodeStarts = readLinfinityFile<LengthBin>(startsFile);
     FileUtil::remove(startsFile.c_str());
+    timer.reset();
     for (size_t i = 0; i < pieceHistograms.size(); i++) {
         if (pieceHistograms[i].empty() == false && pieceHistograms[i].back().length == 0) {
             pieceHistograms[i].pop_back();
@@ -754,7 +758,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         maxPieceSize = std::max(maxPieceSize, pieceSize);
     }
     const size_t bufferSize = std::min(maxPieceSize, static_cast<size_t>(Util::computeMemory(0) * 0.95) / (2 * activeThreads));
-#pragma omp parallel num_threads(activeThreads)
+    size_t writtenBytes = 0;
+#pragma omp parallel num_threads(activeThreads) reduction(+:writtenBytes)
     {
         char *buffer = new(std::nothrow) char[bufferSize];
         Util::checkAllocation(buffer, "Can not allocate buffer memory in createdb");
@@ -779,6 +784,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                         EXIT(EXIT_FAILURE);
                     }
                     flushBufferToDisk(dataFileFds, dataFile, buffer, bufferPos, sortedBuffer, lengthToBin);
+                    writtenBytes += bufferPos + entryCount * sizeof(uint64_t);
                     bufferPos = 0;
                     entryCount = 0;
                 }
@@ -795,6 +801,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             }
             if (bufferPos > 0) {
                 flushBufferToDisk(dataFileFds, dataFile, buffer, bufferPos, sortedBuffer, lengthToBin);
+                writtenBytes += bufferPos + entryCount * sizeof(uint64_t);
             }
             delete kseq;
         }
@@ -808,6 +815,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             EXIT(EXIT_FAILURE);
         }
     }
+    MMseqsNode::addPhaseTime(phaseValues, "writing the sequences", timer);
+    MMseqsNode::addPhaseValue(phaseValues, "Bytes written", SSTR(writtenBytes));
     if (par.compressHeaders) {
         MMseqsNode::barrier(dataFile + ".written");
         const std::string hdrDataFile = dataFile + "_h." + SSTR(MMseqsNode::rank);
@@ -870,10 +879,11 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             Debug(Debug::ERROR) << "Cannot rename " << tmpFile << " to " << hdrDataFile << "\n";
             EXIT(EXIT_FAILURE);
         }
+        MMseqsNode::addPhaseTime(phaseValues, "compressing the headers", timer);
     }
-    MMseqsNode::publishRunFile(dataFile + ".done." + SSTR(MMseqsNode::rank), "");
+    MMseqsNode::publishRunFile(dataFile + ".done." + SSTR(MMseqsNode::rank), phaseValues);
     if (MMseqsNode::isMaster()) {
-        MMseqsNode::gatherRunFiles(dataFile + ".done.");
+        MMseqsNode::printPhaseValues(MMseqsNode::gatherRunFiles(dataFile + ".done."));
         if (par.compressHeaders) {
             FileUtil::remove((dataFile + ".written").c_str());
         }

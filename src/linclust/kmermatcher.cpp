@@ -2574,8 +2574,9 @@ static void writePartition(const PrefFiles &prefFiles, size_t partitionFirstKey,
 }
 
 // --createdb-mode 3 sending: the k-mers of keys [dbFrom, dbFrom + dbSize) in loads, written to a k-mer file per hash range of the receiving node
+// returns the bytes of the k-mer files that this node wrote
 template <typename T, bool includeAdjacency, typename L>
-static void sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, size_t dbFrom, size_t dbSize,
+static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, size_t dbFrom, size_t dbSize,
                       size_t representativeBitsMemory) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     const float kmersPerSequenceScale = par.kmersPerSequenceScale.values.aminoacid();
@@ -2840,10 +2841,16 @@ static void sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *
     delete[] kmerWriteBuffer;
     delete[] groupBuffers;
     delete[] hashSeqPair;
+    size_t sentBytes = 0;
+    for (size_t hashRange = 0; hashRange < exchange.hashRangeCount; hashRange++) {
+        sentBytes += kmerFileBytes[hashRange];
+    }
+    return sentBytes;
 }
 
-// --createdb-mode 3 receiving: the k-mer files of this node in passes; groups choose reps, whose pairs go to a kmer_assignedpairs file per rep node
-static void receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange) {
+// --createdb-mode 3 receiving: the k-mer files of this node in passes; groups choose reps, whose pairs go to a kmer_assignedpairs file per rep node;
+// returns the bytes of the received k-mer files
+static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     // the index codes of a pair record at most: the gamma code of its target count, fewer than the database keys, and its key in its partition
     const size_t recordIndexBytes = (2 * getBitWidth(seqDbr.getSize()) + exchange.partitionKeyBits + CHAR_BIT - 1) / CHAR_BIT;
@@ -2891,6 +2898,10 @@ static void receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const Kme
     }
 
     // a pass and the prefetched next one fit their limit; a bigger hash sub range is a pass that reads its codes in windows
+    size_t receivedBytes = 0;
+    for (size_t nodeHashSubRange = 0; nodeHashSubRange < nodeHashSubRangeCount; nodeHashSubRange++) {
+        receivedBytes += hashSubRangeCodeBytes[nodeHashSubRange];
+    }
     std::vector<size_t> passHashSubRangeOffsets;
     std::vector<size_t> passBytes;
     const size_t passLimit = getPassLimit(exchange.loadMemoryLimit);
@@ -3401,6 +3412,7 @@ static void receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const Kme
         writeRowTable(pairFiles.handles[pairFile], pairFiles.names[pairFile], rows, pairFiles.bytes[pairFile]);
         pairFiles.handles[pairFile] = NULL;
     }
+    return receivedBytes;
 }
 
 // --createdb-mode 3 rep node: merges its partitions into <pref>.<node>; returns firstKey, prefOffset, prefBytes, rep lengths times targets per partition
@@ -3883,20 +3895,28 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     }
     exchange.partitionKeyBits = getBitWidth(std::max<size_t>(1, maxPartitionKeys) - 1);
 
-    sendKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, dbFrom, dbSize, representativeBitsMemory);
+    Timer phaseTimer;
+    std::string sendValues;
+    const size_t sentBytes = sendKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, dbFrom, dbSize, representativeBitsMemory);
+    MMseqsNode::addPhaseTime(sendValues, "sending k-mers", phaseTimer);
+    MMseqsNode::addPhaseValue(sendValues, "K-mer bytes sent", SSTR(sentBytes));
     // the representative bits of the keys of this node
     delete[] representativeBits;
     representativeBits = nodeRepresentativeBits;
     localFirstKey = nodeKeyOffsets[MMseqsNode::rank];
     localKeySize = nodeKeys;
-    MMseqsNode::barrier(par.db2 + ".kmers.done");
+    MMseqsNode::printPhaseValues(MMseqsNode::barrier(par.db2 + ".kmers.done", sendValues));
     // every node has read the memory limits
     if (MMseqsNode::isMaster()) {
         FileUtil::remove((par.db2 + ".memory").c_str());
     }
 
-    receiveKmers(par, seqDbr, exchange);
-    MMseqsNode::barrier(par.db2 + ".kmer_assignedpairs.done");
+    phaseTimer.reset();
+    std::string receiveValues;
+    const size_t receivedBytes = receiveKmers(par, seqDbr, exchange);
+    MMseqsNode::addPhaseTime(receiveValues, "receiving k-mers", phaseTimer);
+    MMseqsNode::addPhaseValue(receiveValues, "K-mer bytes received", SSTR(receivedBytes));
+    MMseqsNode::printPhaseValues(MMseqsNode::barrier(par.db2 + ".kmer_assignedpairs.done", receiveValues));
     // every node has removed its directory of received k-mer files
     if (MMseqsNode::isMaster()) {
         FileUtil::remove((par.db2 + ".kmers.done").c_str());
