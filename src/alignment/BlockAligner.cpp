@@ -115,7 +115,7 @@ void BlockAligner::initQuery(Sequence* query){
     if (Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_AMINO_ACIDS)&& compBiasCorrection){
         SubstitutionMatrix::calcLocalAaBiasCorrection(subMat, queryNumSeq, queryLength, tmpCompBias, compBiasCorrectionScale);
         for (int i =0; i < queryLength; i++) { 
-            queryCompBias[i] = (int16_t) (tmpCompBias[i]);
+            queryCompBias[i] = (int16_t) ((tmpCompBias[i] < 0.0) ? tmpCompBias[i] - 0.5 : tmpCompBias[i] + 0.5);
 		}
     } else {
         memset(queryCompBias, 0, queryLength * sizeof(int16_t));
