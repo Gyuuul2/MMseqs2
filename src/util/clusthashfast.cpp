@@ -10,6 +10,7 @@
 #include "MMseqsNode.h"
 #include "itoa.h"
 #include "FileUtil.h"
+#include "Timer.h"
 
 #include <limits>
 
@@ -284,17 +285,12 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     std::vector<LengthRange> nodeSeqRange;
     if (isLinfinity) {
         MMseqsNode::init();
-        if (reader.getDataFileCnt() != MMseqsNode::count) {
-            Debug(Debug::ERROR) << "Database " << par.db1 << " has " << reader.getDataFileCnt() << " data files, but clusthashfast runs on " << MMseqsNode::count << " nodes\n";
-            EXIT(EXIT_FAILURE);
-        }
+        const size_t endKey = reader.getFileKeyOffsets(MMseqsNode::count)[MMseqsNode::rank + 1];
         const DBReader<DBKeyType>::Index *index = reader.getIndex();
-        size_t endKey = reader.getSize();
         size_t endOffset = 0;
         for (size_t range = 0; range < reader.getIndexSize(); range++) {
             if (reader.getIndexFile(range) == MMseqsNode::rank) {
                 nodeSeqRange.push_back({index[range].id, index[range].offset, index[range].length});
-                endKey = (range + 1 < reader.getIndexSize()) ? index[range + 1].id : reader.getSize();
                 endOffset = index[range].offset + (endKey - index[range].id) * index[range].length;
             }
         }
@@ -377,6 +373,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     ReducedMatrix subMat(sMat.probMatrix, sMat.subMatrixPseudoCounts, sMat.aa2num, sMat.num2aa, sMat.alphabetSize, par.alphabetSize.values.aminoacid(), 2.0);
 
     Debug(Debug::INFO) << "Hashing " << localKeySize << " sequences in " << loadOffsets.size() - 1 << " loads\n";
+    Timer timer;
     Debug::Progress progress(loadOffsets.size() - 1);
     for (size_t load = 0; load + 1 < loadOffsets.size(); load++) {
         progress.updateProgress();
@@ -582,28 +579,12 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     }
 
     if (isLinfinity) {
+        std::string phaseValues;
+        MMseqsNode::addPhaseTime(phaseValues, "hashing the sequences", timer);
+        MMseqsNode::addPhaseValue(phaseValues, "Sequences hashed", SSTR(localKeySize));
+        MMseqsNode::publishRunFile(par.db2 + ".phases." + SSTR(MMseqsNode::rank), phaseValues);
         MMseqsNode::closeClusterWriter(resultWriter, resultIndexFile, resultIndex);
-        // the bits are on disk before the index part that tells the master this node is done
-        const std::string bitsFile = representativeDb + ".bits." + SSTR(MMseqsNode::rank);
-        FILE *bits = FileUtil::openAndDelete(bitsFile.c_str(), "w");
-        const uint64_t header[2] = { localFirstKey, localKeySize };
-        if (fwrite(header, sizeof(uint64_t), 2, bits) != 2 || fwrite(representativeBits, sizeof(uint64_t), representativeBitsSize, bits) != representativeBitsSize
-            || fflush(bits) != 0 || fsync(fileno(bits)) != 0 || fclose(bits) != 0) {
-            Debug(Debug::ERROR) << "Cannot write " << bitsFile << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        // the ranges of this node in the sequence index, with the number of its representatives as a sixth column
-        std::string representativeIndex;
-        for (size_t i = 0; i + 1 < nodeSeqRange.size(); i++) {
-            const size_t rangeEndKey = nodeSeqRange[i + 1].startKey;
-            const size_t rangeRepresentatives = Util::countSetBits(representativeBits, nodeSeqRange[i].startKey - localFirstKey, rangeEndKey - localFirstKey);
-            representativeIndex += SSTR(nodeSeqRange[i].startKey) + "\t" + SSTR(nodeSeqRange[i].offset) + "\t" + SSTR(nodeSeqRange[i].entryLength) + "\t"
-                                 + SSTR(rangeEndKey - nodeSeqRange[i].startKey) + "\t" + SSTR(MMseqsNode::rank) + "\t" + SSTR(rangeRepresentatives) + "\n";
-        }
-        MMseqsNode::publishRunFile(representativeDb + ".index." + SSTR(MMseqsNode::rank), representativeIndex);
-        if (MMseqsNode::isMaster()) {
-            MMseqsNode::publishFile(representativeDb + ".index", MMseqsNode::gatherRunFiles(representativeDb + ".index."));
-        }
+        MMseqsNode::writeRepresentativeBits(representativeDb, reader, representativeBits, localFirstKey, localKeySize);
     } else {
         // clusters are written in key order unless a length was split into hash ranges
         resultWriter.close(false, needsSort);
@@ -619,6 +600,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                 clusters += representativeReader.getRangeRepresentativeCount(range);
             }
             representativeReader.close();
+            MMseqsNode::printPhaseValues(MMseqsNode::gatherRunFiles(par.db2 + ".phases."));
             // a mode 3 subset only feeds the next pipeline steps, which read no headers, lookup or source
             DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_CLUSTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
         } else {
