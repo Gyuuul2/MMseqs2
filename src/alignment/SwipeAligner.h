@@ -24,10 +24,10 @@ public:
     void alignBackward(size_t count, const unsigned char *const *targets, s_align *aligns);
 
     // banded around diagonals (target - query position): score1 and the end, starting with the lanes of word as alignForward,
-    // or with backtraces the whole alignment;
-    // bandWidths are grown while the best cell is at the band edge or below minScores
+    // or with backtraces the whole alignment; bandWidths are grown while the best cell is at the band edge or below minScores,
+    // and a lane stops once its row maximum falls more than xDrop (if > 0) below its best
     void alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals, int *bandWidths,
-                     s_align *aligns, std::string *backtraces, const int *columnEnds, const int *minScores);
+                     s_align *aligns, std::string *backtraces, const int *columnEnds, const int *minScores, int xDrop);
     // qStartPos1 and dbStartPos1 from the results of alignBanded
     void alignBandedBackward(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals, int *bandWidths, s_align *aligns);
 
@@ -55,10 +55,10 @@ private:
 
     template <typename T, bool Reverse, bool Trace>
     void alignBand(const BandJob *jobs, size_t jobCount, const unsigned char *const *targets, const int *targetLengths,
-                   int *bestScores, int *bestRows, int *bestColumns, int *startRows, int *startColumns, std::string *backtraces, uint32_t *identities);
+                   int *bestScores, int *bestRows, int *bestColumns, int *startRows, int *startColumns, std::string *backtraces, uint32_t *identities, int xDrop);
 
     void runBanded(std::vector<BandJob> &jobs, bool reverse, bool trace, const unsigned char *const *targets, const int *targetLengths,
-                   int *bandWidths, s_align *aligns, std::string *backtraces, const int *minScores);
+                   int *bandWidths, s_align *aligns, std::string *backtraces, const int *minScores, int xDrop);
 
     BaseMatrix *subMat;
     int alphabetSize;
