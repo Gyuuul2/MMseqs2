@@ -70,6 +70,7 @@ public:
     static void addPhaseValue(std::string &content, const std::string &name, const std::string &value);
     // the seconds since timer started, which then starts again
     static void addPhaseTime(std::string &content, const std::string &phase, Timer &timer);
+    static void addPhaseSeconds(std::string &content, const std::string &phase, double seconds);
     // the master prints every name of the gathered phase values with its largest value and node, and its smallest value
     static void printPhaseValues(const std::string &values);
     // a barrier that returns the smallest memoryLimit of all nodes, so they all cut the same splits; with threads all nodes must run with as many
@@ -100,6 +101,8 @@ public:
     // whose buffer is not cut into one for every flush
     static void openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeBlock> &blocks, std::vector<FILE *> &files,
                              bool sendersInOrder = false);
+    // the smallest buffer of a block in readExchangeRange
+    static const size_t EXCHANGE_BUFFER_SIZE = 1024 * 1024;
     // moves the buffered records up to last of every block to records, recordOffsets their starts then the end; returns their count, 0 once none is left
     static size_t readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t (*recordSize)(const char *, size_t),
                                     bool (*compare)(const ClusterPair &, const ClusterPair &), const ClusterPair &last,
@@ -139,6 +142,9 @@ public:
     // the representative of entry p becomes the one received for p in the exchange receivedIndex, receivedPrefix if given
     static std::string sendClusterPairs(const std::string &clu, bool withRepresentative, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                                         const std::string &exchange, const std::string &receivedIndex = "", const std::string &receivedPrefix = "");
+    // --filter-cludb-file: a request { key, requesting node } of the exchange requestsIndex, requests gets the other members of the entry of key in <clu>.<node>
+    // as { key, member } through the exchange <members>.<node>
+    static std::string sendClusterMembers(const std::string &clu, const std::string &requestsIndex, const std::string &requests, const std::string &members);
     // once every node has read lastExchange, a node removes its file of it; the master removes the indexes of exchanges and prints phaseValues
     static void removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues = "");
     // ORs the bits of keys [from, to) of a file, bit k at fileOffset = key fileFirstKey + k, into bit key - firstKey of bits, a word longer than its keys
