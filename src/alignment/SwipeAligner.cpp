@@ -191,6 +191,8 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
     const simd_int vZero = simdi_setzero();
     const simd_int vGapO = V::set(-gapOpen);
     const simd_int vGapE = V::set(-gapExtend);
+    // the 16 bit lanes subtract up to 192 from a score saturated at INT16_MAX, so they count as saturated 255 below it
+    const int saturated = (sizeof(T) == 2) ? V::MAX - 255 : V::MAX;
     for (int i = 0; i < Lq; i++) {
         hColumn[i] = vZero;
         eColumn[i] = vZero;
@@ -221,7 +223,7 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
             a.score1 = laneBest[l];
             a.dbEndPos1 = laneBestColumn[l];
             a.qEndPos1 = laneBestRow[l];
-            a.word = (laneBest[l] >= V::MAX) ? ((sizeof(T) == 1) ? 1 : 2) : ((sizeof(T) == 1) ? 0 : 1);
+            a.word = (laneBest[l] >= saturated) ? ((sizeof(T) == 1) ? 1 : 2) : ((sizeof(T) == 1) ? 0 : 1);
         }
         laneJob[l] = -1;
         active--;
@@ -373,7 +375,7 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
                 }
                 laneColumn[l]++;
                 const bool reached = Reverse && laneBest[l] >= static_cast<int>(aligns[id].score1);
-                if (laneColumn[l] == laneColumns[l] || laneBest[l] >= V::MAX || reached) {
+                if (laneColumn[l] == laneColumns[l] || laneBest[l] >= saturated || reached) {
                     finish(l);
                     finished[l] = true;
                 }
