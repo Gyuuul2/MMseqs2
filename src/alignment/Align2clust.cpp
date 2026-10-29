@@ -492,7 +492,7 @@ static bool swipeForwardPasses(const Parameters &par, EvalueComputation &evaluer
 }
 
 // the gapped alignments of the members of a round of alignClusterMembers, of all its gates; the members of a gate whose batch fills
-// the 16 bit lanes go through the lanes together, the others one pair at a time, which only depends on the member order of the gate;
+// half of the 16 bit lanes go through the lanes together, the others one pair at a time, which only depends on the member order of the gate;
 // a failing member closes its gate
 static void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherInitialized, ClusterMembers &members, Sequence &query, Sequence &element,
                               DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer) {
@@ -505,7 +505,7 @@ static void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &mat
     lanePool.assign(swipe.gapped.size(), SIZE_MAX);
     swipe.entries.clear();
     for (size_t g = 0; g < swipe.gapped.size(); g++) {
-        if (members.gates[members.poolGates[g]].batch >= VECSIZE_INT * 2) {
+        if (members.gates[members.poolGates[g]].batch >= VECSIZE_INT) {
             lanePool[g] = swipe.entries.size();
             swipe.entries.push_back(g);
         }
