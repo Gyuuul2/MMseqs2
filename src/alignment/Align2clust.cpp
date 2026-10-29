@@ -352,10 +352,7 @@ struct SwipeBatch {
     std::vector<std::string> backtraces;
     std::vector<size_t> entries;
     // alignClusterMembers
-    std::vector<std::string> records;
     std::vector<size_t> gapped;
-    std::vector<size_t> order;
-    std::vector<int> memberLengths;
     size_t lanePairs;
     size_t laneSlots;
     size_t singlePairs;
@@ -435,6 +432,16 @@ struct SwipeBatch {
     }
 };
 
+// per thread buffers of alignClusterMembers: the member order, the member alignments in member order and the SWIPE lanes (--aligner-mode 1-3)
+struct ClusterMembers {
+    std::vector<size_t> order;
+    std::vector<int> lengths;
+    std::vector<std::string> records;
+    SwipeBatch *swipe;
+
+    explicit ClusterMembers(SwipeBatch *swipe) : swipe(swipe) {}
+};
+
 // the result of a SWIPE alignment with start, end, identities and backtrace
 static Matcher::result_t swipeResult(const Parameters &par, EvalueComputation &evaluer, DBKeyType key, int rawScore, const s_align &alignment,
                                      int queryLength, int targetLength, const std::string &backtrace) {
@@ -457,7 +464,7 @@ static bool swipeForwardPasses(const Parameters &par, EvalueComputation &evaluer
 }
 
 // the gapped alignments of the members of a batch of alignClusterMembers, in the SWIPE lanes if they fill them
-static bool alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherInitialized, SwipeBatch &swipe, Sequence &query, Sequence &element,
+static bool alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherInitialized, SwipeBatch &swipe, std::vector<std::string> &records, Sequence &query, Sequence &element,
                               const std::vector<DBKeyType> &memberKeys, DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx,
                               std::string *pendingMemberAln, char *alnLineBuffer) {
     if (matcherInitialized == false) {
@@ -515,42 +522,41 @@ static bool alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &mat
         }
         if (pendingMemberAln != NULL) {
             size_t len = Matcher::resultToBuffer(alnLineBuffer, res_element, par.addBacktrace);
-            swipe.records[i].assign(alnLineBuffer, len);
+            records[i].assign(alnLineBuffer, len);
         }
     }
     return true;
 }
 
 // whether every --filter-cludb-file member of the cluster of the target, memberKeys, meets the clustering criteria against the query, from startDiagonal;
-// with swipe (--aligner-mode 1-3) the members that cannot be covered fail first, the most different lengths go next, the members go in batches of
-// 1, 2, 4, ... and the gapped alignments of a batch that fills the SWIPE lanes share them, with the same decision
+// the members that cannot be covered fail first and the most different lengths go next, with the decision of the member order; with SWIPE
+// (--aligner-mode 1-3) the members go in batches of 1, 2, 4, ... and the gapped alignments of a batch that fills the lanes share them
 static bool alignClusterMembers(const Parameters &par, BlockAligner &blockAligner, Matcher &matcher, bool &matcherInitialized, Sequence &query, Sequence &element,
                                 const std::vector<DBKeyType> &memberKeys, DBReader<DBKeyType> *cluSeqDbr, short startDiagonal, unsigned int swMode,
-                                unsigned int threadIdx, std::string *pendingMemberAln, char *alnLineBuffer, SwipeBatch *swipe) {
+                                unsigned int threadIdx, std::string *pendingMemberAln, char *alnLineBuffer, ClusterMembers &members) {
     const char *querySequence = query.getSeqData();
+    SwipeBatch *swipe = members.swipe;
     if (pendingMemberAln != NULL) {
         pendingMemberAln->clear();
     }
-    if (swipe != NULL) {
-        swipe->order.resize(memberKeys.size());
-        swipe->memberLengths.resize(memberKeys.size());
-        for (size_t i = 0; i < memberKeys.size(); i++) {
-            swipe->order[i] = i;
-            swipe->memberLengths[i] = static_cast<int>(cluSeqDbr->getSeqLen(cluSeqDbr->getId(memberKeys[i])));
-            int minDiag, maxDiag;
-            if (Util::canBeCovered(par.covThr, par.covMode, query.L, swipe->memberLengths[i]) == false
-                || (par.diagonalMode == Parameters::DIAGONAL_MODE_UNGAPPED && canBeCoveredOnDiagonals(par, query.L, swipe->memberLengths[i], minDiag, maxDiag) == false)) {
-                return false;
-            }
+    members.order.resize(memberKeys.size());
+    members.lengths.resize(memberKeys.size());
+    for (size_t i = 0; i < memberKeys.size(); i++) {
+        members.order[i] = i;
+        members.lengths[i] = static_cast<int>(cluSeqDbr->getSeqLen(cluSeqDbr->getId(memberKeys[i])));
+        int minDiag, maxDiag;
+        if (Util::canBeCovered(par.covThr, par.covMode, query.L, members.lengths[i]) == false
+            || (par.diagonalMode == Parameters::DIAGONAL_MODE_UNGAPPED && canBeCoveredOnDiagonals(par, query.L, members.lengths[i], minDiag, maxDiag) == false)) {
+            return false;
         }
-        const std::vector<int> &memberLengths = swipe->memberLengths;
-        const int queryLength = query.L;
-        std::stable_sort(swipe->order.begin(), swipe->order.end(), [&memberLengths, queryLength](size_t first, size_t second) {
-            return std::abs(memberLengths[first] - queryLength) > std::abs(memberLengths[second] - queryLength);
-        });
-        if (pendingMemberAln != NULL) {
-            swipe->records.assign(memberKeys.size(), std::string());
-        }
+    }
+    const std::vector<int> &memberLengths = members.lengths;
+    const int queryLength = query.L;
+    std::stable_sort(members.order.begin(), members.order.end(), [&memberLengths, queryLength](size_t first, size_t second) {
+        return std::abs(memberLengths[first] - queryLength) > std::abs(memberLengths[second] - queryLength);
+    });
+    if (pendingMemberAln != NULL) {
+        members.records.assign(memberKeys.size(), std::string());
     }
     for (size_t batchStart = 0, batchSize = 1; batchStart < memberKeys.size(); batchStart += batchSize, batchSize *= (swipe != NULL) ? 2 : 1) {
         if (swipe != NULL) {
@@ -558,7 +564,7 @@ static bool alignClusterMembers(const Parameters &par, BlockAligner &blockAligne
             swipe->clear();
         }
         for (size_t o = batchStart; o < std::min(memberKeys.size(), batchStart + batchSize); o++) {
-            const size_t i = (swipe != NULL) ? swipe->order[o] : o;
+            const size_t i = members.order[o];
             const DBKeyType elementKey = memberKeys[i];
             const size_t elementId = cluSeqDbr->getId(elementKey);
             char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
@@ -610,7 +616,7 @@ static bool alignClusterMembers(const Parameters &par, BlockAligner &blockAligne
                 }
                 // stage member alignment (flushed only if all members pass)
                 if (pendingMemberAln != NULL) {
-                    appendAlignmentResult(*pendingMemberAln, alnLineBuffer, res_element, par.addBacktrace);
+                    appendAlignmentResult(members.records[i], alnLineBuffer, res_element, par.addBacktrace);
                 }
             } else if (pendingMemberAln != NULL) {
                 // member passed ungapped: gap-free (all 'M') record
@@ -619,29 +625,28 @@ static bool alignClusterMembers(const Parameters &par, BlockAligner &blockAligne
                     elementUngappedAlignment.tcov, elementSeqId, elementUngappedAlignment.eval, elementUngappedAlignment.alnLen,
                     elementUngappedAlignment.qStart, elementUngappedAlignment.qEnd, query.L,
                     elementUngappedAlignment.tStart, elementUngappedAlignment.tEnd, elementLength, elementBacktrace);
-                appendAlignmentResult((swipe != NULL) ? swipe->records[i] : *pendingMemberAln, alnLineBuffer, elementResult, par.addBacktrace);
+                appendAlignmentResult(members.records[i], alnLineBuffer, elementResult, par.addBacktrace);
             }
         }
-        if (swipe != NULL && swipe->gapped.empty() == false && alignMembersSwipe(par, matcher, matcherInitialized, *swipe, query, element, memberKeys,
+        if (swipe != NULL && swipe->gapped.empty() == false && alignMembersSwipe(par, matcher, matcherInitialized, *swipe, members.records, query, element, memberKeys,
                                                                                   cluSeqDbr, swMode, threadIdx, pendingMemberAln, alnLineBuffer) == false) {
             return false;
         }
     }
-    if (swipe != NULL && pendingMemberAln != NULL) {
-        for (size_t r = 0; r < swipe->records.size(); r++) {
-            *pendingMemberAln += swipe->records[r];
+    if (pendingMemberAln != NULL) {
+        for (size_t r = 0; r < members.records.size(); r++) {
+            *pendingMemberAln += members.records[r];
         }
     }
     return true;
 }
 
-// whether the target meets the clustering criteria against the query of blockAligner, with its --filter-cludb-file members if cluDbr is given,
-// aligned in the SWIPE lanes if swipe is given (--aligner-mode 1-3)
+// whether the target meets the clustering criteria against the query of blockAligner, with its --filter-cludb-file members if cluDbr is given
 static bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockAlignerInitialized, Matcher *matcher, bool &matcherInitialized,
                         Sequence &query, Sequence &target, Sequence *element, DBReader<DBKeyType> *cluDbr, DBReader<DBKeyType> *cluSeqDbr, std::vector<DBKeyType> *memberKeys,
                         float scorePerColThreshold, unsigned int swMode, unsigned short diagonal, unsigned int threadIdx,
                         const ClusterAssignment *assignedCluster, size_t targetId,
-                        std::string *alnResultBuffer, std::string *pendingMemberAln, char *alnLineBuffer, SwipeBatch *swipe) {
+                        std::string *alnResultBuffer, std::string *pendingMemberAln, char *alnLineBuffer, ClusterMembers *members) {
     const char *querySequence = query.getSeqData();
     const char *targetSequence = target.getSeqData();
     if (Util::canBeCovered(par.covThr, par.covMode, query.L, target.L) == false) {
@@ -687,7 +692,7 @@ static bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool 
         if (cluDbr != NULL) {
             getClusterMembers(cluDbr, target.getDbKey(), threadIdx, *memberKeys);
             if (alignClusterMembers(par, blockAligner, *matcher, matcherInitialized, query, *element, *memberKeys, cluSeqDbr,
-                                    diagonal, swMode, threadIdx, pendingMemberAln, alnLineBuffer, swipe) == false) {
+                                    diagonal, swMode, threadIdx, pendingMemberAln, alnLineBuffer, *members) == false) {
                 return false;
             }
         }
@@ -772,7 +777,7 @@ static bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool 
     if (cluDbr != NULL) {
         getClusterMembers(cluDbr, target.getDbKey(), threadIdx, *memberKeys);
         if (alignClusterMembers(par, blockAligner, *matcher, matcherInitialized, query, *element, *memberKeys, cluSeqDbr,
-                                0, swMode, threadIdx, pendingMemberAln, alnLineBuffer, swipe) == false) {
+                                0, swMode, threadIdx, pendingMemberAln, alnLineBuffer, *members) == false) {
             return false;
         }
     }
@@ -1075,6 +1080,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         targetsWithDiagonal.reserve(1000);
         const bool swipeLanes = (par.alignerMode != Parameters::ALIGNER_MODE_DEFAULT);
         SwipeBatch swipe(par, scoring.subMat, scoring.evaluer, db_maxseqlen);
+        ClusterMembers members(swipeLanes ? &swipe : NULL);
         std::vector<DBKeyType> memberKeys;
         std::string querySeqBuffer;
         querySeqBuffer.reserve(db_maxseqlen + 1);
@@ -1174,7 +1180,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 if (alignTarget(par, blockAligner, blockAlignerInitialized, &matcher, matcherInitialized, query, target, &element, cluDbr, cluSeqDbr, &memberKeys,
                                 scoring.scorePerColThreshold, swMode, targetsWithDiagonal[targetIdx].second, threadIdx, assignedCluster, targetId,
                                 includeAlignFiles ? &alnResultBuffer : NULL, includeAlignFiles ? &pendingMemberAln : NULL, alnLineBuffer.data(),
-                                swipeLanes ? &swipe : NULL)) {
+                                &members)) {
                     clusterResult.memberIds.push_back(targetId);
                 }
             }
@@ -1975,6 +1981,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
                     std::vector<DBKeyType> memberKeys;
                     const bool swipeLanes = (par.alignerMode != Parameters::ALIGNER_MODE_DEFAULT);
                     SwipeBatch swipe(par, scoring.subMat, scoring.evaluer, maxSeqLen);
+                    ClusterMembers memberBuffers(swipeLanes ? &swipe : NULL);
 #pragma omp for schedule(dynamic, 1)
                     for (size_t i = partOffsets[part]; i < partOffsets[part + 1]; i++) {
                         const ClusterPair &pair = windowPairs[i];
@@ -1990,8 +1997,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
                         blockAligner.setQuery(&query);
                         bool matcherInitialized = false;
                         swipe.startRep();
-                        membersPassed[i] = alignClusterMembers(par, blockAligner, matcher, matcherInitialized, query, element, memberKeys, memberDbr, 0, swMode, thread_idx, NULL, NULL,
-                                                               swipeLanes ? &swipe : NULL);
+                        membersPassed[i] = alignClusterMembers(par, blockAligner, matcher, matcherInitialized, query, element, memberKeys, memberDbr, 0, swMode, thread_idx, NULL, NULL, memberBuffers);
                     }
                 }
             }
