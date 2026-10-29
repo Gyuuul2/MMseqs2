@@ -74,14 +74,14 @@ static inline void setLaneValue(simd_int *v, int lane, T value) {
 SwipeAligner::SwipeAligner(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend)
     : subMat(subMat), alphabetSize(subMat->alphabetSize), aaBiasCorrection(aaBiasCorrection), aaBiasCorrectionScale(aaBiasCorrectionScale),
       gapOpen(gapOpen), gapExtend(gapExtend), queryLength(0), capacity(0), rowBias8(NULL), rowBias16(NULL), rowBiasRev8(NULL),
-      rowBiasRev16(NULL), rowIndex(NULL), hColumn(NULL), eColumn(NULL), rowMask(NULL), ring(NULL), ringCapacity(0), bandH(NULL), bandF(NULL), bandCapacity(0),
+      rowBiasRev16(NULL), rowSub16(NULL), rowSubRev16(NULL), rowIndex(NULL), hColumn(NULL), eColumn(NULL), rowMask(NULL), ring(NULL), ringCapacity(0), bandH(NULL), bandF(NULL), bandCapacity(0),
       trace(NULL), traceCapacity(0) {
     if (alphabetSize > 32) {
         Debug(Debug::ERROR) << "SWIPE supports alphabets of at most 32 letters\n";
         EXIT(EXIT_FAILURE);
     }
     tmpBias = new float[maxSeqLen + 1];
-    columnScores = malloc_simd_int(alphabetSize * sizeof(simd_int));
+    columnScores = malloc_simd_int(2 * alphabetSize * sizeof(simd_int));
     scoreLo8 = malloc_simd_int(alphabetSize * sizeof(simd_int));
     scoreHi8 = malloc_simd_int(alphabetSize * sizeof(simd_int));
     scoreLo16 = malloc_simd_int(alphabetSize * sizeof(simd_int));
@@ -116,6 +116,8 @@ SwipeAligner::~SwipeAligner() {
     free(rowBias16);
     free(rowBiasRev8);
     free(rowBiasRev16);
+    free(rowSub16);
+    free(rowSubRev16);
     free(rowIndex);
     free(hColumn);
     free(eColumn);
@@ -135,6 +137,8 @@ void SwipeAligner::resize(size_t length) {
     free(rowBias16);
     free(rowBiasRev8);
     free(rowBiasRev16);
+    free(rowSub16);
+    free(rowSubRev16);
     free(rowIndex);
     free(hColumn);
     free(eColumn);
@@ -144,6 +148,8 @@ void SwipeAligner::resize(size_t length) {
     rowBias16 = malloc_simd_int(capacity * sizeof(simd_int));
     rowBiasRev8 = malloc_simd_int(capacity * sizeof(simd_int));
     rowBiasRev16 = malloc_simd_int(capacity * sizeof(simd_int));
+    rowSub16 = malloc_simd_int(capacity * sizeof(simd_int));
+    rowSubRev16 = malloc_simd_int(capacity * sizeof(simd_int));
     rowIndex = malloc_simd_int(capacity * sizeof(simd_int));
     hColumn = malloc_simd_int((capacity + 1) * sizeof(simd_int));
     eColumn = malloc_simd_int((capacity + 1) * sizeof(simd_int));
@@ -168,6 +174,8 @@ void SwipeAligner::initQuery(const Sequence *q) {
         rowBias16[i] = simdi16_set(static_cast<short>(bias[i] - 64));
         rowBiasRev8[i] = simdi8_set(static_cast<char>(biasRev[i]));
         rowBiasRev16[i] = simdi16_set(static_cast<short>(biasRev[i] - 64));
+        rowSub16[i] = simdi16_set(static_cast<short>(64 - bias[i]));
+        rowSubRev16[i] = simdi16_set(static_cast<short>(64 - biasRev[i]));
     }
 }
 
@@ -252,70 +260,127 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
         assign(l);
     }
 
-    simd_int *W = columnScores;
+    // 16 bit lanes take two columns per pass over the query, with H, E and F kept unsigned (saturating at 0 instead of max with 0)
+    const int columnCount = (sizeof(T) == 2) ? 2 : 1;
+    const simd_int *rowSub = Reverse ? rowSubRev16 : rowSub16;
+    const simd_int vGapOpen = V::set(gapOpen);
+    const simd_int vGapExtend = V::set(gapExtend);
     unsigned char letters[SWIPE_MAX_LANES];
-    T colMax[SWIPE_MAX_LANES];
-    T colPos[SWIPE_MAX_LANES];
+    T colMax[2][SWIPE_MAX_LANES];
+    T colPos[2][SWIPE_MAX_LANES];
+    bool finished[SWIPE_MAX_LANES];
     while (active > 0) {
-        for (int l = 0; l < lanes; l++) {
-            const long id = laneJob[l];
-            if (id < 0) {
-                letters[l] = 0;
-            } else {
-                const int c = laneColumn[l];
-                letters[l] = Reverse ? targets[id][aligns[id].dbEndPos1 - c] : targets[id][c];
-            }
-        }
-        simd_int indexLo, indexHi;
-        laneIndices<T>(letters, indexLo, indexHi);
-        for (int a = 0; a < alphabetSize; a++) {
-            W[a] = laneScores(scoreLo[a], scoreHi[a], indexLo, indexHi);
-        }
-        simd_int vHd = vZero;
-        simd_int vF = vZero;
-        simd_int vColMax = vZero;
-        simd_int vColPos = vZero;
-        for (int i = 0; i < Lq; i++) {
-            const simd_int s = V::addBias(W[rowLetters[i]], rowBias[i]);
-            const simd_int e = eColumn[i];
-            // H before F gives the next F (F - gap open is below F - gap extend), so F stays off the H chain
-            simd_int hp = V::max(V::max(V::adds(vHd, s), e), vZero);
-            if (Reverse) {
-                hp = simdi_and(hp, rowMask[i]);
-            }
-            const simd_int h = V::max(hp, vF);
-            vHd = hColumn[i];
-            hColumn[i] = h;
-            const simd_int gt = V::gt(h, vColMax);
-            vColMax = V::max(vColMax, h);
-            vColPos = simdi8_blend(vColPos, rowIndex[i], gt);
-            eColumn[i] = V::max(V::adds(e, vGapE), V::adds(h, vGapO));
-            vF = V::max(V::adds(vF, vGapE), V::adds(hp, vGapO));
-        }
-        simdi_storeu(reinterpret_cast<simd_int *>(colMax), vColMax);
-        simdi_storeu(reinterpret_cast<simd_int *>(colPos), vColPos);
-        for (int l = 0; l < lanes; l++) {
-            const long id = laneJob[l];
-            if (id < 0) {
-                continue;
-            }
-            if (colMax[l] > laneBest[l]) {
-                laneBest[l] = colMax[l];
-                laneBestColumn[l] = laneColumn[l];
-                if (sizeof(T) == 2) {
-                    laneBestRow[l] = static_cast<uint16_t>(colPos[l]);
+        for (int c = 0; c < columnCount; c++) {
+            for (int l = 0; l < lanes; l++) {
+                const long id = laneJob[l];
+                const int column = laneColumn[l] + c;
+                if (id < 0 || column >= laneColumns[l]) {
+                    letters[l] = 0;
                 } else {
-                    int row = static_cast<uint8_t>(colPos[l]);
-                    while (row < Lq && laneValue<T>(hColumn + row, l) != colMax[l]) {
-                        row += 256;
-                    }
-                    laneBestRow[l] = row;
+                    letters[l] = Reverse ? targets[id][aligns[id].dbEndPos1 - column] : targets[id][column];
                 }
             }
-            laneColumn[l]++;
-            const bool reached = Reverse && laneBest[l] >= static_cast<int>(aligns[id].score1);
-            if (laneColumn[l] == laneColumns[l] || laneBest[l] >= V::MAX || reached) {
-                finish(l);
+            simd_int indexLo, indexHi;
+            laneIndices<T>(letters, indexLo, indexHi);
+            for (int a = 0; a < alphabetSize; a++) {
+                columnScores[c * alphabetSize + a] = laneScores(scoreLo[a], scoreHi[a], indexLo, indexHi);
+            }
+        }
+        simd_int vColMax[2] = {vZero, vZero};
+        simd_int vColPos[2] = {vZero, vZero};
+        if (sizeof(T) == 2) {
+            const simd_int *W0 = columnScores;
+            const simd_int *W1 = columnScores + alphabetSize;
+            simd_int vHd0 = vZero;
+            simd_int vHd1 = vZero;
+            simd_int vF0 = vZero;
+            simd_int vF1 = vZero;
+            for (int i = 0; i < Lq; i++) {
+                const simd_int rs = rowSub[i];
+                const simd_int e = eColumn[i];
+                const simd_int hl = hColumn[i];
+                // H before F gives the next F (F - gap open is below F - gap extend), so F stays off the H chain
+                simd_int hp0 = simdi16_max(simdui16_subs(simdi16_adds(vHd0, W0[rowLetters[i]]), rs), e);
+                if (Reverse) {
+                    hp0 = simdi_and(hp0, rowMask[i]);
+                }
+                const simd_int h0 = simdi16_max(hp0, vF0);
+                const simd_int e1 = simdi16_max(simdui16_subs(e, vGapExtend), simdui16_subs(h0, vGapOpen));
+                vF0 = simdi16_max(simdui16_subs(vF0, vGapExtend), simdui16_subs(hp0, vGapOpen));
+                simd_int hp1 = simdi16_max(simdui16_subs(simdi16_adds(vHd1, W1[rowLetters[i]]), rs), e1);
+                if (Reverse) {
+                    hp1 = simdi_and(hp1, rowMask[i]);
+                }
+                const simd_int h1 = simdi16_max(hp1, vF1);
+                eColumn[i] = simdi16_max(simdui16_subs(e1, vGapExtend), simdui16_subs(h1, vGapOpen));
+                vF1 = simdi16_max(simdui16_subs(vF1, vGapExtend), simdui16_subs(hp1, vGapOpen));
+                vHd0 = hl;
+                vHd1 = h0;
+                hColumn[i] = h1;
+                vColPos[0] = simdi8_blend(vColPos[0], rowIndex[i], V::gt(h0, vColMax[0]));
+                vColMax[0] = V::max(vColMax[0], h0);
+                vColPos[1] = simdi8_blend(vColPos[1], rowIndex[i], V::gt(h1, vColMax[1]));
+                vColMax[1] = V::max(vColMax[1], h1);
+            }
+        } else {
+            const simd_int *W = columnScores;
+            simd_int vHd = vZero;
+            simd_int vF = vZero;
+            for (int i = 0; i < Lq; i++) {
+                const simd_int s = V::addBias(W[rowLetters[i]], rowBias[i]);
+                const simd_int e = eColumn[i];
+                // H before F gives the next F (F - gap open is below F - gap extend), so F stays off the H chain
+                simd_int hp = V::max(V::max(V::adds(vHd, s), e), vZero);
+                if (Reverse) {
+                    hp = simdi_and(hp, rowMask[i]);
+                }
+                const simd_int h = V::max(hp, vF);
+                vHd = hColumn[i];
+                hColumn[i] = h;
+                const simd_int gt = V::gt(h, vColMax[0]);
+                vColMax[0] = V::max(vColMax[0], h);
+                vColPos[0] = simdi8_blend(vColPos[0], rowIndex[i], gt);
+                eColumn[i] = V::max(V::adds(e, vGapE), V::adds(h, vGapO));
+                vF = V::max(V::adds(vF, vGapE), V::adds(hp, vGapO));
+            }
+        }
+        for (int c = 0; c < columnCount; c++) {
+            simdi_storeu(reinterpret_cast<simd_int *>(colMax[c]), vColMax[c]);
+            simdi_storeu(reinterpret_cast<simd_int *>(colPos[c]), vColPos[c]);
+        }
+        // the lanes whose target ends with the first column of a pair ignore the second
+        for (int l = 0; l < lanes; l++) {
+            finished[l] = (laneJob[l] < 0);
+        }
+        for (int c = 0; c < columnCount; c++) {
+            for (int l = 0; l < lanes; l++) {
+                if (finished[l]) {
+                    continue;
+                }
+                const long id = laneJob[l];
+                if (colMax[c][l] > laneBest[l]) {
+                    laneBest[l] = colMax[c][l];
+                    laneBestColumn[l] = laneColumn[l];
+                    if (sizeof(T) == 2) {
+                        laneBestRow[l] = static_cast<uint16_t>(colPos[c][l]);
+                    } else {
+                        int row = static_cast<uint8_t>(colPos[c][l]);
+                        while (row < Lq && laneValue<T>(hColumn + row, l) != colMax[c][l]) {
+                            row += 256;
+                        }
+                        laneBestRow[l] = row;
+                    }
+                }
+                laneColumn[l]++;
+                const bool reached = Reverse && laneBest[l] >= static_cast<int>(aligns[id].score1);
+                if (laneColumn[l] == laneColumns[l] || laneBest[l] >= V::MAX || reached) {
+                    finish(l);
+                    finished[l] = true;
+                }
+            }
+        }
+        for (int l = 0; l < lanes; l++) {
+            if (laneJob[l] < 0) {
                 assign(l);
             }
         }

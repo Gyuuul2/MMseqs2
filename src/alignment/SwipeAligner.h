@@ -76,10 +76,14 @@ private:
     simd_int *rowBias16;
     simd_int *rowBiasRev8;
     simd_int *rowBiasRev16;
+    // 64 - composition bias of the query rows, subtracted with saturation from the 16 bit scores biased by 64
+    simd_int *rowSub16;
+    simd_int *rowSubRev16;
     simd_int *rowIndex;
     simd_int *hColumn;
     simd_int *eColumn;
     simd_int *rowMask;
+    // the lane scores of each query letter for the columns of a pass
     simd_int *columnScores;
     simd_int *ring;
     size_t ringCapacity;
