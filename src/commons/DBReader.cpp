@@ -324,25 +324,38 @@ template <typename T> bool DBReader<T>::open(int accessType){
         indexData.close();
     }
     if (externalData == false && isLinfinity && (dataMode & USE_DATA)) {
+        // a large file on local storage bypasses the page cache; network storage is read buffered, since there every O_DIRECT
+        // read waits on a server and the entries that are read again do not stay cached
         const size_t pageCacheLimit = static_cast<size_t>(Util::getTotalSystemMemory() * 0.1);
+        const IoMode ioMode = getIoMode();
+        size_t directFiles = 0;
         for (size_t fileIdx = 0; fileIdx < dataFileNames.size() + headerOffsetsFileNames.size(); fileIdx++) {
             const std::string &fileName = (fileIdx < dataFileNames.size()) ? dataFileNames[fileIdx] : headerOffsetsFileNames[fileIdx - dataFileNames.size()];
-            int fd = -1;
-#ifdef O_DIRECT
-            if ((dataMode & USE_DIRECT_IO) || ((dataMode & USE_BUFFERED_IO) == 0 && fileBytes[fileIdx] > pageCacheLimit)) {
-                fd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-            }
-#endif
-            if (fd < 0) {
-                fd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC);
-            }
+            int fd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC);
             if (fd < 0) {
                 Debug(Debug::ERROR) << "Cannot open data file " << fileName << "!\n";
                 EXIT(EXIT_FAILURE);
             }
+#ifdef O_DIRECT
+            const StorageKind storage = getStorageKind(fd);
+            const bool networkStorage = (storage == STORAGE_PARALLEL_FS || storage == STORAGE_NFS);
+            const bool direct = (ioMode == IO_MODE_DIRECT)
+                                || (ioMode == IO_MODE_AUTO && ((dataMode & USE_DIRECT_IO)
+                                    || ((dataMode & USE_BUFFERED_IO) == 0 && networkStorage == false && fileBytes[fileIdx] > pageCacheLimit)));
+            if (direct) {
+                const int directFd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+                if (directFd >= 0) {
+                    ::close(fd);
+                    fd = directFd;
+                    directFiles++;
+                }
+            }
+#endif
             dataFds.push_back(fd);
         }
         batchReader = new BatchReader(threads, dataFds[0]);
+        Debug(Debug::INFO) << "Reading " << dataFileName << " from " << getStorageName(batchReader->getStorage()) << ": " << directFiles << " of "
+                           << dataFds.size() << " files with O_DIRECT, " << batchReader->getConcurrency() << " reads in flight\n";
         if (isCompressed(dbtype) == COMPRESSED) {
             frameOffsets.resize(dataFileNames.size());
             frameSizes.resize(dataFileNames.size());
@@ -1092,9 +1105,6 @@ template <typename T> size_t DBReader<T>::getBufferSizeToLoad(size_t keyBegin, s
     return planReadRequests(keyBegin, keyEnd, readRequests, headerOffsets, keys, compressedReadRequests, requestFirstKeys);
 }
 
-// entries of a load by keys that are at most this far apart are read in one request
-static const size_t READ_MERGE_GAP = 64 * 1024;
-
 template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys) {
     readRequests.clear();
     requestFirstKeys.clear();
@@ -1106,6 +1116,8 @@ template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<
         return 0;
     }
     const size_t pageSize = Util::getPageSize();
+    // entries at most this far apart are read in one request
+    const size_t mergeGap = getReadMergeGap(batchReader->getStorage());
     size_t bytes = 0;
     // the gaps read with the entries stay below the bytes of the entries, so the buffer is at most about twice them
     size_t entryBytes = 0;
@@ -1122,7 +1134,7 @@ template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<
         entryBytes += index[range].length;
         const size_t gap = readRequests.empty() ? 0 : begin - std::min(begin, readRequests.back().fileOffset + readRequests.back().minBytesToRead);
         if (readRequests.empty() || readRequests.back().fileToRead != fd || begin < readRequests.back().fileOffset
-            || gap > READ_MERGE_GAP || gapBytes + gap > entryBytes) {
+            || gap > mergeGap || gapBytes + gap > entryBytes) {
             if (readRequests.empty() == false) {
                 bytes += readRequests.back().bytesToRead;
             }
