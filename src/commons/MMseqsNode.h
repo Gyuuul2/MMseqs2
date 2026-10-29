@@ -72,12 +72,25 @@ public:
     static void addPhaseSeconds(std::string &content, const std::string &phase, double seconds);
     // the master prints every name of the gathered phase values with its largest value and node, and its smallest value
     static void printPhaseValues(const std::string &values);
-    // the sum of the phase values name of all nodes
-    static size_t sumPhaseValues(const std::string &values, const std::string &name);
-    // a node takes item of a work queue by creating <queue>.<item> exclusively; false if another node has taken it
-    static bool claim(const std::string &queue, size_t item);
-    // removes <queue>.<item> of the items, once no node takes items of the queue
-    static void removeClaims(const std::string &queue, const std::vector<size_t> &items);
+    // the items of a work queue that this node takes: its own items rank, rank + count, ... from the front, then those of the others from the back, round-robin from rank + 1
+    class WorkQueue {
+    public:
+        WorkQueue(const std::string &name, size_t itemCount);
+        // the next item that this node has taken by creating <name>.<item> exclusively, itemCount once none is left
+        size_t claimNext();
+        // removes <name>.<item> of the own items of this node, while no node takes items of the queue
+        void removeClaims();
+
+    private:
+        bool claim(size_t item);
+
+        const std::string name;
+        const size_t itemCount;
+        size_t nextItem;
+        // the items of every other node not tried yet from the back, and the node to try next
+        std::vector<size_t> itemsLeft;
+        size_t nextNode;
+    };
     // a barrier that returns the smallest memoryLimit of all nodes, so they all cut the same splits; with threads all nodes must run with as many
     static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0);
 
