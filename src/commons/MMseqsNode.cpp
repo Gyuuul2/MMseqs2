@@ -519,6 +519,7 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
     ClusterPairWriter pairWriter(exchange, memoryLimit / SENT_PAIRS_MEMORY_DIVISOR / sizeof(ClusterPair), compare, nodeKeyOffsets);
 
     std::vector<DBKeyType> repKeys;
+    std::vector<size_t> pairOffsets;
     std::vector<char> received;
     DBKeyType previousReceivedKey = DB_KEY_INVALID;
     readClusterSplits(clu, memoryLimit, [&](DBReader<DBKeyType> &cluDb, size_t splitBegin, size_t splitEnd, const std::vector<DBKeyType> &entryKeys) {
@@ -541,13 +542,32 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
             }
             previousReceivedKey = receivedPairs[receivedCount - 1].memberKey;
         }
+        pairOffsets.resize(splitEnd - splitBegin + 1);
+        pairOffsets[0] = 0;
+#pragma omp parallel
+        {
+            int thread_idx = 0;
+#ifdef OPENMP
+            thread_idx = omp_get_thread_num();
+#endif
+#pragma omp for schedule(dynamic, 100)
+            for (size_t i = splitBegin; i < splitEnd; i++) {
+                pairOffsets[i - splitBegin + 1] = Util::countLines(cluDb.getData(i, thread_idx), cluDb.getEntryLen(i)) - (withRepresentative ? 0 : 1);
+            }
+        }
+        for (size_t i = 1; i < pairOffsets.size(); i++) {
+            pairOffsets[i] += pairOffsets[i - 1];
+        }
         for (size_t firstEntry = splitBegin; firstEntry < splitEnd;) {
-            // a line has at least a digit and a newline
-            if (pairWriter.pairCount > 0 && pairWriter.pairCount + cluDb.getEntryLen(firstEntry) / 2 > pairWriter.pairCapacity) {
+            const size_t firstPair = pairOffsets[firstEntry - splitBegin];
+            const size_t endEntry = splitBegin + (std::upper_bound(pairOffsets.begin() + (firstEntry - splitBegin) + 1, pairOffsets.end(),
+                                                                   firstPair + pairWriter.pairCapacity - pairWriter.pairCount) - pairOffsets.begin()) - 1;
+            if (endEntry == firstEntry && pairWriter.pairCount > 0) {
                 pairWriter.flush();
+                continue;
             }
             // a cluster with more pairs than fit into memory is sent in several flushes
-            if (cluDb.getEntryLen(firstEntry) / 2 > pairWriter.pairCapacity) {
+            if (endEntry == firstEntry) {
                 const DBKeyType entryKey = cluDb.getDbKey(firstEntry);
                 char keyBuffer[255];
                 for (char *data = cluDb.getData(firstEntry, 0); *data != '\0'; data = Util::skipLine(data)) {
@@ -561,10 +581,6 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
                 firstEntry++;
                 continue;
             }
-            size_t endEntry = firstEntry;
-            for (size_t flushBytes = 0; endEntry < splitEnd && pairWriter.pairCount + (flushBytes + cluDb.getEntryLen(endEntry)) / 2 <= pairWriter.pairCapacity; endEntry++) {
-                flushBytes += cluDb.getEntryLen(endEntry);
-            }
 #pragma omp parallel
             {
                 int thread_idx = 0;
@@ -576,7 +592,7 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
                 for (size_t i = firstEntry; i < endEntry; i++) {
                     const DBKeyType entryKey = cluDb.getDbKey(i);
                     char *data = cluDb.getData(i, thread_idx);
-                    size_t pairOffset = __sync_fetch_and_add(&pairWriter.pairCount, Util::countLines(data, cluDb.getEntryLen(i)) - (withRepresentative ? 0 : 1));
+                    size_t pairOffset = pairWriter.pairCount + pairOffsets[i - splitBegin] - firstPair;
                     while (*data != '\0') {
                         Util::parseKey(data, keyBuffer);
                         const DBKeyType key = Util::fast_atoi<DBKeyType>(keyBuffer);
@@ -589,6 +605,7 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
                     }
                 }
             }
+            pairWriter.pairCount += pairOffsets[endEntry - splitBegin] - firstPair;
             firstEntry = endEntry;
         }
     });
