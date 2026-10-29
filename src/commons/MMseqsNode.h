@@ -73,6 +73,12 @@ public:
     static void addPhaseSeconds(std::string &content, const std::string &phase, double seconds);
     // the master prints every name of the gathered phase values with its largest value and node, and its smallest value
     static void printPhaseValues(const std::string &values);
+    // the sum of the phase values name of all nodes
+    static size_t sumPhaseValues(const std::string &values, const std::string &name);
+    // a node takes item of a work queue by creating <queue>.<item> exclusively; false if another node has taken it
+    static bool claim(const std::string &queue, size_t item);
+    // removes <queue>.<item> of the items, once no node takes items of the queue
+    static void removeClaims(const std::string &queue, const std::vector<size_t> &items);
     // a barrier that returns the smallest memoryLimit of all nodes, so they all cut the same splits; with threads all nodes must run with as many
     static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0);
 
@@ -92,6 +98,8 @@ public:
         std::vector<std::pair<size_t, size_t> > parts;
         size_t nextPart;
         size_t partsBytes;
+        // the records that this node sent to itself, read from memory instead of file and freed once read
+        char *ownRecords;
     };
     // nodeOffsets: where the bytes of every node start in the flush, then the flush size
     static void addExchangeFlush(std::string &indexData, size_t &writtenBytes, const std::vector<size_t> &nodeOffsets);
@@ -111,7 +119,7 @@ public:
 
     // sorts a flush of pairs, appends it to the exchange file of this node and adds its index line; nodeKeyOffsets: keys of every node
     static void writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
-                           FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes);
+                           FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes, size_t *ownPairCount = NULL);
     // the pairs that this node sends through the exchange file <exchange>.<node>, buffered and written by writePairs once pairCapacity are buffered
     struct ClusterPairWriter {
         ClusterPairWriter(const std::string &exchange, size_t pairCapacity, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets);
@@ -125,7 +133,7 @@ public:
             pairCount++;
         }
         void flush();
-        // writes the buffered pairs and returns the index lines of all nodes once every node has closed its file
+        // writes the buffered pairs but keeps those for this node in memory, and returns the index lines of all nodes
         std::string close();
 
         const std::string exchange;

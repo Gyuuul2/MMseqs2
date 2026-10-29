@@ -290,7 +290,7 @@ public:
     // --createdb-mode 3: reads keys [keyBegin, keyEnd) into memory for getData
     void loadData(size_t keyBegin, size_t keyEnd);
     void prefetchData(size_t keyBegin, size_t keyEnd);
-    // --createdb-mode 3 sequences: reads the ascending keys, entries at most getReadMergeGap of the storage apart in one request; loadData takes the keys that prefetchData read before it
+    // --createdb-mode 3 sequences: reads the ascending keys, entries less than a page apart in one request, through the buffered fds; loadData takes the keys that prefetchData read before it
     void loadData(const std::vector<DBKeyType> &keys);
     void prefetchData(const std::vector<DBKeyType> &keys);
     size_t getBufferSizeToLoad(size_t keyBegin, size_t keyEnd);
@@ -631,6 +631,8 @@ private:
     std::vector<std::vector<size_t> > frameOffsets;
     std::vector<size_t> frameSizes;
     std::vector<int> dataFds;
+    // the same files without O_DIRECT for the scattered reads of a load by keys and of findEntryByCell, which the page cache keeps for later windows
+    std::vector<int> bufferedFds;
     BatchReader * batchReader;
     struct BufferInfo {
         char *buffer;

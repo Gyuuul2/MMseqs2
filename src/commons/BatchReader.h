@@ -15,12 +15,10 @@ struct io_uring_sqe;
 struct io_uring_cqe;
 #endif
 
-// the storage of a file decides how many reads are in flight, how far apart reads are merged and if a large file bypasses the page cache
+// the storage of a file decides how many reads are in flight and if the range loads of a large file bypass the page cache
 enum StorageKind { STORAGE_LOCAL_FLASH, STORAGE_LOCAL_DISK, STORAGE_PARALLEL_FS, STORAGE_NFS, STORAGE_UNKNOWN };
 StorageKind getStorageKind(int fd);
 const char *getStorageName(StorageKind storage);
-// entries this far apart are read in one request: a read from network storage or a disk takes milliseconds, in which a MiB arrives
-size_t getReadMergeGap(StorageKind storage);
 // MMSEQS_IO_MODE=buffered|direct instead of the choice of O_DIRECT by storage and size; every node must see the same
 enum IoMode { IO_MODE_AUTO, IO_MODE_BUFFERED, IO_MODE_DIRECT };
 IoMode getIoMode();
