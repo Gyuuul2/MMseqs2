@@ -375,7 +375,8 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
                                 swipeIds.push_back(dbId);
                             }
                         }
-                        const size_t lanes = (swipeWord == 0) ? VECSIZE_INT * 4 : VECSIZE_INT * 2;
+                        // a fixed lane count, so that which hits align in the lanes does not depend on the queries of the thread before
+                        const size_t lanes = VECSIZE_INT * 2;
                         const size_t count = (swipeIds.size() < 2 * lanes) ? 0 : swipeIds.size() / lanes * lanes;
                         for (size_t h = 0; h < swipeEntry.size(); h++) {
                             if (swipeEntry[h] >= static_cast<long>(count)) {
