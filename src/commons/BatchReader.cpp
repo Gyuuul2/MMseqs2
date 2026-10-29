@@ -72,10 +72,6 @@ const char *getStorageName(StorageKind storage) {
     }
 }
 
-size_t getReadMergeGap(StorageKind storage) {
-    return (storage == STORAGE_PARALLEL_FS || storage == STORAGE_NFS || storage == STORAGE_LOCAL_DISK) ? 1024 * 1024 : 64 * 1024;
-}
-
 IoMode getIoMode() {
     const char *mode = getenv("MMSEQS_IO_MODE");
     if (mode == NULL || strcmp(mode, "auto") == 0) {
