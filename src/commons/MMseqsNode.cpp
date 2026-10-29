@@ -254,24 +254,17 @@ void MMseqsNode::printPhaseValues(const std::string &values) {
     }
 }
 
-size_t MMseqsNode::sumPhaseValues(const std::string &values, const std::string &name) {
-    size_t sum = 0;
-    for (char *line = (char *) values.c_str(); *line != '\0'; line = Util::skipLine(line)) {
-        const char *columns[3];
-        if (Util::getFieldsOfLine(line, columns, 3) < 3) {
-            Debug(Debug::ERROR) << "Cannot read the phase values\n";
-            EXIT(EXIT_FAILURE);
-        }
-        if (std::string(columns[0], columns[1] - 1) == name) {
-            sum += Util::fast_atoi<size_t>(columns[2]);
+MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextItem(rank), itemsLeft(count, 0), nextNode((rank + 1) % count) {
+    for (size_t owner = 0; owner < count; owner++) {
+        if (owner != rank && owner < itemCount) {
+            itemsLeft[owner] = (itemCount - 1 - owner) / count + 1;
         }
     }
-    return sum;
 }
 
 // O_EXCL creates atomically on local file systems, GPFS, Lustre and NFS version 3 or later
-bool MMseqsNode::claim(const std::string &queue, size_t item) {
-    const std::string file = queue + "." + SSTR(item);
+bool MMseqsNode::WorkQueue::claim(size_t item) {
+    const std::string file = name + "." + SSTR(item);
     const int fd = open(file.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
     if (fd < 0 && errno == EEXIST) {
         return false;
@@ -283,9 +276,34 @@ bool MMseqsNode::claim(const std::string &queue, size_t item) {
     return true;
 }
 
-void MMseqsNode::removeClaims(const std::string &queue, const std::vector<size_t> &items) {
-    for (size_t i = 0; i < items.size(); i++) {
-        const std::string file = queue + "." + SSTR(items[i]);
+size_t MMseqsNode::WorkQueue::claimNext() {
+    for (; nextItem < itemCount; nextItem += count) {
+        if (claim(nextItem)) {
+            nextItem += count;
+            return nextItem - count;
+        }
+    }
+    // a failed claim at the back of an owner means that its owner or another node is there
+    for (size_t emptyNodes = 0; emptyNodes < count;) {
+        const size_t owner = nextNode;
+        nextNode = (nextNode + 1) % count;
+        if (itemsLeft[owner] == 0) {
+            emptyNodes++;
+            continue;
+        }
+        emptyNodes = 0;
+        itemsLeft[owner]--;
+        if (claim(owner + itemsLeft[owner] * count)) {
+            return owner + itemsLeft[owner] * count;
+        }
+        itemsLeft[owner] = 0;
+    }
+    return itemCount;
+}
+
+void MMseqsNode::WorkQueue::removeClaims() {
+    for (size_t item = rank; item < itemCount; item += count) {
+        const std::string file = name + "." + SSTR(item);
         if (FileUtil::fileExists(file.c_str())) {
             FileUtil::remove(file.c_str());
         }
