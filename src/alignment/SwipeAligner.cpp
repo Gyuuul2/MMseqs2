@@ -221,8 +221,8 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
             }
         } else {
             a.score1 = laneBest[l];
-            a.dbEndPos1 = laneBestColumn[l];
-            a.qEndPos1 = laneBestRow[l];
+            a.dbEndPos1 = (laneBest[l] == 0) ? -1 : laneBestColumn[l];
+            a.qEndPos1 = (laneBest[l] == 0) ? -1 : laneBestRow[l];
             a.word = (laneBest[l] >= saturated) ? ((sizeof(T) == 1) ? 1 : 2) : ((sizeof(T) == 1) ? 0 : 1);
         }
         laneJob[l] = -1;
