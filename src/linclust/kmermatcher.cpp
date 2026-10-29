@@ -2329,6 +2329,10 @@ static void getPassRows(const KmerExchange &exchange, const std::vector<Received
                 }
             }
         }
+        // the loads are key ranges, so their rows in key order give the members of a group in id order whichever node sent them
+        SORT_SERIAL(rows.begin() + rowOffsets.back(), rows.end(), [&](const PassRow &first, const PassRow &second) {
+            return receivedFiles[first.file].rows[first.row].loadFirstKey < receivedFiles[second.file].rows[second.row].loadFirstKey;
+        });
         rowOffsets.push_back(rows.size());
     }
 }
