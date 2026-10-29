@@ -631,6 +631,8 @@ private:
     std::vector<std::vector<size_t> > frameOffsets;
     std::vector<size_t> frameSizes;
     std::vector<int> dataFds;
+    // the same files without O_DIRECT for the scattered reads of a load by keys and of findEntryByCell, which the page cache keeps for later windows
+    std::vector<int> bufferedFds;
     BatchReader * batchReader;
     struct BufferInfo {
         char *buffer;
