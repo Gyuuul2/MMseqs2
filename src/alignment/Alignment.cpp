@@ -18,9 +18,6 @@
 #include <omp.h>
 #endif
 
-// a query with this many hits aligns their forward passes in SWIPE lanes (--aligner-mode 1-3), fewer align one pair at a time
-static const size_t SWIPE_MIN_TARGETS = VECSIZE_INT * 4;
-
 Alignment::Alignment(const std::string &querySeqDB, const std::string &targetSeqDB,
                      const std::string &prefDB, const std::string &prefDBIndex,
                      const std::string &outDB, const std::string &outDBIndex, const Parameters &par, const bool lcaAlign) :
@@ -322,6 +319,7 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
             std::vector<int> swipeLengths;
             std::vector<s_align> swipeAligns;
             std::vector<long> swipeEntry;
+            std::vector<size_t> swipeIds;
             std::vector<size_t> swipePassed;
             std::vector<const unsigned char *> swipeBackwardTargets;
             std::vector<s_align> swipeBackwardAligns;
@@ -359,29 +357,38 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
                     qSeq.mapSequence(qId, queryDbKey, querySeqData, queryLen);
                     matcher.initQuery(&qSeq);
                     if (swipe != NULL) {
+                        // the hits that can be covered, in hit order; whole lane batches of them align in the lanes once there are two,
+                        // the rest one pair at a time
                         swipeSequences.clear();
                         swipeOffsets.clear();
                         swipeLengths.clear();
                         swipeEntry.clear();
+                        swipeIds.clear();
                         for (char *hitData = data; *hitData != '\0'; hitData = Util::skipLine(hitData)) {
                             Util::parseKey(hitData, buffer);
                             const DBKeyType dbKey = Util::fast_atoi<DBKeyType>(buffer);
                             const size_t dbId = tdbr->getId(dbKey);
                             const bool isIdentity = (queryDbKey == dbKey && (includeIdentity || sameQTDB));
                             swipeEntry.push_back(-1);
-                            if (isIdentity || Util::canBeCovered(canCovThr, covMode, static_cast<float>(origQueryLen), static_cast<float>(tdbr->getSeqLen(dbId))) == false) {
-                                continue;
+                            if (isIdentity == false && Util::canBeCovered(canCovThr, covMode, static_cast<float>(origQueryLen), static_cast<float>(tdbr->getSeqLen(dbId)))) {
+                                swipeEntry.back() = static_cast<long>(swipeIds.size());
+                                swipeIds.push_back(dbId);
                             }
-                            dbSeq.mapSequence(dbId, dbKey, tdbr->getData(dbId, thread_idx), tdbr->getSeqLen(dbId));
-                            swipeEntry.back() = static_cast<long>(swipeLengths.size());
+                        }
+                        const size_t lanes = (swipeWord == 0) ? VECSIZE_INT * 4 : VECSIZE_INT * 2;
+                        const size_t count = (swipeIds.size() < 2 * lanes) ? 0 : swipeIds.size() / lanes * lanes;
+                        for (size_t h = 0; h < swipeEntry.size(); h++) {
+                            if (swipeEntry[h] >= static_cast<long>(count)) {
+                                swipeEntry[h] = -1;
+                            }
+                        }
+                        for (size_t i = 0; i < count; i++) {
+                            dbSeq.mapSequence(swipeIds[i], tdbr->getDbKey(swipeIds[i]), tdbr->getData(swipeIds[i], thread_idx), tdbr->getSeqLen(swipeIds[i]));
                             swipeOffsets.push_back(swipeSequences.size());
                             swipeSequences.insert(swipeSequences.end(), dbSeq.numSequence, dbSeq.numSequence + dbSeq.L);
                             swipeLengths.push_back(dbSeq.L);
                         }
-                        const size_t count = swipeLengths.size();
-                        if (count < SWIPE_MIN_TARGETS) {
-                            swipeEntry.assign(swipeEntry.size(), -1);
-                        } else {
+                        if (count > 0) {
                             swipe->initQuery(&qSeq);
                             swipeTargets.resize(count);
                             swipeAligns.resize(count);
