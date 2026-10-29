@@ -125,6 +125,27 @@ public:
 
     static size_t countSetBits(const uint64_t *bits, size_t from, size_t to);
 
+    // a key of a --createdb-mode 3 prefilter result: 7 bits a byte, the high bit set on all bytes but the last; returns its bytes
+    static inline size_t putPrefKey(char *buffer, uint64_t key) {
+        size_t bytes = 0;
+        for (; key >= 0x80; key >>= 7) {
+            buffer[bytes++] = static_cast<char>(key | 0x80);
+        }
+        buffer[bytes++] = static_cast<char>(key);
+        return bytes;
+    }
+
+    static inline uint64_t getPrefKey(const char *&data) {
+        uint64_t key = 0;
+        for (unsigned int shift = 0;; shift += 7) {
+            const unsigned char byte = static_cast<unsigned char>(*data++);
+            key |= static_cast<uint64_t>(byte & 0x7F) << shift;
+            if (byte < 0x80) {
+                return key;
+            }
+        }
+    }
+
     static size_t ompCountLines(const char *data, size_t length, unsigned int threads);
 
     static int readMapping(std::string mappingFilename, std::vector<std::pair<unsigned int, unsigned int> > & mapping);

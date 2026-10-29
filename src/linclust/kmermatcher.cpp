@@ -1918,15 +1918,9 @@ static void putBytes(KmerCodeWriter &kmerCodeWrite, const char *bytes, size_t co
     }
 }
 
-// a pref key: 7 bits a byte, the high bit set on all bytes but the last
 static inline void putPrefKey(KmerCodeWriter &kmerCodeWrite, uint64_t key) {
     char buffer[10];
-    size_t bytes = 0;
-    for (; key >= 0x80; key >>= 7) {
-        buffer[bytes++] = static_cast<char>(key | 0x80);
-    }
-    buffer[bytes++] = static_cast<char>(key);
-    putBytes(kmerCodeWrite, buffer, bytes);
+    putBytes(kmerCodeWrite, buffer, Util::putPrefKey(buffer, key));
 }
 
 static inline size_t getPrefKeyBytes(uint64_t key) {

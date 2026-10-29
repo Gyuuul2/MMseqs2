@@ -111,16 +111,6 @@ std::string MMseqsNode::waitForFile(const std::string &file) {
     return content;
 }
 
-std::string MMseqsNode::gatherFiles(const std::string &prefix) {
-    std::string content;
-    for (unsigned int node = 0; node < count; node++) {
-        const std::string file = prefix + SSTR(node);
-        content += waitForFile(file);
-        FileUtil::remove(file.c_str());
-    }
-    return content;
-}
-
 // a file of another run is read again until this run replaces it
 std::string MMseqsNode::waitForRunFile(const std::string &file) {
     std::string content = waitForFile(file);
@@ -488,16 +478,17 @@ void MMseqsNode::closeExchangeFiles(std::vector<FILE *> &files, const std::strin
     }
 }
 
-void MMseqsNode::writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
-                            FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes, size_t *ownPairCount) {
+// sorts a flush of pairs, appends it to file and adds its index line; ownPairCount: keeps the pairs for this node at the start of pairs instead
+static void writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
+                       FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes, size_t *ownPairCount = NULL) {
     SORT_PARALLEL(pairs, pairs + pairCount, compare);
-    std::vector<size_t> nodeOffsets(count + 1, pairCount * sizeof(ClusterPair));
-    for (size_t node = 0; node < count; node++) {
+    std::vector<size_t> nodeOffsets(MMseqsNode::count + 1, pairCount * sizeof(ClusterPair));
+    for (size_t node = 0; node < MMseqsNode::count; node++) {
         const ClusterPair nodeFirstPair = { static_cast<DBKeyType>(nodeKeyOffsets[node]), static_cast<DBKeyType>(nodeKeyOffsets[node]) };
         nodeOffsets[node] = (std::lower_bound(pairs, pairs + pairCount, nodeFirstPair, compare) - pairs) * sizeof(ClusterPair);
     }
-    const size_t ownBegin = nodeOffsets[rank] / sizeof(ClusterPair);
-    const size_t ownEnd = (ownPairCount != NULL) ? nodeOffsets[rank + 1] / sizeof(ClusterPair) : ownBegin;
+    const size_t ownBegin = nodeOffsets[MMseqsNode::rank] / sizeof(ClusterPair);
+    const size_t ownEnd = (ownPairCount != NULL) ? nodeOffsets[MMseqsNode::rank + 1] / sizeof(ClusterPair) : ownBegin;
     if (fwrite(pairs, sizeof(ClusterPair), ownBegin, file) != ownBegin || fwrite(pairs + ownEnd, sizeof(ClusterPair), pairCount - ownEnd, file) != pairCount - ownEnd) {
         Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
         EXIT(EXIT_FAILURE);
@@ -508,10 +499,10 @@ void MMseqsNode::writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare
     if (ownPairCount != NULL) {
         *ownPairCount = ownEnd - ownBegin;
     }
-    for (size_t node = rank + 1; node <= count; node++) {
+    for (size_t node = MMseqsNode::rank + 1; node <= MMseqsNode::count; node++) {
         nodeOffsets[node] -= (ownEnd - ownBegin) * sizeof(ClusterPair);
     }
-    addExchangeFlush(indexData, writtenBytes, nodeOffsets);
+    MMseqsNode::addExchangeFlush(indexData, writtenBytes, nodeOffsets);
     sentExchangeBytes += (ownEnd - ownBegin) * sizeof(ClusterPair);
 }
 

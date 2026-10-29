@@ -1073,16 +1073,14 @@ struct RepWindow {
     std::vector<DBKeyType> keys;
 };
 
-// a pref key: 7 bits a byte, the high bit set on all bytes but the last
-static inline DBKeyType getPrefKey(const char *&data) {
-    DBKeyType key = 0;
-    for (unsigned int shift = 0;; shift += 7) {
-        const unsigned char byte = static_cast<unsigned char>(*data++);
-        key |= static_cast<DBKeyType>(byte & 0x7F) << shift;
-        if (byte < 0x80) {
-            return key;
-        }
+// the sorted distinct keys that the threads collected
+static void collectUniqueKeys(const std::vector<std::vector<DBKeyType> > &threadKeys, std::vector<DBKeyType> &keys) {
+    keys.clear();
+    for (size_t thread = 0; thread < threadKeys.size(); thread++) {
+        keys.insert(keys.end(), threadKeys[thread].begin(), threadKeys[thread].end());
     }
+    SORT_PARALLEL(keys.begin(), keys.end());
+    keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 }
 
 // a node publishes its log after this many bytes or seconds
@@ -1206,13 +1204,13 @@ static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr,
 #pragma omp for schedule(dynamic, 100)
                 for (size_t entry = 0; entry < entryCount; entry++) {
                     const char *data = prefDb->getData(splitBegin + entry, 0);
-                    const DBKeyType repKey = getPrefKey(data);
+                    const DBKeyType repKey = Util::getPrefKey(data);
                     entryRepKeys[entry] = repKey;
                     DBKeyType *targets = splitTargets.data() + entryTargetOffsets[entry];
                     const size_t targetCount = entryTargetOffsets[entry + 1] - entryTargetOffsets[entry];
                     const size_t repLength = seqDbr.getSeqLen(repKey);
                     for (size_t j = 0; j < targetCount; j++) {
-                        targets[j] = ((j > 0) ? targets[j - 1] : 0) + getPrefKey(data);
+                        targets[j] = ((j > 0) ? targets[j - 1] : 0) + Util::getPrefKey(data);
                         if (targets[j] >= dbSize || targets[j] == repKey || (j > 0 && targets[j] <= targets[j - 1])) {
                             Debug(Debug::ERROR) << "Entry " << repKey << " of " << prefFile << " has the target " << targets[j] << " twice, out of order or not in " << par.db1 << "\n";
                             EXIT(EXIT_FAILURE);
@@ -1227,12 +1225,7 @@ static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr,
             }
             // a node requests the members of a target once per split
             if (memberRequests != NULL) {
-                requestKeys.clear();
-                for (int thread = 0; thread < par.threads; thread++) {
-                    requestKeys.insert(requestKeys.end(), threadRequestKeys[thread].begin(), threadRequestKeys[thread].end());
-                }
-                SORT_PARALLEL(requestKeys.begin(), requestKeys.end());
-                requestKeys.erase(std::unique(requestKeys.begin(), requestKeys.end()), requestKeys.end());
+                collectUniqueKeys(threadRequestKeys, requestKeys);
                 for (size_t j = 0; j < requestKeys.size(); j++) {
                     memberRequests->add(requestKeys[j], MMseqsNode::rank);
                 }
@@ -1321,8 +1314,7 @@ static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr,
 // --createdb-mode 3: align the received records window by window and log the accepted pairs
 static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<size_t> &groupKeyOffsets, size_t lagKeys, size_t memoryLimit, size_t representativeResidues,
                             size_t paddedDbSize, size_t prefSizeBits, const std::string &repTargetsIndex, const std::string &repTargets, const std::string &accepted,
-                            const std::string &assignedChanges, const std::vector<ClusterPair> &members, DBReader<DBKeyType> *memberDbr,
-                            double &waitSeconds, size_t &alignedPairs) {
+                            const std::string &assignedChanges, const std::vector<ClusterPair> &members, DBReader<DBKeyType> *memberDbr, std::string &phaseValues) {
     const size_t dbSize = seqDbr.getSize();
     const size_t orderKeyEnd = (prefSizeBits - 1) * paddedDbSize + dbSize;
     const size_t maxSeqLen = seqDbr.getMaxSeqLen();
@@ -1513,12 +1505,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
                 }
             }
         }
-        window.keys.clear();
-        for (int thread = 0; thread < par.threads; thread++) {
-            window.keys.insert(window.keys.end(), threadKeys[thread].begin(), threadKeys[thread].end());
-        }
-        SORT_PARALLEL(window.keys.begin(), window.keys.end());
-        window.keys.erase(std::unique(window.keys.begin(), window.keys.end()), window.keys.end());
+        collectUniqueKeys(threadKeys, window.keys);
     };
     const auto getFirstRepKey = [&](const RepWindow &window) {
         return (window.end > window.begin) ? static_cast<size_t>(chunkRecords[window.chunk][window.begin].header.pair.repKey) : orderKeyEnd;
@@ -1567,6 +1554,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
     std::vector<size_t> partOffsets;
     std::vector<unsigned char> membersPassed;
     std::vector<DBKeyType> partKeys;
+    double waitSeconds = 0;
+    size_t alignedPairs = 0;
     while (window.end > window.begin) {
         // the master fills the ring up to lagKeys after the clustered key
         const size_t windowRepKey = getFirstRepKey(window);
@@ -1779,6 +1768,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
     }
     MMseqsNode::closeExchangeFiles(repFiles, repTargets);
     seqDbr.close();
+    if (MMseqsNode::rank >= getFirstAlignNode()) {
+        MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the master", waitSeconds);
+        MMseqsNode::addPhaseValue(phaseValues, "Aligned pairs", SSTR(alignedPairs));
+    }
 }
 
 // an accepted pair from the log of a node and its bit in the taken bits of the step
@@ -1804,29 +1797,9 @@ struct TakenBits {
     unsigned int carryBits;
 };
 
-static void appendTakenBits(TakenBits &taken, const uint64_t *bits, size_t bitCount, std::vector<uint64_t> &words, const std::string &fileName) {
-    words.clear();
-    for (size_t i = 0; i < bitCount; i += 64) {
-        const unsigned int wordBits = std::min<size_t>(64, bitCount - i);
-        taken.carry |= bits[i / 64] << taken.carryBits;
-        if (taken.carryBits + wordBits >= 64) {
-            words.push_back(taken.carry);
-            taken.carry = (taken.carryBits > 0) ? bits[i / 64] >> (64 - taken.carryBits) : 0;
-            taken.carryBits = taken.carryBits + wordBits - 64;
-        } else {
-            taken.carryBits += wordBits;
-        }
-    }
-    if (fwrite(words.data(), sizeof(uint64_t), words.size(), taken.file) != words.size()) {
-        Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    taken.bytes += words.size() * sizeof(uint64_t);
-}
-
 // --createdb-mode 3: the master clusters the accepted pairs in order key order; returns the member count
 static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimit, const std::vector<size_t> &groupKeyOffsets, size_t lagKeys, int mode, size_t paddedDbSize, size_t prefSizeBits,
-                                   const std::string &accepted, const std::string &assignedChanges, const std::string &taken, const std::string &assignedKeys, double &clusterSeconds, double &waitSeconds) {
+                                   const std::string &accepted, const std::string &assignedChanges, const std::string &taken, const std::string &assignedKeys, std::string &phaseValues) {
     const size_t assignedWords = (dbSize + 63) / 64;
     const size_t orderKeyEnd = (prefSizeBits - 1) * paddedDbSize + dbSize;
     const size_t orderWords = (orderKeyEnd + 63) / 64;
@@ -1902,6 +1875,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         nodeFile.bytes += sizeof(ClusterPair);
         memberCount++;
     };
+    double waitSeconds = 0;
     Timer clusterTimer;
     unsigned int polls = 0;
     for (size_t clusteredKey = 0; clusteredKey < orderKeyEnd;) {
@@ -2211,7 +2185,25 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                 }
             }
             for (size_t node = 0; node < MMseqsNode::count; node++) {
-                appendTakenBits(nodeTaken[node], nodeTakenBits[node].data(), nodeTakenCounts[node], words, taken + "." + SSTR(node));
+                TakenBits &nodeFile = nodeTaken[node];
+                words.clear();
+                for (size_t i = 0; i < nodeTakenCounts[node]; i += 64) {
+                    const uint64_t bits = nodeTakenBits[node][i / 64];
+                    const unsigned int wordBits = std::min<size_t>(64, nodeTakenCounts[node] - i);
+                    nodeFile.carry |= bits << nodeFile.carryBits;
+                    if (nodeFile.carryBits + wordBits >= 64) {
+                        words.push_back(nodeFile.carry);
+                        nodeFile.carry = (nodeFile.carryBits > 0) ? bits >> (64 - nodeFile.carryBits) : 0;
+                        nodeFile.carryBits = nodeFile.carryBits + wordBits - 64;
+                    } else {
+                        nodeFile.carryBits += wordBits;
+                    }
+                }
+                if (fwrite(words.data(), sizeof(uint64_t), words.size(), nodeFile.file) != words.size()) {
+                    Debug(Debug::ERROR) << "Cannot write " << taken << "." << node << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                nodeFile.bytes += words.size() * sizeof(uint64_t);
             }
         }
         const size_t clusteredBefore = clusteredKey;
@@ -2275,7 +2267,8 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         changesBytes += changes.size() * sizeof(uint64_t);
         MMseqsNode::publishLog(changesHandle, assignedChanges, clusteredKey, changesBytes);
     }
-    clusterSeconds = clusterTimer.getTimediff() - waitSeconds;
+    MMseqsNode::addPhaseSeconds(phaseValues, "clustering the accepted pairs", clusterTimer.getTimediff() - waitSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the aligning nodes", waitSeconds);
     // every node is done with both logs
     if (fclose(changesHandle) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << assignedChanges << "\n";
@@ -2482,8 +2475,7 @@ static int align2clustLinfinity(Parameters &par) {
 
     // the master clusters while the nodes align; on several nodes its log stays empty
     size_t memberCount = 0;
-    double clusterSeconds = 0;
-    double masterWaitSeconds = 0;
+    std::string clusterPhaseValues;
     std::thread clusterThread;
     if (MMseqsNode::isMaster()) {
         clusterThread = std::thread([&]() {
@@ -2491,20 +2483,16 @@ static int align2clustLinfinity(Parameters &par) {
             omp_set_num_threads(clusterThreads);
 #endif
             memberCount = clusterAcceptedPairs(clusterThreads, dbSize, masterMemoryLimit, groupKeyOffsets, lagKeys, par.clusteringMode, paddedDbSize, prefSizeBits,
-                                               accepted, assignedChanges, taken, assignedKeys, clusterSeconds, masterWaitSeconds);
+                                               accepted, assignedChanges, taken, assignedKeys, clusterPhaseValues);
         });
     }
     std::string phaseValues;
     Timer phaseValueTimer;
-    double waitSeconds = 0;
-    size_t alignedPairs = 0;
     alignRepTargets(par, seqDbr, groupKeyOffsets, lagKeys, memoryLimit, representativeResidues, paddedDbSize, prefSizeBits, repTargetsIndex, repTargets, accepted, assignedChanges, members, memberDbr,
-                    waitSeconds, alignedPairs);
+                    phaseValues);
     FileUtil::remove((repTargets + "." + SSTR(MMseqsNode::rank)).c_str());
     if (MMseqsNode::rank >= getFirstAlignNode()) {
         MMseqsNode::addPhaseTime(phaseValues, "aligning the rep targets", phaseValueTimer);
-        MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the master", waitSeconds);
-        MMseqsNode::addPhaseValue(phaseValues, "Aligned pairs", SSTR(alignedPairs));
     }
 
     // once the master is done, every node sends the taken pairs of its log to their rep nodes
@@ -2515,8 +2503,7 @@ static int align2clustLinfinity(Parameters &par) {
     if (MMseqsNode::isMaster()) {
         clusterThread.join();
         Debug(Debug::INFO) << "Number of clusters: " << representatives - memberCount << "\n";
-        MMseqsNode::addPhaseSeconds(phaseValues, "clustering the accepted pairs", clusterSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the aligning nodes", masterWaitSeconds);
+        phaseValues += clusterPhaseValues;
     }
     Debug(Debug::INFO) << "Time for aligning: " << phaseTimer.lap() << "\n";
     phaseValueTimer.reset();

@@ -53,11 +53,10 @@ public:
     static void sleepBeforePoll(unsigned int polls);
     static void publishFile(const std::string &file, const std::string &content);
     static std::string waitForFile(const std::string &file);
-    // waits for prefix + node of every node and returns their content in node order; the files are removed
-    static std::string gatherFiles(const std::string &prefix);
-    // publishFile and gatherFiles for files of this run, so a file that a killed run left is not gathered
+    // publishFile and waitForFile for files of this run, so a file that a killed run left is not read
     static void publishRunFile(const std::string &file, const std::string &content);
     static std::string waitForRunFile(const std::string &file);
+    // waits for prefix + node of every node and returns their content in node order; the files are removed
     static std::string gatherRunFiles(const std::string &prefix);
     // a log that one node appends to while another reads it: its synced byte count and a key are published as <log>.progress, read from a new open
     static void publishLog(FILE *file, const std::string &log, size_t key, size_t bytes);
@@ -82,8 +81,7 @@ public:
     // a barrier that returns the smallest memoryLimit of all nodes, so they all cut the same splits; with threads all nodes must run with as many
     static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0);
 
-    // exchange through files: a node appends flushes sorted by destination to <prefix>.<node>, and the index line of a flush lists
-    // this node and where the bytes of every node start in the file, then its end; a node reads its part of every flush as a block
+    // an exchange file <prefix>.<node> holds flushes sorted by receiving node, each with an index line of the node, where the part of every node starts and the end; a block is a part
     struct ExchangeBlock {
         FILE *file;
         size_t pos;
@@ -105,8 +103,7 @@ public:
     static void addExchangeFlush(std::string &indexData, size_t &writtenBytes, const std::vector<size_t> &nodeOffsets);
     // closes the file of this node and returns the index lines of all nodes once every node has closed its file
     static std::string closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData);
-    // sendersInOrder: the flushes of every node follow each other in record order, so a node's parts of them are read as one block,
-    // whose buffer is not cut into one for every flush
+    // sendersInOrder: the flushes of every node follow each other in record order, so its parts of them are read as one block
     static void openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeBlock> &blocks, std::vector<FILE *> &files,
                              bool sendersInOrder = false);
     // the smallest buffer of a block in readExchangeRange
@@ -117,10 +114,7 @@ public:
                                     std::vector<char> &records, std::vector<size_t> *recordOffsets, const std::string &prefix);
     static void closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix);
 
-    // sorts a flush of pairs, appends it to the exchange file of this node and adds its index line; nodeKeyOffsets: keys of every node
-    static void writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
-                           FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes, size_t *ownPairCount = NULL);
-    // the pairs that this node sends through the exchange file <exchange>.<node>, buffered and written by writePairs once pairCapacity are buffered
+    // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered; nodeKeyOffsets: keys of every node
     struct ClusterPairWriter {
         ClusterPairWriter(const std::string &exchange, size_t pairCapacity, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets);
         ~ClusterPairWriter();
