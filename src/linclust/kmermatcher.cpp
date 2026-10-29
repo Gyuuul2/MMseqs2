@@ -2851,8 +2851,8 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
 }
 
 // --createdb-mode 3 receiving: the k-mer files of this node in passes; groups choose reps, whose pairs go to a kmer_assignedpairs file per rep node;
-// returns the bytes of the received k-mer files
-static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange) {
+// returns the bytes of the received k-mer files, pairBytes those of the written pair records
+static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange, size_t &pairBytes) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     // the index codes of a pair record at most: the gamma code of its target count, fewer than the database keys, and its key in its partition
     const size_t recordIndexBytes = (2 * getBitWidth(seqDbr.getSize()) + exchange.partitionKeyBits + CHAR_BIT - 1) / CHAR_BIT;
@@ -3403,7 +3403,9 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     delete batchReader;
     FileUtil::remove((par.db2 + ".kmers/" + SSTR(MMseqsNode::rank)).c_str());
     // the rows of every pair file in file order
+    pairBytes = 0;
     for (size_t pairFile = 0; pairFile < pairFileCount; pairFile++) {
+        pairBytes += pairFiles.bytes[pairFile];
         std::vector<AssignedPairPartition> &rows = pairFiles.rows[pairFile];
         SORT_SERIAL(rows.begin(), rows.end(), [](const AssignedPairPartition &first, const AssignedPairPartition &second) {
             return first.offsets[PAIR_INDEX_CODES] < second.offsets[PAIR_INDEX_CODES];
@@ -3900,6 +3902,7 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     MMseqsNode::addPhaseTime(sendValues, "sending k-mers", phaseTimer);
     MMseqsNode::addPhaseValue(sendValues, "K-mer bytes sent", SSTR(sentBytes));
     MMseqsNode::printPhaseValues(MMseqsNode::barrier(par.db2 + ".kmers.done", sendValues));
+    const double sendWaitSeconds = phaseTimer.getTimediff();
     // every node has read the memory limits
     if (MMseqsNode::isMaster()) {
         FileUtil::remove((par.db2 + ".memory").c_str());
@@ -3907,10 +3910,15 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
 
     phaseTimer.reset();
     std::string receiveValues;
-    const size_t receivedBytes = receiveKmers(par, seqDbr, exchange);
+    MMseqsNode::addPhaseSeconds(receiveValues, "waiting for the other nodes to send k-mers", sendWaitSeconds);
+    size_t pairBytes = 0;
+    const size_t receivedBytes = receiveKmers(par, seqDbr, exchange, pairBytes);
     MMseqsNode::addPhaseTime(receiveValues, "receiving k-mers", phaseTimer);
     MMseqsNode::addPhaseValue(receiveValues, "K-mer bytes received", SSTR(receivedBytes));
+    MMseqsNode::addPhaseValue(receiveValues, "Pair bytes written", SSTR(pairBytes));
     MMseqsNode::printPhaseValues(MMseqsNode::barrier(par.db2 + ".kmer_assignedpairs.done", receiveValues));
+    std::string mergeValues;
+    MMseqsNode::addPhaseTime(mergeValues, "waiting for the other nodes to receive k-mers", phaseTimer);
     // every node has removed its directory of received k-mer files
     if (MMseqsNode::isMaster()) {
         FileUtil::remove((par.db2 + ".kmers.done").c_str());
@@ -3918,11 +3926,16 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     }
 
     const std::string partitionsData = mergeAssignedPairs(par, seqDbr, exchange);
+    MMseqsNode::addPhaseTime(mergeValues, "merging pairs", phaseTimer);
     // the partition rows of all nodes in node order, so in key order
     MMseqsNode::publishRunFile(par.db2 + ".partitions." + SSTR(MMseqsNode::rank), partitionsData);
+    MMseqsNode::publishRunFile(par.db2 + ".merge." + SSTR(MMseqsNode::rank), mergeValues);
     if (MMseqsNode::isMaster()) {
         // every node has passed the last barrier and removed its directory of received pair files
         const std::string partitions = MMseqsNode::gatherRunFiles(par.db2 + ".partitions.");
+        std::string mergeWaitValues;
+        MMseqsNode::addPhaseTime(mergeWaitValues, "waiting for the other nodes to merge pairs", phaseTimer);
+        MMseqsNode::printPhaseValues(MMseqsNode::gatherRunFiles(par.db2 + ".merge.") + mergeWaitValues);
         FileUtil::remove((par.db2 + ".kmer_assignedpairs.done").c_str());
         FileUtil::remove(receiveDirs[2].c_str());
         MMseqsNode::publishFile(par.db2 + ".partitions", partitions);
