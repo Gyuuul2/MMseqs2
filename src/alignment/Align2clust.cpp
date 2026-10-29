@@ -344,6 +344,7 @@ struct SwipeBatch {
     std::vector<size_t> offsets;
     std::vector<const unsigned char *> targets;
     std::vector<int> lengths;
+    std::vector<int> laneLengths;
     std::vector<int> diagonals;
     std::vector<int> bandWidths;
     std::vector<int> columnEnds;
@@ -367,8 +368,7 @@ struct SwipeBatch {
         swipeSinglePairs += singlePairs;
     }
 
-    // the SIMD lanes of the 8 bit (word 0) or 16 bit lanes the members start with; a batch this large goes through the lanes,
-    // a smaller one aligns one pair at a time as in --aligner-mode 0
+    // the SIMD lanes of the 8 bit (word 0) or 16 bit lanes the members start with
     size_t lanes() const {
         return (memberWord == 0) ? VECSIZE_INT * 4 : VECSIZE_INT * 2;
     }
@@ -442,6 +442,7 @@ struct MemberGate {
     std::vector<int> lengths;
     std::vector<std::string> records;
     size_t next;
+    size_t batch;
     bool live;
 };
 
@@ -451,6 +452,7 @@ struct ClusterMembers {
     std::vector<MemberGate> gates;
     size_t gateCount;
     std::vector<size_t> poolGates;
+    std::vector<size_t> lanePool;
     SwipeBatch *swipe;
     bool deferGates;
 
@@ -489,7 +491,8 @@ static bool swipeForwardPasses(const Parameters &par, EvalueComputation &evaluer
     return Util::hasCoverage(par.covThr, par.covMode, qCov, tCov) && evaluer.computeEvalue(alignment.score1, queryLength) <= par.evalThr;
 }
 
-// the gapped alignments of the members of a round of alignClusterMembers, of all its gates, in the SWIPE lanes if they fill them;
+// the gapped alignments of the members of a round of alignClusterMembers, of all its gates; the members of a gate whose batch fills
+// the 16 bit lanes go through the lanes together, the others one pair at a time, which only depends on the member order of the gate;
 // a failing member closes its gate
 static void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherInitialized, ClusterMembers &members, Sequence &query, Sequence &element,
                               DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer) {
@@ -498,37 +501,45 @@ static void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &mat
         matcher.initQuery(&query);
         matcherInitialized = true;
     }
-    const bool useLanes = (swipe.gapped.size() >= swipe.lanes());
-    if (useLanes == false) {
-        swipe.singlePairs += swipe.gapped.size();
-    } else {
-        swipe.countLanes(swipe.gapped.size());
-        swipe.entries.resize(swipe.gapped.size());
-        for (size_t g = 0; g < swipe.gapped.size(); g++) {
-            swipe.entries[g] = g;
+    std::vector<size_t> &lanePool = members.lanePool;
+    lanePool.assign(swipe.gapped.size(), SIZE_MAX);
+    swipe.entries.clear();
+    for (size_t g = 0; g < swipe.gapped.size(); g++) {
+        if (members.gates[members.poolGates[g]].batch >= VECSIZE_INT * 2) {
+            lanePool[g] = swipe.entries.size();
+            swipe.entries.push_back(g);
         }
-        swipe.select(swipe.gapped.size(), swipe.memberWord);
+    }
+    const size_t laneCount = swipe.entries.size();
+    swipe.singlePairs += swipe.gapped.size() - laneCount;
+    if (laneCount > 0) {
+        swipe.countLanes(laneCount);
+        swipe.select(laneCount, swipe.memberWord);
+        swipe.laneLengths.resize(laneCount);
+        for (size_t l = 0; l < laneCount; l++) {
+            swipe.laneLengths[l] = swipe.lengths[swipe.entries[l]];
+        }
         swipe.setQuery(query);
-        swipe.aligner.alignForward(swipe.gapped.size(), swipe.targets.data(), swipe.lengths.data(), swipe.aligns.data());
-        swipe.updateWord(swipe.memberWord, swipe.gapped.size());
-        for (size_t g = 0; g < swipe.gapped.size(); g++) {
-            const s_align &alignment = swipe.aligns[g];
-            if (alignment.word < 2 && swipeForwardPasses(par, swipe.evaluer, alignment, query.L, swipe.lengths[g]) == false) {
-                members.gates[members.poolGates[g]].live = false;
+        swipe.aligner.alignForward(laneCount, swipe.targets.data(), swipe.laneLengths.data(), swipe.aligns.data());
+        swipe.updateWord(swipe.memberWord, laneCount);
+        for (size_t l = 0; l < laneCount; l++) {
+            const s_align &alignment = swipe.aligns[l];
+            if (alignment.word < 2 && swipeForwardPasses(par, swipe.evaluer, alignment, query.L, swipe.laneLengths[l]) == false) {
+                members.gates[members.poolGates[swipe.entries[l]]].live = false;
             }
         }
         if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE) {
-            swipe.aligner.alignBackward(swipe.gapped.size(), swipe.targets.data(), swipe.aligns.data());
+            swipe.aligner.alignBackward(laneCount, swipe.targets.data(), swipe.aligns.data());
         } else if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK) {
-            swipe.backtraces.resize(swipe.gapped.size());
-            swipe.columnEnds.resize(swipe.gapped.size());
-            swipe.minScores.resize(swipe.gapped.size());
-            for (size_t g = 0; g < swipe.gapped.size(); g++) {
-                swipe.diagonals[g] = swipe.aligns[g].dbEndPos1 - swipe.aligns[g].qEndPos1;
-                swipe.columnEnds[g] = swipe.aligns[g].dbEndPos1 + 1;
-                swipe.minScores[g] = swipe.aligns[g].score1;
+            swipe.backtraces.resize(laneCount);
+            swipe.columnEnds.resize(laneCount);
+            swipe.minScores.resize(laneCount);
+            for (size_t l = 0; l < laneCount; l++) {
+                swipe.diagonals[l] = swipe.aligns[l].dbEndPos1 - swipe.aligns[l].qEndPos1;
+                swipe.columnEnds[l] = swipe.aligns[l].dbEndPos1 + 1;
+                swipe.minScores[l] = swipe.aligns[l].score1;
             }
-            swipe.aligner.alignBanded(swipe.gapped.size(), swipe.targets.data(), swipe.lengths.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
+            swipe.aligner.alignBanded(laneCount, swipe.targets.data(), swipe.laneLengths.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
                                       swipe.aligns.data(), swipe.backtraces.data(), swipe.columnEnds.data(), swipe.minScores.data());
         }
     }
@@ -541,13 +552,14 @@ static void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &mat
         const DBKeyType elementKey = gate.memberKeys[i];
         const size_t elementId = cluSeqDbr->getId(elementKey);
         element.mapSequence(elementId, elementKey, cluSeqDbr->getData(elementId, threadIdx), cluSeqDbr->getSeqLen(elementId));
+        const size_t l = lanePool[g];
         Matcher::result_t res_element;
-        if (useLanes == false || swipe.aligns[g].word >= 2) {
+        if (l == SIZE_MAX || swipe.aligns[l].word >= 2) {
             res_element = matcher.getSWResult(&element, 0, false, par.covMode, par.covThr, par.evalThr, swMode, par.seqIdMode, false);
         } else if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK) {
-            res_element = swipeResult(par, swipe.evaluer, elementKey, swipe.minScores[g], swipe.aligns[g], query.L, element.L, swipe.backtraces[g]);
+            res_element = swipeResult(par, swipe.evaluer, elementKey, swipe.minScores[l], swipe.aligns[l], query.L, element.L, swipe.backtraces[l]);
         } else {
-            res_element = matcher.getSWResult(&element, 0, false, par.covMode, par.covThr, par.evalThr, swMode, par.seqIdMode, false, false, &swipe.aligns[g]);
+            res_element = matcher.getSWResult(&element, 0, false, par.covMode, par.covThr, par.evalThr, swMode, par.seqIdMode, false, false, &swipe.aligns[l]);
         }
         if (Alignment::checkCriteria(res_element, false, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr) == false) {
             gate.live = false;
@@ -611,6 +623,7 @@ static void alignClusterMembers(const Parameters &par, BlockAligner &blockAligne
             }
             open = true;
             const size_t batchEnd = std::min(gate.memberKeys.size(), gate.next + batchSize);
+            gate.batch = batchEnd - gate.next;
             for (size_t o = gate.next; o < batchEnd && gate.live; o++) {
                 const size_t i = gate.order[o];
                 const DBKeyType elementKey = gate.memberKeys[i];
