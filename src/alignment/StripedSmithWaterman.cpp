@@ -139,6 +139,9 @@ std::pair<alignment_end, alignment_end> sw_sse2_byte(
 	/* 16 byte insertion extension vector */
 	simd_int vGapE = simdi8_set(gap_extend);
 
+	/* F from H before F decays by the smaller gap penalty, which equals F from H after F also when gap open is below gap extend */
+	simd_int vGapF = simdi8_set(std::min(gap_open, gap_extend));
+
 	/* 16 byte bias vector */
 	simd_int vBias = simdi8_set(bias);
 
@@ -195,8 +198,8 @@ std::pair<alignment_end, alignment_end> sw_sse2_byte(
 			e = simdui8_max(e, vH);
 			simdi_store(pvE + j, e);
 
-			/* Update vF value, from H before F (F - gap open is below F - gap extend), off the H chain. */
-			vF = simdui8_max(simdui8_subs(vF, vGapE), simdui8_subs(hp, vGapO));
+			/* Update vF value, from H before F, off the H chain. */
+			vF = simdui8_max(simdui8_subs(vF, vGapF), simdui8_subs(hp, vGapO));
 			/* Load the next vH. */
 			vH = simdi_load(pvHLoad + j);
 		}
@@ -338,6 +341,9 @@ std::pair<alignment_end, alignment_end> sw_sse2_word(
 	/* 16 byte insertion extension vector */
 	simd_int vGapE = simdi16_set(gap_extend);
 
+	/* F from H before F decays by the smaller gap penalty, which equals F from H after F also when gap open is below gap extend */
+	simd_int vGapF = simdi16_set(std::min(gap_open, gap_extend));
+
 	simd_int vMaxScore = vZero; /* Trace the highest score of the whole SW matrix. */
 	simd_int vMaxMark = vZero; /* Trace the highest score till the previous column. */
 	int32_t edge, begin = 0, end = db_length, step = 1;
@@ -388,8 +394,8 @@ std::pair<alignment_end, alignment_end> sw_sse2_word(
 			e = simdi16_max(e, vH);
 			simdi_store(pvE + j, e);
 
-			/* Update vF value, from H before F (F - gap open is below F - gap extend), off the H chain. */
-			vF = simdi16_max(simdui16_subs(vF, vGapE), simdui16_subs(hp, vGapO));
+			/* Update vF value, from H before F, off the H chain. */
+			vF = simdi16_max(simdui16_subs(vF, vGapF), simdui16_subs(hp, vGapO));
 
 			/* Load the next vH. */
 			vH = simdi_load(pvHLoad + j);
