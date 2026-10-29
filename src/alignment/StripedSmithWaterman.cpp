@@ -182,6 +182,7 @@ std::pair<alignment_end, alignment_end> sw_sse2_byte(
 			/* Get max from vH, vE and vF. */
 			e = simdi_load(pvE + j);
 			vH = simdui8_max(vH, e);
+			const simd_int hp = vH;
 			vH = simdui8_max(vH, vF);
 			vMaxColumn = simdui8_max(vMaxColumn, vH);
 
@@ -194,9 +195,8 @@ std::pair<alignment_end, alignment_end> sw_sse2_byte(
 			e = simdui8_max(e, vH);
 			simdi_store(pvE + j, e);
 
-			/* Update vF value. */
-			vF = simdui8_subs(vF, vGapE);
-			vF = simdui8_max(vF, vH);
+			/* Update vF value, from H before F (F - gap open is below F - gap extend), off the H chain. */
+			vF = simdui8_max(simdui8_subs(vF, vGapE), simdui8_subs(hp, vGapO));
 			/* Load the next vH. */
 			vH = simdi_load(pvHLoad + j);
 		}
@@ -375,6 +375,7 @@ std::pair<alignment_end, alignment_end> sw_sse2_word(
 			/* Get max from vH, vE and vF. */
 			e = simdi_load(pvE + j);
 			vH = simdi16_max(vH, e);
+			const simd_int hp = vH;
 			vH = simdi16_max(vH, vF);
 			vMaxColumn = simdi16_max(vMaxColumn, vH);
 
@@ -387,9 +388,8 @@ std::pair<alignment_end, alignment_end> sw_sse2_word(
 			e = simdi16_max(e, vH);
 			simdi_store(pvE + j, e);
 
-			/* Update vF value. */
-			vF = simdui16_subs(vF, vGapE);
-			vF = simdi16_max(vF, vH);
+			/* Update vF value, from H before F (F - gap open is below F - gap extend), off the H chain. */
+			vF = simdi16_max(simdui16_subs(vF, vGapE), simdui16_subs(hp, vGapO));
 
 			/* Load the next vH. */
 			vH = simdi_load(pvHLoad + j);
