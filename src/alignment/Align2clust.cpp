@@ -15,6 +15,10 @@
 #include "FileUtil.h"
 #include <atomic>
 #include <climits>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/statvfs.h>
+#include <unistd.h>
 #include <cstdlib>
 #include <cstring>
 #include <thread>
@@ -1071,6 +1075,10 @@ struct RepWindow {
     size_t begin;
     size_t end;
     std::vector<DBKeyType> keys;
+    // the bytes of the keys, the keys in the data files of other nodes and the targets left out as assigned
+    size_t keyBytes;
+    size_t otherNodeKeys;
+    size_t assignedTargets;
 };
 
 // a pref key: 7 bits a byte, the high bit set on all bytes but the last
@@ -1317,8 +1325,10 @@ static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr,
 static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<size_t> &groupKeyOffsets, size_t lagKeys, size_t memoryLimit, size_t representativeResidues,
                             size_t paddedDbSize, size_t prefSizeBits, const std::string &repTargetsIndex, const std::string &repTargets, const std::string &accepted,
                             const std::string &assignedChanges, const std::vector<ClusterPair> &members, DBReader<DBKeyType> *memberDbr,
-                            double &waitSeconds, size_t &alignedPairs) {
+                            double &waitSeconds, size_t &alignedPairs, std::string &phaseValues) {
     const size_t dbSize = seqDbr.getSize();
+    // the key ranges of the data files of the nodes, to count the keys that a window reads from other nodes
+    const std::vector<size_t> fileKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
     const size_t orderKeyEnd = (prefSizeBits - 1) * paddedDbSize + dbSize;
     const size_t maxSeqLen = seqDbr.getMaxSeqLen();
     // a scattered entry is read as at least one page
@@ -1447,6 +1457,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
     size_t chunk = 0;
     const ClusterPair lastRecord = { DB_KEY_INVALID, DB_KEY_INVALID };
     std::vector<std::vector<DBKeyType> > threadKeys(par.threads);
+    std::vector<size_t> threadAssignedTargets(par.threads);
     // a window: records while their reps and targets fit, at least one, and the rep and unassigned target keys to load
     const auto readWindow = [&](RepWindow &window) {
         if (chunkPos[chunk] == chunkRecords[chunk].size()) {
@@ -1493,27 +1504,44 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
             threadKeys[thread_idx].clear();
+            threadAssignedTargets[thread_idx] = 0;
 #pragma omp for schedule(dynamic, 100)
             for (size_t i = window.begin; i < window.end; i++) {
                 const RepTargetsRecord &record = chunkRecords[window.chunk][i];
                 threadKeys[thread_idx].push_back(record.header.pair.repKey % paddedDbSize);
                 if (isAssigned(record.header.pair.repKey)) {
+                    threadAssignedTargets[thread_idx] += record.header.targetCount;
                     continue;
                 }
                 const DBKeyType *targets = chunkTargets[window.chunk].data() + record.targetOffset;
                 for (unsigned int j = 0; j < record.header.targetCount; j++) {
                     if (isAssigned(targets[j]) == false) {
                         threadKeys[thread_idx].push_back(targets[j]);
+                    } else {
+                        threadAssignedTargets[thread_idx]++;
                     }
                 }
             }
         }
         window.keys.clear();
+        window.assignedTargets = 0;
         for (int thread = 0; thread < par.threads; thread++) {
             window.keys.insert(window.keys.end(), threadKeys[thread].begin(), threadKeys[thread].end());
+            window.assignedTargets += threadAssignedTargets[thread];
         }
         SORT_PARALLEL(window.keys.begin(), window.keys.end());
         window.keys.erase(std::unique(window.keys.begin(), window.keys.end()), window.keys.end());
+        size_t keyBytes = 0;
+        size_t otherNodeKeys = 0;
+        const size_t ownFirstKey = fileKeyOffsets[std::min<size_t>(MMseqsNode::rank, fileKeyOffsets.size() - 1)];
+        const size_t ownEndKey = fileKeyOffsets[std::min<size_t>(MMseqsNode::rank + 1, fileKeyOffsets.size() - 1)];
+#pragma omp parallel for schedule(static) reduction(+:keyBytes, otherNodeKeys)
+        for (size_t i = 0; i < window.keys.size(); i++) {
+            keyBytes += seqDbr.getEntryLen(window.keys[i]);
+            otherNodeKeys += (window.keys[i] < ownFirstKey || window.keys[i] >= ownEndKey);
+        }
+        window.keyBytes = keyBytes;
+        window.otherNodeKeys = otherNodeKeys;
     };
     const auto getFirstRepKey = [&](const RepWindow &window) {
         return (window.end > window.begin) ? static_cast<size_t>(chunkRecords[window.chunk][window.begin].header.pair.repKey) : orderKeyEnd;
@@ -1521,9 +1549,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
     // a band: the keys from the first window key on that fit the window memory, kept while the windows fit it; the window keys if they do not fit
     size_t bandBegin = 0;
     size_t bandEnd = 0;
+    // how a window was read: from the band read before, as a new band or by its keys
+    enum WindowRead { READ_IN_BAND, READ_BAND, READ_KEYS };
+    const char *windowReadNames[] = { "in band", "band", "keys" };
+    size_t windowReads[3] = { 0, 0, 0 };
     const auto readBand = [&](const std::vector<DBKeyType> &windowKeys, bool isPrefetch) {
         if (windowKeys.empty() || (windowKeys.front() >= bandBegin && windowKeys.back() < bandEnd)) {
-            return;
+            return READ_IN_BAND;
         }
         const size_t begin = windowKeys.front();
         const size_t end = seqDbr.getSplitKeyOffsets(begin, dbSize, memoryLimit / WINDOW_MEMORY_DIVISOR, 0)[1];
@@ -1534,7 +1566,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
             } else {
                 seqDbr.prefetchData(windowKeys);
             }
-            return;
+            return fitsBand ? READ_BAND : READ_KEYS;
         }
         bandBegin = begin;
         bandEnd = fitsBand ? end : begin;
@@ -1543,7 +1575,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
         } else {
             seqDbr.loadData(windowKeys);
         }
+        return fitsBand ? READ_BAND : READ_KEYS;
     };
+    size_t windowCount = 0;
+    size_t windowKeys = 0;
+    size_t windowKeyBytes = 0;
+    size_t windowOtherNodeKeys = 0;
+    size_t windowAssignedTargets = 0;
 
     RepWindow window;
     RepWindow nextWindow;
@@ -1576,7 +1614,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
             publishTime = time(NULL);
             waitSeconds += waitTimer.getTimediff();
         }
-        readBand(window.keys, false);
+        Timer windowTimer;
+        const WindowRead windowRead = readBand(window.keys, false);
+        const double loadSeconds = windowTimer.getTimediff();
         readWindow(nextWindow);
         readBand(nextWindow.keys, true);
         const size_t nextRepKey = getFirstRepKey(nextWindow);
@@ -1758,8 +1798,23 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
                 readAssignedChanges();
             }
         }
+        Debug(Debug::INFO) << "Window " << windowCount << " from rep " << windowRepKey % paddedDbSize << ": " << recordCount << " records, " << window.keys.size() << " keys of "
+                           << window.keyBytes << " bytes read as " << windowReadNames[windowRead] << " in " << loadSeconds << " s, " << window.otherNodeKeys << " keys of other nodes, "
+                           << window.assignedTargets << " assigned targets left out, " << windowTimer.getTimediff() << " s\n";
+        windowCount++;
+        windowKeys += window.keys.size();
+        windowKeyBytes += window.keyBytes;
+        windowOtherNodeKeys += window.otherNodeKeys;
+        windowAssignedTargets += window.assignedTargets;
+        windowReads[windowRead]++;
         std::swap(window, nextWindow);
     }
+    MMseqsNode::addPhaseValue(phaseValues, "Windows", SSTR(windowCount));
+    MMseqsNode::addPhaseValue(phaseValues, "Windows read as band, in band, by keys", SSTR(windowReads[READ_BAND]) + " " + SSTR(windowReads[READ_IN_BAND]) + " " + SSTR(windowReads[READ_KEYS]));
+    MMseqsNode::addPhaseValue(phaseValues, "Window keys", SSTR(windowKeys));
+    MMseqsNode::addPhaseValue(phaseValues, "Window key bytes", SSTR(windowKeyBytes));
+    MMseqsNode::addPhaseValue(phaseValues, "Window keys of other nodes", SSTR(windowOtherNodeKeys));
+    MMseqsNode::addPhaseValue(phaseValues, "Assigned targets left out of windows", SSTR(windowAssignedTargets));
     // readExchangeRange stops at an out of order block, so every block must be read to its end
     for (size_t i = 0; i < repBlocks.size(); i++) {
         if (repBlocks[i].pos != repBlocks[i].end || repBlocks[i].partsBytes != 0 || repBlocks[i].bufferPos != repBlocks[i].bufferEnd) {
@@ -2305,6 +2360,81 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     return memberCount;
 }
 
+// the most memory that this process held at once
+static size_t getPeakResidentBytes() {
+    struct rusage usage;
+    return (getrusage(RUSAGE_SELF, &usage) == 0) ? static_cast<size_t>(usage.ru_maxrss) * 1024 : 0;
+}
+
+// --local-db-dir: the bytes copied at once by a thread
+static const size_t LOCAL_COPY_CHUNK = 64 * 1024 * 1024;
+// shared storage serves this many large reads of a copy at once
+static const int LOCAL_COPY_THREADS = 64;
+
+// --local-db-dir: copies the sequence data files of db and its dbtype into <dir>/<name of out>.<node>, the files of every node,
+// so random reads of the sequences stay on the node; returns the data file name of the copy, whose files are listed in copies
+static std::string copyToLocalDir(const Parameters &par, const std::string &db, const std::string &out, std::vector<std::string> &copies) {
+    const std::vector<std::string> dataFiles = FileUtil::findDatafiles(db.c_str());
+    if (dataFiles.empty()) {
+        Debug(Debug::ERROR) << "No datafile could be found for " << db << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    const std::string localDir = par.localDbDir + "/" + FileUtil::baseName(out) + "." + SSTR(MMseqsNode::rank);
+    if (FileUtil::directoryExists(localDir.c_str()) == false && FileUtil::makeDir(localDir.c_str()) == false) {
+        Debug(Debug::ERROR) << "Cannot create " << localDir << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    const std::string localDb = localDir + "/" + FileUtil::baseName(db);
+    std::vector<size_t> fileBytes(dataFiles.size());
+    std::vector<std::pair<size_t, size_t> > chunks;
+    size_t totalBytes = 0;
+    for (size_t i = 0; i < dataFiles.size(); i++) {
+        fileBytes[i] = FileUtil::getFileSize(dataFiles[i]);
+        for (size_t offset = 0; offset < fileBytes[i]; offset += LOCAL_COPY_CHUNK) {
+            chunks.emplace_back(i, offset);
+        }
+        totalBytes += fileBytes[i];
+    }
+    struct statvfs fs;
+    if (statvfs(localDir.c_str(), &fs) != 0 || static_cast<size_t>(fs.f_bavail) * fs.f_frsize < totalBytes) {
+        Debug(Debug::ERROR) << "--local-db-dir " << par.localDbDir << " needs " << totalBytes << " free bytes for the sequences of " << db << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    std::vector<int> sourceFds(dataFiles.size());
+    std::vector<int> copyFds(dataFiles.size());
+    for (size_t i = 0; i < dataFiles.size(); i++) {
+        // the copy keeps the suffix of the data file, so DBReader finds it next to localDb
+        copies.push_back(localDb + dataFiles[i].substr(db.size()));
+        sourceFds[i] = ::open(dataFiles[i].c_str(), O_RDONLY | O_CLOEXEC);
+        copyFds[i] = ::open(copies.back().c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (sourceFds[i] < 0 || copyFds[i] < 0 || ftruncate(copyFds[i], fileBytes[i]) != 0) {
+            Debug(Debug::ERROR) << "Cannot copy " << dataFiles[i] << " to " << copies.back() << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+#pragma omp parallel num_threads(std::max(1, std::min(par.threads, LOCAL_COPY_THREADS)))
+    {
+        std::vector<char> buffer(LOCAL_COPY_CHUNK);
+#pragma omp for schedule(dynamic, 1)
+        for (size_t i = 0; i < chunks.size(); i++) {
+            const size_t file = chunks[i].first;
+            const size_t bytes = std::min(LOCAL_COPY_CHUNK, fileBytes[file] - chunks[i].second);
+            FileUtil::preadAll(sourceFds[file], dataFiles[file].c_str(), buffer.data(), bytes, chunks[i].second);
+            FileUtil::pwriteAll(copyFds[file], copies[file].c_str(), buffer.data(), bytes, chunks[i].second);
+        }
+    }
+    for (size_t i = 0; i < dataFiles.size(); i++) {
+        if (::close(sourceFds[i]) != 0 || ::close(copyFds[i]) != 0) {
+            Debug(Debug::ERROR) << "Cannot copy " << dataFiles[i] << " to " << copies[i] << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+    FileUtil::copyFile(db + ".dbtype", localDb + ".dbtype");
+    copies.push_back(localDb + ".dbtype");
+    Debug(Debug::INFO) << "Copied " << totalBytes << " bytes of " << db << " to " << localDb << "\n";
+    return localDb;
+}
+
 // --createdb-mode 3: the nodes align the reps of their targets while the master clusters
 static int align2clustLinfinity(Parameters &par) {
     Timer timer;
@@ -2312,7 +2442,16 @@ static int align2clustLinfinity(Parameters &par) {
     if (MMseqsNode::isMaster() && FileUtil::fileExists((par.db3 + ".dbtype").c_str())) {
         FileUtil::remove((par.db3 + ".dbtype").c_str());
     }
-    DBReader<DBKeyType> seqDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
+    std::string phaseValues;
+    Timer phaseValueTimer;
+    // --local-db-dir: the node reads the sequences from its copy
+    std::string seqData = par.db1;
+    std::vector<std::string> localCopies;
+    if (par.localDbDir.empty() == false) {
+        seqData = copyToLocalDir(par, par.db1, par.db3, localCopies);
+        MMseqsNode::addPhaseTime(phaseValues, "copying the sequences to --local-db-dir", phaseValueTimer);
+    }
+    DBReader<DBKeyType> seqDbr(seqData.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
     seqDbr.open(DBReader<DBKeyType>::NOSORT);
     const std::vector<size_t> nodeKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
     const size_t dbSize = seqDbr.getSize();
@@ -2487,18 +2626,26 @@ static int align2clustLinfinity(Parameters &par) {
                                                accepted, assignedChanges, taken, assignedKeys, clusterSeconds, masterWaitSeconds);
         });
     }
-    std::string phaseValues;
-    Timer phaseValueTimer;
+    phaseValueTimer.reset();
     double waitSeconds = 0;
     size_t alignedPairs = 0;
     alignRepTargets(par, seqDbr, groupKeyOffsets, lagKeys, memoryLimit, representativeResidues, paddedDbSize, prefSizeBits, repTargetsIndex, repTargets, accepted, assignedChanges, members, memberDbr,
-                    waitSeconds, alignedPairs);
+                    waitSeconds, alignedPairs, phaseValues);
     FileUtil::remove((repTargets + "." + SSTR(MMseqsNode::rank)).c_str());
+    // alignRepTargets closed seqDbr, the last reader of the copy
+    for (size_t i = 0; i < localCopies.size(); i++) {
+        FileUtil::remove(localCopies[i].c_str());
+    }
+    if (localCopies.empty() == false) {
+        rmdir(FileUtil::dirName(seqData).c_str());
+    }
     if (MMseqsNode::rank >= getFirstAlignNode()) {
         MMseqsNode::addPhaseTime(phaseValues, "aligning the rep targets", phaseValueTimer);
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the master", waitSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Aligned pairs", SSTR(alignedPairs));
     }
+    MMseqsNode::addPhaseValue(phaseValues, "Memory limit", SSTR(memoryLimit));
+    MMseqsNode::addPhaseValue(phaseValues, "Peak resident bytes after aligning", SSTR(getPeakResidentBytes()));
 
     // once the master is done, every node sends the taken pairs of its log to their rep nodes
     const std::string takenFile = taken + "." + SSTR(MMseqsNode::rank);
@@ -2617,6 +2764,7 @@ static int align2clustLinfinity(Parameters &par) {
     MMseqsNode::writeClusterPairs(clustersIndex, clusters, par.db3, singletonBits, nodeFirstKey, nodeKeys);
     delete[] singletonBits;
     MMseqsNode::addPhaseTime(phaseValues, "writing the clusters", phaseValueTimer);
+    MMseqsNode::addPhaseValue(phaseValues, "Peak resident bytes", SSTR(getPeakResidentBytes()));
     MMseqsNode::removeExchanges(par.db3, clusters, exchanges, phaseValues);
     if (MMseqsNode::isMaster()) {
         FileUtil::remove((par.db3 + ".memory").c_str());

@@ -676,6 +676,7 @@ public:
     // align2clust
     std::string filterCluDBFile;
     std::string filterSeqDBFile;
+    std::string localDbDir;
 
     // besthitperset
     bool simpleBestHit;
@@ -1083,6 +1084,7 @@ public:
     // align2clust
     PARAMETER(PARAM_FILTER_CLUDB_FILE)
     PARAMETER(PARAM_FILTER_SEQDB_FILE)
+    PARAMETER(PARAM_LOCAL_DB_DIR)
 
     //besthitperset
     PARAMETER(PARAM_SIMPLE_BEST_HIT)
