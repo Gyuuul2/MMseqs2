@@ -370,10 +370,15 @@ struct SwipeBatch {
         swipeSinglePairs += singlePairs;
     }
 
-    void countLanes(size_t count, int word) {
-        const size_t lanes = (word == 0) ? VECSIZE_INT * 4 : VECSIZE_INT * 2;
+    // the SIMD lanes of the 8 bit (word 0) or 16 bit lanes the members start with; a batch this large goes through the lanes,
+    // a smaller one aligns one pair at a time as in --aligner-mode 0
+    size_t lanes() const {
+        return (memberWord == 0) ? VECSIZE_INT * 4 : VECSIZE_INT * 2;
+    }
+
+    void countLanes(size_t count) {
         lanePairs += count;
-        laneSlots += (count + lanes - 1) / lanes * lanes;
+        laneSlots += (count + lanes() - 1) / lanes() * lanes();
     }
 
     // most members of a cluster are similar enough to saturate 8 bit
@@ -430,9 +435,6 @@ struct SwipeBatch {
     }
 };
 
-// a batch of members goes through the SWIPE lanes from this size on, smaller ones align one pair at a time as in --aligner-mode 0
-static const size_t SWIPE_MIN_TARGETS = VECSIZE_INT * 4;
-
 // the result of a SWIPE alignment with start, end, identities and backtrace
 static Matcher::result_t swipeResult(const Parameters &par, EvalueComputation &evaluer, DBKeyType key, int rawScore, const s_align &alignment,
                                      int queryLength, int targetLength, const std::string &backtrace) {
@@ -454,7 +456,7 @@ static bool swipeForwardPasses(const Parameters &par, EvalueComputation &evaluer
     return Util::hasCoverage(par.covThr, par.covMode, qCov, tCov) && evaluer.computeEvalue(alignment.score1, queryLength) <= par.evalThr;
 }
 
-// the gapped alignments of the members of a batch of alignClusterMembers, in the SWIPE lanes if there are at least SWIPE_MIN_TARGETS
+// the gapped alignments of the members of a batch of alignClusterMembers, in the SWIPE lanes if they fill them
 static bool alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherInitialized, SwipeBatch &swipe, Sequence &query, Sequence &element,
                               const std::vector<DBKeyType> &memberKeys, DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx,
                               std::string *pendingMemberAln, char *alnLineBuffer) {
@@ -462,11 +464,11 @@ static bool alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &mat
         matcher.initQuery(&query);
         matcherInitialized = true;
     }
-    const bool useLanes = (swipe.gapped.size() >= SWIPE_MIN_TARGETS);
+    const bool useLanes = (swipe.gapped.size() >= swipe.lanes());
     if (useLanes == false) {
         swipe.singlePairs += swipe.gapped.size();
     } else {
-        swipe.countLanes(swipe.gapped.size(), swipe.memberWord);
+        swipe.countLanes(swipe.gapped.size());
         swipe.entries.resize(swipe.gapped.size());
         for (size_t g = 0; g < swipe.gapped.size(); g++) {
             swipe.entries[g] = g;
@@ -521,7 +523,7 @@ static bool alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &mat
 
 // whether every --filter-cludb-file member of the cluster of the target, memberKeys, meets the clustering criteria against the query, from startDiagonal;
 // with swipe (--aligner-mode 1-3) the members that cannot be covered fail first, the most different lengths go next, the members go in batches of
-// 1, 2, 4, ... and the gapped alignments of a batch with at least SWIPE_MIN_TARGETS members share the SWIPE lanes, with the same decision
+// 1, 2, 4, ... and the gapped alignments of a batch that fills the SWIPE lanes share them, with the same decision
 static bool alignClusterMembers(const Parameters &par, BlockAligner &blockAligner, Matcher &matcher, bool &matcherInitialized, Sequence &query, Sequence &element,
                                 const std::vector<DBKeyType> &memberKeys, DBReader<DBKeyType> *cluSeqDbr, short startDiagonal, unsigned int swMode,
                                 unsigned int threadIdx, std::string *pendingMemberAln, char *alnLineBuffer, SwipeBatch *swipe) {
