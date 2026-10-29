@@ -13,6 +13,7 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
+#include <map>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -28,6 +29,8 @@ static std::string runId;
 // the exchange bytes that this node sent, all of them and those for other nodes, reported by removeExchanges
 static size_t sentExchangeBytes = 0;
 static size_t sentOtherNodeExchangeBytes = 0;
+// the records and their bytes that this node sent to itself in the last flush of an exchange, until openExchange reads them
+static std::map<std::string, std::pair<char *, size_t> > ownExchangeRecords;
 
 void MMseqsNode::init() {
     // mpirun (Open MPI, then PMI of MPICH/Intel MPI) before SLURM, whose variables mpirun tasks inherit from the allocation
@@ -314,8 +317,14 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
             blocks.back().partsBytes += end - pos;
             continue;
         }
-        const ExchangeBlock block = { files[node], pos, end, std::vector<char>(), 0, 0, 0, 0, std::vector<std::pair<size_t, size_t> >(), 0, 0 };
+        const ExchangeBlock block = { files[node], pos, end, std::vector<char>(), 0, 0, 0, 0, std::vector<std::pair<size_t, size_t> >(), 0, 0, NULL };
         blocks.push_back(block);
+    }
+    std::map<std::string, std::pair<char *, size_t> >::iterator own = ownExchangeRecords.find(prefix);
+    if (own != ownExchangeRecords.end()) {
+        const ExchangeBlock block = { NULL, 0, own->second.second, std::vector<char>(), 0, 0, 0, 0, std::vector<std::pair<size_t, size_t> >(), 0, 0, own->second.first };
+        blocks.push_back(block);
+        ownExchangeRecords.erase(own);
     }
 }
 
@@ -353,9 +362,17 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
                     block.nextPart++;
                 }
                 const size_t readBytes = std::min(block.buffer.size() - block.bufferEnd, block.end - block.pos);
-                FileUtil::preadAll(fileno(block.file), prefix.c_str(), block.buffer.data() + block.bufferEnd, readBytes, block.pos);
+                if (block.ownRecords != NULL) {
+                    memcpy(block.buffer.data() + block.bufferEnd, block.ownRecords + block.pos, readBytes);
+                } else {
+                    FileUtil::preadAll(fileno(block.file), prefix.c_str(), block.buffer.data() + block.bufferEnd, readBytes, block.pos);
+                }
                 block.pos += readBytes;
                 block.bufferEnd += readBytes;
+            }
+            if (block.ownRecords != NULL && getUnreadBytes(block) == 0) {
+                free(block.ownRecords);
+                block.ownRecords = NULL;
             }
             for (size_t size; (size = recordSize(block.buffer.data() + block.recordEnd, block.bufferEnd - block.recordEnd)) > 0; block.recordEnd += size) {
                 block.lastRecord = block.recordEnd;
@@ -432,28 +449,40 @@ void MMseqsNode::closeExchangeFiles(std::vector<FILE *> &files, const std::strin
 }
 
 void MMseqsNode::writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
-                            FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes) {
+                            FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes, size_t *ownPairCount) {
     SORT_PARALLEL(pairs, pairs + pairCount, compare);
     std::vector<size_t> nodeOffsets(count + 1, pairCount * sizeof(ClusterPair));
     for (size_t node = 0; node < count; node++) {
         const ClusterPair nodeFirstPair = { static_cast<DBKeyType>(nodeKeyOffsets[node]), static_cast<DBKeyType>(nodeKeyOffsets[node]) };
         nodeOffsets[node] = (std::lower_bound(pairs, pairs + pairCount, nodeFirstPair, compare) - pairs) * sizeof(ClusterPair);
     }
-    if (fwrite(pairs, sizeof(ClusterPair), pairCount, file) != pairCount) {
+    const size_t ownBegin = nodeOffsets[rank] / sizeof(ClusterPair);
+    const size_t ownEnd = (ownPairCount != NULL) ? nodeOffsets[rank + 1] / sizeof(ClusterPair) : ownBegin;
+    if (fwrite(pairs, sizeof(ClusterPair), ownBegin, file) != ownBegin || fwrite(pairs + ownEnd, sizeof(ClusterPair), pairCount - ownEnd, file) != pairCount - ownEnd) {
         Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
+    if (ownPairCount != NULL && ownBegin > 0) {
+        memmove(pairs, pairs + ownBegin, (ownEnd - ownBegin) * sizeof(ClusterPair));
+    }
+    if (ownPairCount != NULL) {
+        *ownPairCount = ownEnd - ownBegin;
+    }
+    for (size_t node = rank + 1; node <= count; node++) {
+        nodeOffsets[node] -= (ownEnd - ownBegin) * sizeof(ClusterPair);
+    }
     addExchangeFlush(indexData, writtenBytes, nodeOffsets);
+    sentExchangeBytes += (ownEnd - ownBegin) * sizeof(ClusterPair);
 }
 
 MMseqsNode::ClusterPairWriter::ClusterPairWriter(const std::string &exchange, size_t pairCapacity, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets)
-    : exchange(exchange), fileName(exchange + "." + SSTR(rank)), file(FileUtil::openAndDelete(fileName.c_str(), "w")), pairs(new(std::nothrow) ClusterPair[pairCapacity]),
+    : exchange(exchange), fileName(exchange + "." + SSTR(rank)), file(FileUtil::openAndDelete(fileName.c_str(), "w")), pairs(static_cast<ClusterPair *>(malloc(pairCapacity * sizeof(ClusterPair)))),
       pairCapacity(pairCapacity), pairCount(0), compare(compare), nodeKeyOffsets(nodeKeyOffsets), writtenBytes(0) {
     Util::checkAllocation(pairs, "Can not allocate pairs memory in ClusterPairWriter");
 }
 
 MMseqsNode::ClusterPairWriter::~ClusterPairWriter() {
-    delete[] pairs;
+    free(pairs);
 }
 
 void MMseqsNode::ClusterPairWriter::flush() {
@@ -462,10 +491,19 @@ void MMseqsNode::ClusterPairWriter::flush() {
 }
 
 std::string MMseqsNode::ClusterPairWriter::close() {
+    size_t ownPairCount = 0;
     if (pairCount > 0) {
-        flush();
+        writePairs(pairs, pairCount, compare, nodeKeyOffsets, file, fileName, indexData, writtenBytes, &ownPairCount);
+        pairCount = 0;
     }
-    delete[] pairs;
+    // the buffer, cut to the pairs for this node, becomes their records
+    if (ownPairCount > 0) {
+        pairs = static_cast<ClusterPair *>(realloc(pairs, ownPairCount * sizeof(ClusterPair)));
+        Util::checkAllocation(pairs, "Can not shrink pairs memory in ClusterPairWriter");
+        ownExchangeRecords[exchange] = std::make_pair(reinterpret_cast<char *>(pairs), ownPairCount * sizeof(ClusterPair));
+    } else {
+        free(pairs);
+    }
     pairs = NULL;
     return closeExchange(file, fileName, exchange + ".index", indexData);
 }
@@ -983,6 +1021,10 @@ void MMseqsNode::closeClusterWriter(DBWriter &writer, FILE *indexFile, const std
 }
 
 void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues) {
+    if (ownExchangeRecords.empty() == false) {
+        Debug(Debug::ERROR) << "The pairs that node " << rank << " sent to itself through " << ownExchangeRecords.begin()->first << " were not read\n";
+        EXIT(EXIT_FAILURE);
+    }
     addPhaseValue(phaseValues, "Exchange bytes sent", SSTR(sentExchangeBytes));
     addPhaseValue(phaseValues, "Exchange bytes sent to other nodes", SSTR(sentOtherNodeExchangeBytes));
     printPhaseValues(barrier(prefix + ".merged", phaseValues));
