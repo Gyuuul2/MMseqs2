@@ -309,7 +309,7 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
             queryToWrap.reserve(maxSeqLen * 2);
 
             // --aligner-mode 1-3: the forward passes of the hits of a query, several at once (SWIPE)
-            const bool swipeLanes = (alignerMode != Parameters::ALIGNER_MODE_DEFAULT && wrappedScoring == false
+            const bool swipeLanes = (alignerMode != Parameters::ALIGNER_MODE_DEFAULT && wrappedScoring == false && gapOpen >= gapExtend
                                      && Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_AMINO_ACIDS)
                                      && Parameters::isEqualDbtype(targetSeqType, Parameters::DBTYPE_AMINO_ACIDS));
             SwipeAligner *swipe = swipeLanes ? new SwipeAligner(m, maxMatcherSeqLen, compBiasCorrection, compBiasCorrectionScale, gapOpen, gapExtend) : NULL;
