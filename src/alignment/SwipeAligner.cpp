@@ -277,22 +277,20 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
         simd_int vColPos = vZero;
         for (int i = 0; i < Lq; i++) {
             const simd_int s = V::addBias(W[rowLetters[i]], rowBias[i]);
-            simd_int h = V::adds(vHd, s);
             const simd_int e = eColumn[i];
-            h = V::max(h, e);
-            h = V::max(h, vF);
-            h = V::max(h, vZero);
+            // H before F gives the next F (F - gap open is below F - gap extend), so F stays off the H chain
+            simd_int hp = V::max(V::max(V::adds(vHd, s), e), vZero);
             if (Reverse) {
-                h = simdi_and(h, rowMask[i]);
+                hp = simdi_and(hp, rowMask[i]);
             }
+            const simd_int h = V::max(hp, vF);
             vHd = hColumn[i];
             hColumn[i] = h;
             const simd_int gt = V::gt(h, vColMax);
             vColMax = V::max(vColMax, h);
             vColPos = simdi8_blend(vColPos, rowIndex[i], gt);
-            const simd_int hg = V::adds(h, vGapO);
-            eColumn[i] = V::max(V::adds(e, vGapE), hg);
-            vF = V::max(V::adds(vF, vGapE), hg);
+            eColumn[i] = V::max(V::adds(e, vGapE), V::adds(h, vGapO));
+            vF = V::max(V::adds(vF, vGapE), V::adds(hp, vGapO));
         }
         simdi_storeu(reinterpret_cast<simd_int *>(colMax), vColMax);
         simdi_storeu(reinterpret_cast<simd_int *>(colPos), vColPos);
@@ -478,14 +476,15 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
             const int slot = (r + k) & ringMask;
             const simd_int s = V::addBias(laneScores(tLo, tHi, ringLo[slot], ringHi[slot]), rb);
             const simd_int diag = V::adds(hRow[k], s);
+            // H before E of the left cell gives E (E - gap open is below E - gap extend), so E stays off the H chain
             const simd_int eo = V::adds(vHl, vGapO);
             const simd_int ee = V::adds(vE, vGapE);
             vE = V::max(eo, ee);
             const simd_int fo = V::adds(hRow[k + 1], vGapO);
             const simd_int fe = V::adds(fRow[k + 1], vGapE);
             const simd_int f = V::max(fo, fe);
-            simd_int h = V::max(V::max(diag, vE), V::max(f, vZero));
-            h = simdi_and(h, ringValid[slot]);
+            const simd_int hp = simdi_and(V::max(V::max(diag, f), vZero), ringValid[slot]);
+            const simd_int h = simdi_and(V::max(hp, vE), ringValid[slot]);
             if (Trace) {
                 simd_int code = simdi_and(V::eq(h, vZero), vThirtyTwo);
                 code = simdi_or(code, simdi_and(V::eq(h, diag), vOne));
@@ -496,7 +495,7 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
             }
             hRow[k] = h;
             fRow[k] = f;
-            vHl = h;
+            vHl = hp;
             vRowMax = V::max(vRowMax, h);
         }
         if (simdi8_movemask(V::gt(vRowMax, vBest)) != 0) {
