@@ -73,6 +73,12 @@ public:
     static void addPhaseSeconds(std::string &content, const std::string &phase, double seconds);
     // the master prints every name of the gathered phase values with its largest value and node, and its smallest value
     static void printPhaseValues(const std::string &values);
+    // the sum of the phase values name of all nodes
+    static size_t sumPhaseValues(const std::string &values, const std::string &name);
+    // a node takes item of a work queue by creating <queue>.<item> exclusively; false if another node has taken it
+    static bool claim(const std::string &queue, size_t item);
+    // removes <queue>.<item> of the items, once no node takes items of the queue
+    static void removeClaims(const std::string &queue, const std::vector<size_t> &items);
     // a barrier that returns the smallest memoryLimit of all nodes, so they all cut the same splits; with threads all nodes must run with as many
     static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0);
 

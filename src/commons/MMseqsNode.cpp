@@ -9,11 +9,13 @@
 #include "itoa.h"
 #include "Timer.h"
 
+#include <cerrno>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
 #include <map>
+#include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
 
@@ -258,6 +260,44 @@ void MMseqsNode::printPhaseValues(const std::string &values) {
             Debug(Debug::INFO) << names[i] << ": " << maxValues[i] << ((count > 1) ? " (node " + maxNodes[i] + ")" : "") << "\n";
         } else {
             Debug(Debug::INFO) << names[i] << ": max " << maxValues[i] << " (node " << maxNodes[i] << ") min " << minValues[i] << "\n";
+        }
+    }
+}
+
+size_t MMseqsNode::sumPhaseValues(const std::string &values, const std::string &name) {
+    size_t sum = 0;
+    for (char *line = (char *) values.c_str(); *line != '\0'; line = Util::skipLine(line)) {
+        const char *columns[3];
+        if (Util::getFieldsOfLine(line, columns, 3) < 3) {
+            Debug(Debug::ERROR) << "Cannot read the phase values\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (std::string(columns[0], columns[1] - 1) == name) {
+            sum += Util::fast_atoi<size_t>(columns[2]);
+        }
+    }
+    return sum;
+}
+
+// O_EXCL creates atomically on local file systems, GPFS, Lustre and NFS version 3 or later
+bool MMseqsNode::claim(const std::string &queue, size_t item) {
+    const std::string file = queue + "." + SSTR(item);
+    const int fd = open(file.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
+    if (fd < 0 && errno == EEXIST) {
+        return false;
+    }
+    if (fd < 0 || close(fd) != 0) {
+        Debug(Debug::ERROR) << "Cannot create " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return true;
+}
+
+void MMseqsNode::removeClaims(const std::string &queue, const std::vector<size_t> &items) {
+    for (size_t i = 0; i < items.size(); i++) {
+        const std::string file = queue + "." + SSTR(items[i]);
+        if (FileUtil::fileExists(file.c_str())) {
+            FileUtil::remove(file.c_str());
         }
     }
 }
