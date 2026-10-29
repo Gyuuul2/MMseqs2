@@ -290,7 +290,7 @@ public:
     // --createdb-mode 3: reads keys [keyBegin, keyEnd) into memory for getData
     void loadData(size_t keyBegin, size_t keyEnd);
     void prefetchData(size_t keyBegin, size_t keyEnd);
-    // --createdb-mode 3 sequences: reads the ascending keys, entries at most 64 KiB apart in one request; loadData takes the keys that prefetchData read before it
+    // --createdb-mode 3 sequences: reads the ascending keys, entries at most getReadMergeGap of the storage apart in one request; loadData takes the keys that prefetchData read before it
     void loadData(const std::vector<DBKeyType> &keys);
     void prefetchData(const std::vector<DBKeyType> &keys);
     size_t getBufferSizeToLoad(size_t keyBegin, size_t keyEnd);
