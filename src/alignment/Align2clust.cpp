@@ -1112,6 +1112,11 @@ static const size_t STEP_PAIRS_MEMORY_DIVISOR = 16;   // the pairs of a clusteri
 static const size_t LOG_PART_MEMORY_DIVISOR = 64;     // a part of a log read at once
 static const size_t CLUSTERS_MEMORY_DIVISOR = 16;     // the cluster pairs or member requests that a node sends at once
 
+// the assigned bits and the steps of clusterAcceptedPairs, without the sets of set cover
+static size_t getClusterStepMemory(size_t dbSize, size_t memoryLimit) {
+    return (dbSize + 63) / 64 * sizeof(uint64_t) + memoryLimit / STEP_MEMORY_DIVISOR;
+}
+
 // --createdb-mode 3: write every rep of the partitions of this node with its targets for this node to align; memberRequests: request the --filter-cludb-file members of the targets
 static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &nodePartitions, size_t maxWindowBytes,
                                    size_t memoryLimit, size_t paddedDbSize, size_t prefSizeBits, const std::string &repTargets, MMseqsNode::ClusterPairWriter *memberRequests) {
@@ -1880,7 +1885,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     std::vector<size_t> repSetOffsets;
     size_t liveMemberCount = 0;
     // the sets get the memory left by the assigned bits and the steps, reserved once
-    const size_t setCoverBytes = memoryLimit - std::min(memoryLimit, assignedWords * sizeof(uint64_t) + memoryLimit / STEP_MEMORY_DIVISOR);
+    const size_t setCoverBytes = memoryLimit - std::min(memoryLimit, getClusterStepMemory(dbSize, memoryLimit));
     if (mode == Parameters::SET_COVER) {
         memberPool.reserve(setCoverBytes / sizeof(DBKeyType));
         candidates.reserve(setCoverBytes / sizeof(SetCoverCandidate));
@@ -2318,8 +2323,10 @@ static int align2clustLinfinity(Parameters &par) {
     const size_t dbSize = seqDbr.getSize();
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     const size_t nodeMemoryLimit = Util::computeMemory(par.splitMemoryLimit);
-    // on one node the master also clusters, with part of the memory and a few threads
-    const size_t memoryLimit = nodeMemoryLimit / ((MMseqsNode::isMaster() && getFirstAlignNode() == 0) ? MASTER_MEMORY_DIVISOR : 1);
+    // on one node the master also clusters, with a few threads and at most half of the memory
+    const size_t masterMemoryLimit = nodeMemoryLimit / ((getFirstAlignNode() == 0) ? MASTER_MEMORY_DIVISOR : 1);
+    const size_t masterMemory = (par.clusteringMode == Parameters::SET_COVER) ? masterMemoryLimit : getClusterStepMemory(dbSize, masterMemoryLimit);
+    const size_t memoryLimit = nodeMemoryLimit - ((getFirstAlignNode() == 0) ? std::min(masterMemoryLimit, masterMemory) : 0);
     const int clusterThreads = (getFirstAlignNode() > 0) ? par.threads : std::min(CLUSTER_THREADS, std::max(1, par.threads / 4));
 
     // a clusthashfast subset has bits; its sixth index column counts the representatives for the e-values
@@ -2483,7 +2490,7 @@ static int align2clustLinfinity(Parameters &par) {
 #ifdef OPENMP
             omp_set_num_threads(clusterThreads);
 #endif
-            memberCount = clusterAcceptedPairs(clusterThreads, dbSize, memoryLimit, groupKeyOffsets, lagKeys, par.clusteringMode, paddedDbSize, prefSizeBits,
+            memberCount = clusterAcceptedPairs(clusterThreads, dbSize, masterMemoryLimit, groupKeyOffsets, lagKeys, par.clusteringMode, paddedDbSize, prefSizeBits,
                                                accepted, assignedChanges, taken, assignedKeys, clusterSeconds, masterWaitSeconds);
         });
     }
