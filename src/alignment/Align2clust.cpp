@@ -1534,36 +1534,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
     const auto getFirstRepKey = [&](const RepWindow &window) {
         return (window.end > window.begin) ? static_cast<size_t>(chunkRecords[window.chunk][window.begin].header.pair.repKey) : orderKeyEnd;
     };
-    // a band: the keys from the first window key on that fit the window memory, kept while the windows fit it; the window keys if they do not fit
-    size_t bandBegin = 0;
-    size_t bandEnd = 0;
-    size_t bandReads = 0;
-    size_t keyReads = 0;
-    const auto readBand = [&](const std::vector<DBKeyType> &windowKeys, bool isPrefetch) {
-        if (windowKeys.empty() || (windowKeys.front() >= bandBegin && windowKeys.back() < bandEnd)) {
-            return;
-        }
-        const size_t begin = windowKeys.front();
-        const size_t end = seqDbr.getSplitKeyOffsets(begin, dbSize, memoryLimit / WINDOW_MEMORY_DIVISOR, 0)[1];
-        const bool fitsBand = windowKeys.back() < end;
-        bandReads += fitsBand;
-        keyReads += (fitsBand == false);
-        if (isPrefetch) {
-            if (fitsBand) {
-                seqDbr.prefetchData(begin, end);
-            } else {
-                seqDbr.prefetchData(windowKeys);
-            }
-            return;
-        }
-        bandBegin = begin;
-        bandEnd = fitsBand ? end : begin;
-        if (fitsBand) {
-            seqDbr.loadData(begin, end);
-        } else {
-            seqDbr.loadData(windowKeys);
-        }
-    };
+    // the blocks of the window keys take the memory left by the bits, the members, two chunks, each with its records, and the keys read by two windows and a member part, up to twice their estimate
+    const size_t reservedMemory = (ownWords.size() + ring.size()) * sizeof(uint64_t) + members.size() * sizeof(ClusterPair) + repBlocks.size() * MMseqsNode::EXCHANGE_BUFFER_SIZE
+                                  + 2 * 2 * (memoryLimit / CHUNK_MEMORY_DIVISOR) + 2 * 2 * (memoryLimit / WINDOW_MEMORY_DIVISOR) + ((memberDbr != NULL) ? 2 * (memoryLimit / MEMBER_PART_MEMORY_DIVISOR) : 0);
+    seqDbr.setBlockCacheBytes(memoryLimit - std::min(memoryLimit, reservedMemory));
     size_t windowCount = 0;
     size_t windowKeys = 0;
 
@@ -1600,9 +1574,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
             publishTime = time(NULL);
             waitSeconds += waitTimer.getTimediff();
         }
-        readBand(window.keys, false);
+        // the blocks before the window keys go; reps come in key order and their targets mostly have larger keys, so few come back
+        seqDbr.releaseBlocks(window.keys.front());
+        seqDbr.loadData(window.keys);
         readWindow(nextWindow);
-        readBand(nextWindow.keys, true);
+        seqDbr.prefetchData(nextWindow.keys);
         const size_t nextRepKey = getFirstRepKey(nextWindow);
         const std::vector<RepTargetsRecord> &records = chunkRecords[window.chunk];
         const size_t recordCount = window.end - window.begin;
@@ -1779,8 +1755,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
     }
     MMseqsNode::addPhaseValue(phaseValues, "Windows", SSTR(windowCount));
     MMseqsNode::addPhaseValue(phaseValues, "Window keys", SSTR(windowKeys));
-    MMseqsNode::addPhaseValue(phaseValues, "Band reads", SSTR(bandReads));
-    MMseqsNode::addPhaseValue(phaseValues, "Key reads", SSTR(keyReads));
+    MMseqsNode::addPhaseValue(phaseValues, "Block read bytes", SSTR(seqDbr.getBlockReadBytes()));
+    MMseqsNode::addPhaseValue(phaseValues, "Key read bytes", SSTR(seqDbr.getKeyReadBytes()));
     // readExchangeRange stops at an out of order block, so every block must be read to its end
     for (size_t i = 0; i < repBlocks.size(); i++) {
         if (repBlocks[i].pos != repBlocks[i].end || repBlocks[i].partsBytes != 0 || repBlocks[i].bufferPos != repBlocks[i].bufferEnd) {
