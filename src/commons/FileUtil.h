@@ -57,6 +57,9 @@ public:
     static void copyFile(const char *src, const char *dst);
     static void copyFile(const std::string& src, const std::string& dst);
 
+    // copies the data files of db into the directory localDir and returns the name of the copy; memoryBytes: its bytes if it is on tmpfs
+    static std::string copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &memoryBytes);
+
     static FILE *openAndDelete(const char *fileName, const char *mode);
 
     static std::vector<std::string> findDatafiles(const char * datafiles);
