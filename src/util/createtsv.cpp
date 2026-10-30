@@ -45,26 +45,50 @@ static size_t memberAccessionSize(const char *record, size_t bytes) {
 static void writeMemberAccessions(std::vector<MemberAccession> &memberAccessions, const std::string &accessions, const std::vector<size_t> &nodeKeyOffsets,
                                   FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes) {
     SORT_PARALLEL(memberAccessions.begin(), memberAccessions.end(), MemberAccession::compareByRep);
-    std::vector<size_t> nodeOffsets(MMseqsNode::count + 1, 0);
-    std::string writeBuffer;
-    size_t node = 0;
-    for (size_t i = 0; i < memberAccessions.size(); i++) {
-        const MemberAccession &memberAccession = memberAccessions[i];
-        for (; node < MMseqsNode::count && nodeKeyOffsets[node] <= memberAccession.repKey; node++) {
-            nodeOffsets[node] = writeBuffer.size();
+    const size_t accessionCount = memberAccessions.size();
+    // the first member accession of every node, then the end
+    std::vector<size_t> nodeAccessions(MMseqsNode::count + 1, accessionCount);
+    for (size_t node = 0; node < MMseqsNode::count; node++) {
+        const MemberAccession nodeFirst = { static_cast<DBKeyType>(nodeKeyOffsets[node]), static_cast<DBKeyType>(nodeKeyOffsets[node]), 0, 0 };
+        nodeAccessions[node] = std::lower_bound(memberAccessions.begin(), memberAccessions.end(), nodeFirst, MemberAccession::compareByRep) - memberAccessions.begin();
+    }
+    const int threads = Parameters::getInstance().threads;
+    std::vector<size_t> threadOffsets(threads + 1, 0);
+#pragma omp parallel for schedule(static)
+    for (int thread = 0; thread < threads; thread++) {
+        for (size_t i = accessionCount * thread / threads; i < accessionCount * (thread + 1) / threads; i++) {
+            threadOffsets[thread + 1] += MEMBER_ACCESSION_SIZE + memberAccessions[i].accessionLength;
         }
-        writeBuffer.append(reinterpret_cast<const char *>(&memberAccession.repKey), sizeof(DBKeyType));
-        writeBuffer.append(reinterpret_cast<const char *>(&memberAccession.memberKey), sizeof(DBKeyType));
-        writeBuffer.append(reinterpret_cast<const char *>(&memberAccession.accessionLength), sizeof(unsigned int));
-        writeBuffer.append(accessions, memberAccession.accessionOffset, memberAccession.accessionLength);
     }
-    for (; node <= MMseqsNode::count; node++) {
-        nodeOffsets[node] = writeBuffer.size();
+    for (int thread = 0; thread < threads; thread++) {
+        threadOffsets[thread + 1] += threadOffsets[thread];
     }
-    if (fwrite(writeBuffer.data(), sizeof(char), writeBuffer.size(), file) != writeBuffer.size()) {
+    const size_t writeBufferSize = threadOffsets[threads];
+    char *writeBuffer = new(std::nothrow) char[writeBufferSize];
+    Util::checkAllocation(writeBuffer, "Can not allocate writeBuffer memory in createtsv");
+    std::vector<size_t> nodeOffsets(MMseqsNode::count + 1, writeBufferSize);
+#pragma omp parallel for schedule(static)
+    for (int thread = 0; thread < threads; thread++) {
+        const size_t begin = accessionCount * thread / threads;
+        size_t node = std::lower_bound(nodeAccessions.begin(), nodeAccessions.end(), begin) - nodeAccessions.begin();
+        size_t bufferPos = threadOffsets[thread];
+        for (size_t i = begin; i < accessionCount * (thread + 1) / threads; i++) {
+            for (; node <= MMseqsNode::count && nodeAccessions[node] == i; node++) {
+                nodeOffsets[node] = bufferPos;
+            }
+            const MemberAccession &memberAccession = memberAccessions[i];
+            memcpy(writeBuffer + bufferPos, &memberAccession.repKey, sizeof(DBKeyType));
+            memcpy(writeBuffer + bufferPos + sizeof(DBKeyType), &memberAccession.memberKey, sizeof(DBKeyType));
+            memcpy(writeBuffer + bufferPos + 2 * sizeof(DBKeyType), &memberAccession.accessionLength, sizeof(unsigned int));
+            memcpy(writeBuffer + bufferPos + MEMBER_ACCESSION_SIZE, accessions.data() + memberAccession.accessionOffset, memberAccession.accessionLength);
+            bufferPos += MEMBER_ACCESSION_SIZE + memberAccession.accessionLength;
+        }
+    }
+    if (fwrite(writeBuffer, sizeof(char), writeBufferSize, file) != writeBufferSize) {
         Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
+    delete[] writeBuffer;
     MMseqsNode::addExchangeFlush(indexData, writtenBytes, nodeOffsets);
 }
 

@@ -56,6 +56,23 @@ static size_t memberIndex(const MemberBits *memberBits, size_t pos) {
     return memberBits[pos / 64].membersBefore + __builtin_popcountll(memberBits[pos / 64].isMember & ((1ull << (pos % 64)) - 1));
 }
 
+// the sequences whose clusters a thread formats at once before they are written, at most a few bytes each
+static const size_t WRITE_THREAD_SEQS = 1024 * 1024;
+
+// the first position from pos on in hashIdPairs [0, end), sorted by hash, that does not continue the hash before it
+static size_t findHashStart(const HashEntry *hashIdPairs, size_t pos, size_t end) {
+    return (pos == 0) ? 0 : std::upper_bound(hashIdPairs + pos, hashIdPairs + end, HashEntry{hashIdPairs[pos - 1].hash, std::numeric_limits<DBLocalId>::max()}, HashEntry::compareByHashAndId) - hashIdPairs;
+}
+
+// cuts hashIdPairs [begin, end), sorted by hash, into a part for every thread without cutting a hash
+static void cutThreadOffsets(const HashEntry *hashIdPairs, size_t begin, size_t end, std::vector<size_t> &threadOffsets) {
+    const size_t threads = threadOffsets.size() - 1;
+    for (size_t thread = 0; thread < threads; thread++) {
+        threadOffsets[thread] = findHashStart(hashIdPairs, begin + (end - begin) / threads * thread, end);
+    }
+    threadOffsets[threads] = end;
+}
+
 // a load fits when its sequence buffer is at most a third of the limit and its hashIdPairs fit next to two buffers
 static bool fitsWithPrefetch(const LengthRange *begin, const LengthRange *end, bool isLinfinity, size_t seqBufferLimit, size_t hashIdPairsLimit) {
     const size_t seqBufferBytes = isLinfinity ? end->offset - begin->offset + 2 * Util::getPageSize() : 0;
@@ -363,8 +380,12 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     HashEntry *hashIdPairs = NULL;
     size_t hashIdPairsSize = 0;
 
-    std::string result;
     char buffer[32];
+    std::vector<size_t> threadOffsets(par.threads + 1);
+    std::vector<std::string> threadData(par.threads);
+    // (representative id, offset) of the entries of the part of a thread, (key, offset in the data file) once written to a mode 3 index
+    std::vector<std::vector<uint64_t> > threadEntries(par.threads);
+    std::vector<size_t> threadDataOffsets(par.threads + 1);
     ClusterPair *loadPairs = NULL;
     size_t loadPairCount = 0;
     bool needsSort = false;
@@ -465,11 +486,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             }
 
             // bins never cross threads; threadOffsets are fixed before hash is overwritten with the representative id
-            std::vector<size_t> threadOffsets(par.threads + 1, hashedSeqCount);
-            for (int thread = 0; thread < par.threads; thread++) {
-                const size_t pos = hashedSeqCount / par.threads * thread;
-                threadOffsets[thread] = (pos == 0) ? 0 : std::upper_bound(rangeHashIdPairs + pos, rangeHashIdPairs + hashedSeqCount, HashEntry{rangeHashIdPairs[pos - 1].hash, std::numeric_limits<DBLocalId>::max()}, HashEntry::compareByHashAndId) - rangeHashIdPairs;
-            }
+            cutThreadOffsets(rangeHashIdPairs, 0, hashedSeqCount, threadOffsets);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
             for (int thread = 0; thread < par.threads; thread++) {
                 const size_t threadEnd = threadOffsets[thread + 1];
@@ -511,38 +528,80 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
 
             // hash now holds the representative id, so sorting again gathers each cluster with its representative first
             SORT_PARALLEL(rangeHashIdPairs, rangeHashIdPairs + hashedSeqCount, HashEntry::compareByHashAndId);
-            for (size_t clusterBegin = 0; clusterBegin < hashedSeqCount;) {
-                size_t clusterEnd = clusterBegin + 1;
-                while (clusterEnd < hashedSeqCount && rangeHashIdPairs[clusterEnd].hash == rangeHashIdPairs[clusterBegin].hash) {
-                    clusterEnd++;
+            for (size_t writeBegin = 0, writeEnd; writeBegin < hashedSeqCount; writeBegin = writeEnd) {
+                writeEnd = findHashStart(rangeHashIdPairs, std::min(hashedSeqCount, writeBegin + WRITE_THREAD_SEQS * par.threads), hashedSeqCount);
+                cutThreadOffsets(rangeHashIdPairs, writeBegin, writeEnd, threadOffsets);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+                for (int thread = 0; thread < par.threads; thread++) {
+                    std::string &data = threadData[thread];
+                    std::vector<uint64_t> &entries = threadEntries[thread];
+                    data.clear();
+                    entries.clear();
+                    char keyBuffer[32];
+                    const size_t threadEnd = threadOffsets[thread + 1];
+                    for (size_t clusterBegin = threadOffsets[thread]; clusterBegin < threadEnd;) {
+                        size_t clusterEnd = clusterBegin + 1;
+                        while (clusterEnd < threadEnd && rangeHashIdPairs[clusterEnd].hash == rangeHashIdPairs[clusterBegin].hash) {
+                            clusterEnd++;
+                        }
+                        const DBLocalId repId = rangeHashIdPairs[clusterBegin].id;
+                        if (isLinfinity) {
+                            __sync_fetch_and_or(&representativeBits[(repId - localFirstKey) / 64], 1ull << ((repId - localFirstKey) % 64));
+                        }
+                        // the clusters of a split mode 3 length are written in key order after its last hash range, the representative first
+                        if (copiesSeqs) {
+                            for (size_t i = clusterBegin; i < clusterEnd; i++) {
+                                const ClusterPair pair = { reader.getDbKey(repId), reader.getDbKey(rangeHashIdPairs[i].id) };
+                                loadPairs[loadPairCount + i] = pair;
+                            }
+                        } else {
+                            entries.push_back(repId);
+                            entries.push_back(data.size());
+                            for (size_t i = clusterBegin; i < clusterEnd; i++) {
+                                char *end = Itoa::u64toa_sse2(static_cast<uint64_t>(reader.getDbKey(rangeHashIdPairs[i].id)), keyBuffer);
+                                *(end - 1) = '\n';
+                                data.append(keyBuffer, end - keyBuffer);
+                            }
+                            data.push_back('\0');
+                        }
+                        clusterBegin = clusterEnd;
+                    }
                 }
-                const DBLocalId repId = rangeHashIdPairs[clusterBegin].id;
-                const DBKeyType repKey = reader.getDbKey(repId);
                 if (isLinfinity) {
-                    representativeBits[(repId - localFirstKey) / 64] |= 1ull << ((repId - localFirstKey) % 64);
-                } else {
-                    representativeWriter.writeIndexEntry(repKey, reader.getOffset(repId), reader.getEntryLen(repId), 0);
-                    clusters++;
+                    threadDataOffsets[0] = resultWriter.getOffset(0);
+                    for (int thread = 0; thread < par.threads; thread++) {
+                        threadDataOffsets[thread + 1] = threadDataOffsets[thread] + threadData[thread].size();
+                    }
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+                    for (int thread = 0; thread < par.threads; thread++) {
+                        for (size_t i = 0; i < threadEntries[thread].size(); i += 2) {
+                            threadEntries[thread][i] = reader.getDbKey(threadEntries[thread][i]);
+                            threadEntries[thread][i + 1] += threadDataOffsets[thread];
+                        }
+                    }
                 }
-                // the clusters of a split mode 3 length are written in key order after its last hash range
-                if (copiesSeqs) {
-                    for (size_t i = clusterBegin + 1; i < clusterEnd; i++) {
-                        const ClusterPair pair = { repKey, reader.getDbKey(rangeHashIdPairs[i].id) };
-                        loadPairs[loadPairCount++] = pair;
-                    }
-                } else {
-                    for (size_t i = clusterBegin; i < clusterEnd; i++) {
-                        char *end = Itoa::u64toa_sse2(static_cast<uint64_t>(reader.getDbKey(rangeHashIdPairs[i].id)), buffer);
-                        *(end - 1) = '\n';
-                        result.append(buffer, end - buffer);
-                    }
+                for (int thread = 0; thread < par.threads; thread++) {
+                    const std::string &data = threadData[thread];
+                    const std::vector<uint64_t> &entries = threadEntries[thread];
                     if (isLinfinity) {
-                        MMseqsNode::writeClusterIndexEntry(resultIndexFile, resultIndex, repKey, resultWriter.getOffset(0));
+                        resultWriter.writeAdd(data.data(), data.size(), 0);
+                        if (fwrite(entries.data(), sizeof(uint64_t), entries.size(), resultIndexFile) != entries.size()) {
+                            Debug(Debug::ERROR) << "Cannot write " << resultIndex << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        continue;
                     }
-                    resultWriter.writeData(result.c_str(), result.length(), repKey, 0, true, isLinfinity == false);
-                    result.clear();
+                    for (size_t i = 0; i < entries.size(); i += 2) {
+                        const DBLocalId repId = entries[i];
+                        const size_t entryEnd = (i + 2 < entries.size()) ? entries[i + 3] : data.size();
+                        resultWriter.writeData(data.data() + entries[i + 1], entryEnd - entries[i + 1] - 1, reader.getDbKey(repId), 0);
+                        representativeWriter.writeIndexEntry(reader.getDbKey(repId), reader.getOffset(repId), reader.getEntryLen(repId), 0);
+                    }
+                    clusters += entries.size() / 2;
                 }
-                clusterBegin = clusterEnd;
+            }
+            if (copiesSeqs) {
+                loadPairCount += hashedSeqCount;
             }
         }
         if (copiesSeqs) {
@@ -559,6 +618,9 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                 *(end - 1) = '\n';
                 resultWriter.writeAdd(buffer, end - buffer, 0);
                 for (; pair < loadPairCount && loadPairs[pair].repKey == key; pair++) {
+                    if (loadPairs[pair].memberKey == key) {
+                        continue;
+                    }
                     end = Itoa::u64toa_sse2(static_cast<uint64_t>(loadPairs[pair].memberKey), buffer);
                     *(end - 1) = '\n';
                     resultWriter.writeAdd(buffer, end - buffer, 0);
