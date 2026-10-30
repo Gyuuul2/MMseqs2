@@ -1550,6 +1550,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
     time_t changesTime = publishTime;
     std::mutex acceptedMutex;
     std::mutex assignedChangesMutex;
+    std::vector<size_t> batchOffsets;
     std::vector<unsigned char> batchDone;
     std::vector<std::vector<ClusterPair> > batchPairs;
     std::vector<ClusterPair> windowPairs;
@@ -1580,7 +1581,22 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
         const size_t nextRepKey = getFirstRepKey(nextWindow);
         const std::vector<RepTargetsRecord> &records = chunkRecords[window.chunk];
         const size_t recordCount = window.end - window.begin;
-        const size_t batchCount = std::min(recordCount, par.threads * ALIGN_BATCHES_PER_THREAD);
+        // batches of about the same rep length times targets, the cost of the kmermatcher partitions, so the longest reps do not fall into one batch
+        const size_t maxBatches = std::min(recordCount, par.threads * ALIGN_BATCHES_PER_THREAD);
+        __extension__ typedef unsigned __int128 uint128;
+        size_t windowCost = 0;
+        for (size_t i = window.begin; i < window.end; i++) {
+            windowCost += seqDbr.getSeqLen(records[i].header.pair.repKey % paddedDbSize) * records[i].header.targetCount;
+        }
+        batchOffsets.assign(1, window.begin);
+        for (size_t i = window.begin, cost = 0; i + 1 < window.end; i++) {
+            cost += seqDbr.getSeqLen(records[i].header.pair.repKey % paddedDbSize) * records[i].header.targetCount;
+            if (static_cast<uint128>(cost) * maxBatches >= static_cast<uint128>(windowCost) * batchOffsets.size()) {
+                batchOffsets.push_back(i + 1);
+            }
+        }
+        batchOffsets.push_back(window.end);
+        const size_t batchCount = batchOffsets.size() - 1;
         batchDone.assign(batchCount, 0);
         batchPairs.assign(batchCount, std::vector<ClusterPair>());
         size_t firstUnfinishedBatch = 0;
@@ -1600,7 +1616,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
 #pragma omp for schedule(dynamic, 1)
             for (size_t batch = 0; batch < batchCount; batch++) {
                 pairs.clear();
-                for (size_t i = window.begin + recordCount * batch / batchCount; i < window.begin + recordCount * (batch + 1) / batchCount; i++) {
+                for (size_t i = batchOffsets[batch]; i < batchOffsets[batch + 1]; i++) {
                     const RepTargets &header = records[i].header;
                     if (isAssigned(header.pair.repKey)) {
                         continue;
@@ -1642,7 +1658,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
                     }
                     const time_t now = time(NULL);
                     if (acceptedBytes - publishedBytes >= PUBLISH_BYTES || now - publishTime >= PUBLISH_SECONDS) {
-                        const size_t doneRepKey = (firstUnfinishedBatch < batchCount) ? static_cast<size_t>(records[window.begin + recordCount * firstUnfinishedBatch / batchCount].header.pair.repKey) : nextRepKey;
+                        const size_t doneRepKey = (firstUnfinishedBatch < batchCount) ? static_cast<size_t>(records[batchOffsets[firstUnfinishedBatch]].header.pair.repKey) : nextRepKey;
                         MMseqsNode::publishLog(acceptedHandle, acceptedLog, doneRepKey, acceptedBytes);
                         publishedBytes = acceptedBytes;
                         publishTime = now;
