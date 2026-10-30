@@ -2319,8 +2319,8 @@ static const size_t LOCAL_COPY_CHUNK = 64 * 1024 * 1024;
 // shared storage serves this many large reads of a copy at once
 static const int LOCAL_COPY_THREADS = 64;
 
-// --local-db-dir: copies the sequence data files of db into <dir>/<name of out>.<node> and returns the name of the copy
-static std::string copyToLocalDir(const Parameters &par, const std::string &db, const std::string &out, std::vector<std::string> &copies) {
+// --local-db-dir: copies the sequence data files of db into <dir>/<name of out>.<node> and returns the name of the copy; memoryBytes: its bytes if it is on tmpfs
+static std::string copyToLocalDir(const Parameters &par, const std::string &db, const std::string &out, std::vector<std::string> &copies, size_t &memoryBytes) {
     const std::vector<std::string> dataFiles = FileUtil::findDatafiles(db.c_str());
     if (dataFiles.empty()) {
         Debug(Debug::ERROR) << "No datafile could be found for " << db << "\n";
@@ -2342,11 +2342,6 @@ static std::string copyToLocalDir(const Parameters &par, const std::string &db, 
         }
         totalBytes += fileBytes[i];
     }
-    struct statvfs fs;
-    if (statvfs(localDir.c_str(), &fs) != 0 || static_cast<size_t>(fs.f_bavail) * fs.f_frsize < totalBytes) {
-        Debug(Debug::ERROR) << "--local-db-dir " << par.localDbDir << " needs " << totalBytes << " free bytes for the sequences of " << db << "\n";
-        EXIT(EXIT_FAILURE);
-    }
     std::vector<int> sourceFds(dataFiles.size());
     std::vector<int> copyFds(dataFiles.size());
     for (size_t i = 0; i < dataFiles.size(); i++) {
@@ -2359,6 +2354,13 @@ static std::string copyToLocalDir(const Parameters &par, const std::string &db, 
             EXIT(EXIT_FAILURE);
         }
     }
+    // after O_TRUNC, so a copy left by a killed run does not take the free space; the copies are still sparse
+    struct statvfs fs;
+    if (statvfs(localDir.c_str(), &fs) != 0 || static_cast<size_t>(fs.f_bavail) * fs.f_frsize < totalBytes) {
+        Debug(Debug::ERROR) << "--local-db-dir " << par.localDbDir << " needs " << totalBytes << " free bytes for the sequences of " << db << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    memoryBytes = (getStorageKind(copyFds[0]) == STORAGE_MEMORY) ? totalBytes : 0;
 #pragma omp parallel num_threads(std::max(1, std::min(par.threads, LOCAL_COPY_THREADS)))
     {
         std::vector<char> buffer(LOCAL_COPY_CHUNK);
@@ -2394,8 +2396,9 @@ static int align2clustLinfinity(Parameters &par) {
     // --local-db-dir: the node reads the sequences from its copy
     std::string seqData = par.db1;
     std::vector<std::string> localCopies;
+    size_t localCopyMemory = 0;
     if (par.localDbDir.empty() == false) {
-        seqData = copyToLocalDir(par, par.db1, par.db3, localCopies);
+        seqData = copyToLocalDir(par, par.db1, par.db3, localCopies, localCopyMemory);
         MMseqsNode::addPhaseTime(phaseValues, "copying the sequences to --local-db-dir", phaseValueTimer);
     }
     DBReader<DBKeyType> seqDbr(seqData.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
@@ -2403,7 +2406,8 @@ static int align2clustLinfinity(Parameters &par) {
     const std::vector<size_t> nodeKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
     const size_t dbSize = seqDbr.getSize();
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
-    const size_t nodeMemoryLimit = Util::computeMemory(par.splitMemoryLimit);
+    // a copy on tmpfs holds the sequences in memory
+    const size_t nodeMemoryLimit = std::max(Util::computeMemory(par.splitMemoryLimit), localCopyMemory) - localCopyMemory;
     // on one node the master also clusters, with a few threads and at most half of the memory
     const size_t masterMemoryLimit = nodeMemoryLimit / ((getFirstAlignNode() == 0) ? MASTER_MEMORY_DIVISOR : 1);
     const size_t masterMemory = (par.clusteringMode == Parameters::SET_COVER) ? masterMemoryLimit : getClusterStepMemory(dbSize, masterMemoryLimit);
