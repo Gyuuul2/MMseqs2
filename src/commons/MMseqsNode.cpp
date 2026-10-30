@@ -1066,6 +1066,21 @@ void MMseqsNode::writeClusterIndexEntry(FILE *file, const std::string &fileName,
     }
 }
 
+// how many of the sorted pairs come before position pos once they are merged with the sorted singletons in rep order
+static size_t findMergedPairCount(const ClusterPair *pairs, size_t pairCount, const ClusterPair *singletons, size_t singletonCount, size_t pos) {
+    size_t low = (pos > singletonCount) ? pos - singletonCount : 0;
+    size_t high = std::min(pos, pairCount);
+    while (low < high) {
+        const size_t mid = low + (high - low) / 2;
+        if (ClusterPair::compareByRep(pairs[mid], singletons[pos - mid - 1])) {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    return low;
+}
+
 void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &prefix, const std::string &clu, const uint64_t *singletonBits, size_t firstKey, size_t keyCount) {
     const Parameters &par = Parameters::getInstance();
     std::vector<ExchangeBlock> repBlocks;
@@ -1079,6 +1094,7 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
     dbw.open();
     std::vector<char> records;
     std::vector<ClusterPair> singletons;
+    std::vector<size_t> threadSingletonOffsets(par.threads + 1, 0);
     std::vector<std::string> threadData(par.threads);
     // (key, offset) of the entries that start in the part of a thread
     std::vector<std::vector<uint64_t> > threadIndex(par.threads);
@@ -1094,35 +1110,56 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
         size_t pairCount;
         do {
             pairCount = readExchangeRange(repBlocks, memoryLimit / 8, ClusterPair::recordSize, ClusterPair::compareByRep, lastPair, records, NULL, prefix);
+            ClusterPair *pairs = reinterpret_cast<ClusterPair *>(records.data());
+            SORT_PARALLEL(pairs, pairs + pairCount, ClusterPair::compareByRep);
             singletons.clear();
             if (singletonBits != NULL) {
                 // the singletons up to the largest rep of the pairs go with them in rep order, and the rest of the split after the last pairs
-                size_t singletonEnd = (pairCount > 0) ? nextSingletonKey : splitEnd;
-                for (size_t i = 0; i < pairCount; i++) {
-                    singletonEnd = std::max<size_t>(singletonEnd, reinterpret_cast<ClusterPair *>(records.data())[i].repKey + 1);
-                }
+                const size_t singletonEnd = (pairCount > 0) ? std::max<size_t>(nextSingletonKey, pairs[pairCount - 1].repKey + 1) : splitEnd;
                 const size_t bitBegin = nextSingletonKey - firstKey;
                 const size_t bitEnd = singletonEnd - firstKey;
-                for (size_t word = bitBegin / 64; word * 64 < bitEnd; word++) {
-                    uint64_t bits = singletonBits[word] & ((word == bitBegin / 64) ? ~0ULL << (bitBegin % 64) : ~0ULL);
-                    for (; bits != 0 && word * 64 + __builtin_ctzll(bits) < bitEnd; bits &= bits - 1) {
-                        const DBKeyType key = firstKey + word * 64 + __builtin_ctzll(bits);
-                        const ClusterPair singleton = { key, key };
-                        singletons.push_back(singleton);
+                const size_t wordBegin = bitBegin / 64;
+                const size_t wordCount = (bitEnd + 63) / 64 - wordBegin;
+                const auto getSingletonWord = [&](size_t word) {
+                    const uint64_t bits = singletonBits[word] & ((word == wordBegin) ? ~0ULL << (bitBegin % 64) : ~0ULL);
+                    return (bitEnd - word * 64 < 64) ? bits & ((1ULL << (bitEnd - word * 64)) - 1) : bits;
+                };
+#pragma omp parallel for schedule(dynamic, 1)
+                for (int thread = 0; thread < par.threads; thread++) {
+                    size_t threadSingletons = 0;
+                    for (size_t word = wordBegin + wordCount * thread / par.threads; word < wordBegin + wordCount * (thread + 1) / par.threads; word++) {
+                        threadSingletons += __builtin_popcountll(getSingletonWord(word));
+                    }
+                    threadSingletonOffsets[thread + 1] = threadSingletons;
+                }
+                for (int thread = 0; thread < par.threads; thread++) {
+                    threadSingletonOffsets[thread + 1] += threadSingletonOffsets[thread];
+                }
+                singletons.resize(threadSingletonOffsets[par.threads]);
+#pragma omp parallel for schedule(dynamic, 1)
+                for (int thread = 0; thread < par.threads; thread++) {
+                    size_t singleton = threadSingletonOffsets[thread];
+                    for (size_t word = wordBegin + wordCount * thread / par.threads; word < wordBegin + wordCount * (thread + 1) / par.threads; word++) {
+                        for (uint64_t bits = getSingletonWord(word); bits != 0; bits &= bits - 1) {
+                            const DBKeyType key = firstKey + word * 64 + __builtin_ctzll(bits);
+                            singletons[singleton].repKey = key;
+                            singletons[singleton].memberKey = key;
+                            singleton++;
+                        }
                     }
                 }
                 nextSingletonKey = std::max(nextSingletonKey, singletonEnd);
             }
-            if (records.size() < (pairCount + singletons.size()) * sizeof(ClusterPair)) {
-                records.resize((pairCount + singletons.size()) * sizeof(ClusterPair));
-            }
-            ClusterPair *pairs = reinterpret_cast<ClusterPair *>(records.data());
-            std::copy(singletons.begin(), singletons.end(), pairs + pairCount);
-            const size_t writeCount = pairCount + singletons.size();
+            const size_t singletonCount = singletons.size();
+            const size_t writeCount = pairCount + singletonCount;
             if (writeCount == 0) {
                 break;
             }
-            SORT_PARALLEL(pairs, pairs + writeCount, ClusterPair::compareByRep);
+            // the rep of the last of the first pairsBefore pairs and singletonsBefore singletons in rep order
+            const auto getLastRepKey = [&](size_t pairsBefore, size_t singletonsBefore) {
+                const bool isPair = singletonsBefore == 0 || (pairsBefore > 0 && ClusterPair::compareByRep(singletons[singletonsBefore - 1], pairs[pairsBefore - 1]));
+                return isPair ? pairs[pairsBefore - 1].repKey : singletons[singletonsBefore - 1].repKey;
+            };
 #pragma omp parallel for schedule(dynamic, 1)
             for (int thread = 0; thread < par.threads; thread++) {
                 std::string &data = threadData[thread];
@@ -1131,21 +1168,27 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
                 threadEntries.clear();
                 char buffer[32];
                 const size_t begin = writeCount * thread / par.threads;
-                DBKeyType repKey = (begin > 0) ? pairs[begin - 1].repKey : previousRepKey;
-                for (size_t i = begin; i < writeCount * (thread + 1) / par.threads; i++) {
-                    if (pairs[i].repKey != repKey) {
+                const size_t end = writeCount * (thread + 1) / par.threads;
+                size_t pair = findMergedPairCount(pairs, pairCount, singletons.data(), singletonCount, begin);
+                size_t singleton = begin - pair;
+                const size_t endPair = findMergedPairCount(pairs, pairCount, singletons.data(), singletonCount, end);
+                const size_t endSingleton = end - endPair;
+                DBKeyType repKey = (begin > 0) ? getLastRepKey(pair, singleton) : previousRepKey;
+                while (pair < endPair || singleton < endSingleton) {
+                    const ClusterPair &next = (singleton == endSingleton || (pair < endPair && ClusterPair::compareByRep(pairs[pair], singletons[singleton]))) ? pairs[pair++] : singletons[singleton++];
+                    if (next.repKey != repKey) {
                         if (repKey != DB_KEY_INVALID) {
                             data.push_back('\0');
                         }
-                        repKey = pairs[i].repKey;
+                        repKey = next.repKey;
                         threadEntries.push_back(static_cast<uint64_t>(repKey));
                         threadEntries.push_back(data.size());
                         char *tmpBuff = Itoa::u64toa_sse2(static_cast<uint64_t>(repKey), buffer);
                         *(tmpBuff - 1) = '\n';
                         data.append(buffer, tmpBuff - buffer);
                     }
-                    if (pairs[i].memberKey != repKey) {
-                        char *tmpBuff = Itoa::u64toa_sse2(static_cast<uint64_t>(pairs[i].memberKey), buffer);
+                    if (next.memberKey != repKey) {
+                        char *tmpBuff = Itoa::u64toa_sse2(static_cast<uint64_t>(next.memberKey), buffer);
                         *(tmpBuff - 1) = '\n';
                         data.append(buffer, tmpBuff - buffer);
                     }
@@ -1168,7 +1211,7 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
                     EXIT(EXIT_FAILURE);
                 }
             }
-            previousRepKey = pairs[writeCount - 1].repKey;
+            previousRepKey = getLastRepKey(pairCount, singletonCount);
         } while (pairCount > 0);
     }
     const ClusterPair lastPair = { DB_KEY_INVALID, DB_KEY_INVALID };
