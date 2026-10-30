@@ -324,9 +324,14 @@ template <typename T> bool DBReader<T>::open(int accessType){
         indexData.close();
     }
     if (externalData == false && isLinfinity && (dataMode & USE_DATA)) {
+        // range loads of a large file on local storage bypass the page cache; on network storage they stay buffered, since there
+        // every O_DIRECT read waits on a server
         const size_t pageCacheLimit = static_cast<size_t>(Util::getTotalSystemMemory() * 0.1);
+        const IoMode ioMode = getIoMode();
+        size_t directFiles = 0;
         for (size_t fileIdx = 0; fileIdx < dataFileNames.size() + headerOffsetsFileNames.size(); fileIdx++) {
             const std::string &fileName = (fileIdx < dataFileNames.size()) ? dataFileNames[fileIdx] : headerOffsetsFileNames[fileIdx - dataFileNames.size()];
+            // key loads and index searches always read through bufferedFd; the O_DIRECT fd only serves range loads
             const int bufferedFd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC);
             if (bufferedFd < 0) {
                 Debug(Debug::ERROR) << "Cannot open data file " << fileName << "!\n";
@@ -334,14 +339,22 @@ template <typename T> bool DBReader<T>::open(int accessType){
             }
             int fd = -1;
 #ifdef O_DIRECT
-            if ((dataMode & USE_DIRECT_IO) || ((dataMode & USE_BUFFERED_IO) == 0 && fileBytes[fileIdx] > pageCacheLimit)) {
+            const StorageKind storage = getStorageKind(bufferedFd);
+            const bool networkStorage = (storage == STORAGE_PARALLEL_FS || storage == STORAGE_NFS);
+            const bool direct = (ioMode == IO_MODE_DIRECT)
+                                || (ioMode == IO_MODE_AUTO && ((dataMode & USE_DIRECT_IO)
+                                    || ((dataMode & USE_BUFFERED_IO) == 0 && networkStorage == false && fileBytes[fileIdx] > pageCacheLimit)));
+            if (direct) {
                 fd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+                directFiles += (fd >= 0);
             }
 #endif
             dataFds.push_back((fd < 0) ? bufferedFd : fd);
             bufferedFds.push_back(bufferedFd);
         }
         batchReader = new BatchReader(threads, dataFds[0]);
+        Debug(Debug::INFO) << "Reading " << dataFileName << " from " << getStorageName(batchReader->getStorage()) << ": " << directFiles << " of "
+                           << dataFds.size() << " files with O_DIRECT, " << batchReader->getConcurrency() << " reads in flight\n";
         if (isCompressed(dbtype) == COMPRESSED) {
             frameOffsets.resize(dataFileNames.size());
             frameSizes.resize(dataFileNames.size());

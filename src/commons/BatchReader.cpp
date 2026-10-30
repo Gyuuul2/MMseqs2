@@ -27,22 +27,22 @@ static const unsigned int MAX_RING_DEPTH = 4096;
 static const unsigned int MIN_RING_DEPTH = 64;
 #endif
 
-static int storageConcurrency(int fd, int maxIoThreads) {
+StorageKind getStorageKind(int fd) {
 #ifdef __linux__
     struct statfs fs;
     if (fstatfs(fd, &fs) != 0) {
-        return 16;
+        return STORAGE_UNKNOWN;
     }
     // GPFS, Lustre | NFS | ext2/3/4, xfs, btrfs, f2fs, zfs, tmpfs
     switch (static_cast<unsigned int>(fs.f_type)) {
         case 0x47504653: case 0x0BD00BD0:
-            return 16;
+            return STORAGE_PARALLEL_FS;
         case 0x6969:
-            return 4;
+            return STORAGE_NFS;
         case 0xEF53: case 0x58465342: case 0x9123683E: case 0xF2F52010: case 0x2FC12FC1: case 0x01021994:
             break;
         default:
-            return 16;
+            return STORAGE_UNKNOWN;
     }
     struct stat st;
     if (fstat(fd, &st) == 0) {
@@ -54,16 +54,62 @@ static int storageConcurrency(int fd, int maxIoThreads) {
             if (file != NULL) {
                 const int rotational = fgetc(file);
                 fclose(file);
-                return (rotational == '1') ? 1 : maxIoThreads;
+                return (rotational == '1') ? STORAGE_LOCAL_DISK : STORAGE_LOCAL_FLASH;
             }
         }
     }
 #endif
-    return maxIoThreads;
+    return STORAGE_LOCAL_FLASH;
+}
+
+const char *getStorageName(StorageKind storage) {
+    switch (storage) {
+        case STORAGE_LOCAL_FLASH: return "local flash";
+        case STORAGE_LOCAL_DISK: return "local disk";
+        case STORAGE_PARALLEL_FS: return "parallel file system";
+        case STORAGE_NFS: return "NFS";
+        default: return "unknown storage";
+    }
+}
+
+IoMode getIoMode() {
+    const char *mode = getenv("MMSEQS_IO_MODE");
+    if (mode == NULL || strcmp(mode, "auto") == 0) {
+        return IO_MODE_AUTO;
+    }
+    if (strcmp(mode, "buffered") == 0) {
+        return IO_MODE_BUFFERED;
+    }
+    if (strcmp(mode, "direct") == 0) {
+        return IO_MODE_DIRECT;
+    }
+    Debug(Debug::ERROR) << "MMSEQS_IO_MODE must be auto, buffered or direct, not " << mode << "\n";
+    EXIT(EXIT_FAILURE);
+}
+
+// a read from Lustre or GPFS waits milliseconds on its server, so many are in flight; the servers of NFS take fewer
+static int storageConcurrency(StorageKind storage, int maxIoThreads) {
+    const char *concurrency = getenv("MMSEQS_IO_CONCURRENCY");
+    if (concurrency != NULL) {
+        const int value = atoi(concurrency);
+        if (value < 1) {
+            Debug(Debug::ERROR) << "MMSEQS_IO_CONCURRENCY must be a positive number, not " << concurrency << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        return value;
+    }
+    switch (storage) {
+        case STORAGE_PARALLEL_FS: return 128;
+        case STORAGE_NFS: return 16;
+        case STORAGE_LOCAL_DISK: return 1;
+        case STORAGE_LOCAL_FLASH: return maxIoThreads;
+        default: return 16;
+    }
 }
 
 BatchReader::BatchReader(int maxIoThreads, int fdToDetectStorage) : nextSplitReadRequest(0), readError(0), readErrorFileName(NULL) {
-    concurrencyRequests = std::max(1, std::min(storageConcurrency(fdToDetectStorage, maxIoThreads), maxIoThreads));
+    storage = getStorageKind(fdToDetectStorage);
+    concurrencyRequests = std::max(1, std::min(storageConcurrency(storage, maxIoThreads), maxIoThreads));
 #ifdef HAVE_IO_URING
     ringFd = -1;
     ringWorkersLimited = false;

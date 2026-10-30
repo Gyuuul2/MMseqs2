@@ -262,6 +262,7 @@ Parameters::Parameters():
         // align2clust
         PARAM_FILTER_CLUDB_FILE(PARAM_FILTER_CLUDB_FILE_ID, "--filter-cludb-file", "Filter cluDB file", "Specify a cluDB file to filter", typeid(std::string), (void *) &filterCluDBFile, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_FILTER_SEQDB_FILE(PARAM_FILTER_SEQDB_FILE_ID, "--filter-seqdb-file", "Filter seqDB file", "Specify a seqDB of cluDB file to filter", typeid(std::string), (void *) &filterSeqDBFile, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LOCAL_DB_DIR(PARAM_LOCAL_DB_DIR_ID, "--local-db-dir", "Local database directory", "--createdb-mode 3: copy the sequences to this node-local directory (NVMe, /dev/shm) and read them from there; every node needs room for the whole sequence database", typeid(std::string), (void *) &localDbDir, "", MMseqsParameter::COMMAND_EXPERT),
         // besthitperset
         PARAM_SIMPLE_BEST_HIT(PARAM_SIMPLE_BEST_HIT_ID, "--simple-best-hit", "Use simple best hit", "Update the p-value by a single best hit, or by best and second best hits", typeid(bool), (void *) &simpleBestHit, ""),
         PARAM_ALPHA(PARAM_ALPHA_ID, "--alpha", "Alpha", "Set alpha for combining p-values during aggregation", typeid(float), (void *) &alpha, "^0(\\.[0-9]+)?|^1(\\.0+)?$"),
@@ -479,6 +480,7 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_CLUSTER_MODE);
     align2clust.push_back(&PARAM_FILTER_CLUDB_FILE);
     align2clust.push_back(&PARAM_FILTER_SEQDB_FILE);
+    align2clust.push_back(&PARAM_LOCAL_DB_DIR);
     align2clust.push_back(&PARAM_INCLUDE_ALIGN_FILES);
     align2clust.push_back(&PARAM_DIAGONAL_MODE);
 
@@ -2638,6 +2640,7 @@ void Parameters::setDefaults() {
         runner = "";
     }
     nodeRunner = "";
+    localDbDir = "";
     reuseLatest = false;
     // Clustering workflow
     removeTmpFiles = false;
