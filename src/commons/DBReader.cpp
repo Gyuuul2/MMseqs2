@@ -324,8 +324,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
         indexData.close();
     }
     if (externalData == false && isLinfinity && (dataMode & USE_DATA)) {
-        // range loads of a large file on local storage bypass the page cache; on network storage they stay buffered, since there
-        // every O_DIRECT read waits on a server
+        // range loads of a large local file bypass the page cache; on network storage every O_DIRECT read waits on a server
         const size_t pageCacheLimit = static_cast<size_t>(Util::getTotalSystemMemory() * 0.1);
         const IoMode ioMode = getIoMode();
         size_t directFiles = 0;
