@@ -12,37 +12,21 @@ int createsubdb(int argc, const char **argv, const Command& command) {
     Parameters& par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
-    // --createdb-mode 3: the entry keys of <subset>.<node>, a cluster database, become the representative bits of the node and the sixth index column
+    // --createdb-mode 3: the entry keys of the cluster database <subset>.<node> become the representative bits of the data file of a node and the sixth index column
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db2.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
         MMseqsNode::init();
         DBReader<DBKeyType> reader(par.db2.c_str(), par.db2Index.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
         reader.open(DBReader<DBKeyType>::NOSORT);
-        const std::vector<size_t> nodeKeyOffsets = reader.getFileKeyOffsets(MMseqsNode::count);
-        const size_t firstKey = nodeKeyOffsets[MMseqsNode::rank];
-        const size_t keyCount = nodeKeyOffsets[MMseqsNode::rank + 1] - firstKey;
+        const std::vector<size_t> fileKeyOffsets = reader.getFileKeyOffsets(MMseqsNode::count);
+        const std::vector<size_t> cluKeyOffsets = MMseqsNode::getClusterKeyOffsets(par.db3 + ".keys", par.db1, reader.getSize());
+        const size_t firstKey = fileKeyOffsets[MMseqsNode::rank];
+        const size_t keyCount = fileKeyOffsets[MMseqsNode::rank + 1] - firstKey;
         std::vector<uint64_t> bits((keyCount + 63) / 64, 0);
-        const std::string cluIndex = par.db1 + ".index." + SSTR(MMseqsNode::rank);
-        FILE *cluIndexFile = FileUtil::openFileOrDie(cluIndex.c_str(), "r", true);
-        // (key, offset) cells in key order, the last one (DB_KEY_INVALID, data size)
-        std::vector<uint64_t> cells(1024 * 1024 / sizeof(uint64_t));
-        size_t cellCount;
-        while ((cellCount = fread(cells.data(), 2 * sizeof(uint64_t), cells.size() / 2, cluIndexFile)) > 0) {
-            for (size_t i = 0; i < cellCount; i++) {
-                const DBKeyType key = cells[2 * i];
-                if (key == DB_KEY_INVALID) {
-                    continue;
-                }
-                if (key < firstKey || key >= firstKey + keyCount) {
-                    Debug(Debug::ERROR) << "Key " << key << " of " << cluIndex << " is not a key of " << par.db2 << "." << MMseqsNode::rank << "\n";
-                    EXIT(EXIT_FAILURE);
-                }
-                bits[(key - firstKey) / 64] |= 1ULL << ((key - firstKey) % 64);
-            }
-        }
-        if (fclose(cluIndexFile) != 0) {
-            Debug(Debug::ERROR) << "Cannot close " << cluIndex << "\n";
-            EXIT(EXIT_FAILURE);
+        std::vector<DBKeyType> repKeys;
+        MMseqsNode::readClusterKeys(par.db1, cluKeyOffsets, firstKey, firstKey + keyCount, repKeys);
+        for (size_t i = 0; i < repKeys.size(); i++) {
+            bits[(repKeys[i] - firstKey) / 64] |= 1ULL << ((repKeys[i] - firstKey) % 64);
         }
         MMseqsNode::writeRepresentativeBits(par.db3, reader, bits.data(), firstKey, keyCount);
         if (MMseqsNode::isMaster()) {
