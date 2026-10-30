@@ -33,13 +33,15 @@ StorageKind getStorageKind(int fd) {
     if (fstatfs(fd, &fs) != 0) {
         return STORAGE_UNKNOWN;
     }
-    // GPFS, Lustre | NFS | ext2/3/4, xfs, btrfs, f2fs, zfs, tmpfs
+    // GPFS, Lustre | NFS | tmpfs | ext2/3/4, xfs, btrfs, f2fs, zfs
     switch (static_cast<unsigned int>(fs.f_type)) {
         case 0x47504653: case 0x0BD00BD0:
             return STORAGE_PARALLEL_FS;
         case 0x6969:
             return STORAGE_NFS;
-        case 0xEF53: case 0x58465342: case 0x9123683E: case 0xF2F52010: case 0x2FC12FC1: case 0x01021994:
+        case 0x01021994:
+            return STORAGE_MEMORY;
+        case 0xEF53: case 0x58465342: case 0x9123683E: case 0xF2F52010: case 0x2FC12FC1:
             break;
         default:
             return STORAGE_UNKNOWN;
@@ -66,6 +68,7 @@ const char *getStorageName(StorageKind storage) {
     switch (storage) {
         case STORAGE_LOCAL_FLASH: return "local flash";
         case STORAGE_LOCAL_DISK: return "local disk";
+        case STORAGE_MEMORY: return "memory";
         case STORAGE_PARALLEL_FS: return "parallel file system";
         case STORAGE_NFS: return "NFS";
         default: return "unknown storage";
@@ -102,7 +105,7 @@ static int storageConcurrency(StorageKind storage, int maxIoThreads) {
         case STORAGE_PARALLEL_FS: return 128;
         case STORAGE_NFS: return 16;
         case STORAGE_LOCAL_DISK: return 1;
-        case STORAGE_LOCAL_FLASH: return maxIoThreads;
+        case STORAGE_LOCAL_FLASH: case STORAGE_MEMORY: return maxIoThreads;
         default: return 16;
     }
 }

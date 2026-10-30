@@ -324,7 +324,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
         indexData.close();
     }
     if (externalData == false && isLinfinity && (dataMode & USE_DATA)) {
-        // range loads of a large local file bypass the page cache; on network storage every O_DIRECT read waits on a server
+        // range loads of a large file on a local device bypass the page cache; on network or unknown storage every O_DIRECT read may wait on a server, tmpfs is the page cache
         const size_t pageCacheLimit = static_cast<size_t>(Util::getTotalSystemMemory() * 0.1);
         const IoMode ioMode = getIoMode();
         size_t directFiles = 0;
@@ -339,10 +339,10 @@ template <typename T> bool DBReader<T>::open(int accessType){
             int fd = -1;
 #ifdef O_DIRECT
             const StorageKind storage = getStorageKind(bufferedFd);
-            const bool networkStorage = (storage == STORAGE_PARALLEL_FS || storage == STORAGE_NFS);
+            const bool localDevice = (storage == STORAGE_LOCAL_FLASH || storage == STORAGE_LOCAL_DISK);
             const bool direct = (ioMode == IO_MODE_DIRECT)
                                 || (ioMode == IO_MODE_AUTO && ((dataMode & USE_DIRECT_IO)
-                                    || ((dataMode & USE_BUFFERED_IO) == 0 && networkStorage == false && fileBytes[fileIdx] > pageCacheLimit)));
+                                    || ((dataMode & USE_BUFFERED_IO) == 0 && localDevice && fileBytes[fileIdx] > pageCacheLimit)));
             if (direct) {
                 fd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
                 directFiles += (fd >= 0);
