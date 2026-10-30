@@ -338,8 +338,6 @@ struct SwipeBatch {
     SwipeAligner aligner;
     EvalueComputation &evaluer;
     bool initialized;
-    // 8 bit (0) or 16 bit (1) lanes first for the members of the current rep
-    int memberWord;
     std::vector<unsigned char> sequences;
     std::vector<size_t> offsets;
     std::vector<const unsigned char *> targets;
@@ -360,7 +358,7 @@ struct SwipeBatch {
 
     SwipeBatch(const Parameters &par, BaseMatrix *subMat, EvalueComputation &evaluer, size_t maxSeqLen)
         : aligner(subMat, maxSeqLen, par.compBiasCorrection, par.compBiasCorrectionScale, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid()),
-          evaluer(evaluer), initialized(false), memberWord(1), lanePairs(0), laneSlots(0), singlePairs(0) {}
+          evaluer(evaluer), initialized(false), lanePairs(0), laneSlots(0), singlePairs(0) {}
 
     ~SwipeBatch() {
         swipeLanePairs += lanePairs;
@@ -368,20 +366,14 @@ struct SwipeBatch {
         swipeSinglePairs += singlePairs;
     }
 
-    // the SIMD lanes of the 8 bit (word 0) or 16 bit lanes the members start with
-    size_t lanes() const {
-        return (memberWord == 0) ? VECSIZE_INT * 4 : VECSIZE_INT * 2;
-    }
-
     void countLanes(size_t count) {
+        const size_t lanes = VECSIZE_INT * 2;
         lanePairs += count;
-        laneSlots += (count + lanes() - 1) / lanes() * lanes();
+        laneSlots += (count + lanes - 1) / lanes * lanes;
     }
 
-    // most members of a cluster are similar enough to saturate 8 bit
     void startRep() {
         initialized = false;
-        memberWord = 1;
     }
 
     void clear() {
@@ -397,15 +389,15 @@ struct SwipeBatch {
         return offsets.size() - 1;
     }
 
-    // the entries in order, with the lanes starting at word
-    void select(size_t count, int word) {
+    // the entries in order in 16 bit lanes, as most members of a cluster are similar enough to saturate 8 bit
+    void select(size_t count) {
         targets.resize(count);
         diagonals.resize(count);
         bandWidths.assign(count, 0);
         aligns.resize(count);
         for (size_t i = 0; i < count; i++) {
             targets[i] = sequences.data() + offsets[entries[i]];
-            aligns[i].word = word;
+            aligns[i].word = 1;
         }
     }
 
@@ -413,21 +405,6 @@ struct SwipeBatch {
         if (initialized == false) {
             aligner.initQuery(&query);
             initialized = true;
-        }
-    }
-
-    // 16 bit lanes first once most 8 bit lanes of the rep saturate, 8 bit again once all 16 bit scores fit
-    void updateWord(int &word, size_t count) {
-        size_t wide = 0;
-        size_t fitting = 0;
-        for (size_t i = 0; i < count; i++) {
-            wide += (aligns[i].word >= 1);
-            fitting += (aligns[i].score1 < static_cast<uint32_t>(INT8_MAX));
-        }
-        if (word == 0 && 2 * wide > count) {
-            word = 1;
-        } else if (word == 1 && fitting == count) {
-            word = 0;
         }
     }
 };
@@ -514,14 +491,13 @@ static void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &mat
     swipe.singlePairs += swipe.gapped.size() - laneCount;
     if (laneCount > 0) {
         swipe.countLanes(laneCount);
-        swipe.select(laneCount, swipe.memberWord);
+        swipe.select(laneCount);
         swipe.laneLengths.resize(laneCount);
         for (size_t l = 0; l < laneCount; l++) {
             swipe.laneLengths[l] = swipe.lengths[swipe.entries[l]];
         }
         swipe.setQuery(query);
         swipe.aligner.alignForward(laneCount, swipe.targets.data(), swipe.laneLengths.data(), swipe.aligns.data());
-        swipe.updateWord(swipe.memberWord, laneCount);
         for (size_t l = 0; l < laneCount; l++) {
             const s_align &alignment = swipe.aligns[l];
             if (alignment.word < 2 && swipeForwardPasses(par, swipe.evaluer, alignment, query.L, swipe.laneLengths[l]) == false) {
