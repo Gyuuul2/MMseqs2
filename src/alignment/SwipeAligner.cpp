@@ -483,8 +483,11 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
     if (rowLo >= rowHi) {
         return;
     }
+    // the 4 bit trace codes of 2 (8 bit) or 4 (16 bit) neighbouring cells share a lane
+    const int codesPerLane = 2 * sizeof(T);
+    const int traceWidth = (width + codesPerLane - 1) / codesPerLane;
     if (Trace) {
-        const size_t cells = static_cast<size_t>(rowHi - rowLo) * width;
+        const size_t cells = static_cast<size_t>(rowHi - rowLo) * traceWidth;
         if (cells > traceCapacity) {
             free(trace);
             traceCapacity = cells;
@@ -527,9 +530,9 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
     simd_int vBest = vZero;
     const simd_int vOne = V::set(1);
     const simd_int vTwo = V::set(2);
+    const simd_int vThree = V::set(3);
+    const simd_int vFour = V::set(4);
     const simd_int vEight = V::set(8);
-    const simd_int vSixteen = V::set(16);
-    const simd_int vThirtyTwo = V::set(32);
     for (int r = rowLo; r < rowHi; r++) {
         fillSlot(r + width - 1);
         const simd_int tLo = scoreLo[rowLetters[r]];
@@ -538,7 +541,8 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
         simd_int vHl = vZero;
         simd_int vE = vZero;
         simd_int vRowMax = vZero;
-        simd_int *traceRow = Trace ? trace + static_cast<size_t>(r - rowLo) * width : NULL;
+        simd_int *traceRow = Trace ? trace + static_cast<size_t>(r - rowLo) * traceWidth : NULL;
+        simd_int codes = vZero;
         for (int k = 0; k < width; k++) {
             const int slot = (r + k) & ringMask;
             const simd_int s = V::addBias(laneScores(tLo, tHi, ringLo[slot], ringHi[slot]), rb);
@@ -553,17 +557,27 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
             const simd_int hp = simdi_and(V::max(V::max(diag, f), vZero), ringValid[slot]);
             const simd_int h = simdi_and(V::max(hp, vE), ringValid[slot]);
             if (Trace) {
-                simd_int code = simdi_and(V::eq(h, vZero), vThirtyTwo);
-                code = simdi_or(code, simdi_and(V::eq(h, diag), vOne));
-                code = simdi_or(code, simdi_and(V::eq(h, vE), vTwo));
-                code = simdi_or(code, simdi_andnot(V::gt(eo, ee), vEight));
-                code = simdi_or(code, simdi_andnot(V::gt(fo, fe), vSixteen));
-                traceRow[k] = code;
+                // H from 0 (H is 0), 1 (diagonal), 2 (E) or 3 (F), 4 if E extends and 8 if F extends
+                simd_int code = simdi8_blend(vThree, vTwo, V::eq(h, vE));
+                code = simdi8_blend(code, vOne, V::eq(h, diag));
+                code = simdi_andnot(V::eq(h, vZero), code);
+                code = simdi_or(code, simdi_andnot(V::gt(eo, ee), vFour));
+                code = simdi_or(code, simdi_andnot(V::gt(fo, fe), vEight));
+                codes = (k % codesPerLane == 0) ? code : simdi_or(simdi16_slli(codes, 4), code);
+                if (k % codesPerLane == codesPerLane - 1) {
+                    traceRow[k / codesPerLane] = codes;
+                }
             }
             hRow[k] = h;
             fRow[k] = f;
             vHl = hp;
             vRowMax = V::max(vRowMax, h);
+        }
+        if (Trace && width % codesPerLane != 0) {
+            for (int k = width; k % codesPerLane != 0; k++) {
+                codes = simdi16_slli(codes, 4);
+            }
+            traceRow[width / codesPerLane] = codes;
         }
         if (simdi8_movemask(V::gt(vRowMax, vBest)) != 0) {
             simdi_storeu(reinterpret_cast<simd_int *>(rowMax), vRowMax);
@@ -596,28 +610,32 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
             int k = columns[l];
             int state = 0;
             uint32_t identities = 0;
+            const auto traceCode = [&](int row, int column) {
+                const int codes = laneValue<T>(trace + static_cast<size_t>(row - rowLo) * traceWidth + column / codesPerLane, l);
+                return (codes >> (4 * (codesPerLane - 1 - column % codesPerLane))) & 15;
+            };
             const size_t maxSteps = static_cast<size_t>(rowHi - rowLo) + width + targetLengths[jobs[l].id] + 1;
             while (backtrace.size() <= maxSteps) {
-                const T code = laneValue<T>(trace + static_cast<size_t>(r - rowLo) * width + k, l);
+                const int code = traceCode(r, k);
                 if (state == 0) {
-                    if (code & 1) {
+                    if ((code & 3) == 1) {
                         backtrace.push_back('M');
                         identities += (rowLetters[r] == t[r + offset + k]);
-                        if (r == rowLo || (laneValue<T>(trace + static_cast<size_t>(r - 1 - rowLo) * width + k, l) & 32)) {
+                        if (r == rowLo || (traceCode(r - 1, k) & 3) == 0) {
                             break;
                         }
                         r--;
                         continue;
                     }
-                    state = (code & 2) ? 1 : 2;
+                    state = ((code & 3) == 2) ? 1 : 2;
                 }
                 if (state == 1) {
                     backtrace.push_back('D');
-                    state = (code & 8) ? 1 : 0;
+                    state = (code & 4) ? 1 : 0;
                     k--;
                 } else {
                     backtrace.push_back('I');
-                    state = (code & 16) ? 2 : 0;
+                    state = (code & 8) ? 2 : 0;
                     r--;
                     k++;
                 }
