@@ -903,7 +903,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     FileUtil::pwriteAll(fileno(dataFiles[HEADER_OFFSETS]), dataFileNames[HEADER_OFFSETS].c_str(), reinterpret_cast<const char *>(&headerDataSize), sizeof(uint64_t), dataFileSizes[HEADER_OFFSETS]);
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < DATA_FILE_TYPES; i++) {
-        if (fsync(fileno(dataFiles[i])) != 0 || fclose(dataFiles[i]) != 0) {
+        if (fclose(dataFiles[i]) != 0) {
             Debug(Debug::ERROR) << "Cannot close data file " << dataFileNames[i] << "\n";
             EXIT(EXIT_FAILURE);
         }
@@ -962,7 +962,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             Debug(Debug::ERROR) << "Can not write to data file " << tmpFile << "\n";
             EXIT(EXIT_FAILURE);
         }
-        if (fflush(zstdFile) != 0 || fsync(fileno(zstdFile)) != 0 || fclose(zstdFile) != 0) {
+        if (fclose(zstdFile) != 0) {
             Debug(Debug::ERROR) << "Cannot close data file " << tmpFile << "\n";
             EXIT(EXIT_FAILURE);
         }

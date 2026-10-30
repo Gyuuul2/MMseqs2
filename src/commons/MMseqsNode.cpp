@@ -190,7 +190,7 @@ void MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
 }
 
 void MMseqsNode::publishExchangeFlush(FILE *file, const std::string &fileName, size_t bytes, const std::string &indexFile, const std::vector<uint64_t> &line) {
-    if (fflush(file) != 0 || fsync(fileno(file)) != 0 || fclose(file) != 0) {
+    if (fclose(file) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
@@ -1062,13 +1062,12 @@ uint64_t *MMseqsNode::readRepresentativeBits(const std::string &db, const std::v
 }
 
 void MMseqsNode::writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount) {
-    // the bits are on disk before the index part that tells the master this node is done
     const std::string bitsFile = db + ".bits." + SSTR(rank);
     FILE *file = FileUtil::openAndDelete(bitsFile.c_str(), "w");
     const uint64_t header[2] = { firstKey, keyCount };
     const size_t words = (keyCount + 63) / 64;
     if (fwrite(header, sizeof(uint64_t), 2, file) != 2 || fwrite(bits, sizeof(uint64_t), words, file) != words
-        || fflush(file) != 0 || fsync(fileno(file)) != 0 || fclose(file) != 0) {
+        || fclose(file) != 0) {
         Debug(Debug::ERROR) << "Cannot write " << bitsFile << "\n";
         EXIT(EXIT_FAILURE);
     }
