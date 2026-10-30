@@ -291,11 +291,12 @@ public:
     // --createdb-mode 3: reads keys [keyBegin, keyEnd) into memory for getData
     void loadData(size_t keyBegin, size_t keyEnd);
     void prefetchData(size_t keyBegin, size_t keyEnd);
-    // --createdb-mode 3 sequences: reads the ascending keys, entries less than a page apart in one request, through the buffered fds; loadData takes the keys that prefetchData read before it
+    // --createdb-mode 3 sequences: reads the ascending keys, entries less than a page apart in one request, through the buffered fds
     void loadData(const std::vector<DBKeyType> &keys);
-    void prefetchData(const std::vector<DBKeyType> &keys);
     // --createdb-mode 3 sequences: loads by keys read the whole block of a key while the blocks fit cacheBytes; blocks below the loaded and the requested keys are freed when new blocks need their room
     void setBlockCacheBytes(size_t cacheBytes);
+    // the block of setBlockCacheBytes that holds key
+    size_t getKeyBlock(size_t key) const;
     size_t getBlockReadBytes() { return blockReadBytes; }
     size_t getKeyReadBytes() { return keyReadBytes; }
     size_t getBufferSizeToLoad(size_t keyBegin, size_t keyEnd);
@@ -573,7 +574,6 @@ private:
     size_t planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys);
     // a load and a prefetch of keys [keyBegin, keyEnd), only the given keys of them if keys is not NULL
     void loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
-    void prefetchKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
     void decompressLoadedBuffer();
 
     int threads;

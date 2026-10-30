@@ -49,8 +49,8 @@ public:
         return rank == MASTER;
     }
 
-    // sleeps before poll number polls of a file that another node publishes: ten milliseconds, twice as long each poll, up to 160 milliseconds
-    static void sleepBeforePoll(unsigned int polls);
+    // sleeps before poll number polls of a file that another node publishes: ten milliseconds, twice as long each poll, up to 10 << maxShift milliseconds
+    static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
     static void publishFile(const std::string &file, const std::string &content);
     static std::string waitForFile(const std::string &file);
     // publishFile and waitForFile for files of this run, so a file that a killed run left is not read
@@ -63,6 +63,10 @@ public:
     static bool readLogProgress(const std::string &log, size_t &key, size_t &bytes);
     static void waitForLog(const std::string &log, size_t &key, size_t &bytes);
     static void readLog(const std::string &log, size_t from, size_t to, char *data);
+    // closes file, a flush of bytes that only this node writes, then appends line, whose first word is the flush number, to indexFile, which exists from before a barrier on
+    static void publishExchangeFlush(FILE *file, const std::string &fileName, size_t bytes, const std::string &indexFile, const std::vector<uint64_t> &line);
+    // reads line number flush, of line.size() words, of indexFile from a new open; false until all of it is there
+    static bool readExchangeFlush(const std::string &indexFile, size_t flush, std::vector<uint64_t> &line);
     // every node publishes content as file + "." + node; returns all contents in node order, gathered by the master into file
     static std::string barrier(const std::string &file, const std::string &content = "");
     // phase values that a node appends to the content of a barrier as lines name<TAB>node<TAB>value, for the master to print

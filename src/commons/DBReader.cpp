@@ -1147,7 +1147,7 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(BufferInfo &bufferTo
         size_t block = SIZE_MAX;
         bool isCached = false;
         for (size_t i = 0; i < keys->size(); i++) {
-            const size_t keyBlock = std::upper_bound(blockKeyOffsets.begin(), blockKeyOffsets.end(), (*keys)[i]) - blockKeyOffsets.begin() - 1;
+            const size_t keyBlock = getKeyBlock((*keys)[i]);
             if (keyBlock != block) {
                 block = keyBlock;
                 isCached = cachedBlocks.count(block) > 0;
@@ -1229,9 +1229,7 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(BufferInfo &bufferTo
 }
 
 template <typename T> void DBReader<T>::loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys) {
-    cacheBlocks(prefetchBuffer);
-    if (prefetchBuffer.isPrefetched && prefetchBuffer.keyBegin == keyBegin && prefetchBuffer.keyEnd == keyEnd
-        && (keys != NULL ? prefetchBuffer.requestedKeys == *keys : prefetchBuffer.requestedKeys.empty())) {
+    if (keys == NULL && prefetchBuffer.isPrefetched && prefetchBuffer.keyBegin == keyBegin && prefetchBuffer.keyEnd == keyEnd) {
         batchReader->waitAsyncRead();
         prefetchBuffer.isPrefetched = false;
         std::swap(loadedBuffer, prefetchBuffer);
@@ -1242,31 +1240,20 @@ template <typename T> void DBReader<T>::loadKeys(size_t keyBegin, size_t keyEnd,
     decompressLoadedBuffer();
 }
 
-template <typename T> void DBReader<T>::prefetchKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys) {
-    cacheBlocks(prefetchBuffer);
-    if (prepareBufferToLoad(prefetchBuffer, keyBegin, keyEnd, keys)) {
-        batchReader->readAsync(frameOffsets.empty() ? prefetchBuffer.readRequests : prefetchBuffer.compressedReadRequests);
-        prefetchBuffer.isPrefetched = true;
-    }
-}
-
 template <typename T> void DBReader<T>::loadData(size_t keyBegin, size_t keyEnd) {
     loadKeys(keyBegin, keyEnd, NULL);
 }
 
 template <typename T> void DBReader<T>::prefetchData(size_t keyBegin, size_t keyEnd) {
-    prefetchKeys(keyBegin, keyEnd, NULL);
+    if (prepareBufferToLoad(prefetchBuffer, keyBegin, keyEnd, NULL)) {
+        batchReader->readAsync(frameOffsets.empty() ? prefetchBuffer.readRequests : prefetchBuffer.compressedReadRequests);
+        prefetchBuffer.isPrefetched = true;
+    }
 }
 
 template <typename T> void DBReader<T>::loadData(const std::vector<DBKeyType> &keys) {
     if (keys.empty() == false) {
         loadKeys(keys.front(), keys.back() + 1, &keys);
-    }
-}
-
-template <typename T> void DBReader<T>::prefetchData(const std::vector<DBKeyType> &keys) {
-    if (keys.empty() == false) {
-        prefetchKeys(keys.front(), keys.back() + 1, &keys);
     }
 }
 
@@ -1306,6 +1293,10 @@ template <typename T> void DBReader<T>::setBlockCacheBytes(size_t cacheBytes) {
     }
     blockKeyOffsets.push_back(size);
     incrementMemory(blockKeyOffsets.size() * sizeof(size_t));
+}
+
+template <typename T> size_t DBReader<T>::getKeyBlock(size_t key) const {
+    return std::upper_bound(blockKeyOffsets.begin(), blockKeyOffsets.end(), key) - blockKeyOffsets.begin() - 1;
 }
 
 // frees blocks below keyEnd, smallest keys first, until neededBytes fit
@@ -1369,7 +1360,7 @@ template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key) {
             length = loadedBuffer.headerOffsets[headerOffsetsPos + 1] - fileOffset;
         }
         if (cachedBlocks.empty() == false) {
-            const size_t block = std::upper_bound(blockKeyOffsets.begin(), blockKeyOffsets.end(), key) - blockKeyOffsets.begin() - 1;
+            const size_t block = getKeyBlock(key);
             const std::map<size_t, BatchReader::ReadRequest>::const_iterator cached = cachedBlocks.find(block);
             if (cached != cachedBlocks.end()) {
                 return cached->second.destination + (fileOffset - cached->second.fileOffset);
@@ -1616,7 +1607,6 @@ int DBReader<T>::isCompressed(int dbtype) {
 template <typename T> void DBReader<T>::releaseDataPages() {
     if (batchReader != NULL) {
         batchReader->waitAsyncRead();
-        cacheBlocks(prefetchBuffer);
         freeBlocks(size, SIZE_MAX);
         free(loadedBuffer.buffer);
         decrementMemory(loadedBuffer.allocatedBytes);
