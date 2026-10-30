@@ -61,7 +61,7 @@ void Matcher::initQuery(Sequence* query){
 
 Matcher::result_t Matcher::getSWResult(Sequence* dbSeq, const int diagonal, bool isReverse, const int covMode, const float covThr,
                                        const double evalThr, unsigned int alignmentMode, unsigned int seqIdMode, bool isIdentity,
-                                       bool wrappedScoring, const s_align *forward){
+                                       bool wrappedScoring, const s_align *forward, bool wordFirst){
 
     // calculation of the score and traceback of the alignment
     int32_t maskLen = currentQuery->L / 2;
@@ -82,7 +82,7 @@ Matcher::result_t Matcher::getSWResult(Sequence* dbSeq, const int diagonal, bool
             alignment = aligner->ssw_align(dbSeq->numSequence,
                                            dbSeq->L, backtrace,
                                            gapOpen, gapExtend, alignmentMode, evalThr, evaluer, covMode,
-                                           covThr, correlationScoreWeight, maskLen, forward);
+                                           covThr, correlationScoreWeight, maskLen, forward, wordFirst);
         } else {
             alignment = aligner->scoreIdentical(dbSeq->numSequence, dbSeq->L, evaluer, alignmentMode, backtrace);
         }

@@ -649,8 +649,9 @@ static void alignClusterMembers(const Parameters &par, BlockAligner &blockAligne
                         matcher.initQuery(&query);
                         matcherInitialized = true;
                     }
+                    // most members score beyond the byte pass, which their ungapped score shows
                     Matcher::result_t res_element = matcher.getSWResult(&element, static_cast<int>(elementDiagonal), false, par.covMode, par.covThr, par.evalThr,
-                                                                        swMode, par.seqIdMode, false);
+                                                                        swMode, par.seqIdMode, false, false, NULL, elementUngappedAlignment.score >= UCHAR_MAX);
                     if (Alignment::checkCriteria(res_element, false, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr) == false) {
                         gate.live = false;
                         break;
