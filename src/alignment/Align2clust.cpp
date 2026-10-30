@@ -2733,7 +2733,9 @@ static int align2clustLinfinity(Parameters &par) {
     }
     DBReader<DBKeyType> seqDbr(seqData.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
     seqDbr.open(DBReader<DBKeyType>::NOSORT);
-    const std::vector<size_t> nodeKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
+    const std::vector<size_t> nodeKeyOffsets = seqDbr.getNodeKeyOffsets(MMseqsNode::count);
+    // the representative bits of a subset follow its data files
+    const std::vector<size_t> fileKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
     const size_t dbSize = seqDbr.getSize();
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     // a copy on tmpfs holds the sequences in memory
@@ -2869,9 +2871,10 @@ static int align2clustLinfinity(Parameters &par) {
     const std::string memberRequests = par.db3 + "_swap_3";
     const std::string membersExchange = par.db3 + "_swap_4";
     MMseqsNode::ClusterPairWriter *memberRequestWriter = NULL;
+    const std::vector<size_t> filterCluKeyOffsets = par.filterCluDBFile.empty() ? nodeKeyOffsets : MMseqsNode::getClusterKeyOffsets(par.db3 + ".keys", par.filterCluDBFile, dbSize);
     if (par.filterCluDBFile.empty() == false) {
         memberRequestWriter = new MMseqsNode::ClusterPairWriter(memberRequests, std::max<size_t>(1, memoryLimit / CLUSTERS_MEMORY_DIVISOR / sizeof(ClusterPair)),
-                                                                ClusterPair::compareByRep, nodeKeyOffsets);
+                                                                ClusterPair::compareByRep, filterCluKeyOffsets);
     }
     const std::string repTargets = par.db3 + "_swap_0";
     const std::string repTargetsIndex = writeRepTargets(par, seqDbr, nodePartitions, maxWindowBytes, memoryLimit, paddedDbSize, prefSizeBits, repTargets, memberRequestWriter);
@@ -3085,7 +3088,7 @@ static int align2clustLinfinity(Parameters &par) {
     }
     uint64_t *singletonBits = NULL;
     if (hasRepresentativeBits) {
-        singletonBits = MMseqsNode::readRepresentativeBits(par.db1, nodeKeyOffsets, nodeFirstKey, nodeKeys);
+        singletonBits = MMseqsNode::readRepresentativeBits(par.db1, fileKeyOffsets, nodeFirstKey, nodeKeys);
     } else {
         singletonBits = new(std::nothrow) uint64_t[nodeWords];
         Util::checkAllocation(singletonBits, "Can not allocate singletonBits memory in align2clust");

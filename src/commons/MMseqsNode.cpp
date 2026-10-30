@@ -974,14 +974,14 @@ void MMseqsNode::readKeyBits(int fd, const std::string &fileName, size_t fileOff
     }
 }
 
-uint64_t *MMseqsNode::readRepresentativeBits(const std::string &db, const std::vector<size_t> &nodeKeyOffsets, size_t firstKey, size_t keyCount) {
+uint64_t *MMseqsNode::readRepresentativeBits(const std::string &db, const std::vector<size_t> &fileKeyOffsets, size_t firstKey, size_t keyCount) {
     const size_t words = (keyCount + 63) / 64 + 1;
     uint64_t *bits = new(std::nothrow) uint64_t[words];
     Util::checkAllocation(bits, "Can not allocate representative bit memory");
     memset(bits, 0, words * sizeof(uint64_t));
-    for (size_t node = 0; node + 1 < nodeKeyOffsets.size(); node++) {
-        const size_t from = std::max(firstKey, nodeKeyOffsets[node]);
-        const size_t to = std::min(firstKey + keyCount, nodeKeyOffsets[node + 1]);
+    for (size_t node = 0; node + 1 < fileKeyOffsets.size(); node++) {
+        const size_t from = std::max(firstKey, fileKeyOffsets[node]);
+        const size_t to = std::min(firstKey + keyCount, fileKeyOffsets[node + 1]);
         if (from >= to) {
             continue;
         }
@@ -1029,6 +1029,33 @@ void MMseqsNode::writeRepresentativeBits(const std::string &db, DBReader<DBKeyTy
     if (isMaster()) {
         publishFile(db + ".index", gatherRunFiles(db + ".index."));
     }
+}
+
+std::vector<size_t> MMseqsNode::getClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount) {
+    const std::string cluIndex = clu + ".index." + SSTR(rank);
+    FILE *handle = FileUtil::openFileOrDie(cluIndex.c_str(), "r", true);
+    uint64_t firstCell[2];
+    if (fread(firstCell, sizeof(uint64_t), 2, handle) != 2 || fclose(handle) != 0) {
+        Debug(Debug::ERROR) << "Cannot read " << cluIndex << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    const std::string firstKeys = barrier(file, SSTR(firstCell[0]) + "\n");
+    // the master removes file once every node has read it
+    publishRunFile(file + ".read." + SSTR(rank), "");
+    if (isMaster()) {
+        gatherRunFiles(file + ".read.");
+        FileUtil::remove(file.c_str());
+    }
+    std::vector<size_t> offsets(count + 1, keyCount);
+    char *line = (char *) firstKeys.c_str();
+    for (size_t node = 0; node < count; node++, line = Util::skipLine(line)) {
+        offsets[node] = Util::fast_atoi<size_t>(line);
+    }
+    // a part without entries starts with its end cell, so it starts where the next part starts
+    for (size_t node = count; node > 0; node--) {
+        offsets[node - 1] = std::min(offsets[node - 1], offsets[node]);
+    }
+    return offsets;
 }
 
 void MMseqsNode::writeClusterIndexEntry(FILE *file, const std::string &fileName, DBKeyType key, size_t offset) {

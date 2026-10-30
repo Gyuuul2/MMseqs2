@@ -26,13 +26,15 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         // the header index has a line for every data file, also for one without sequences
         DBReader<DBKeyType> dbr(par.hdr1.c_str(), (par.db1 + ".nodeinfo").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
         dbr.open(DBReader<DBKeyType>::NOSORT);
-        const std::vector<size_t> nodeKeyOffsets = dbr.getFileKeyOffsets(MMseqsNode::count);
-        dbr.close();
+        const std::vector<size_t> nodeKeyOffsets = dbr.getNodeKeyOffsets(MMseqsNode::count);
         const bool hasSecondClustering = par.filenames.size() > 3;
+        // the members of the second clustering go to the nodes of their entries in the first
+        const std::vector<size_t> firstClusteringKeyOffsets = hasSecondClustering ? MMseqsNode::getClusterKeyOffsets(par.db2 + ".keys", par.filenames[2], dbr.getSize()) : nodeKeyOffsets;
+        dbr.close();
         std::string phaseValues;
         Timer timer;
         const std::string sortedByMember = par.db2 + "_swap_0";
-        const std::string sortedByMemberIndex = hasSecondClustering ? MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, nodeKeyOffsets, sortedByMember) : "";
+        const std::string sortedByMemberIndex = hasSecondClustering ? MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, firstClusteringKeyOffsets, sortedByMember) : "";
         const std::string sortedByRep = par.db2 + "_swap_1";
         const std::string sortedByRepIndex = MMseqsNode::sendClusterPairs(par.filenames[2], true, ClusterPair::compareByRep, nodeKeyOffsets, sortedByRep,
                                                                           sortedByMemberIndex, hasSecondClustering ? sortedByMember : "");
