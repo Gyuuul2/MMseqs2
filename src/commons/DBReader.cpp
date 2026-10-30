@@ -1155,7 +1155,8 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(BufferInfo &bufferTo
                     readRequests.clear();
                     planReadRequests(blockKeyOffsets[block], blockKeyOffsets[block + 1], readRequests, headerOffsets, clusterKeys, compressedReadRequests, requestFirstKeys);
                     BatchReader::ReadRequest &request = readRequests[0];
-                    isCached = cachedBlockBytes + request.bytesToRead <= blockCacheBytes;
+                    freeBlocks(std::min(loadedBuffer.keyBegin, static_cast<size_t>(keys->front())), request.bytesToRead);
+                    isCached = request.bytesToRead <= blockCacheBytes - cachedBlockBytes;
                     if (isCached) {
                         if (posix_memalign(reinterpret_cast<void **>(&request.destination), Util::getPageSize(), request.bytesToRead) != 0) {
                             Debug(Debug::ERROR) << "Cannot allocate " << request.bytesToRead << " bytes to read " << dataFileName << "\n";
@@ -1307,9 +1308,10 @@ template <typename T> void DBReader<T>::setBlockCacheBytes(size_t cacheBytes) {
     incrementMemory(blockKeyOffsets.size() * sizeof(size_t));
 }
 
-template <typename T> void DBReader<T>::releaseBlocks(size_t keyBegin) {
-    // the map is in block order, which is key order
-    for (std::map<size_t, BatchReader::ReadRequest>::iterator cached = cachedBlocks.begin(); cached != cachedBlocks.end() && blockKeyOffsets[cached->first + 1] <= keyBegin;) {
+// frees blocks below keyEnd, smallest keys first, until neededBytes fit
+template <typename T> void DBReader<T>::freeBlocks(size_t keyEnd, size_t neededBytes) {
+    for (std::map<size_t, BatchReader::ReadRequest>::iterator cached = cachedBlocks.begin();
+         cached != cachedBlocks.end() && blockKeyOffsets[cached->first + 1] <= keyEnd && neededBytes > blockCacheBytes - cachedBlockBytes;) {
         free(cached->second.destination);
         decrementMemory(cached->second.bytesToRead);
         cachedBlockBytes -= cached->second.bytesToRead;
@@ -1615,7 +1617,7 @@ template <typename T> void DBReader<T>::releaseDataPages() {
     if (batchReader != NULL) {
         batchReader->waitAsyncRead();
         cacheBlocks(prefetchBuffer);
-        releaseBlocks(size);
+        freeBlocks(size, SIZE_MAX);
         free(loadedBuffer.buffer);
         decrementMemory(loadedBuffer.allocatedBytes);
         loadedBuffer = BufferInfo();
