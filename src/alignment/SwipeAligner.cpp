@@ -72,7 +72,7 @@ static inline void setLaneValue(simd_int *v, int lane, T value) {
 }
 
 SwipeAligner::SwipeAligner(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend)
-    : subMat(subMat), alphabetSize(subMat->alphabetSize), aaBiasCorrection(aaBiasCorrection), aaBiasCorrectionScale(aaBiasCorrectionScale),
+    : extendLaneRows(0), extendSlotRows(0), subMat(subMat), alphabetSize(subMat->alphabetSize), aaBiasCorrection(aaBiasCorrection), aaBiasCorrectionScale(aaBiasCorrectionScale),
       gapOpen(gapOpen), gapExtend(gapExtend), queryLength(0), capacity(0), rowBias8(NULL), rowBias16(NULL), rowBiasRev8(NULL),
       rowBiasRev16(NULL), rowSub16(NULL), rowSubRev16(NULL), rowIndex(NULL), hColumn(NULL), eColumn(NULL), rowMask(NULL), ring(NULL), ringCapacity(0), bandH(NULL), bandF(NULL), bandCapacity(0),
       trace(NULL), traceCapacity(0) {
@@ -792,4 +792,377 @@ void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets
         bandJobs.push_back(job);
     }
     runBanded(bandJobs, doTrace, targets, targetLengths, bandWidths, aligns, backtraces, minScores);
+}
+
+
+// a lane stops after as many rows in a row below the X-drop as BlockAligner takes (two steps of eight)
+static const int SWIPE_XDROP_ROWS = 16;
+// the scores of a lane whose best score passes this go down by it, so that 16 bit lanes extend any length
+static const int SWIPE_REBASE_SCORE = 16384;
+
+void SwipeAligner::extendBand(const ExtendJob *jobs, size_t jobCount, bool backward, int xDrop, const unsigned char *const *targets,
+                              const int *targetLengths, s_align *aligns, std::string *backtraces, bool *growLefts, bool *growRights) {
+    typedef SwipeLanes<int16_t> V;
+    const int lanes = V::COUNT;
+    const int Lq = queryLength;
+    const int width = jobs[0].left + jobs[0].right + 1;
+    int ringSize = 1;
+    while (ringSize < width + 1) {
+        ringSize *= 2;
+    }
+    const int ringMask = ringSize - 1;
+    if (static_cast<size_t>(3 * ringSize) > ringCapacity) {
+        free(ring);
+        ringCapacity = 3 * ringSize;
+        ring = malloc_simd_int(ringCapacity * sizeof(simd_int));
+    }
+    simd_int *ringLo = ring;
+    simd_int *ringHi = ring + ringSize;
+    simd_int *ringValid = ring + 2 * ringSize;
+    if (static_cast<size_t>(width) + 1 > bandCapacity) {
+        free(bandH);
+        free(bandF);
+        bandCapacity = width + 1;
+        bandH = malloc_simd_int(bandCapacity * sizeof(simd_int));
+        bandF = malloc_simd_int(bandCapacity * sizeof(simd_int));
+    }
+    simd_int *hRow = bandH;
+    simd_int *fRow = bandF;
+    const unsigned char *rowLetters = backward ? queryRev.data() : query.data();
+    const simd_int *rowBias = backward ? rowBiasRev16 : rowBias16;
+    const simd_int vNeg = V::set(SHRT_MIN);
+    const simd_int vZero = simdi_setzero();
+    const simd_int vGapO = V::set(-gapOpen);
+    const simd_int vGapE = V::set(-gapExtend);
+    const simd_int vXDrop = V::set(-xDrop);
+    const simd_int vOne = V::set(1);
+    const simd_int vTwo = V::set(2);
+    const simd_int vThree = V::set(3);
+    const simd_int vFour = V::set(4);
+    const simd_int vEight = V::set(8);
+    const simd_int vDropRows = V::set(SWIPE_XDROP_ROWS - 1);
+    const simd_int vRebaseMin = V::set(SWIPE_REBASE_SCORE - 1);
+    const simd_int vRebase = V::set(-SWIPE_REBASE_SCORE);
+    for (int k = 0; k <= width; k++) {
+        hRow[k] = vNeg;
+        fRow[k] = vNeg;
+    }
+
+    int offsets[SWIPE_MAX_LANES];
+    int lengths[SWIPE_MAX_LANES];
+    const unsigned char *letters[SWIPE_MAX_LANES];
+    bool done[SWIPE_MAX_LANES];
+    int bests[SWIPE_MAX_LANES];
+    int bestRows[SWIPE_MAX_LANES];
+    int bestColumns[SWIPE_MAX_LANES];
+    int shifts[SWIPE_MAX_LANES];
+    int rowLo = INT_MAX;
+    for (int l = 0; l < lanes; l++) {
+        done[l] = (static_cast<size_t>(l) >= jobCount);
+        offsets[l] = 0;
+        lengths[l] = 0;
+        if (done[l]) {
+            continue;
+        }
+        const ExtendJob &job = jobs[l];
+        offsets[l] = job.seedColumn - job.seedRow - job.left;
+        lengths[l] = targetLengths[job.id];
+        letters[l] = targets[job.id];
+        bests[l] = SHRT_MIN;
+        bestRows[l] = job.seedRow;
+        bestColumns[l] = job.left;
+        shifts[l] = 0;
+        rowLo = std::min(rowLo, job.seedRow);
+    }
+
+    unsigned char slotLetters[SWIPE_MAX_LANES];
+    int16_t slotValid[SWIPE_MAX_LANES];
+    const auto fillSlot = [&](int m) {
+        for (int l = 0; l < lanes; l++) {
+            slotLetters[l] = 0;
+            slotValid[l] = 0;
+            if (static_cast<size_t>(l) >= jobCount) {
+                continue;
+            }
+            const int j = m + offsets[l];
+            if (j >= jobs[l].seedColumn && j < lengths[l]) {
+                slotLetters[l] = backward ? letters[l][lengths[l] - 1 - j] : letters[l][j];
+                slotValid[l] = -1;
+            }
+        }
+        const int slot = m & ringMask;
+        laneIndices<int16_t>(slotLetters, ringLo[slot], ringHi[slot]);
+        ringValid[slot] = simdi_loadu(reinterpret_cast<const simd_int *>(slotValid));
+    };
+
+    // the 4 bit trace codes of 4 neighbouring cells share a lane
+    const int traceWidth = (width + 3) / 4;
+    int16_t active[SWIPE_MAX_LANES];
+    int16_t rowMax[SWIPE_MAX_LANES];
+    int16_t rowPos[SWIPE_MAX_LANES];
+    int16_t laneFlags[SWIPE_MAX_LANES];
+    simd_int vBest = vNeg;
+    simd_int vDropped = vZero;
+    simd_int vEdgeLeft = vZero;
+    simd_int vEdgeRight = vZero;
+    int fillEnd = rowLo;
+    for (int r = rowLo; r < Lq; r++) {
+        int kBegin = INT_MAX;
+        int kEnd = 0;
+        int activeCount = 0;
+        bool running = false;
+        for (int l = 0; l < lanes; l++) {
+            active[l] = 0;
+            if (done[l]) {
+                continue;
+            }
+            running = true;
+            if (r < jobs[l].seedRow) {
+                continue;
+            }
+            const int lo = std::max(0, jobs[l].seedColumn - r - offsets[l]);
+            const int hi = std::min(width, lengths[l] - r - offsets[l]);
+            if (lo >= hi) {
+                done[l] = true;
+                continue;
+            }
+            active[l] = -1;
+            activeCount++;
+            kBegin = std::min(kBegin, lo);
+            kEnd = std::max(kEnd, hi);
+            if (r == jobs[l].seedRow) {
+                setLaneValue<int16_t>(hRow + jobs[l].left, l, 0);
+            }
+        }
+        if (running == false) {
+            break;
+        }
+        if (activeCount == 0) {
+            continue;
+        }
+        extendLaneRows += activeCount;
+        extendSlotRows += lanes;
+        const size_t cells = static_cast<size_t>(r - rowLo + 1) * traceWidth;
+        if (cells > traceCapacity) {
+            const size_t grownCapacity = std::max(cells, 2 * traceCapacity);
+            simd_int *grown = malloc_simd_int(grownCapacity * sizeof(simd_int));
+            if (trace != NULL) {
+                memcpy(grown, trace, traceCapacity * sizeof(simd_int));
+                free(trace);
+            }
+            trace = grown;
+            traceCapacity = grownCapacity;
+        }
+        // a lane starting later can start left of the others in the band, only the slots left of the row are never read again
+        fillEnd = std::max(fillEnd, r);
+        while (fillEnd < r + kEnd) {
+            fillSlot(fillEnd++);
+        }
+        const simd_int vActive = simdi_loadu(reinterpret_cast<const simd_int *>(active));
+        const simd_int tLo = scoreLo16[rowLetters[r]];
+        const simd_int tHi = scoreHi16[rowLetters[r]];
+        const simd_int rb = rowBias[r];
+        simd_int *traceRow = trace + static_cast<size_t>(r - rowLo) * traceWidth;
+        simd_int codes = vZero;
+        simd_int vHl = vNeg;
+        simd_int vE = vNeg;
+        simd_int vRowMax = vNeg;
+        simd_int vPos = vZero;
+        simd_int vK = V::set(kBegin);
+        for (int k = kBegin; k < kEnd; k++) {
+            const int slot = (r + k) & ringMask;
+            const simd_int s = simdi16_add(laneScores(tLo, tHi, ringLo[slot], ringHi[slot]), rb);
+            const simd_int diag = simdi16_adds(hRow[k], s);
+            // H before E of the left cell gives E (E - gap open is below E - gap extend), so E stays off the H chain
+            const simd_int eo = simdi16_adds(vHl, vGapO);
+            const simd_int ee = simdi16_adds(vE, vGapE);
+            vE = simdi16_max(eo, ee);
+            const simd_int fo = simdi16_adds(hRow[k + 1], vGapO);
+            const simd_int fe = simdi16_adds(fRow[k + 1], vGapE);
+            const simd_int f = simdi16_max(fo, fe);
+            const simd_int valid = simdi_and(ringValid[slot], vActive);
+            const simd_int hp = simdi8_blend(vNeg, simdi16_max(diag, f), valid);
+            const simd_int h = simdi8_blend(vNeg, simdi16_max(hp, vE), valid);
+            // H from 1 (diagonal), 2 (E) or 3 (F), 4 if E extends and 8 if F extends; ties go to the gap and to its opening, as in BlockAligner
+            simd_int code = simdi8_blend(vOne, vThree, simdi16_eq(h, f));
+            code = simdi8_blend(code, vTwo, simdi16_eq(h, vE));
+            code = simdi_or(code, simdi_and(simdi16_gt(ee, eo), vFour));
+            code = simdi_or(code, simdi_and(simdi16_gt(fe, fo), vEight));
+            codes = simdi_or(simdi16_slli(codes, 4), code);
+            if (k % 4 == 3) {
+                traceRow[k / 4] = codes;
+            }
+            hRow[k] = h;
+            fRow[k] = simdi8_blend(vNeg, f, valid);
+            vHl = hp;
+            vPos = simdi8_blend(vK, vPos, simdi16_gt(vRowMax, h));
+            vRowMax = simdi16_max(vRowMax, h);
+            vK = simdi16_add(vK, vOne);
+        }
+        if (kEnd % 4 != 0) {
+            for (int k = kEnd; k % 4 != 0; k++) {
+                codes = simdi16_slli(codes, 4);
+            }
+            traceRow[kEnd / 4] = codes;
+        }
+        // ties go to the larger target position, then the later row, as in BlockAligner
+        if (simdi8_movemask(simdi_andnot(simdi16_gt(vBest, vRowMax), vActive)) != 0) {
+            simdi_storeu(reinterpret_cast<simd_int *>(rowMax), vRowMax);
+            simdi_storeu(reinterpret_cast<simd_int *>(rowPos), vPos);
+            for (int l = 0; l < lanes; l++) {
+                if (active[l] && (rowMax[l] > bests[l] || (rowMax[l] == bests[l] && r + rowPos[l] >= bestRows[l] + bestColumns[l]))) {
+                    bests[l] = rowMax[l];
+                    bestRows[l] = r;
+                    bestColumns[l] = rowPos[l];
+                }
+            }
+            vBest = simdi16_max(vBest, vRowMax);
+        }
+        // a side of the band grows if its edge is within the X-drop of the best score
+        const simd_int vAlive = simdi16_adds(vBest, vXDrop);
+        vEdgeLeft = simdi_or(vEdgeLeft, simdi_andnot(simdi16_gt(vAlive, hRow[0]), vActive));
+        vEdgeRight = simdi_or(vEdgeRight, simdi_andnot(simdi16_gt(vAlive, hRow[width - 1]), vActive));
+        vDropped = simdi_and(simdi16_add(vDropped, vOne), simdi_and(simdi16_gt(vAlive, vRowMax), vActive));
+        const simd_int stop = simdi16_gt(vDropped, vDropRows);
+        if (simdi8_movemask(stop) != 0) {
+            simdi_storeu(reinterpret_cast<simd_int *>(laneFlags), stop);
+            for (int l = 0; l < lanes; l++) {
+                done[l] = done[l] || laneFlags[l] != 0;
+            }
+        }
+        const simd_int rebase = simdi16_gt(vBest, vRebaseMin);
+        if (simdi8_movemask(rebase) != 0) {
+            const simd_int vShift = simdi_and(rebase, vRebase);
+            for (int k = 0; k <= width; k++) {
+                hRow[k] = simdi16_adds(hRow[k], vShift);
+                fRow[k] = simdi16_adds(fRow[k], vShift);
+            }
+            vBest = simdi16_adds(vBest, vShift);
+            simdi_storeu(reinterpret_cast<simd_int *>(laneFlags), rebase);
+            for (int l = 0; l < lanes; l++) {
+                if (laneFlags[l] != 0) {
+                    bests[l] -= SWIPE_REBASE_SCORE;
+                    shifts[l] += SWIPE_REBASE_SCORE;
+                }
+            }
+        }
+    }
+
+    int16_t edgeLefts[SWIPE_MAX_LANES];
+    int16_t edgeRights[SWIPE_MAX_LANES];
+    simdi_storeu(reinterpret_cast<simd_int *>(edgeLefts), vEdgeLeft);
+    simdi_storeu(reinterpret_cast<simd_int *>(edgeRights), vEdgeRight);
+    for (size_t l = 0; l < jobCount; l++) {
+        const ExtendJob &job = jobs[l];
+        s_align &a = aligns[job.id];
+        growLefts[l] = (edgeLefts[l] != 0);
+        growRights[l] = (edgeRights[l] != 0);
+        const int row = bestRows[l];
+        const int column = row + offsets[l] + bestColumns[l];
+        a.score1 = std::max(0, bests[l] + shifts[l]);
+        if (backward) {
+            a.qStartPos1 = Lq - 1 - row;
+            a.dbStartPos1 = lengths[l] - 1 - column;
+        } else {
+            a.qEndPos1 = row;
+            a.dbEndPos1 = column;
+        }
+        if (growLefts[l] || growRights[l] || a.score1 == 0) {
+            continue;
+        }
+        std::string &backtrace = backtraces[job.id];
+        backtrace.clear();
+        int i = row;
+        int k = bestColumns[l];
+        int state = 0;
+        while (true) {
+            const int laneCodes = static_cast<uint16_t>(laneValue<int16_t>(trace + static_cast<size_t>(i - rowLo) * traceWidth + k / 4, l));
+            const int code = (laneCodes >> (4 * (3 - k % 4))) & 15;
+            if (state == 0) {
+                if ((code & 3) == 1) {
+                    backtrace.push_back('M');
+                    if (i == job.seedRow && k == job.left) {
+                        break;
+                    }
+                    i--;
+                    continue;
+                }
+                state = ((code & 3) == 2) ? 1 : 2;
+            }
+            if (state == 1) {
+                backtrace.push_back('D');
+                state = (code & 4) ? 1 : 0;
+                k--;
+            } else {
+                backtrace.push_back('I');
+                state = (code & 8) ? 2 : 0;
+                i--;
+                k++;
+            }
+        }
+        // a backward extension walks from its start to the seed, which is already the alignment order
+        if (backward == false) {
+            std::reverse(backtrace.begin(), backtrace.end());
+        }
+    }
+}
+
+void SwipeAligner::extendBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *seedQueries, const int *seedTargets,
+                                bool backward, int xDrop, int bandSide, s_align *aligns, std::string *backtraces) {
+    const int Lq = queryLength;
+    // a job whose trace may not fit or whose band column passes 16 bit goes back with word 2, as in alignBand
+    const auto queue = [&](std::vector<ExtendJob> &jobs, const ExtendJob &job) {
+        const int width = job.left + job.right + 1;
+        if (width > SHRT_MAX || static_cast<size_t>(Lq - job.seedRow) * ((width + 3) / 4) > SWIPE_MAX_TRACE_CELLS) {
+            aligns[job.id].word = 2;
+            return;
+        }
+        jobs.push_back(job);
+    };
+    extendJobs.clear();
+    for (size_t i = 0; i < count; i++) {
+        aligns[i].word = 0;
+        ExtendJob job;
+        job.id = i;
+        job.seedRow = backward ? Lq - 1 - seedQueries[i] : seedQueries[i];
+        job.seedColumn = backward ? targetLengths[i] - 1 - seedTargets[i] : seedTargets[i];
+        job.left = bandSide;
+        job.right = bandSide;
+        queue(extendJobs, job);
+    }
+    std::vector<ExtendJob> &pending = extendPending;
+    bool growLefts[SWIPE_MAX_LANES];
+    bool growRights[SWIPE_MAX_LANES];
+    const size_t lanes = SwipeLanes<int16_t>::COUNT;
+    while (extendJobs.empty() == false) {
+        // the lanes of a batch share the band width and start on close rows
+        std::sort(extendJobs.begin(), extendJobs.end(), [](const ExtendJob &a, const ExtendJob &b) {
+            if (a.left + a.right != b.left + b.right) {
+                return a.left + a.right < b.left + b.right;
+            }
+            if (a.seedRow != b.seedRow) {
+                return a.seedRow < b.seedRow;
+            }
+            return a.id < b.id;
+        });
+        pending.clear();
+        for (size_t start = 0; start < extendJobs.size(); ) {
+            const int width = extendJobs[start].left + extendJobs[start].right;
+            size_t end = start + 1;
+            while (end < extendJobs.size() && end - start < lanes && extendJobs[end].left + extendJobs[end].right == width) {
+                end++;
+            }
+            extendBand(&extendJobs[start], end - start, backward, xDrop, targets, targetLengths, aligns, backtraces, growLefts, growRights);
+            for (size_t l = 0; l < end - start; l++) {
+                if (growLefts[l] || growRights[l]) {
+                    ExtendJob job = extendJobs[start + l];
+                    job.left *= (growLefts[l] ? 2 : 1);
+                    job.right *= (growRights[l] ? 2 : 1);
+                    queue(pending, job);
+                }
+            }
+            start = end;
+        }
+        extendJobs.swap(pending);
+    }
 }

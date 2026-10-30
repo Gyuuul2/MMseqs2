@@ -28,7 +28,19 @@ public:
     void alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals, int *bandWidths,
                      s_align *aligns, std::string *backtraces, const int *columnEnds, const int *minScores);
 
+    // banded X-drop extension with backtrace from the seed to the right, or to the left if backward, as BlockAligner::bandedalign
+    void extendBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *seedQueries, const int *seedTargets,
+                      bool backward, int xDrop, int bandSide, s_align *aligns, std::string *backtraces);
+
+    int cellScore(int queryPos, unsigned char targetLetter) const {
+        return subMat->subMatrix[query[queryPos]][targetLetter] + bias[queryPos];
+    }
+
     static const int MIN_BAND_WIDTH = 16;
+
+    // extendBanded: the lane rows that extended a target and all lane rows of its batches
+    size_t extendLaneRows;
+    size_t extendSlotRows;
 
 private:
     struct BandJob {
@@ -40,6 +52,17 @@ private:
         int columnBegin;
         int columnEnd;
     };
+
+    struct ExtendJob {
+        size_t id;
+        int seedRow;
+        int seedColumn;
+        int left;
+        int right;
+    };
+
+    void extendBand(const ExtendJob *jobs, size_t jobCount, bool backward, int xDrop, const unsigned char *const *targets, const int *targetLengths,
+                    s_align *aligns, std::string *backtraces, bool *growLefts, bool *growRights);
 
     template <typename T, bool Reverse>
     void alignFull(const std::vector<size_t> &jobs, const unsigned char *const *targets, const int *targetLengths, s_align *aligns);
@@ -95,6 +118,8 @@ private:
 
     std::vector<size_t> jobBuffer;
     std::vector<BandJob> bandJobs;
+    std::vector<ExtendJob> extendJobs;
+    std::vector<ExtendJob> extendPending;
     std::vector<int> bestScores;
     std::vector<int> bestRows;
     std::vector<int> bestColumns;
