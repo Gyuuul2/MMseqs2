@@ -85,8 +85,8 @@ void MMseqsNode::publishFile(const std::string &file, const std::string &content
     }
 }
 
-void MMseqsNode::sleepBeforePoll(unsigned int polls) {
-    usleep(10000u << std::min(polls, 4u));
+void MMseqsNode::sleepBeforePoll(unsigned int polls, unsigned int maxShift) {
+    usleep(10000u << std::min(polls, maxShift));
 }
 
 std::string MMseqsNode::waitForFile(const std::string &file) {
@@ -187,6 +187,35 @@ void MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
         Debug(Debug::ERROR) << "Cannot close " << log << "\n";
         EXIT(EXIT_FAILURE);
     }
+}
+
+void MMseqsNode::publishExchangeFlush(FILE *file, const std::string &fileName, size_t bytes, const std::string &indexFile, const std::vector<uint64_t> &line) {
+    if (fflush(file) != 0 || fsync(fileno(file)) != 0 || fclose(file) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    sentExchangeBytes += bytes;
+    sentOtherNodeExchangeBytes += bytes;
+    FILE *handle = FileUtil::openFileOrDie(indexFile.c_str(), "a", true);
+    if (fwrite(line.data(), sizeof(uint64_t), line.size(), handle) != line.size() || fflush(handle) != 0 || fsync(fileno(handle)) != 0 || fclose(handle) != 0) {
+        Debug(Debug::ERROR) << "Cannot write " << indexFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
+bool MMseqsNode::readExchangeFlush(const std::string &indexFile, size_t flush, std::vector<uint64_t> &line) {
+    const size_t lineBytes = line.size() * sizeof(uint64_t);
+    const int fd = open(indexFile.c_str(), O_RDONLY);
+    if (fd < 0) {
+        Debug(Debug::ERROR) << "Cannot open " << indexFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    const ssize_t readBytes = pread(fd, line.data(), lineBytes, flush * lineBytes);
+    if (close(fd) != 0 || readBytes < 0) {
+        Debug(Debug::ERROR) << "Cannot read " << indexFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return static_cast<size_t>(readBytes) == lineBytes && line[0] == flush;
 }
 
 std::string MMseqsNode::barrier(const std::string &file, const std::string &content) {
