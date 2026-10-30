@@ -1058,6 +1058,46 @@ std::vector<size_t> MMseqsNode::getClusterKeyOffsets(const std::string &file, co
     return offsets;
 }
 
+void MMseqsNode::readClusterKeys(const std::string &clu, const std::vector<size_t> &cluKeyOffsets, size_t keyBegin, size_t keyEnd, std::vector<DBKeyType> &keys) {
+    keys.clear();
+    // (key, offset) cells in key order
+    std::vector<uint64_t> cells(1024 * 1024 / sizeof(uint64_t));
+    for (size_t node = 0; node < count; node++) {
+        const size_t from = std::max(keyBegin, cluKeyOffsets[node]);
+        const size_t to = std::min(keyEnd, cluKeyOffsets[node + 1]);
+        if (from >= to) {
+            continue;
+        }
+        const std::string cluData = clu + "." + SSTR(node);
+        const std::string cluIndex = clu + ".index." + SSTR(node);
+        DBReader<DBKeyType> cluDb(cluData.c_str(), cluIndex.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
+        cluDb.open(DBReader<DBKeyType>::NOSORT);
+        const size_t entryBegin = cluDb.findEntryByKey(from);
+        const size_t entryEnd = cluDb.findEntryByKey(to);
+        cluDb.close();
+        FILE *cluIndexFile = FileUtil::openFileOrDie(cluIndex.c_str(), "r", true);
+        if (fseek(cluIndexFile, entryBegin * 2 * sizeof(uint64_t), SEEK_SET) != 0) {
+            Debug(Debug::ERROR) << "Cannot read " << cluIndex << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        for (size_t entry = entryBegin; entry < entryEnd;) {
+            const size_t cellCount = fread(cells.data(), 2 * sizeof(uint64_t), std::min(cells.size() / 2, entryEnd - entry), cluIndexFile);
+            if (cellCount == 0) {
+                Debug(Debug::ERROR) << "Cannot read " << cluIndex << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            for (size_t i = 0; i < cellCount; i++) {
+                keys.push_back(cells[2 * i]);
+            }
+            entry += cellCount;
+        }
+        if (fclose(cluIndexFile) != 0) {
+            Debug(Debug::ERROR) << "Cannot close " << cluIndex << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+}
+
 void MMseqsNode::writeClusterIndexEntry(FILE *file, const std::string &fileName, DBKeyType key, size_t offset) {
     const uint64_t cell[2] = { static_cast<uint64_t>(key), static_cast<uint64_t>(offset) };
     if (fwrite(cell, sizeof(uint64_t), 2, file) != 2) {
