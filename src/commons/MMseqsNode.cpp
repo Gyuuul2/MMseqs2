@@ -366,7 +366,7 @@ void MMseqsNode::addExchangeFlush(std::string &indexData, size_t &writtenBytes, 
 }
 
 std::string MMseqsNode::closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData) {
-    if (fflush(file) != 0 || fsync(fileno(file)) != 0 || fclose(file) != 0) {
+    if (fclose(file) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
@@ -409,6 +409,56 @@ static size_t getUnreadBytes(const MMseqsNode::ExchangeBlock &block) {
     return block.end - block.pos + block.partsBytes;
 }
 
+static const char *getBlockData(const MMseqsNode::ExchangeBlock &block) {
+    return (block.ownRecords != NULL) ? block.ownRecords : block.buffer.data();
+}
+
+// buffers at least bytes of the unread records of a block, fewer only at its end, reading up to bufferSize; the records that this node sent to itself stay where they are
+static void bufferExchangeBlock(MMseqsNode::ExchangeBlock &block, size_t bytes, size_t bufferSize, const std::string &prefix) {
+    if (block.ownRecords != NULL) {
+        block.bufferEnd = std::max(block.bufferEnd, std::min(block.end, block.bufferPos + std::max(bytes, bufferSize)));
+        block.pos = block.bufferEnd;
+        return;
+    }
+    if (block.bufferEnd - block.bufferPos >= bytes || getUnreadBytes(block) == 0) {
+        return;
+    }
+    memmove(block.buffer.data(), block.buffer.data() + block.bufferPos, block.bufferEnd - block.bufferPos);
+    block.bufferEnd -= block.bufferPos;
+    block.recordEnd -= std::min(block.recordEnd, block.bufferPos);
+    block.lastRecord -= std::min(block.lastRecord, block.bufferPos);
+    block.bufferPos = 0;
+    const size_t blockBufferSize = std::min(std::max(bytes, bufferSize), block.bufferEnd + getUnreadBytes(block));
+    if (block.buffer.size() < blockBufferSize) {
+        block.buffer.resize(blockBufferSize);
+    }
+    // the parts of a block follow each other in its buffer, and a flush holds whole records
+    while (block.bufferEnd < block.buffer.size() && getUnreadBytes(block) > 0) {
+        if (block.pos == block.end) {
+            block.pos = block.parts[block.nextPart].first;
+            block.end = block.parts[block.nextPart].second;
+            block.partsBytes -= block.end - block.pos;
+            block.nextPart++;
+        }
+        const size_t readBytes = std::min(block.buffer.size() - block.bufferEnd, block.end - block.pos);
+        FileUtil::preadAll(fileno(block.file), prefix.c_str(), block.buffer.data() + block.bufferEnd, readBytes, block.pos);
+        block.pos += readBytes;
+        block.bufferEnd += readBytes;
+    }
+}
+
+// frees the records that this node sent to itself once a block has passed them all
+static void releaseOwnRecords(MMseqsNode::ExchangeBlock &block) {
+    if (block.ownRecords != NULL && block.bufferPos == block.end) {
+        free(block.ownRecords);
+        block.ownRecords = NULL;
+        block.bufferPos = 0;
+        block.bufferEnd = 0;
+        block.recordEnd = 0;
+        block.lastRecord = 0;
+    }
+}
+
 size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t (*recordSize)(const char *, size_t),
                                      bool (*compare)(const ClusterPair &, const ClusterPair &), const ClusterPair &last,
                                      std::vector<char> &records, std::vector<size_t> *recordOffsets, const std::string &prefix) {
@@ -420,41 +470,17 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
         if (getUnreadBytes(block) == 0 || (block.bufferEnd - block.bufferPos >= bufferSize / 2 && block.recordEnd > block.bufferPos)) {
             continue;
         }
-        memmove(block.buffer.data(), block.buffer.data() + block.bufferPos, block.bufferEnd - block.bufferPos);
-        block.bufferEnd -= block.bufferPos;
-        block.recordEnd -= block.bufferPos;
-        block.lastRecord -= block.bufferPos;
-        block.bufferPos = 0;
         // a record larger than the buffer doubles it
-        do {
-            if (block.bufferEnd == block.buffer.size()) {
-                block.buffer.resize(std::min(std::max(bufferSize, 2 * block.buffer.size()), block.bufferEnd + getUnreadBytes(block)));
-            }
-            // the parts of a block follow each other in its buffer, and a flush holds whole records
-            while (block.bufferEnd < block.buffer.size() && getUnreadBytes(block) > 0) {
-                if (block.pos == block.end) {
-                    block.pos = block.parts[block.nextPart].first;
-                    block.end = block.parts[block.nextPart].second;
-                    block.partsBytes -= block.end - block.pos;
-                    block.nextPart++;
-                }
-                const size_t readBytes = std::min(block.buffer.size() - block.bufferEnd, block.end - block.pos);
-                if (block.ownRecords != NULL) {
-                    memcpy(block.buffer.data() + block.bufferEnd, block.ownRecords + block.pos, readBytes);
-                } else {
-                    FileUtil::preadAll(fileno(block.file), prefix.c_str(), block.buffer.data() + block.bufferEnd, readBytes, block.pos);
-                }
-                block.pos += readBytes;
-                block.bufferEnd += readBytes;
-            }
-            if (block.ownRecords != NULL && getUnreadBytes(block) == 0) {
-                free(block.ownRecords);
-                block.ownRecords = NULL;
-            }
-            for (size_t size; (size = recordSize(block.buffer.data() + block.recordEnd, block.bufferEnd - block.recordEnd)) > 0; block.recordEnd += size) {
+        for (size_t bytes = bufferSize; ; bytes *= 2) {
+            bufferExchangeBlock(block, bytes, bytes, prefix);
+            const char *data = getBlockData(block);
+            for (size_t size; (size = recordSize(data + block.recordEnd, block.bufferEnd - block.recordEnd)) > 0; block.recordEnd += size) {
                 block.lastRecord = block.recordEnd;
             }
-        } while (block.recordEnd == 0 && getUnreadBytes(block) > 0);
+            if (block.recordEnd > block.bufferPos || getUnreadBytes(block) == 0) {
+                break;
+            }
+        }
         if (getUnreadBytes(block) == 0 && block.recordEnd != block.bufferEnd) {
             Debug(Debug::ERROR) << "Cannot read " << prefix << ": a record ends after its block\n";
             EXIT(EXIT_FAILURE);
@@ -465,7 +491,7 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
     for (size_t i = 0; i < blocks.size(); i++) {
         if (getUnreadBytes(blocks[i]) > 0) {
             ClusterPair blockLast;
-            memcpy(&blockLast, blocks[i].buffer.data() + blocks[i].lastRecord, sizeof(ClusterPair));
+            memcpy(&blockLast, getBlockData(blocks[i]) + blocks[i].lastRecord, sizeof(ClusterPair));
             if (compare(blockLast, rangeLast)) {
                 rangeLast = blockLast;
             }
@@ -477,10 +503,11 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < blocks.size(); i++) {
         const ExchangeBlock &block = blocks[i];
+        const char *data = getBlockData(block);
         size_t pos = block.bufferPos;
         size_t recordCount = 0;
-        for (ClusterPair pair; pos < block.recordEnd; pos += recordSize(block.buffer.data() + pos, block.recordEnd - pos), recordCount++) {
-            memcpy(&pair, block.buffer.data() + pos, sizeof(ClusterPair));
+        for (ClusterPair pair; pos < block.recordEnd; pos += recordSize(data + pos, block.recordEnd - pos), recordCount++) {
+            memcpy(&pair, data + pos, sizeof(ClusterPair));
             if (compare(rangeLast, pair)) {
                 break;
             }
@@ -503,7 +530,7 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < blocks.size(); i++) {
         ExchangeBlock &block = blocks[i];
-        memcpy(records.data() + blockByteOffsets[i], block.buffer.data() + block.bufferPos, rangeEnds[i] - block.bufferPos);
+        memcpy(records.data() + blockByteOffsets[i], getBlockData(block) + block.bufferPos, rangeEnds[i] - block.bufferPos);
         if (recordOffsets != NULL) {
             size_t pos = blockByteOffsets[i];
             for (size_t record = blockRecordOffsets[i]; record < blockRecordOffsets[i + 1]; record++) {
@@ -512,8 +539,49 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
             }
         }
         block.bufferPos = rangeEnds[i];
+        releaseOwnRecords(block);
     }
     return blockRecordOffsets.back();
+}
+
+size_t MMseqsNode::readExchangeSegments(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t maxSegmentSize, uint64_t fileType, size_t windowBegin, size_t windowEnd,
+                                        char *window, std::vector<std::pair<size_t, size_t> > &segments, const std::string &prefix) {
+    const size_t bufferSize = std::max(3 * sizeof(uint64_t) + maxSegmentSize, bufferMemory / std::max<size_t>(1, blocks.size()));
+    size_t nextOffset = SIZE_MAX;
+#pragma omp parallel reduction(min:nextOffset)
+    {
+        std::vector<std::pair<size_t, size_t> > threadSegments;
+#pragma omp for schedule(dynamic, 1) nowait
+        for (size_t i = 0; i < blocks.size(); i++) {
+            ExchangeBlock &block = blocks[i];
+            uint64_t segment[3];
+            for (;;) {
+                bufferExchangeBlock(block, sizeof(segment), bufferSize, prefix);
+                if (block.bufferEnd - block.bufferPos < sizeof(segment)) {
+                    break;
+                }
+                memcpy(segment, getBlockData(block) + block.bufferPos, sizeof(segment));
+                if (segment[0] != fileType || segment[1] >= windowEnd) {
+                    if (segment[0] == fileType) {
+                        nextOffset = std::min<size_t>(nextOffset, segment[1]);
+                    }
+                    break;
+                }
+                bufferExchangeBlock(block, sizeof(segment) + segment[2], bufferSize, prefix);
+                if (block.bufferEnd - block.bufferPos < sizeof(segment) + segment[2]) {
+                    Debug(Debug::ERROR) << "Cannot read " << prefix << ": a record ends after its block\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                memcpy(window + (segment[1] - windowBegin), getBlockData(block) + block.bufferPos + sizeof(segment), segment[2]);
+                threadSegments.push_back(std::make_pair(segment[1], segment[2]));
+                block.bufferPos += sizeof(segment) + segment[2];
+            }
+            releaseOwnRecords(block);
+        }
+#pragma omp critical
+        segments.insert(segments.end(), threadSegments.begin(), threadSegments.end());
+    }
+    return nextOffset;
 }
 
 void MMseqsNode::closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix) {

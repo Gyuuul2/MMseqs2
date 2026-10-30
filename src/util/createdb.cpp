@@ -18,7 +18,6 @@
 #include <zstd.h>
 #include "zstd/contrib/seekable_format/zstd_seekable.h"
 #include <unistd.h>
-#include <fcntl.h>
 #include <sys/stat.h>
 #include <algorithm>
 #include <cstring>
@@ -373,6 +372,16 @@ struct InputPiece {
     size_t end;
 };
 
+// a segment of a data file goes to the node of the file as { data file type, offset, size } then its bytes
+static const size_t SEGMENT_HEADER_SIZE = 3 * sizeof(uint64_t);
+// the most bytes of a segment, so the buffers of the exchange blocks stay small
+static const size_t MAX_SEGMENT_SIZE = 64 * 1024;
+
+// the most bytes of the segment headers of a flush of entryCount entries with dataSize bytes and lengths below lengthCount
+static size_t getSegmentHeadersSize(size_t entryCount, size_t lengthCount, size_t dataSize) {
+    return (DATA_FILE_TYPES * (std::min(entryCount, lengthCount) + 1) + dataSize / MAX_SEGMENT_SIZE) * SEGMENT_HEADER_SIZE;
+}
+
 static std::vector<LengthBin> makeLengthBins(const std::vector<size_t> &sequenceCount, const std::vector<size_t> &headerSize) {
     std::vector<LengthBin> histogram;
     for (size_t length = sequenceCount.size(); length-- > 0; ) {
@@ -429,45 +438,102 @@ static void splitStarts(const std::vector<LengthBin> &starts, std::vector<std::v
     }
 }
 
-static void flushBufferToDisk(const std::vector<int> &dataFileFds, const std::string &dataFile, const char *buffer, size_t bufferPos, char *sortedBuffer, std::vector<LengthBin> &lengthToBin) {
+// copies data behind the written bytes of the segments that start at segments, skipping the header of every segment
+static void copyToSegments(char *segments, size_t &written, const char *data, size_t size) {
+    while (size > 0) {
+        const size_t bytes = std::min(size, MAX_SEGMENT_SIZE - written % MAX_SEGMENT_SIZE);
+        memcpy(segments + (written / MAX_SEGMENT_SIZE + 1) * SEGMENT_HEADER_SIZE + written, data, bytes);
+        written += bytes;
+        data += bytes;
+        size -= bytes;
+    }
+}
+
+// sorts the entries of buffer into segments of the data files in sortedBuffer; writes those of this node to its data files and appends the others to the exchange file with their index line
+static void flushBufferToExchange(const char *buffer, size_t bufferPos, char *sortedBuffer, std::vector<LengthBin> &lengthToBin, FILE *const *dataFiles, const std::string *dataFileNames,
+                                  FILE *exchangeFile, const std::string &exchangeFileName, std::string &indexData, size_t &exchangeBytes) {
     const size_t lengthCount = lengthToBin.size();
-    std::vector<size_t> startPos(DATA_FILE_TYPES * lengthCount + 1, 0);
+    std::vector<size_t> binSizes(DATA_FILE_TYPES * lengthCount, 0);
     for (size_t pos = 0; pos < bufferPos; ) {
         const size_t seqSize = strlen(buffer + pos) + 1;
         const size_t hdrSize = strlen(buffer + pos + seqSize) + 1;
-        startPos[SEQUENCE_DATA * lengthCount + seqSize - 1] += seqSize;
-        startPos[HEADER_DATA * lengthCount + seqSize - 1] += hdrSize;
-        startPos[HEADER_OFFSETS * lengthCount + seqSize - 1] += sizeof(uint64_t);
+        binSizes[SEQUENCE_DATA * lengthCount + seqSize - 2] += seqSize;
+        binSizes[HEADER_DATA * lengthCount + seqSize - 2] += hdrSize;
+        binSizes[HEADER_OFFSETS * lengthCount + seqSize - 2] += sizeof(uint64_t);
         pos += seqSize + hdrSize;
     }
-    for (size_t i = 1; i < startPos.size(); i++) {
-        startPos[i] += startPos[i - 1];
-    }
-    std::vector<size_t> writePos(startPos.begin(), startPos.end() - 1);
-    for (size_t pos = 0; pos < bufferPos; ) {
-        const size_t seqSize = strlen(buffer + pos) + 1;
-        const size_t hdrSize = strlen(buffer + pos + seqSize) + 1;
-        const size_t length = seqSize - 2;
-        memcpy(sortedBuffer + writePos[SEQUENCE_DATA * lengthCount + length], buffer + pos, seqSize);
-        writePos[SEQUENCE_DATA * lengthCount + length] += seqSize;
-        const uint64_t headerOffset = lengthToBin[length].headerOffset + (writePos[HEADER_DATA * lengthCount + length] - startPos[HEADER_DATA * lengthCount + length]);
-        memcpy(sortedBuffer + writePos[HEADER_OFFSETS * lengthCount + length], &headerOffset, sizeof(uint64_t));
-        writePos[HEADER_OFFSETS * lengthCount + length] += sizeof(uint64_t);
-        memcpy(sortedBuffer + writePos[HEADER_DATA * lengthCount + length], buffer + pos + seqSize, hdrSize);
-        writePos[HEADER_DATA * lengthCount + length] += hdrSize;
-        pos += seqSize + hdrSize;
-    }
-    for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
-        for (size_t length = 0; length < lengthCount; length++) {
-            const size_t i = fileType * lengthCount + length;
-            LengthBin &bin = lengthToBin[length];
-            size_t &offset = (fileType == SEQUENCE_DATA) ? bin.offset : ((fileType == HEADER_DATA) ? bin.headerOffset : bin.headerIndexOffset);
-            const size_t size = startPos[i + 1] - startPos[i];
-            const size_t file = fileType * MMseqsNode::count + bin.file;
-            FileUtil::pwriteAll(dataFileFds[file], dataFile.c_str(), sortedBuffer + startPos[i], size, offset);
-            offset += size;
+    // the lengths of a data file follow each other, longer first; its segments are sorted by data file type and offset
+    std::vector<size_t> binStarts(DATA_FILE_TYPES * lengthCount, 0);
+    std::vector<size_t> nodeOffsets(MMseqsNode::count + 1, 0);
+    size_t node = 0;
+    size_t sortedPos = 0;
+    for (size_t lengthEnd = lengthCount; lengthEnd > 0; ) {
+        const size_t dataFile = lengthToBin[lengthEnd - 1].file;
+        size_t lengthBegin = lengthEnd - 1;
+        while (lengthBegin > 0 && (lengthToBin[lengthBegin - 1].sequenceCount == 0 || lengthToBin[lengthBegin - 1].file == dataFile)) {
+            lengthBegin--;
         }
+        for (; node <= dataFile; node++) {
+            nodeOffsets[node] = sortedPos;
+        }
+        for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
+            for (size_t length = lengthEnd; length-- > lengthBegin; ) {
+                const size_t bin = fileType * lengthCount + length;
+                const LengthBin &lengthBin = lengthToBin[length];
+                const size_t offset = (fileType == SEQUENCE_DATA) ? lengthBin.offset : ((fileType == HEADER_DATA) ? lengthBin.headerOffset : lengthBin.headerIndexOffset);
+                binStarts[bin] = sortedPos;
+                for (size_t segment = 0; segment * MAX_SEGMENT_SIZE < binSizes[bin]; segment++) {
+                    const uint64_t segmentHeader[3] = { fileType, offset + segment * MAX_SEGMENT_SIZE, std::min(MAX_SEGMENT_SIZE, binSizes[bin] - segment * MAX_SEGMENT_SIZE) };
+                    memcpy(sortedBuffer + sortedPos, segmentHeader, SEGMENT_HEADER_SIZE);
+                    sortedPos += SEGMENT_HEADER_SIZE + segmentHeader[2];
+                }
+            }
+        }
+        lengthEnd = lengthBegin;
     }
+    for (; node <= MMseqsNode::count; node++) {
+        nodeOffsets[node] = sortedPos;
+    }
+    std::vector<size_t> binWritten(DATA_FILE_TYPES * lengthCount, 0);
+    for (size_t pos = 0; pos < bufferPos; ) {
+        const size_t seqSize = strlen(buffer + pos) + 1;
+        const size_t hdrSize = strlen(buffer + pos + seqSize) + 1;
+        const size_t seqBin = SEQUENCE_DATA * lengthCount + seqSize - 2;
+        const size_t hdrBin = HEADER_DATA * lengthCount + seqSize - 2;
+        const size_t offsetBin = HEADER_OFFSETS * lengthCount + seqSize - 2;
+        const uint64_t headerOffset = lengthToBin[seqSize - 2].headerOffset + binWritten[hdrBin];
+        copyToSegments(sortedBuffer + binStarts[seqBin], binWritten[seqBin], buffer + pos, seqSize);
+        copyToSegments(sortedBuffer + binStarts[hdrBin], binWritten[hdrBin], buffer + pos + seqSize, hdrSize);
+        copyToSegments(sortedBuffer + binStarts[offsetBin], binWritten[offsetBin], reinterpret_cast<const char *>(&headerOffset), sizeof(uint64_t));
+        pos += seqSize + hdrSize;
+    }
+    for (size_t length = 0; length < lengthCount; length++) {
+        lengthToBin[length].offset += binSizes[SEQUENCE_DATA * lengthCount + length];
+        lengthToBin[length].headerOffset += binSizes[HEADER_DATA * lengthCount + length];
+        lengthToBin[length].headerIndexOffset += binSizes[HEADER_OFFSETS * lengthCount + length];
+    }
+    const size_t ownBegin = nodeOffsets[MMseqsNode::rank];
+    const size_t ownEnd = nodeOffsets[MMseqsNode::rank + 1];
+    for (size_t pos = ownBegin; pos < ownEnd; ) {
+        uint64_t segmentHeader[3];
+        memcpy(segmentHeader, sortedBuffer + pos, SEGMENT_HEADER_SIZE);
+        FileUtil::pwriteAll(fileno(dataFiles[segmentHeader[0]]), dataFileNames[segmentHeader[0]].c_str(), sortedBuffer + pos + SEGMENT_HEADER_SIZE, segmentHeader[2], segmentHeader[1]);
+        pos += SEGMENT_HEADER_SIZE + segmentHeader[2];
+    }
+    if (ownEnd - ownBegin == sortedPos) {
+        return;
+    }
+    for (node = MMseqsNode::rank + 1; node <= MMseqsNode::count; node++) {
+        nodeOffsets[node] -= ownEnd - ownBegin;
+    }
+    size_t exchangeOffset;
+#pragma omp critical
+    {
+        exchangeOffset = exchangeBytes;
+        MMseqsNode::addExchangeFlush(indexData, exchangeBytes, nodeOffsets);
+    }
+    FileUtil::pwriteAll(fileno(exchangeFile), exchangeFileName.c_str(), sortedBuffer, ownBegin, exchangeOffset);
+    FileUtil::pwriteAll(fileno(exchangeFile), exchangeFileName.c_str(), sortedBuffer + ownEnd, sortedPos - ownEnd, exchangeOffset + ownBegin);
 }
 
 template <typename T>
@@ -681,27 +747,6 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             const size_t fileKeyCount = dataFileSizes[i] / sizeof(uint64_t);
             nodeInfoData += SSTR(fileFirstKey) + "\t" + SSTR(fileKeyCount) + "\n";
             fileFirstKey += fileKeyCount;
-            dataFileSizes[i] += sizeof(uint64_t);
-        }
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-        for (size_t i = 0; i < dataFileSizes.size(); i++) {
-            const std::string name = dataFile + dataFileSuffixes[i / MMseqsNode::count] + SSTR(i % MMseqsNode::count);
-            FILE *handle = FileUtil::openAndDelete(name.c_str(), "w");
-            if (ftruncate(fileno(handle), dataFileSizes[i]) != 0) {
-                Debug(Debug::ERROR) << "Could not resize file " << name << "!\n";
-                EXIT(EXIT_FAILURE);
-            }
-            if (i / MMseqsNode::count == HEADER_OFFSETS) {
-                const uint64_t headerFileSize = dataFileSizes[HEADER_DATA * MMseqsNode::count + i % MMseqsNode::count];
-                if (pwrite(fileno(handle), &headerFileSize, sizeof(uint64_t), dataFileSizes[i] - sizeof(uint64_t)) != sizeof(uint64_t)) {
-                    Debug(Debug::ERROR) << "Can not write to data file " << name << "\n";
-                    EXIT(EXIT_FAILURE);
-                }
-            }
-            if (fsync(fileno(handle)) != 0 || fclose(handle) != 0) {
-                Debug(Debug::ERROR) << "Cannot close data file " << name << "\n";
-                EXIT(EXIT_FAILURE);
-            }
         }
         splitStarts(globalHistogram, nodeHistograms);
         for (unsigned int node = 0; node < MMseqsNode::count; node++) {
@@ -726,40 +771,40 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     }
     splitStarts(localNodeStarts, pieceHistograms);
 
-    std::vector<size_t> dataFileEnds(DATA_FILE_TYPES * MMseqsNode::count, 0);
+    std::string dataFileNames[DATA_FILE_TYPES];
+    FILE *dataFiles[DATA_FILE_TYPES];
+    size_t dataFileSizes[DATA_FILE_TYPES] = {};
+    for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
+        dataFileNames[fileType] = dataFile + dataFileSuffixes[fileType] + SSTR(MMseqsNode::rank);
+        dataFiles[fileType] = FileUtil::openAndDelete(dataFileNames[fileType].c_str(), "w");
+    }
     for (size_t i = 0; i < localNodeStarts.size(); i++) {
         const LengthBin &bin = localNodeStarts[i];
-        dataFileEnds[SEQUENCE_DATA * MMseqsNode::count + bin.file] = bin.offset + bin.sequenceCount * (bin.length + 2);
-        dataFileEnds[HEADER_DATA * MMseqsNode::count + bin.file] = bin.headerOffset + bin.headerSize;
-        dataFileEnds[HEADER_OFFSETS * MMseqsNode::count + bin.file] = bin.headerIndexOffset + bin.sequenceCount * sizeof(uint64_t);
-    }
-    std::vector<int> dataFileFds(DATA_FILE_TYPES * MMseqsNode::count);
-    for (size_t i = 0; i < dataFileFds.size(); i++) {
-        const std::string name = dataFile + dataFileSuffixes[i / MMseqsNode::count] + SSTR(i % MMseqsNode::count);
-        dataFileFds[i] = open(name.c_str(), O_WRONLY | O_CREAT, 0666);
-        struct stat sb;
-        if (dataFileFds[i] < 0 || fstat(dataFileFds[i], &sb) != 0) {
-            Debug(Debug::ERROR) << "Cannot open data file " << name << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        if (static_cast<size_t>(sb.st_size) < dataFileEnds[i]) {
-            Debug(Debug::ERROR) << "Data file " << name << " is smaller than expected: " << sb.st_size << " bytes, need " << dataFileEnds[i] << "\n";
-            EXIT(EXIT_FAILURE);
+        if (bin.file == MMseqsNode::rank) {
+            dataFileSizes[SEQUENCE_DATA] = std::max(dataFileSizes[SEQUENCE_DATA], bin.offset + bin.sequenceCount * (bin.length + 2));
+            dataFileSizes[HEADER_DATA] = std::max(dataFileSizes[HEADER_DATA], bin.headerOffset + bin.headerSize);
+            dataFileSizes[HEADER_OFFSETS] = std::max(dataFileSizes[HEADER_OFFSETS], bin.headerIndexOffset + bin.sequenceCount * sizeof(uint64_t));
         }
     }
-
+    const std::string exchange = dataFile + "_swap_0";
+    const std::string exchangeFile = exchange + "." + SSTR(MMseqsNode::rank);
+    FILE *exchangeHandle = FileUtil::openAndDelete(exchangeFile.c_str(), "w");
+    std::string exchangeIndexData;
+    size_t exchangeBytes = 0;
     const size_t activeThreads = std::max<size_t>(1, std::min<size_t>(par.threads, nodePieces.size()));
     size_t maxPieceSize = 0;
-    size_t writtenBytes = 0;
     for (size_t i = 0; i < pieceHistograms.size(); i++) {
         size_t pieceSize = 0;
+        size_t pieceEntryCount = 0;
         for (size_t j = 0; j < pieceHistograms[i].size(); j++) {
             pieceSize += pieceHistograms[i][j].sequenceCount * (pieceHistograms[i][j].length + 2 + sizeof(uint64_t)) + pieceHistograms[i][j].headerSize;
+            pieceEntryCount += pieceHistograms[i][j].sequenceCount;
         }
-        maxPieceSize = std::max(maxPieceSize, pieceSize);
-        writtenBytes += pieceSize;
+        const size_t lengthCount = pieceHistograms[i].empty() ? 0 : pieceHistograms[i][0].length + 1;
+        maxPieceSize = std::max(maxPieceSize, pieceSize + getSegmentHeadersSize(pieceEntryCount, lengthCount, pieceSize));
     }
-    const size_t bufferSize = std::min(maxPieceSize, static_cast<size_t>(Util::computeMemory(0) * 0.95) / (2 * activeThreads));
+    const size_t memoryLimit = Util::computeMemory(0);
+    const size_t bufferSize = std::min(maxPieceSize, static_cast<size_t>(memoryLimit * 0.95) / (2 * activeThreads));
 #pragma omp parallel num_threads(activeThreads)
     {
         char *buffer = new(std::nothrow) char[bufferSize];
@@ -779,12 +824,13 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 }
                 const size_t nameLength = strlen(e.name.s);
                 const size_t entrySize = e.sequence.l + nameLength + 4;
-                if (bufferPos + entrySize + (entryCount + 1) * sizeof(uint64_t) > bufferSize) {
-                    if (entrySize + sizeof(uint64_t) > bufferSize) {
+                const size_t dataSize = bufferPos + entrySize + (entryCount + 1) * sizeof(uint64_t);
+                if (dataSize + getSegmentHeadersSize(entryCount + 1, lengthToBin.size(), dataSize) > bufferSize) {
+                    if (entrySize + sizeof(uint64_t) + getSegmentHeadersSize(1, lengthToBin.size(), entrySize + sizeof(uint64_t)) > bufferSize) {
                         Debug(Debug::ERROR) << "Not enough memory for entry " << e.name.s << "\n";
                         EXIT(EXIT_FAILURE);
                     }
-                    flushBufferToDisk(dataFileFds, dataFile, buffer, bufferPos, sortedBuffer, lengthToBin);
+                    flushBufferToExchange(buffer, bufferPos, sortedBuffer, lengthToBin, dataFiles, dataFileNames, exchangeHandle, exchangeFile, exchangeIndexData, exchangeBytes);
                     bufferPos = 0;
                     entryCount = 0;
                 }
@@ -800,25 +846,74 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 entryCount++;
             }
             if (bufferPos > 0) {
-                flushBufferToDisk(dataFileFds, dataFile, buffer, bufferPos, sortedBuffer, lengthToBin);
+                flushBufferToExchange(buffer, bufferPos, sortedBuffer, lengthToBin, dataFiles, dataFileNames, exchangeHandle, exchangeFile, exchangeIndexData, exchangeBytes);
             }
             delete kseq;
         }
         delete[] buffer;
         delete[] sortedBuffer;
     }
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-    for (size_t i = 0; i < dataFileFds.size(); i++) {
-        if (fsync(dataFileFds[i]) != 0 || close(dataFileFds[i]) != 0) {
-            Debug(Debug::ERROR) << "Cannot close data file " << dataFile << dataFileSuffixes[i / MMseqsNode::count] << (i % MMseqsNode::count) << "\n";
+    const std::string exchangeIndex = MMseqsNode::closeExchange(exchangeHandle, exchangeFile, exchange + ".index", exchangeIndexData);
+    MMseqsNode::addPhaseTime(phaseValues, "sending the sequences", timer);
+
+    // the segments of the data files of this node that other nodes sent, written window by window
+    {
+        std::vector<MMseqsNode::ExchangeBlock> blocks;
+        std::vector<FILE *> exchangeFiles;
+        MMseqsNode::openExchange(exchangeIndex, exchange, blocks, exchangeFiles);
+        const size_t windowSize = memoryLimit / 64;
+        const size_t writeSize = std::max<size_t>(1, windowSize / par.threads);
+        // a segment that starts in the window ends at most MAX_SEGMENT_SIZE behind it
+        char *window = NULL;
+        if (blocks.empty() == false) {
+            window = new(std::nothrow) char[windowSize + MAX_SEGMENT_SIZE];
+            Util::checkAllocation(window, "Can not allocate window memory in createdb");
+        }
+        std::vector<std::pair<size_t, size_t> > segments;
+        std::vector<std::pair<size_t, size_t> > writes;
+        for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
+            for (size_t windowBegin = 0; windowBegin != SIZE_MAX; ) {
+                segments.clear();
+                const size_t nextOffset = MMseqsNode::readExchangeSegments(blocks, windowSize, MAX_SEGMENT_SIZE, fileType, windowBegin, windowBegin + windowSize, window, segments, exchange);
+                SORT_SERIAL(segments.begin(), segments.end());
+                // segments that follow each other are written at once, the bytes of this node between them were written while sending
+                writes.clear();
+                for (size_t i = 0; i < segments.size(); i++) {
+                    if (writes.empty() == false && writes.back().first + writes.back().second == segments[i].first && writes.back().second + segments[i].second <= writeSize) {
+                        writes.back().second += segments[i].second;
+                    } else {
+                        writes.push_back(segments[i]);
+                    }
+                }
+#pragma omp parallel for schedule(dynamic, 1)
+                for (size_t i = 0; i < writes.size(); i++) {
+                    FileUtil::pwriteAll(fileno(dataFiles[fileType]), dataFileNames[fileType].c_str(), window + (writes[i].first - windowBegin), writes[i].second, writes[i].first);
+                }
+                if (writes.empty() == false) {
+                    dataFileSizes[fileType] = std::max(dataFileSizes[fileType], writes.back().first + writes.back().second);
+                }
+                windowBegin = nextOffset;
+            }
+        }
+        delete[] window;
+        MMseqsNode::closeExchangeFiles(exchangeFiles, exchange);
+    }
+    const size_t writtenBytes = dataFileSizes[SEQUENCE_DATA] + dataFileSizes[HEADER_DATA] + dataFileSizes[HEADER_OFFSETS];
+    const uint64_t headerDataSize = dataFileSizes[HEADER_DATA];
+    FileUtil::pwriteAll(fileno(dataFiles[HEADER_OFFSETS]), dataFileNames[HEADER_OFFSETS].c_str(), reinterpret_cast<const char *>(&headerDataSize), sizeof(uint64_t), dataFileSizes[HEADER_OFFSETS]);
+#pragma omp parallel for schedule(dynamic, 1)
+    for (size_t i = 0; i < DATA_FILE_TYPES; i++) {
+        if (fsync(fileno(dataFiles[i])) != 0 || fclose(dataFiles[i]) != 0) {
+            Debug(Debug::ERROR) << "Cannot close data file " << dataFileNames[i] << "\n";
             EXIT(EXIT_FAILURE);
         }
     }
     MMseqsNode::addPhaseTime(phaseValues, "writing the sequences", timer);
     MMseqsNode::addPhaseValue(phaseValues, "Bytes written", SSTR(writtenBytes));
+    MMseqsNode::removeExchanges(dataFile, exchange, std::vector<std::string>(1, exchange), phaseValues);
     if (par.compressHeaders) {
-        MMseqsNode::barrier(dataFile + ".written");
-        MMseqsNode::addPhaseTime(phaseValues, "waiting for the sequences of all nodes", timer);
+        phaseValues.clear();
+        timer.reset();
         const std::string hdrDataFile = dataFile + "_h." + SSTR(MMseqsNode::rank);
         FILE *hdrFile = FileUtil::openFileOrDie(hdrDataFile.c_str(), "r", true);
         const size_t headerFileSize = FileUtil::getFileSize(hdrDataFile);
@@ -880,13 +975,12 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             EXIT(EXIT_FAILURE);
         }
         MMseqsNode::addPhaseTime(phaseValues, "compressing the headers", timer);
-    }
-    MMseqsNode::publishRunFile(dataFile + ".done." + SSTR(MMseqsNode::rank), phaseValues);
-    if (MMseqsNode::isMaster()) {
-        MMseqsNode::printPhaseValues(MMseqsNode::gatherRunFiles(dataFile + ".done."));
-        if (par.compressHeaders) {
-            FileUtil::remove((dataFile + ".written").c_str());
+        MMseqsNode::publishRunFile(dataFile + ".compressed." + SSTR(MMseqsNode::rank), phaseValues);
+        if (MMseqsNode::isMaster()) {
+            MMseqsNode::printPhaseValues(MMseqsNode::gatherRunFiles(dataFile + ".compressed."));
         }
+    }
+    if (MMseqsNode::isMaster()) {
         std::string sourceData;
         for (size_t i = 0; i < filenames.size(); i++) {
             sourceData += SSTR(i) + "\t" + FileUtil::baseName(filenames[i]) + "\n";
