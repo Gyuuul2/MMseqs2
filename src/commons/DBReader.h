@@ -300,8 +300,8 @@ public:
     size_t getBlockReadBytes() { return blockReadBytes; }
     size_t getKeyReadBytes() { return keyReadBytes; }
     size_t getBufferSizeToLoad(size_t keyBegin, size_t keyEnd);
-    // --createdb-mode 3 headers: the size of the names in data file fileIdx
-    size_t getNamesSize(size_t fileIdx);
+    // --createdb-mode 3 headers: the size of the names of keys [keyBegin, keyEnd)
+    size_t getNamesSize(size_t keyBegin, size_t keyEnd);
     // --createdb-mode 3 cluster databases: the first entry that starts at offset or later, the entry count after the last
     size_t findEntryByOffset(size_t offset) {
         return findEntryByCell(1, offset);
@@ -557,6 +557,8 @@ public:
 
     // --createdb-mode 3: data file f holds the keys [offsets[f], offsets[f + 1]), the data files follow in key order
     std::vector<size_t> getFileKeyOffsets(size_t fileCount);
+    // --createdb-mode 3: node n holds the keys [offsets[n], offsets[n + 1]), as many for every node, the entries of node n of a cluster database are those of its representatives
+    std::vector<size_t> getNodeKeyOffsets(size_t nodeCount);
     // --createdb-mode 3: split s holds the keys [offsets[s], offsets[s + 1]) of [keyBegin, keyEnd) whose entries, keyBytes more per key, fit splitBytes, at least one key
     std::vector<size_t> getSplitKeyOffsets(size_t keyBegin, size_t keyEnd, size_t splitBytes, size_t keyBytes);
     size_t findIdRange(size_t id);

@@ -936,18 +936,27 @@ template <typename T> size_t DBReader<T>::findEntryByCell(size_t column, size_t 
     return entry;
 }
 
-template <typename T> size_t DBReader<T>::getNamesSize(size_t fileIdx) {
-    if (clusterIndex || fileIdx >= headerOffsetsFileNames.size()) {
-        Debug(Debug::ERROR) << "Call of getNamesSize is only allowed for the data files of the headers of a --createdb-mode 3 database " << dataFileName << "\n";
+template <typename T> size_t DBReader<T>::getNamesSize(size_t keyBegin, size_t keyEnd) {
+    if (clusterIndex || headerOffsetsFileNames.empty() || bufferedFds.empty()) {
+        Debug(Debug::ERROR) << "Call of getNamesSize is only allowed for the headers of a --createdb-mode 3 database opened with data " << dataFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
-    // the last header offset of a data file is the size of its names
-    const std::string &headerOffsetsFile = headerOffsetsFileNames[fileIdx];
-    uint64_t namesSize = 0;
-    FILE *headerOffsets = FileUtil::openFileOrDie(headerOffsetsFile.c_str(), "r", true);
-    if (fseek(headerOffsets, -static_cast<long>(sizeof(uint64_t)), SEEK_END) != 0 || fread(&namesSize, sizeof(uint64_t), 1, headerOffsets) != 1 || fclose(headerOffsets) != 0) {
-        Debug(Debug::ERROR) << "Cannot read " << headerOffsetsFile << "\n";
-        EXIT(EXIT_FAILURE);
+    // the names of the keys of a file run from the header offset of the first key to the one after the last
+    size_t namesSize = 0;
+    for (size_t range = findIdRange(keyBegin); range < indexSize && indexIdToNum(&index[range].id) < keyEnd; range++) {
+        const size_t firstId = indexIdToNum(&index[range].id);
+        const size_t endId = (range + 1 < indexSize) ? indexIdToNum(&index[range + 1].id) : size;
+        const size_t begin = std::max(keyBegin, firstId) - firstId;
+        const size_t end = std::min(keyEnd, endId) - firstId;
+        if (begin >= end) {
+            continue;
+        }
+        const int fd = bufferedFds[dataFileNames.size() + index2dbfile[range]];
+        const char *headerOffsetsFile = headerOffsetsFileNames[index2dbfile[range]].c_str();
+        uint64_t offsets[2];
+        FileUtil::preadAll(fd, headerOffsetsFile, reinterpret_cast<char *>(&offsets[0]), sizeof(uint64_t), begin * sizeof(uint64_t));
+        FileUtil::preadAll(fd, headerOffsetsFile, reinterpret_cast<char *>(&offsets[1]), sizeof(uint64_t), end * sizeof(uint64_t));
+        namesSize += offsets[1] - offsets[0];
     }
     return namesSize;
 }
@@ -1860,6 +1869,15 @@ std::vector<size_t> DBReader<T>::getFileKeyOffsets(size_t fileCount) {
     }
     for (size_t file = 0; file < fileCount; file++) {
         offsets[file + 1] = std::max(offsets[file + 1], offsets[file]);
+    }
+    return offsets;
+}
+
+template<typename T>
+std::vector<size_t> DBReader<T>::getNodeKeyOffsets(size_t nodeCount) {
+    std::vector<size_t> offsets(nodeCount + 1);
+    for (size_t node = 0; node <= nodeCount; node++) {
+        offsets[node] = size * node / nodeCount;
     }
     return offsets;
 }

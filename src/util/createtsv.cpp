@@ -77,7 +77,7 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
     const size_t localFirstKey = nodeKeyOffsets[MMseqsNode::rank];
     const size_t localEndKey = nodeKeyOffsets[MMseqsNode::rank + 1];
     // a key also holds its name offset in the read buffer and in the split
-    const size_t keyBytes = headers.getNamesSize(MMseqsNode::rank) / std::max<size_t>(1, localEndKey - localFirstKey) + sizeof(uint64_t) + sizeof(size_t);
+    const size_t keyBytes = headers.getNamesSize(localFirstKey, localEndKey) / std::max<size_t>(1, localEndKey - localFirstKey) + sizeof(uint64_t) + sizeof(size_t);
     const size_t splitKeys = std::max<size_t>(1, memoryLimit / 8 / keyBytes);
 
     const std::string sortedByRepFile = sortedByRep + "." + SSTR(MMseqsNode::rank);
@@ -261,7 +261,7 @@ int createtsv(int argc, const char **argv, const Command &command) {
         }
         DBReader<DBKeyType> headers(par.hdr1.c_str(), (par.db1 + ".nodeinfo").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
         headers.open(DBReader<DBKeyType>::NOSORT);
-        const std::vector<size_t> nodeKeyOffsets = headers.getFileKeyOffsets(MMseqsNode::count);
+        const std::vector<size_t> nodeKeyOffsets = headers.getNodeKeyOffsets(MMseqsNode::count);
         std::string phaseValues;
         Timer timer;
         const std::string sortedByMember = par.db4 + "_swap_0";
