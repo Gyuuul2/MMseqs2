@@ -294,10 +294,8 @@ public:
     // --createdb-mode 3 sequences: reads the ascending keys, entries less than a page apart in one request, through the buffered fds; loadData takes the keys that prefetchData read before it
     void loadData(const std::vector<DBKeyType> &keys);
     void prefetchData(const std::vector<DBKeyType> &keys);
-    // --createdb-mode 3 sequences: loads by keys read the whole block of a key while the blocks fit cacheBytes and keep it until releaseBlocks
+    // --createdb-mode 3 sequences: loads by keys read the whole block of a key while the blocks fit cacheBytes; blocks below the loaded and the requested keys are freed when new blocks need their room
     void setBlockCacheBytes(size_t cacheBytes);
-    // frees the cached blocks whose keys are all below keyBegin
-    void releaseBlocks(size_t keyBegin);
     size_t getBlockReadBytes() { return blockReadBytes; }
     size_t getKeyReadBytes() { return keyReadBytes; }
     size_t getBufferSizeToLoad(size_t keyBegin, size_t keyEnd);
@@ -661,6 +659,7 @@ private:
     };
     BufferInfo loadedBuffer, prefetchBuffer;
     void cacheBlocks(BufferInfo &buffer);
+    void freeBlocks(size_t keyEnd, size_t neededBytes);
     // --createdb-mode 3 sequences: block b holds the keys [blockKeyOffsets[b], blockKeyOffsets[b + 1]) whose entries start in the same MAX_READ_REQUEST_SIZE bytes of a data file
     std::vector<size_t> blockKeyOffsets;
     std::map<size_t, BatchReader::ReadRequest> cachedBlocks;

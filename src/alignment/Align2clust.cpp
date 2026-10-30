@@ -1574,8 +1574,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
             publishTime = time(NULL);
             waitSeconds += waitTimer.getTimediff();
         }
-        // the blocks before the window keys go; reps come in key order and their targets mostly have larger keys, so few come back
-        seqDbr.releaseBlocks(window.keys.front());
         seqDbr.loadData(window.keys);
         readWindow(nextWindow);
         seqDbr.prefetchData(nextWindow.keys);
