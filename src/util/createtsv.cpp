@@ -83,10 +83,7 @@ static void writeMemberAccessions(std::vector<MemberAccession> &memberAccessions
             memcpy(writeBuffer + bufferPos + MEMBER_ACCESSION_SIZE, accessions.data() + memberAccession.accessionOffset, memberAccession.accessionLength);
             bufferPos += MEMBER_ACCESSION_SIZE + memberAccession.accessionLength;
         }
-    }
-    if (fwrite(writeBuffer, sizeof(char), writeBufferSize, file) != writeBufferSize) {
-        Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
-        EXIT(EXIT_FAILURE);
+        FileUtil::pwriteAll(fileno(file), fileName.c_str(), writeBuffer + threadOffsets[thread], threadOffsets[thread + 1] - threadOffsets[thread], writtenBytes + threadOffsets[thread]);
     }
     delete[] writeBuffer;
     MMseqsNode::addExchangeFlush(indexData, writtenBytes, nodeOffsets);

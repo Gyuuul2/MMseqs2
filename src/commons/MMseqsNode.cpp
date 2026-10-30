@@ -432,7 +432,8 @@ static void bufferExchangeBlock(MMseqsNode::ExchangeBlock &block, size_t bytes, 
     if (block.buffer.size() < blockBufferSize) {
         block.buffer.resize(blockBufferSize);
     }
-    // the parts of a block follow each other in its buffer, and a flush holds whole records
+    // the parts of a block follow each other in its buffer, and a flush holds whole records; outside a parallel region the threads read pieces of it
+    std::vector<std::pair<size_t, size_t> > reads;
     while (block.bufferEnd < block.buffer.size() && getUnreadBytes(block) > 0) {
         if (block.pos == block.end) {
             block.pos = block.parts[block.nextPart].first;
@@ -440,10 +441,16 @@ static void bufferExchangeBlock(MMseqsNode::ExchangeBlock &block, size_t bytes, 
             block.partsBytes -= block.end - block.pos;
             block.nextPart++;
         }
-        const size_t readBytes = std::min(block.buffer.size() - block.bufferEnd, block.end - block.pos);
-        FileUtil::preadAll(fileno(block.file), prefix.c_str(), block.buffer.data() + block.bufferEnd, readBytes, block.pos);
+        const size_t readBytes = std::min(std::min(block.buffer.size() - block.bufferEnd, block.end - block.pos), MAX_READ_REQUEST_SIZE);
+        reads.push_back(std::make_pair(block.pos, block.bufferEnd));
         block.pos += readBytes;
         block.bufferEnd += readBytes;
+    }
+    const size_t readCount = reads.size();
+    reads.push_back(std::make_pair(block.pos, block.bufferEnd));
+#pragma omp parallel for schedule(dynamic, 1) if (omp_in_parallel() == 0)
+    for (size_t i = 0; i < readCount; i++) {
+        FileUtil::preadAll(fileno(block.file), prefix.c_str(), block.buffer.data() + reads[i].second, reads[i + 1].second - reads[i].second, reads[i].first);
     }
 }
 
@@ -464,16 +471,34 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
                                      std::vector<char> &records, std::vector<size_t> *recordOffsets, const std::string &prefix) {
     // the buffers of the blocks and the copy of their records each take half of bufferMemory
     const size_t bufferSize = std::max(EXCHANGE_BUFFER_SIZE, bufferMemory / 2 / std::max<size_t>(1, blocks.size()));
+    // with fewer blocks than threads, the threads share the reads and copies of a block
+    const size_t threads = static_cast<size_t>(Parameters::getInstance().threads);
+    const bool isClusterPair = recordSize == ClusterPair::recordSize;
+    std::vector<char> isRead(blocks.size());
+    for (size_t i = 0; i < blocks.size(); i++) {
+        const ExchangeBlock &block = blocks[i];
+        isRead[i] = getUnreadBytes(block) > 0 && (block.bufferEnd - block.bufferPos < bufferSize / 2 || block.recordEnd == block.bufferPos);
+    }
+#pragma omp parallel for schedule(dynamic, 1) if (blocks.size() >= threads)
+    for (size_t i = 0; i < blocks.size(); i++) {
+        if (isRead[i]) {
+            bufferExchangeBlock(blocks[i], bufferSize, bufferSize, prefix);
+        }
+    }
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < blocks.size(); i++) {
         ExchangeBlock &block = blocks[i];
-        if (getUnreadBytes(block) == 0 || (block.bufferEnd - block.bufferPos >= bufferSize / 2 && block.recordEnd > block.bufferPos)) {
+        if (isRead[i] == false) {
             continue;
         }
         // a record larger than the buffer doubles it
         for (size_t bytes = bufferSize; ; bytes *= 2) {
             bufferExchangeBlock(block, bytes, bytes, prefix);
             const char *data = getBlockData(block);
+            if (isClusterPair && block.bufferEnd - block.recordEnd >= sizeof(ClusterPair)) {
+                block.recordEnd += (block.bufferEnd - block.recordEnd) / sizeof(ClusterPair) * sizeof(ClusterPair);
+                block.lastRecord = block.recordEnd - sizeof(ClusterPair);
+            }
             for (size_t size; (size = recordSize(data + block.recordEnd, block.bufferEnd - block.recordEnd)) > 0; block.recordEnd += size) {
                 block.lastRecord = block.recordEnd;
             }
@@ -506,7 +531,13 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
         const char *data = getBlockData(block);
         size_t pos = block.bufferPos;
         size_t recordCount = 0;
-        for (ClusterPair pair; pos < block.recordEnd; pos += recordSize(data + pos, block.recordEnd - pos), recordCount++) {
+        if (isClusterPair) {
+            // the records of a block are in order
+            const ClusterPair *pairs = reinterpret_cast<const ClusterPair *>(data + block.bufferPos);
+            recordCount = std::upper_bound(pairs, pairs + (block.recordEnd - block.bufferPos) / sizeof(ClusterPair), rangeLast, compare) - pairs;
+            pos += recordCount * sizeof(ClusterPair);
+        }
+        for (ClusterPair pair; isClusterPair == false && pos < block.recordEnd; pos += recordSize(data + pos, block.recordEnd - pos), recordCount++) {
             memcpy(&pair, data + pos, sizeof(ClusterPair));
             if (compare(rangeLast, pair)) {
                 break;
@@ -527,10 +558,22 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
         recordOffsets->resize(blockRecordOffsets.back() + 1);
         recordOffsets->back() = blockByteOffsets.back();
     }
+    // the copies are cut into a piece per thread
+    const size_t pieceSize = std::max<size_t>(EXCHANGE_BUFFER_SIZE, blockByteOffsets.back() / threads + 1);
+    const size_t pieceCount = (blockByteOffsets.back() + pieceSize - 1) / pieceSize;
+#pragma omp parallel for schedule(dynamic, 1)
+    for (size_t piece = 0; piece < pieceCount; piece++) {
+        const size_t pieceBegin = piece * pieceSize;
+        const size_t pieceEnd = std::min(blockByteOffsets.back(), pieceBegin + pieceSize);
+        for (size_t i = std::upper_bound(blockByteOffsets.begin(), blockByteOffsets.end(), pieceBegin) - blockByteOffsets.begin() - 1; i < blocks.size() && blockByteOffsets[i] < pieceEnd; i++) {
+            const size_t from = std::max(pieceBegin, blockByteOffsets[i]);
+            const size_t to = std::min(pieceEnd, blockByteOffsets[i + 1]);
+            memcpy(records.data() + from, getBlockData(blocks[i]) + blocks[i].bufferPos + (from - blockByteOffsets[i]), to - from);
+        }
+    }
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < blocks.size(); i++) {
         ExchangeBlock &block = blocks[i];
-        memcpy(records.data() + blockByteOffsets[i], getBlockData(block) + block.bufferPos, rangeEnds[i] - block.bufferPos);
         if (recordOffsets != NULL) {
             size_t pos = blockByteOffsets[i];
             for (size_t record = blockRecordOffsets[i]; record < blockRecordOffsets[i + 1]; record++) {
