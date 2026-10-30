@@ -636,6 +636,22 @@ void MMseqsNode::closeExchangeFiles(std::vector<FILE *> &files, const std::strin
     }
 }
 
+void MMseqsNode::readExchangePairs(const std::string &index, const std::string &prefix, std::vector<ClusterPair> &pairs) {
+    std::vector<ExchangeBlock> blocks;
+    std::vector<FILE *> files;
+    openExchange(index, prefix, blocks, files);
+    std::vector<size_t> blockOffsets(blocks.size() + 1, 0);
+    for (size_t i = 0; i < blocks.size(); i++) {
+        blockOffsets[i + 1] = blockOffsets[i] + blocks[i].end - blocks[i].pos;
+    }
+    pairs.resize(blockOffsets.back() / sizeof(ClusterPair));
+#pragma omp parallel for schedule(dynamic, 1)
+    for (size_t i = 0; i < blocks.size(); i++) {
+        FileUtil::preadAll(fileno(blocks[i].file), prefix.c_str(), reinterpret_cast<char *>(pairs.data()) + blockOffsets[i], blockOffsets[i + 1] - blockOffsets[i], blocks[i].pos);
+    }
+    closeExchangeFiles(files, prefix);
+}
+
 // sorts a flush of pairs, appends it to file and adds its index line; ownPairCount: keeps the pairs for this node at the start of pairs instead
 static void writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                        FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes, size_t *ownPairCount = NULL) {

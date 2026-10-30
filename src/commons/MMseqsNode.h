@@ -133,6 +133,8 @@ public:
     static size_t readExchangeSegments(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t maxSegmentSize, uint64_t fileType, size_t windowBegin, size_t windowEnd,
                                        char *window, std::vector<std::pair<size_t, size_t> > &segments, const std::string &prefix);
     static void closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix);
+    // reads all pairs of the exchange index for this node at once, from files only, as sendClusterMembers writes them
+    static void readExchangePairs(const std::string &index, const std::string &prefix, std::vector<ClusterPair> &pairs);
 
     // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered; nodeKeyOffsets: keys of every node
     struct ClusterPairWriter {
@@ -145,6 +147,15 @@ public:
             pairs[pairCount].repKey = repKey;
             pairs[pairCount].memberKey = memberKey;
             pairCount++;
+        }
+        // makes room for count more pairs, at most pairCapacity, and returns where they go
+        ClusterPair *reservePairs(size_t count) {
+            if (pairCount + count > pairCapacity) {
+                flush();
+            }
+            ClusterPair *reserved = pairs + pairCount;
+            pairCount += count;
+            return reserved;
         }
         void flush();
         // writes the buffered pairs but keeps those for this node in memory, and returns the index lines of all nodes
