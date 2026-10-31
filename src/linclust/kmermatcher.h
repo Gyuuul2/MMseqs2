@@ -4,7 +4,9 @@
 #include "DBWriter.h"
 #include "Parameters.h"
 #include "BaseMatrix.h"
+#include "MathUtil.h"
 
+#include <climits>
 #include <queue>
 #ifndef SIZE_T_MAX
 #define SIZE_T_MAX ((size_t) -1)
@@ -348,6 +350,90 @@ void setLinearFilterDefault(Parameters *p);
 
 size_t computeMemoryNeededLinearfilter(size_t totalKmer);
 
+// --createdb-mode 3: the first key of the send range that this node sends or merges, only the keys set in representativeBits unless NULL
+extern size_t localFirstKey;
+extern uint64_t *representativeBits;
+extern BaseMatrix *adjSubMat;
+
+static inline bool isRepresentative(size_t id) {
+    return representativeBits == NULL || ((representativeBits[(id - localFirstKey) / 64] >> ((id - localFirstKey) % 64)) & 1);
+}
+
+static inline unsigned int getBitWidth(uint64_t value) {
+    return (value == 0) ? 0 : 64 - __builtin_clzll(value);
+}
+
+static inline unsigned int getKmerBits(const BaseMatrix *subMat, int kmerSize) {
+    return (kmerSize * MathUtil::log2(subMat->alphabetSize - 1) >= 64) ? 64 : getBitWidth(MathUtil::ipow<size_t>(subMat->alphabetSize - 1, kmerSize) - 1);
+}
+
+static inline size_t computeSeqKmerCount(int seqLen, size_t kmerSize, size_t chooseTopKmer, float chooseTopKmerScale) {
+    int kmerAdjustedSeqLen = std::max(1, seqLen - static_cast<int>(kmerSize) + 2);
+    return std::min(kmerAdjustedSeqLen, static_cast<int>(chooseTopKmer + (chooseTopKmerScale * seqLen)));
+}
+
+// the score of the adjacent residues of adjKey against those of the previous representative in subMatPos
+static inline int getAdjKeyScore(short *subMatPos[6], unsigned int adjKey) {
+    int score = 0;
+    for (int j = 0; j < 6; j++) {
+        score += subMatPos[j][KmerPositionBit::getAdjacentSeq(adjKey, j)];
+    }
+    return score;
+}
+
+// the next rep of a k-mer group: the adjKey candidate scoring lowest against the previous one, at a tie the first by isBefore
+template <typename Candidate, typename ForEachRepCandidate, typename IsBefore>
+static inline void selectGroupRepSeqs(std::vector<Candidate> &reps, size_t maxRepSeqs, ForEachRepCandidate forEachRepCandidate, IsBefore isBefore) {
+    short *subMatPos[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
+    unsigned int repAdjKey = 0;
+    while (reps.size() < maxRepSeqs) {
+        if (reps.empty() == false) {
+            for (int j = 0; j < 6; j++) {
+                subMatPos[j] = adjSubMat->subMatrix[KmerPositionBit::getAdjacentSeq(repAdjKey, j)];
+            }
+        }
+        bool hasBest = false;
+        Candidate bestCandidate = Candidate();
+        unsigned int bestAdjKey = 0;
+        int bestScore = INT_MAX;
+        bool isFirst = true;
+        unsigned int prevAdjKey = 0;
+        forEachRepCandidate([&](unsigned int adjKey, const Candidate &candidate) {
+            const bool isOtherAdjKey = isFirst || adjKey != prevAdjKey;
+            isFirst = false;
+            prevAdjKey = adjKey;
+            if (isOtherAdjKey == false) {
+                return;
+            }
+            for (size_t rep = 0; rep < reps.size(); rep++) {
+                if (isBefore(candidate, reps[rep]) == false && isBefore(reps[rep], candidate) == false) {
+                    return;
+                }
+            }
+            const int score = reps.empty() ? 0 : getAdjKeyScore(subMatPos, adjKey);
+            if (hasBest == false || score < bestScore || (score == bestScore && isBefore(candidate, bestCandidate))) {
+                hasBest = true;
+                bestScore = score;
+                bestCandidate = candidate;
+                bestAdjKey = adjKey;
+            }
+        });
+        if (hasBest == false) {
+            break;
+        }
+        reps.push_back(bestCandidate);
+        repAdjKey = bestAdjKey;
+    }
+}
+
+template <int TYPE, typename T, bool includeAdjacency, typename L, typename KmerPositionType>
+std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, size_t kmerArraySize, DBReader<DBKeyType> &seqDbr,
+                                                Parameters & par, BaseMatrix * subMat, bool hashWholeSequence, bool prefetchesNextReadChunk,
+                                                size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution,
+                                                const std::vector<size_t> &readChunkOffsets);
+
+template <typename T, bool includeAdjacency, typename L>
+void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, size_t memoryLimit);
 
 #undef SIZE_T_MAX
 
