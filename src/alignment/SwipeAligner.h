@@ -116,7 +116,7 @@ public:
     size_t addQuery(const Sequence *query);
     void clearQueries();
 
-    // the extensions from the seeds against their queries to the right, or to the left if backward; word 2 for the ones that do not fit the lanes
+    // the extensions from the seeds against their queries to the right, or to the left if backward
     void extendBanded(size_t count, const size_t *queryIds, const unsigned char *const *targets, const int *targetLengths, const int *seedQueries,
                       const int *seedTargets, bool backward, int xDrop, int bandSide, s_align *aligns, std::string *backtraces);
 
@@ -125,9 +125,10 @@ public:
         return subMat->subMatrix[queries[position]][targetLetter] + biases[position];
     }
 
-    // the lane rows that extended a target and all lane rows
+    // the lane rows that extended a target and all lane rows, and the extensions that went on alone with a trace of their lane only
     size_t extendLaneRows;
     size_t extendSlotRows;
+    size_t extendSoloJobs;
 
 private:
     struct ExtendJob {
@@ -138,8 +139,6 @@ private:
         int left;
         int right;
     };
-
-    void queue(std::vector<ExtendJob> &jobs, const ExtendJob &job, s_align *aligns) const;
 
     template <bool Solo>
     void extendBand(const ExtendJob *jobs, size_t jobCount, bool backward, int xDrop, const unsigned char *const *targets, const int *targetLengths,
