@@ -3253,7 +3253,7 @@ static int align2clustLinfinity(Parameters &par) {
 
     // every partition of the prefilter is a group of keys, taken by the aligning nodes in turn so that they align close keys at the same time
     const std::string partitionsFile = par.db2 + ".partitions";
-    const std::string partitionsData = MMseqsNode::waitForFile(partitionsFile);
+    const std::string partitionsData = MMseqsNode::readFile(partitionsFile);
     std::vector<PrefPartition> partitions;
     for (char *line = (char *) partitionsData.c_str(); *line != '\0'; line = Util::skipLine(line)) {
         const char *columns[5];

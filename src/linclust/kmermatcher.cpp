@@ -4092,9 +4092,10 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
         }
         MMseqsNode::publishFile(par.db2 + ".partitions", sortedPartitions);
         DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_PREFILTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
+        MMseqsNode::publishRunFile(par.db2 + ".merged", "");
     } else {
-        // the master writes the dbtype once every node has merged, so no node takes merge ranges any more
-        MMseqsNode::waitForFile(par.db2 + ".dbtype");
+        // the master publishes this once every node has merged, so no node takes merge ranges any more
+        MMseqsNode::waitForRunFile(par.db2 + ".merged");
         mergeQueue.removeClaims();
     }
 }

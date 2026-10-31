@@ -88,26 +88,49 @@ void MMseqsNode::sleepBeforePoll(unsigned int polls, unsigned int maxShift) {
     usleep(10000u << std::min(polls, maxShift));
 }
 
-std::string MMseqsNode::waitForFile(const std::string &file) {
-    for (unsigned int polls = 0; FileUtil::fileExists(file.c_str()) == false; polls++) {
-        sleepBeforePoll(polls);
+// opens file for a poll: NFS answers a stat or open of a name that it once saw missing from its cache for up to 60 s,
+// while an open with O_CREAT always asks the server; a file not published yet is an empty placeholder that publishFile renames over
+static int openPolledFile(const std::string &file) {
+    const int fd = open(file.c_str(), O_RDONLY | O_CREAT, 0666);
+    if (fd < 0) {
+        Debug(Debug::ERROR) << "Cannot open " << file << "\n";
+        EXIT(EXIT_FAILURE);
     }
-    FILE *handle = FileUtil::openFileOrDie(file.c_str(), "r", true);
+    return fd;
+}
+
+// reads all of fd and closes it
+static std::string readAndClose(int fd, const std::string &file) {
     struct stat sb;
-    if (fstat(fileno(handle), &sb) != 0) {
+    if (fstat(fd, &sb) != 0) {
         Debug(Debug::ERROR) << "Cannot read " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
     std::string content(sb.st_size, '\0');
-    if (fread(&content[0], sizeof(char), content.size(), handle) != content.size()) {
-        Debug(Debug::ERROR) << "Cannot read " << file << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    if (fclose(handle) != 0) {
+    FileUtil::preadAll(fd, file.c_str(), &content[0], content.size(), 0);
+    if (close(fd) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
     return content;
+}
+
+std::string MMseqsNode::waitForFile(const std::string &file) {
+    std::string content = readAndClose(openPolledFile(file), file);
+    for (unsigned int polls = 0; content.empty(); polls++) {
+        sleepBeforePoll(polls);
+        content = readAndClose(openPolledFile(file), file);
+    }
+    return content;
+}
+
+std::string MMseqsNode::readFile(const std::string &file) {
+    const int fd = open(file.c_str(), O_RDONLY);
+    if (fd < 0) {
+        Debug(Debug::ERROR) << "Cannot open " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return readAndClose(fd, file);
 }
 
 // a file of another run is read again until this run replaces it
@@ -144,19 +167,12 @@ void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size
 
 bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &bytes) {
     const std::string file = log + ".progress";
-    if (FileUtil::fileExists(file.c_str()) == false) {
-        return false;
-    }
     // NFS may fail to read a progress file that was just replaced; the next poll reads it again
-    FILE *handle = fopen(file.c_str(), "r");
-    if (handle == NULL) {
-        return false;
-    }
+    const int fd = openPolledFile(file);
     char buffer[256];
-    const size_t size = fread(buffer, sizeof(char), sizeof(buffer) - 1, handle);
-    const bool hasError = ferror(handle) != 0;
-    fclose(handle);
-    if (hasError) {
+    const ssize_t size = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (size <= 0) {
         return false;
     }
     const std::string content(buffer, size);
