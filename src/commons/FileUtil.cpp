@@ -5,6 +5,7 @@
 #include "BatchReader.h"
 
 #include <cstddef>
+#include <cerrno>
 #include <cstring>
 #include <climits>
 #include <algorithm>
@@ -103,8 +104,14 @@ void FileUtil::deleteTempFiles(const std::list<std::string> &tmpFiles) {
 void FileUtil::preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset) {
     for (size_t done = 0; done < size;) {
         const ssize_t count = pread(fd, data + done, size - done, offset + done);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
         if (count <= 0) {
-            Debug(Debug::ERROR) << "Cannot read " << fileName << "\n";
+            const int readError = (count < 0) ? errno : 0;
+            Debug(Debug::ERROR) << "Cannot read " << fileName << " at offset " << offset + done
+                                << " (" << size - done << " bytes remaining): "
+                                << (readError == 0 ? "end of file" : strerror(readError)) << "\n";
             EXIT(EXIT_FAILURE);
         }
         done += count;
