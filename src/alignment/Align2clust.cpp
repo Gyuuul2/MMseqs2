@@ -3206,8 +3206,8 @@ static int align2clustLinfinity(Parameters &par) {
     const std::string taken = par.db3 + "_taken";
     const std::string assignedBits = par.db3 + "_assigned.bits";
     // the sequence exchange indexes exist from before the memory barrier on, so no node looks one up before it is there
-    const std::string requests = par.db3 + "_swap_2";
-    const std::string served = par.db3 + "_swap_3";
+    const std::string requests = par.db3 + "_sequence_requests";
+    const std::string served = par.db3 + "_served_sequences";
     std::vector<std::string> sequenceIndexes;
     std::vector<std::string> sequenceFiles;
     if (MMseqsNode::rank >= getFirstAlignNode() && MMseqsNode::count - getFirstAlignNode() > 1) {
@@ -3262,8 +3262,8 @@ static int align2clustLinfinity(Parameters &par) {
     }
     groupKeyOffsets.push_back(dbSize);
 
-    const std::string memberRequests = par.db3 + "_swap_0";
-    const std::string membersExchange = par.db3 + "_swap_1";
+    const std::string memberRequests = par.db3 + "_member_requests";
+    const std::string membersExchange = par.db3 + "_members";
     MMseqsNode::ClusterPairWriter *memberRequestWriter = NULL;
     const std::vector<size_t> filterCluKeyOffsets = par.filterCluDBFile.empty() ? nodeKeyOffsets : MMseqsNode::getClusterKeyOffsets(par.db3 + ".keys", par.filterCluDBFile, dbSize);
     if (par.filterCluDBFile.empty() == false) {
@@ -3337,7 +3337,7 @@ static int align2clustLinfinity(Parameters &par) {
     const size_t nodeFirstKey = nodeKeyOffsets[MMseqsNode::rank];
     const size_t nodeKeys = nodeKeyOffsets[MMseqsNode::rank + 1] - nodeFirstKey;
     const size_t nodeWords = (nodeKeys + 63) / 64;
-    const std::string clusterPairs = par.db3 + "_swap_4";
+    const std::string clusterPairs = par.db3 + "_cluster_pairs";
     MMseqsNode::ClusterPairWriter clusterPairWriter(clusterPairs, std::max<size_t>(64, memoryLimit / CLUSTER_PAIRS_MEMORY_DIVISOR / sizeof(ClusterPair)), ClusterPair::compareByRep, nodeKeyOffsets);
     const std::string acceptedFile = accepted + "." + SSTR(MMseqsNode::rank);
     if (par.clusteringMode == Parameters::SET_COVER) {
