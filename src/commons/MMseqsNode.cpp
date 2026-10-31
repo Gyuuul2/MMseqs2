@@ -410,6 +410,11 @@ void MMseqsNode::addExchangeFlush(std::string &indexData, size_t &writtenBytes, 
     sentOtherNodeExchangeBytes += nodeOffsets.back() - (nodeOffsets[rank + 1] - nodeOffsets[rank]);
 }
 
+void MMseqsNode::keepOwnExchangeRecords(const std::string &exchange, char *records, size_t bytes) {
+    ownExchangeRecords[exchange] = std::make_pair(records, bytes);
+    sentExchangeBytes += bytes;
+}
+
 std::string MMseqsNode::closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData) {
     if (fclose(file) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
@@ -710,7 +715,6 @@ static void writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare)(con
         nodeOffsets[node] -= (ownEnd - ownBegin) * sizeof(ClusterPair);
     }
     MMseqsNode::addExchangeFlush(indexData, writtenBytes, nodeOffsets);
-    sentExchangeBytes += (ownEnd - ownBegin) * sizeof(ClusterPair);
 }
 
 MMseqsNode::ClusterPairWriter::ClusterPairWriter(const std::string &exchange, size_t pairCapacity, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets)
@@ -738,7 +742,7 @@ std::string MMseqsNode::ClusterPairWriter::close() {
     if (ownPairCount > 0) {
         pairs = static_cast<ClusterPair *>(realloc(pairs, ownPairCount * sizeof(ClusterPair)));
         Util::checkAllocation(pairs, "Can not shrink pairs memory in ClusterPairWriter");
-        ownExchangeRecords[exchange] = std::make_pair(reinterpret_cast<char *>(pairs), ownPairCount * sizeof(ClusterPair));
+        keepOwnExchangeRecords(exchange, reinterpret_cast<char *>(pairs), ownPairCount * sizeof(ClusterPair));
     } else {
         Util::releasePages(pairs, pairCapacity * sizeof(ClusterPair));
         free(pairs);
