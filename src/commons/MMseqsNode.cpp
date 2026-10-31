@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <map>
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -88,30 +89,61 @@ void MMseqsNode::sleepBeforePoll(unsigned int polls, unsigned int maxShift) {
     usleep(10000u << std::min(polls, maxShift));
 }
 
-// the content of file, or an empty string while it is not published: NFS answers a stat or open of a name that it once saw
-// missing from its cache for up to 60 s, while an open with O_CREAT always asks the server. Until publishFile renames the file
-// over it, the name is an empty placeholder, and an open placeholder that the rename removes fails with ESTALE on NFS
+// whether the directory of file lists it: reading the directory asks the server, while a lookup of a name that NFS once
+// saw missing is answered from its cache for up to 60 s (Nextflow lists the work directory before it reads .exitcode, too)
+static bool isListed(const std::string &file) {
+    const std::string name = FileUtil::baseName(file);
+    DIR *directory = opendir(FileUtil::dirName(file).c_str());
+    if (directory == NULL) {
+        return false;
+    }
+    bool isFound = false;
+    for (struct dirent *entry; isFound == false && (entry = readdir(directory)) != NULL;) {
+        isFound = name == entry->d_name;
+    }
+    closedir(directory);
+    return isFound;
+}
+
+// the content of file, or an empty string while it is not published; a file that a later publish replaces while it is read
+// fails with ESTALE on NFS and is read again by the next poll
 static std::string readPolledFile(const std::string &file) {
-    const int fd = open(file.c_str(), O_RDONLY | O_CREAT, 0666);
+    int fd = open(file.c_str(), O_RDONLY);
+    if (fd < 0 && errno == ENOENT && isListed(file)) {
+        fd = open(file.c_str(), O_RDONLY);
+    }
     if (fd < 0) {
+        if (errno == ENOENT || errno == ESTALE) {
+            return std::string();
+        }
         Debug(Debug::ERROR) << "Cannot open " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
     std::string content;
     struct stat sb;
-    if (fstat(fd, &sb) == 0) {
-        content.resize(sb.st_size);
-        for (size_t done = 0; done < content.size();) {
-            const ssize_t count = pread(fd, &content[done], content.size() - done, done);
-            if (count <= 0) {
-                content.clear();
-                break;
-            }
-            done += count;
+    bool isStale = false;
+    if (fstat(fd, &sb) != 0) {
+        isStale = errno == ESTALE;
+        if (isStale == false) {
+            Debug(Debug::ERROR) << "Cannot read " << file << "\n";
+            EXIT(EXIT_FAILURE);
         }
     }
+    content.resize(isStale ? 0 : sb.st_size);
+    for (size_t done = 0; done < content.size();) {
+        const ssize_t count = pread(fd, &content[done], content.size() - done, done);
+        if (count < 0 && errno != ESTALE) {
+            Debug(Debug::ERROR) << "Cannot read " << file << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (count <= 0) {
+            isStale = true;
+            break;
+        }
+        done += count;
+    }
     close(fd);
-    return content;
+    return isStale ? std::string() : content;
 }
 
 std::string MMseqsNode::waitForFile(const std::string &file) {
