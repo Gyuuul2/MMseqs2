@@ -28,6 +28,7 @@
 #include <fcntl.h>
 
 #include <limits>
+#include <thread>
 #include <algorithm>
 
 #ifdef OPENMP
@@ -1785,13 +1786,11 @@ static void kmermatcherWithoutDiagonalInner(Parameters &par, DBReader<DBKeyType>
     delete[] groupRepSeqs;
 }
 
-static const size_t KMER_FILE_BUFFER_SIZE = 1024 * 1024;
+static const size_t KMER_FILE_BUFFER_SIZE = 16 * 1024 * 1024;
 // the bit buffer keeps less than a byte between codes, so this many bits always fit in one step
 static const unsigned int KMER_FILE_STEP_BITS = 64 - CHAR_BIT;
 // open files besides the k-mer and sequence data files: standard streams and barrier files, with headroom
 static const size_t OTHER_OPEN_FILES = 64;
-// a receiving pass holds about this many hash sub ranges
-static const size_t HASH_SUB_RANGES_PER_PASS = 2;
 // the work that all threads share is cut into this many chunks per thread
 static const size_t CHUNKS_PER_THREAD = 2;
 // a send range is cut into at least this many partitions per thread
@@ -1849,13 +1848,13 @@ struct KmerChunkStart {
     size_t bitPos[KMER_CODE_COUNT];
 };
 
-// after the rows at tableOffset in item order, writes where the rows of every item start and their end, then tableOffset; syncs and closes the file
+// after the rows at tableOffset in item order, writes where the rows of every item start and their end, then tableOffset; closes the file
 template <typename Row>
 static void writeRowTable(FILE *file, const std::string &fileName, const std::vector<size_t> &itemRowOffsets, size_t tableOffset) {
     const size_t offsetsPos = tableOffset + itemRowOffsets.back() * sizeof(Row);
     FileUtil::pwriteAll(fileno(file), fileName.c_str(), reinterpret_cast<const char *>(itemRowOffsets.data()), itemRowOffsets.size() * sizeof(size_t), offsetsPos);
     FileUtil::pwriteAll(fileno(file), fileName.c_str(), reinterpret_cast<const char *>(&tableOffset), sizeof(size_t), offsetsPos + itemRowOffsets.size() * sizeof(size_t));
-    if (fsync(fileno(file)) != 0 || fclose(file) != 0) {
+    if (fclose(file) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
@@ -2097,7 +2096,7 @@ struct PartitionMerge {
     std::vector<size_t> readRecords;
     std::vector<std::vector<PairRecordChunk> > rowRecordChunks;
     std::vector<size_t> keyOffsets;
-    std::vector<DBKeyType> targets;
+    DBKeyType *targets;
     std::vector<size_t> keyChunkOffsets;
     std::vector<size_t> keyChunkDataOffsets;
     std::vector<size_t> keyChunkEntryOffsets;
@@ -2121,6 +2120,8 @@ struct ReceivedFile {
     FILE *file;
     size_t rowTableOffset;
     std::vector<size_t> itemRowOffsets;
+    // without a file, the rows that this node sent to itself in memory
+    char *data;
 };
 
 template <typename Row>
@@ -2158,7 +2159,7 @@ static void readItemRows(const ReceivedFile &receivedFile, size_t item, std::vec
 
 static void closeReceivedFiles(std::vector<ReceivedFile> &receivedFiles) {
     for (size_t i = 0; i < receivedFiles.size(); i++) {
-        if (fclose(receivedFiles[i].file) != 0) {
+        if (receivedFiles[i].file != NULL && fclose(receivedFiles[i].file) != 0) {
             Debug(Debug::ERROR) << "Cannot close " << receivedFiles[i].fileName << "\n";
             EXIT(EXIT_FAILURE);
         }
@@ -2182,10 +2183,10 @@ static void readPassRows(const std::vector<ReceivedFile> &receivedFiles, const s
         PassRow &passRow = passRows[readOrder[i]];
         const Row &codeRow = fileRows[passRow.file][passRow.row];
         const size_t bytes = getRowEnd(codeRow) - codeRow.offsets[0];
-        if (bytes == 0) {
+        const ReceivedFile &receivedFile = receivedFiles[passRow.file];
+        if (bytes == 0 || receivedFile.data != NULL) {
             continue;
         }
-        const ReceivedFile &receivedFile = receivedFiles[passRow.file];
         passRow.bufferOffset = bufferPos;
         BatchReader::ReadRequest *last = readRequests.empty() ? NULL : &readRequests.back();
         if (last != NULL && last->fileToRead == fileno(receivedFile.file) && last->fileOffset + last->bytesToRead == codeRow.offsets[0]) {
@@ -2210,11 +2211,13 @@ static void readPassRows(const std::vector<ReceivedFile> &receivedFiles, const s
     }
 }
 
-// a reader of a code of a row: in the pass buffer at bufferOffset, or with windowBytes through window
+// a reader of a code of a row: in the memory of the received file, in the pass buffer at bufferOffset, or with windowBytes through window
 template <typename Row>
 static KmerCodeReader getRowCodeReader(const ReceivedFile &receivedFile, const Row &codeRow, size_t bufferOffset, size_t code, char *passBuffer, char *window, size_t windowBytes) {
     KmerCodeReader codeRead = {NULL, 0, 0, 0, -1, NULL, SIZE_T_MAX, 0, 0};
-    if (windowBytes == 0) {
+    if (receivedFile.data != NULL) {
+        codeRead.buffer = receivedFile.data + codeRow.offsets[code];
+    } else if (windowBytes == 0) {
         codeRead.buffer = passBuffer + bufferOffset + codeRow.offsets[code] - codeRow.offsets[0];
     } else {
         codeRead.buffer = window;
@@ -2330,7 +2333,7 @@ static void getPassRows(const KmerExchange &exchange, const std::vector<std::vec
     rows.clear();
     rowOffsets.assign(1, 0);
     for (size_t rangeHashSubRange = passFirstHashSubRange; rangeHashSubRange < passEndHashSubRange; rangeHashSubRange++) {
-        for (size_t sender = 0; sender < MMseqsNode::count; sender++) {
+        for (size_t sender = 0; sender < fileRows.size(); sender++) {
             for (size_t row = rangeHashSubRange; row < fileRows[sender].size(); row += exchange.rowsPerHashRange) {
                 if (fileRows[sender][row].groupCount > 0) {
                     const PassRow passRow = {sender, row, 0};
@@ -2356,34 +2359,32 @@ struct AssignedPairFile {
     std::vector<size_t> sendRangeRowCounts;
 };
 
-// writes the records of passBuffer by partition at reserved bytes of the pair file, a send range per thread, then their rows, a row per partition, as a block
+// writes the records of passBuffer by partition at reserved bytes of the pair file, a row per partition, then their rows as a block
 static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &pairFile, const char *passBuffer, const AssignedPairRecord *records, size_t recordCount,
                                char *writeBuffers, int threads) {
     if (recordCount == 0) {
         return;
     }
-    std::vector<AssignedPairPartition> rows;
-    std::vector<size_t> rowRecordOffsets;
-    std::vector<size_t> sendRangeRowOffsets;
-    for (size_t i = 0; i < recordCount; i++) {
-        if (i == 0 || records[i].partition != records[i - 1].partition) {
-            if (i == 0 || records[i].partition / exchange.partitionsPerRange != records[i - 1].partition / exchange.partitionsPerRange) {
-                sendRangeRowOffsets.push_back(rows.size());
-            }
-            const AssignedPairPartition row = {{0, 0, 0}, records[i].partition, 0, 0};
-            rows.push_back(row);
-            rowRecordOffsets.push_back(i);
-        }
-        // the bytes of every code until the row is placed
-        AssignedPairPartition &row = rows.back();
-        for (size_t code = 0; code < PAIR_CODE_COUNT; code++) {
-            row.offsets[code + 1] += records[i].codeBytes[code];
-        }
-        row.recordCount++;
-        row.targetCount += records[i].targetCount;
+    // the records are sorted by partition, so the records of a row follow each other
+    std::vector<size_t> rowRecordOffsets(1, 0);
+    while (rowRecordOffsets.back() < recordCount) {
+        const size_t partition = records[rowRecordOffsets.back()].partition;
+        rowRecordOffsets.push_back(std::partition_point(records + rowRecordOffsets.back(), records + recordCount,
+                                                        [&](const AssignedPairRecord &record) { return record.partition == partition; }) - records);
     }
-    rowRecordOffsets.push_back(recordCount);
-    sendRangeRowOffsets.push_back(rows.size());
+    std::vector<AssignedPairPartition> rows(rowRecordOffsets.size() - 1);
+    // the bytes of every code until the row is placed
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+    for (size_t row = 0; row < rows.size(); row++) {
+        const AssignedPairPartition partitionRow = {{0, 0, 0}, records[rowRecordOffsets[row]].partition, rowRecordOffsets[row + 1] - rowRecordOffsets[row], 0};
+        rows[row] = partitionRow;
+        for (size_t i = rowRecordOffsets[row]; i < rowRecordOffsets[row + 1]; i++) {
+            for (size_t code = 0; code < PAIR_CODE_COUNT; code++) {
+                rows[row].offsets[code + 1] += records[i].codeBytes[code];
+            }
+            rows[row].targetCount += records[i].targetCount;
+        }
+    }
     for (size_t row = 0; row < rows.size(); row++) {
         rows[row].offsets[0] = pairFile.bytes;
         for (size_t code = 0; code < PAIR_CODE_COUNT; code++) {
@@ -2392,20 +2393,16 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
         pairFile.bytes = rows[row].offsets[PAIR_CODE_COUNT];
         pairFile.sendRangeRowCounts[rows[row].partition / exchange.partitionsPerRange]++;
     }
-    const size_t sendRangeCount = sendRangeRowOffsets.size() - 1;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (size_t sendRange = 0; sendRange < sendRangeCount; sendRange++) {
+    for (size_t row = 0; row < rows.size(); row++) {
         unsigned int thread_idx = 0;
 #ifdef OPENMP
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-        KmerCodeWriter pairWrite = {fileno(pairFile.file), pairFile.name.c_str(), writeBuffers + thread_idx * KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE, 0,
-                                    rows[sendRangeRowOffsets[sendRange]].offsets[0], 0, 0};
-        for (size_t row = sendRangeRowOffsets[sendRange]; row < sendRangeRowOffsets[sendRange + 1]; row++) {
-            for (size_t code = 0; code < PAIR_CODE_COUNT; code++) {
-                for (size_t i = rowRecordOffsets[row]; i < rowRecordOffsets[row + 1]; i++) {
-                    putBytes(pairWrite, passBuffer + records[i].codeOffsets[code], records[i].codeBytes[code]);
-                }
+        KmerCodeWriter pairWrite = {fileno(pairFile.file), pairFile.name.c_str(), writeBuffers + thread_idx * KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE, 0, rows[row].offsets[0], 0, 0};
+        for (size_t code = 0; code < PAIR_CODE_COUNT; code++) {
+            for (size_t i = rowRecordOffsets[row]; i < rowRecordOffsets[row + 1]; i++) {
+                putBytes(pairWrite, passBuffer + records[i].codeOffsets[code], records[i].codeBytes[code]);
             }
         }
         writeKmerCodeBuffer(pairWrite);
@@ -2458,52 +2455,86 @@ static void countPartitionTargets(const KmerExchange &exchange, const std::vecto
         readRecords.push_back(pairRow.recordCount);
     }
     merge.pairReadStarts = pairReads;
-    keyOffsets.assign(partitionKeys + 1, 0);
+    keyOffsets.resize(partitionKeys + 1);
     const size_t chunkTargetBits = std::max<size_t>(1, partitionCodeBytes * CHAR_BIT / (CHUNKS_PER_THREAD * threads));
     merge.rowRecordChunks.assign(readRecords.size(), std::vector<PairRecordChunk>());
-#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (size_t read = 0; read < readRecords.size(); read++) {
-        KmerCodeReader &indexRead = pairReads[read * PAIR_CODE_COUNT + PAIR_INDEX_CODES];
-        size_t targetBitPos = 0;
-        size_t chunkBits = 0;
-        for (size_t record = 0; record < readRecords[read]; record++) {
-            if (record == 0 || chunkBits >= chunkTargetBits) {
-                const PairRecordChunk recordChunk = {read, indexRead, targetBitPos, 0};
-                merge.rowRecordChunks[read].push_back(recordChunk);
-                chunkBits = 0;
+    // the target count of every key, then where its targets start, summed in a part of the keys per thread and then over the parts
+    std::vector<size_t> partTargets(threads + 1, 0);
+#pragma omp parallel num_threads(threads)
+    {
+#pragma omp for schedule(static)
+        for (size_t key = 0; key <= partitionKeys; key++) {
+            keyOffsets[key] = 0;
+        }
+#pragma omp for schedule(dynamic, 1)
+        for (size_t read = 0; read < readRecords.size(); read++) {
+            KmerCodeReader &indexRead = pairReads[read * PAIR_CODE_COUNT + PAIR_INDEX_CODES];
+            size_t targetBitPos = 0;
+            size_t chunkBits = 0;
+            for (size_t record = 0; record < readRecords[read]; record++) {
+                if (record == 0 || chunkBits >= chunkTargetBits) {
+                    const PairRecordChunk recordChunk = {read, indexRead, targetBitPos, 0};
+                    merge.rowRecordChunks[read].push_back(recordChunk);
+                    chunkBits = 0;
+                }
+                const size_t targetCount = getEliasGamma(indexRead);
+                __sync_fetch_and_add(&keyOffsets[getBits(indexRead, exchange.partitionKeyBits) + 1], targetCount);
+                getBits(indexRead, indexRead.bitCount);
+                const size_t recordTargetBits = (targetCount * exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT * CHAR_BIT;
+                targetBitPos += recordTargetBits;
+                chunkBits += recordTargetBits;
+                merge.rowRecordChunks[read].back().recordCount++;
             }
-            const size_t targetCount = getEliasGamma(indexRead);
-            __sync_fetch_and_add(&keyOffsets[getBits(indexRead, exchange.partitionKeyBits) + 1], targetCount);
-            getBits(indexRead, indexRead.bitCount);
-            const size_t recordTargetBits = (targetCount * exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT * CHAR_BIT;
-            targetBitPos += recordTargetBits;
-            chunkBits += recordTargetBits;
-            merge.rowRecordChunks[read].back().recordCount++;
+        }
+#pragma omp for schedule(static)
+        for (int part = 0; part < threads; part++) {
+            const size_t partBegin = 1 + partitionKeys * part / threads;
+            const size_t partEnd = 1 + partitionKeys * (part + 1) / threads;
+            for (size_t key = partBegin + 1; key < partEnd; key++) {
+                keyOffsets[key] += keyOffsets[key - 1];
+            }
+            partTargets[part + 1] = (partEnd > partBegin) ? keyOffsets[partEnd - 1] : 0;
+        }
+#pragma omp single
+        for (int part = 0; part < threads; part++) {
+            partTargets[part + 1] += partTargets[part];
+        }
+#pragma omp for schedule(static)
+        for (int part = 1; part < threads; part++) {
+            for (size_t key = 1 + partitionKeys * part / threads; key < 1 + partitionKeys * (part + 1) / threads; key++) {
+                keyOffsets[key] += partTargets[part];
+            }
         }
     }
-    // where the targets of every key start, and chunks of keys with about the same keys and targets
+    // chunks of keys with about the same keys and targets: a chunk starts at the first key whose keys and targets before it reach a multiple of keyChunkWeight
     const size_t keyChunkWeight = std::max<size_t>(1, (partitionTargets + partitionKeys + CHUNKS_PER_THREAD * threads - 1) / (CHUNKS_PER_THREAD * threads));
     merge.keyChunkOffsets.assign(1, 0);
-    for (size_t key = 0; key < partitionKeys; key++) {
-        if (keyOffsets[key] + key >= merge.keyChunkOffsets.size() * keyChunkWeight) {
-            merge.keyChunkOffsets.push_back(key);
+    for (size_t chunk = 1; merge.keyChunkOffsets.back() < partitionKeys; chunk++) {
+        size_t low = merge.keyChunkOffsets.back();
+        size_t high = partitionKeys;
+        while (low < high) {
+            const size_t mid = low + (high - low) / 2;
+            if (keyOffsets[mid] + mid < chunk * keyChunkWeight) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
         }
-        keyOffsets[key + 1] += keyOffsets[key];
+        if (low > merge.keyChunkOffsets.back()) {
+            merge.keyChunkOffsets.push_back(low);
+        }
     }
-    merge.keyChunkOffsets.push_back(partitionKeys);
 }
 
-// with threads: places and sorts the targets of every kept key without repeats and finds where the entries and index cells of every key chunk start
-static void mergePartitionTargets(const KmerExchange &exchange, DBReader<DBKeyType> &seqDbr, size_t partitionFirstKey, PartitionMerge &merge, int threads) {
+// with threads: places the targets of every key in targets, sorts those of every kept key without repeats and finds where the entries and index cells of every key chunk start
+static void mergePartitionTargets(const KmerExchange &exchange, DBReader<DBKeyType> &seqDbr, size_t partitionFirstKey, PartitionMerge &merge, DBKeyType *targets, int threads) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
-    const size_t partitionKeys = merge.keyOffsets.size() - 1;
     std::vector<size_t> &keyOffsets = merge.keyOffsets;
-    std::vector<DBKeyType> &targets = merge.targets;
+    merge.targets = targets;
     std::vector<PairRecordChunk> recordChunks;
     for (size_t read = 0; read < merge.rowRecordChunks.size(); read++) {
         recordChunks.insert(recordChunks.end(), merge.rowRecordChunks[read].begin(), merge.rowRecordChunks[read].end());
     }
-    targets.resize(keyOffsets[partitionKeys]);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
     for (size_t chunk = 0; chunk < recordChunks.size(); chunk++) {
         PairRecordChunk &recordChunk = recordChunks[chunk];
@@ -2533,8 +2564,8 @@ static void mergePartitionTargets(const KmerExchange &exchange, DBReader<DBKeyTy
             if (isRepresentative(partitionFirstKey + key) == false) {
                 continue;
             }
-            DBKeyType *keyTargets = targets.data() + ((key > 0) ? keyOffsets[key - 1] : 0);
-            const size_t keyTargetCount = sortKeyTargets(keyTargets, targets.data() + keyOffsets[key]);
+            DBKeyType *keyTargets = targets + ((key > 0) ? keyOffsets[key - 1] : 0);
+            const size_t keyTargetCount = sortKeyTargets(keyTargets, targets + keyOffsets[key]);
             size_t entryBytes = getPrefKeyBytes(partitionFirstKey + key) + 1;
             for (size_t target = 0; target < keyTargetCount; target++) {
                 entryBytes += getPrefKeyBytes(keyTargets[target] - ((target > 0) ? keyTargets[target - 1] : 0));
@@ -2578,7 +2609,7 @@ static void writePartition(const PrefFiles &prefFiles, size_t partitionFirstKey,
                                      indexOffset + merge.keyChunkEntryOffsets[keyChunk] * 2 * sizeof(uint64_t), 0, 0};
         for (size_t key = merge.keyChunkOffsets[keyChunk]; key < merge.keyChunkOffsets[keyChunk + 1]; key++) {
             if (isRepresentative(partitionFirstKey + key)) {
-                writePrefEntry(partitionFirstKey + key, merge.targets.data() + ((key > 0) ? merge.keyOffsets[key - 1] : 0), merge.targets.data() + merge.keyOffsets[key], dataWrite, indexWrite);
+                writePrefEntry(partitionFirstKey + key, merge.targets + ((key > 0) ? merge.keyOffsets[key - 1] : 0), merge.targets + merge.keyOffsets[key], dataWrite, indexWrite);
             }
         }
         writeKmerCodeBuffer(dataWrite);
@@ -2586,10 +2617,19 @@ static void writePartition(const PrefFiles &prefFiles, size_t partitionFirstKey,
     }
 }
 
+// the rows that a node sends to itself for the first of its own hash ranges, which it takes itself, in memory instead of its k-mer file up to limit bytes
+struct OwnKmers {
+    char *data;
+    size_t bytes;
+    size_t limit;
+    std::vector<std::vector<KmerHashSubRange> > hashRangeRows;
+    std::vector<size_t> hashRanges;
+};
+
 // --createdb-mode 3 sending: the nodes take the send ranges one at a time, the k-mers of a send range in loads, written to <pref>.kmers.<node>
 template <typename T, bool includeAdjacency, typename L>
 static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, MMseqsNode::WorkQueue &sendQueue,
-                        size_t representativeBitsMemory, std::vector<size_t> &sendRanges, std::string &sendValues) {
+                        size_t representativeBitsMemory, std::vector<size_t> &sendRanges, std::string &sendValues, OwnKmers &ownKmers) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     const float kmersPerSequenceScale = par.kmersPerSequenceScale.values.aminoacid();
     const size_t readChunkBytes = std::min(MAX_INFLIGHT_READ_SIZE, exchange.loadMemoryLimit / 4);
@@ -2608,6 +2648,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
     // the k-mers of the largest send range so far, kept for the next ones so their pages are not mapped again, while they fit with the group buffers
     KmerPositionBit *hashSeqPair = NULL;
     size_t hashSeqPairCapacity = 0;
+    std::vector<char> isOwnLoadHashRange(exchange.hashRangeCount);
     for (size_t sendRange = sendQueue.claimNext(); sendRange < exchange.sendRangeCount; sendRange = sendQueue.claimNext()) {
         Timer sendRangeTimer;
         sendRanges.push_back(sendRange);
@@ -2618,8 +2659,9 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
         const auto countRepresentatives = [&](size_t from, size_t to) {
             return (representativeBits == NULL) ? to - from : Util::countSetBits(representativeBits, from - dbFrom, to - dbFrom);
         };
-        // the k-mers of a load and a group buffer per thread fit the memory, with fewer k-mers per load if needed
-        size_t kmerCapacity = exchange.loadMemoryLimit / sizeof(KmerPositionBit);
+        // the k-mers of a load and a group buffer per thread fit the memory beside the own rows, with fewer k-mers per load if needed
+        const size_t loadMemoryLimit = exchange.loadMemoryLimit - ownKmers.bytes;
+        size_t kmerCapacity = loadMemoryLimit / sizeof(KmerPositionBit);
         std::vector<size_t> loadOffsets;
         size_t maxLoadKmers = 0;
         size_t maxLoadKeys = 0;
@@ -2680,7 +2722,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
             // a group buffer holds the ids of a group, or for a bigger group a bit per key of the load and the count of set bits before every 512 of them
             groupBufferWords = (maxLoadKeys + 63) / 64 + (maxLoadKeys + 511) / 512;
             fixedBytes = par.threads * groupBufferWords * sizeof(uint64_t);
-            if (fixedBytes + maxLoadKmers * sizeof(KmerPositionBit) <= exchange.loadMemoryLimit) {
+            if (fixedBytes + maxLoadKmers * sizeof(KmerPositionBit) <= loadMemoryLimit) {
                 break;
             }
             if (maxLoadKmers == 0) {
@@ -2690,7 +2732,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                 EXIT(EXIT_FAILURE);
             }
             // fewer k-mers per load take fewer keys per group buffer
-            kmerCapacity = std::min(maxLoadKmers - 1, (fixedBytes < exchange.loadMemoryLimit) ? (exchange.loadMemoryLimit - fixedBytes) / sizeof(KmerPositionBit) : maxLoadKmers / 2);
+            kmerCapacity = std::min(maxLoadKmers - 1, (fixedBytes < loadMemoryLimit) ? (loadMemoryLimit - fixedBytes) / sizeof(KmerPositionBit) : maxLoadKmers / 2);
         }
         const size_t loadCount = loadOffsets.size() - 1;
         if (loadCount > 1) {
@@ -2704,7 +2746,8 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
         KmerPositionBit::kmerShift = idBits + exchange.adjKeyBits;
         KmerPositionBit::maxSeqLen = 0;
 
-        if (maxLoadKmers > hashSeqPairCapacity || fixedBytes + hashSeqPairCapacity * sizeof(KmerPositionBit) > exchange.loadMemoryLimit) {
+        if (maxLoadKmers > hashSeqPairCapacity || fixedBytes + hashSeqPairCapacity * sizeof(KmerPositionBit) > loadMemoryLimit) {
+            Util::releasePages(hashSeqPair, hashSeqPairCapacity * sizeof(KmerPositionBit));
             delete[] hashSeqPair;
             hashSeqPairCapacity = maxLoadKmers;
             hashSeqPair = new(std::nothrow) KmerPositionBit[hashSeqPairCapacity];
@@ -2755,142 +2798,160 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
             const size_t loadWords = (loadOffsets[load + 1] - loadOffsets[load] + 63) / 64;
             // the code bytes of every row, as they are written below
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-            for (size_t hashRange = 0; hashRange < exchange.hashRangeCount; hashRange++) {
-                unsigned int thread_idx = 0;
-#ifdef OPENMP
-                thread_idx = static_cast<unsigned int>(omp_get_thread_num());
-#endif
-                uint64_t *groupBuffer = groupBuffers + thread_idx * groupBufferWords;
-                uint64_t *setBitCounts = groupBuffer + (maxLoadKeys + 63) / 64;
-                for (size_t row = 0; row < exchange.rowsPerHashRange; row++) {
-                    const bool isWholeSequence = (row >= exchange.hashSubRangesPerRange);
-                    const size_t hashSubRange = hashRange * exchange.hashSubRangesPerRange + row % exchange.hashSubRangesPerRange;
-                    const size_t from = (isWholeSequence ? wholeSequenceOffsets : hashSubRangeOffsets)[hashSubRange];
-                    const size_t to = (isWholeSequence ? wholeSequenceOffsets : hashSubRangeOffsets)[hashSubRange + 1];
-                    const unsigned int hashShift = isWholeSequence ? 0 : exchange.kmerHashShift;
-                    KmerHashSubRange &hashSubRangeRow = loadRows[hashRange * exchange.rowsPerHashRange + row];
-                    const KmerHashSubRange emptyRow = {static_cast<DBKeyType>(loadOffsets[load]), idBits, {0, 0, 0, 0}, 0};
-                    hashSubRangeRow = emptyRow;
-                    for (size_t pos = from; pos < to; pos++) {
-                        hashSubRangeRow.groupCount += (pos == from || hashSeqPair[pos].getKmer() != hashSeqPair[pos - 1].getKmer());
-                    }
-                    const unsigned int hashDiffLowBits = getHashDiffLowBits(hashSubRange, exchange.hashSubRangeCount, hashShift, hashSubRangeRow.groupCount);
-                    uint64_t prevHash = static_cast<uint64_t>(getHashSubRangeStart(hashSubRange, exchange.hashSubRangeCount, hashShift));
-                    size_t codeBits[KMER_CODE_COUNT] = {0, 0, 0};
-                    for (size_t groupStart = from, groupEnd = from; groupStart < to; groupStart = groupEnd) {
-                        const uint64_t hash = static_cast<uint64_t>(hashSeqPair[groupStart].getKmer()) >> hashShift;
-                        size_t repCandidateCount = 1;
-                        for (groupEnd = groupStart + 1; groupEnd < to && hashSeqPair[groupEnd].getKmer() == hashSeqPair[groupStart].getKmer(); groupEnd++) {
-                            repCandidateCount += (hashSeqPair[groupEnd].getAdjKey() != hashSeqPair[groupEnd - 1].getAdjKey());
-                        }
-                        const size_t memberCount = getGroupIds(hashSeqPair, groupStart, groupEnd, groupBuffer, groupBufferWords, setBitCounts, loadWords);
-                        codeBits[KMER_MEMBER_CODES] += memberCount * idBits;
-                        codeBits[KMER_INDEX_CODES] += (((groupStart == from) ? hash - prevHash : hash - prevHash - 1) >> hashDiffLowBits) + 1 + hashDiffLowBits
-                                                      + 2 * getBitWidth(memberCount) - 1;
-                        if (isWholeSequence == false) {
-                            codeBits[KMER_REP_CANDIDATE_CODES] += repCandidateCount * (exchange.adjKeyBits + getBitWidth(memberCount - 1));
-                            codeBits[KMER_INDEX_CODES] += 2 * getBitWidth(repCandidateCount) - 1;
-                        }
-                        prevHash = hash;
-                    }
-                    for (size_t code = 0; code < KMER_CODE_COUNT; code++) {
-                        hashSubRangeRow.offsets[code + 1] = hashSubRangeRow.offsets[code] + (codeBits[code] + CHAR_BIT - 1) / CHAR_BIT;
-                    }
-                }
-            }
-            // the rows of the hash ranges follow each other in the k-mer file
             for (size_t row = 0; row < loadRows.size(); row++) {
-                for (size_t code = 0; code <= KMER_CODE_COUNT; code++) {
-                    loadRows[row].offsets[code] += kmerFileBytes;
-                }
-                kmerFileBytes = loadRows[row].offsets[KMER_CODE_COUNT];
-            }
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-            for (size_t hashRange = 0; hashRange < exchange.hashRangeCount; hashRange++) {
                 unsigned int thread_idx = 0;
 #ifdef OPENMP
                 thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-                KmerCodeWriter codeWrite = {fileno(kmerFileHandle), kmerFile.c_str(), kmerWriteBuffer + thread_idx * KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE, 0,
-                                            loadRows[hashRange * exchange.rowsPerHashRange].offsets[0], 0, 0};
                 uint64_t *groupBuffer = groupBuffers + thread_idx * groupBufferWords;
                 uint64_t *setBitCounts = groupBuffer + (maxLoadKeys + 63) / 64;
-                for (size_t row = 0; row < exchange.rowsPerHashRange; row++) {
-                    const bool isWholeSequence = (row >= exchange.hashSubRangesPerRange);
-                    const size_t hashSubRange = hashRange * exchange.hashSubRangesPerRange + row % exchange.hashSubRangesPerRange;
-                    const size_t from = (isWholeSequence ? wholeSequenceOffsets : hashSubRangeOffsets)[hashSubRange];
-                    const size_t to = (isWholeSequence ? wholeSequenceOffsets : hashSubRangeOffsets)[hashSubRange + 1];
-                    const unsigned int hashShift = isWholeSequence ? 0 : exchange.kmerHashShift;
-                    const KmerHashSubRange &hashSubRangeRow = loadRows[hashRange * exchange.rowsPerHashRange + row];
-                    // a code ends at a byte boundary, where the next one starts
-                    const auto endCode = [&](size_t code) {
-                        putBits(codeWrite, 0, (CHAR_BIT - codeWrite.bitCount) % CHAR_BIT);
-                        if (codeWrite.writePos + codeWrite.bufferPos != hashSubRangeRow.offsets[code + 1]) {
-                            Debug(Debug::ERROR) << "Cannot write " << kmerFile << "\n";
-                            EXIT(EXIT_FAILURE);
-                        }
-                    };
-                    // the codes of a row follow each other: the ids of the members, the rep candidates, then the index
-                    for (size_t groupStart = from, groupEnd = from; groupStart < to; groupStart = groupEnd) {
-                        for (groupEnd = groupStart + 1; groupEnd < to && hashSeqPair[groupEnd].getKmer() == hashSeqPair[groupStart].getKmer(); groupEnd++) {}
-                        const size_t memberCount = getGroupIds(hashSeqPair, groupStart, groupEnd, groupBuffer, groupBufferWords, setBitCounts, loadWords);
-                        if (groupEnd - groupStart <= groupBufferWords) {
-                            for (size_t member = 0; member < memberCount; member++) {
-                                putBits(codeWrite, groupBuffer[member], idBits);
-                            }
-                        } else {
-                            for (size_t word = 0; word < loadWords; word++) {
-                                for (uint64_t bits = groupBuffer[word]; bits != 0; bits &= bits - 1) {
-                                    putBits(codeWrite, word * 64 + __builtin_ctzll(bits), idBits);
-                                }
-                            }
-                        }
-                    }
-                    endCode(KMER_MEMBER_CODES);
-                    // a rep candidate is the first member of an adjKey, so the smallest id, as its index in the members of the group; a whole sequence has none
-                    for (size_t groupStart = from, groupEnd = from; isWholeSequence == false && groupStart < to; groupStart = groupEnd) {
-                        for (groupEnd = groupStart + 1; groupEnd < to && hashSeqPair[groupEnd].getKmer() == hashSeqPair[groupStart].getKmer(); groupEnd++) {}
-                        const size_t memberCount = getGroupIds(hashSeqPair, groupStart, groupEnd, groupBuffer, groupBufferWords, setBitCounts, loadWords);
-                        const unsigned int memberIndexBits = getBitWidth(memberCount - 1);
-                        for (size_t pos = groupStart; pos < groupEnd; pos++) {
-                            if (pos > groupStart && hashSeqPair[pos].getAdjKey() == hashSeqPair[pos - 1].getAdjKey()) {
-                                continue;
-                            }
-                            const DBKeyType id = hashSeqPair[pos].getId();
-                            size_t memberIndex = 0;
-                            if (groupEnd - groupStart <= groupBufferWords) {
-                                memberIndex = std::lower_bound(groupBuffer, groupBuffer + memberCount, id) - groupBuffer;
-                            } else {
-                                memberIndex = setBitCounts[id / 512] + __builtin_popcountll(groupBuffer[id / 64] & ((1ULL << (id % 64)) - 1));
-                                for (size_t word = id / 512 * 8; word < id / 64; word++) {
-                                    memberIndex += __builtin_popcountll(groupBuffer[word]);
-                                }
-                            }
-                            putBits(codeWrite, hashSeqPair[pos].getAdjKey(), exchange.adjKeyBits);
-                            putBits(codeWrite, memberIndex, memberIndexBits);
-                        }
-                    }
-                    endCode(KMER_REP_CANDIDATE_CODES);
-                    const unsigned int hashDiffLowBits = getHashDiffLowBits(hashSubRange, exchange.hashSubRangeCount, hashShift, hashSubRangeRow.groupCount);
-                    uint64_t prevHash = static_cast<uint64_t>(getHashSubRangeStart(hashSubRange, exchange.hashSubRangeCount, hashShift));
-                    for (size_t groupStart = from, groupEnd = from; groupStart < to; groupStart = groupEnd) {
-                        const uint64_t hash = static_cast<uint64_t>(hashSeqPair[groupStart].getKmer()) >> hashShift;
-                        size_t repCandidateCount = 1;
-                        for (groupEnd = groupStart + 1; groupEnd < to && hashSeqPair[groupEnd].getKmer() == hashSeqPair[groupStart].getKmer(); groupEnd++) {
-                            repCandidateCount += (hashSeqPair[groupEnd].getAdjKey() != hashSeqPair[groupEnd - 1].getAdjKey());
-                        }
-                        putRice(codeWrite, (groupStart == from) ? hash - prevHash : hash - prevHash - 1, hashDiffLowBits);
-                        putEliasGamma(codeWrite, getGroupIds(hashSeqPair, groupStart, groupEnd, groupBuffer, groupBufferWords, setBitCounts, loadWords));
-                        if (isWholeSequence == false) {
-                            putEliasGamma(codeWrite, repCandidateCount);
-                        }
-                        prevHash = hash;
-                    }
-                    endCode(KMER_INDEX_CODES);
+                const bool isWholeSequence = (row % exchange.rowsPerHashRange >= exchange.hashSubRangesPerRange);
+                const size_t hashSubRange = row / exchange.rowsPerHashRange * exchange.hashSubRangesPerRange + row % exchange.hashSubRangesPerRange;
+                const size_t from = (isWholeSequence ? wholeSequenceOffsets : hashSubRangeOffsets)[hashSubRange];
+                const size_t to = (isWholeSequence ? wholeSequenceOffsets : hashSubRangeOffsets)[hashSubRange + 1];
+                const unsigned int hashShift = isWholeSequence ? 0 : exchange.kmerHashShift;
+                KmerHashSubRange &hashSubRangeRow = loadRows[row];
+                const KmerHashSubRange emptyRow = {static_cast<DBKeyType>(loadOffsets[load]), idBits, {0, 0, 0, 0}, 0};
+                hashSubRangeRow = emptyRow;
+                for (size_t pos = from; pos < to; pos++) {
+                    hashSubRangeRow.groupCount += (pos == from || hashSeqPair[pos].getKmer() != hashSeqPair[pos - 1].getKmer());
                 }
-                writeKmerCodeBuffer(codeWrite);
-                kmerFileRows[hashRange].insert(kmerFileRows[hashRange].end(), loadRows.begin() + hashRange * exchange.rowsPerHashRange,
-                                               loadRows.begin() + (hashRange + 1) * exchange.rowsPerHashRange);
+                const unsigned int hashDiffLowBits = getHashDiffLowBits(hashSubRange, exchange.hashSubRangeCount, hashShift, hashSubRangeRow.groupCount);
+                uint64_t prevHash = static_cast<uint64_t>(getHashSubRangeStart(hashSubRange, exchange.hashSubRangeCount, hashShift));
+                size_t codeBits[KMER_CODE_COUNT] = {0, 0, 0};
+                for (size_t groupStart = from, groupEnd = from; groupStart < to; groupStart = groupEnd) {
+                    const uint64_t hash = static_cast<uint64_t>(hashSeqPair[groupStart].getKmer()) >> hashShift;
+                    size_t repCandidateCount = 1;
+                    for (groupEnd = groupStart + 1; groupEnd < to && hashSeqPair[groupEnd].getKmer() == hashSeqPair[groupStart].getKmer(); groupEnd++) {
+                        repCandidateCount += (hashSeqPair[groupEnd].getAdjKey() != hashSeqPair[groupEnd - 1].getAdjKey());
+                    }
+                    const size_t memberCount = getGroupIds(hashSeqPair, groupStart, groupEnd, groupBuffer, groupBufferWords, setBitCounts, loadWords);
+                    codeBits[KMER_MEMBER_CODES] += memberCount * idBits;
+                    codeBits[KMER_INDEX_CODES] += (((groupStart == from) ? hash - prevHash : hash - prevHash - 1) >> hashDiffLowBits) + 1 + hashDiffLowBits
+                                                  + 2 * getBitWidth(memberCount) - 1;
+                    if (isWholeSequence == false) {
+                        codeBits[KMER_REP_CANDIDATE_CODES] += repCandidateCount * (exchange.adjKeyBits + getBitWidth(memberCount - 1));
+                        codeBits[KMER_INDEX_CODES] += 2 * getBitWidth(repCandidateCount) - 1;
+                    }
+                    prevHash = hash;
+                }
+                for (size_t code = 0; code < KMER_CODE_COUNT; code++) {
+                    hashSubRangeRow.offsets[code + 1] = hashSubRangeRow.offsets[code] + (codeBits[code] + CHAR_BIT - 1) / CHAR_BIT;
+                }
+            }
+            // the own hash ranges keep their rows of the load in memory up to the first that does not fit beside the load
+            const size_t ownLoadLimit = std::min(exchange.loadMemoryLimit - ownKmers.bytes - fixedBytes - hashSeqPairCapacity * sizeof(KmerPositionBit),
+                                                 ownKmers.limit - std::min(ownKmers.limit, ownKmers.bytes));
+            size_t ownLoadBytes = 0;
+            isOwnLoadHashRange.assign(exchange.hashRangeCount, false);
+            for (size_t i = 0; i < ownKmers.hashRanges.size(); i++) {
+                const size_t hashRange = ownKmers.hashRanges[i];
+                size_t hashRangeBytes = 0;
+                for (size_t row = hashRange * exchange.rowsPerHashRange; row < (hashRange + 1) * exchange.rowsPerHashRange; row++) {
+                    hashRangeBytes += loadRows[row].offsets[KMER_CODE_COUNT];
+                }
+                if (ownLoadBytes + hashRangeBytes > ownLoadLimit) {
+                    break;
+                }
+                isOwnLoadHashRange[hashRange] = true;
+                ownLoadBytes += hashRangeBytes;
+            }
+            // the rows of the hash ranges follow each other in the k-mer file or in memory
+            for (size_t row = 0; row < loadRows.size(); row++) {
+                size_t &bytes = isOwnLoadHashRange[row / exchange.rowsPerHashRange] ? ownKmers.bytes : kmerFileBytes;
+                for (size_t code = 0; code <= KMER_CODE_COUNT; code++) {
+                    loadRows[row].offsets[code] += bytes;
+                }
+                bytes = loadRows[row].offsets[KMER_CODE_COUNT];
+            }
+            if (ownLoadBytes > 0) {
+                ownKmers.data = static_cast<char *>(realloc(ownKmers.data, ownKmers.bytes));
+                Util::checkAllocation(ownKmers.data, "Can not allocate ownKmers memory in sendKmers");
+            }
+            // a row writes its codes in one pass over its groups: the ids of the members, the rep candidates and the index, each at its offset
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+            for (size_t row = 0; row < loadRows.size(); row++) {
+                unsigned int thread_idx = 0;
+#ifdef OPENMP
+                thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+                uint64_t *groupBuffer = groupBuffers + thread_idx * groupBufferWords;
+                uint64_t *setBitCounts = groupBuffer + (maxLoadKeys + 63) / 64;
+                const bool isWholeSequence = (row % exchange.rowsPerHashRange >= exchange.hashSubRangesPerRange);
+                const size_t hashSubRange = row / exchange.rowsPerHashRange * exchange.hashSubRangesPerRange + row % exchange.hashSubRangesPerRange;
+                const size_t from = (isWholeSequence ? wholeSequenceOffsets : hashSubRangeOffsets)[hashSubRange];
+                const size_t to = (isWholeSequence ? wholeSequenceOffsets : hashSubRangeOffsets)[hashSubRange + 1];
+                const unsigned int hashShift = isWholeSequence ? 0 : exchange.kmerHashShift;
+                const KmerHashSubRange &hashSubRangeRow = loadRows[row];
+                const size_t codeBufferSize = KMER_FILE_BUFFER_SIZE / KMER_CODE_COUNT;
+                KmerCodeWriter codeWrites[KMER_CODE_COUNT];
+                for (size_t code = 0; code < KMER_CODE_COUNT; code++) {
+                    const size_t writePos = hashSubRangeRow.offsets[code];
+                    codeWrites[code] = isOwnLoadHashRange[row / exchange.rowsPerHashRange]
+                        ? KmerCodeWriter{-1, NULL, ownKmers.data + writePos, ownKmers.bytes - writePos, 0, writePos, 0, 0}
+                        : KmerCodeWriter{fileno(kmerFileHandle), kmerFile.c_str(), kmerWriteBuffer + thread_idx * KMER_FILE_BUFFER_SIZE + code * codeBufferSize, codeBufferSize, 0, writePos, 0, 0};
+                }
+                const unsigned int hashDiffLowBits = getHashDiffLowBits(hashSubRange, exchange.hashSubRangeCount, hashShift, hashSubRangeRow.groupCount);
+                uint64_t prevHash = static_cast<uint64_t>(getHashSubRangeStart(hashSubRange, exchange.hashSubRangeCount, hashShift));
+                for (size_t groupStart = from, groupEnd = from; groupStart < to; groupStart = groupEnd) {
+                    const uint64_t hash = static_cast<uint64_t>(hashSeqPair[groupStart].getKmer()) >> hashShift;
+                    size_t repCandidateCount = 1;
+                    for (groupEnd = groupStart + 1; groupEnd < to && hashSeqPair[groupEnd].getKmer() == hashSeqPair[groupStart].getKmer(); groupEnd++) {
+                        repCandidateCount += (hashSeqPair[groupEnd].getAdjKey() != hashSeqPair[groupEnd - 1].getAdjKey());
+                    }
+                    const size_t memberCount = getGroupIds(hashSeqPair, groupStart, groupEnd, groupBuffer, groupBufferWords, setBitCounts, loadWords);
+                    if (groupEnd - groupStart <= groupBufferWords) {
+                        for (size_t member = 0; member < memberCount; member++) {
+                            putBits(codeWrites[KMER_MEMBER_CODES], groupBuffer[member], idBits);
+                        }
+                    } else {
+                        for (size_t word = 0; word < loadWords; word++) {
+                            for (uint64_t bits = groupBuffer[word]; bits != 0; bits &= bits - 1) {
+                                putBits(codeWrites[KMER_MEMBER_CODES], word * 64 + __builtin_ctzll(bits), idBits);
+                            }
+                        }
+                    }
+                    // a rep candidate is the first member of an adjKey, so the smallest id, as its index in the members of the group; a whole sequence has none
+                    const unsigned int memberIndexBits = getBitWidth(memberCount - 1);
+                    for (size_t pos = groupStart; isWholeSequence == false && pos < groupEnd; pos++) {
+                        if (pos > groupStart && hashSeqPair[pos].getAdjKey() == hashSeqPair[pos - 1].getAdjKey()) {
+                            continue;
+                        }
+                        const DBKeyType id = hashSeqPair[pos].getId();
+                        size_t memberIndex = 0;
+                        if (groupEnd - groupStart <= groupBufferWords) {
+                            memberIndex = std::lower_bound(groupBuffer, groupBuffer + memberCount, id) - groupBuffer;
+                        } else {
+                            memberIndex = setBitCounts[id / 512] + __builtin_popcountll(groupBuffer[id / 64] & ((1ULL << (id % 64)) - 1));
+                            for (size_t word = id / 512 * 8; word < id / 64; word++) {
+                                memberIndex += __builtin_popcountll(groupBuffer[word]);
+                            }
+                        }
+                        putBits(codeWrites[KMER_REP_CANDIDATE_CODES], hashSeqPair[pos].getAdjKey(), exchange.adjKeyBits);
+                        putBits(codeWrites[KMER_REP_CANDIDATE_CODES], memberIndex, memberIndexBits);
+                    }
+                    putRice(codeWrites[KMER_INDEX_CODES], (groupStart == from) ? hash - prevHash : hash - prevHash - 1, hashDiffLowBits);
+                    putEliasGamma(codeWrites[KMER_INDEX_CODES], memberCount);
+                    if (isWholeSequence == false) {
+                        putEliasGamma(codeWrites[KMER_INDEX_CODES], repCandidateCount);
+                    }
+                    prevHash = hash;
+                }
+                // a code ends at a byte boundary, where the next one starts
+                for (size_t code = 0; code < KMER_CODE_COUNT; code++) {
+                    putBits(codeWrites[code], 0, (CHAR_BIT - codeWrites[code].bitCount) % CHAR_BIT);
+                    if (codeWrites[code].writePos + codeWrites[code].bufferPos != hashSubRangeRow.offsets[code + 1]) {
+                        Debug(Debug::ERROR) << "Cannot write " << kmerFile << "\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    if (codeWrites[code].fd != -1) {
+                        writeKmerCodeBuffer(codeWrites[code]);
+                    }
+                }
+            }
+            for (size_t hashRange = 0; hashRange < exchange.hashRangeCount; hashRange++) {
+                std::vector<KmerHashSubRange> &hashRangeRows = (isOwnLoadHashRange[hashRange] ? ownKmers.hashRangeRows : kmerFileRows)[hashRange];
+                hashRangeRows.insert(hashRangeRows.end(), loadRows.begin() + hashRange * exchange.rowsPerHashRange, loadRows.begin() + (hashRange + 1) * exchange.rowsPerHashRange);
             }
             Debug(Debug::INFO) << "Time for write: " << timer.lap() << "\n";
         }
@@ -2899,6 +2960,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
     }
     seqDbr.releaseDataPages();
     delete[] kmerWriteBuffer;
+    Util::releasePages(hashSeqPair, hashSeqPairCapacity * sizeof(KmerPositionBit));
     delete[] hashSeqPair;
     // the rows of the k-mer file by hash range, which the receiving nodes read after the barrier
     std::vector<KmerHashSubRange> rows;
@@ -2927,7 +2989,7 @@ struct ReceivedHashRange {
 
 // --createdb-mode 3 receiving: the nodes take the hash ranges one at a time, in passes, and write the pairs of the chosen reps to <pref>.pairs.<node>
 static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange, MMseqsNode::WorkQueue &hashQueue, std::vector<size_t> &hashRanges,
-                           std::string &receiveValues, size_t &pairBytes) {
+                           std::string &receiveValues, size_t &pairBytes, const OwnKmers &ownKmers) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     // the index codes of a pair record at most: the gamma code of its target count, fewer than the database keys, and its key in its partition
     const size_t recordIndexBytes = (2 * getBitWidth(seqDbr.getSize()) + exchange.partitionKeyBits + CHAR_BIT - 1) / CHAR_BIT;
@@ -2939,17 +3001,18 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     pairFile.sendRangeRowCounts.assign(exchange.sendRangeCount, 0);
     char *pairWriteBuffer = new(std::nothrow) char[par.threads * KMER_FILE_BUFFER_SIZE];
     Util::checkAllocation(pairWriteBuffer, "Can not allocate pairWriteBuffer memory in receiveKmers");
-    // the k-mer file of every sender, open for the whole phase
-    std::vector<ReceivedFile> receivedFiles(MMseqsNode::count);
+    // the k-mer file of every sender, open for the whole phase, then the own rows in memory
+    std::vector<ReceivedFile> receivedFiles(MMseqsNode::count + 1);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-    for (size_t sender = 0; sender < receivedFiles.size(); sender++) {
+    for (size_t sender = 0; sender < MMseqsNode::count; sender++) {
         receivedFiles[sender].fileName = par.db2 + ".kmers." + SSTR(sender);
         openReceivedFile<KmerHashSubRange>(receivedFiles[sender], exchange.hashRangeCount);
     }
+    receivedFiles[MMseqsNode::count].data = ownKmers.data;
 
     std::vector<KmerChunkStart> chunkStarts;
-    // a pass and the prefetched next one fit their limit beside the rows of a flush; a bigger hash sub range is a pass that reads its codes in windows
-    const size_t passLimit = getPassLimit(exchange.loadMemoryLimit - std::min(exchange.loadMemoryLimit, exchange.pairRowsMemory));
+    // a pass and the prefetched next one fit their limit beside the rows of a flush and the own rows; a bigger hash sub range is a pass that reads its codes in windows
+    const size_t passLimit = getPassLimit(exchange.loadMemoryLimit - std::min(exchange.loadMemoryLimit, exchange.pairRowsMemory + ownKmers.bytes));
     // the records and code output of a flush, then two code buffers for a pass and the prefetched next one, or the windows of a windowed pass
     const size_t outputBytes = passLimit;
     // the buffer of the largest hash range so far, kept for the next ones so their pages are not mapped again
@@ -2968,7 +3031,8 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     size_t receivedBytes = 0;
     const auto planHashRange = [&](ReceivedHashRange &received, size_t hashRange) {
         received.hashRange = hashRange;
-        received.fileRows.resize(MMseqsNode::count);
+        received.fileRows.resize(MMseqsNode::count + 1);
+        received.fileRows[MMseqsNode::count] = ownKmers.hashRangeRows[hashRange];
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
         for (size_t sender = 0; sender < MMseqsNode::count; sender++) {
             readItemRows(receivedFiles[sender], hashRange, received.fileRows[sender]);
@@ -2982,20 +3046,21 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
         std::vector<size_t> hashSubRangeCodeBytes(exchange.rowsPerHashRange, 0);
         // the output of a hash sub range at most: a record per group and representative, every member a target of every representative
         received.hashSubRangeOutputBounds.assign(exchange.rowsPerHashRange, 0);
-        for (size_t sender = 0; sender < MMseqsNode::count; sender++) {
+        for (size_t sender = 0; sender < received.fileRows.size(); sender++) {
             const std::vector<KmerHashSubRange> &rows = received.fileRows[sender];
             for (size_t row = 0; row < rows.size(); row++) {
                 const size_t rangeHashSubRange = row % exchange.rowsPerHashRange;
                 const size_t groupMaxRepSeqs = (row % exchange.rowsPerHashRange >= exchange.hashSubRangesPerRange) ? 1 : exchange.maxRepSeqs;
                 const size_t members = (rows[row].offsets[KMER_REP_CANDIDATE_CODES] - rows[row].offsets[KMER_MEMBER_CODES]) * CHAR_BIT / std::max(1U, rows[row].idBits);
                 received.hashSubRangeReads[rangeHashSubRange] += (rows[row].groupCount > 0);
-                hashSubRangeCodeBytes[rangeHashSubRange] += getRowEnd(rows[row]) - rows[row].offsets[0];
+                receivedBytes += getRowEnd(rows[row]) - rows[row].offsets[0];
+                // a pass reads the rows of the files to its code buffer
+                if (receivedFiles[sender].data == NULL) {
+                    hashSubRangeCodeBytes[rangeHashSubRange] += getRowEnd(rows[row]) - rows[row].offsets[0];
+                }
                 received.hashSubRangeOutputBounds[rangeHashSubRange] += groupMaxRepSeqs * (rows[row].groupCount * (sizeof(AssignedPairRecord) + recordIndexBytes + 1)
                                                                                           + (members * exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT);
             }
-        }
-        for (size_t rangeHashSubRange = 0; rangeHashSubRange < exchange.rowsPerHashRange; rangeHashSubRange++) {
-            receivedBytes += hashSubRangeCodeBytes[rangeHashSubRange];
         }
         const size_t maxPassBytes = planPasses(hashSubRangeCodeBytes, passLimit, received.passHashSubRangeOffsets, received.passBytes);
         const bool hasWindowedPass = (*std::max_element(received.passBytes.begin(), received.passBytes.end()) > passLimit);
@@ -3019,8 +3084,13 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
         readPassRows(receivedFiles, received.fileRows, passRows[codeBuffer], passBuffer + outputBytes + codeBuffer * codeBufferBytes, isAsync, batchReader, par.threads);
     };
 
+    // the hash ranges of the own rows first, which this node took while sending
+    size_t ownHashRanges = 0;
+    const auto takeHashRange = [&]() {
+        return (ownHashRanges < ownKmers.hashRanges.size()) ? ownKmers.hashRanges[ownHashRanges++] : hashQueue.claimNext();
+    };
     ReceivedHashRange receivedHashRanges[2];
-    size_t hashRange = hashQueue.claimNext();
+    size_t hashRange = takeHashRange();
     if (hashRange < exchange.hashRangeCount) {
         planHashRange(receivedHashRanges[0], hashRange);
     }
@@ -3038,6 +3108,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
         }
         // a hash range that needs a bigger buffer is not prefetched
         if (passBuffer == NULL || received.codeBufferBytes > codeBufferBytes) {
+            Util::releasePages(passBuffer, outputBytes + 2 * codeBufferBytes);
             delete[] passBuffer;
             codeBufferBytes = received.codeBufferBytes;
             passBuffer = new(std::nothrow) char[outputBytes + 2 * codeBufferBytes];
@@ -3068,7 +3139,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
             }
             // the last pass takes the next hash range, so its first pass is read while this one is merged
             if (pass + 1 == passCount) {
-                nextHashRange = hashQueue.claimNext();
+                nextHashRange = takeHashRange();
                 if (nextHashRange < exchange.hashRangeCount) {
                     planHashRange(nextReceived, nextHashRange);
                 }
@@ -3461,6 +3532,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     }
     delete batchReader;
     closeReceivedFiles(receivedFiles);
+    Util::releasePages(passBuffer, outputBytes + 2 * codeBufferBytes);
     delete[] passBuffer;
     delete[] pairWriteBuffer;
     // the row table: the rows of every flush, a block in send range order, go to their send range in file order
@@ -3512,6 +3584,9 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     // the buffer of the largest send range so far, kept for the next ones so their pages are not mapped again
     char *pairPassBuffer = NULL;
     size_t pairPassBufferBytes = 0;
+    // the targets of the partitions of a pass, one after the other, kept like pairPassBuffer
+    DBKeyType *pairPassTargets = NULL;
+    size_t pairPassTargetsSize = 0;
     // the pair file of every receiving node, open for the whole phase, and its rows of a send range
     std::vector<ReceivedFile> receivedPairFiles(MMseqsNode::count);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
@@ -3574,13 +3649,17 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
         const size_t pairPassCount = pairPassBytes.size();
         std::vector<size_t> pairPassCodeBytes(pairPassCount, 0);
         size_t maxPairPassCodeBytes = 0;
+        size_t maxPairPassTargets = 0;
         bool hasWindowedPairPass = false;
         for (size_t pass = 0; pass < pairPassCount; pass++) {
+            size_t pairPassTargetCount = 0;
             for (size_t partition = passPartitionOffsets[pass]; partition < passPartitionOffsets[pass + 1]; partition++) {
                 pairPassCodeBytes[pass] += partitionCodeBytes[partition];
+                pairPassTargetCount += partitionTargets[partition];
             }
             if (pairPassBytes[pass] <= pairPassLimit) {
                 maxPairPassCodeBytes = std::max(maxPairPassCodeBytes, pairPassCodeBytes[pass]);
+                maxPairPassTargets = std::max(maxPairPassTargets, pairPassTargetCount);
             } else {
                 hasWindowedPairPass = true;
             }
@@ -3588,10 +3667,19 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
 
         // two code buffers for a pass and the prefetched next one, or the windows and then the targets or merge windows of a windowed pass
         if (std::max(2 * maxPairPassCodeBytes, hasWindowedPairPass ? 2 * pairPassLimit : 0) > pairPassBufferBytes) {
+            Util::releasePages(pairPassBuffer, pairPassBufferBytes);
             delete[] pairPassBuffer;
             pairPassBufferBytes = std::max(2 * maxPairPassCodeBytes, hasWindowedPairPass ? 2 * pairPassLimit : 0);
             pairPassBuffer = new(std::nothrow) char[pairPassBufferBytes];
             Util::checkAllocation(pairPassBuffer, "Can not allocate pairPassBuffer memory in mergeAssignedPairs");
+        }
+        // the threads that place the targets touch their pages first
+        if (maxPairPassTargets > pairPassTargetsSize) {
+            Util::releasePages(pairPassTargets, pairPassTargetsSize * sizeof(DBKeyType));
+            delete[] pairPassTargets;
+            pairPassTargetsSize = maxPairPassTargets;
+            pairPassTargets = new(std::nothrow) DBKeyType[pairPassTargetsSize];
+            Util::checkAllocation(pairPassTargets, "Can not allocate pairPassTargets memory in mergeAssignedPairs");
         }
         BatchReader *batchReader = NULL;
         // the rows of a pass, partition after partition, and where the rows of every partition start
@@ -3636,6 +3724,10 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                            || (partitionTargets[passFirstPartition + first] == partitionTargets[passFirstPartition + second] && first < second);
                 });
                 partitionMerges.resize(passPartitions);
+                std::vector<size_t> partitionTargetOffsets(passPartitions + 1, 0);
+                for (size_t passPartition = 0; passPartition < passPartitions; passPartition++) {
+                    partitionTargetOffsets[passPartition + 1] = partitionTargetOffsets[passPartition] + partitionTargets[passFirstPartition + passPartition];
+                }
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
                 for (size_t i = 0; i < passPartitions; i++) {
                     const size_t passPartition = partitionOrder[i];
@@ -3645,7 +3737,7 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                                           partitionPassRowOffsets[passPartition + 1] - partitionPassRowOffsets[passPartition], codeBuffer, 0,
                                           getPartitionFirstKey(exchange, sendRange, partition + 1) - partitionFirstKey, partitionCodeBytes[partition], partitionTargets[partition],
                                           partitionMerges[passPartition], 1);
-                    mergePartitionTargets(exchange, seqDbr, partitionFirstKey, partitionMerges[passPartition], 1);
+                    mergePartitionTargets(exchange, seqDbr, partitionFirstKey, partitionMerges[passPartition], pairPassTargets + partitionTargetOffsets[passPartition], 1);
                 }
                 std::vector<size_t> partitionDataOffsets(passPartitions + 1, prefDataBytes);
                 std::vector<size_t> partitionIndexOffsets(passPartitions + 1, prefIndexBytes);
@@ -3669,7 +3761,7 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                 prefDataBytes = partitionDataOffsets[passPartitions];
                 prefIndexBytes = partitionIndexOffsets[passPartitions];
             } else {
-                // a pass of few partitions: the partitions one after the other, all threads merge a partition
+                // a pass of few partitions: the partitions one after the other in one PartitionMerge that keeps its buffers, all threads merge a partition
                 for (size_t passPartition = 0; passPartition < passPartitions; passPartition++) {
                     const size_t partition = passFirstPartition + passPartition;
                     const size_t partitionFirstKey = getPartitionFirstKey(exchange, sendRange, partition);
@@ -3689,7 +3781,7 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                     size_t partitionEntryCount = 0;
                     size_t partitionCost = 0;
                     if (isWindowedPass == false) {
-                        mergePartitionTargets(exchange, seqDbr, partitionFirstKey, merge, par.threads);
+                        mergePartitionTargets(exchange, seqDbr, partitionFirstKey, merge, pairPassTargets, par.threads);
                         writePartition(prefFiles, partitionFirstKey, merge, prefDataBytes, prefIndexBytes, 0, par.threads);
                         partitionEntryCount = merge.keyChunkEntryOffsets.back();
                         partitionCost = merge.cost;
@@ -3814,7 +3906,6 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                     }
                     addPartitionRow(partitionFirstKey, partitionDataOffset, prefDataBytes - partitionDataOffset, partitionCost);
                     prefIndexBytes += partitionEntryCount * 2 * sizeof(uint64_t);
-                    partitionMerges[0] = PartitionMerge();
                 }
             }
         }
@@ -3822,7 +3913,10 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
         MMseqsNode::addPhaseTime(mergeValues, "merging a send range", mergeRangeTimer);
     }
     closeReceivedFiles(receivedPairFiles);
+    Util::releasePages(pairPassBuffer, pairPassBufferBytes);
     delete[] pairPassBuffer;
+    Util::releasePages(pairPassTargets, pairPassTargetsSize * sizeof(DBKeyType));
+    delete[] pairPassTargets;
     delete[] prefFiles.writeBuffers;
     if (fseek(prefFiles.indexFile, prefIndexBytes, SEEK_SET) != 0) {
         Debug(Debug::ERROR) << "Cannot write " << prefFiles.indexName << "\n";
@@ -3914,7 +4008,9 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     }
 
     const size_t representativeBitsMemory = exchange.hasRepresentativeBits ? ((maxSendRangeKeys + 63) / 64 + 1) * sizeof(uint64_t) : 0;
-    exchange.loadMemoryLimit = (representativeBitsMemory < memoryLimit) ? static_cast<size_t>(static_cast<double>(memoryLimit - representativeBitsMemory) * 0.95) : 0;
+    // every thread writes through two buffers at most
+    const size_t fixedMemory = representativeBitsMemory + 2 * par.threads * KMER_FILE_BUFFER_SIZE;
+    exchange.loadMemoryLimit = (fixedMemory < memoryLimit) ? static_cast<size_t>(static_cast<double>(memoryLimit - fixedMemory) * 0.95) : 0;
 
     // keys are in length descending order, so a record needs no length, and no position as the diagonal comes later
     exchange.adjKeyBits = (includeAdjacency ? 6 : 0) * KmerPositionBit::RESIDUE_BITS;
@@ -3938,8 +4034,8 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     mergeQueue.removeClaims();
     const size_t minPassLimit = std::max<size_t>(1, getPassLimit(MMseqsNode::getSmallestMemoryLimit(par.db2 + ".memory", memoryLimit, par.threads)));
     const size_t passes = std::max<size_t>(1, (globalKmers * receiverKmerBytes + minPassLimit - 1) / minPassLimit);
-    // a pass cuts its hash sub ranges into chunks for the threads, so their count follows the passes only
-    exchange.hashSubRangesPerRange = (passes * HASH_SUB_RANGES_PER_PASS + exchange.hashRangeCount - 1) / exchange.hashRangeCount;
+    // a pass holds about CHUNKS_PER_THREAD hash sub ranges per thread, so the threads take whole hash sub ranges without decoding a row to cut it
+    exchange.hashSubRangesPerRange = (std::max(passes, exchange.hashRangeCount) * CHUNKS_PER_THREAD * par.threads + exchange.hashRangeCount - 1) / exchange.hashRangeCount;
     exchange.hashSubRangeCount = exchange.hashRangeCount * exchange.hashSubRangesPerRange;
     exchange.rowsPerHashRange = 2 * exchange.hashSubRangesPerRange;
     const size_t rangePairPasses = std::max<size_t>(1, (globalKmers / exchange.sendRangeCount * exchange.maxRepSeqs * pairTargetBytes + minPassLimit - 1) / minPassLimit);
@@ -3955,9 +4051,26 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     Timer phaseTimer;
     std::string sendValues;
     std::vector<size_t> sendRanges;
-    const size_t sentBytes = sendKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, sendQueue, representativeBitsMemory, sendRanges, sendValues);
+    // the own rows stay in memory beside the loads and in the budget of a receiving pass, for as many of the first own hash ranges as are expected to fit
+    // and as a node half as fast as the others takes itself, ownItems * count / (2 * count - 1), so the other nodes can take the rest
+    OwnKmers ownKmers = {NULL, 0, getPassLimit(exchange.loadMemoryLimit - std::min(exchange.loadMemoryLimit, exchange.pairRowsMemory)),
+                         std::vector<std::vector<KmerHashSubRange> >(exchange.hashRangeCount), std::vector<size_t>()};
+    const size_t sendRangeKmerBytes = globalKmers / exchange.sendRangeCount * sizeof(KmerPositionBit);
+    const size_t ownMemory = std::min(ownKmers.limit, exchange.loadMemoryLimit - std::min(exchange.loadMemoryLimit, sendRangeKmerBytes));
+    const size_t ownHashRangeBytes = std::max<size_t>(1, globalKmers * receiverKmerBytes / (MMseqsNode::count * exchange.hashRangeCount));
+    const size_t ownItems = (exchange.hashRangeCount - MMseqsNode::rank + MMseqsNode::count - 1) / MMseqsNode::count;
+    const size_t ownHashRanges = std::min(ownItems * MMseqsNode::count / (2 * MMseqsNode::count - 1), ownMemory / ownHashRangeBytes);
+    for (size_t i = 0; i < ownHashRanges; i++) {
+        ownKmers.hashRanges.push_back(MMseqsNode::rank + i * MMseqsNode::count);
+    }
+    const size_t sentBytes = sendKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, sendQueue, representativeBitsMemory, sendRanges, sendValues, ownKmers);
+    // no node takes hash ranges before the barrier, so claimNext takes the first own hash ranges in order
+    for (size_t i = 0; i < ownKmers.hashRanges.size(); i++) {
+        hashQueue.claimNext();
+    }
     MMseqsNode::addPhaseTime(sendValues, "sending k-mers", phaseTimer);
-    MMseqsNode::addPhaseValue(sendValues, "K-mer bytes sent", SSTR(sentBytes));
+    MMseqsNode::addPhaseValue(sendValues, "K-mer bytes sent", SSTR(sentBytes + ownKmers.bytes));
+    MMseqsNode::addPhaseValue(sendValues, "K-mer bytes kept in memory", SSTR(ownKmers.bytes));
     MMseqsNode::addPhaseValue(sendValues, "Send ranges", SSTR(sendRanges.size()));
     sendValues = MMseqsNode::barrier(par.db2 + ".kmers.done", sendValues);
     MMseqsNode::printPhaseValues(sendValues);
@@ -3974,7 +4087,9 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     MMseqsNode::addPhaseSeconds(receiveValues, "waiting for the other nodes to send k-mers", sendWaitSeconds);
     std::vector<size_t> hashRanges;
     size_t pairBytes = 0;
-    const size_t receivedBytes = receiveKmers(par, seqDbr, exchange, hashQueue, hashRanges, receiveValues, pairBytes);
+    const size_t receivedBytes = receiveKmers(par, seqDbr, exchange, hashQueue, hashRanges, receiveValues, pairBytes, ownKmers);
+    Util::releasePages(ownKmers.data, ownKmers.bytes);
+    free(ownKmers.data);
     MMseqsNode::addPhaseTime(receiveValues, "receiving k-mers", phaseTimer);
     MMseqsNode::addPhaseValue(receiveValues, "K-mer bytes received", SSTR(receivedBytes));
     MMseqsNode::addPhaseValue(receiveValues, "Pair bytes written", SSTR(pairBytes));
@@ -3985,13 +4100,16 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     MMseqsNode::addPhaseTime(mergeValues, "waiting for the other nodes to receive k-mers", phaseTimer);
     // every node has passed the hash ranges and read the k-mer file of this node
     hashQueue.removeClaims();
-    FileUtil::remove((par.db2 + ".kmers." + SSTR(MMseqsNode::rank)).c_str());
+    // freeing the blocks and cached pages of a large k-mer file takes long, so it is removed while the pairs are merged
+    const std::string kmerFile = par.db2 + ".kmers." + SSTR(MMseqsNode::rank);
+    std::thread kmerFileRemoval([&kmerFile]() { FileUtil::remove(kmerFile.c_str()); });
     if (MMseqsNode::isMaster()) {
         FileUtil::remove((par.db2 + ".kmers.done").c_str());
     }
 
     std::vector<size_t> mergeRanges;
     const std::string partitionsData = mergeAssignedPairs(par, seqDbr, exchange, mergeQueue, mergeRanges, mergeValues);
+    kmerFileRemoval.join();
     MMseqsNode::addPhaseTime(mergeValues, "merging pairs", phaseTimer);
     MMseqsNode::addPhaseValue(mergeValues, "Send ranges merged", SSTR(mergeRanges.size()));
     MMseqsNode::publishRunFile(par.db2 + ".partitions." + SSTR(MMseqsNode::rank), partitionsData);
