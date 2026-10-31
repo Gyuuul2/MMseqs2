@@ -116,6 +116,8 @@ public:
     };
     // nodeOffsets: where the bytes of every node start in the flush, then the flush size
     static void addExchangeFlush(std::string &indexData, size_t &writtenBytes, const std::vector<size_t> &nodeOffsets);
+    // openExchange reads records, from malloc, as the records that this node sends to itself through exchange in its last flush
+    static void keepOwnExchangeRecords(const std::string &exchange, char *records, size_t bytes);
     // closes the file of this node and returns the index lines of all nodes once every node has closed its file
     static std::string closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData);
     static void openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeBlock> &blocks, std::vector<FILE *> &files);
