@@ -13,13 +13,13 @@
 
 
 int result2flat(int argc, const char **argv, const Command &command) {
+    MMseqsNode::init();
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     // --createdb-mode 3: every node writes the representatives of its cluster database <clu>.<node> with their sequences to <out>.<node>
     std::string nodeSuffix;
     if (isLinfinity) {
-        MMseqsNode::init();
         nodeSuffix = "." + SSTR(MMseqsNode::rank);
     }
 

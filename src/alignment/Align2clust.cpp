@@ -3471,6 +3471,7 @@ static int align2clustLinfinity(Parameters &par) {
 }
 
 int align2clust(int argc, const char **argv, const Command &command) {
+    MMseqsNode::init();
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
     if (par.filterCluDBFile.empty() != par.filterSeqDBFile.empty()) {
@@ -3479,7 +3480,6 @@ int align2clust(int argc, const char **argv, const Command &command) {
     }
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
-        MMseqsNode::init();
         if (par.clusteringMode != Parameters::SET_COVER && par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
             Debug(Debug::ERROR) << "align2clust supports only --cluster-mode " << Parameters::SET_COVER << ", " << Parameters::GREEDY << " and " << Parameters::GREEDY_MEM
                                 << " for --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";

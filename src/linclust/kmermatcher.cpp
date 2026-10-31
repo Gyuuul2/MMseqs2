@@ -212,7 +212,9 @@ static std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerAr
 
 #pragma omp for schedule(dynamic, 100)
             for (size_t id = start; id < (start + bucketSize); id++) {
-                progress.updateProgress();
+                if (isLinfinity == false) {
+                    progress.updateProgress();
+                }
                 if (isRepresentative(id) == false) {
                     continue;
                 }
@@ -2699,9 +2701,6 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
             kmerCapacity = std::min(maxLoadKmers - 1, (fixedBytes < loadMemoryLimit) ? (loadMemoryLimit - fixedBytes) / sizeof(KmerPositionBit) : maxLoadKmers / 2);
         }
         const size_t loadCount = loadOffsets.size() - 1;
-        if (loadCount > 1) {
-            Debug(Debug::INFO) << "Process file into " << loadCount << " parts\n";
-        }
 
         const unsigned int idBits = getBitWidth(maxLoadKeys);
         KmerPositionBit::idShift = 0;
@@ -2737,16 +2736,11 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                 }
             }
             readChunkOffsets.push_back(loadOffsets[load + 1]);
-            Debug(Debug::INFO) << "Generate k-mers list for " << (load + 1) << " part\n";
             const size_t kmerCount = fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, L>(
                 hashSeqPair, maxLoadKmers, seqDbr, par, subMat, true, true, 0, SIZE_T_MAX, NULL, readChunkOffsets).first;
 
-            Debug(Debug::INFO) << "Sort kmer ";
-            Timer timer;
             sortKmers(hashSeqPair, kmerCount);
-            Debug(Debug::INFO) << timer.lap() << "\n";
 
-            timer.reset();
             // the whole sequence records follow the k-mer records, both in hash order
             const size_t wholeSequenceStart = std::partition_point(hashSeqPair, hashSeqPair + kmerCount,
                                                                    [](const KmerPositionBit &kmer) { return kmer.isWholeSequence() == false; }) - hashSeqPair;
@@ -2917,7 +2911,6 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                 std::vector<KmerHashSubRange> &hashRangeRows = (isOwnLoadHashRange[hashRange] ? ownKmers.hashRangeRows : kmerFileRows)[hashRange];
                 hashRangeRows.insert(hashRangeRows.end(), loadRows.begin() + hashRange * exchange.rowsPerHashRange, loadRows.begin() + (hashRange + 1) * exchange.rowsPerHashRange);
             }
-            Debug(Debug::INFO) << "Time for write: " << timer.lap() << "\n";
         }
         delete[] groupBuffers;
         MMseqsNode::addPhaseTime(sendValues, "sending a send range", sendRangeTimer);
@@ -3067,9 +3060,6 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
         const ReceivedHashRange &received = receivedHashRanges[taken % 2];
         ReceivedHashRange &nextReceived = receivedHashRanges[(taken + 1) % 2];
         const size_t passCount = received.passBytes.size();
-        if (passCount > 1) {
-            Debug(Debug::INFO) << "Receive k-mers in " << passCount << " passes\n";
-        }
         // a hash range that needs a bigger buffer is not prefetched
         if (passBuffer == NULL || received.codeBufferBytes > codeBufferBytes) {
             Util::releasePages(passBuffer, outputBytes + 2 * codeBufferBytes);
@@ -3081,7 +3071,6 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
         chunkStarts.reserve(received.maxChunkStarts);
         size_t nextHashRange = exchange.hashRangeCount;
         for (size_t pass = 0; pass < passCount; pass++) {
-            Timer timer;
             const size_t passFirstHashSubRange = received.passHashSubRangeOffsets[pass];
             const size_t passHashSubRanges = received.passHashSubRangeOffsets[pass + 1] - passFirstHashSubRange;
             // a windowed pass is a single hash sub range that reads its codes in windows of windowBytes
@@ -3489,7 +3478,6 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                 SORT_PARALLEL(passRecords, passRecords + flushRecordCount, AssignedPairRecord::compareByPartition);
                 writeAssignedPairs(exchange, pairFile, passBuffer, passRecords, flushRecordCount, pairWriteBuffer, par.threads);
             }
-            Debug(Debug::INFO) << "Time for merge: " << timer.lap() << "\n";
         }
         hashRange = nextHashRange;
         MMseqsNode::addPhaseTime(receiveValues, "receiving a hash range", hashRangeTimer);
@@ -4015,6 +4003,7 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     for (size_t i = 0; i < ownHashRanges; i++) {
         ownKmers.hashRanges.push_back(MMseqsNode::rank + i * MMseqsNode::count);
     }
+    Debug(Debug::INFO) << "Send k-mers of " << exchange.sendRangeCount << " send ranges\n";
     const size_t sentBytes = sendKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, sendQueue, representativeBitsMemory, sendRanges, sendValues, ownKmers);
     // no node takes hash ranges before the barrier, so claimNext takes the first own hash ranges in order
     for (size_t i = 0; i < ownKmers.hashRanges.size(); i++) {
@@ -4039,6 +4028,7 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     MMseqsNode::addPhaseSeconds(receiveValues, "waiting for the other nodes to send k-mers", sendWaitSeconds);
     std::vector<size_t> hashRanges;
     size_t pairBytes = 0;
+    Debug(Debug::INFO) << "Receive k-mers of " << exchange.hashRangeCount << " hash ranges\n";
     const size_t receivedBytes = receiveKmers(par, seqDbr, exchange, hashQueue, hashRanges, receiveValues, pairBytes, ownKmers);
     Util::releasePages(ownKmers.data, ownKmers.bytes);
     free(ownKmers.data);
@@ -4060,6 +4050,7 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     }
 
     std::vector<size_t> mergeRanges;
+    Debug(Debug::INFO) << "Merge pairs of " << exchange.sendRangeCount << " send ranges\n";
     const std::string partitionsData = mergeAssignedPairs(par, seqDbr, exchange, mergeQueue, mergeRanges, mergeValues);
     kmerFileRemoval.join();
     MMseqsNode::addPhaseTime(mergeValues, "merging pairs", phaseTimer);
@@ -4459,6 +4450,7 @@ static DBReader<DBKeyType> *openReaderWithMappedIndex(Parameters &par, MemoryMap
 
 int kmermatcher(int argc, const char **argv, const Command &command) {
     MMseqsMPI::init(argc, argv);
+    MMseqsNode::init();
 
     Parameters &par = Parameters::getInstance();
     setLinearFilterDefault(&par);
@@ -4469,7 +4461,6 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     DBReader<DBKeyType> *seqDbrPtr;
     if (isLinfinity) {
-        MMseqsNode::init();
         seqDbrPtr = new DBReader<DBKeyType>(par.db1.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
         seqDbrPtr->open(DBReader<DBKeyType>::NOSORT);
     } else {

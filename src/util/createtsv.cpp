@@ -302,11 +302,11 @@ static void writeRepresentativeEntries(const std::string &sortedByRepIndex, cons
 }
 
 int createtsv(int argc, const char **argv, const Command &command) {
+    MMseqsNode::init();
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_VARIADIC, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
-        MMseqsNode::init();
         if (par.filenames.size() <= 3 || par.db2.compare(par.db1) != 0) {
             Debug(Debug::ERROR) << "createtsv needs the --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " database as both query and target database: createtsv DB DB clu tsv\n";
             EXIT(EXIT_FAILURE);

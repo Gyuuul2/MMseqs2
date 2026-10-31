@@ -5,6 +5,7 @@
 #include "CommandCaller.h"
 #include "ByteParser.h"
 #include "FileUtil.h"
+#include "MMseqsNode.h"
 
 #include <map>
 #include <iomanip>
@@ -2159,7 +2160,7 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
         }
     }
 
-    if (MMseqsMPI::isMaster()) {
+    if (MMseqsMPI::isMaster() && MMseqsNode::isMaster()) {
         Debug::setDebugLevel(verbosity);
     }
 

@@ -9,13 +9,13 @@
 #include <climits>
 
 int createsubdb(int argc, const char **argv, const Command& command) {
+    MMseqsNode::init();
     Parameters& par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
     // --createdb-mode 3: the entry keys of the cluster database <subset>.<node> become the representative bits of the data file of a node and the sixth index column
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db2.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
-        MMseqsNode::init();
         DBReader<DBKeyType> reader(par.db2.c_str(), par.db2Index.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
         reader.open(DBReader<DBKeyType>::NOSORT);
         const std::vector<size_t> fileKeyOffsets = reader.getFileKeyOffsets(MMseqsNode::count);
