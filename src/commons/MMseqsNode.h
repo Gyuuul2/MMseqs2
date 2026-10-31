@@ -169,8 +169,11 @@ public:
         size_t writtenBytes;
     };
     // the representative of entry p becomes the one received for p in the exchange receivedIndex, receivedPrefix if given
+    // representativeBits: the keys [firstKey, firstKey + keyCount) of clu, which holds no entries for clusters of one key: a received member without an entry
+    // goes on to its representative, and the bits left, those of the keys that stay alone or represent others, are published as <singletons>.bits.<node>
     static std::string sendClusterPairs(const std::string &clu, bool withRepresentative, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
-                                        const std::string &exchange, const std::string &receivedIndex = "", const std::string &receivedPrefix = "");
+                                        const std::string &exchange, const std::string &receivedIndex = "", const std::string &receivedPrefix = "",
+                                        uint64_t *representativeBits = NULL, size_t firstKey = 0, size_t keyCount = 0, const std::string &singletons = "");
     // --filter-cludb-file: a request { key, requesting node } of the exchange requestsIndex, requests gets the other members of key in <clu>.<node> as { key, member } through <members>.<node>
     static std::string sendClusterMembers(const std::string &clu, const std::string &requestsIndex, const std::string &requests, const std::string &members);
     // once every node has read lastExchange, a node removes its file of it; the master removes the indexes of exchanges and prints phaseValues
@@ -182,7 +185,7 @@ public:
     // writes the representative bits of this node as <db>.bits.<node> and its ranges with their representative counts as <db>.index.<node>, gathered by the master
     static void writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount);
     // a barrier that returns where the keys of every <clu>.<node> start, then keyCount, from their first entries, for parts in key order; only keys that are entries of the clustering are routed
-    static std::vector<size_t> getClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount);
+    static std::vector<size_t> getClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount, const std::string &firstKeyFile = "");
     // the entry keys in [keyBegin, keyEnd) of the parts <clu>.<node>, whose keys start at cluKeyOffsets, in key order
     static void readClusterKeys(const std::string &clu, const std::vector<size_t> &cluKeyOffsets, size_t keyBegin, size_t keyEnd, std::vector<DBKeyType> &keys);
     // --createdb-mode 3 cluster databases: <clu>.index.<node> holds uint64 (key, offset) per entry in key order, then (DB_KEY_INVALID, data size)

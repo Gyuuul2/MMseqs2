@@ -754,6 +754,17 @@ static const size_t RECEIVED_MEMORY_DIVISOR = 64;
 // the pairs sent at once
 static const size_t SENT_PAIRS_MEMORY_DIVISOR = 2;
 
+static void writeKeyBits(const std::string &bitsFile, const uint64_t *bits, size_t firstKey, size_t keyCount) {
+    FILE *file = FileUtil::openAndDelete(bitsFile.c_str(), "w");
+    const uint64_t header[2] = { firstKey, keyCount };
+    const size_t words = (keyCount + 63) / 64;
+    if (fwrite(header, sizeof(uint64_t), 2, file) != 2 || fwrite(bits, sizeof(uint64_t), words, file) != words
+        || fclose(file) != 0) {
+        Debug(Debug::ERROR) << "Cannot write " << bitsFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
 // loads <clu>.<rank> split by split, prefetching the next, and calls processSplit(cluDb, splitBegin, splitEnd, entryKeys); a larger entry is a split of its own
 template<typename ProcessSplit>
 static void readClusterSplits(const std::string &clu, size_t memoryLimit, ProcessSplit processSplit) {
@@ -786,7 +797,8 @@ static void readClusterSplits(const std::string &clu, size_t memoryLimit, Proces
 }
 
 std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepresentative, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
-                                         const std::string &exchange, const std::string &receivedIndex, const std::string &receivedPrefix) {
+                                         const std::string &exchange, const std::string &receivedIndex, const std::string &receivedPrefix,
+                                         uint64_t *representativeBits, size_t firstKey, size_t keyCount, const std::string &singletons) {
     std::vector<ExchangeBlock> receivedBlocks;
     std::vector<FILE *> receivedFiles;
     if (receivedPrefix.empty() == false) {
@@ -799,8 +811,25 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
     std::vector<size_t> pairOffsets;
     std::vector<char> received;
     DBKeyType previousReceivedKey = DB_KEY_INVALID;
+    const auto clearRepresentativeBit = [&](DBKeyType key) {
+        representativeBits[(key - firstKey) / 64] &= ~(1ULL << ((key - firstKey) % 64));
+    };
+    // the members with an entry have the repKey DB_KEY_INVALID
+    const auto sendMembersWithoutEntry = [&](const ClusterPair *pairs, size_t pairCount) {
+        for (size_t i = 0; i < pairCount; i++) {
+            if (pairs[i].repKey != DB_KEY_INVALID) {
+                pairWriter.add(pairs[i].repKey, pairs[i].memberKey);
+                clearRepresentativeBit(pairs[i].memberKey);
+            }
+        }
+    };
     readClusterSplits(clu, memoryLimit, [&](DBReader<DBKeyType> &cluDb, size_t splitBegin, size_t splitEnd, const std::vector<DBKeyType> &entryKeys) {
         repKeys = entryKeys;
+        if (representativeBits != NULL) {
+            for (size_t i = 0; i < entryKeys.size(); i++) {
+                clearRepresentativeBit(entryKeys[i]);
+            }
+        }
         const ClusterPair splitLast = { entryKeys.back(), entryKeys.back() };
         size_t receivedCount;
         while ((receivedCount = readExchangeRange(receivedBlocks, memoryLimit / RECEIVED_MEMORY_DIVISOR, ClusterPair::recordSize, ClusterPair::compareByMember, splitLast, received, NULL, receivedPrefix)) > 0) {
@@ -810,14 +839,21 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
             for (size_t i = 0; i < receivedCount; i++) {
                 const DBKeyType memberKey = receivedPairs[i].memberKey;
                 const size_t entry = std::lower_bound(entryKeys.begin(), entryKeys.end(), memberKey) - entryKeys.begin();
+                const bool isEntry = entry < entryKeys.size() && entryKeys[entry] == memberKey;
                 // a received member is an entry of this node once, and the entries are in key order
-                if (entry == entryKeys.size() || entryKeys[entry] != memberKey || memberKey == ((i > 0) ? receivedPairs[i - 1].memberKey : previousReceivedKey)) {
+                if ((isEntry == false && representativeBits == NULL) || memberKey == ((i > 0) ? receivedPairs[i - 1].memberKey : previousReceivedKey)) {
                     Debug(Debug::ERROR) << "Key " << memberKey << " of " << receivedPrefix << " is no entry of " << clu << "." << rank << " in key order\n";
                     EXIT(EXIT_FAILURE);
                 }
-                repKeys[entry] = receivedPairs[i].repKey;
+                if (isEntry) {
+                    repKeys[entry] = receivedPairs[i].repKey;
+                    receivedPairs[i].repKey = DB_KEY_INVALID;
+                }
             }
             previousReceivedKey = receivedPairs[receivedCount - 1].memberKey;
+            if (representativeBits != NULL) {
+                sendMembersWithoutEntry(receivedPairs, receivedCount);
+            }
         }
         pairOffsets.resize(splitEnd - splitBegin + 1);
         pairOffsets[0] = 0;
@@ -887,11 +923,18 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
         }
     });
     const ClusterPair lastPair = { DB_KEY_INVALID, DB_KEY_INVALID };
-    if (readExchangeRange(receivedBlocks, memoryLimit / RECEIVED_MEMORY_DIVISOR, ClusterPair::recordSize, ClusterPair::compareByMember, lastPair, received, NULL, receivedPrefix) > 0) {
-        Debug(Debug::ERROR) << "Key " << reinterpret_cast<ClusterPair *>(received.data())->memberKey << " of " << receivedPrefix << " is no entry of " << clu << "." << rank << "\n";
-        EXIT(EXIT_FAILURE);
+    size_t receivedCount;
+    while ((receivedCount = readExchangeRange(receivedBlocks, memoryLimit / RECEIVED_MEMORY_DIVISOR, ClusterPair::recordSize, ClusterPair::compareByMember, lastPair, received, NULL, receivedPrefix)) > 0) {
+        if (representativeBits == NULL) {
+            Debug(Debug::ERROR) << "Key " << reinterpret_cast<ClusterPair *>(received.data())->memberKey << " of " << receivedPrefix << " is no entry of " << clu << "." << rank << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        sendMembersWithoutEntry(reinterpret_cast<ClusterPair *>(received.data()), receivedCount);
     }
     closeExchangeFiles(receivedFiles, receivedPrefix);
+    if (representativeBits != NULL) {
+        writeKeyBits(singletons + ".bits." + SSTR(rank), representativeBits, firstKey, keyCount);
+    }
     return pairWriter.close();
 }
 
@@ -1096,15 +1139,7 @@ uint64_t *MMseqsNode::readRepresentativeBits(const std::string &db, const std::v
 }
 
 void MMseqsNode::writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount) {
-    const std::string bitsFile = db + ".bits." + SSTR(rank);
-    FILE *file = FileUtil::openAndDelete(bitsFile.c_str(), "w");
-    const uint64_t header[2] = { firstKey, keyCount };
-    const size_t words = (keyCount + 63) / 64;
-    if (fwrite(header, sizeof(uint64_t), 2, file) != 2 || fwrite(bits, sizeof(uint64_t), words, file) != words
-        || fclose(file) != 0) {
-        Debug(Debug::ERROR) << "Cannot write " << bitsFile << "\n";
-        EXIT(EXIT_FAILURE);
-    }
+    writeKeyBits(db + ".bits." + SSTR(rank), bits, firstKey, keyCount);
     // the ranges of this node in the sequence index, with the number of its representatives as a sixth column
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     std::string representativeIndex;
@@ -1123,8 +1158,8 @@ void MMseqsNode::writeRepresentativeBits(const std::string &db, DBReader<DBKeyTy
     }
 }
 
-std::vector<size_t> MMseqsNode::getClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount) {
-    const std::string cluIndex = clu + ".index." + SSTR(rank);
+std::vector<size_t> MMseqsNode::getClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount, const std::string &firstKeyFile) {
+    const std::string cluIndex = firstKeyFile.empty() ? clu + ".index." + SSTR(rank) : firstKeyFile;
     FILE *handle = FileUtil::openFileOrDie(cluIndex.c_str(), "r", true);
     uint64_t firstCell[2];
     if (fread(firstCell, sizeof(uint64_t), 2, handle) != 2 || fclose(handle) != 0) {

@@ -562,7 +562,8 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                                 const ClusterPair pair = { reader.getDbKey(repId), reader.getDbKey(rangeHashIdPairs[i].id) };
                                 loadPairs[loadPairCount + i] = pair;
                             }
-                        } else {
+                        } else if (isLinfinity == false || clusterEnd - clusterBegin > 1) {
+                            // a mode 3 representative without members has its bit and no entry
                             entries.push_back(isLinfinity ? static_cast<uint64_t>(reader.getDbKey(repId)) : repId);
                             entries.push_back(data.size());
                             for (size_t i = clusterBegin; i < clusterEnd; i++) {
@@ -596,7 +597,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             }
         }
         if (copiesSeqs) {
-            // every representative of the length starts an entry, also one that is alone in its hash
             SORT_PARALLEL(loadPairs, loadPairs + loadPairCount, ClusterPair::compareByRep);
             const size_t loadEndKey = loadFirstKey + loadSeqCount;
             for (size_t writeBegin = loadFirstKey; writeBegin < loadEndKey; writeBegin += WRITE_THREAD_SEQS * par.threads) {
@@ -608,23 +608,22 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     data.clear();
                     entries.clear();
                     char keyBuffer[32];
-                    const size_t keyEnd = writeBegin + writeKeys * (thread + 1) / par.threads;
-                    size_t key = writeBegin + writeKeys * thread / par.threads;
-                    size_t pair = std::lower_bound(loadPairs, loadPairs + loadPairCount, key, [](const ClusterPair &first, size_t second) { return first.repKey < second; }) - loadPairs;
-                    for (; key < keyEnd; key++) {
-                        if ((representativeBits[(key - localFirstKey) / 64] & (1ull << ((key - localFirstKey) % 64))) == 0) {
+                    const auto findRepKey = [&](size_t key) {
+                        return std::lower_bound(loadPairs, loadPairs + loadPairCount, key, [](const ClusterPair &first, size_t second) { return first.repKey < second; }) - loadPairs;
+                    };
+                    size_t pair = findRepKey(writeBegin + writeKeys * thread / par.threads);
+                    const size_t endPair = findRepKey(writeBegin + writeKeys * (thread + 1) / par.threads);
+                    while (pair < endPair) {
+                        const DBKeyType repKey = loadPairs[pair].repKey;
+                        // the representative comes first in its pairs
+                        if (pair + 1 == endPair || loadPairs[pair + 1].repKey != repKey) {
+                            pair++;
                             continue;
                         }
-                        entries.push_back(key);
+                        entries.push_back(repKey);
                         entries.push_back(data.size());
-                        char *end = Itoa::u64toa_sse2(static_cast<uint64_t>(key), keyBuffer);
-                        *(end - 1) = '\n';
-                        data.append(keyBuffer, end - keyBuffer);
-                        for (; pair < loadPairCount && loadPairs[pair].repKey == key; pair++) {
-                            if (loadPairs[pair].memberKey == key) {
-                                continue;
-                            }
-                            end = Itoa::u64toa_sse2(static_cast<uint64_t>(loadPairs[pair].memberKey), keyBuffer);
+                        for (; pair < endPair && loadPairs[pair].repKey == repKey; pair++) {
+                            char *end = Itoa::u64toa_sse2(static_cast<uint64_t>(loadPairs[pair].memberKey), keyBuffer);
                             *(end - 1) = '\n';
                             data.append(keyBuffer, end - keyBuffer);
                         }
