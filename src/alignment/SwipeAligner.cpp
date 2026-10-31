@@ -285,6 +285,8 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
     unsigned char letters[SWIPE_MAX_LANES];
     T colMax[2][SWIPE_MAX_LANES];
     T colPos[2][SWIPE_MAX_LANES];
+    // Keep high row bits when a query exceeds 65536 residues.
+    T colPosHigh[2][SWIPE_MAX_LANES];
     bool finished[SWIPE_MAX_LANES];
     while (active > 0) {
         for (int c = 0; c < columnCount; c++) {
@@ -305,6 +307,7 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
         }
         simd_int vColMax[2] = {vZero, vZero};
         simd_int vColPos[2] = {vZero, vZero};
+        simd_int vColPosHigh[2] = {vZero, vZero};
         if (sizeof(T) == 2) {
             const simd_int *W0 = columnScores;
             const simd_int *W1 = columnScores + alphabetSize;
@@ -334,10 +337,17 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
                 vHd0 = hl;
                 vHd1 = h0;
                 hColumn[i] = h1;
-                vColPos[0] = simdi8_blend(vColPos[0], rowIndex[i], V::gt(h0, vColMax[0]));
+                const simd_int gt0 = V::gt(h0, vColMax[0]);
+                const simd_int gt1 = V::gt(h1, vColMax[1]);
+                vColPos[0] = simdi8_blend(vColPos[0], rowIndex[i], gt0);
                 vColMax[0] = V::max(vColMax[0], h0);
-                vColPos[1] = simdi8_blend(vColPos[1], rowIndex[i], V::gt(h1, vColMax[1]));
+                vColPos[1] = simdi8_blend(vColPos[1], rowIndex[i], gt1);
                 vColMax[1] = V::max(vColMax[1], h1);
+                if (Lq > 65536) {
+                    const simd_int high = V::set(i >> 16);
+                    vColPosHigh[0] = simdi8_blend(vColPosHigh[0], high, gt0);
+                    vColPosHigh[1] = simdi8_blend(vColPosHigh[1], high, gt1);
+                }
             }
         } else {
             const simd_int *W = columnScores;
@@ -364,6 +374,9 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
         for (int c = 0; c < columnCount; c++) {
             simdi_storeu(reinterpret_cast<simd_int *>(colMax[c]), vColMax[c]);
             simdi_storeu(reinterpret_cast<simd_int *>(colPos[c]), vColPos[c]);
+            if (sizeof(T) == 2 && Lq > 65536) {
+                simdi_storeu(reinterpret_cast<simd_int *>(colPosHigh[c]), vColPosHigh[c]);
+            }
         }
         // the lanes whose target ends with the first column of a pair ignore the second
         for (int l = 0; l < lanes; l++) {
@@ -379,7 +392,8 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
                     laneBest[l] = colMax[c][l];
                     laneBestColumn[l] = laneColumn[l];
                     if (sizeof(T) == 2) {
-                        laneBestRow[l] = static_cast<uint16_t>(colPos[c][l]);
+                        laneBestRow[l] = static_cast<int>(static_cast<uint16_t>(colPos[c][l])
+                            | (Lq > 65536 ? (static_cast<uint32_t>(static_cast<uint16_t>(colPosHigh[c][l])) << 16) : 0));
                     } else {
                         int row = static_cast<uint8_t>(colPos[c][l]);
                         while (row < Lq && laneValue<T>(hColumn + row, l) != colMax[c][l]) {
@@ -982,10 +996,10 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
     int bestRows[SWIPE_MAX_LANES];
     int bestColumns[SWIPE_MAX_LANES];
     int shifts[SWIPE_MAX_LANES];
-    int16_t laneBests[SWIPE_MAX_LANES];
-    int16_t laneDropped[SWIPE_MAX_LANES];
-    int16_t edgeLefts[SWIPE_MAX_LANES];
-    int16_t edgeRights[SWIPE_MAX_LANES];
+    int16_t laneBests[SWIPE_MAX_LANES] = {};
+    int16_t laneDropped[SWIPE_MAX_LANES] = {};
+    int16_t edgeLefts[SWIPE_MAX_LANES] = {};
+    int16_t edgeRights[SWIPE_MAX_LANES] = {};
     // the lanes of a row: active, band columns, composition bias, score row and target letters from band column 0
     int16_t active[SWIPE_MAX_LANES];
     int16_t columnBegins[SWIPE_MAX_LANES];
