@@ -4,6 +4,7 @@
 #include "IndexTypes.h"
 
 #include <cstdio>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -63,10 +64,16 @@ public:
     static bool readLogProgress(const std::string &log, size_t &key, size_t &bytes);
     static void waitForLog(const std::string &log, size_t &key, size_t &bytes);
     static void readLog(const std::string &log, size_t from, size_t to, char *data);
-    // closes file, a flush of bytes that only this node writes, then appends line, whose first word is the flush number, to indexFile, which exists from before a barrier on
+    // closes file, a flush of bytes that only this node writes, then appends line with its last word set to this run's magic to indexFile
     static void publishExchangeFlush(FILE *file, const std::string &fileName, size_t bytes, const std::string &indexFile, const std::vector<uint64_t> &line);
-    // reads line number flush, of line.size() words, of indexFile from a new open; false until all of it is there
+    // reads line number flush, of line.size() words, of indexFile from a new open; false until this run's line is there
     static bool readExchangeFlush(const std::string &indexFile, size_t flush, std::vector<uint64_t> &line);
+    static const size_t EXCHANGE_SLICE_HEADER_BYTES = 2 * sizeof(uint64_t);
+    static void writeExchangeSliceHeader(FILE *file, const std::string &fileName, uint64_t generation);
+    static int tryOpenExchangeSlice(const std::string &file, size_t expectedBytes, uint64_t expectedGeneration, time_t &lastDirectoryRefresh,
+                                    size_t &observedBytes, uint64_t &observedGeneration, int &lastError);
+    static bool tryReadExchangeSlice(int fd, char *data, size_t bytes, size_t offset, int &readError);
+    static void truncateExchangeSlice(const std::string &file);
     // every node publishes content as file + "." + node; returns all contents in node order, gathered by the master into file
     static std::string barrier(const std::string &file, const std::string &content = "");
     // phase values that a node appends to the content of a barrier as lines name<TAB>node<TAB>value, for the master to print
@@ -129,8 +136,45 @@ public:
     static size_t readExchangeSegments(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t maxSegmentSize, uint64_t fileType, size_t windowBegin, size_t windowEnd,
                                        char *window, std::vector<std::pair<size_t, size_t> > &segments, const std::string &prefix);
     static void closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix);
-    // reads all pairs of the exchange index for this node at once, from files only, as sendClusterMembers writes them
-    static void readExchangePairs(const std::string &index, const std::string &prefix, std::vector<ClusterPair> &pairs);
+    class ClusterMemberLookup {
+    public:
+        struct Cursor {
+            size_t block;
+            size_t offset;
+            DBKeyType key;
+            size_t bufferBegin;
+            size_t bufferEnd;
+            size_t nextReadBytes;
+            std::vector<ClusterPair> buffer;
+        };
+
+        ClusterMemberLookup(const std::string &index, const std::string &prefix, size_t maxBytes);
+        ~ClusterMemberLookup();
+        void find(DBKeyType key, Cursor &cursor) const;
+        bool next(Cursor &cursor, DBKeyType &memberKey) const;
+        size_t memoryBytes() const;
+
+    private:
+        struct Range {
+            DBKeyType firstKey;
+            DBKeyType lastKey;
+            size_t firstAnchor;
+            size_t lastAnchor;
+        };
+        struct Anchor {
+            DBKeyType key;
+            size_t offset;
+        };
+        ClusterPair readPair(size_t block, size_t offset) const;
+        ClusterMemberLookup(const ClusterMemberLookup &);
+        ClusterMemberLookup &operator=(const ClusterMemberLookup &);
+
+        const std::string prefix;
+        std::vector<ExchangeBlock> blocks;
+        std::vector<FILE *> files;
+        std::vector<Range> ranges;
+        std::vector<Anchor> anchors;
+    };
 
     // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered; nodeKeyOffsets: keys of every node
     struct ClusterPairWriter {
