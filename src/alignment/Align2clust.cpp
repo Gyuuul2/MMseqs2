@@ -366,7 +366,7 @@ static std::atomic<size_t> swipeLanePairs(0);
 static std::atomic<size_t> swipeLaneSlots(0);
 static std::atomic<size_t> swipeSinglePairs(0);
 
-// mode 3 target gapped alignments in SWIPE lanes, their lane rows and all lane rows of their batches, and the ones aligned one pair at a time
+// mode 3 target gapped alignments in SWIPE lanes, their lane rows and all lane rows, and the ones extended alone with a trace of their lane only
 static std::atomic<size_t> swipeTargetPairs(0);
 static std::atomic<size_t> swipeTargetLaneRows(0);
 static std::atomic<size_t> swipeTargetSlotRows(0);
@@ -484,19 +484,17 @@ struct SwipeTargets {
     std::vector<int> seedTargets;
     std::vector<s_align> backAligns;
     std::vector<std::string> backBacktraces;
-    std::vector<ClusterPair> singlePairs;
     size_t targetPairs;
-    size_t targetSinglePairs;
 
     SwipeTargets(const Parameters &par, BaseMatrix *subMat, EvalueComputation &evaluer, size_t maxSeqLen)
         : extender(subMat, maxSeqLen, par.compBiasCorrection, par.compBiasCorrectionScale, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid()),
-          evaluer(evaluer), repKey(0), initialized(false), queryId(0), targetPairs(0), targetSinglePairs(0) {}
+          evaluer(evaluer), repKey(0), initialized(false), queryId(0), targetPairs(0) {}
 
     ~SwipeTargets() {
         swipeTargetPairs += targetPairs;
         swipeTargetLaneRows += extender.extendLaneRows;
         swipeTargetSlotRows += extender.extendSlotRows;
-        swipeTargetSinglePairs += targetSinglePairs;
+        swipeTargetSinglePairs += extender.extendSoloJobs;
     }
 
     void addTarget(Sequence &query, Sequence &target, int seedQuery, int seedTarget) {
@@ -531,7 +529,6 @@ struct SwipeTargets {
         targetSequences.clear();
         seedQueries.clear();
         seedTargets.clear();
-        singlePairs.clear();
     }
 
     void startRep(DBKeyType key) {
@@ -599,8 +596,11 @@ static bool swipeForwardPasses(const Parameters &par, EvalueComputation &evaluer
     return Util::hasCoverage(par.covThr, par.covMode, qCov, tCov) && evaluer.computeEvalue(alignment.score1, queryLength) <= par.evalThr;
 }
 
-// the gapped alignments of the members of a round of alignClusterMembers, of all its gates; the members of a gate whose batch fills
-// half of the 16 bit lanes go through the lanes together, the others one pair at a time, which only depends on the member order of the gate;
+// the members of a gate whose batch of a round has this many go through the SWIPE lanes, on every ISA
+static const size_t SWIPE_GATE_MIN_BATCH = 4;
+
+// the gapped alignments of the members of a round of alignClusterMembers, of all its gates; the members of a gate whose batch has
+// SWIPE_GATE_MIN_BATCH members go through the lanes together, the others one pair at a time, which only depends on the member order of the gate;
 // a failing member closes its gate
 static void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherInitialized, ClusterMembers &members, Sequence &query, Sequence &element,
                               DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer) {
@@ -613,7 +613,7 @@ static void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &mat
     lanePool.assign(swipe.gapped.size(), SIZE_MAX);
     swipe.entries.clear();
     for (size_t g = 0; g < swipe.gapped.size(); g++) {
-        if (members.gates[members.poolGates[g]].batch >= VECSIZE_INT) {
+        if (members.gates[members.poolGates[g]].batch >= SWIPE_GATE_MIN_BATCH) {
             lanePool[g] = swipe.entries.size();
             swipe.entries.push_back(g);
         }
@@ -899,11 +899,6 @@ static void alignTargetsSwipe(const Parameters &par, SwipeTargets &swipe, const 
     size_t passed = 0;
     for (size_t i = 0; i < count; i++) {
         const s_align &forward = swipe.aligns[i];
-        if (forward.word == 2) {
-            const ClusterPair pair = { swipe.repKeys[swipe.queryIds[i]], swipe.targetKeys[i] };
-            swipe.singlePairs.push_back(pair);
-            continue;
-        }
         if (forward.score1 == 0 || Util::hasCoverage(par.covThr, par.covMode, SmithWaterman::computeCov(0, forward.qEndPos1, swipe.repLengths[swipe.queryIds[i]]),
                                                      SmithWaterman::computeCov(0, forward.dbEndPos1, swipe.lengths[i])) == false) {
             continue;
@@ -919,24 +914,18 @@ static void alignTargetsSwipe(const Parameters &par, SwipeTargets &swipe, const 
         swipe.backtraces[passed].swap(swipe.backtraces[i]);
         passed++;
     }
-    swipe.targetPairs += count - swipe.singlePairs.size();
+    swipe.targetPairs += count;
     count = passed;
     swipe.backAligns.resize(count);
     swipe.backBacktraces.resize(count);
     swipe.extender.extendBanded(count, swipe.queryIds.data(), swipe.targets.data(), swipe.lengths.data(), swipe.seedQueries.data(), swipe.seedTargets.data(), true, xDrop,
                                bandSide, swipe.backAligns.data(), swipe.backBacktraces.data());
     for (size_t i = 0; i < count; i++) {
-        if (swipe.backAligns[i].word == 2) {
-            const ClusterPair pair = { swipe.repKeys[swipe.queryIds[i]], swipe.targetKeys[i] };
-            swipe.singlePairs.push_back(pair);
-            continue;
-        }
         if (swipe.backAligns[i].score1 > 0 && swipeExtensionsPass(par, swipe, i)) {
             const ClusterPair pair = { swipe.repKeys[swipe.queryIds[i]], swipe.targetKeys[i] };
             pairs.push_back(pair);
         }
     }
-    swipe.targetSinglePairs += swipe.singlePairs.size();
 }
 
 // whether the target meets the clustering criteria against the query of blockAligner; diagonal becomes the one its --filter-cludb-file members start from
@@ -2410,20 +2399,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
                         }
                     }
                 }
-                // the queued gapped alignments of the batch, then the pairs that do not fit the lanes on the path of mode 0
                 alignTargetsSwipe(par, swipe, isAssigned, pairs);
-                for (size_t t = 0; t < swipe.singlePairs.size(); t++) {
-                    const ClusterPair &pair = swipe.singlePairs[t];
-                    const size_t repKey = pair.repKey % paddedDbSize;
-                    query.mapSequence(repKey, repKey, getWindowData(repKey), seqDbr.getSeqLen(repKey));
-                    blockAligner.setQuery(&query);
-                    bool blockAlignerInitialized = false;
-                    target.mapSequence(pair.memberKey, pair.memberKey, getWindowData(pair.memberKey), seqDbr.getSeqLen(pair.memberKey));
-                    unsigned short diagonal = 0;
-                    if (alignTarget(par, blockAligner, blockAlignerInitialized, query, target, scoring.scorePerColThreshold, diagonal, NULL, 0, NULL, NULL)) {
-                        pairs.push_back(pair);
-                    }
-                }
                 swipe.clearTargets();
                 // the lanes finish the pairs of the batch out of rep order
                 SORT_SERIAL(pairs.begin(), pairs.end(), ClusterPair::compareByRep);

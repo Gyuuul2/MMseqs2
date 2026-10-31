@@ -38,6 +38,8 @@ struct SwipeLanes<int16_t> {
 static const int SWIPE_MAX_LANES = VECSIZE_INT * 4;
 static const unsigned char SWIPE_ZERO_INDEX = 0x80;
 static const size_t SWIPE_MAX_TRACE_CELLS = 16 * 1024 * 1024 / sizeof(simd_int);
+// the band rows times width of the lanes of alignBanded with backtrace, the same on every ISA
+static const size_t SWIPE_MAX_BAND_TRACE_CELLS = 1 << 20;
 
 // shuffle indices of the lane letters into the 0-15 and 16-31 score tables, the high byte of 16 bit lanes reads 0
 template <typename T>
@@ -691,7 +693,7 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const uns
             startRows.resize(n);
             startColumns.resize(n);
             const size_t traceCells = static_cast<size_t>(Lq + 1) * jobs[start].width;
-            const bool canTrace = traceCells <= SWIPE_MAX_TRACE_CELLS;
+            const bool canTrace = traceCells <= SWIPE_MAX_BAND_TRACE_CELLS;
             if (doTrace && canTrace == false) {
                 for (size_t l = start; l < end; l++) {
                     aligns[jobs[l].id].word = 2;
@@ -804,6 +806,8 @@ static const int SWIPE_XDROP_ROWS = 16;
 static const int SWIPE_REBASE_SCORE = 16384;
 // the target letters of a score row of SwipeExtender
 static const int SWIPE_SCORE_ROW = 32;
+// the widest band of an extension, its band columns are 16 bit lane values
+static const int SWIPE_MAX_WIDTH = 4096;
 
 #if !defined(AVX512)
 #if defined(AVX2)
@@ -894,7 +898,7 @@ static inline void laneCellScores(const unsigned char *const *letters, const int
 #undef SWIPE_WIDEN
 
 SwipeExtender::SwipeExtender(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend)
-    : extendLaneRows(0), extendSlotRows(0), subMat(subMat), aaBiasCorrection(aaBiasCorrection), aaBiasCorrectionScale(aaBiasCorrectionScale),
+    : extendLaneRows(0), extendSlotRows(0), extendSoloJobs(0), subMat(subMat), aaBiasCorrection(aaBiasCorrection), aaBiasCorrectionScale(aaBiasCorrectionScale),
       gapOpen(gapOpen), gapExtend(gapExtend), band(NULL), bandCapacity(0), trace(NULL), traceCapacity(0), laneTargets(SwipeLanes<int16_t>::COUNT) {
     const int alphabetSize = subMat->alphabetSize;
     if (alphabetSize > SWIPE_SCORE_ROW) {
@@ -933,16 +937,6 @@ void SwipeExtender::clearQueries() {
     biases.clear();
     queryOffsets.clear();
     queryLengths.clear();
-}
-
-// a job whose trace may not fit or whose band column passes 16 bit goes back with word 2, as in alignBand
-void SwipeExtender::queue(std::vector<ExtendJob> &jobs, const ExtendJob &job, s_align *aligns) const {
-    const int width = job.left + job.right + 1;
-    if (width > SHRT_MAX || static_cast<size_t>(queryLengths[job.query] - job.seedRow) * ((width + 3) / 4) > SWIPE_MAX_TRACE_CELLS) {
-        aligns[job.id].word = 2;
-        return;
-    }
-    jobs.push_back(job);
 }
 
 template <bool Solo>
@@ -1044,8 +1038,11 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
             ExtendJob wider = job;
             wider.left *= (edgeLefts[l] != 0) ? 2 : 1;
             wider.right *= (edgeRights[l] != 0) ? 2 : 1;
-            queue(extendPending, wider, aligns);
-            return;
+            // a band grows up to SWIPE_MAX_WIDTH columns, the extension of a band that would pass it keeps its result
+            if (wider.left + wider.right + 1 <= SWIPE_MAX_WIDTH) {
+                extendPending.push_back(wider);
+                return;
+            }
         }
         s_align &a = aligns[job.id];
         const int row = bestRows[l];
@@ -1310,7 +1307,6 @@ void SwipeExtender::extendBanded(size_t count, const size_t *queryIds, const uns
     extendJobs.clear();
     for (size_t i = 0; i < count; i++) {
         const int queryLength = queryLengths[queryIds[i]];
-        aligns[i].word = 0;
         ExtendJob job;
         job.id = i;
         job.query = queryIds[i];
@@ -1318,7 +1314,7 @@ void SwipeExtender::extendBanded(size_t count, const size_t *queryIds, const uns
         job.seedColumn = backward ? targetLengths[i] - 1 - seedTargets[i] : seedTargets[i];
         job.left = bandSide;
         job.right = bandSide;
-        queue(extendJobs, job, aligns);
+        extendJobs.push_back(job);
     }
     while (extendJobs.empty() == false) {
         // the lanes of a band width take the jobs with the most query rows first
@@ -1342,6 +1338,7 @@ void SwipeExtender::extendBanded(size_t count, const size_t *queryIds, const uns
             }
             soloJobs.clear();
             extendBand<false>(&extendJobs[start], end - start, backward, xDrop, targets, targetLengths, aligns, backtraces);
+            extendSoloJobs += soloJobs.size();
             if (soloJobs.empty() == false) {
                 extendBand<true>(soloJobs.data(), soloJobs.size(), backward, xDrop, targets, targetLengths, aligns, backtraces);
             }
