@@ -99,6 +99,9 @@ public:
 
     static char touchMemory(const char* memory, size_t size);
 
+    // returns the pages of memory to the system on all threads, so freeing a large buffer afterwards does not unmap them on one thread
+    static void releasePages(void *memory, size_t size);
+
     // Wrap posix_madvise with errno-aware logging. Returns posix_madvise's
     // return value (errno-valued, 0 on success). Severity is WARNING for
     // benign cases (advisory SEQUENTIAL hint failures, or EINVAL on

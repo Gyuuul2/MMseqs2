@@ -850,6 +850,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             }
             delete kseq;
         }
+        Util::releasePages(buffer, bufferSize);
+        Util::releasePages(sortedBuffer, bufferSize);
         delete[] buffer;
         delete[] sortedBuffer;
     }
@@ -895,6 +897,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 windowBegin = nextOffset;
             }
         }
+        Util::releasePages(window, windowSize + MAX_SEGMENT_SIZE);
         delete[] window;
         MMseqsNode::closeExchangeFiles(exchangeFiles, exchange);
     }
