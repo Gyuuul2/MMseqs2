@@ -1624,13 +1624,36 @@ static const size_t FIRST_WINDOW_BYTES = 64 * 1024 * 1024;
 // the bytes of the rep targets that a thread writes at once
 static const size_t REP_TARGETS_WRITE_BYTES = 16 * 1024 * 1024;
 
+// offsets[0] is 0, offsets[1..count] become their sums from the front: every thread sums its part, then adds the parts before it
+static void sumOffsets(size_t *offsets, size_t count, int threads) {
+    std::vector<size_t> threadOffsets(threads + 1, 0);
+#pragma omp parallel for schedule(static)
+    for (int thread = 0; thread < threads; thread++) {
+        const size_t end = count * (thread + 1) / threads + 1;
+        for (size_t i = count * thread / threads + 2; i < end; i++) {
+            offsets[i] += offsets[i - 1];
+        }
+        threadOffsets[thread + 1] = (count * thread / threads + 1 < end) ? offsets[end - 1] : 0;
+    }
+    for (int thread = 0; thread < threads; thread++) {
+        threadOffsets[thread + 1] += threadOffsets[thread];
+    }
+#pragma omp parallel for schedule(static)
+    for (int thread = 0; thread < threads; thread++) {
+        for (size_t i = count * thread / threads + 1; i < count * (thread + 1) / threads + 1; i++) {
+            offsets[i] += threadOffsets[thread];
+        }
+    }
+}
+
 static size_t getClusterStepMemory(size_t dbSize, size_t memoryLimit) {
     return (dbSize + 63) / 64 * sizeof(uint64_t) + memoryLimit / STEP_MEMORY_DIVISOR;
 }
 
 // --createdb-mode 3: writes the reps of the partitions of this node with their targets; memberRequests: requests their --filter-cludb-file members
 static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &nodePartitions, size_t maxWindowBytes,
-                                   size_t memoryLimit, size_t paddedDbSize, size_t prefSizeBits, const std::string &repTargets, MMseqsNode::ClusterPairWriter *memberRequests) {
+                                   size_t memoryLimit, size_t paddedDbSize, size_t prefSizeBits, const std::string &repTargets, MMseqsNode::ClusterPairWriter *memberRequests,
+                                   std::string &phaseValues) {
     // a record holds at most maxRecordTargets targets, so they fit maxWindowBytes as pages
     const size_t batchBytes = std::max<size_t>(1, memoryLimit / WRITE_BATCH_MEMORY_DIVISOR);
     const size_t maxRecordTargets = std::min<size_t>(UINT_MAX, std::max<size_t>(1, std::min(batchBytes / 2 / sizeof(DBKeyType), maxWindowBytes / std::max<size_t>(seqDbr.getMaxSeqLen() + 2, Util::getPageSize()))));
@@ -1640,18 +1663,25 @@ static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr,
     std::string repTargetsIndexData;
     size_t repTargetsBytes = 0;
     std::vector<std::pair<size_t, size_t> > prefSplits;
-    std::vector<DBKeyType> entryRepKeys;
-    std::vector<size_t> entryTargetOffsets;
-    std::vector<size_t> entryRecordOffsets;
-    std::vector<DBKeyType> splitTargets;
-    std::vector<size_t> batchEntryOffsets;
-    std::vector<RepTargetsRecord> records;
-    std::vector<size_t> recordOffsets;
-    std::vector<char> flushBuffer;
+    // not zeroed, as each split or batch overwrites all of its part of them
+    DBKeyType *entryRepKeys = NULL;
+    size_t *entryTargetOffsets = NULL;
+    size_t *entryRecordOffsets = NULL;
+    size_t allocatedEntries = 0;
+    DBKeyType *splitTargets = NULL;
+    size_t allocatedTargets = 0;
+    RepTargetsRecord *records = NULL;
+    size_t allocatedRecords = 0;
+    char *flushBuffer = NULL;
+    size_t allocatedBytes = 0;
+    std::vector<size_t> threadOffsets(par.threads + 1);
     std::vector<size_t> nodeOffsets(MMseqsNode::count + 1);
     std::vector<std::vector<DBKeyType> > threadRequestKeys(par.threads);
     std::vector<DBKeyType> requestKeys;
+    double readSeconds = 0;
+    double writeSeconds = 0;
     for (size_t i = 0; i < nodePartitions.size();) {
+        Timer readTimer;
         const size_t prefNode = nodePartitions[i].node;
         DBReader<DBKeyType> *prefDb = new DBReader<DBKeyType>((par.db2 + "." + SSTR(prefNode)).c_str(), (par.db2 + ".index." + SSTR(prefNode)).c_str(), par.threads,
                                                               DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
@@ -1677,26 +1707,50 @@ static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr,
                 prefSplits[split].second = (split + 1 < prefSplits.size()) ? prefSplits[split + 1].first : partitionEndEntry;
             }
         }
+        readSeconds += readTimer.getTimediff();
+        std::thread prefetchThread;
         for (size_t split = 0; split < prefSplits.size(); split++) {
             const size_t splitBegin = prefSplits[split].first;
             const size_t entryCount = prefSplits[split].second - splitBegin;
-            prefDb->loadData(splitBegin, prefSplits[split].second);
-            if (split + 1 < prefSplits.size()) {
-                prefDb->prefetchData(prefSplits[split + 1].first, prefSplits[split + 1].second);
+            readTimer.reset();
+            if (prefetchThread.joinable()) {
+                prefetchThread.join();
             }
-            entryRepKeys.resize(entryCount);
-            entryTargetOffsets.assign(entryCount + 1, 0);
-            entryRecordOffsets.assign(entryCount + 1, 0);
+            prefDb->loadData(splitBegin, prefSplits[split].second);
+            readSeconds += readTimer.getTimediff();
+            // prefetchData reads the entry offsets before it returns, so it runs beside the work on this split
+            if (split + 1 < prefSplits.size()) {
+                prefetchThread = std::thread(&DBReader<DBKeyType>::prefetchData, prefDb, prefSplits[split + 1].first, prefSplits[split + 1].second);
+            }
+            if (allocatedEntries < entryCount + 1) {
+                delete[] entryRepKeys;
+                delete[] entryTargetOffsets;
+                delete[] entryRecordOffsets;
+                allocatedEntries = entryCount + 1;
+                entryRepKeys = new(std::nothrow) DBKeyType[allocatedEntries];
+                entryTargetOffsets = new(std::nothrow) size_t[allocatedEntries];
+                entryRecordOffsets = new(std::nothrow) size_t[allocatedEntries];
+                Util::checkAllocation(entryRepKeys, "Can not allocate entryRepKeys memory in align2clust");
+                Util::checkAllocation(entryTargetOffsets, "Can not allocate entryTargetOffsets memory in align2clust");
+                Util::checkAllocation(entryRecordOffsets, "Can not allocate entryRecordOffsets memory in align2clust");
+            }
+            entryTargetOffsets[0] = 0;
+            entryRecordOffsets[0] = 0;
 #pragma omp parallel for schedule(dynamic, 100)
             for (size_t entry = 0; entry < entryCount; entry++) {
                 const char *data = prefDb->getData(splitBegin + entry, 0);
-                const size_t keys = std::count_if(data, data + prefDb->getEntryLen(splitBegin + entry) - 1, [](char byte) { return static_cast<unsigned char>(byte) < 0x80; });
-                entryTargetOffsets[entry + 1] = keys - 1;
+                const size_t targetCount = std::count_if(data, data + prefDb->getEntryLen(splitBegin + entry) - 1, [](char byte) { return static_cast<unsigned char>(byte) < 0x80; }) - 1;
+                entryTargetOffsets[entry + 1] = targetCount;
+                entryRecordOffsets[entry + 1] = (targetCount + maxRecordTargets - 1) / maxRecordTargets;
             }
-            for (size_t entry = 0; entry < entryCount; entry++) {
-                entryTargetOffsets[entry + 1] += entryTargetOffsets[entry];
+            sumOffsets(entryTargetOffsets, entryCount, par.threads);
+            sumOffsets(entryRecordOffsets, entryCount, par.threads);
+            if (allocatedTargets < entryTargetOffsets[entryCount]) {
+                delete[] splitTargets;
+                allocatedTargets = entryTargetOffsets[entryCount];
+                splitTargets = new(std::nothrow) DBKeyType[allocatedTargets];
+                Util::checkAllocation(splitTargets, "Can not allocate splitTargets memory in align2clust");
             }
-            splitTargets.resize(entryTargetOffsets[entryCount]);
 #pragma omp parallel
             {
                 unsigned int thread_idx = 0;
@@ -1709,7 +1763,7 @@ static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr,
                     const char *data = prefDb->getData(splitBegin + entry, 0);
                     const DBKeyType repKey = Util::getPrefKey(data);
                     entryRepKeys[entry] = repKey;
-                    DBKeyType *targets = splitTargets.data() + entryTargetOffsets[entry];
+                    DBKeyType *targets = splitTargets + entryTargetOffsets[entry];
                     const size_t targetCount = entryTargetOffsets[entry + 1] - entryTargetOffsets[entry];
                     const size_t repLength = seqDbr.getSeqLen(repKey);
                     for (size_t j = 0; j < targetCount; j++) {
@@ -1719,7 +1773,6 @@ static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr,
                             threadRequestKeys[thread_idx].push_back(targets[j]);
                         }
                     }
-                    entryRecordOffsets[entry + 1] = (targetCount + maxRecordTargets - 1) / maxRecordTargets;
                 }
             }
             if (memberRequests != NULL) {
@@ -1728,24 +1781,32 @@ static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr,
                     memberRequests->add(requestKeys[j], MMseqsNode::rank);
                 }
             }
-            batchEntryOffsets.assign(1, 0);
-            for (size_t entry = 0, recordBytes = 0; entry < entryCount; entry++) {
-                const size_t entryRecordBytes = entryRecordOffsets[entry + 1] * sizeof(RepTargets) + (entryTargetOffsets[entry + 1] - entryTargetOffsets[entry]) * sizeof(DBKeyType);
-                entryRecordOffsets[entry + 1] += entryRecordOffsets[entry];
-                if (entry > batchEntryOffsets.back() && recordBytes + entryRecordBytes > batchBytes) {
-                    batchEntryOffsets.push_back(entry);
-                    recordBytes = 0;
+            const auto getRecordBytes = [&](size_t entry) {
+                return entryRecordOffsets[entry] * sizeof(RepTargets) + entryTargetOffsets[entry] * sizeof(DBKeyType);
+            };
+            // a batch ends before the entry whose records would exceed batchBytes, but takes at least one entry
+            for (size_t firstEntry = 0, endEntry = 0; firstEntry < entryCount; firstEntry = endEntry) {
+                const size_t maxRecordBytes = getRecordBytes(firstEntry) + batchBytes;
+                endEntry = firstEntry + 1;
+                for (size_t entries = entryCount - endEntry; entries > 0;) {
+                    const size_t half = entries / 2;
+                    if (getRecordBytes(endEntry + half + 1) <= maxRecordBytes) {
+                        endEntry += half + 1;
+                        entries -= half + 1;
+                    } else {
+                        entries = half;
+                    }
                 }
-                recordBytes += entryRecordBytes;
-            }
-            batchEntryOffsets.push_back(entryCount);
-            for (size_t batch = 0; batch + 1 < batchEntryOffsets.size(); batch++) {
-                const size_t firstEntry = batchEntryOffsets[batch];
-                const size_t endEntry = batchEntryOffsets[batch + 1];
                 const size_t firstRecord = entryRecordOffsets[firstEntry];
-                records.resize(entryRecordOffsets[endEntry] - firstRecord);
-                if (records.empty()) {
+                const size_t recordCount = entryRecordOffsets[endEntry] - firstRecord;
+                if (recordCount == 0) {
                     continue;
+                }
+                if (allocatedRecords < recordCount) {
+                    delete[] records;
+                    allocatedRecords = recordCount;
+                    records = new(std::nothrow) RepTargetsRecord[allocatedRecords];
+                    Util::checkAllocation(records, "Can not allocate records memory in align2clust");
                 }
 #pragma omp parallel for schedule(dynamic, 100)
                 for (size_t entry = firstEntry; entry < endEntry; entry++) {
@@ -1754,33 +1815,59 @@ static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr,
                     const size_t prefSizeBit = (targetCount > 0) ? std::min<size_t>(prefSizeBits - 1, 63 - __builtin_clzll(targetCount)) : 0;
                     for (size_t first = 0; first < targetCount; first += maxRecordTargets, j++) {
                         RepTargets &header = records[j].header;
+                        // the file gets the padding too
+                        memset(&header, 0, sizeof(RepTargets));
                         header.repFirstTarget.repKey = (prefSizeBits - 1 - prefSizeBit) * paddedDbSize + entryRepKeys[entry];
                         header.repFirstTarget.memberKey = splitTargets[entryTargetOffsets[entry] + first];
                         header.targetCount = static_cast<unsigned int>(std::min(targetCount - first, maxRecordTargets));
                         records[j].targetOffset = entryTargetOffsets[entry] + first;
                     }
                 }
-                SORT_PARALLEL(records.begin(), records.end(), RepTargetsRecord::compareByRep);
-                recordOffsets.resize(records.size() + 1);
-                recordOffsets[0] = 0;
-                for (size_t j = 0; j < records.size(); j++) {
-                    recordOffsets[j + 1] = recordOffsets[j] + sizeof(RepTargets) + records[j].header.targetCount * sizeof(DBKeyType);
+                // the records of entries in rep order are already sorted
+                bool isSorted = true;
+#pragma omp parallel for schedule(static) reduction(&&: isSorted)
+                for (size_t j = 1; j < recordCount; j++) {
+                    isSorted = isSorted && RepTargetsRecord::compareByRep(records[j], records[j - 1]) == false;
                 }
-                flushBuffer.resize(recordOffsets.back());
-#pragma omp parallel for schedule(dynamic, 100)
-                for (size_t j = 0; j < records.size(); j++) {
-                    const RepTargets &header = records[j].header;
-                    char *data = flushBuffer.data() + recordOffsets[j];
-                    memcpy(data, &header, sizeof(RepTargets));
-                    memcpy(data + sizeof(RepTargets), splitTargets.data() + records[j].targetOffset, header.targetCount * sizeof(DBKeyType));
+                if (isSorted == false) {
+                    SORT_PARALLEL(records, records + recordCount, RepTargetsRecord::compareByRep);
                 }
+                std::fill(threadOffsets.begin(), threadOffsets.end(), 0);
+#pragma omp parallel for schedule(static)
+                for (int thread = 0; thread < par.threads; thread++) {
+                    for (size_t j = recordCount * thread / par.threads; j < recordCount * (thread + 1) / par.threads; j++) {
+                        threadOffsets[thread + 1] += sizeof(RepTargets) + records[j].header.targetCount * sizeof(DBKeyType);
+                    }
+                }
+                for (int thread = 0; thread < par.threads; thread++) {
+                    threadOffsets[thread + 1] += threadOffsets[thread];
+                }
+                const size_t flushBytes = threadOffsets[par.threads];
+                if (allocatedBytes < flushBytes) {
+                    delete[] flushBuffer;
+                    allocatedBytes = flushBytes;
+                    flushBuffer = new(std::nothrow) char[allocatedBytes];
+                    Util::checkAllocation(flushBuffer, "Can not allocate flushBuffer memory in align2clust");
+                }
+#pragma omp parallel for schedule(static)
+                for (int thread = 0; thread < par.threads; thread++) {
+                    size_t bufferPos = threadOffsets[thread];
+                    for (size_t j = recordCount * thread / par.threads; j < recordCount * (thread + 1) / par.threads; j++) {
+                        const RepTargets &header = records[j].header;
+                        memcpy(flushBuffer + bufferPos, &header, sizeof(RepTargets));
+                        memcpy(flushBuffer + bufferPos + sizeof(RepTargets), splitTargets + records[j].targetOffset, header.targetCount * sizeof(DBKeyType));
+                        bufferPos += sizeof(RepTargets) + header.targetCount * sizeof(DBKeyType);
+                    }
+                }
+                Timer writeTimer;
+#pragma omp parallel for schedule(dynamic, 1)
+                for (size_t offset = 0; offset < flushBytes; offset += REP_TARGETS_WRITE_BYTES) {
+                    FileUtil::pwriteAll(fileno(repTargetsHandle), repTargetsFile.c_str(), flushBuffer + offset, std::min(REP_TARGETS_WRITE_BYTES, flushBytes - offset), repTargetsBytes + offset);
+                }
+                writeSeconds += writeTimer.getTimediff();
                 // all bytes of the flush are for this node
                 for (size_t node = 0; node <= MMseqsNode::count; node++) {
-                    nodeOffsets[node] = (node <= MMseqsNode::rank) ? 0 : flushBuffer.size();
-                }
-#pragma omp parallel for schedule(dynamic, 1)
-                for (size_t offset = 0; offset < flushBuffer.size(); offset += REP_TARGETS_WRITE_BYTES) {
-                    FileUtil::pwriteAll(fileno(repTargetsHandle), repTargetsFile.c_str(), flushBuffer.data() + offset, std::min(REP_TARGETS_WRITE_BYTES, flushBuffer.size() - offset), repTargetsBytes + offset);
+                    nodeOffsets[node] = (node <= MMseqsNode::rank) ? 0 : flushBytes;
                 }
                 MMseqsNode::addExchangeFlush(repTargetsIndexData, repTargetsBytes, nodeOffsets);
             }
@@ -1788,11 +1875,20 @@ static std::string writeRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr,
         prefDb->close();
         delete prefDb;
     }
+    delete[] entryRepKeys;
+    delete[] entryTargetOffsets;
+    delete[] entryRecordOffsets;
+    delete[] splitTargets;
+    delete[] records;
+    delete[] flushBuffer;
     // only this node reads its file, so it needs no barrier
     if (fclose(repTargetsHandle) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << repTargetsFile << "\n";
         EXIT(EXIT_FAILURE);
     }
+    MMseqsNode::addPhaseSeconds(phaseValues, "reading the prefilter", readSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "writing the rep targets file", writeSeconds);
+    MMseqsNode::addPhaseValue(phaseValues, "Rep targets bytes", SSTR(repTargetsBytes));
     return repTargetsIndexData;
 }
 
@@ -3191,7 +3287,7 @@ static int align2clustLinfinity(Parameters &par) {
                                                                 ClusterPair::compareByRep, filterCluKeyOffsets);
     }
     const std::string repTargets = par.db3 + "_rep_targets";
-    const std::string repTargetsIndex = writeRepTargets(par, seqDbr, nodePartitions, maxWindowBytes, memoryLimit, paddedDbSize, prefSizeBits, repTargets, memberRequestWriter);
+    const std::string repTargetsIndex = writeRepTargets(par, seqDbr, nodePartitions, maxWindowBytes, memoryLimit, paddedDbSize, prefSizeBits, repTargets, memberRequestWriter, phaseValues);
     MMseqsNode::addPhaseTime(phaseValues, "writing the rep targets", phaseValueTimer);
 
     std::vector<ClusterPair> members;
