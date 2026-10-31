@@ -119,7 +119,12 @@ struct KmerPositionBit {
     DBKeyType getId() const { return getBits(idShift, seqLenShift); }
     size_t getPos() const { return getBits(0, idShift); }
 
-    bool operator<(const KmerPositionBit &other) const { return value < other.value; }
+    // the upper words first: ips4o sorts with this more than twice as fast as with the 128 bit compare
+    bool operator<(const KmerPositionBit &other) const {
+        const uint64_t upper = static_cast<uint64_t>(value >> 64);
+        const uint64_t otherUpper = static_cast<uint64_t>(other.value >> 64);
+        return (upper != otherUpper) ? upper < otherUpper : static_cast<uint64_t>(value) < static_cast<uint64_t>(other.value);
+    }
 
 private:
     size_t getBits(unsigned int shift, unsigned int nextShift) const {
