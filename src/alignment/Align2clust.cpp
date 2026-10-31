@@ -1056,12 +1056,14 @@ static size_t getAlignNode(const std::vector<size_t> &groupKeyOffsets, size_t ke
 
 // --createdb-mode 3: the records [begin, end) of a chunk aligned at once, with the keys to load and their entries
 struct RepWindow {
+    RepWindow() : chunk(0), begin(0), end(0), data(NULL), allocatedBytes(0) {}
     size_t chunk;
     size_t begin;
     size_t end;
     std::vector<DBKeyType> keys;
     std::vector<size_t> homeKeyOffsets;
-    std::vector<char> data;
+    char *data;
+    size_t allocatedBytes;
     std::vector<size_t> entryOffsets;
 };
 
@@ -1420,7 +1422,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
     };
     std::vector<DBKeyType> uniqueKeys;
     std::vector<unsigned int> keyHomes;
-    std::vector<size_t> homeKeyEnds;
+    std::vector<size_t> threadHomeOffsets;
     size_t windowLimit = std::min(memoryLimit / WINDOW_MEMORY_DIVISOR / 64, FIRST_WINDOW_BYTES);
     // a window takes records while their reps and targets fit, at least one
     const auto readWindow = [&](RepWindow &window) {
@@ -1487,21 +1489,40 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
         collectUniqueKeys(threadKeys, uniqueKeys);
         const size_t keyCount = uniqueKeys.size();
         keyHomes.resize(keyCount);
-#pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < keyCount; i++) {
-            keyHomes[i] = getKeyHome(uniqueKeys[i]);
-        }
-        window.homeKeyOffsets.assign(nodes + 1, 0);
-        for (size_t i = 0; i < keyCount; i++) {
-            window.homeKeyOffsets[keyHomes[i] + 1]++;
-        }
-        for (unsigned int node = 0; node < nodes; node++) {
-            window.homeKeyOffsets[node + 1] += window.homeKeyOffsets[node];
-        }
-        homeKeyEnds.assign(window.homeKeyOffsets.begin(), window.homeKeyOffsets.end() - 1);
         window.keys.resize(keyCount);
-        for (size_t i = 0; i < keyCount; i++) {
-            window.keys[homeKeyEnds[keyHomes[i]]++] = uniqueKeys[i];
+        // the keys go to their homes in key order: every thread counts the homes of its static part, then places it after the parts of the lower threads
+        threadHomeOffsets.assign(nodes * par.threads + 1, 0);
+#pragma omp parallel
+        {
+            unsigned int thread_idx = 0;
+#ifdef OPENMP
+            thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+            std::vector<size_t> homeOffsets(nodes, 0);
+#pragma omp for schedule(static)
+            for (size_t i = 0; i < keyCount; i++) {
+                keyHomes[i] = getKeyHome(uniqueKeys[i]);
+                homeOffsets[keyHomes[i]]++;
+            }
+            for (unsigned int node = 0; node < nodes; node++) {
+                threadHomeOffsets[node * par.threads + thread_idx + 1] = homeOffsets[node];
+            }
+#pragma omp barrier
+#pragma omp single
+            for (size_t i = 0; i + 1 < threadHomeOffsets.size(); i++) {
+                threadHomeOffsets[i + 1] += threadHomeOffsets[i];
+            }
+            for (unsigned int node = 0; node < nodes; node++) {
+                homeOffsets[node] = threadHomeOffsets[node * par.threads + thread_idx];
+            }
+#pragma omp for schedule(static)
+            for (size_t i = 0; i < keyCount; i++) {
+                window.keys[homeOffsets[keyHomes[i]]++] = uniqueKeys[i];
+            }
+        }
+        window.homeKeyOffsets.resize(nodes + 1);
+        for (unsigned int node = 0; node <= nodes; node++) {
+            window.homeKeyOffsets[node] = threadHomeOffsets[node * par.threads];
         }
         window.entryOffsets.resize(keyCount + 1);
         window.entryOffsets[0] = 0;
@@ -1512,7 +1533,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
         for (size_t i = 0; i < keyCount; i++) {
             window.entryOffsets[i + 1] += window.entryOffsets[i];
         }
-        window.data.resize(window.entryOffsets[keyCount]);
+        // not zeroed, as the entries overwrite all of it
+        if (window.allocatedBytes < window.entryOffsets[keyCount]) {
+            delete[] window.data;
+            window.allocatedBytes = window.entryOffsets[keyCount];
+            window.data = new(std::nothrow) char[window.allocatedBytes];
+            Util::checkAllocation(window.data, "Can not allocate window data memory in align2clust");
+        }
     };
     const auto getFirstRepKey = [&](const RepWindow &window) {
         return (window.end > window.begin) ? static_cast<size_t>(chunkRecords[window.chunk][window.begin].header.repFirstTarget.repKey) : orderKeyEnd;
@@ -1549,7 +1576,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
         const size_t home = getKeyHome(key);
         const DBKeyType *keys = window.keys.data();
         const DBKeyType *found = std::lower_bound(keys + window.homeKeyOffsets[home], keys + window.homeKeyOffsets[home + 1], static_cast<DBKeyType>(key));
-        return (found != keys + window.homeKeyOffsets[home + 1] && *found == key) ? window.data.data() + window.entryOffsets[found - keys] : NULL;
+        return (found != keys + window.homeKeyOffsets[home + 1] && *found == key) ? window.data + window.entryOffsets[found - keys] : NULL;
     };
 
     // a service thread besides --threads gets the entries of a window from their homes and serves the keys of its blocks to the others
@@ -1560,18 +1587,18 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
     RepWindow *fetchedWindow = NULL;
     bool isWaitingForMaster = false;
     std::vector<DBKeyType> loadKeys;
-    const auto copyEntries = [&](const DBKeyType *keys, size_t keyCount, char *data) {
+    // copies the entries of keys to data at entryOffsets on --threads threads besides the aligning ones, as one thread could not keep up with them
+    const auto copyEntries = [&](const DBKeyType *keys, size_t keyCount, const size_t *entryOffsets, char *data) {
         for (size_t first = 0; first < keyCount;) {
-            loadKeys.clear();
-            for (size_t loadBytes = 0; first < keyCount && (loadKeys.empty() || loadBytes + std::max(seqDbr.getEntryLen(keys[first]), pageSize) <= memoryLimit / WINDOW_MEMORY_DIVISOR); first++) {
-                loadBytes += std::max(seqDbr.getEntryLen(keys[first]), pageSize);
-                loadKeys.push_back(keys[first]);
+            const size_t loadFirst = first;
+            for (size_t loadBytes = 0; first < keyCount && (first == loadFirst || loadBytes + std::max(entryOffsets[first + 1] - entryOffsets[first], pageSize) <= memoryLimit / WINDOW_MEMORY_DIVISOR); first++) {
+                loadBytes += std::max(entryOffsets[first + 1] - entryOffsets[first], pageSize);
             }
+            loadKeys.assign(keys + loadFirst, keys + first);
             seqDbr.loadData(loadKeys);
-            for (size_t i = 0; i < loadKeys.size(); i++) {
-                const size_t entryLength = seqDbr.getEntryLen(loadKeys[i]);
-                memcpy(data, seqDbr.getData(loadKeys[i], 0), entryLength);
-                data += entryLength;
+#pragma omp parallel for schedule(static) num_threads(par.threads)
+            for (size_t i = loadFirst; i < first; i++) {
+                memcpy(data + entryOffsets[i], seqDbr.getData(keys[i], 0), entryOffsets[i + 1] - entryOffsets[i]);
             }
         }
     };
@@ -1607,6 +1634,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
             }
             std::vector<unsigned char> isReceived(nodes, 0);
             std::vector<DBKeyType> requestKeys;
+            std::vector<size_t> requestOffsets;
             std::vector<char> slice;
             std::vector<BatchReader::ReadRequest> sliceReads;
             BatchReader *sliceReader = NULL;
@@ -1658,7 +1686,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
                             MMseqsNode::publishExchangeFlush(requestHandle, requestFiles[rank], requestBytes, requestIndexes[rank], requestLine);
                         }
                         const size_t ownKey = nextRequest->homeKeyOffsets[rank];
-                        copyEntries(nextRequest->keys.data() + ownKey, nextRequest->homeKeyOffsets[rank + 1] - ownKey, nextRequest->data.data() + nextRequest->entryOffsets[ownKey]);
+                        copyEntries(nextRequest->keys.data() + ownKey, nextRequest->homeKeyOffsets[rank + 1] - ownKey, nextRequest->entryOffsets.data() + ownKey, nextRequest->data);
                         isLastRequested = isLast;
                         requestedWindow = nextRequest;
                         hasWorked = true;
@@ -1683,7 +1711,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
                             Debug(Debug::ERROR) << "Cannot open " << receivedFiles[home] << "\n";
                             EXIT(EXIT_FAILURE);
                         }
-                        const BatchReader::ReadRequest request = { fd, receivedFiles[home].c_str(), requestedWindow->data.data() + sliceBegin, 0, sliceEnd - sliceBegin, sliceEnd - sliceBegin };
+                        const BatchReader::ReadRequest request = { fd, receivedFiles[home].c_str(), requestedWindow->data + sliceBegin, 0, sliceEnd - sliceBegin, sliceEnd - sliceBegin };
                         sliceReads.push_back(request);
                         isReceived[home] = 1;
                         nodeReceived[home]++;
@@ -1726,16 +1754,27 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
                         }
                         requestKeys.resize((requestLine[3 + rank] - requestLine[2 + rank]) / sizeof(DBKeyType));
                         MMseqsNode::readLog(requestFiles[node], requestLine[2 + rank], requestLine[3 + rank], reinterpret_cast<char *>(requestKeys.data()));
-                        size_t sliceBytes = 0;
+                        requestOffsets.resize(requestKeys.size() + 1);
+                        requestOffsets[0] = 0;
+#pragma omp parallel for schedule(static) num_threads(par.threads)
                         for (size_t j = 0; j < requestKeys.size(); j++) {
-                            sliceBytes += seqDbr.getEntryLen(requestKeys[j]);
+                            requestOffsets[j + 1] = seqDbr.getEntryLen(requestKeys[j]);
                         }
-                        slice.resize(sliceBytes);
-                        copyEntries(requestKeys.data(), requestKeys.size(), slice.data());
+                        for (size_t j = 0; j < requestKeys.size(); j++) {
+                            requestOffsets[j + 1] += requestOffsets[j];
+                        }
+                        const size_t sliceBytes = requestOffsets[requestKeys.size()];
+                        if (slice.size() < sliceBytes) {
+                            slice.resize(sliceBytes);
+                        }
+                        copyEntries(requestKeys.data(), requestKeys.size(), requestOffsets.data(), slice.data());
                         FILE *servedHandle = FileUtil::openAndDelete(servedFiles[node].c_str(), "w");
-                        FileUtil::pwriteAll(fileno(servedHandle), servedFiles[node].c_str(), slice.data(), slice.size(), 0);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+                        for (size_t offset = 0; offset < sliceBytes; offset += REP_TARGETS_WRITE_BYTES) {
+                            FileUtil::pwriteAll(fileno(servedHandle), servedFiles[node].c_str(), slice.data() + offset, std::min(REP_TARGETS_WRITE_BYTES, sliceBytes - offset), offset);
+                        }
                         servedLine[0] = nodeServed[node]++;
-                        MMseqsNode::publishExchangeFlush(servedHandle, servedFiles[node], slice.size(), servedIndexes[node], servedLine);
+                        MMseqsNode::publishExchangeFlush(servedHandle, servedFiles[node], sliceBytes, servedIndexes[node], servedLine);
                     }
                 }
                 // idle: poll again after up to 160 ms while the main thread may wait, else up to 1.28 s
@@ -1969,6 +2008,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, const 
     if (hasService) {
         serviceThread.join();
     }
+    delete[] window.data;
+    delete[] nextWindow.data;
     MMseqsNode::addPhaseValue(phaseValues, "Block read bytes", SSTR(seqDbr.getBlockReadBytes()));
     MMseqsNode::addPhaseValue(phaseValues, "Key read bytes", SSTR(seqDbr.getKeyReadBytes()));
     MMseqsNode::closeExchangeFiles(repFiles, repTargets);
