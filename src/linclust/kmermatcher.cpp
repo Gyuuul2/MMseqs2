@@ -28,6 +28,7 @@
 #include <fcntl.h>
 
 #include <limits>
+#include <thread>
 #include <algorithm>
 
 #ifdef OPENMP
@@ -2418,39 +2419,75 @@ static void countPartitionTargets(const KmerExchange &exchange, const std::vecto
         readRecords.push_back(pairRow.recordCount);
     }
     merge.pairReadStarts = pairReads;
-    keyOffsets.assign(partitionKeys + 1, 0);
+    keyOffsets.resize(partitionKeys + 1);
     const size_t chunkTargetBits = std::max<size_t>(1, partitionCodeBytes * CHAR_BIT / (CHUNKS_PER_THREAD * threads));
     merge.rowRecordChunks.assign(readRecords.size(), std::vector<PairRecordChunk>());
-#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (size_t read = 0; read < readRecords.size(); read++) {
-        KmerCodeReader &indexRead = pairReads[read * PAIR_CODE_COUNT + PAIR_INDEX_CODES];
-        size_t targetBitPos = 0;
-        size_t chunkBits = 0;
-        for (size_t record = 0; record < readRecords[read]; record++) {
-            if (record == 0 || chunkBits >= chunkTargetBits) {
-                const PairRecordChunk recordChunk = {read, indexRead, targetBitPos, 0};
-                merge.rowRecordChunks[read].push_back(recordChunk);
-                chunkBits = 0;
+    // the target count of every key, then where its targets start, summed in a part of the keys per thread and then over the parts
+    std::vector<size_t> partTargets(threads + 1, 0);
+#pragma omp parallel num_threads(threads)
+    {
+#pragma omp for schedule(static)
+        for (size_t key = 0; key <= partitionKeys; key++) {
+            keyOffsets[key] = 0;
+        }
+#pragma omp for schedule(dynamic, 1)
+        for (size_t read = 0; read < readRecords.size(); read++) {
+            KmerCodeReader &indexRead = pairReads[read * PAIR_CODE_COUNT + PAIR_INDEX_CODES];
+            size_t targetBitPos = 0;
+            size_t chunkBits = 0;
+            for (size_t record = 0; record < readRecords[read]; record++) {
+                if (record == 0 || chunkBits >= chunkTargetBits) {
+                    const PairRecordChunk recordChunk = {read, indexRead, targetBitPos, 0};
+                    merge.rowRecordChunks[read].push_back(recordChunk);
+                    chunkBits = 0;
+                }
+                const size_t targetCount = getEliasGamma(indexRead);
+                __sync_fetch_and_add(&keyOffsets[getBits(indexRead, exchange.partitionKeyBits) + 1], targetCount);
+                getBits(indexRead, indexRead.bitCount);
+                const size_t recordTargetBits = (targetCount * exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT * CHAR_BIT;
+                targetBitPos += recordTargetBits;
+                chunkBits += recordTargetBits;
+                merge.rowRecordChunks[read].back().recordCount++;
             }
-            const size_t targetCount = getEliasGamma(indexRead);
-            __sync_fetch_and_add(&keyOffsets[getBits(indexRead, exchange.partitionKeyBits) + 1], targetCount);
-            getBits(indexRead, indexRead.bitCount);
-            const size_t recordTargetBits = (targetCount * exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT * CHAR_BIT;
-            targetBitPos += recordTargetBits;
-            chunkBits += recordTargetBits;
-            merge.rowRecordChunks[read].back().recordCount++;
+        }
+#pragma omp for schedule(static)
+        for (int part = 0; part < threads; part++) {
+            const size_t partBegin = 1 + partitionKeys * part / threads;
+            const size_t partEnd = 1 + partitionKeys * (part + 1) / threads;
+            for (size_t key = partBegin + 1; key < partEnd; key++) {
+                keyOffsets[key] += keyOffsets[key - 1];
+            }
+            partTargets[part + 1] = (partEnd > partBegin) ? keyOffsets[partEnd - 1] : 0;
+        }
+#pragma omp single
+        for (int part = 0; part < threads; part++) {
+            partTargets[part + 1] += partTargets[part];
+        }
+#pragma omp for schedule(static)
+        for (int part = 1; part < threads; part++) {
+            for (size_t key = 1 + partitionKeys * part / threads; key < 1 + partitionKeys * (part + 1) / threads; key++) {
+                keyOffsets[key] += partTargets[part];
+            }
         }
     }
-    // where the targets of every key start, and chunks of keys with about the same keys and targets
+    // chunks of keys with about the same keys and targets: a chunk starts at the first key whose keys and targets before it reach a multiple of keyChunkWeight
     const size_t keyChunkWeight = std::max<size_t>(1, (partitionTargets + partitionKeys + CHUNKS_PER_THREAD * threads - 1) / (CHUNKS_PER_THREAD * threads));
     merge.keyChunkOffsets.assign(1, 0);
-    for (size_t key = 0; key < partitionKeys; key++) {
-        if (keyOffsets[key] + key >= merge.keyChunkOffsets.size() * keyChunkWeight) {
-            merge.keyChunkOffsets.push_back(key);
+    for (size_t chunk = 1; merge.keyChunkOffsets.back() < partitionKeys; chunk++) {
+        size_t low = merge.keyChunkOffsets.back();
+        size_t high = partitionKeys;
+        while (low < high) {
+            const size_t mid = low + (high - low) / 2;
+            if (keyOffsets[mid] + mid < chunk * keyChunkWeight) {
+                low = mid + 1;
+            } else {
+                high = mid;
+            }
         }
-        keyOffsets[key + 1] += keyOffsets[key];
+        if (low > merge.keyChunkOffsets.back()) {
+            merge.keyChunkOffsets.push_back(low);
+        }
     }
-    merge.keyChunkOffsets.push_back(partitionKeys);
 }
 
 // with threads: places the targets of every key in targets, sorts those of every kept key without repeats and finds where the entries and index cells of every key chunk start
@@ -3688,7 +3725,7 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                 prefDataBytes = partitionDataOffsets[passPartitions];
                 prefIndexBytes = partitionIndexOffsets[passPartitions];
             } else {
-                // a pass of few partitions: the partitions one after the other, all threads merge a partition
+                // a pass of few partitions: the partitions one after the other in one PartitionMerge that keeps its buffers, all threads merge a partition
                 for (size_t passPartition = 0; passPartition < passPartitions; passPartition++) {
                     const size_t partition = passFirstPartition + passPartition;
                     const size_t partitionFirstKey = getPartitionFirstKey(exchange, sendRange, partition);
@@ -3833,7 +3870,6 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                     }
                     addPartitionRow(partitionFirstKey, partitionDataOffset, prefDataBytes - partitionDataOffset, partitionCost);
                     prefIndexBytes += partitionEntryCount * 2 * sizeof(uint64_t);
-                    partitionMerges[0] = PartitionMerge();
                 }
             }
         }
@@ -4028,13 +4064,16 @@ static void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, B
     MMseqsNode::addPhaseTime(mergeValues, "waiting for the other nodes to receive k-mers", phaseTimer);
     // every node has passed the hash ranges and read the k-mer file of this node
     hashQueue.removeClaims();
-    FileUtil::remove((par.db2 + ".kmers." + SSTR(MMseqsNode::rank)).c_str());
+    // freeing the blocks and cached pages of a large k-mer file takes long, so it is removed while the pairs are merged
+    const std::string kmerFile = par.db2 + ".kmers." + SSTR(MMseqsNode::rank);
+    std::thread kmerFileRemoval([&kmerFile]() { FileUtil::remove(kmerFile.c_str()); });
     if (MMseqsNode::isMaster()) {
         FileUtil::remove((par.db2 + ".kmers.done").c_str());
     }
 
     std::vector<size_t> mergeRanges;
     const std::string partitionsData = mergeAssignedPairs(par, seqDbr, exchange, mergeQueue, mergeRanges, mergeValues);
+    kmerFileRemoval.join();
     MMseqsNode::addPhaseTime(mergeValues, "merging pairs", phaseTimer);
     MMseqsNode::addPhaseValue(mergeValues, "Send ranges merged", SSTR(mergeRanges.size()));
     MMseqsNode::publishRunFile(par.db2 + ".partitions." + SSTR(MMseqsNode::rank), partitionsData);
