@@ -1118,8 +1118,8 @@ std::vector<size_t> MMseqsNode::getClusterKeyOffsets(const std::string &file, co
 
 void MMseqsNode::readClusterKeys(const std::string &clu, const std::vector<size_t> &cluKeyOffsets, size_t keyBegin, size_t keyEnd, std::vector<DBKeyType> &keys) {
     keys.clear();
-    // (key, offset) cells in key order
-    std::vector<uint64_t> cells(1024 * 1024 / sizeof(uint64_t));
+    // the (key, offset) cells in key order that a thread reads at once
+    const size_t pieceEntries = 1024 * 1024 / (2 * sizeof(uint64_t));
     for (size_t node = 0; node < count; node++) {
         const size_t from = std::max(keyBegin, cluKeyOffsets[node]);
         const size_t to = std::min(keyEnd, cluKeyOffsets[node + 1]);
@@ -1134,20 +1134,19 @@ void MMseqsNode::readClusterKeys(const std::string &clu, const std::vector<size_
         const size_t entryEnd = cluDb.findEntryByKey(to);
         cluDb.close();
         FILE *cluIndexFile = FileUtil::openFileOrDie(cluIndex.c_str(), "r", true);
-        if (fseek(cluIndexFile, entryBegin * 2 * sizeof(uint64_t), SEEK_SET) != 0) {
-            Debug(Debug::ERROR) << "Cannot read " << cluIndex << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        for (size_t entry = entryBegin; entry < entryEnd;) {
-            const size_t cellCount = fread(cells.data(), 2 * sizeof(uint64_t), std::min(cells.size() / 2, entryEnd - entry), cluIndexFile);
-            if (cellCount == 0) {
-                Debug(Debug::ERROR) << "Cannot read " << cluIndex << "\n";
-                EXIT(EXIT_FAILURE);
+        const size_t nodeKeysBegin = keys.size();
+        keys.resize(nodeKeysBegin + entryEnd - entryBegin);
+#pragma omp parallel
+        {
+            std::vector<uint64_t> cells(2 * pieceEntries);
+#pragma omp for schedule(dynamic, 1)
+            for (size_t entry = entryBegin; entry < entryEnd; entry += pieceEntries) {
+                const size_t cellCount = std::min(pieceEntries, entryEnd - entry);
+                FileUtil::preadAll(fileno(cluIndexFile), cluIndex.c_str(), reinterpret_cast<char *>(cells.data()), cellCount * 2 * sizeof(uint64_t), entry * 2 * sizeof(uint64_t));
+                for (size_t i = 0; i < cellCount; i++) {
+                    keys[nodeKeysBegin + entry - entryBegin + i] = cells[2 * i];
+                }
             }
-            for (size_t i = 0; i < cellCount; i++) {
-                keys.push_back(cells[2 * i]);
-            }
-            entry += cellCount;
         }
         if (fclose(cluIndexFile) != 0) {
             Debug(Debug::ERROR) << "Cannot close " << cluIndex << "\n";
