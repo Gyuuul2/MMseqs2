@@ -5,7 +5,6 @@
 #include "Util.h"
 #include "FastSort.h"
 #include "DBReader.h"
-#include "DBWriter.h"
 #include "itoa.h"
 #include "Timer.h"
 
@@ -457,6 +456,7 @@ static void bufferExchangeBlock(MMseqsNode::ExchangeBlock &block, size_t bytes, 
 // frees the records that this node sent to itself once a block has passed them all
 static void releaseOwnRecords(MMseqsNode::ExchangeBlock &block) {
     if (block.ownRecords != NULL && block.bufferPos == block.end) {
+        Util::releasePages(block.ownRecords, block.end);
         free(block.ownRecords);
         block.ownRecords = NULL;
         block.bufferPos = 0;
@@ -707,6 +707,7 @@ std::string MMseqsNode::ClusterPairWriter::close() {
         Util::checkAllocation(pairs, "Can not shrink pairs memory in ClusterPairWriter");
         ownExchangeRecords[exchange] = std::make_pair(reinterpret_cast<char *>(pairs), ownPairCount * sizeof(ClusterPair));
     } else {
+        Util::releasePages(pairs, pairCapacity * sizeof(ClusterPair));
         free(pairs);
     }
     pairs = NULL;
@@ -1155,10 +1156,39 @@ void MMseqsNode::readClusterKeys(const std::string &clu, const std::vector<size_
     }
 }
 
-void MMseqsNode::writeClusterIndexEntry(FILE *file, const std::string &fileName, DBKeyType key, size_t offset) {
-    const uint64_t cell[2] = { static_cast<uint64_t>(key), static_cast<uint64_t>(offset) };
-    if (fwrite(cell, sizeof(uint64_t), 2, file) != 2) {
-        Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
+void MMseqsNode::writeClusterThreadParts(FILE *dataFile, const std::string &dataFileName, FILE *indexFile, const std::string &indexFileName,
+                                         std::vector<std::string> &threadData, std::vector<std::vector<uint64_t> > &threadEntries, size_t &dataBytes, size_t &indexBytes) {
+    const int threads = static_cast<int>(threadData.size());
+    std::vector<size_t> threadDataOffsets(threads + 1);
+    std::vector<size_t> threadEntryOffsets(threads + 1);
+    threadDataOffsets[0] = dataBytes;
+    threadEntryOffsets[0] = indexBytes;
+    for (int thread = 0; thread < threads; thread++) {
+        threadDataOffsets[thread + 1] = threadDataOffsets[thread] + threadData[thread].size();
+        threadEntryOffsets[thread + 1] = threadEntryOffsets[thread] + threadEntries[thread].size() * sizeof(uint64_t);
+    }
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+    for (int thread = 0; thread < threads; thread++) {
+        std::vector<uint64_t> &entries = threadEntries[thread];
+        for (size_t i = 1; i < entries.size(); i += 2) {
+            entries[i] += threadDataOffsets[thread];
+        }
+        FileUtil::pwriteAll(fileno(dataFile), dataFileName.c_str(), threadData[thread].data(), threadData[thread].size(), threadDataOffsets[thread]);
+        FileUtil::pwriteAll(fileno(indexFile), indexFileName.c_str(), reinterpret_cast<const char *>(entries.data()), entries.size() * sizeof(uint64_t), threadEntryOffsets[thread]);
+    }
+    dataBytes = threadDataOffsets[threads];
+    indexBytes = threadEntryOffsets[threads];
+}
+
+void MMseqsNode::closeClusterFiles(FILE *dataFile, const std::string &dataFileName, FILE *indexFile, const std::string &indexFileName, size_t dataBytes, size_t indexBytes) {
+    const uint64_t endEntry[2] = { static_cast<uint64_t>(DB_KEY_INVALID), static_cast<uint64_t>(dataBytes) };
+    FileUtil::pwriteAll(fileno(indexFile), indexFileName.c_str(), reinterpret_cast<const char *>(endEntry), sizeof(endEntry), indexBytes);
+    if (fclose(dataFile) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << dataFileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fclose(indexFile) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << indexFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
 }
@@ -1186,16 +1216,16 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
     const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
     const std::string resultDb = clu + "." + SSTR(rank);
     const std::string resultIndex = clu + ".index." + SSTR(rank);
+    FILE *resultDataFile = FileUtil::openAndDelete(resultDb.c_str(), "w");
     FILE *resultIndexFile = FileUtil::openAndDelete(resultIndex.c_str(), "w");
-    DBWriter dbw(resultDb.c_str(), (resultDb + ".index").c_str(), 1, 0, Parameters::DBTYPE_OMIT_FILE);
-    dbw.open();
+    size_t resultDataBytes = 0;
+    size_t resultIndexBytes = 0;
     std::vector<char> records;
     std::vector<ClusterPair> singletons;
     std::vector<size_t> threadSingletonOffsets(par.threads + 1, 0);
     std::vector<std::string> threadData(par.threads);
     // (key, offset) of the entries that start in the part of a thread
     std::vector<std::vector<uint64_t> > threadIndex(par.threads);
-    std::vector<size_t> threadDataOffsets(par.threads + 1);
     DBKeyType previousRepKey = DB_KEY_INVALID;
     // the keys go in splits, so the pairs of their singletons fit into memory
     const size_t splitKeys = std::max<size_t>(1, memoryLimit / 16 / sizeof(ClusterPair));
@@ -1291,23 +1321,7 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
                     }
                 }
             }
-            threadDataOffsets[0] = dbw.getOffset(0);
-            for (int thread = 0; thread < par.threads; thread++) {
-                threadDataOffsets[thread + 1] = threadDataOffsets[thread] + threadData[thread].size();
-            }
-#pragma omp parallel for schedule(dynamic, 1)
-            for (int thread = 0; thread < par.threads; thread++) {
-                for (size_t i = 1; i < threadIndex[thread].size(); i += 2) {
-                    threadIndex[thread][i] += threadDataOffsets[thread];
-                }
-            }
-            for (int thread = 0; thread < par.threads; thread++) {
-                dbw.writeAdd(threadData[thread].data(), threadData[thread].size(), 0);
-                if (fwrite(threadIndex[thread].data(), sizeof(uint64_t), threadIndex[thread].size(), resultIndexFile) != threadIndex[thread].size()) {
-                    Debug(Debug::ERROR) << "Cannot write " << resultIndex << "\n";
-                    EXIT(EXIT_FAILURE);
-                }
-            }
+            writeClusterThreadParts(resultDataFile, resultDb, resultIndexFile, resultIndex, threadData, threadIndex, resultDataBytes, resultIndexBytes);
             previousRepKey = getLastRepKey(pairCount, singletonCount);
         } while (pairCount > 0);
     }
@@ -1317,20 +1331,11 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
         EXIT(EXIT_FAILURE);
     }
     if (previousRepKey != DB_KEY_INVALID) {
-        dbw.writeAdd("\0", 1, 0);
+        FileUtil::pwriteAll(fileno(resultDataFile), resultDb.c_str(), "\0", 1, resultDataBytes);
+        resultDataBytes++;
     }
-    closeClusterWriter(dbw, resultIndexFile, resultIndex);
+    closeClusterFiles(resultDataFile, resultDb, resultIndexFile, resultIndex, resultDataBytes, resultIndexBytes);
     closeExchangeFiles(repFiles, prefix);
-}
-
-void MMseqsNode::closeClusterWriter(DBWriter &writer, FILE *indexFile, const std::string &indexFileName) {
-    writeClusterIndexEntry(indexFile, indexFileName, DB_KEY_INVALID, writer.getOffset(0));
-    if (fclose(indexFile) != 0) {
-        Debug(Debug::ERROR) << "Cannot close " << indexFileName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    writer.close(false, false);
-    FileUtil::remove(writer.getIndexFileName());
 }
 
 void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues) {

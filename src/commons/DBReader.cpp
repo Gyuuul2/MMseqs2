@@ -1002,9 +1002,13 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
         } else if (clusterIndex) {
             const BatchReader::ReadRequest &offsetsRequest = offsetsRequests[range - firstRange];
             const uint64_t *cells = reinterpret_cast<const uint64_t *>(offsetsRequest.destination + keyBegin * offsetBytes - offsetsRequest.fileOffset);
+            const size_t firstCell = keys.size();
+            keys.resize(firstCell + keyEnd - keyBegin + 1);
+            headerOffsets.resize(firstCell + keyEnd - keyBegin + 1);
+#pragma omp parallel for schedule(static)
             for (size_t i = 0; i <= keyEnd - keyBegin; i++) {
-                keys.push_back(cells[2 * i]);
-                headerOffsets.push_back(cells[2 * i + 1]);
+                keys[firstCell + i] = cells[2 * i];
+                headerOffsets[firstCell + i] = cells[2 * i + 1];
             }
             begin = headerOffsets.front();
             end = headerOffsets.back();
@@ -1142,8 +1146,11 @@ template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<
 
 template <typename T> bool DBReader<T>::prepareBufferToLoad(BufferInfo &bufferToLoadInto, size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys) {
     std::vector<BatchReader::ReadRequest> readRequests;
+    // the offsets and keys are planned in the vectors of the buffer, so their memory is reused
     std::vector<size_t> headerOffsets;
     std::vector<size_t> clusterKeys;
+    headerOffsets.swap(bufferToLoadInto.headerOffsets);
+    clusterKeys.swap(bufferToLoadInto.keys);
     std::vector<BatchReader::ReadRequest> compressedReadRequests;
     std::vector<size_t> requestFirstKeys;
     // with a block cache, the uncached blocks of the keys are read whole while they fit it, the keys of the others one by one
@@ -1191,6 +1198,8 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(BufferInfo &bufferTo
                                             : planReadRequests(keyBegin, keyEnd, readRequests, headerOffsets, clusterKeys, compressedReadRequests, requestFirstKeys);
         keyReadBytes += (keys != NULL) ? bytes : 0;
         if (readRequests.empty() && blocks.empty()) {
+            bufferToLoadInto.headerOffsets.swap(headerOffsets);
+            bufferToLoadInto.keys.swap(clusterKeys);
             return false;
         }
         if (bytes > bufferToLoadInto.allocatedBytes) {

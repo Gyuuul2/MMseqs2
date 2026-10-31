@@ -3882,19 +3882,7 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     Util::releasePages(pairPassTargets, pairPassTargetsSize * sizeof(DBKeyType));
     delete[] pairPassTargets;
     delete[] prefFiles.writeBuffers;
-    if (fseek(prefFiles.indexFile, prefIndexBytes, SEEK_SET) != 0) {
-        Debug(Debug::ERROR) << "Cannot write " << prefFiles.indexName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    MMseqsNode::writeClusterIndexEntry(prefFiles.indexFile, prefFiles.indexName, DB_KEY_INVALID, prefDataBytes);
-    if (fclose(prefFiles.dataFile) != 0) {
-        Debug(Debug::ERROR) << "Cannot close " << prefFiles.dataName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    if (fclose(prefFiles.indexFile) != 0) {
-        Debug(Debug::ERROR) << "Cannot close " << prefFiles.indexName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
+    MMseqsNode::closeClusterFiles(prefFiles.dataFile, prefFiles.dataName, prefFiles.indexFile, prefFiles.indexName, prefDataBytes, prefIndexBytes);
     return partitionsData;
 }
 
