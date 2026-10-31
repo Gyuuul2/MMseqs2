@@ -9,6 +9,7 @@ set(alignment_header_files
         alignment/StripedSmithWaterman.h
         alignment/BandedNucleotideAligner.h
         alignment/BlockAligner.h
+        alignment/SwipeAligner.h
         alignment/DistanceCalculator.h
         alignment/Fwbw.h
         PARENT_SCOPE
@@ -26,6 +27,7 @@ set(alignment_source_files
         alignment/StripedSmithWaterman.cpp
         alignment/BandedNucleotideAligner.cpp
         alignment/BlockAligner.cpp
+        alignment/SwipeAligner.cpp
         alignment/DistanceCalculator.cpp
         alignment/rescorediagonal.cpp
         alignment/Fwbw.cpp
