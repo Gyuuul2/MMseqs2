@@ -388,8 +388,7 @@ std::string MMseqsNode::closeExchange(FILE *file, const std::string &fileName, c
     return barrier(indexFile, indexData);
 }
 
-void MMseqsNode::openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeBlock> &blocks, std::vector<FILE *> &files,
-                              bool sendersInOrder) {
+void MMseqsNode::openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeBlock> &blocks, std::vector<FILE *> &files) {
     files.assign(count, NULL);
     std::vector<const char *> columns(count + 2);
     for (char *line = (char *) index.c_str(); *line != '\0'; line = Util::skipLine(line)) {
@@ -403,25 +402,19 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
         if (files[node] == NULL) {
             files[node] = FileUtil::openFileOrDie((prefix + "." + SSTR(node)).c_str(), "r", true);
         }
-        // the index lists the flushes of every node one after the other
-        if (sendersInOrder && blocks.empty() == false && blocks.back().file == files[node]) {
-            blocks.back().parts.push_back(std::make_pair(pos, end));
-            blocks.back().partsBytes += end - pos;
-            continue;
-        }
-        const ExchangeBlock block = { files[node], pos, end, std::vector<char>(), 0, 0, 0, 0, std::vector<std::pair<size_t, size_t> >(), 0, 0, NULL };
+        const ExchangeBlock block = { files[node], pos, end, std::vector<char>(), 0, 0, 0, 0, NULL };
         blocks.push_back(block);
     }
     std::map<std::string, std::pair<char *, size_t> >::iterator own = ownExchangeRecords.find(prefix);
     if (own != ownExchangeRecords.end()) {
-        const ExchangeBlock block = { NULL, 0, own->second.second, std::vector<char>(), 0, 0, 0, 0, std::vector<std::pair<size_t, size_t> >(), 0, 0, own->second.first };
+        const ExchangeBlock block = { NULL, 0, own->second.second, std::vector<char>(), 0, 0, 0, 0, own->second.first };
         blocks.push_back(block);
         ownExchangeRecords.erase(own);
     }
 }
 
 static size_t getUnreadBytes(const MMseqsNode::ExchangeBlock &block) {
-    return block.end - block.pos + block.partsBytes;
+    return block.end - block.pos;
 }
 
 static const char *getBlockData(const MMseqsNode::ExchangeBlock &block) {
@@ -447,15 +440,9 @@ static void bufferExchangeBlock(MMseqsNode::ExchangeBlock &block, size_t bytes, 
     if (block.buffer.size() < blockBufferSize) {
         block.buffer.resize(blockBufferSize);
     }
-    // the parts of a block follow each other in its buffer, and a flush holds whole records; outside a parallel region the threads read pieces of it
+    // outside a parallel region the threads read pieces of the block
     std::vector<std::pair<size_t, size_t> > reads;
     while (block.bufferEnd < block.buffer.size() && getUnreadBytes(block) > 0) {
-        if (block.pos == block.end) {
-            block.pos = block.parts[block.nextPart].first;
-            block.end = block.parts[block.nextPart].second;
-            block.partsBytes -= block.end - block.pos;
-            block.nextPart++;
-        }
         const size_t readBytes = std::min(std::min(block.buffer.size() - block.bufferEnd, block.end - block.pos), MAX_READ_REQUEST_SIZE);
         reads.push_back(std::make_pair(block.pos, block.bufferEnd));
         block.pos += readBytes;
