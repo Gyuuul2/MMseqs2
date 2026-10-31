@@ -18,6 +18,7 @@
 #include "StripedSmithWaterman.h"
 #include "Parameters.h"
 #include "Matcher.h"
+#include "SwipeAligner.h"
 
 const char* binary_name = "test_alignment";
 DEFAULT_PARAMETER_SINGLETON_INIT
@@ -34,6 +35,58 @@ int main (int, const char**) {
     Parameters& par = Parameters::getInstance();
     par.initMatrices();
     SubstitutionMatrix subMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, -0.0f);
+    {
+        std::string queryText(66000, 'C');
+        queryText.append(100, 'A');
+        const std::string targetText(100, 'A');
+        Sequence query(66101, Parameters::DBTYPE_AMINO_ACIDS, &subMat, 0, false, false);
+        Sequence target(101, Parameters::DBTYPE_AMINO_ACIDS, &subMat, 0, false, false);
+        query.mapSequence(0, 0, queryText.data(), queryText.size());
+        target.mapSequence(1, 1, targetText.data(), targetText.size());
+        SwipeAligner swipe(&subMat, 66101, false, 1.0f, 11, 1);
+        swipe.initQuery(&query);
+        const unsigned char *targets[] = {target.numSequence};
+        const int lengths[] = {target.L};
+        s_align result = {};
+        result.word = 1;
+        swipe.alignForward(1, targets, lengths, &result);
+        swipe.alignBackward(1, targets, &result);
+        if (result.score1 != 400 || result.qEndPos1 != 66099 || result.dbEndPos1 != 99
+            || result.qStartPos1 != 66000 || result.dbStartPos1 != 0) {
+            std::cerr << "Long query SWIPE coordinates are incorrect\n";
+            return 1;
+        }
+    }
+    {
+        const std::string longText(96, 'A');
+        const std::string shortText(65, 'A');
+        Sequence query(97, Parameters::DBTYPE_AMINO_ACIDS, &subMat, 0, false, false);
+        Sequence longTarget(97, Parameters::DBTYPE_AMINO_ACIDS, &subMat, 0, false, false);
+        Sequence shortTarget(66, Parameters::DBTYPE_AMINO_ACIDS, &subMat, 0, false, false);
+        query.mapSequence(0, 0, longText.data(), longText.size());
+        longTarget.mapSequence(1, 1, longText.data(), longText.size());
+        shortTarget.mapSequence(2, 2, shortText.data(), shortText.size());
+        SwipeExtender extender(&subMat, 97, false, 1.0f, 11, 1);
+        const size_t queryId = extender.addQuery(&query);
+        const size_t ids[] = {queryId, queryId};
+        const unsigned char *targets[] = {longTarget.numSequence, shortTarget.numSequence};
+        const int lengths[] = {longTarget.L, shortTarget.L};
+        const int seeds[] = {20, 20};
+        for (int direction = 0; direction < 2; direction++) {
+            s_align single = {};
+            s_align batched[2] = {};
+            std::string singleTrace;
+            std::string batchedTrace[2];
+            extender.extendBanded(1, ids, targets, lengths, seeds, seeds, direction != 0, 40, 16, &single, &singleTrace);
+            extender.extendBanded(2, ids, targets, lengths, seeds, seeds, direction != 0, 40, 16, batched, batchedTrace);
+            if (single.score1 == 0 || single.score1 != batched[0].score1 || single.qEndPos1 != batched[0].qEndPos1
+                || single.dbEndPos1 != batched[0].dbEndPos1 || single.qStartPos1 != batched[0].qStartPos1
+                || single.dbStartPos1 != batched[0].dbStartPos1 || singleTrace != batchedTrace[0]) {
+                std::cerr << "SWIPE extension depends on batch mates\n";
+                return 1;
+            }
+        }
+    }
     std::cout << "Substitution matrix:\n";
     SubstitutionMatrix::print(subMat.subMatrix,subMat.num2aa,subMat.alphabetSize);
     SubstitutionMatrix::print(subMat.subMatrix,subMat.num2aa,subMat.alphabetSize);
