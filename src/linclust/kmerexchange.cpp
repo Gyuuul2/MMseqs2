@@ -1602,18 +1602,18 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                         }
 
                         // merges the groups of the rows by hash
-                        KmerHashQueue hashQueue;
+                        KmerHashQueue kmerHashQueue;
                         for (size_t row = 0; row < reads.size(); row++) {
-                            queueNextKmerGroup(hashQueue, row, reads[row]);
+                            queueNextKmerGroup(kmerHashQueue, row, reads[row]);
                         }
-                        while (hashQueue.empty() == false) {
-                            const uint64_t hash = hashQueue.top().hash;
+                        while (kmerHashQueue.empty() == false) {
+                            const uint64_t hash = kmerHashQueue.top().hash;
                             groupRows.clear();
                             size_t memberCount = 0;
-                            while (hashQueue.empty() == false && hashQueue.top().hash == hash) {
-                                groupRows.push_back(hashQueue.top().row);
-                                memberCount += reads[hashQueue.top().row].groupMemberCount;
-                                hashQueue.pop();
+                            while (kmerHashQueue.empty() == false && kmerHashQueue.top().hash == hash) {
+                                groupRows.push_back(kmerHashQueue.top().row);
+                                memberCount += reads[kmerHashQueue.top().row].groupMemberCount;
+                                kmerHashQueue.pop();
                             }
                             if (memberCount < 2) {
                                 for (size_t row = 0; row < groupRows.size(); row++) {
@@ -1737,7 +1737,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                 }
                             }
                             for (size_t row = 0; row < groupRows.size(); row++) {
-                                queueNextKmerGroup(hashQueue, groupRows[row], reads[groupRows[row]]);
+                                queueNextKmerGroup(kmerHashQueue, groupRows[row], reads[groupRows[row]]);
                             }
                         }
                         chunkRecordCounts[chunk] = recordCount;
