@@ -325,10 +325,19 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         par.compressed = 0;
     }
     const std::string resultDb = isLinfinity ? par.db2 + "." + SSTR(MMseqsNode::rank) : par.db2;
-    DBWriter resultWriter(resultDb.c_str(), (resultDb + ".index").c_str(), 1, par.compressed, isLinfinity ? Parameters::DBTYPE_OMIT_FILE : Parameters::DBTYPE_CLUSTER_RES);
-    resultWriter.open();
+    DBWriter resultWriter(resultDb.c_str(), (resultDb + ".index").c_str(), 1, par.compressed, Parameters::DBTYPE_CLUSTER_RES);
     const std::string resultIndex = par.db2 + ".index." + SSTR(MMseqsNode::rank);
-    FILE *resultIndexFile = isLinfinity ? FileUtil::openAndDelete(resultIndex.c_str(), "w") : NULL;
+    // a mode 3 node writes its data and index file on all threads at prefix-summed offsets
+    FILE *resultDataFile = NULL;
+    FILE *resultIndexFile = NULL;
+    size_t resultDataBytes = 0;
+    size_t resultIndexBytes = 0;
+    if (isLinfinity) {
+        resultDataFile = FileUtil::openAndDelete(resultDb.c_str(), "w");
+        resultIndexFile = FileUtil::openAndDelete(resultIndex.c_str(), "w");
+    } else {
+        resultWriter.open();
+    }
     const std::string representativeDb = par.db2 + "_redundancy";
     DBWriter representativeWriter(representativeDb.c_str(), (representativeDb + ".index").c_str(), 1, 0, Parameters::DBTYPE_OMIT_FILE);
     if (isLinfinity == false) {
@@ -380,12 +389,31 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     HashEntry *hashIdPairs = NULL;
     size_t hashIdPairsSize = 0;
 
-    char buffer[32];
     std::vector<size_t> threadOffsets(par.threads + 1);
     std::vector<std::string> threadData(par.threads);
-    // (representative id, offset) of the entries of the part of a thread, (key, offset in the data file) once written to a mode 3 index
+    // (representative id, offset) of the entries of the part of a thread; mode 3: (key, offset), the offset in the data file once written
     std::vector<std::vector<uint64_t> > threadEntries(par.threads);
     std::vector<size_t> threadDataOffsets(par.threads + 1);
+    std::vector<size_t> threadEntryOffsets(par.threads + 1);
+    const auto writeThreadParts = [&]() {
+        threadDataOffsets[0] = resultDataBytes;
+        threadEntryOffsets[0] = resultIndexBytes;
+        for (int thread = 0; thread < par.threads; thread++) {
+            threadDataOffsets[thread + 1] = threadDataOffsets[thread] + threadData[thread].size();
+            threadEntryOffsets[thread + 1] = threadEntryOffsets[thread] + threadEntries[thread].size() * sizeof(uint64_t);
+        }
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+        for (int thread = 0; thread < par.threads; thread++) {
+            std::vector<uint64_t> &entries = threadEntries[thread];
+            for (size_t i = 1; i < entries.size(); i += 2) {
+                entries[i] += threadDataOffsets[thread];
+            }
+            FileUtil::pwriteAll(fileno(resultDataFile), resultDb.c_str(), threadData[thread].data(), threadData[thread].size(), threadDataOffsets[thread]);
+            FileUtil::pwriteAll(fileno(resultIndexFile), resultIndex.c_str(), reinterpret_cast<const char *>(entries.data()), entries.size() * sizeof(uint64_t), threadEntryOffsets[thread]);
+        }
+        resultDataBytes = threadDataOffsets[par.threads];
+        resultIndexBytes = threadEntryOffsets[par.threads];
+    };
     ClusterPair *loadPairs = NULL;
     size_t loadPairCount = 0;
     bool needsSort = false;
@@ -556,7 +584,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                                 loadPairs[loadPairCount + i] = pair;
                             }
                         } else {
-                            entries.push_back(repId);
+                            entries.push_back(isLinfinity ? static_cast<uint64_t>(reader.getDbKey(repId)) : repId);
                             entries.push_back(data.size());
                             for (size_t i = clusterBegin; i < clusterEnd; i++) {
                                 char *end = Itoa::u64toa_sse2(static_cast<uint64_t>(reader.getDbKey(rangeHashIdPairs[i].id)), keyBuffer);
@@ -569,29 +597,12 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     }
                 }
                 if (isLinfinity) {
-                    threadDataOffsets[0] = resultWriter.getOffset(0);
-                    for (int thread = 0; thread < par.threads; thread++) {
-                        threadDataOffsets[thread + 1] = threadDataOffsets[thread] + threadData[thread].size();
-                    }
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-                    for (int thread = 0; thread < par.threads; thread++) {
-                        for (size_t i = 0; i < threadEntries[thread].size(); i += 2) {
-                            threadEntries[thread][i] = reader.getDbKey(threadEntries[thread][i]);
-                            threadEntries[thread][i + 1] += threadDataOffsets[thread];
-                        }
-                    }
+                    writeThreadParts();
+                    continue;
                 }
                 for (int thread = 0; thread < par.threads; thread++) {
                     const std::string &data = threadData[thread];
                     const std::vector<uint64_t> &entries = threadEntries[thread];
-                    if (isLinfinity) {
-                        resultWriter.writeAdd(data.data(), data.size(), 0);
-                        if (fwrite(entries.data(), sizeof(uint64_t), entries.size(), resultIndexFile) != entries.size()) {
-                            Debug(Debug::ERROR) << "Cannot write " << resultIndex << "\n";
-                            EXIT(EXIT_FAILURE);
-                        }
-                        continue;
-                    }
                     for (size_t i = 0; i < entries.size(); i += 2) {
                         const DBLocalId repId = entries[i];
                         const size_t entryEnd = (i + 2 < entries.size()) ? entries[i + 3] : data.size();
@@ -608,25 +619,40 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         if (copiesSeqs) {
             // every representative of the length starts an entry, also one that is alone in its hash
             SORT_PARALLEL(loadPairs, loadPairs + loadPairCount, ClusterPair::compareByRep);
-            size_t pair = 0;
-            for (size_t key = loadFirstKey; key < loadFirstKey + loadSeqCount; key++) {
-                if ((representativeBits[(key - localFirstKey) / 64] & (1ull << ((key - localFirstKey) % 64))) == 0) {
-                    continue;
-                }
-                MMseqsNode::writeClusterIndexEntry(resultIndexFile, resultIndex, key, resultWriter.getOffset(0));
-                resultWriter.writeStart(0);
-                char *end = Itoa::u64toa_sse2(static_cast<uint64_t>(key), buffer);
-                *(end - 1) = '\n';
-                resultWriter.writeAdd(buffer, end - buffer, 0);
-                for (; pair < loadPairCount && loadPairs[pair].repKey == key; pair++) {
-                    if (loadPairs[pair].memberKey == key) {
-                        continue;
+            const size_t loadEndKey = loadFirstKey + loadSeqCount;
+            for (size_t writeBegin = loadFirstKey; writeBegin < loadEndKey; writeBegin += WRITE_THREAD_SEQS * par.threads) {
+                const size_t writeKeys = std::min(loadEndKey - writeBegin, WRITE_THREAD_SEQS * par.threads);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+                for (int thread = 0; thread < par.threads; thread++) {
+                    std::string &data = threadData[thread];
+                    std::vector<uint64_t> &entries = threadEntries[thread];
+                    data.clear();
+                    entries.clear();
+                    char keyBuffer[32];
+                    const size_t keyEnd = writeBegin + writeKeys * (thread + 1) / par.threads;
+                    size_t key = writeBegin + writeKeys * thread / par.threads;
+                    size_t pair = std::lower_bound(loadPairs, loadPairs + loadPairCount, key, [](const ClusterPair &first, size_t second) { return first.repKey < second; }) - loadPairs;
+                    for (; key < keyEnd; key++) {
+                        if ((representativeBits[(key - localFirstKey) / 64] & (1ull << ((key - localFirstKey) % 64))) == 0) {
+                            continue;
+                        }
+                        entries.push_back(key);
+                        entries.push_back(data.size());
+                        char *end = Itoa::u64toa_sse2(static_cast<uint64_t>(key), keyBuffer);
+                        *(end - 1) = '\n';
+                        data.append(keyBuffer, end - keyBuffer);
+                        for (; pair < loadPairCount && loadPairs[pair].repKey == key; pair++) {
+                            if (loadPairs[pair].memberKey == key) {
+                                continue;
+                            }
+                            end = Itoa::u64toa_sse2(static_cast<uint64_t>(loadPairs[pair].memberKey), keyBuffer);
+                            *(end - 1) = '\n';
+                            data.append(keyBuffer, end - keyBuffer);
+                        }
+                        data.push_back('\0');
                     }
-                    end = Itoa::u64toa_sse2(static_cast<uint64_t>(loadPairs[pair].memberKey), buffer);
-                    *(end - 1) = '\n';
-                    resultWriter.writeAdd(buffer, end - buffer, 0);
                 }
-                resultWriter.writeEnd(key, 0, true, false);
+                writeThreadParts();
             }
             Util::releasePages(loadPairs, loadSeqCount * sizeof(ClusterPair));
             delete[] loadPairs;
@@ -648,7 +674,12 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         MMseqsNode::addPhaseTime(phaseValues, "hashing the sequences", timer);
         MMseqsNode::addPhaseValue(phaseValues, "Sequences hashed", SSTR(localKeySize));
         MMseqsNode::publishRunFile(par.db2 + ".phases." + SSTR(MMseqsNode::rank), phaseValues);
-        MMseqsNode::closeClusterWriter(resultWriter, resultIndexFile, resultIndex);
+        const uint64_t lastCell[2] = { static_cast<uint64_t>(DB_KEY_INVALID), static_cast<uint64_t>(resultDataBytes) };
+        FileUtil::pwriteAll(fileno(resultIndexFile), resultIndex.c_str(), reinterpret_cast<const char *>(lastCell), sizeof(lastCell), resultIndexBytes);
+        if (fclose(resultIndexFile) != 0 || fclose(resultDataFile) != 0) {
+            Debug(Debug::ERROR) << "Cannot close " << resultDb << "\n";
+            EXIT(EXIT_FAILURE);
+        }
         MMseqsNode::writeRepresentativeBits(representativeDb, reader, representativeBits, localFirstKey, localKeySize);
     } else {
         // clusters are written in key order unless a length was split into hash ranges
