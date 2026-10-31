@@ -415,6 +415,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                                         && fitsWithPrefetch(&nodeSeqRange[loadOffsets[load]], &nodeSeqRange[loadOffsets[load + 1]], isLinfinity, seqBufferLimit, hashIdPairsLimit)
                                         && fitsWithPrefetch(&nodeSeqRange[loadOffsets[load + 1]], &nodeSeqRange[loadOffsets[load + 2]], isLinfinity, seqBufferLimit, hashIdPairsLimit);
         if (hashIdPairsSize < hashedSeqCapacity) {
+            Util::releasePages(hashIdPairs, hashIdPairsSize * sizeof(HashEntry));
             delete[] hashIdPairs;
             hashIdPairs = new(std::nothrow) HashEntry[hashedSeqCapacity];
             Util::checkAllocation(hashIdPairs, "Can not allocate hash entry memory");
@@ -627,6 +628,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                 }
                 resultWriter.writeEnd(key, 0, true, false);
             }
+            Util::releasePages(loadPairs, loadSeqCount * sizeof(ClusterPair));
             delete[] loadPairs;
             loadPairs = NULL;
         }
@@ -634,6 +636,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         // only a load and the next one it prefetched keep both sequence buffers and hashIdPairs
         if (isLinfinity && prefetchesNextLoad == false) {
             reader.releaseDataPages();
+            Util::releasePages(hashIdPairs, hashIdPairsSize * sizeof(HashEntry));
             delete[] hashIdPairs;
             hashIdPairs = NULL;
             hashIdPairsSize = 0;
@@ -672,6 +675,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     Debug(Debug::INFO) << "Size of the sequence database: " << reader.getSize() << "\n";
     Debug(Debug::INFO) << "Number of clusters: " << clusters << "\n";
     delete[] representativeBits;
+    Util::releasePages(hashIdPairs, hashIdPairsSize * sizeof(HashEntry));
     delete[] hashIdPairs;
     reader.close();
     return EXIT_SUCCESS;

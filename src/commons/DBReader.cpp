@@ -1195,6 +1195,7 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(BufferInfo &bufferTo
         }
         if (bytes > bufferToLoadInto.allocatedBytes) {
             batchReader->waitAsyncRead();
+            Util::releasePages(bufferToLoadInto.buffer, bufferToLoadInto.allocatedBytes);
             free(bufferToLoadInto.buffer);
             decrementMemory(bufferToLoadInto.allocatedBytes);
             // O_DIRECT reads need a page aligned buffer
@@ -1617,9 +1618,11 @@ template <typename T> void DBReader<T>::releaseDataPages() {
     if (batchReader != NULL) {
         batchReader->waitAsyncRead();
         freeBlocks(size, SIZE_MAX);
+        Util::releasePages(loadedBuffer.buffer, loadedBuffer.allocatedBytes);
         free(loadedBuffer.buffer);
         decrementMemory(loadedBuffer.allocatedBytes);
         loadedBuffer = BufferInfo();
+        Util::releasePages(prefetchBuffer.buffer, prefetchBuffer.allocatedBytes);
         free(prefetchBuffer.buffer);
         decrementMemory(prefetchBuffer.allocatedBytes);
         prefetchBuffer = BufferInfo();
