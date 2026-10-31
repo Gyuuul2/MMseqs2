@@ -125,10 +125,10 @@ public:
         return subMat->subMatrix[queries[position]][targetLetter] + biases[position];
     }
 
-    // the lane rows that extended a target and all lane rows, and the extensions that went on alone with a trace of their lane only
+    // the lane rows that extended a target and all lane rows, and the extensions with more rows than the trace of the last rows holds
     size_t extendLaneRows;
     size_t extendSlotRows;
-    size_t extendSoloJobs;
+    size_t extendLongJobs;
 
 private:
     struct ExtendJob {
@@ -140,7 +140,6 @@ private:
         int right;
     };
 
-    template <bool Solo>
     void extendBand(const ExtendJob *jobs, size_t jobCount, bool backward, int xDrop, const unsigned char *const *targets, const int *targetLengths,
                     s_align *aligns, std::string *backtraces);
 
@@ -170,12 +169,11 @@ private:
     // the target of every lane forward or reversed, after as many zeros as the left side of its band and before a band width of zeros
     std::vector<std::vector<unsigned char>> laneTargets;
     std::vector<unsigned char> zeroLetters;
-    // the trace of the lane of a job that goes on alone
-    std::vector<uint16_t> soloTrace;
+    // the trace codes of the first rows of every lane whose job has more rows than the trace of the last rows holds
+    std::vector<std::vector<uint16_t>> laneTraces;
 
     std::vector<ExtendJob> extendJobs;
     std::vector<ExtendJob> extendPending;
-    std::vector<ExtendJob> soloJobs;
 };
 
 #endif

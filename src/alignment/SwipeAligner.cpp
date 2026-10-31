@@ -898,8 +898,9 @@ static inline void laneCellScores(const unsigned char *const *letters, const int
 #undef SWIPE_WIDEN
 
 SwipeExtender::SwipeExtender(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend)
-    : extendLaneRows(0), extendSlotRows(0), extendSoloJobs(0), subMat(subMat), aaBiasCorrection(aaBiasCorrection), aaBiasCorrectionScale(aaBiasCorrectionScale),
-      gapOpen(gapOpen), gapExtend(gapExtend), band(NULL), bandCapacity(0), trace(NULL), traceCapacity(0), laneTargets(SwipeLanes<int16_t>::COUNT) {
+    : extendLaneRows(0), extendSlotRows(0), extendLongJobs(0), subMat(subMat), aaBiasCorrection(aaBiasCorrection), aaBiasCorrectionScale(aaBiasCorrectionScale),
+      gapOpen(gapOpen), gapExtend(gapExtend), band(NULL), bandCapacity(0), trace(NULL), traceCapacity(0), laneTargets(SwipeLanes<int16_t>::COUNT),
+      laneTraces(SwipeLanes<int16_t>::COUNT) {
     const int alphabetSize = subMat->alphabetSize;
     if (alphabetSize > SWIPE_SCORE_ROW) {
         Debug(Debug::ERROR) << "SWIPE supports alphabets of at most 32 letters\n";
@@ -939,18 +940,16 @@ void SwipeExtender::clearQueries() {
     queryLengths.clear();
 }
 
-template <bool Solo>
 void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool backward, int xDrop, const unsigned char *const *targets,
                                const int *targetLengths, s_align *aligns, std::string *backtraces) {
     typedef SwipeLanes<int16_t> V;
     const int lanes = V::COUNT;
-    const int usedLanes = Solo ? 1 : lanes;
     const int width = jobs[0].left + jobs[0].right + 1;
     const int paddedWidth = (width + lanes - 1) / lanes * lanes;
     // the 4 bit trace codes of 4 neighbouring cells share a lane
     const int traceWidth = (width + 3) / 4;
-    // the trace of the last traceSteps rows of all lanes, a lane that needs more goes on alone with a trace of its lane only
-    const size_t traceSteps = Solo ? 1 : SWIPE_MAX_TRACE_CELLS / traceWidth;
+    // the trace of the last traceSteps rows of all lanes, a lane that needs more keeps its older rows in laneTraces
+    const size_t traceSteps = SWIPE_MAX_TRACE_CELLS / traceWidth;
     reserveVectors(trace, traceCapacity, traceSteps * traceWidth);
     reserveVectors(band, bandCapacity, 2 * (width + 1));
     simd_int *hRow = band;
@@ -1027,9 +1026,7 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
             setLaneValue<int16_t>(fRow + k, l, SHRT_MIN);
         }
         setLaneValue<int16_t>(hRow + job.left, l, 0);
-        if (Solo) {
-            soloTrace.clear();
-        }
+        laneTraces[l].clear();
     };
     const auto finish = [&](int l) {
         const ExtendJob &job = *laneJobs[l];
@@ -1060,8 +1057,8 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
         }
         const auto traceCode = [&](int i, int k) {
             const size_t rowStep = static_cast<size_t>(i - job.seedRow);
-            const int laneCodes = Solo ? soloTrace[rowStep * traceWidth + k / 4]
-                                       : static_cast<uint16_t>(laneValue<int16_t>(trace + (laneStarts[l] + rowStep) % traceSteps * traceWidth + k / 4, l));
+            const int laneCodes = (rowStep * traceWidth < laneTraces[l].size()) ? laneTraces[l][rowStep * traceWidth + k / 4]
+                                  : static_cast<uint16_t>(laneValue<int16_t>(trace + (laneStarts[l] + rowStep) % traceSteps * traceWidth + k / 4, l));
             return (laneCodes >> (4 * (3 - k % 4))) & 15;
         };
         std::string &backtrace = backtraces[job.id];
@@ -1107,7 +1104,7 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
         // a free lane takes the next job, a lane ends when its band leaves the query or the target
         int activeCount = 0;
         for (int l = 0; l < lanes; l++) {
-            while (l < usedLanes) {
+            while (true) {
                 if (laneJobs[l] == NULL) {
                     if (next == jobCount) {
                         break;
@@ -1120,11 +1117,6 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
                 const int hi = std::min(width, targetLengths[job.id] - i - laneOffsets[l]);
                 if (i == queryLengths[job.query] || lo >= hi) {
                     finish(l);
-                    continue;
-                }
-                if (Solo == false && step - laneStarts[l] >= traceSteps) {
-                    soloJobs.push_back(job);
-                    laneJobs[l] = NULL;
                     continue;
                 }
                 const size_t position = queryOffsets[job.query] + (backward ? queryLengths[job.query] : 0) + i;
@@ -1161,6 +1153,16 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
         simd_int vEdgeLeft = simdi_loadu(reinterpret_cast<const simd_int *>(edgeLefts));
         simd_int vEdgeRight = simdi_loadu(reinterpret_cast<const simd_int *>(edgeRights));
         simd_int *traceRow = trace + step % traceSteps * traceWidth;
+        // a lane keeps its row of the trace that this row overwrites
+        for (int l = 0; l < lanes; l++) {
+            if (laneJobs[l] != NULL && step - laneStarts[l] >= traceSteps) {
+                extendLongJobs += (step - laneStarts[l] == traceSteps);
+                std::vector<uint16_t> &laneTrace = laneTraces[l];
+                for (int w = 0; w < traceWidth; w++) {
+                    laneTrace.push_back(static_cast<uint16_t>(laneValue<int16_t>(traceRow + w, l)));
+                }
+            }
+        }
         simd_int codes = vZero;
         simd_int vHl = vNeg;
         simd_int vE = vNeg;
@@ -1240,11 +1242,6 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
             }
             if (width % 4 != 0) {
                 traceRow[width / 4] = codes;
-            }
-        }
-        if (Solo) {
-            for (int w = 0; w < traceWidth; w++) {
-                soloTrace.push_back(static_cast<uint16_t>(laneValue<int16_t>(traceRow + w, 0)));
             }
         }
         // ties go to the larger target position, then the later row, as in BlockAligner
@@ -1336,12 +1333,7 @@ void SwipeExtender::extendBanded(size_t count, const size_t *queryIds, const uns
             while (end < extendJobs.size() && extendJobs[end].left + extendJobs[end].right == width) {
                 end++;
             }
-            soloJobs.clear();
-            extendBand<false>(&extendJobs[start], end - start, backward, xDrop, targets, targetLengths, aligns, backtraces);
-            extendSoloJobs += soloJobs.size();
-            if (soloJobs.empty() == false) {
-                extendBand<true>(soloJobs.data(), soloJobs.size(), backward, xDrop, targets, targetLengths, aligns, backtraces);
-            }
+            extendBand(&extendJobs[start], end - start, backward, xDrop, targets, targetLengths, aligns, backtraces);
             start = end;
         }
         extendJobs.swap(extendPending);
