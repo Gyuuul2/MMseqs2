@@ -111,10 +111,6 @@ public:
         // end of the records that the buffer holds in full and start of the last of them
         size_t recordEnd;
         size_t lastRecord;
-        // the parts read after [pos, end) as one block, the next of them and the bytes of those not started yet
-        std::vector<std::pair<size_t, size_t> > parts;
-        size_t nextPart;
-        size_t partsBytes;
         // the records that this node sent to itself, read from memory instead of file and freed once read
         char *ownRecords;
     };
@@ -122,9 +118,7 @@ public:
     static void addExchangeFlush(std::string &indexData, size_t &writtenBytes, const std::vector<size_t> &nodeOffsets);
     // closes the file of this node and returns the index lines of all nodes once every node has closed its file
     static std::string closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData);
-    // sendersInOrder: the flushes of every node follow each other in record order, so its parts of them are read as one block
-    static void openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeBlock> &blocks, std::vector<FILE *> &files,
-                             bool sendersInOrder = false);
+    static void openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeBlock> &blocks, std::vector<FILE *> &files);
     // the smallest buffer of a block in readExchangeRange
     static const size_t EXCHANGE_BUFFER_SIZE = 1024 * 1024;
     // moves the buffered records up to last of every block to records, recordOffsets their starts then the end; returns their count, 0 once none is left
