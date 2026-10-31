@@ -786,7 +786,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             dataFileSizes[HEADER_OFFSETS] = std::max(dataFileSizes[HEADER_OFFSETS], bin.headerIndexOffset + bin.sequenceCount * sizeof(uint64_t));
         }
     }
-    const std::string exchange = dataFile + "_swap_0";
+    const std::string exchange = dataFile + "_sent_entries";
     const std::string exchangeFile = exchange + "." + SSTR(MMseqsNode::rank);
     FILE *exchangeHandle = FileUtil::openAndDelete(exchangeFile.c_str(), "w");
     std::string exchangeIndexData;

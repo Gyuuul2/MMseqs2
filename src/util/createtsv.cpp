@@ -359,10 +359,10 @@ int createtsv(int argc, const char **argv, const Command &command) {
         const std::vector<size_t> nodeKeyOffsets = headers.getNodeKeyOffsets(MMseqsNode::count);
         std::string phaseValues;
         Timer timer;
-        const std::string sortedByMember = par.db4 + "_swap_0";
+        const std::string sortedByMember = par.db4 + "_by_member";
         const std::string sortedByMemberIndex = MMseqsNode::sendClusterPairs(par.db3, true, ClusterPair::compareByMember, nodeKeyOffsets, sortedByMember);
         MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", timer);
-        const std::string sortedByRep = par.db4 + "_swap_1";
+        const std::string sortedByRep = par.db4 + "_by_rep";
         const std::string sortedByRepIndex = readMemberAccessions(sortedByMemberIndex, sortedByMember, headers, nodeKeyOffsets, Util::computeMemory(par.splitMemoryLimit), sortedByRep);
         MMseqsNode::addPhaseTime(phaseValues, "sending the member accessions", timer);
         FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());

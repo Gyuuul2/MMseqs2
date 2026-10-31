@@ -41,9 +41,9 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         uint64_t *representativeBits = hasRepresentativeBits ? MMseqsNode::readRepresentativeBits(representativeDb, firstClusteringKeyOffsets, firstKey, keyCount) : NULL;
         std::string phaseValues;
         Timer timer;
-        const std::string sortedByMember = par.db2 + "_swap_0";
+        const std::string sortedByMember = par.db2 + "_by_member";
         const std::string sortedByMemberIndex = hasSecondClustering ? MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, firstClusteringKeyOffsets, sortedByMember) : "";
-        const std::string sortedByRep = par.db2 + "_swap_1";
+        const std::string sortedByRep = par.db2 + "_by_rep";
         const std::string sortedByRepIndex = MMseqsNode::sendClusterPairs(par.filenames[2], true, ClusterPair::compareByRep, nodeKeyOffsets, sortedByRep,
                                                                           sortedByMemberIndex, hasSecondClustering ? sortedByMember : "", representativeBits, firstKey, keyCount, par.db2 + "_singletons");
         delete[] representativeBits;
