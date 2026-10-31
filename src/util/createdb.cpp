@@ -999,6 +999,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
 }
 
 int createdb(int argc, const char **argv, const Command& command) {
+    MMseqsNode::init();
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, false, Parameters::PARSE_VARIADIC, 0);
     if(par.gpu){
@@ -1006,9 +1007,6 @@ int createdb(int argc, const char **argv, const Command& command) {
         par.maskMode = 1;
     }else{
         par.maskMode = 0;
-    }
-    if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) {
-        MMseqsNode::init();
     }
     par.printParameters(command.cmd, argc, argv, *command.params);
 

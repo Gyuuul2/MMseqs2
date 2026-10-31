@@ -281,6 +281,7 @@ static void loadBlockSeqs(DBReader<DBKeyType> &reader, size_t firstKey, size_t s
 }
 
 int clusthashfast(int argc, const char **argv, const Command &command) {
+    MMseqsNode::init();
     Parameters &par = Parameters::getInstance();
     par.alphabetSize = MultiParam<NuclAA<int>>(NuclAA<int>(Parameters::CLUST_HASH_DEFAULT_ALPH_SIZE, 5));
     par.seqIdThr = (float)Parameters::CLUST_HASH_DEFAULT_MIN_SEQ_ID / 100.0f;
@@ -301,7 +302,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
 
     std::vector<LengthRange> nodeSeqRange;
     if (isLinfinity) {
-        MMseqsNode::init();
         const size_t endKey = reader.getFileKeyOffsets(MMseqsNode::count)[MMseqsNode::rank + 1];
         const DBReader<DBKeyType>::Index *index = reader.getIndex();
         size_t endOffset = 0;
