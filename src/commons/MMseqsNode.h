@@ -49,8 +49,8 @@ public:
         return rank == MASTER;
     }
 
-    // sleeps before poll number polls of a file that another node publishes: ten milliseconds, twice as long each poll, up to 160 milliseconds
-    static void sleepBeforePoll(unsigned int polls);
+    // sleeps before poll number polls of a file that another node publishes: ten milliseconds, twice as long each poll, up to 10 << maxShift milliseconds
+    static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
     static void publishFile(const std::string &file, const std::string &content);
     static std::string waitForFile(const std::string &file);
     // publishFile and waitForFile for files of this run, so a file that a killed run left is not read
@@ -63,6 +63,10 @@ public:
     static bool readLogProgress(const std::string &log, size_t &key, size_t &bytes);
     static void waitForLog(const std::string &log, size_t &key, size_t &bytes);
     static void readLog(const std::string &log, size_t from, size_t to, char *data);
+    // closes file, a flush of bytes that only this node writes, then appends line, whose first word is the flush number, to indexFile, which exists from before a barrier on
+    static void publishExchangeFlush(FILE *file, const std::string &fileName, size_t bytes, const std::string &indexFile, const std::vector<uint64_t> &line);
+    // reads line number flush, of line.size() words, of indexFile from a new open; false until all of it is there
+    static bool readExchangeFlush(const std::string &indexFile, size_t flush, std::vector<uint64_t> &line);
     // every node publishes content as file + "." + node; returns all contents in node order, gathered by the master into file
     static std::string barrier(const std::string &file, const std::string &content = "");
     // phase values that a node appends to the content of a barrier as lines name<TAB>node<TAB>value, for the master to print
@@ -125,7 +129,12 @@ public:
     static size_t readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t (*recordSize)(const char *, size_t),
                                     bool (*compare)(const ClusterPair &, const ClusterPair &), const ClusterPair &last,
                                     std::vector<char> &records, std::vector<size_t> *recordOffsets, const std::string &prefix);
+    // copies each segment { fileType, offset, size } then bytes of fileType that starts before windowEnd to window + offset - windowBegin and adds { offset, size } to segments; returns the offset of the next one, SIZE_MAX if none is left
+    static size_t readExchangeSegments(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t maxSegmentSize, uint64_t fileType, size_t windowBegin, size_t windowEnd,
+                                       char *window, std::vector<std::pair<size_t, size_t> > &segments, const std::string &prefix);
     static void closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix);
+    // reads all pairs of the exchange index for this node at once, from files only, as sendClusterMembers writes them
+    static void readExchangePairs(const std::string &index, const std::string &prefix, std::vector<ClusterPair> &pairs);
 
     // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered; nodeKeyOffsets: keys of every node
     struct ClusterPairWriter {
@@ -138,6 +147,15 @@ public:
             pairs[pairCount].repKey = repKey;
             pairs[pairCount].memberKey = memberKey;
             pairCount++;
+        }
+        // makes room for count more pairs, at most pairCapacity, and returns where they go
+        ClusterPair *reservePairs(size_t count) {
+            if (pairCount + count > pairCapacity) {
+                flush();
+            }
+            ClusterPair *reserved = pairs + pairCount;
+            pairCount += count;
+            return reserved;
         }
         void flush();
         // writes the buffered pairs but keeps those for this node in memory, and returns the index lines of all nodes
@@ -164,9 +182,13 @@ public:
     // ORs the bits of keys [from, to) of a file, bit k at fileOffset = key fileFirstKey + k, into bit key - firstKey of bits, a word longer than its keys
     static void readKeyBits(int fd, const std::string &fileName, size_t fileOffset, size_t fileFirstKey, size_t from, size_t to, size_t firstKey, uint64_t *bits);
     // the representative bits of keys [firstKey, firstKey + keyCount) from the files <db>.bits.<node>, each {firstKey, keyCount} then its bits
-    static uint64_t *readRepresentativeBits(const std::string &db, const std::vector<size_t> &nodeKeyOffsets, size_t firstKey, size_t keyCount);
+    static uint64_t *readRepresentativeBits(const std::string &db, const std::vector<size_t> &fileKeyOffsets, size_t firstKey, size_t keyCount);
     // writes the representative bits of this node as <db>.bits.<node> and its ranges with their representative counts as <db>.index.<node>, gathered by the master
     static void writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount);
+    // a barrier that returns where the keys of every <clu>.<node> start, then keyCount, from their first entries, for parts in key order; only keys that are entries of the clustering are routed
+    static std::vector<size_t> getClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount);
+    // the entry keys in [keyBegin, keyEnd) of the parts <clu>.<node>, whose keys start at cluKeyOffsets, in key order
+    static void readClusterKeys(const std::string &clu, const std::vector<size_t> &cluKeyOffsets, size_t keyBegin, size_t keyEnd, std::vector<DBKeyType> &keys);
     // --createdb-mode 3 cluster databases: <clu>.index.<node> holds uint64 (key, offset) per entry in key order, then (DB_KEY_INVALID, data size)
     static void writeClusterIndexEntry(FILE *file, const std::string &fileName, DBKeyType key, size_t offset);
     // closes writer of <db>.<node> of a --createdb-mode 3 result and removes its text index; ends and closes indexFile, the cluster database index

@@ -16,7 +16,7 @@ struct io_uring_cqe;
 #endif
 
 // the storage of a file decides how many reads are in flight and if the range loads of a large file bypass the page cache
-enum StorageKind { STORAGE_LOCAL_FLASH, STORAGE_LOCAL_DISK, STORAGE_PARALLEL_FS, STORAGE_NFS, STORAGE_UNKNOWN };
+enum StorageKind { STORAGE_LOCAL_FLASH, STORAGE_LOCAL_DISK, STORAGE_MEMORY, STORAGE_PARALLEL_FS, STORAGE_NFS, STORAGE_UNKNOWN };
 StorageKind getStorageKind(int fd);
 const char *getStorageName(StorageKind storage);
 // MMSEQS_IO_MODE=buffered|direct instead of the choice of O_DIRECT by storage and size; every node must see the same

@@ -403,6 +403,29 @@ int Util::madviseLogged(void* addr, size_t len, int advice, const char* context)
 #endif
 }
 
+void Util::releasePages(void *memory, size_t size) {
+#ifdef MADV_DONTNEED
+    if (memory == NULL) {
+        return;
+    }
+    const size_t pageSize = getPageSize();
+    const size_t begin = (reinterpret_cast<size_t>(memory) + pageSize - 1) / pageSize;
+    const size_t end = (reinterpret_cast<size_t>(memory) + size) / pageSize;
+    const size_t pages = (end > begin) ? end - begin : 0;
+    int threads = 1;
+#ifdef OPENMP
+    threads = (omp_in_parallel() == 0) ? omp_get_max_threads() : 1;
+#endif
+#pragma omp parallel for schedule(static) num_threads(threads)
+    for (int thread = 0; thread < threads; thread++) {
+        const size_t from = begin + pages * thread / threads;
+        const size_t to = begin + pages * (thread + 1) / threads;
+        if (from < to) {
+            madvise(reinterpret_cast<void *>(from * pageSize), (to - from) * pageSize, MADV_DONTNEED);
+        }
+    }
+#else
+    (void) memory; (void) size;
 void Util::adviseHugePages(void* addr, size_t len) {
 #ifdef MADV_HUGEPAGE
     const uintptr_t hugePageSize = 2 * 1024 * 1024;

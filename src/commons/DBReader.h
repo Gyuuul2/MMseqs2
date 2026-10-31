@@ -7,6 +7,7 @@
 //
 #include "MemoryTracker.h"
 #include <cstddef>
+#include <map>
 #include <utility>
 #include <vector>
 #include <string>
@@ -290,12 +291,17 @@ public:
     // --createdb-mode 3: reads keys [keyBegin, keyEnd) into memory for getData
     void loadData(size_t keyBegin, size_t keyEnd);
     void prefetchData(size_t keyBegin, size_t keyEnd);
-    // --createdb-mode 3 sequences: reads the ascending keys, entries less than a page apart in one request, through the buffered fds; loadData takes the keys that prefetchData read before it
+    // --createdb-mode 3 sequences: reads the ascending keys, entries less than a page apart in one request, through the buffered fds
     void loadData(const std::vector<DBKeyType> &keys);
-    void prefetchData(const std::vector<DBKeyType> &keys);
+    // --createdb-mode 3 sequences: loads by keys read the whole block of a key while the blocks fit cacheBytes; blocks below the loaded and the requested keys are freed when new blocks need their room
+    void setBlockCacheBytes(size_t cacheBytes);
+    // the block of setBlockCacheBytes that holds key
+    size_t getKeyBlock(size_t key) const;
+    size_t getBlockReadBytes() { return blockReadBytes; }
+    size_t getKeyReadBytes() { return keyReadBytes; }
     size_t getBufferSizeToLoad(size_t keyBegin, size_t keyEnd);
-    // --createdb-mode 3 headers: the size of the names in data file fileIdx
-    size_t getNamesSize(size_t fileIdx);
+    // --createdb-mode 3 headers: the size of the names of keys [keyBegin, keyEnd)
+    size_t getNamesSize(size_t keyBegin, size_t keyEnd);
     // --createdb-mode 3 cluster databases: the first entry that starts at offset or later, the entry count after the last
     size_t findEntryByOffset(size_t offset) {
         return findEntryByCell(1, offset);
@@ -551,6 +557,8 @@ public:
 
     // --createdb-mode 3: data file f holds the keys [offsets[f], offsets[f + 1]), the data files follow in key order
     std::vector<size_t> getFileKeyOffsets(size_t fileCount);
+    // --createdb-mode 3: node n holds the keys [offsets[n], offsets[n + 1]), as many for every node, the entries of node n of a cluster database are those of its representatives
+    std::vector<size_t> getNodeKeyOffsets(size_t nodeCount);
     // --createdb-mode 3: split s holds the keys [offsets[s], offsets[s + 1]) of [keyBegin, keyEnd) whose entries, keyBytes more per key, fit splitBytes, at least one key
     std::vector<size_t> getSplitKeyOffsets(size_t keyBegin, size_t keyEnd, size_t splitBytes, size_t keyBytes);
     size_t findIdRange(size_t id);
@@ -568,7 +576,6 @@ private:
     size_t planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys);
     // a load and a prefetch of keys [keyBegin, keyEnd), only the given keys of them if keys is not NULL
     void loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
-    void prefetchKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
     void decompressLoadedBuffer();
 
     int threads;
@@ -649,8 +656,20 @@ private:
         std::vector<DBKeyType> requestedKeys;
         // read by prefetchData and not yet taken by loadData
         bool isPrefetched;
+        // the blocks of the last blocks.size() read requests, which join the cache once read
+        std::vector<size_t> blocks;
     };
     BufferInfo loadedBuffer, prefetchBuffer;
+    void cacheBlocks(BufferInfo &buffer);
+    void freeBlocks(size_t keyEnd, size_t neededBytes);
+    // --createdb-mode 3 sequences: block b holds the keys [blockKeyOffsets[b], blockKeyOffsets[b + 1]) whose entries start in the same MAX_READ_REQUEST_SIZE bytes of a data file
+    std::vector<size_t> blockKeyOffsets;
+    std::map<size_t, BatchReader::ReadRequest> cachedBlocks;
+    size_t blockCacheBytes;
+    // the bytes of the cached blocks and of those being read
+    size_t cachedBlockBytes;
+    size_t blockReadBytes;
+    size_t keyReadBytes;
     bool prepareBufferToLoad(BufferInfo &bufferToLoadInto, size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
 
     bool dataMapped;
