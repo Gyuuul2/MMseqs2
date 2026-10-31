@@ -109,18 +109,28 @@ static void writeMemberAccessions(MemberAccession *memberAccessions, size_t acce
         FileUtil::pwriteAll(fileno(file), fileName.c_str(), writeBuffer + begin, beforeOwn - begin, writtenBytes + begin);
         FileUtil::pwriteAll(fileno(file), fileName.c_str(), writeBuffer + afterOwn, end - afterOwn, writtenBytes + getFileOffset(afterOwn));
     }
-    // the buffer, cut to the records for this node, becomes their records
-    if (ownEnd > ownBegin) {
-        memmove(writeBuffer, writeBuffer + ownBegin, ownEnd - ownBegin);
-        writeBuffer = static_cast<char *>(realloc(writeBuffer, ownEnd - ownBegin));
-        Util::checkAllocation(writeBuffer, "Can not shrink writeBuffer memory in createtsv");
-        MMseqsNode::keepOwnExchangeRecords(*ownExchange, writeBuffer, ownEnd - ownBegin);
-    } else {
-        Util::releasePages(writeBuffer, writeBufferSize);
-        free(writeBuffer);
-    }
     // with fewer nodes than threads the flush is indexed in pieces of threads, so the receiving node scans the records on all threads
     const int flushPieces = std::max(1, threads / static_cast<int>(MMseqsNode::count));
+    std::vector<char *> ownRecords(flushPieces, NULL);
+    std::vector<size_t> ownRecordBytes(flushPieces, 0);
+#pragma omp parallel for schedule(dynamic, 1)
+    for (int piece = 0; piece < flushPieces; piece++) {
+        const size_t pieceBegin = std::max(ownBegin, threadOffsets[threads * piece / flushPieces]);
+        const size_t pieceEnd = std::min(ownEnd, threadOffsets[threads * (piece + 1) / flushPieces]);
+        if (pieceBegin < pieceEnd) {
+            ownRecordBytes[piece] = pieceEnd - pieceBegin;
+            ownRecords[piece] = static_cast<char *>(malloc(ownRecordBytes[piece]));
+            Util::checkAllocation(ownRecords[piece], "Can not allocate own record memory in createtsv");
+            memcpy(ownRecords[piece], writeBuffer + pieceBegin, ownRecordBytes[piece]);
+        }
+    }
+    for (int piece = 0; piece < flushPieces; piece++) {
+        if (ownRecordBytes[piece] > 0) {
+            MMseqsNode::keepOwnExchangeRecords(*ownExchange, ownRecords[piece], ownRecordBytes[piece]);
+        }
+    }
+    Util::releasePages(writeBuffer, writeBufferSize);
+    free(writeBuffer);
     std::vector<size_t> threadNodeOffsets(MMseqsNode::count + 1);
     for (int piece = 0; piece < flushPieces; piece++) {
         const size_t pieceBegin = getFileOffset(threadOffsets[threads * piece / flushPieces]);

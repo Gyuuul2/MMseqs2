@@ -32,7 +32,7 @@ static std::string runId;
 static size_t sentExchangeBytes = 0;
 static size_t sentOtherNodeExchangeBytes = 0;
 // the records and their bytes that this node sent to itself in the last flush of an exchange, until openExchange reads them
-static std::map<std::string, std::pair<char *, size_t> > ownExchangeRecords;
+static std::map<std::string, std::vector<std::pair<char *, size_t> > > ownExchangeRecords;
 
 void MMseqsNode::init() {
     // mpirun (Open MPI, then PMI of MPICH/Intel MPI) before SLURM, whose variables mpirun tasks inherit from the allocation
@@ -146,10 +146,11 @@ static std::string readPolledFile(const std::string &file) {
     return isStale ? std::string() : content;
 }
 
-std::string MMseqsNode::waitForFile(const std::string &file) {
+// the content of file once it is published; a published file is never empty
+static std::string waitForFile(const std::string &file) {
     std::string content = readPolledFile(file);
     for (unsigned int polls = 0; content.empty(); polls++) {
-        sleepBeforePoll(polls);
+        MMseqsNode::sleepBeforePoll(polls);
         content = readPolledFile(file);
     }
     return content;
@@ -411,7 +412,7 @@ void MMseqsNode::addExchangeFlush(std::string &indexData, size_t &writtenBytes, 
 }
 
 void MMseqsNode::keepOwnExchangeRecords(const std::string &exchange, char *records, size_t bytes) {
-    ownExchangeRecords[exchange] = std::make_pair(records, bytes);
+    ownExchangeRecords[exchange].push_back(std::make_pair(records, bytes));
     sentExchangeBytes += bytes;
 }
 
@@ -440,10 +441,12 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
         const ExchangeBlock block = { files[node], pos, end, std::vector<char>(), 0, 0, 0, 0, NULL };
         blocks.push_back(block);
     }
-    std::map<std::string, std::pair<char *, size_t> >::iterator own = ownExchangeRecords.find(prefix);
+    std::map<std::string, std::vector<std::pair<char *, size_t> > >::iterator own = ownExchangeRecords.find(prefix);
     if (own != ownExchangeRecords.end()) {
-        const ExchangeBlock block = { NULL, 0, own->second.second, std::vector<char>(), 0, 0, 0, 0, own->second.first };
-        blocks.push_back(block);
+        for (size_t i = 0; i < own->second.size(); i++) {
+            const ExchangeBlock block = { NULL, 0, own->second[i].second, std::vector<char>(), 0, 0, 0, 0, own->second[i].first };
+            blocks.push_back(block);
+        }
         ownExchangeRecords.erase(own);
     }
 }
@@ -1325,11 +1328,8 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
                 };
 #pragma omp parallel for schedule(dynamic, 1)
                 for (int thread = 0; thread < par.threads; thread++) {
-                    size_t threadSingletons = 0;
-                    for (size_t word = wordBegin + wordCount * thread / par.threads; word < wordBegin + wordCount * (thread + 1) / par.threads; word++) {
-                        threadSingletons += __builtin_popcountll(getSingletonWord(word));
-                    }
-                    threadSingletonOffsets[thread + 1] = threadSingletons;
+                    threadSingletonOffsets[thread + 1] = Util::countSetBits(singletonBits, std::max(bitBegin, (wordBegin + wordCount * thread / par.threads) * 64),
+                                                                            std::min(bitEnd, (wordBegin + wordCount * (thread + 1) / par.threads) * 64));
                 }
                 for (int thread = 0; thread < par.threads; thread++) {
                     threadSingletonOffsets[thread + 1] += threadSingletonOffsets[thread];

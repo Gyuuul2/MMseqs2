@@ -51,11 +51,9 @@ public:
     // sleeps before poll number polls of a file that another node publishes: ten milliseconds, twice as long each poll, up to 10 << maxShift milliseconds
     static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
     static void publishFile(const std::string &file, const std::string &content);
-    // waits until file is published; a published file is never empty
-    static std::string waitForFile(const std::string &file);
     // reads a file that an earlier step wrote
     static std::string readFile(const std::string &file);
-    // publishFile and waitForFile for files of this run, so a file that a killed run left is not read
+    // publishFile and waiting for a file of this run, so a file that a killed run left is not read
     static void publishRunFile(const std::string &file, const std::string &content);
     static std::string waitForRunFile(const std::string &file);
     // waits for prefix + node of every node and returns their content in node order; the files are removed
