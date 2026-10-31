@@ -366,20 +366,20 @@ static std::atomic<size_t> swipeLanePairs(0);
 static std::atomic<size_t> swipeLaneSlots(0);
 static std::atomic<size_t> swipeSinglePairs(0);
 
-// mode 3 target gapped alignments in SWIPE lanes, their lane rows and all lane rows, and the ones extended alone with a trace of their lane only
+// mode 3 target gapped alignments in SWIPE lanes, their lane rows and all lane rows, and the extensions longer than the trace of the last lane rows
 static std::atomic<size_t> swipeTargetPairs(0);
 static std::atomic<size_t> swipeTargetLaneRows(0);
 static std::atomic<size_t> swipeTargetSlotRows(0);
-static std::atomic<size_t> swipeTargetSinglePairs(0);
+static std::atomic<size_t> swipeTargetLongPairs(0);
 
 static void printSwipeLanes() {
     Debug(Debug::INFO) << "SWIPE member gapped alignments: " << swipeLanePairs.load() << " in lanes ("
                        << swipeLanePairs.load() * 100 / std::max<size_t>(1, swipeLaneSlots.load()) << "% lane fill), "
                        << swipeSinglePairs.load() << " one pair at a time\n";
-    if (swipeTargetPairs.load() + swipeTargetSinglePairs.load() > 0) {
+    if (swipeTargetPairs.load() + swipeTargetLongPairs.load() > 0) {
         Debug(Debug::INFO) << "SWIPE target gapped alignments: " << swipeTargetPairs.load() << " in lanes ("
                            << swipeTargetLaneRows.load() * 100 / std::max<size_t>(1, swipeTargetSlotRows.load()) << "% lane fill), "
-                           << swipeTargetSinglePairs.load() << " one pair at a time\n";
+                           << swipeTargetLongPairs.load() << " extensions longer than the lane trace\n";
     }
 }
 
@@ -494,7 +494,7 @@ struct SwipeTargets {
         swipeTargetPairs += targetPairs;
         swipeTargetLaneRows += extender.extendLaneRows;
         swipeTargetSlotRows += extender.extendSlotRows;
-        swipeTargetSinglePairs += extender.extendSoloJobs;
+        swipeTargetLongPairs += extender.extendLongJobs;
     }
 
     void addTarget(Sequence &query, Sequence &target, int seedQuery, int seedTarget) {
