@@ -7,7 +7,6 @@
 #include <string>
 #include <vector>
 
-class DBWriter;
 class Timer;
 template <typename T> class DBReader;
 
@@ -190,9 +189,11 @@ public:
     // the entry keys in [keyBegin, keyEnd) of the parts <clu>.<node>, whose keys start at cluKeyOffsets, in key order
     static void readClusterKeys(const std::string &clu, const std::vector<size_t> &cluKeyOffsets, size_t keyBegin, size_t keyEnd, std::vector<DBKeyType> &keys);
     // --createdb-mode 3 cluster databases: <clu>.index.<node> holds uint64 (key, offset) per entry in key order, then (DB_KEY_INVALID, data size)
-    static void writeClusterIndexEntry(FILE *file, const std::string &fileName, DBKeyType key, size_t offset);
-    // closes writer of <db>.<node> of a --createdb-mode 3 result and removes its text index; ends and closes indexFile, the cluster database index
-    static void closeClusterWriter(DBWriter &writer, FILE *indexFile, const std::string &indexFileName);
+    // appends the data and (key, offset in the data of the thread) entries of every thread to dataFile and indexFile, which hold dataBytes and indexBytes, on all threads
+    static void writeClusterThreadParts(FILE *dataFile, const std::string &dataFileName, FILE *indexFile, const std::string &indexFileName,
+                                        std::vector<std::string> &threadData, std::vector<std::vector<uint64_t> > &threadEntries, size_t &dataBytes, size_t &indexBytes);
+    // writes the end entry (DB_KEY_INVALID, dataBytes) at indexBytes and closes dataFile and indexFile
+    static void closeClusterFiles(FILE *dataFile, const std::string &dataFileName, FILE *indexFile, const std::string &indexFileName, size_t dataBytes, size_t indexBytes);
     // writes the pairs of an exchange in rep order as the cluster database <clu>.<node>; singletonBits: bit k makes key firstKey + k a singleton
     static void writeClusterPairs(const std::string &index, const std::string &prefix, const std::string &clu, const uint64_t *singletonBits, size_t firstKey, size_t keyCount);
 };
