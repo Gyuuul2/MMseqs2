@@ -19,6 +19,8 @@
 #include "Parameters.h"
 #include "Matcher.h"
 #include "SwipeAligner.h"
+#include "BlockAligner.h"
+#include "EvalueComputation.h"
 
 const char* binary_name = "test_alignment";
 DEFAULT_PARAMETER_SINGLETON_INIT
@@ -85,6 +87,37 @@ int main (int, const char**) {
                 std::cerr << "SWIPE extension depends on batch mates\n";
                 return 1;
             }
+        }
+    }
+    {
+        const std::string letters(30000, 'A');
+        Sequence query(30001, Parameters::DBTYPE_AMINO_ACIDS, &subMat, 0, false, false);
+        Sequence target(30001, Parameters::DBTYPE_AMINO_ACIDS, &subMat, 0, false, false);
+        query.mapSequence(0, 0, letters.c_str(), letters.size());
+        target.mapSequence(1, 1, letters.c_str(), letters.size());
+        SubstitutionMatrix::FastMatrix fast = SubstitutionMatrix::createAsciiSubMat(subMat);
+        EvalueComputation evaluer(100000, &subMat, 11, 1);
+        BlockAligner aligner(Parameters::DBTYPE_AMINO_ACIDS, 30001, &subMat, &fast, &evaluer, false, 0.0f, -11, -1);
+        aligner.setQuery(&query);
+        if (static_cast<int16_t>(aligner.bestDiagonal(&target, -1000, 1000)) != 0) {
+            std::cerr << "Saturated ungapped diagonal selected incorrectly\n";
+            return 1;
+        }
+    }
+    {
+        const std::string queryText = "FGFFFEGAIDAGIGDEDGGIHIDCGFFHDHFEAHFCEHHCFHGFGHEHHEEIGHFFHGAAICAFIHHGHFHGEIDCHIFCECIGIGGCFGAIHFIEAHDD";
+        const std::string targetText = "CFCAFEIADHEDGCGADHIICDFFAIACHHDEDFEGIFGFGFIDHFCDFHCAGICCDCECGAHEICDFAIICACIAIADFCAHCHIFCAACHHFDEFHDE";
+        Sequence query(101, Parameters::DBTYPE_AMINO_ACIDS, &subMat, 0, false, false);
+        Sequence target(101, Parameters::DBTYPE_AMINO_ACIDS, &subMat, 0, false, false);
+        query.mapSequence(0, 0, queryText.c_str(), queryText.size());
+        target.mapSequence(1, 1, targetText.c_str(), targetText.size());
+        SubstitutionMatrix::FastMatrix fast = SubstitutionMatrix::createAsciiSubMat(subMat);
+        EvalueComputation evaluer(100000, &subMat, 11, 1);
+        BlockAligner aligner(Parameters::DBTYPE_AMINO_ACIDS, 101, &subMat, &fast, &evaluer, false, 0.0f, -11, -1);
+        aligner.setQuery(&query);
+        if (aligner.bestDiagonal(&target, 0, 49) != 48) {
+            std::cerr << "Ungapped diagonal depends on SIMD width\n";
+            return 1;
         }
     }
     std::cout << "Substitution matrix:\n";
