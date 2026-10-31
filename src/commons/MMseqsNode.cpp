@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <cstdlib>
 #include <map>
-#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -89,17 +88,8 @@ void MMseqsNode::sleepBeforePoll(unsigned int polls, unsigned int maxShift) {
     usleep(10000u << std::min(polls, maxShift));
 }
 
-// NFS caches that a name does not exist until it checks the directory again, by default after 30 s; opening the directory checks it now
-static bool isFilePublished(const std::string &file) {
-    DIR *directory = opendir(FileUtil::dirName(file).c_str());
-    if (directory != NULL) {
-        closedir(directory);
-    }
-    return FileUtil::fileExists(file.c_str());
-}
-
 std::string MMseqsNode::waitForFile(const std::string &file) {
-    for (unsigned int polls = 0; isFilePublished(file) == false; polls++) {
+    for (unsigned int polls = 0; FileUtil::fileExists(file.c_str()) == false; polls++) {
         sleepBeforePoll(polls);
     }
     FILE *handle = FileUtil::openFileOrDie(file.c_str(), "r", true);
@@ -154,7 +144,7 @@ void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size
 
 bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &bytes) {
     const std::string file = log + ".progress";
-    if (isFilePublished(file) == false) {
+    if (FileUtil::fileExists(file.c_str()) == false) {
         return false;
     }
     // NFS may fail to read a progress file that was just replaced; the next poll reads it again
