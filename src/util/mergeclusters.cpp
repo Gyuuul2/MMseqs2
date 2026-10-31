@@ -28,21 +28,33 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         dbr.open(DBReader<DBKeyType>::NOSORT);
         const std::vector<size_t> nodeKeyOffsets = dbr.getNodeKeyOffsets(MMseqsNode::count);
         const bool hasSecondClustering = par.filenames.size() > 3;
+        // clusthashfast writes no entries for clusters of one key, its representative bits hold them
+        const std::string representativeDb = par.filenames[2] + "_redundancy";
+        const bool hasRepresentativeBits = FileUtil::fileExists((representativeDb + ".dbtype").c_str());
         // the members of the second clustering go to the nodes of their entries in the first
-        const std::vector<size_t> firstClusteringKeyOffsets = hasSecondClustering ? MMseqsNode::getClusterKeyOffsets(par.db2 + ".keys", par.filenames[2], dbr.getSize()) : nodeKeyOffsets;
+        const std::vector<size_t> firstClusteringKeyOffsets = (hasSecondClustering || hasRepresentativeBits)
+                                                              ? MMseqsNode::getClusterKeyOffsets(par.db2 + ".keys", par.filenames[2], dbr.getSize(), hasRepresentativeBits ? representativeDb + ".bits." + SSTR(MMseqsNode::rank) : "")
+                                                              : nodeKeyOffsets;
         dbr.close();
+        const size_t firstKey = firstClusteringKeyOffsets[MMseqsNode::rank];
+        const size_t keyCount = firstClusteringKeyOffsets[MMseqsNode::rank + 1] - firstKey;
+        uint64_t *representativeBits = hasRepresentativeBits ? MMseqsNode::readRepresentativeBits(representativeDb, firstClusteringKeyOffsets, firstKey, keyCount) : NULL;
         std::string phaseValues;
         Timer timer;
         const std::string sortedByMember = par.db2 + "_swap_0";
         const std::string sortedByMemberIndex = hasSecondClustering ? MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, firstClusteringKeyOffsets, sortedByMember) : "";
         const std::string sortedByRep = par.db2 + "_swap_1";
         const std::string sortedByRepIndex = MMseqsNode::sendClusterPairs(par.filenames[2], true, ClusterPair::compareByRep, nodeKeyOffsets, sortedByRep,
-                                                                          sortedByMemberIndex, hasSecondClustering ? sortedByMember : "");
+                                                                          sortedByMemberIndex, hasSecondClustering ? sortedByMember : "", representativeBits, firstKey, keyCount, par.db2 + "_singletons");
+        delete[] representativeBits;
         MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", timer);
         if (hasSecondClustering) {
             FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
         }
-        MMseqsNode::writeClusterPairs(sortedByRepIndex, sortedByRep, par.db2, NULL, nodeKeyOffsets[MMseqsNode::rank], nodeKeyOffsets[MMseqsNode::rank + 1] - nodeKeyOffsets[MMseqsNode::rank]);
+        const size_t nodeKeys = nodeKeyOffsets[MMseqsNode::rank + 1] - nodeKeyOffsets[MMseqsNode::rank];
+        uint64_t *singletonBits = hasRepresentativeBits ? MMseqsNode::readRepresentativeBits(par.db2 + "_singletons", firstClusteringKeyOffsets, nodeKeyOffsets[MMseqsNode::rank], nodeKeys) : NULL;
+        MMseqsNode::writeClusterPairs(sortedByRepIndex, sortedByRep, par.db2, singletonBits, nodeKeyOffsets[MMseqsNode::rank], nodeKeys);
+        delete[] singletonBits;
         MMseqsNode::addPhaseTime(phaseValues, "writing the clusters", timer);
         std::vector<std::string> exchanges;
         exchanges.push_back(sortedByRep);
@@ -50,6 +62,9 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
             exchanges.push_back(sortedByMember);
         }
         MMseqsNode::removeExchanges(par.db2, sortedByRep, exchanges, phaseValues);
+        if (hasRepresentativeBits) {
+            FileUtil::remove((par.db2 + "_singletons.bits." + SSTR(MMseqsNode::rank)).c_str());
+        }
         if (MMseqsNode::isMaster()) {
             DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_CLUSTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
         }

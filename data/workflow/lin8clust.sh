@@ -60,10 +60,6 @@ if notExists "${CLUDB}.dbtype" ${ITER2_PRODUCTS}; then
     if [ -n "$REMOVE_TMP" ]; then
         # shellcheck disable=SC2086
         "$MMSEQS" rmdb "${TMP_PATH}/pref" ${VERBOSITY}
-        if [ -n "$CLUSTHASH" ]; then
-            # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust_redundancy" ${VERBOSITY}
-        fi
     fi
 fi
 
@@ -83,6 +79,8 @@ if [ -n "$CLUSTHASH" ]; then
         if [ -n "$REMOVE_TMP" ]; then
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust" ${VERBOSITY}
+            # shellcheck disable=SC2086
+            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust_redundancy" ${VERBOSITY}
             # shellcheck disable=SC2086
             "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY}
         fi
