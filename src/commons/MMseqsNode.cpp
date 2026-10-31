@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <map>
+#include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -88,10 +89,73 @@ void MMseqsNode::sleepBeforePoll(unsigned int polls, unsigned int maxShift) {
     usleep(10000u << std::min(polls, maxShift));
 }
 
-std::string MMseqsNode::waitForFile(const std::string &file) {
-    for (unsigned int polls = 0; FileUtil::fileExists(file.c_str()) == false; polls++) {
-        sleepBeforePoll(polls);
+// whether the directory of file lists it: reading the directory asks the server, while a lookup of a name that NFS once
+// saw missing is answered from its cache for up to 60 s (Nextflow lists the work directory before it reads .exitcode, too)
+static bool isListed(const std::string &file) {
+    const std::string name = FileUtil::baseName(file);
+    DIR *directory = opendir(FileUtil::dirName(file).c_str());
+    if (directory == NULL) {
+        return false;
     }
+    bool isFound = false;
+    for (struct dirent *entry; isFound == false && (entry = readdir(directory)) != NULL;) {
+        isFound = name == entry->d_name;
+    }
+    closedir(directory);
+    return isFound;
+}
+
+// the content of file, or an empty string while it is not published; a file that a later publish replaces while it is read
+// fails with ESTALE on NFS and is read again by the next poll
+static std::string readPolledFile(const std::string &file) {
+    int fd = open(file.c_str(), O_RDONLY);
+    if (fd < 0 && errno == ENOENT && isListed(file)) {
+        fd = open(file.c_str(), O_RDONLY);
+    }
+    if (fd < 0) {
+        if (errno == ENOENT || errno == ESTALE) {
+            return std::string();
+        }
+        Debug(Debug::ERROR) << "Cannot open " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    std::string content;
+    struct stat sb;
+    bool isStale = false;
+    if (fstat(fd, &sb) != 0) {
+        isStale = errno == ESTALE;
+        if (isStale == false) {
+            Debug(Debug::ERROR) << "Cannot read " << file << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+    content.resize(isStale ? 0 : sb.st_size);
+    for (size_t done = 0; done < content.size();) {
+        const ssize_t count = pread(fd, &content[done], content.size() - done, done);
+        if (count < 0 && errno != ESTALE) {
+            Debug(Debug::ERROR) << "Cannot read " << file << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (count <= 0) {
+            isStale = true;
+            break;
+        }
+        done += count;
+    }
+    close(fd);
+    return isStale ? std::string() : content;
+}
+
+std::string MMseqsNode::waitForFile(const std::string &file) {
+    std::string content = readPolledFile(file);
+    for (unsigned int polls = 0; content.empty(); polls++) {
+        sleepBeforePoll(polls);
+        content = readPolledFile(file);
+    }
+    return content;
+}
+
+std::string MMseqsNode::readFile(const std::string &file) {
     FILE *handle = FileUtil::openFileOrDie(file.c_str(), "r", true);
     struct stat sb;
     if (fstat(fileno(handle), &sb) != 0) {
@@ -99,12 +163,8 @@ std::string MMseqsNode::waitForFile(const std::string &file) {
         EXIT(EXIT_FAILURE);
     }
     std::string content(sb.st_size, '\0');
-    if (fread(&content[0], sizeof(char), content.size(), handle) != content.size()) {
+    if (fread(&content[0], sizeof(char), content.size(), handle) != content.size() || fclose(handle) != 0) {
         Debug(Debug::ERROR) << "Cannot read " << file << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    if (fclose(handle) != 0) {
-        Debug(Debug::ERROR) << "Cannot close " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
     return content;
@@ -144,22 +204,8 @@ void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size
 
 bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &bytes) {
     const std::string file = log + ".progress";
-    if (FileUtil::fileExists(file.c_str()) == false) {
-        return false;
-    }
     // NFS may fail to read a progress file that was just replaced; the next poll reads it again
-    FILE *handle = fopen(file.c_str(), "r");
-    if (handle == NULL) {
-        return false;
-    }
-    char buffer[256];
-    const size_t size = fread(buffer, sizeof(char), sizeof(buffer) - 1, handle);
-    const bool hasError = ferror(handle) != 0;
-    fclose(handle);
-    if (hasError) {
-        return false;
-    }
-    const std::string content(buffer, size);
+    const std::string content = readPolledFile(file);
     if (content.compare(0, runId.size(), runId) != 0) {
         return false;
     }
