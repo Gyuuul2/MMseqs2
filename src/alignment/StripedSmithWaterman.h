@@ -140,7 +140,8 @@ public:
 		int32_t db_length,
 		const uint8_t gap_open,
 		const uint8_t gap_extend,
-		const int32_t maskLen);
+		const int32_t maskLen,
+		bool wordFirst);
 
     template <unsigned int type>
     s_align alignStartPosBacktrace (
@@ -176,7 +177,7 @@ public:
                         const double filters,
                         EvalueComputation * filterd,
                         const int covMode, const float covThr, const float correlationScoreWeight,
-                        const int32_t maskLen);
+                        const int32_t maskLen, const s_align *forward = NULL, bool wordFirst = false);
 
 
     /*!	@function computed ungapped alignment score
@@ -300,7 +301,7 @@ private:
                         const double filters,
                         EvalueComputation * filterd,
                         const int covMode, const float covThr, const float correlationScoreWeight,
-                        const int32_t maskLen);
+                        const int32_t maskLen, const s_align *forward, bool wordFirst);
 
     template <unsigned int type>
     SmithWaterman::cigar *banded_sw(const unsigned char *db_sequence, const int8_t *query_sequence,
