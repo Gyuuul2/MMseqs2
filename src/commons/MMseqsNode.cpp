@@ -110,20 +110,17 @@ static bool isListed(const std::string &file) {
 static int openReadOnly(const std::string &file, int flags = O_RDONLY) {
     int fd;
     do {
-        fd = open(file.c_str(), flags);
+        fd = open(file.c_str(), flags, 0666);
     } while (fd < 0 && errno == EINTR);
     return fd;
 }
 
-// the content of file, or an empty string while it is not published; a file that a later publish replaces while it is read
-// fails with ESTALE on NFS and is read again by the next poll
+// the content of file, or an empty string while it is not published; NFS only promises that open sees the latest state of a file that
+// exists, a name it found missing can stay missing, so a poll creates the empty file that the rename of the publish replaces; a file
+// that a later publish replaces while it is read fails with ESTALE and is read again by the next poll
 static std::string readPolledFile(const std::string &file) {
-    int fd = openReadOnly(file);
-    int openError = (fd < 0) ? errno : 0;
-    if (openError == ENOENT && isListed(file)) {
-        fd = openReadOnly(file);
-        openError = (fd < 0) ? errno : 0;
-    }
+    int fd = openReadOnly(file, O_RDONLY | O_CREAT);
+    const int openError = (fd < 0) ? errno : 0;
     if (fd < 0) {
         if (openError == ENOENT || openError == ESTALE) {
             return std::string();
@@ -158,12 +155,20 @@ static std::string readPolledFile(const std::string &file) {
     return isStale ? std::string() : content;
 }
 
+static const size_t WAIT_WARNING_SECONDS = 600;
+
 // the content of file once it is published; a published file is never empty
 static std::string waitForFile(const std::string &file) {
     std::string content = readPolledFile(file);
+    Timer timer;
+    size_t warnSeconds = WAIT_WARNING_SECONDS;
     for (unsigned int polls = 0; content.empty(); polls++) {
         MMseqsNode::sleepBeforePoll(polls);
         content = readPolledFile(file);
+        if (content.empty() && timer.getTimediff() >= warnSeconds) {
+            Debug(Debug::WARNING) << "Waited " << warnSeconds << " s for " << file << "\n";
+            warnSeconds *= 2;
+        }
     }
     return content;
 }
