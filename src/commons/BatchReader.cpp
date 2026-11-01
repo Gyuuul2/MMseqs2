@@ -188,6 +188,9 @@ void BatchReader::readSync(const std::vector<ReadRequest> &requests) {
 
 void BatchReader::waitAsyncRead() {
 #ifdef HAVE_IO_URING
+    if (ringThread.joinable()) {
+        ringThread.join();
+    }
     if (ringFd >= 0) {
         readWithRing(true);
     }
@@ -236,7 +239,12 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
                 break;
             }
         }
-        readWithRing(false);
+        // the ring holds the requests of most reads; for more, a thread refills it while the caller works
+        if (callingThreadReads == false && splitReadRequests.size() > inflightReadLimit) {
+            ringThread = std::thread(&BatchReader::readWithRing, this, true);
+        } else {
+            readWithRing(false);
+        }
         return;
     }
 #endif

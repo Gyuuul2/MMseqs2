@@ -64,6 +64,7 @@ private:
 #ifdef HAVE_IO_URING
     void readWithRing(bool waitForAll);
 
+    std::thread ringThread;
     int ringFd;
     bool ringWorkersLimited;
     unsigned int inflightReadRequests;

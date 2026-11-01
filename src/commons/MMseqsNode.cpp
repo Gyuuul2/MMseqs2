@@ -667,7 +667,9 @@ static void bufferExchangeBlock(MMseqsNode::ExchangeBlock &block, size_t bytes, 
     if (block.bufferEnd - block.bufferPos >= bytes || getUnreadBytes(block) == 0) {
         return;
     }
-    memmove(block.buffer.data(), block.buffer.data() + block.bufferPos, block.bufferEnd - block.bufferPos);
+    if (block.bufferEnd > block.bufferPos) {
+        memmove(block.buffer.data(), block.buffer.data() + block.bufferPos, block.bufferEnd - block.bufferPos);
+    }
     block.bufferEnd -= block.bufferPos;
     block.recordEnd -= std::min(block.recordEnd, block.bufferPos);
     block.lastRecord -= std::min(block.lastRecord, block.bufferPos);
@@ -884,25 +886,25 @@ MMseqsNode::ClusterMemberLookup::ClusterMemberLookup(const std::string &index, c
     // an anchor at the start of every block and every stridePairs pairs, as many as maxBytes holds
     const size_t maxAnchors = std::max(blocks.size() + 1, maxBytes / sizeof(Anchor));
     const size_t stridePairs = std::max<size_t>(4096, totalPairs / (maxAnchors - blocks.size()) + 1);
-    anchors.reserve(blocks.size() + totalPairs / stridePairs);
-    ranges.reserve(blocks.size());
+    std::vector<size_t> blockAnchorOffsets(blocks.size() + 1, 0);
     for (size_t i = 0; i < blocks.size(); i++) {
-        const ExchangeBlock &block = blocks[i];
-        const size_t pairCount = (block.end - block.pos) / sizeof(ClusterPair);
-        const ClusterPair first = readPair(i, block.pos);
-        const ClusterPair last = readPair(i, block.end - sizeof(ClusterPair));
-        Range range = { first.repKey, last.repKey, anchors.size(), 0 };
-        for (size_t pair = 0; pair < pairCount;) {
-            const ClusterPair sample = (pair == 0) ? first : readPair(i, block.pos + pair * sizeof(ClusterPair));
-            const Anchor anchor = { sample.repKey, block.pos + pair * sizeof(ClusterPair) };
-            anchors.push_back(anchor);
-            if (pairCount - pair <= stridePairs) {
-                break;
-            }
-            pair += stridePairs;
-        }
-        range.lastAnchor = anchors.size();
-        ranges.push_back(range);
+        const size_t pairCount = (blocks[i].end - blocks[i].pos) / sizeof(ClusterPair);
+        blockAnchorOffsets[i + 1] = blockAnchorOffsets[i] + (pairCount + stridePairs - 1) / stridePairs;
+    }
+    // one read of a few bytes per anchor in the files of other nodes, so many are in flight
+    anchors.resize(blockAnchorOffsets.back());
+#pragma omp parallel for schedule(dynamic, 64)
+    for (size_t anchor = 0; anchor < anchors.size(); anchor++) {
+        const size_t i = std::upper_bound(blockAnchorOffsets.begin(), blockAnchorOffsets.end(), anchor) - blockAnchorOffsets.begin() - 1;
+        const size_t offset = blocks[i].pos + (anchor - blockAnchorOffsets[i]) * stridePairs * sizeof(ClusterPair);
+        anchors[anchor].key = readPair(i, offset).repKey;
+        anchors[anchor].offset = offset;
+    }
+    ranges.resize(blocks.size());
+#pragma omp parallel for schedule(dynamic, 64)
+    for (size_t i = 0; i < blocks.size(); i++) {
+        const Range range = { anchors[blockAnchorOffsets[i]].key, readPair(i, blocks[i].end - sizeof(ClusterPair)).repKey, blockAnchorOffsets[i], blockAnchorOffsets[i + 1] };
+        ranges[i] = range;
     }
 }
 
