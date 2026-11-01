@@ -6,6 +6,7 @@
 #include "Util.h"
 #include "FileUtil.h"
 #include "MMseqsNode.h"
+#include "Timer.h"
 
 #ifdef OPENMP
 #include <omp.h>
@@ -59,13 +60,17 @@ int result2flat(int argc, const char **argv, const Command &command) {
     }
     const size_t splitCount = isLinfinity ? splitKeyOffsets.size() - 1 : 1;
 
-    const size_t chunkEntries = 1024;
+    const size_t chunkEntries = isLinfinity ? 4096 : 1024;
     // the chunks that the threads format at once before they are written at their prefix-summed offsets
-    const size_t batchChunks = 16 * static_cast<size_t>(par.threads);
+    const size_t batchChunks = (isLinfinity ? 4 : 16) * static_cast<size_t>(par.threads);
     std::vector<std::string> chunkData(batchChunks);
     std::vector<size_t> chunkOffsets(batchChunks + 1);
     size_t fastaSize = 0;
     std::vector<DBKeyType> repKeys;
+    Timer timer;
+    double loadSeconds = 0;
+    double formatSeconds = 0;
+    double writeSeconds = 0;
     for (size_t split = 0; split < splitCount; split++) {
         size_t splitEnd = isLinfinity ? 0 : dbr_data.getSize();
         if (isLinfinity) {
@@ -78,6 +83,8 @@ int result2flat(int argc, const char **argv, const Command &command) {
             MMseqsNode::readClusterKeys(par.db3, cluKeyOffsets, splitKeyOffsets[split], splitKeyOffsets[split + 1], repKeys);
             splitEnd = repKeys.size();
         }
+        loadSeconds += timer.getTimediff();
+        timer.reset();
         const size_t chunkCount = (splitEnd + chunkEntries - 1) / chunkEntries;
         for (size_t batchBegin = 0; batchBegin < chunkCount; batchBegin += batchChunks) {
             const size_t batchEnd = std::min(chunkCount, batchBegin + batchChunks);
@@ -168,6 +175,8 @@ int result2flat(int argc, const char **argv, const Command &command) {
                     }
                 }
             }
+            formatSeconds += timer.getTimediff();
+            timer.reset();
             chunkOffsets[0] = fastaSize;
             for (size_t chunk = batchBegin; chunk < batchEnd; chunk++) {
                 chunkOffsets[chunk - batchBegin + 1] = chunkOffsets[chunk - batchBegin] + chunkData[chunk - batchBegin].size();
@@ -178,6 +187,8 @@ int result2flat(int argc, const char **argv, const Command &command) {
                 FileUtil::pwriteAll(fileno(fastaFP), fastaFile.c_str(), buffer.data(), buffer.size(), chunkOffsets[chunk - batchBegin]);
             }
             fastaSize = chunkOffsets[batchEnd - batchBegin];
+            writeSeconds += timer.getTimediff();
+            timer.reset();
         }
     }
 
@@ -186,6 +197,12 @@ int result2flat(int argc, const char **argv, const Command &command) {
         EXIT(EXIT_FAILURE);
     }
     if (isLinfinity) {
+        writeSeconds += timer.getTimediff();
+        std::string phaseValues;
+        MMseqsNode::addPhaseSeconds(phaseValues, "loading the sequences", loadSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "formatting the sequences", formatSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "writing the sequences", writeSeconds);
+        MMseqsNode::printPhaseValues(phaseValues);
         seqDbr.close();
     } else {
         targetdb_header.close();
