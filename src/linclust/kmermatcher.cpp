@@ -158,6 +158,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
         size_t threadLongestKmer = par.kmerSize;
         unsigned short * scoreDist= new(std::nothrow) unsigned short[65536];
         Util::checkAllocation(scoreDist, "Can not allocate scoreDist memory in fillKmerPositionArray");
+        memset(scoreDist, 0, sizeof(unsigned short) * 65536);
         unsigned int * hierarchicalScoreDist= new(std::nothrow) unsigned int[128];
         Util::checkAllocation(hierarchicalScoreDist, "Can not allocate hierarchicalScoreDist memory in fillKmerPositionArray");
 
@@ -176,6 +177,26 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
         const size_t alphabetSize = subMat->alphabetSize - 1;
         const size_t kmerIdxRange = idxer.powers[par.kmerSize - 1] * alphabetSize;
         const bool kmerWindowIsNumSequence = (TYPE == Parameters::DBTYPE_AMINO_ACIDS) && seq.getEffectiveKmerSize() == static_cast<unsigned int>(par.kmerSize);
+        // spaced k-mers: the index is a sum of blocks of adjacent pattern positions, each block rolled once over the sequence
+        const bool hasSpacedBlocks = (TYPE == Parameters::DBTYPE_AMINO_ACIDS) && kmerWindowIsNumSequence == false && seq.getKmerSize() == static_cast<unsigned int>(par.kmerSize);
+        std::vector<unsigned int> blockStarts;
+        std::vector<unsigned int> blockLengths;
+        std::vector<size_t> blockWeights;
+        unsigned int maxBlockLength = 0;
+        if (hasSpacedBlocks) {
+            const unsigned char *patternPositions = seq.getAAPosInSpacedPattern();
+            for (int i = 0; i < par.kmerSize; i++) {
+                if (i == 0 || patternPositions[i] != patternPositions[i - 1] + 1) {
+                    blockStarts.push_back(patternPositions[i]);
+                    blockLengths.push_back(0);
+                    blockWeights.push_back(idxer.powers[i]);
+                }
+                blockLengths.back()++;
+                maxBlockLength = std::max(maxBlockLength, blockLengths.back());
+            }
+        }
+        std::vector<size_t> blockKmers;
+        std::vector<unsigned char> blockHasX;
         const unsigned int BUFFER_SIZE = static_cast<unsigned int>(KMER_STAGING_BUFFER_SIZE);
         size_t bufferPos = 0;
         KmerPosition<T, includeAdjacency, L> * threadKmerBuffer = NULL;
@@ -205,7 +226,6 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                 if (isRepresentative(id) == false) {
                     continue;
                 }
-                memset(scoreDist, 0, sizeof(unsigned short) * 65536);
                 memset(hierarchicalScoreDist, 0, sizeof(unsigned int) * 128);
 
                 const char *seqData = seqDbr.getData(id, thread_idx);
@@ -254,7 +274,46 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                         seqKmerCount++;
                     }
                 }
-                while (kmerWindowIsNumSequence == false && seq.hasNextKmer()) {
+                if (hasSpacedBlocks && static_cast<unsigned int>(seq.L) >= seq.getEffectiveKmerSize()) {
+                    const unsigned char *numSequence = seq.numSequence;
+                    const size_t stride = seq.L;
+                    if (blockKmers.size() < maxBlockLength * stride) {
+                        blockKmers.resize(maxBlockLength * stride);
+                        blockHasX.resize(maxBlockLength * stride);
+                    }
+                    for (int p = 0; p < seq.L; p++) {
+                        blockKmers[p] = numSequence[p];
+                        blockHasX[p] = (numSequence[p] == maskedIndex);
+                    }
+                    for (unsigned int length = 2; length <= maxBlockLength; length++) {
+                        const size_t row = (length - 1) * stride;
+                        for (int p = 0; p + static_cast<int>(length) <= seq.L; p++) {
+                            blockKmers[row + p] = numSequence[p] + alphabetSize * blockKmers[row - stride + p + 1];
+                            blockHasX[row + p] = blockHasX[p] | blockHasX[row - stride + p + 1];
+                        }
+                    }
+                    const int lastPos = seq.L - static_cast<int>(seq.getEffectiveKmerSize());
+                    for (int pos = 0; pos <= lastPos; pos++) {
+                        size_t kmerIdx = 0;
+                        unsigned char hasX = 0;
+                        for (size_t b = 0; b < blockStarts.size(); b++) {
+                            const size_t at = (blockLengths[b] - 1) * stride + pos + blockStarts[b];
+                            kmerIdx += blockKmers[at] * blockWeights[b];
+                            hasX |= blockHasX[at];
+                        }
+                        if (hasX) {
+                            continue;
+                        }
+                        (kmers + seqKmerCount)->kmer = kmerIdx;
+                        (kmers + seqKmerCount)->pos = pos;
+                        const unsigned short hash = hashUInt64(kmerIdx, par.hashShift);
+                        (kmers + seqKmerCount)->score = hash;
+                        scoreDist[hash]++;
+                        hierarchicalScoreDist[hash >> 9]++;
+                        seqKmerCount++;
+                    }
+                }
+                while (kmerWindowIsNumSequence == false && hasSpacedBlocks == false && seq.hasNextKmer()) {
                     unsigned char *kmer = (unsigned char*) seq.nextKmer();
                     if(seq.kmerContainsX()){
                         continue;
@@ -446,6 +505,9 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                             }
                         }
                     }
+                }
+                for (size_t i = 0; i < seqKmerCount; i++) {
+                    scoreDist[(kmers + i)->score] = 0;
                 }
             }
 #pragma omp barrier
