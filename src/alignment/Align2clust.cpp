@@ -3709,6 +3709,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #pragma omp for schedule(dynamic, 1024)
                 for (size_t i = 0; i < windowPairs.size(); i++) {
                     memberBytes[i] = 0;
+                    memberOffsets[i + 1] = 0;
                     members->find(windowPairs[i].memberKey, cursor);
                     DBKeyType memberKey;
                     while (members->next(cursor, memberKey)) {
@@ -3718,6 +3719,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             break;
                         }
                         memberBytes[i] += entryBytes;
+                        memberOffsets[i + 1]++;
                     }
                 }
             }
@@ -3808,16 +3810,24 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     continue;
                 }
                 Timer memberTimer;
-                partMembers.clear();
+                memberOffsets[first] = 0;
                 for (size_t i = first; i < last; i++) {
-                    memberOffsets[i] = partMembers.size();
-                    members->find(windowPairs[i].memberKey, partCursor);
-                    DBKeyType memberKey;
-                    while (members->next(partCursor, memberKey)) {
-                        partMembers.push_back(memberKey);
+                    memberOffsets[i + 1] += memberOffsets[i];
+                }
+                partMembers.resize(memberOffsets[last]);
+#pragma omp parallel
+                {
+                    MMseqsNode::ClusterMemberLookup::Cursor cursor;
+#pragma omp for schedule(dynamic, 1024)
+                    for (size_t i = first; i < last; i++) {
+                        members->find(windowPairs[i].memberKey, cursor);
+                        size_t member = memberOffsets[i];
+                        DBKeyType memberKey;
+                        while (members->next(cursor, memberKey)) {
+                            partMembers[member++] = memberKey;
+                        }
                     }
                 }
-                memberOffsets[last] = partMembers.size();
                 partKeys.clear();
                 partKeys = partMembers;
                 SORT_PARALLEL(partKeys.begin(), partKeys.end());
