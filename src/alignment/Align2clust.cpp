@@ -3186,6 +3186,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t alignedPairs = 0;
     size_t repBatchCount = 0;
     std::vector<double> repBatchWorkerSeconds(par.threads, 0.0);
+    double repBatchWallSeconds = 0;
+    double memberLookupSeconds = 0;
+    double memberReadSeconds = 0;
+    double memberGateSeconds = 0;
     std::vector<double> repBatchLockWaitSeconds(par.threads, 0.0);
     std::vector<double> repBatchLongestSeconds(par.threads, 0.0);
     const auto getWindowData = [&](size_t key) -> const char * {
@@ -3586,6 +3590,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         repBatchCount += batchCount;
         batchDone.assign(batchCount, 0);
         batchPairs.assign(batchCount, std::vector<ClusterPair>());
+        Timer repBatchTimer;
         size_t firstUnfinishedBatch = 0;
 #pragma omp parallel
         {
@@ -3688,7 +3693,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             repBatchLockWaitSeconds[thread_idx] += threadLockWaitSeconds;
             repBatchLongestSeconds[thread_idx] = std::max(repBatchLongestSeconds[thread_idx], threadLongestBatchSeconds);
         }
+        repBatchWallSeconds += repBatchTimer.getTimediff();
         if (memberDbr != NULL) {
+            Timer memberScanTimer;
             windowPairs.clear();
             for (size_t batch = 0; batch < batchCount; batch++) {
                 windowPairs.insert(windowPairs.end(), batchPairs[batch].begin(), batchPairs[batch].end());
@@ -3714,6 +3721,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                 }
             }
+            memberLookupSeconds += memberScanTimer.getTimediff();
             partOffsets.assign(1, 0);
             for (size_t i = 0, partBytes = 0; i < windowPairs.size(); i++) {
                 if (i > partOffsets.back() && (partBytes > memberPartBudget || memberBytes[i] > memberPartBudget - partBytes)) {
@@ -3799,6 +3807,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     membersPassed[first] = passed;
                     continue;
                 }
+                Timer memberTimer;
                 partMembers.clear();
                 for (size_t i = first; i < last; i++) {
                     memberOffsets[i] = partMembers.size();
@@ -3813,7 +3822,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 partKeys = partMembers;
                 SORT_PARALLEL(partKeys.begin(), partKeys.end());
                 partKeys.erase(std::unique(partKeys.begin(), partKeys.end()), partKeys.end());
+                memberLookupSeconds += memberTimer.getTimediff();
+                memberTimer.reset();
                 memberDbr->loadData(partKeys);
+                memberReadSeconds += memberTimer.getTimediff();
+                memberTimer.reset();
                 // the pairs of a rep are next to each other, they share the query and the rounds of their member gates
                 repGroups.clear();
                 for (size_t i = first; i < last; i++) {
@@ -3887,6 +3900,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         }
                     }
                 }
+                memberGateSeconds += memberTimer.getTimediff();
             }
             size_t acceptedCount = 0;
             for (size_t i = 0; i < windowPairs.size(); i++) {
@@ -3939,6 +3953,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         MMseqsNode::addPhaseValue(phaseValues, "Rep alignment batches", SSTR(repBatchCount));
         MMseqsNode::addPhaseSeconds(phaseValues, "cumulative rep batch worker time", workerSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "longest rep batch", longestBatchSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "all rep batches", repBatchWallSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "looking up the members", memberLookupSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "reading the members", memberReadSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "member gates", memberGateSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the accepted log mutex", lockWaitSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Aligned pairs", SSTR(alignedPairs));
     }
