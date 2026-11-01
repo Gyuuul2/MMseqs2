@@ -360,6 +360,30 @@ extern size_t localFirstKey;
 extern uint64_t *representativeBits;
 extern BaseMatrix *adjSubMat;
 
+// --kmer-context-families: words over 8 symbols, 3 bits a residue
+static const unsigned int CONTEXT_SYMBOL_BITS = 3;
+static const size_t CONTEXT_SYMBOLS = 1 << CONTEXT_SYMBOL_BITS;
+// the shortest word that leaves at most this many residues of the database per possible word, the weight of the masks at least
+static const double CONTEXT_RESIDUES_PER_WORD = 4.4;
+static const int CONTEXT_MIN_KMER_SIZE = 9;
+// a group of a word with more sequences or occurrences is skipped
+static const size_t CONTEXT_MAX_GROUP_IDS = 32;
+static const size_t CONTEXT_MAX_GROUP_KMERS = 128;
+// a sequence pairs with its neighbor only from this sum of the scores of the six flanking residues
+static const int CONTEXT_MIN_NEIGHBOR_SCORE = 5;
+
+// a seed family: the offsets of the word residues in its mask, the length of its mask and the first-order model of its words
+struct ContextKmerFamily {
+    std::vector<unsigned int> positions;
+    unsigned int span;
+    float logFirst[CONTEXT_SYMBOLS];
+    float logTransition[CONTEXT_SYMBOLS][CONTEXT_SYMBOLS];
+};
+
+extern std::vector<ContextKmerFamily> contextKmerFamilies;
+// the symbol of a residue, UCHAR_MAX if a word cannot hold it
+extern unsigned char contextKmerSymbols[UCHAR_MAX + 1];
+
 static inline bool isRepresentative(size_t id) {
     return representativeBits == NULL || ((representativeBits[(id - localFirstKey) / 64] >> ((id - localFirstKey) % 64)) & 1);
 }
@@ -370,6 +394,10 @@ static inline unsigned int getBitWidth(uint64_t value) {
 
 static inline unsigned int getKmerBits(const BaseMatrix *subMat, int kmerSize) {
     return (kmerSize * MathUtil::log2(subMat->alphabetSize - 1) >= 64) ? 64 : getBitWidth(MathUtil::ipow<size_t>(subMat->alphabetSize - 1, kmerSize) - 1);
+}
+
+static inline unsigned int getLinfinityKmerBits(const Parameters &par, const BaseMatrix *subMat) {
+    return (par.kmerContextFamilies > 0) ? CONTEXT_SYMBOL_BITS * par.kmerSize + getBitWidth(par.kmerContextFamilies - 1) : getKmerBits(subMat, par.kmerSize);
 }
 
 static inline size_t computeSeqKmerCount(int seqLen, size_t kmerSize, size_t chooseTopKmer, float chooseTopKmerScale) {

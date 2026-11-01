@@ -620,6 +620,7 @@ public:
     int diagonalMode;
     int alignerMode;
     bool kmerPosFilter;
+    int kmerContextFamilies;
     bool clustHash;
     int linclustVersion;
     int clusterVersion;
@@ -991,6 +992,7 @@ public:
     PARAMETER(PARAM_DIAGONAL_MODE)
     PARAMETER(PARAM_ALIGNER_MODE)
     PARAMETER(PARAM_KMER_POS_FILTER)
+    PARAMETER(PARAM_KMER_CONTEXT_FAMILIES)
     PARAMETER(PARAM_USE_PARALLELISM)
     PARAMETER(PARAM_NEED_WRITEBUFFER)
     PARAMETER(PARAM_CLUST_HASH)

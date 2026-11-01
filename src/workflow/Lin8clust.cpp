@@ -62,6 +62,9 @@ int lin8clust(int argc, const char **argv, const Command& command) {
                                        : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
     }
 
+    // the context k-mers replace only the k-mers of the second iteration
+    const int contextFamilies = par.kmerContextFamilies;
+    par.kmerContextFamilies = 0;
     CommandCaller cmd;
     cmd.addVariable("REMOVE_TMP", par.removeTmpFiles ? "TRUE" : NULL);
     cmd.addVariable("RUNNER", par.nodeRunner.c_str());
@@ -75,6 +78,7 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     if (par.linclustIterations > 1) {
         par.spacedKmer = true;
         par.kmersPerSequenceScale = 0.1;
+        par.kmerContextFamilies = contextFamilies;
         cmd.addVariable("KMERMATCHER_PAR2", par.createParameterString(par.kmermatcher).c_str());
     }
 

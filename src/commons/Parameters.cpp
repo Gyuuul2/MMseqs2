@@ -177,6 +177,7 @@ Parameters::Parameters():
         PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: take the alignment diagonal from the k-mer match\n1: find the best diagonal by an ungapped scan in align2clust", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ALIGNER_MODE(PARAM_ALIGNER_MODE_ID, "--aligner-mode", "Aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: forward and backward passes of several targets at once (SWIPE), then banded traceback\n2: forward pass of several targets at once (SWIPE), then block aligner backward pass and traceback\n3: forward pass and traceback of several targets at once (SWIPE) in align2clust, also the seed extensions of the rep targets of mode 3 DBs; 1 in align", typeid(int), (void *) &alignerMode, "^[0-3]{1}$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_KMER_POS_FILTER(PARAM_KMER_POS_FILTER_ID, "--kmer-pos-filter", "K-mer position filter", "Drop k-mer matches whose diagonal cannot reach the coverage", typeid(bool), (void *) &kmerPosFilter, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_KMER_CONTEXT_FAMILIES(PARAM_KMER_CONTEXT_FAMILIES_ID, "--kmer-context-families", "K-mer context families", "Spaced seed families of rare words that replace the k-mers of a --createdb-mode 3 database, every sequence pairs with the neighbor of its word with the best flanking residues, 0 keeps the k-mers", typeid(int), (void *) &kmerContextFamilies, "^[0-7]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -1144,6 +1145,7 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_ADJACENCY_ALPH_SIZE);
     kmermatcher.push_back(&PARAM_DIAGONAL_MODE);
     kmermatcher.push_back(&PARAM_KMER_POS_FILTER);
+    kmermatcher.push_back(&PARAM_KMER_CONTEXT_FAMILIES);
     kmermatcher.push_back(&PARAM_USE_PARALLELISM);
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
     kmermatcher.push_back(&PARAM_LINCLUST_VERSION);
@@ -2846,6 +2848,7 @@ void Parameters::setDefaults() {
     diagonalMode = DIAGONAL_MODE_KMER;
     alignerMode = ALIGNER_MODE_DEFAULT;
     kmerPosFilter = true;
+    kmerContextFamilies = 0;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;
     clusterVersion = CLUSTER_VERSION1;

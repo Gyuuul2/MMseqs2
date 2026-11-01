@@ -51,6 +51,9 @@ size_t KmerPositionBit::maxSeqLen = 0;
 size_t localFirstKey = 0;
 uint64_t *representativeBits = NULL;
 
+std::vector<ContextKmerFamily> contextKmerFamilies;
+unsigned char contextKmerSymbols[UCHAR_MAX + 1];
+
 static inline unsigned char adjacentResidue(const Sequence &seq, const char *seqData, size_t pos,
                                             unsigned char maskedIndex, unsigned char xIndex) {
     return (seq.numSequence[pos] == maskedIndex)
@@ -68,6 +71,46 @@ uint64_t hashUInt64(uint64_t in, uint64_t seed) {
 static inline uint64_t mixKmerIndex(uint64_t kmerIdx, unsigned int kmerBits) {
     const uint64_t mask = (kmerBits == 64) ? ~0ULL : (1ULL << kmerBits) - 1;
     return ((kmerIdx * 0x9E3779B97F4A7C15ULL) & mask) << (64 - kmerBits);
+}
+
+struct ContextKmer {
+    uint64_t word;
+    unsigned int pos;
+    float logProbability;
+};
+
+// the kmerConsidered words of a family in a sequence that its model finds rarest, at the same probability by hash and then position
+static void selectContextKmers(const ContextKmerFamily &family, const unsigned char *symbols, int seqLen, size_t kmerConsidered, int hashShift, std::vector<ContextKmer> &words) {
+    words.clear();
+    const size_t weight = family.positions.size();
+    for (int pos = 0; pos + static_cast<int>(family.span) <= seqLen; pos++) {
+        ContextKmer contextKmer = {0, static_cast<unsigned int>(pos), 0.0f};
+        unsigned char prevSymbol = 0;
+        size_t residue = 0;
+        for (; residue < weight; residue++) {
+            const unsigned char symbol = symbols[pos + family.positions[residue]];
+            if (symbol == UCHAR_MAX) {
+                break;
+            }
+            contextKmer.word |= static_cast<uint64_t>(symbol) << (residue * CONTEXT_SYMBOL_BITS);
+            contextKmer.logProbability += (residue == 0) ? family.logFirst[symbol] : family.logTransition[prevSymbol][symbol];
+            prevSymbol = symbol;
+        }
+        if (residue == weight) {
+            words.push_back(contextKmer);
+        }
+    }
+    if (words.size() > kmerConsidered) {
+        std::nth_element(words.begin(), words.begin() + kmerConsidered, words.end(), [hashShift](const ContextKmer &first, const ContextKmer &second) {
+            if (first.logProbability != second.logProbability) {
+                return first.logProbability < second.logProbability;
+            }
+            const unsigned short firstHash = hashUInt64(first.word, hashShift);
+            const unsigned short secondHash = hashUInt64(second.word, hashShift);
+            return firstHash < secondHash || (firstHash == secondHash && first.pos < second.pos);
+        });
+        words.resize(kmerConsidered);
+    }
 }
 
 template <typename T, bool includeAdjacency, typename L>
@@ -138,7 +181,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
     const unsigned char maskedIndex = subMat->aa2num[static_cast<int>('X')];
     // --createdb-mode 3: a k-mer record holds a mix of the k-mer index in its top bits instead of the index and the key minus the first key of the load
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(querySeqType) & Parameters::DBTYPE_EXTENDED_LINFINITY;
-    const unsigned int kmerBits = isLinfinity ? getKmerBits(subMat, par.kmerSize) : 0;
+    const unsigned int kmerBits = isLinfinity ? getLinfinityKmerBits(par, subMat) : 0;
     const size_t loadFirstKey = readChunkOffsets.front();
 
     ScoreMatrix two;
@@ -197,6 +240,8 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
         }
         std::vector<size_t> blockKmers;
         std::vector<unsigned char> blockHasX;
+        std::vector<unsigned char> contextSymbols;
+        std::vector<ContextKmer> contextKmers;
         const unsigned int BUFFER_SIZE = static_cast<unsigned int>(KMER_STAGING_BUFFER_SIZE);
         size_t bufferPos = 0;
         KmerPosition<T, includeAdjacency, L> * threadKmerBuffer = NULL;
@@ -229,6 +274,37 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                 memset(hierarchicalScoreDist, 0, sizeof(unsigned int) * 128);
 
                 const char *seqData = seqDbr.getData(id, thread_idx);
+                if (contextKmerFamilies.empty() == false) {
+                    const int seqLen = static_cast<int>(seqDbr.getSeqLen(id));
+                    contextSymbols.resize(seqLen);
+                    for (int pos = 0; pos < seqLen; pos++) {
+                        contextSymbols[pos] = contextKmerSymbols[static_cast<unsigned char>(seqData[pos])];
+                    }
+                    const size_t kmerConsidered = static_cast<size_t>(par.kmersPerSequence - 1 + (par.kmersPerSequenceScale.values.aminoacid() * seqLen));
+                    for (size_t family = 0; family < contextKmerFamilies.size(); family++) {
+                        selectContextKmers(contextKmerFamilies[family], contextSymbols.data(), seqLen, kmerConsidered, par.hashShift, contextKmers);
+                        for (size_t i = 0; i < contextKmers.size(); i++) {
+                            KmerPosition<T, includeAdjacency, L> &kmer = threadKmerBuffer[bufferPos];
+                            kmer.kmer = mixKmerIndex((family << (CONTEXT_SYMBOL_BITS * par.kmerSize)) | contextKmers[i].word, kmerBits);
+                            kmer.id = seqDbr.getDbKey(id);
+                            kmer.pos = 0;
+                            kmer.seqLen = static_cast<L>(seqLen);
+                            for (int o = 0; o < 3; o++) {
+                                const int before = static_cast<int>(contextKmers[i].pos) - 3 + o;
+                                const int after = static_cast<int>(contextKmers[i].pos + contextKmerFamilies[family].span) + o;
+                                kmer.setAdjacentSeq(o, (before >= 0) ? adjSubMat->aa2num[static_cast<unsigned char>(seqData[before])] : xIndex);
+                                kmer.setAdjacentSeq(3 + o, (after < seqLen) ? adjSubMat->aa2num[static_cast<unsigned char>(seqData[after])] : xIndex);
+                            }
+                            encodeKmerPosition(kmerArray, threadKmerBuffer, bufferPos, false, loadFirstKey);
+                            bufferPos++;
+                            if (bufferPos >= BUFFER_SIZE) {
+                                flushKmerBuffer(kmerArray, kmerArraySize, threadKmerBuffer, bufferPos, &offset);
+                                bufferPos = 0;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 seq.mapSequence(id, seqDbr.getDbKey(id), seqData, seqDbr.getSeqLen(id));
 
                 size_t seqHash =  SIZE_T_MAX;
@@ -2180,6 +2256,19 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     }
     if (isLinfinity) {
         par.kmerPosFilter = false;
+    }
+    if (isLinfinity == false && par.kmerContextFamilies > 0) {
+        Debug(Debug::WARNING) << "--kmer-context-families can only be used with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
+        Debug(Debug::WARNING) << "We recompute with --kmer-context-families 0\n";
+        par.kmerContextFamilies = 0;
+    }
+    if (par.kmerContextFamilies > 0) {
+        par.kmerSize = std::max(CONTEXT_MIN_KMER_SIZE, static_cast<int>(ceil(log(aminoAcidDBSize / CONTEXT_RESIDUES_PER_WORD) / log(static_cast<double>(CONTEXT_SYMBOLS)))));
+        par.spacedKmer = false;
+        // the residues next to a word are scored in the full alphabet
+        par.includeAdjacency = true;
+        par.adjacencyAlphabetSize = 21;
+        Debug(Debug::INFO) << "Context k-mer length " << par.kmerSize << ", families " << par.kmerContextFamilies << "\n";
     }
     if (par.diagonalMode == Parameters::DIAGONAL_MODE_UNGAPPED) {
         if (isLinfinity == false

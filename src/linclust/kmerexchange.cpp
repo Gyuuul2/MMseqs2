@@ -36,6 +36,12 @@ static const size_t PARTITIONS_PER_THREAD = 4;
 static const size_t RANGES_PER_NODE = 8;
 // sending a k-mer takes about as long as reading this many bytes of sequence
 static const size_t SEND_KMER_BYTES = 12;
+// the seed families of --kmer-context-families, a longer word repeats the last CONTEXT_MASK_SUFFIX positions of its mask
+static const char *CONTEXT_KMER_MASKS[] = {"111111001101", "111100101111", "011101111101", "101101110111", "11010110011011", "110111011011", "101111011101"};
+static const size_t CONTEXT_MASK_SUFFIX = 5;
+static const char *CONTEXT_SYMBOL_RESIDUES[CONTEXT_SYMBOLS] = {"C", "G", "P", "WFY", "DNB", "IVLMJ", "AST", "HKREQZ"};
+// the models of the seed families count the windows of at most about this many sequences of the database, however large it is
+static const size_t CONTEXT_SAMPLE_KEYS = 16384;
 
 // the codes of a row of a k-mer file, one after the other
 enum { KMER_MEMBER_CODES, KMER_REP_CANDIDATE_CODES, KMER_INDEX_CODES, KMER_CODE_COUNT };
@@ -540,6 +546,100 @@ static void setSendRange(const Parameters &par, const KmerExchange &exchange, si
     }
 }
 
+// the masks of the seed families and their models from the sampled representatives of all nodes, every node counts its own send ranges
+static void setContextKmerFamilies(Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange) {
+    memset(contextKmerSymbols, UCHAR_MAX, sizeof(contextKmerSymbols));
+    for (size_t symbol = 0; symbol < CONTEXT_SYMBOLS; symbol++) {
+        for (const char *residue = CONTEXT_SYMBOL_RESIDUES[symbol]; *residue != '\0'; residue++) {
+            contextKmerSymbols[static_cast<unsigned char>(*residue)] = symbol;
+        }
+    }
+    contextKmerFamilies.resize(par.kmerContextFamilies);
+    for (size_t family = 0; family < contextKmerFamilies.size(); family++) {
+        std::string mask = CONTEXT_KMER_MASKS[family];
+        int weight = std::count(mask.begin(), mask.end(), '1');
+        while (weight < par.kmerSize) {
+            mask.push_back(mask[mask.size() - CONTEXT_MASK_SUFFIX]);
+            weight += (mask.back() == '1');
+        }
+        contextKmerFamilies[family].span = mask.size();
+        for (size_t pos = 0; pos < mask.size(); pos++) {
+            if (mask[pos] == '1') {
+                contextKmerFamilies[family].positions.push_back(pos);
+            }
+        }
+    }
+    size_t keyStride = 1;
+    while (seqDbr.getSize() / keyStride > CONTEXT_SAMPLE_KEYS) {
+        keyStride *= 2;
+    }
+    // of every family the windows that start with a symbol, then the windows with a pair of symbols in a row of the word
+    const size_t familyCounts = CONTEXT_SYMBOLS + CONTEXT_SYMBOLS * CONTEXT_SYMBOLS;
+    std::vector<size_t> counts(contextKmerFamilies.size() * familyCounts, 0);
+    for (size_t sendRange = MMseqsNode::rank; sendRange < exchange.sendRangeCount; sendRange += MMseqsNode::count) {
+        setSendRange(par, exchange, sendRange);
+        std::vector<DBKeyType> keys;
+        for (size_t key = (exchange.sendRangeKeyOffsets[sendRange] + keyStride - 1) / keyStride * keyStride; key < exchange.sendRangeKeyOffsets[sendRange + 1]; key += keyStride) {
+            if (isRepresentative(key)) {
+                keys.push_back(key);
+            }
+        }
+        seqDbr.loadData(keys);
+        for (size_t i = 0; i < keys.size(); i++) {
+            const char *seqData = seqDbr.getData(keys[i], 0);
+            const int seqLen = static_cast<int>(seqDbr.getSeqLen(keys[i]));
+            for (size_t family = 0; family < contextKmerFamilies.size(); family++) {
+                const ContextKmerFamily &contextFamily = contextKmerFamilies[family];
+                size_t *familyCount = counts.data() + family * familyCounts;
+                const auto getSymbol = [&](int pos, size_t residue) {
+                    return contextKmerSymbols[static_cast<unsigned char>(seqData[pos + contextFamily.positions[residue]])];
+                };
+                for (int pos = 0; pos + static_cast<int>(contextFamily.span) <= seqLen; pos++) {
+                    bool isValid = true;
+                    for (size_t residue = 0; isValid && residue < contextFamily.positions.size(); residue++) {
+                        isValid = (getSymbol(pos, residue) != UCHAR_MAX);
+                    }
+                    if (isValid) {
+                        familyCount[getSymbol(pos, 0)]++;
+                        for (size_t residue = 1; residue < contextFamily.positions.size(); residue++) {
+                            familyCount[CONTEXT_SYMBOLS + getSymbol(pos, residue - 1) * CONTEXT_SYMBOLS + getSymbol(pos, residue)]++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    std::string nodeCounts;
+    for (size_t i = 0; i < counts.size(); i++) {
+        nodeCounts += SSTR(counts[i]) + "\n";
+    }
+    const std::string allCounts = MMseqsNode::barrier(par.db2 + ".context_counts", nodeCounts);
+    std::fill(counts.begin(), counts.end(), 0);
+    size_t count = 0;
+    for (char *line = (char *) allCounts.c_str(); *line != '\0'; line = Util::skipLine(line)) {
+        counts[count++ % counts.size()] += Util::fast_atoi<size_t>(line);
+    }
+    for (size_t family = 0; family < contextKmerFamilies.size(); family++) {
+        ContextKmerFamily &contextFamily = contextKmerFamilies[family];
+        const size_t *familyCount = counts.data() + family * familyCounts;
+        size_t windows = 0;
+        for (size_t symbol = 0; symbol < CONTEXT_SYMBOLS; symbol++) {
+            windows += familyCount[symbol];
+        }
+        for (size_t symbol = 0; symbol < CONTEXT_SYMBOLS; symbol++) {
+            contextFamily.logFirst[symbol] = std::log(static_cast<float>(familyCount[symbol] + 1) / static_cast<float>(windows + CONTEXT_SYMBOLS));
+            const size_t *pairCount = familyCount + CONTEXT_SYMBOLS + symbol * CONTEXT_SYMBOLS;
+            size_t rowCount = 0;
+            for (size_t next = 0; next < CONTEXT_SYMBOLS; next++) {
+                rowCount += pairCount[next];
+            }
+            for (size_t next = 0; next < CONTEXT_SYMBOLS; next++) {
+                contextFamily.logTransition[symbol][next] = std::log(static_cast<float>(pairCount[next] + 1) / static_cast<float>(rowCount + CONTEXT_SYMBOLS));
+            }
+        }
+    }
+}
+
 // the distinct ids of [groupStart, groupEnd), sorted in groupBuffer or, if they do not fit, set as load bits counted per 512; returns their count
 static size_t getGroupIds(const KmerPositionBit *hashSeqPair, size_t groupStart, size_t groupEnd, uint64_t *groupBuffer, size_t groupBufferWords, uint64_t *setBitCounts, size_t loadWords) {
     if (groupEnd - groupStart <= groupBufferWords) {
@@ -863,12 +963,19 @@ struct OwnKmers {
     std::vector<size_t> hashRanges;
 };
 
+// the k-mers of a sequence at most, of every seed family with --kmer-context-families
+static size_t getSeqKmerCount(const Parameters &par, float kmersPerSequenceScale, size_t seqLen) {
+    return std::max(1, par.kmerContextFamilies) * computeSeqKmerCount(static_cast<int>(seqLen), par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
+}
+
 // --createdb-mode 3 sending: the nodes take the send ranges one at a time, the k-mers of a send range in loads, written to <pref>.kmers.<node>
 template <typename T, bool includeAdjacency, typename L>
 static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, MMseqsNode::WorkQueue &sendQueue,
                         size_t representativeBitsMemory, std::vector<size_t> &sendRanges, std::string &sendValues, OwnKmers &ownKmers) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     const float kmersPerSequenceScale = par.kmersPerSequenceScale.values.aminoacid();
+    // every context k-mer goes to its group with its residues, not only the first of its adjKey
+    const bool hasContextKmers = (par.kmerContextFamilies > 0);
     const size_t readChunkBytes = std::min(MAX_INFLIGHT_READ_SIZE, exchange.loadMemoryLimit / 4);
     // a load spans so few keys that their ids fit next to the whole sequence bit, the hash and the adjKey
     const size_t loadKeyLimit = (1ULL << (128 - 1 - 64 - exchange.adjKeyBits)) - 1;
@@ -911,7 +1018,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
             for (size_t range = firstRange; range < seqDbr.getIndexSize() && index[range].id < dbFrom + dbSize; range++) {
                 const size_t rangeFrom = std::max(static_cast<size_t>(index[range].id), dbFrom);
                 const size_t rangeTo = std::min((range + 1 < seqDbr.getIndexSize()) ? static_cast<size_t>(index[range + 1].id) : seqDbr.getSize(), dbFrom + dbSize);
-                const size_t seqKmers = computeSeqKmerCount(static_cast<int>(index[range].length - 2), par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
+                const size_t seqKmers = getSeqKmerCount(par, kmersPerSequenceScale, index[range].length - 2);
                 if (seqKmers > kmerCapacity) {
                     Debug(Debug::ERROR) << "Not enough memory to extract the k-mers of a sequence of length " << index[range].length - 2 << ". Raise --split-memory-limit.\n";
                     EXIT(EXIT_FAILURE);
@@ -1052,7 +1159,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                     const uint64_t hash = static_cast<uint64_t>(hashSeqPair[groupStart].getKmer()) >> hashShift;
                     size_t repCandidateCount = 1;
                     for (groupEnd = groupStart + 1; groupEnd < to && hashSeqPair[groupEnd].getKmer() == hashSeqPair[groupStart].getKmer(); groupEnd++) {
-                        repCandidateCount += (hashSeqPair[groupEnd].getAdjKey() != hashSeqPair[groupEnd - 1].getAdjKey());
+                        repCandidateCount += (hasContextKmers || hashSeqPair[groupEnd].getAdjKey() != hashSeqPair[groupEnd - 1].getAdjKey());
                     }
                     const size_t memberCount = getGroupIds(hashSeqPair, groupStart, groupEnd, groupBuffer, groupBufferWords, setBitCounts, loadWords);
                     codeBits[KMER_MEMBER_CODES] += memberCount * idBits;
@@ -1126,7 +1233,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                     const uint64_t hash = static_cast<uint64_t>(hashSeqPair[groupStart].getKmer()) >> hashShift;
                     size_t repCandidateCount = 1;
                     for (groupEnd = groupStart + 1; groupEnd < to && hashSeqPair[groupEnd].getKmer() == hashSeqPair[groupStart].getKmer(); groupEnd++) {
-                        repCandidateCount += (hashSeqPair[groupEnd].getAdjKey() != hashSeqPair[groupEnd - 1].getAdjKey());
+                        repCandidateCount += (hasContextKmers || hashSeqPair[groupEnd].getAdjKey() != hashSeqPair[groupEnd - 1].getAdjKey());
                     }
                     const size_t memberCount = getGroupIds(hashSeqPair, groupStart, groupEnd, groupBuffer, groupBufferWords, setBitCounts, loadWords);
                     if (groupEnd - groupStart <= groupBufferWords) {
@@ -1143,7 +1250,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                     // a rep candidate is the first member of an adjKey, so the smallest id, as its index in the members of the group; a whole sequence has none
                     const unsigned int memberIndexBits = getBitWidth(memberCount - 1);
                     for (size_t pos = groupStart; isWholeSequence == false && pos < groupEnd; pos++) {
-                        if (pos > groupStart && hashSeqPair[pos].getAdjKey() == hashSeqPair[pos - 1].getAdjKey()) {
+                        if (hasContextKmers == false && pos > groupStart && hashSeqPair[pos].getAdjKey() == hashSeqPair[pos - 1].getAdjKey()) {
                             continue;
                         }
                         const DBKeyType id = hashSeqPair[pos].getId();
@@ -1224,6 +1331,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     // the index codes of a pair record at most: the gamma code of its target count, fewer than the database keys, and its key in its partition
     const size_t recordIndexBytes = (2 * getBitWidth(seqDbr.getSize()) + exchange.partitionKeyBits + CHAR_BIT - 1) / CHAR_BIT;
+    const bool hasContextKmers = (par.kmerContextFamilies > 0);
 
     AssignedPairFile pairFile;
     pairFile.name = par.db2 + ".pairs." + SSTR(MMseqsNode::rank);
@@ -1275,7 +1383,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
         }
         received.hashSubRangeReads.assign(exchange.rowsPerHashRange, 0);
         std::vector<size_t> hashSubRangeCodeBytes(exchange.rowsPerHashRange, 0);
-        // the output of a hash sub range at most: a record per group and representative, every member a target of every representative
+        // the output of a hash sub range at most: a record per group and representative, every member a target of every representative; with context k-mers a record per member
         received.hashSubRangeOutputBounds.assign(exchange.rowsPerHashRange, 0);
         for (size_t sender = 0; sender < received.fileRows.size(); sender++) {
             const std::vector<KmerHashSubRange> &rows = received.fileRows[sender];
@@ -1289,7 +1397,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                 if (receivedFiles[sender].data == NULL) {
                     hashSubRangeCodeBytes[rangeHashSubRange] += getRowEnd(rows[row]) - rows[row].offsets[0];
                 }
-                received.hashSubRangeOutputBounds[rangeHashSubRange] += groupMaxRepSeqs * (rows[row].groupCount * (sizeof(AssignedPairRecord) + recordIndexBytes + 1)
+                received.hashSubRangeOutputBounds[rangeHashSubRange] += groupMaxRepSeqs * ((hasContextKmers ? members : rows[row].groupCount) * (sizeof(AssignedPairRecord) + recordIndexBytes + 1)
                                                                                           + (members * exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT);
             }
         }
@@ -1468,7 +1576,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                     members += (rowStarts[rowCount + row].bitPos[KMER_MEMBER_CODES] - rowStarts[row].bitPos[KMER_MEMBER_CODES]) / std::max(1U, received.fileRows[passRow.file][passRow.row].idBits);
                 }
                 const size_t groupMaxRepSeqs = isWholeSequenceHashSubRange(passHashSubRange) ? 1 : exchange.maxRepSeqs;
-                chunkRecordBounds[chunk] = groupMaxRepSeqs * groups;
+                chunkRecordBounds[chunk] = hasContextKmers ? members : groupMaxRepSeqs * groups;
                 chunkTargetBounds[chunk] = chunkRecordBounds[chunk] + groupMaxRepSeqs * ((members * exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT);
                 chunkOutputBounds[chunk] = chunkRecordBounds[chunk] * (sizeof(AssignedPairRecord) + recordIndexBytes) + chunkTargetBounds[chunk];
             }
@@ -1610,18 +1718,118 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                             const uint64_t hash = kmerHashQueue.top().hash;
                             groupRows.clear();
                             size_t memberCount = 0;
+                            size_t groupKmerCount = 0;
                             while (kmerHashQueue.empty() == false && kmerHashQueue.top().hash == hash) {
                                 groupRows.push_back(kmerHashQueue.top().row);
                                 memberCount += reads[kmerHashQueue.top().row].groupMemberCount;
+                                groupKmerCount += reads[kmerHashQueue.top().row].groupRepCandidateCount;
                                 kmerHashQueue.pop();
                             }
-                            if (memberCount < 2) {
+                            const size_t maxRecordIndexBytes = (2 * getBitWidth(memberCount) + exchange.partitionKeyBits + CHAR_BIT - 1) / CHAR_BIT;
+                            AssignedPairRecord record = {0, 0, {0, 0}, {0, 0}};
+                            size_t repPartitionKey = 0;
+                            const auto setRecordRep = [&](DBKeyType repId) {
+                                const std::vector<size_t> &sendRangeKeyOffsets = exchange.sendRangeKeyOffsets;
+                                const size_t repSendRange = std::upper_bound(sendRangeKeyOffsets.begin(), sendRangeKeyOffsets.end(), static_cast<size_t>(repId)) - sendRangeKeyOffsets.begin() - 1;
+                                const size_t repPartition = (repId - sendRangeKeyOffsets[repSendRange]) * exchange.partitionsPerRange / (sendRangeKeyOffsets[repSendRange + 1] - sendRangeKeyOffsets[repSendRange]);
+                                repPartitionKey = repId - getPartitionFirstKey(exchange, repSendRange, repPartition);
+                                record.partition = repSendRange * exchange.partitionsPerRange + repPartition;
+                            };
+                            const auto startRecord = [&]() {
+                                if (recordCount == recordCapacity || indexWrite.bufferPos + maxRecordIndexBytes > indexWrite.bufferSize) {
+                                    flushRecords();
+                                }
+                                record.codeOffsets[PAIR_TARGET_CODES] = targetWrite.buffer - passBuffer + targetWrite.bufferPos;
+                                record.targetCount = 0;
+                            };
+                            const auto endRecord = [&]() {
+                                if (record.targetCount == 0) {
+                                    return;
+                                }
+                                putBits(targetWrite, 0, (CHAR_BIT - targetWrite.bitCount) % CHAR_BIT);
+                                record.codeBytes[PAIR_TARGET_CODES] = targetWrite.buffer - passBuffer + targetWrite.bufferPos - record.codeOffsets[PAIR_TARGET_CODES];
+                                record.codeOffsets[PAIR_INDEX_CODES] = indexWrite.buffer - passBuffer + indexWrite.bufferPos;
+                                putEliasGamma(indexWrite, record.targetCount);
+                                putBits(indexWrite, repPartitionKey, exchange.partitionKeyBits);
+                                putBits(indexWrite, 0, (CHAR_BIT - indexWrite.bitCount) % CHAR_BIT);
+                                record.codeBytes[PAIR_INDEX_CODES] = indexWrite.buffer - passBuffer + indexWrite.bufferPos - record.codeOffsets[PAIR_INDEX_CODES];
+                                records[recordCount++] = record;
+                            };
+                            const auto addTarget = [&](size_t id) {
+                                // a record that outgrows the output buffer continues in the next flush
+                                if (targetWrite.bufferPos + (targetWrite.bitCount + exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT > targetWrite.bufferSize) {
+                                    endRecord();
+                                    flushRecords();
+                                    startRecord();
+                                }
+                                putBits(targetWrite, id, exchange.globalIdBits);
+                                record.targetCount++;
+                            };
+                            if (memberCount < 2 || (hasContextKmers && (memberCount > CONTEXT_MAX_GROUP_IDS || groupKmerCount > CONTEXT_MAX_GROUP_KMERS))) {
                                 for (size_t row = 0; row < groupRows.size(); row++) {
                                     KmerHashSubRangeRead &read = reads[groupRows[row]];
                                     KmerCodeReader &memberRead = read.codeReads[KMER_MEMBER_CODES];
                                     KmerCodeReader &repCandidateRead = read.codeReads[KMER_REP_CANDIDATE_CODES];
                                     seekKmerCodeBits(memberRead, getKmerCodeBitPos(memberRead) + read.groupMemberCount * read.hashSubRangeRow->idBits);
                                     seekKmerCodeBits(repCandidateRead, getKmerCodeBitPos(repCandidateRead) + read.groupRepCandidateCount * (exchange.adjKeyBits + getBitWidth(read.groupMemberCount - 1)));
+                                }
+                            } else if (hasContextKmers) {
+                                DBKeyType memberIds[CONTEXT_MAX_GROUP_IDS];
+                                float memberLengths[CONTEXT_MAX_GROUP_IDS];
+                                int neighborScores[CONTEXT_MAX_GROUP_IDS];
+                                size_t neighbors[CONTEXT_MAX_GROUP_IDS];
+                                unsigned int kmerAdjKeys[CONTEXT_MAX_GROUP_KMERS];
+                                size_t kmerMembers[CONTEXT_MAX_GROUP_KMERS];
+                                size_t rowFirstMember = 0;
+                                size_t kmer = 0;
+                                for (size_t row = 0; row < groupRows.size(); row++) {
+                                    KmerHashSubRangeRead &read = reads[groupRows[row]];
+                                    for (size_t member = 0; member < read.groupMemberCount; member++) {
+                                        memberIds[rowFirstMember + member] = getBits(read.codeReads[KMER_MEMBER_CODES], read.hashSubRangeRow->idBits) + read.hashSubRangeRow->loadFirstKey;
+                                    }
+                                    const unsigned int memberIndexBits = getBitWidth(read.groupMemberCount - 1);
+                                    for (size_t repCandidate = 0; repCandidate < read.groupRepCandidateCount; repCandidate++) {
+                                        kmerAdjKeys[kmer] = getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], exchange.adjKeyBits);
+                                        kmerMembers[kmer] = rowFirstMember + getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], memberIndexBits);
+                                        kmer++;
+                                    }
+                                    rowFirstMember += read.groupMemberCount;
+                                }
+                                for (size_t member = 0; member < memberCount; member++) {
+                                    memberLengths[member] = static_cast<float>(index[seqDbr.findIdRange(memberIds[member])].length - 2);
+                                    neighborScores[member] = INT_MIN;
+                                }
+                                // a neighbor covers the member like a representative, the best one with the highest score of the flanking residues and at a tie the smallest id
+                                const auto addNeighbor = [&](size_t member, size_t neighbor, int score) {
+                                    if (Util::canBeCovered(par.covThr, par.covMode, memberLengths[neighbor], memberLengths[member])
+                                        && (score > neighborScores[member] || (score == neighborScores[member] && memberIds[neighbor] < memberIds[neighbors[member]]))) {
+                                        neighborScores[member] = score;
+                                        neighbors[member] = neighbor;
+                                    }
+                                };
+                                short *subMatPos[6];
+                                for (size_t first = 0; first < groupKmerCount; first++) {
+                                    for (int j = 0; j < 6; j++) {
+                                        subMatPos[j] = adjSubMat->subMatrix[KmerPositionBit::getAdjacentSeq(kmerAdjKeys[first], j)];
+                                    }
+                                    for (size_t second = first + 1; second < groupKmerCount; second++) {
+                                        if (kmerMembers[first] != kmerMembers[second]) {
+                                            const int score = getAdjKeyScore(subMatPos, kmerAdjKeys[second]);
+                                            addNeighbor(kmerMembers[first], kmerMembers[second], score);
+                                            addNeighbor(kmerMembers[second], kmerMembers[first], score);
+                                        }
+                                    }
+                                }
+                                for (size_t member = 0; member < memberCount; member++) {
+                                    if (neighborScores[member] < CONTEXT_MIN_NEIGHBOR_SCORE) {
+                                        continue;
+                                    }
+                                    // with coverage of both sequences the member is the query, otherwise the neighbor that covers it
+                                    const bool isMemberQuery = (par.covMode == Parameters::COV_MODE_BIDIRECTIONAL);
+                                    setRecordRep(memberIds[isMemberQuery ? member : neighbors[member]]);
+                                    startRecord();
+                                    addTarget(memberIds[isMemberQuery ? neighbors[member] : member]);
+                                    endRecord();
                                 }
                             } else {
                                 groupRepCandidateStarts.clear();
@@ -1675,7 +1883,6 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                     repSeqIds.push_back(getBits(memberRead, read.hashSubRangeRow->idBits) + read.hashSubRangeRow->loadFirstKey);
                                 }
                                 // a pair record per representative: the members with a length it can cover, in id order (the members of the rows in row order) and without itself
-                                const size_t maxRecordIndexBytes = (2 * getBitWidth(memberCount) + exchange.partitionKeyBits + CHAR_BIT - 1) / CHAR_BIT;
                                 for (size_t rep = 0; rep < repSeqIds.size(); rep++) {
                                     const DBKeyType repId = repSeqIds[rep];
                                     const size_t repRange = seqDbr.findIdRange(repId);
@@ -1689,31 +1896,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                     const DBReader<DBKeyType>::Index *coveredEndRange = std::partition_point(index + repRange, index + seqDbr.getIndexSize(), isCovered);
                                     const size_t coveredFrom = coveredFirstRange->id;
                                     const size_t coveredTo = (coveredEndRange < index + seqDbr.getIndexSize()) ? static_cast<size_t>(coveredEndRange->id) : seqDbr.getSize();
-                                    const std::vector<size_t> &sendRangeKeyOffsets = exchange.sendRangeKeyOffsets;
-                                    const size_t repSendRange = std::upper_bound(sendRangeKeyOffsets.begin(), sendRangeKeyOffsets.end(), static_cast<size_t>(repId)) - sendRangeKeyOffsets.begin() - 1;
-                                    const size_t repPartition = (repId - sendRangeKeyOffsets[repSendRange]) * exchange.partitionsPerRange / (sendRangeKeyOffsets[repSendRange + 1] - sendRangeKeyOffsets[repSendRange]);
-                                    const size_t repPartitionKey = repId - getPartitionFirstKey(exchange, repSendRange, repPartition);
-                                    AssignedPairRecord record = {repSendRange * exchange.partitionsPerRange + repPartition, 0, {0, 0}, {0, 0}};
-                                    const auto startRecord = [&]() {
-                                        if (recordCount == recordCapacity || indexWrite.bufferPos + maxRecordIndexBytes > indexWrite.bufferSize) {
-                                            flushRecords();
-                                        }
-                                        record.codeOffsets[PAIR_TARGET_CODES] = targetWrite.buffer - passBuffer + targetWrite.bufferPos;
-                                        record.targetCount = 0;
-                                    };
-                                    const auto endRecord = [&]() {
-                                        if (record.targetCount == 0) {
-                                            return;
-                                        }
-                                        putBits(targetWrite, 0, (CHAR_BIT - targetWrite.bitCount) % CHAR_BIT);
-                                        record.codeBytes[PAIR_TARGET_CODES] = targetWrite.buffer - passBuffer + targetWrite.bufferPos - record.codeOffsets[PAIR_TARGET_CODES];
-                                        record.codeOffsets[PAIR_INDEX_CODES] = indexWrite.buffer - passBuffer + indexWrite.bufferPos;
-                                        putEliasGamma(indexWrite, record.targetCount);
-                                        putBits(indexWrite, repPartitionKey, exchange.partitionKeyBits);
-                                        putBits(indexWrite, 0, (CHAR_BIT - indexWrite.bitCount) % CHAR_BIT);
-                                        record.codeBytes[PAIR_INDEX_CODES] = indexWrite.buffer - passBuffer + indexWrite.bufferPos - record.codeOffsets[PAIR_INDEX_CODES];
-                                        records[recordCount++] = record;
-                                    };
+                                    setRecordRep(repId);
                                     rewindGroupReads(KMER_MEMBER_CODES, groupMemberStarts);
                                     startRecord();
                                     for (size_t row = 0; row < groupRows.size(); row++) {
@@ -1723,14 +1906,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                             if (id == repId || id < coveredFrom || id >= coveredTo) {
                                                 continue;
                                             }
-                                            // a record that outgrows the output buffer continues in the next flush
-                                            if (targetWrite.bufferPos + (targetWrite.bitCount + exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT > targetWrite.bufferSize) {
-                                                endRecord();
-                                                flushRecords();
-                                                startRecord();
-                                            }
-                                            putBits(targetWrite, id, exchange.globalIdBits);
-                                            record.targetCount++;
+                                            addTarget(id);
                                         }
                                     }
                                     endRecord();
@@ -2159,7 +2335,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     size_t globalBytes = 0;
     for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {
         const size_t rangeKeys = ((range + 1 < seqDbr.getIndexSize()) ? static_cast<size_t>(index[range + 1].id) : seqDbr.getSize()) - index[range].id;
-        globalKmers += seqDbr.getRangeRepresentativeCount(range) * computeSeqKmerCount(static_cast<int>(index[range].length - 2), par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
+        globalKmers += seqDbr.getRangeRepresentativeCount(range) * getSeqKmerCount(par, kmersPerSequenceScale, index[range].length - 2);
         globalBytes += rangeKeys * index[range].length;
     }
     // RANGES_PER_NODE send ranges a node, one without other nodes to balance, cut like decomposeDomainByAminoAcid on sequence bytes plus SEND_KMER_BYTES a k-mer
@@ -2171,7 +2347,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     size_t costBefore = 0;
     for (size_t range = 0, sendRange = 1; range < seqDbr.getIndexSize(); range++) {
         const size_t rangeKeys = ((range + 1 < seqDbr.getIndexSize()) ? static_cast<size_t>(index[range + 1].id) : seqDbr.getSize()) - index[range].id;
-        const size_t rangeKmers = seqDbr.getRangeRepresentativeCount(range) * computeSeqKmerCount(static_cast<int>(index[range].length - 2), par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
+        const size_t rangeKmers = seqDbr.getRangeRepresentativeCount(range) * getSeqKmerCount(par, kmersPerSequenceScale, index[range].length - 2);
         const size_t rangeCost = rangeKmers * SEND_KMER_BYTES + rangeKeys * index[range].length;
         for (; sendRange < exchange.sendRangeCount && costBefore + rangeCost >= sendRange * sendRangeCost; sendRange++) {
             // ceil(cutCost * rangeKeys / rangeCost) bit by bit over rangeKeys, so no value exceeds rangeCost
@@ -2229,12 +2405,12 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     // keys are in length descending order, so a record needs no length, and no position as the diagonal comes later
     exchange.adjKeyBits = (includeAdjacency ? 6 : 0) * KmerPositionBit::RESIDUE_BITS;
     // a k-mer record holds its hash in the top kmerBits bits, the hash of a whole sequence takes all 64
-    exchange.kmerHashShift = 64 - getKmerBits(subMat, par.kmerSize);
+    exchange.kmerHashShift = 64 - getLinfinityKmerBits(par, subMat);
 
     // hash ranges are cut by the top bits of the hash, RANGES_PER_NODE a node and enough for the threads that write the k-mer file of a load
     exchange.hashRangeCount = std::max(RANGES_PER_NODE * MMseqsNode::count, CHUNKS_PER_THREAD * par.threads);
     exchange.globalIdBits = getBitWidth(seqDbr.getSize() - 1);
-    exchange.maxRepSeqs = 1 + (includeAdjacency ? par.adjIteration : 0);
+    exchange.maxRepSeqs = 1 + ((includeAdjacency && par.kmerContextFamilies == 0) ? par.adjIteration : 0);
     // a receiving node reads about a member id, a rep candidate and its index codes per record
     const size_t receiverKmerBytes = (2 * exchange.globalIdBits + exchange.adjKeyBits + CHAR_BIT - 1) / CHAR_BIT;
     // a representative node reads a target id and sorts it, a record can be a target of every representative of its group
@@ -2277,6 +2453,9 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     for (size_t i = 0; i < ownHashRanges; i++) {
         ownKmers.hashRanges.push_back(MMseqsNode::rank + i * MMseqsNode::count);
     }
+    if (par.kmerContextFamilies > 0) {
+        setContextKmerFamilies(par, seqDbr, exchange);
+    }
     Debug(Debug::INFO) << "Send k-mers of " << exchange.sendRangeCount << " send ranges\n";
     const size_t sentBytes = sendKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, sendQueue, representativeBitsMemory, sendRanges, sendValues, ownKmers);
     // no node takes hash ranges before the barrier, so claimNext takes the first own hash ranges in order
@@ -2295,6 +2474,9 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     // every node has read the memory limits
     if (MMseqsNode::isMaster()) {
         FileUtil::remove((par.db2 + ".memory").c_str());
+        if (par.kmerContextFamilies > 0) {
+            FileUtil::remove((par.db2 + ".context_counts").c_str());
+        }
     }
 
     phaseTimer.reset();
