@@ -23,12 +23,9 @@ public:
     // qStartPos1 and dbStartPos1 from the forward results of alignForward
     void alignBackward(size_t count, const unsigned char *const *targets, s_align *aligns);
 
-    // banded around diagonals (target - query position): score1 and the end, starting with the lanes of word as alignForward,
-    // or with backtraces the whole alignment; bandWidths are grown while the best cell is at the band edge or below minScores
-    void alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals, int *bandWidths,
+    // banded around diagonals (target - query position) with backtrace; a band grows while its score is below minScores
+    void alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals,
                      s_align *aligns, std::string *backtraces, const int *columnEnds, const int *minScores);
-
-    static const int MIN_BAND_WIDTH = 16;
 
 private:
     struct BandJob {
@@ -44,12 +41,12 @@ private:
     template <typename T, bool Reverse>
     void alignFull(const std::vector<size_t> &jobs, const unsigned char *const *targets, const int *targetLengths, s_align *aligns);
 
-    template <typename T, bool Trace>
+    template <typename T>
     void alignBand(const BandJob *jobs, size_t jobCount, const unsigned char *const *targets, const int *targetLengths,
-                   int *bestScores, int *bestRows, int *bestColumns, int *startRows, int *startColumns, std::string *backtraces, uint32_t *identities);
+                   int *bests, int *rows, int *columns, int *firstRows, int *firstColumns, std::string *backtraces, uint32_t *ids);
 
-    void runBanded(std::vector<BandJob> &jobs, bool trace, const unsigned char *const *targets, const int *targetLengths,
-                   int *bandWidths, s_align *aligns, std::string *backtraces, const int *minScores);
+    void runBanded(std::vector<BandJob> &jobs, const unsigned char *const *targets, const int *targetLengths,
+                   s_align *aligns, std::string *backtraces, const int *minScores);
 
     BaseMatrix *subMat;
     int alphabetSize;

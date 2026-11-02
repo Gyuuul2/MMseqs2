@@ -35,6 +35,7 @@ static size_t sentExchangeBytes = 0;
 static size_t sentOtherNodeExchangeBytes = 0;
 // the records and their bytes that this node sent to itself in the last flush of an exchange, until openExchange reads them
 static std::map<std::string, std::vector<std::pair<char *, size_t> > > ownExchangeRecords;
+static const unsigned int MAX_READ_POLLS = 400;
 
 void MMseqsNode::init() {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -287,8 +288,8 @@ void MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
     if (bytes == 0) {
         return;
     }
-    // NFS can expose the progress file before the flushed log is visible.
-    for (unsigned int polls = 0; polls < 400; polls++) {
+    // NFS can expose the progress file before the flushed log is visible
+    for (unsigned int polls = 0; polls < MAX_READ_POLLS; polls++) {
         int fd = openReadOnly(log);
         int openError = (fd < 0) ? errno : 0;
         if (openError == ENOENT && isListed(log)) {
@@ -327,7 +328,7 @@ void MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
         }
         sleepBeforePoll(polls);
     }
-    Debug(Debug::ERROR) << "Cannot read " << log << " bytes " << from << " to " << to << " after 400 polls\n";
+    Debug(Debug::ERROR) << "Cannot read " << log << " bytes " << from << " to " << to << " after " << MAX_READ_POLLS << " polls\n";
     EXIT(EXIT_FAILURE);
 }
 
@@ -353,7 +354,7 @@ bool MMseqsNode::readExchangeFlush(const std::string &indexFile, size_t flush, s
     const size_t lineBytes = line.size() * sizeof(uint64_t);
     int fd = openReadOnly(indexFile);
     int openError = (fd < 0) ? errno : 0;
-    // Refresh an NFS negative lookup before retrying the index open.
+    // a listing refreshes an NFS negative lookup before the index is opened again
     if (openError == ENOENT && isListed(indexFile)) {
         fd = openReadOnly(indexFile);
         openError = (fd < 0) ? errno : 0;
@@ -390,7 +391,7 @@ static const uint64_t EXCHANGE_SLICE_MAGIC = 0x4d4d533258434831ULL;
 
 static uint64_t exchangeSliceMagic() {
     uint64_t magic = EXCHANGE_SLICE_MAGIC;
-    // Run identity prevents a stale generation-zero file from an earlier SLURM job matching this one.
+    // the run id keeps a generation 0 file of an earlier job from matching this one
     for (size_t i = 0; i < runId.size(); i++) {
         magic = (magic ^ static_cast<unsigned char>(runId[i])) * 1099511628211ULL;
     }
@@ -458,7 +459,7 @@ int MMseqsNode::tryOpenExchangeSlice(const std::string &file, size_t expectedByt
 }
 
 bool MMseqsNode::tryReadExchangeSlice(int fd, char *data, size_t bytes, size_t offset, int &readError) {
-    // A published slice may still read short or turn stale on NFS; the caller reopens and retries it.
+    // a published slice may still read short or turn stale on NFS; the caller opens it again
     for (size_t done = 0; done < bytes;) {
         const ssize_t count = pread(fd, data + done, bytes - done, offset + done);
         if (count < 0 && errno == EINTR) {
@@ -476,7 +477,7 @@ bool MMseqsNode::tryReadExchangeSlice(int fd, char *data, size_t bytes, size_t o
 
 void MMseqsNode::truncateExchangeSlice(const std::string &file) {
     time_t lastDirectoryRefresh = 0;
-    for (unsigned int polls = 0; polls < 400; polls++) {
+    for (unsigned int polls = 0; polls < MAX_READ_POLLS; polls++) {
         if (truncate(file.c_str(), 0) == 0) {
             return;
         }
@@ -500,7 +501,7 @@ void MMseqsNode::truncateExchangeSlice(const std::string &file) {
         }
         sleepBeforePoll(polls);
     }
-    Debug(Debug::ERROR) << "Cannot truncate " << file << " after 400 polls\n";
+    Debug(Debug::ERROR) << "Cannot truncate " << file << " after " << MAX_READ_POLLS << " polls\n";
     EXIT(EXIT_FAILURE);
 }
 
@@ -1742,11 +1743,6 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
             previousRepKey = getLastRepKey(pairCount, singletonCount);
         } while (pairCount > 0);
     }
-    const ClusterPair lastPair = { DB_KEY_INVALID, DB_KEY_INVALID };
-    if (readExchangeRange(repBlocks, memoryLimit / 8, ClusterPair::recordSize, ClusterPair::compareByRep, lastPair, records, NULL, prefix) > 0) {
-        Debug(Debug::ERROR) << "Key " << reinterpret_cast<ClusterPair *>(records.data())->repKey << " of " << prefix << " is no key of node " << rank << "\n";
-        EXIT(EXIT_FAILURE);
-    }
     if (previousRepKey != DB_KEY_INVALID) {
         FileUtil::pwriteAll(fileno(resultDataFile), resultDb.c_str(), "\0", 1, resultDataBytes);
         resultDataBytes++;
@@ -1756,10 +1752,6 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
 }
 
 void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues) {
-    if (ownExchangeRecords.empty() == false) {
-        Debug(Debug::ERROR) << "The pairs that node " << rank << " sent to itself through " << ownExchangeRecords.begin()->first << " were not read\n";
-        EXIT(EXIT_FAILURE);
-    }
     addPhaseValue(phaseValues, "Exchange bytes sent", SSTR(sentExchangeBytes));
     addPhaseValue(phaseValues, "Exchange bytes sent to other nodes", SSTR(sentOtherNodeExchangeBytes));
     printPhaseValues(barrier(prefix + ".merged", phaseValues));

@@ -919,7 +919,7 @@ s_align SmithWaterman::ssw_align_private (
 		return align;
 	}
 
-	// Keep the byte traceback for SWIPE scores that the default forward pass would score in bytes.
+	// byte SW is faster than the block aligner on the short alignments it can score, or a SWIPE backward pass found the start
 	if ((forward == NULL || keepByteTraceback) ? align.word == 0 : align.dbStartPos1 != -1) {
 		return alignStartPosBacktrace<type>(db_sequence, db_length, gap_open, gap_extend, alignmentMode, backtrace, align, evaluer, covMode, covThr, correlationScoreWeight, maskLen);
 	}

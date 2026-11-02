@@ -1288,7 +1288,6 @@ struct SwipeBatch {
     std::vector<int> lengths;
     std::vector<int> laneLengths;
     std::vector<int> diagonals;
-    std::vector<int> bandWidths;
     std::vector<int> columnEnds;
     std::vector<int> minScores;
     std::vector<s_align> aligns;
@@ -1338,7 +1337,6 @@ struct SwipeBatch {
     void select(size_t count) {
         targets.resize(count);
         diagonals.resize(count);
-        bandWidths.assign(count, 0);
         aligns.resize(count);
         for (size_t i = 0; i < count; i++) {
             targets[i] = sequences.data() + offsets[entries[i]];
@@ -1354,9 +1352,7 @@ struct SwipeBatch {
     }
 };
 
-// per thread buffers of --align2clust-aligner-mode 3 on mode 3 DBs: the targets of the reps of a batch that alignTarget queued with their query and seed
-// for the SWIPE extensions, their backward extensions and the pairs that do not fit the lanes; a rep and its query go to the queue with
-// its first queued target
+// per thread queue of the rep targets for the SWIPE extensions (--align2clust-aligner-mode 3 on mode 3 DBs)
 struct SwipeTargets {
     SwipeExtender extender;
     EvalueComputation &evaluer;
@@ -1526,9 +1522,7 @@ static bool findMatchSeed(const char *querySequence, const char *targetSequence,
 // the members of a gate whose batch of a round has this many go through the SWIPE lanes of alignMembersSwipe, on every ISA
 static const size_t SWIPE_GATE_MIN_BATCH = 4;
 
-// the gapped alignments of the members of a round of alignClusterMembers, of all its gates; the members of a gate whose batch has
-// SWIPE_GATE_MIN_BATCH members go through the lanes together, the others one pair at a time, which only depends on the member order of the gate;
-// a failing member closes its gate
+// the gapped member alignments of a round; gates with SWIPE_GATE_MIN_BATCH members share the lanes, the others go one pair at a time; a failing member closes its gate
 static void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherInitialized, ClusterMembers &members, Sequence &query, Sequence &element,
                               DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer) {
     SwipeBatch &swipe = *members.swipe;
@@ -1573,7 +1567,7 @@ static void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &mat
                 swipe.columnEnds[l] = swipe.aligns[l].dbEndPos1 + 1;
                 swipe.minScores[l] = swipe.aligns[l].score1;
             }
-            swipe.aligner.alignBanded(laneCount, swipe.targets.data(), swipe.laneLengths.data(), swipe.diagonals.data(), swipe.bandWidths.data(),
+            swipe.aligner.alignBanded(laneCount, swipe.targets.data(), swipe.laneLengths.data(), swipe.diagonals.data(),
                                       swipe.aligns.data(), swipe.backtraces.data(), swipe.columnEnds.data(), swipe.minScores.data());
         }
     }
@@ -1698,6 +1692,7 @@ static bool alignMemberRound(const Parameters &par, BlockAligner &blockAligner, 
                 if (members.targets != NULL) {
                     int seedQuery, seedTarget;
                     if (findMatchSeed(querySequence, elementSequence, elementUngappedAlignment, seedQuery, seedTarget)) {
+                        // the key of a member extension is its position in gappedGates
                         members.targets->addTarget(query, element, members.gappedGates.size(), seedQuery, seedTarget);
                     }
                     members.gappedGates.push_back(g);
@@ -1740,10 +1735,8 @@ static bool alignMemberRound(const Parameters &par, BlockAligner &blockAligner, 
     return open;
 }
 
-// whether every --filter-cludb-file member of the cluster of the target of each gate meets the clustering criteria against the query
-// (MemberGate::live); the members that cannot be covered fail first and the most different lengths go next, with the decision of the
-// member order; with SWIPE (--align2clust-aligner-mode 1-3) the gates go in rounds of 1, 2, 4, ... members each, and the gapped alignments of a
-// round of all gates share the lanes once they fill them
+// whether all --filter-cludb-file members of each gate meet the criteria, the ones that cannot be covered first and the most different lengths next;
+// with SWIPE the gates go in rounds of 1, 2, 4, ... members
 static void alignClusterMembers(const Parameters &par, BlockAligner &blockAligner, Matcher &matcher, bool &matcherInitialized, Sequence &query, Sequence &element,
                                 DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer,
                                 ClusterMembers &members) {
@@ -1815,8 +1808,7 @@ static bool swipeExtensionsPass(const Parameters &par, SwipeTargets &swipe, size
     return Alignment::checkCriteria(result, false, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr);
 }
 
-// the gapped alignments of the targets that alignTarget queued (--align2clust-aligner-mode 3) in SWIPE lanes, the steps of BlockAligner::bandedalign;
-// the ones whose rep or which were assigned since are left out
+// the SWIPE extensions of the queued targets (--align2clust-aligner-mode 3), skipping the ones assigned since
 template <typename Assigned>
 static void alignTargetsSwipe(const Parameters &par, SwipeTargets &swipe, const Assigned &isAssigned, std::vector<ClusterPair> &pairs) {
     const int32_t xDrop = (MIN_SIZE * par.gapExtend.values.aminoacid() + par.gapOpen.values.aminoacid());
@@ -1988,9 +1980,6 @@ static bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool 
     }
 
     if (hasAlnLen && hasCoverage && hasSeqId && hasEvalue) {
-        if (isAssigned()) {
-            return false;
-        }
         if (result != NULL) {
             std::string backtrace = par.addBacktrace ? std::string(ungappedAlignment.alnLen, 'M') : std::string();
             *result = Matcher::result_t(target.getDbKey(), ungappedAlignment.score, ungappedAlignment.qcov,
@@ -3222,7 +3211,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         query.mapSequence(repKey, repKey, getWindowData(window, repKey), seqDbr.getSeqLen(repKey));
         blockAligner.setQuery(&query);
     };
-    const bool extendMembers = par.align2clustAlignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid();
+    const bool swipeLanes = par.align2clustAlignerMode != Parameters::ALIGNER_MODE_DEFAULT && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid();
+    const bool extendMembers = swipeLanes && par.align2clustAlignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK;
 
     // a service thread besides --threads gets the entries of a window from their homes and serves the keys of its blocks to the others
     const bool hasService = rank >= firstAlignNode;
@@ -3639,7 +3629,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                      &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
                                      -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
             // --align2clust-aligner-mode 3: the gapped alignments of the reps of a batch go through the SWIPE lanes together
-            const bool swipeLanes = par.align2clustAlignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid();
             SwipeTargets swipe(par, scoring.subMat, scoring.evaluer, maxSeqLen);
             std::vector<ClusterPair> pairs;
             size_t threadAlignedPairs = 0;
@@ -3672,7 +3661,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         threadAlignedPairs++;
                         unsigned short diagonal = 0;
                         if (alignTarget(par, blockAligner, blockAlignerInitialized, query, target, scoring.scorePerColThreshold, diagonal, NULL, 0, NULL,
-                                        swipeLanes ? &swipe : NULL)) {
+                                        extendMembers ? &swipe : NULL)) {
                             const ClusterPair pair = { header.repFirstTarget.repKey, targetKey };
                             pairs.push_back(pair);
                         }
@@ -3794,7 +3783,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                              -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
                     Matcher matcher(Parameters::DBTYPE_AMINO_ACIDS, maxMemberSeqLen, scoring.subMat, &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
                                     par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop);
-                    const bool swipeLanes = (par.align2clustAlignerMode != Parameters::ALIGNER_MODE_DEFAULT && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid());
                     SwipeBatch swipe(par, scoring.subMat, scoring.evaluer, maxMemberSeqLen);
                     SwipeTargets memberTargets(par, scoring.subMat, scoring.evaluer, maxMemberSeqLen, true);
                     ClusterMembers memberBuffers(swipeLanes ? &swipe : NULL, true, extendMembers ? &memberTargets : NULL);
@@ -3913,7 +3901,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                              -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
                     Matcher matcher(Parameters::DBTYPE_AMINO_ACIDS, maxMemberSeqLen, scoring.subMat, &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
                                     par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop);
-                    const bool swipeLanes = (par.align2clustAlignerMode != Parameters::ALIGNER_MODE_DEFAULT && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid());
                     SwipeBatch swipe(par, scoring.subMat, scoring.evaluer, maxMemberSeqLen);
                     SwipeTargets memberTargets(par, scoring.subMat, scoring.evaluer, maxMemberSeqLen, true);
                     ClusterMembers memberBuffers(swipeLanes ? &swipe : NULL, true, extendMembers ? &memberTargets : NULL);

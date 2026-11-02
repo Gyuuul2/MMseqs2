@@ -51,7 +51,7 @@ public:
 
     // sleeps before poll number polls of a file that another node publishes: ten milliseconds, twice as long each poll, up to 10 << maxShift milliseconds
     static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
-    // every node tells of a wait for what that takes seconds, then twice as long each time, as Debug::WARNING prints on the master only
+    // every node tells of a wait for what that takes seconds, then twice as long each time, as Debug::ERROR so that every node prints it
     class WaitWarning {
     public:
         explicit WaitWarning(size_t seconds = 600);

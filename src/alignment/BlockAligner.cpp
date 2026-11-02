@@ -12,8 +12,7 @@
 
 #include <algorithm>
 
-// bestDiagonal: one lane per diagonal, 8-bit first, a group reruns in 16 bits if a lane may have saturated
-// Keep the sampled diagonal group width fixed across SIMD implementations.
+// bestDiagonal: one lane per diagonal, 8-bit first, a group reruns in 16 bits if a lane may have saturated; the group width is the same on every ISA
 static const int DIAG_GROUP = 6 * 2 * SSE_VECSIZE_INT;
 static const int DIAG_MAX_STEP = 8;
 static const int DIAG_MIN_SCORE = -2;
@@ -300,7 +299,7 @@ static void diagonalMaxScoresTwoGroups(const int8_t* queryProfile, const unsigne
     for (int c = 0; c < vectorCount; c++) {
         vScore[c] = vMaxScore[c] = simdi8_set(-128);
     }
-    // An AVX2 vector straddles the two logical groups at lane 48.
+    // an AVX2 vector straddles the two groups at lane 48
     int8_t secondGroupBytes[VECSIZE_INT * 4] __attribute__((aligned(64)));
     for (int lane = 0; lane < vectorSize; lane++) {
         secondGroupBytes[lane] = (lane >= DIAG_GROUP % vectorSize) ? -1 : 0;
@@ -390,6 +389,8 @@ unsigned short BlockAligner::bestDiagonal(Sequence* currentTarget, int minDiag, 
         for (int group = 0; group < (twoGroups ? 2 : 1); group++, d0 += DIAG_GROUP) {
             const int8_t* groupMaxScores = maxScoresByte + group * DIAG_GROUP;
             const int diagonalCount = std::min(DIAG_GROUP, endDiag - d0);
+            const int groupDbBegin = std::max(0, -(d0 + DIAG_GROUP - 1));
+            const int groupDbEnd = std::min(dbLength, queryLength - d0);
             // a lane below DIAG_BYTE_SATURATED never saturated, so only the 16 bit vectors of the saturated lanes rerun
             const int wordLanes = VECSIZE_INT * 2;
             unsigned int saturatedVectors = 0;
@@ -408,25 +409,23 @@ unsigned short BlockAligner::bestDiagonal(Sequence* currentTarget, int minDiag, 
                 for (int c = 0; (saturatedVectors >> c) != 0; c++) {
                     if ((saturatedVectors >> c) & 1) {
                         diagonalMaxScores<int16_t, 1>(diagProfileWord + 2 * DIAG_GROUP + d0 + c * wordLanes, dbSequence, diagProfileStride,
-                                                  std::max(0, -(d0 + DIAG_GROUP - 1)), std::min(dbLength, queryLength - d0), maxScoresWord + c * wordLanes);
+                                                  groupDbBegin, groupDbEnd, maxScoresWord + c * wordLanes);
                     }
                 }
             }
             for (int k = 0; k < diagonalCount; k++) {
                 int64_t score = static_cast<int>(maxScoresWord[k]) + 32768;
                 if (saturated && maxScoresWord[k] >= DIAG_WORD_SATURATED) {
-                    const int dbBegin = std::max(0, -(d0 + DIAG_GROUP - 1));
-                    const int dbEnd = std::min(dbLength, queryLength - d0);
-                    const int tailBegin = dbBegin + (dbEnd - dbBegin) / DIAG_MAX_STEP * DIAG_MAX_STEP;
+                    const int tailBegin = groupDbBegin + (groupDbEnd - groupDbBegin) / DIAG_MAX_STEP * DIAG_MAX_STEP;
                     int64_t wideScore = 0;
                     score = 0;
-                    for (int j = dbBegin; j < dbEnd; j++) {
+                    for (int j = groupDbBegin; j < groupDbEnd; j++) {
                         const int queryPosition = d0 + k + j;
                         const int residueScore = (queryPosition < 0 || queryPosition >= queryLength)
                             ? DIAG_MIN_SCORE
                             : diagSubMatrix[dbSequence[j] * subMat->alphabetSize + queryNumSeq[queryPosition]];
                         wideScore = std::max<int64_t>(0, wideScore + residueScore);
-                        if ((j - dbBegin + 1) % DIAG_MAX_STEP == 0 || j >= tailBegin) {
+                        if ((j - groupDbBegin + 1) % DIAG_MAX_STEP == 0 || j >= tailBegin) {
                             score = std::max(score, wideScore);
                         }
                     }

@@ -615,7 +615,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     const size_t endPair = findRepKey(writeBegin + writeKeys * (thread + 1) / par.threads);
                     while (pair < endPair) {
                         const DBKeyType repKey = loadPairs[pair].repKey;
-                        // the representative comes first in its pairs
+                        // a mode 3 representative without members has its bit and no entry
                         if (pair + 1 == endPair || loadPairs[pair + 1].repKey != repKey) {
                             pair++;
                             continue;

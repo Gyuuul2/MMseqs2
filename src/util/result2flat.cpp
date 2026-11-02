@@ -50,13 +50,13 @@ int result2flat(int argc, const char **argv, const Command &command) {
     std::vector<size_t> cluKeyOffsets;
     if (isLinfinity) {
         cluKeyOffsets = MMseqsNode::getClusterKeyOffsets(par.db4 + ".keys", par.db3, seqDbr.getSize());
-        const std::vector<size_t> nodeKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
-        const size_t nodeFirstKey = nodeKeyOffsets[MMseqsNode::rank];
-        const size_t nodeEndKey = nodeKeyOffsets[MMseqsNode::rank + 1];
+        const std::vector<size_t> fileKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
+        const size_t fileFirstKey = fileKeyOffsets[MMseqsNode::rank];
+        const size_t fileEndKey = fileKeyOffsets[MMseqsNode::rank + 1];
         // a key also holds its name with its offset and its representative key
-        const size_t keyBytes = querydb_header.getNamesSize(nodeFirstKey, nodeEndKey) / std::max<size_t>(1, nodeEndKey - nodeFirstKey) + 2 * sizeof(uint64_t);
+        const size_t keyBytes = querydb_header.getNamesSize(fileFirstKey, fileEndKey) / std::max<size_t>(1, fileEndKey - fileFirstKey) + 2 * sizeof(uint64_t);
         const size_t splitBytes = std::max<size_t>(1, Util::computeMemory(par.splitMemoryLimit) / 8);
-        splitKeyOffsets = seqDbr.getSplitKeyOffsets(nodeFirstKey, nodeEndKey, splitBytes, keyBytes);
+        splitKeyOffsets = seqDbr.getSplitKeyOffsets(fileFirstKey, fileEndKey, splitBytes, keyBytes);
     }
     const size_t splitCount = isLinfinity ? splitKeyOffsets.size() - 1 : 1;
 

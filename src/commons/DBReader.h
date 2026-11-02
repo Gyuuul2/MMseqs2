@@ -574,7 +574,7 @@ private:
     size_t findEntryByCell(size_t column, size_t value);
     size_t planReadRequests(size_t keyBegin, size_t keyEnd, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &headerOffsets, std::vector<size_t> &keys, std::vector<BatchReader::ReadRequest> &compressedReadRequests, std::vector<size_t> &requestFirstKeys);
     size_t planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys);
-    // a load and a prefetch of keys [keyBegin, keyEnd), only the given keys of them if keys is not NULL
+    // a load of keys [keyBegin, keyEnd), only the given keys of them if keys is not NULL
     void loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
     void decompressLoadedBuffer();
 
@@ -652,8 +652,8 @@ private:
         std::vector<BatchReader::ReadRequest> compressedReadRequests;
         // the first key of every read request, they follow in key order
         std::vector<size_t> requestFirstKeys;
-        // the given keys of a key list load, empty for a load of all keys of [keyBegin, keyEnd)
-        std::vector<DBKeyType> requestedKeys;
+        // a load of a key list, read through bufferedFds
+        bool isKeyLoad;
         // read by prefetchData and not yet taken by loadData
         bool isPrefetched;
         // the blocks of the last blocks.size() read requests, which join the cache once read

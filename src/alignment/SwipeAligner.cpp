@@ -40,6 +40,7 @@ static const unsigned char SWIPE_ZERO_INDEX = 0x80;
 static const size_t SWIPE_MAX_TRACE_CELLS = 16 * 1024 * 1024 / sizeof(simd_int);
 // the band rows times width of the lanes of alignBanded with backtrace, the same on every ISA
 static const size_t SWIPE_MAX_BAND_TRACE_CELLS = 1 << 20;
+static const int SWIPE_MIN_BAND_WIDTH = 16;
 
 // shuffle indices of the lane letters into the 0-15 and 16-31 score tables, the high byte of 16 bit lanes reads 0
 template <typename T>
@@ -285,7 +286,7 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
     unsigned char letters[SWIPE_MAX_LANES];
     T colMax[2][SWIPE_MAX_LANES];
     T colPos[2][SWIPE_MAX_LANES];
-    // Keep high row bits when a query exceeds 65536 residues.
+    // the high row bits of queries longer than 65536 residues
     T colPosHigh[2][SWIPE_MAX_LANES];
     bool finished[SWIPE_MAX_LANES];
     while (active > 0) {
@@ -466,7 +467,7 @@ void SwipeAligner::alignBackward(size_t count, const unsigned char *const *targe
     }
 }
 
-template <typename T, bool Trace>
+template <typename T>
 void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigned char *const *targets, const int *targetLengths,
                              int *bests, int *rows, int *columns, int *firstRows, int *firstColumns, std::string *backtraces, uint32_t *ids) {
     typedef SwipeLanes<T> V;
@@ -505,13 +506,11 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
     // the 4 bit trace codes of 2 (8 bit) or 4 (16 bit) neighbouring cells share a lane
     const int codesPerLane = 2 * sizeof(T);
     const int traceWidth = (width + codesPerLane - 1) / codesPerLane;
-    if (Trace) {
-        const size_t cells = static_cast<size_t>(rowHi - rowLo) * traceWidth;
-        if (cells > traceCapacity) {
-            free(trace);
-            traceCapacity = cells;
-            trace = malloc_simd_int(traceCapacity * sizeof(simd_int));
-        }
+    const size_t cells = static_cast<size_t>(rowHi - rowLo) * traceWidth;
+    if (cells > traceCapacity) {
+        free(trace);
+        traceCapacity = cells;
+        trace = malloc_simd_int(traceCapacity * sizeof(simd_int));
     }
     simd_int *hRow = band;
     simd_int *fRow = band + width + 1;
@@ -560,7 +559,7 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
         simd_int vHl = vZero;
         simd_int vE = vZero;
         simd_int vRowMax = vZero;
-        simd_int *traceRow = Trace ? trace + static_cast<size_t>(r - rowLo) * traceWidth : NULL;
+        simd_int *traceRow = trace + static_cast<size_t>(r - rowLo) * traceWidth;
         simd_int codes = vZero;
         for (int k = 0; k < width; k++) {
             const int slot = (r + k) & ringMask;
@@ -575,24 +574,22 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
             const simd_int f = V::max(fo, fe);
             const simd_int hp = simdi_and(V::max(V::max(diag, f), vZero), ringValid[slot]);
             const simd_int h = simdi_and(V::max(hp, vE), ringValid[slot]);
-            if (Trace) {
-                // H from 0 (H is 0), 1 (diagonal), 2 (E) or 3 (F), 4 if E extends and 8 if F extends
-                simd_int code = simdi8_blend(vThree, vTwo, V::eq(h, vE));
-                code = simdi8_blend(code, vOne, V::eq(h, diag));
-                code = simdi_andnot(V::eq(h, vZero), code);
-                code = simdi_or(code, simdi_andnot(V::gt(eo, ee), vFour));
-                code = simdi_or(code, simdi_andnot(V::gt(fo, fe), vEight));
-                codes = (k % codesPerLane == 0) ? code : simdi_or(simdi16_slli(codes, 4), code);
-                if (k % codesPerLane == codesPerLane - 1) {
-                    traceRow[k / codesPerLane] = codes;
-                }
+            // H from 0 (H is 0), 1 (diagonal), 2 (E) or 3 (F), 4 if E extends and 8 if F extends
+            simd_int code = simdi8_blend(vThree, vTwo, V::eq(h, vE));
+            code = simdi8_blend(code, vOne, V::eq(h, diag));
+            code = simdi_andnot(V::eq(h, vZero), code);
+            code = simdi_or(code, simdi_andnot(V::gt(eo, ee), vFour));
+            code = simdi_or(code, simdi_andnot(V::gt(fo, fe), vEight));
+            codes = (k % codesPerLane == 0) ? code : simdi_or(simdi16_slli(codes, 4), code);
+            if (k % codesPerLane == codesPerLane - 1) {
+                traceRow[k / codesPerLane] = codes;
             }
             hRow[k] = h;
             fRow[k] = f;
             vHl = hp;
             vRowMax = V::max(vRowMax, h);
         }
-        if (Trace && width % codesPerLane != 0) {
+        if (width % codesPerLane != 0) {
             for (int k = width; k % codesPerLane != 0; k++) {
                 codes = simdi16_slli(codes, 4);
             }
@@ -615,63 +612,61 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
         }
     }
 
-    if (Trace) {
-        for (size_t l = 0; l < jobCount; l++) {
-            std::string &backtrace = backtraces[jobs[l].id];
-            backtrace.clear();
-            ids[l] = 0;
-            if (bests[l] <= 0) {
-                continue;
-            }
-            const unsigned char *t = targets[jobs[l].id];
-            const int offset = jobs[l].offset;
-            int r = rows[l];
-            int k = columns[l];
-            int state = 0;
-            uint32_t identities = 0;
-            const auto traceCode = [&](int row, int column) {
-                const int codes = laneValue<T>(trace + static_cast<size_t>(row - rowLo) * traceWidth + column / codesPerLane, l);
-                return (codes >> (4 * (codesPerLane - 1 - column % codesPerLane))) & 15;
-            };
-            const size_t maxSteps = static_cast<size_t>(rowHi - rowLo) + width + targetLengths[jobs[l].id] + 1;
-            while (backtrace.size() <= maxSteps) {
-                const int code = traceCode(r, k);
-                if (state == 0) {
-                    if ((code & 3) == 1) {
-                        backtrace.push_back('M');
-                        identities += (rowLetters[r] == t[r + offset + k]);
-                        if (r == rowLo || (traceCode(r - 1, k) & 3) == 0) {
-                            break;
-                        }
-                        r--;
-                        continue;
-                    }
-                    state = ((code & 3) == 2) ? 1 : 2;
-                }
-                if (state == 1) {
-                    backtrace.push_back('D');
-                    state = (code & 4) ? 1 : 0;
-                    k--;
-                } else {
-                    backtrace.push_back('I');
-                    state = (code & 8) ? 2 : 0;
-                    r--;
-                    k++;
-                }
-                if (r < rowLo || k < 0 || k >= width) {
-                    break;
-                }
-            }
-            std::reverse(backtrace.begin(), backtrace.end());
-            ids[l] = identities;
-            firstRows[l] = r;
-            firstColumns[l] = k;
+    for (size_t l = 0; l < jobCount; l++) {
+        std::string &backtrace = backtraces[jobs[l].id];
+        backtrace.clear();
+        ids[l] = 0;
+        if (bests[l] <= 0) {
+            continue;
         }
+        const unsigned char *t = targets[jobs[l].id];
+        const int offset = jobs[l].offset;
+        int r = rows[l];
+        int k = columns[l];
+        int state = 0;
+        uint32_t identities = 0;
+        const auto traceCode = [&](int row, int column) {
+            const int codes = laneValue<T>(trace + static_cast<size_t>(row - rowLo) * traceWidth + column / codesPerLane, l);
+            return (codes >> (4 * (codesPerLane - 1 - column % codesPerLane))) & 15;
+        };
+        const size_t maxSteps = static_cast<size_t>(rowHi - rowLo) + width + targetLengths[jobs[l].id] + 1;
+        while (backtrace.size() <= maxSteps) {
+            const int code = traceCode(r, k);
+            if (state == 0) {
+                if ((code & 3) == 1) {
+                    backtrace.push_back('M');
+                    identities += (rowLetters[r] == t[r + offset + k]);
+                    if (r == rowLo || (traceCode(r - 1, k) & 3) == 0) {
+                        break;
+                    }
+                    r--;
+                    continue;
+                }
+                state = ((code & 3) == 2) ? 1 : 2;
+            }
+            if (state == 1) {
+                backtrace.push_back('D');
+                state = (code & 4) ? 1 : 0;
+                k--;
+            } else {
+                backtrace.push_back('I');
+                state = (code & 8) ? 2 : 0;
+                r--;
+                k++;
+            }
+            if (r < rowLo || k < 0 || k >= width) {
+                break;
+            }
+        }
+        std::reverse(backtrace.begin(), backtrace.end());
+        ids[l] = identities;
+        firstRows[l] = r;
+        firstColumns[l] = k;
     }
 }
 
-void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const unsigned char *const *targets, const int *targetLengths,
-                             int *bandWidths, s_align *aligns, std::string *backtraces, const int *minScores) {
+void SwipeAligner::runBanded(std::vector<BandJob> &jobs, const unsigned char *const *targets, const int *targetLengths,
+                             s_align *aligns, std::string *backtraces, const int *minScores) {
     const int Lq = queryLength;
     std::vector<BandJob> pending;
     while (jobs.empty() == false) {
@@ -708,20 +703,18 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const uns
             startColumns.resize(n);
             const size_t traceCells = static_cast<size_t>(Lq + 1) * jobs[start].width;
             const bool canTrace = traceCells <= SWIPE_MAX_BAND_TRACE_CELLS;
-            if (doTrace && canTrace == false) {
+            if (canTrace == false) {
                 for (size_t l = start; l < end; l++) {
                     aligns[jobs[l].id].word = 2;
                 }
                 start = end;
                 continue;
             }
-#define SWIPE_BAND(T, TR) alignBand<T, TR>(&jobs[start], n, targets, targetLengths, bestScores.data(), bestRows.data(), bestColumns.data(), startRows.data(), startColumns.data(), backtraces, identities.data())
             if (word == 0) {
-                if (doTrace) { SWIPE_BAND(int8_t, true); } else { SWIPE_BAND(int8_t, false); }
+                alignBand<int8_t>(&jobs[start], n, targets, targetLengths, bestScores.data(), bestRows.data(), bestColumns.data(), startRows.data(), startColumns.data(), backtraces, identities.data());
             } else {
-                if (doTrace) { SWIPE_BAND(int16_t, true); } else { SWIPE_BAND(int16_t, false); }
+                alignBand<int16_t>(&jobs[start], n, targets, targetLengths, bestScores.data(), bestRows.data(), bestColumns.data(), startRows.data(), startColumns.data(), backtraces, identities.data());
             }
-#undef SWIPE_BAND
             for (size_t l = 0; l < n; l++) {
                 const BandJob &job = jobs[start + l];
                 s_align &a = aligns[job.id];
@@ -737,8 +730,7 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const uns
                 const int w = (job.width - 1) / 2;
                 const int center = job.offset + w;
                 const bool fullBand = (center - w <= job.columnBegin - (Lq - 1)) && (center + w >= job.columnEnd - 1);
-                const int k = bestColumns[l];
-                const bool grow = (best > 0 && doTrace == false && (k <= 1 || k >= job.width - 2)) || (minScores != NULL && best < minScores[job.id]);
+                const bool grow = best < minScores[job.id];
                 if (grow && fullBand == false) {
                     BandJob wider = job;
                     const int w2 = 2 * w;
@@ -746,7 +738,6 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const uns
                     wider.width = 2 * w2 + 1;
                     wider.rowBegin = std::max(0, job.columnBegin - wider.offset - (wider.width - 1));
                     wider.rowEnd = std::min(Lq, job.columnEnd - wider.offset);
-                    bandWidths[job.id] = w2;
                     pending.push_back(wider);
                     continue;
                 }
@@ -756,18 +747,12 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const uns
                 }
                 const int row = bestRows[l];
                 const int column = row + job.offset + bestColumns[l];
-                if (doTrace) {
-                    a.score1 = best;
-                    a.qEndPos1 = row;
-                    a.dbEndPos1 = column;
-                    a.qStartPos1 = startRows[l];
-                    a.dbStartPos1 = startRows[l] + job.offset + startColumns[l];
-                    a.identicalAACnt = identities[l];
-                } else {
-                    a.score1 = best;
-                    a.qEndPos1 = row;
-                    a.dbEndPos1 = column;
-                }
+                a.score1 = best;
+                a.qEndPos1 = row;
+                a.dbEndPos1 = column;
+                a.qStartPos1 = startRows[l];
+                a.dbStartPos1 = startRows[l] + job.offset + startColumns[l];
+                a.identicalAACnt = identities[l];
             }
             start = end;
         }
@@ -775,21 +760,13 @@ void SwipeAligner::runBanded(std::vector<BandJob> &jobs, bool doTrace, const uns
     }
 }
 
-void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals, int *bandWidths,
+void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals,
                                s_align *aligns, std::string *backtraces, const int *columnEnds, const int *minScores) {
     const int Lq = queryLength;
-    const bool doTrace = (backtraces != NULL);
     bandJobs.clear();
     for (size_t i = 0; i < count; i++) {
         s_align &a = aligns[i];
-        if (doTrace == false) {
-            a.score1 = 0;
-            a.qEndPos1 = -1;
-            a.dbEndPos1 = -1;
-            a.word = (a.word == 1) ? 1 : 0;
-        } else {
-            a.word = (minScores != NULL && minScores[i] >= SwipeLanes<int8_t>::MAX) ? 1 : ((a.score1 >= static_cast<uint32_t>(SwipeLanes<int8_t>::MAX)) ? 1 : 0);
-        }
+        a.word = (minScores[i] >= SwipeLanes<int8_t>::MAX) ? 1 : 0;
         a.qStartPos1 = -1;
         a.dbStartPos1 = -1;
         a.score2 = 0;
@@ -797,20 +774,17 @@ void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets
         a.cigar = NULL;
         a.cigarLen = 0;
         a.identicalAACnt = 0;
-        if (bandWidths[i] <= 0) {
-            bandWidths[i] = MIN_BAND_WIDTH;
-        }
         BandJob job;
         job.id = i;
-        job.width = 2 * bandWidths[i] + 1;
-        job.offset = diagonals[i] - bandWidths[i];
+        job.width = 2 * SWIPE_MIN_BAND_WIDTH + 1;
+        job.offset = diagonals[i] - SWIPE_MIN_BAND_WIDTH;
         job.columnBegin = 0;
-        job.columnEnd = (columnEnds != NULL) ? columnEnds[i] : targetLengths[i];
+        job.columnEnd = columnEnds[i];
         job.rowBegin = std::max(0, job.columnBegin - job.offset - (job.width - 1));
         job.rowEnd = std::min(Lq, job.columnEnd - job.offset);
         bandJobs.push_back(job);
     }
-    runBanded(bandJobs, doTrace, targets, targetLengths, bandWidths, aligns, backtraces, minScores);
+    runBanded(bandJobs, targets, targetLengths, aligns, backtraces, minScores);
 }
 
 
@@ -1258,7 +1232,7 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
                 traceRow[width / 4] = codes;
             }
         }
-        // ties go to the larger target position, then the later row, as in BlockAligner
+        // ties go to the larger target position, then the later row, so an extension ends at the farthest cell of its best score; BlockAligner does so only within the step that raised it
         if (simdi8_movemask(simdi_andnot(simdi16_gt(vBest, vRowMax), vActive)) != 0) {
             simdi_storeu(reinterpret_cast<simd_int *>(rowMax), vRowMax);
             simdi_storeu(reinterpret_cast<simd_int *>(rowPos), vPos);

@@ -19,16 +19,12 @@
 #include "Masker.h"
 #include "MemoryMapped.h"
 #include "MMseqsNode.h"
-#include "BatchReader.h"
-#include "itoa.h"
 
 #include <sys/stat.h>
-#include <sys/resource.h>
 #include <sys/mman.h>
 #include <fcntl.h>
 
 #include <limits>
-#include <thread>
 #include <algorithm>
 
 #ifdef OPENMP
@@ -128,7 +124,7 @@ static void encodeKmerPosition(KmerPositionType *, KmerPosition<T, includeAdjace
 
 template <int TYPE, typename T, bool includeAdjacency, typename L, typename KmerPositionType>
 std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, size_t kmerArraySize, DBReader<DBKeyType> &seqDbr,
-                                                Parameters & par, BaseMatrix * subMat, bool hashWholeSequence, bool prefetchesNextReadChunk,
+                                                Parameters & par, BaseMatrix * subMat, bool hashWholeSequence,
                                                 size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution,
                                                 const std::vector<size_t> &readChunkOffsets){
     size_t offset = 0;
@@ -212,7 +208,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
             size_t bucketSize = readChunkOffsets[i + 1] - start;
             if (thread_idx == 0) {
                 seqDbr.loadData(start, start + bucketSize);
-                if (prefetchesNextReadChunk && i + 2 < readChunkOffsets.size()) {
+                if (isLinfinity && i + 2 < readChunkOffsets.size()) {
                     seqDbr.prefetchData(readChunkOffsets[i + 1], readChunkOffsets[i + 2]);
                 }
             }
@@ -515,7 +511,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
 #ifdef OPENMP
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-            if (thread_idx == 0 && prefetchesNextReadChunk == false) {
+            if (thread_idx == 0 && isLinfinity == false) {
                 seqDbr.releaseDataPages();
             }
 #pragma omp barrier
@@ -558,7 +554,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
         readChunkOffsets.push_back(start);
     }
     readChunkOffsets.push_back(seqDbr.getSize());
-    return fillKmerPositionArray<TYPE, T, includeAdjacency, L>(kmerArray, kmerArraySize, seqDbr, par, subMat, hashWholeSequence, false,
+    return fillKmerPositionArray<TYPE, T, includeAdjacency, L>(kmerArray, kmerArraySize, seqDbr, par, subMat, hashWholeSequence,
                                                                hashStartRange, hashEndRange, hashDistribution, readChunkOffsets);
 }
 
@@ -2770,12 +2766,12 @@ template std::pair<size_t, size_t>  fillKmerPositionArray<1, int, false, int>(Km
 template std::pair<size_t, size_t>  fillKmerPositionArray<2, int, true, int>(KmerPosition<int, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
 template std::pair<size_t, size_t>  fillKmerPositionArray<2, int, false, int>(KmerPosition<int, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
 
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, short, true, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, short, false, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, true, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, false, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, true, int, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, false, int, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, short, true, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, short, false, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, true, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, false, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, true, int, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, false, int, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
 
 template KmerPosition<short, true> *initKmerPositionMemory(size_t size);
 template KmerPosition<short, false> *initKmerPositionMemory(size_t size);

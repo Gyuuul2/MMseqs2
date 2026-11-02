@@ -119,7 +119,6 @@ struct KmerPositionBit {
     DBKeyType getId() const { return getBits(idShift, seqLenShift); }
     size_t getPos() const { return getBits(0, idShift); }
 
-    // the upper words first: ips4o sorts with this more than twice as fast as with the 128 bit compare
     bool operator<(const KmerPositionBit &other) const {
         const uint64_t upper = static_cast<uint64_t>(value >> 64);
         const uint64_t otherUpper = static_cast<uint64_t>(other.value >> 64);
@@ -355,10 +354,10 @@ void setLinearFilterDefault(Parameters *p);
 
 size_t computeMemoryNeededLinearfilter(size_t totalKmer);
 
+extern BaseMatrix *adjSubMat;
 // --createdb-mode 3: the first key of the send range that this node sends or merges, only the keys set in representativeBits unless NULL
 extern size_t localFirstKey;
 extern uint64_t *representativeBits;
-extern BaseMatrix *adjSubMat;
 
 static inline bool isRepresentative(size_t id) {
     return representativeBits == NULL || ((representativeBits[(id - localFirstKey) / 64] >> ((id - localFirstKey) % 64)) & 1);
@@ -375,15 +374,6 @@ static inline unsigned int getKmerBits(const BaseMatrix *subMat, int kmerSize) {
 static inline size_t computeSeqKmerCount(int seqLen, size_t kmerSize, size_t chooseTopKmer, float chooseTopKmerScale) {
     int kmerAdjustedSeqLen = std::max(1, seqLen - static_cast<int>(kmerSize) + 2);
     return std::min(kmerAdjustedSeqLen, static_cast<int>(chooseTopKmer + (chooseTopKmerScale * seqLen)));
-}
-
-// the score of the adjacent residues of adjKey against those of the previous representative in subMatPos
-static inline int getAdjKeyScore(short *subMatPos[6], unsigned int adjKey) {
-    int score = 0;
-    for (int j = 0; j < 6; j++) {
-        score += subMatPos[j][KmerPositionBit::getAdjacentSeq(adjKey, j)];
-    }
-    return score;
 }
 
 // the next rep of a k-mer group: the adjKey candidate scoring lowest against the previous one, at a tie the first by isBefore
@@ -415,7 +405,10 @@ static inline void selectGroupRepSeqs(std::vector<Candidate> &reps, size_t maxRe
                     return;
                 }
             }
-            const int score = reps.empty() ? 0 : getAdjKeyScore(subMatPos, adjKey);
+            int score = 0;
+            for (int j = 0; reps.empty() == false && j < 6; j++) {
+                score += subMatPos[j][KmerPositionBit::getAdjacentSeq(adjKey, j)];
+            }
             if (hasBest == false || score < bestScore || (score == bestScore && isBefore(candidate, bestCandidate))) {
                 hasBest = true;
                 bestScore = score;
@@ -433,7 +426,7 @@ static inline void selectGroupRepSeqs(std::vector<Candidate> &reps, size_t maxRe
 
 template <int TYPE, typename T, bool includeAdjacency, typename L, typename KmerPositionType>
 std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, size_t kmerArraySize, DBReader<DBKeyType> &seqDbr,
-                                                Parameters & par, BaseMatrix * subMat, bool hashWholeSequence, bool prefetchesNextReadChunk,
+                                                Parameters & par, BaseMatrix * subMat, bool hashWholeSequence,
                                                 size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution,
                                                 const std::vector<size_t> &readChunkOffsets);
 

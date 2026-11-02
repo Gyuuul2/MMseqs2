@@ -20,9 +20,6 @@
 #include "nucleotide.out.h"
 #include "base64/base64.h"
 
-// how long a step on several machines waits for an input that a step before it wrote on another machine
-static const int INPUT_LATENCY_SECONDS = 120;
-
 #ifdef __CYGWIN__
 #include <sys/cygwin.h>
 #endif
@@ -30,6 +27,9 @@ static const int INPUT_LATENCY_SECONDS = 120;
 #ifdef OPENMP
 #include <omp.h>
 #endif
+
+// how long a step on several machines waits for an input that a step before it wrote on another machine
+static const int INPUT_LATENCY_SECONDS = 120;
 
 Parameters* Parameters::instance = NULL;
 

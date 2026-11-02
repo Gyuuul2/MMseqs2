@@ -4,14 +4,10 @@
 #include "FastSort.h"
 #include "MMseqsNode.h"
 #include "BatchReader.h"
-#include "itoa.h"
 
 #include <sys/resource.h>
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include <sys/stat.h>
 
-#include <limits>
 #include <thread>
 #include <algorithm>
 
@@ -510,7 +506,7 @@ struct KmerExchange {
     std::vector<size_t> sendRangeKeyOffsets;
     size_t sendRangeCount;
     // the keys of the data files, and whether a clusthashfast subset has the representative bits of their keys
-    std::vector<size_t> nodeKeyOffsets;
+    std::vector<size_t> fileKeyOffsets;
     bool hasRepresentativeBits;
     size_t memoryLimit;
     size_t writeBehindMemory;
@@ -540,7 +536,7 @@ static void setSendRange(const Parameters &par, const KmerExchange &exchange, si
     delete[] representativeBits;
     representativeBits = NULL;
     if (exchange.hasRepresentativeBits) {
-        representativeBits = MMseqsNode::readRepresentativeBits(par.db1, exchange.nodeKeyOffsets, localFirstKey, exchange.sendRangeKeyOffsets[sendRange + 1] - localFirstKey);
+        representativeBits = MMseqsNode::readRepresentativeBits(par.db1, exchange.fileKeyOffsets, localFirstKey, exchange.sendRangeKeyOffsets[sendRange + 1] - localFirstKey);
     }
 }
 
@@ -1015,7 +1011,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
             }
             readChunkOffsets.push_back(loadOffsets[load + 1]);
             const size_t kmerCount = fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, L>(
-                hashSeqPair, maxLoadKmers, seqDbr, par, subMat, true, true, 0, SIZE_T_MAX, NULL, readChunkOffsets).first;
+                hashSeqPair, maxLoadKmers, seqDbr, par, subMat, true, 0, SIZE_T_MAX, NULL, readChunkOffsets).first;
 
             SORT_PARALLEL(hashSeqPair, hashSeqPair + kmerCount);
 
@@ -1176,10 +1172,6 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                 // a code ends at a byte boundary, where the next one starts
                 for (size_t code = 0; code < KMER_CODE_COUNT; code++) {
                     putBits(codeWrites[code], 0, (CHAR_BIT - codeWrites[code].bitCount) % CHAR_BIT);
-                    if (codeWrites[code].writePos + codeWrites[code].bufferPos != hashSubRangeRow.offsets[code + 1]) {
-                        Debug(Debug::ERROR) << "Cannot write " << kmerFile << "\n";
-                        EXIT(EXIT_FAILURE);
-                    }
                     if (codeWrites[code].fd != -1) {
                         writeKmerCodeBuffer(codeWrites[code]);
                     }
@@ -1278,11 +1270,6 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
         for (size_t sender = 0; sender < MMseqsNode::count; sender++) {
             readItemRows(receivedFiles[sender], hashRange, received.fileRows[sender]);
-            // every node must cut the same hash sub ranges
-            if (received.fileRows[sender].size() % exchange.rowsPerHashRange != 0) {
-                Debug(Debug::ERROR) << "Data file " << receivedFiles[sender].fileName << " has other hash sub ranges than " << exchange.hashSubRangesPerRange << " per hash range\n";
-                EXIT(EXIT_FAILURE);
-            }
         }
         received.hashSubRangeReads.assign(exchange.rowsPerHashRange, 0);
         std::vector<size_t> hashSubRangeCodeBytes(exchange.rowsPerHashRange, 0);
@@ -1292,7 +1279,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
             const std::vector<KmerHashSubRange> &rows = received.fileRows[sender];
             for (size_t row = 0; row < rows.size(); row++) {
                 const size_t rangeHashSubRange = row % exchange.rowsPerHashRange;
-                const size_t groupMaxRepSeqs = (row % exchange.rowsPerHashRange >= exchange.hashSubRangesPerRange) ? 1 : exchange.maxRepSeqs;
+                const size_t groupMaxRepSeqs = (rangeHashSubRange >= exchange.hashSubRangesPerRange) ? 1 : exchange.maxRepSeqs;
                 const size_t members = (rows[row].offsets[KMER_REP_CANDIDATE_CODES] - rows[row].offsets[KMER_MEMBER_CODES]) * CHAR_BIT / std::max(1U, rows[row].idBits);
                 received.hashSubRangeReads[rangeHashSubRange] += (rows[row].groupCount > 0);
                 receivedBytes += getRowEnd(rows[row]) - rows[row].offsets[0];
@@ -1842,16 +1829,7 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
         setSendRange(par, exchange, sendRange);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
         for (size_t receiver = 0; receiver < receivedPairFiles.size(); receiver++) {
-            std::vector<AssignedPairPartition> &rows = pairFileRows[receiver];
-            readItemRows(receivedPairFiles[receiver], sendRange, rows);
-            bool isValid = true;
-            for (size_t row = 0; isValid && row < rows.size(); row++) {
-                isValid = (rows[row].partition < exchange.partitionsPerRange);
-            }
-            if (isValid == false) {
-                Debug(Debug::ERROR) << "Data file " << receivedPairFiles[receiver].fileName << " has other partitions than " << exchange.partitionsPerRange << " per send range\n";
-                EXIT(EXIT_FAILURE);
-            }
+            readItemRows(receivedPairFiles[receiver], sendRange, pairFileRows[receiver]);
         }
         std::vector<size_t> partitionCodeBytes(exchange.partitionsPerRange, 0);
         std::vector<size_t> partitionTargets(exchange.partitionsPerRange, 0);
@@ -2191,28 +2169,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         const size_t rangeKmers = seqDbr.getRangeRepresentativeCount(range) * computeSeqKmerCount(static_cast<int>(index[range].length - 2), par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
         const size_t rangeCost = rangeKmers * SEND_KMER_BYTES + rangeKeys * index[range].length;
         for (; sendRange < exchange.sendRangeCount && costBefore + rangeCost >= sendRange * sendRangeCost; sendRange++) {
-            // ceil(cutCost * rangeKeys / rangeCost) bit by bit over rangeKeys, so no value exceeds rangeCost
             const size_t cutCost = sendRange * sendRangeCost - costBefore;
-            size_t keys = 0;
-            size_t remainder = 0;
-            for (int bit = std::numeric_limits<size_t>::digits - 1; bit >= 0; bit--) {
-                keys *= 2;
-                if (remainder >= rangeCost - remainder) {
-                    remainder -= rangeCost - remainder;
-                    keys++;
-                } else {
-                    remainder += remainder;
-                }
-                if ((rangeKeys >> bit) & 1) {
-                    if (remainder >= rangeCost - cutCost) {
-                        remainder -= rangeCost - cutCost;
-                        keys++;
-                    } else {
-                        remainder += cutCost;
-                    }
-                }
-            }
-            sendRangeKeyOffsets[sendRange] = index[range].id + keys + (remainder != 0);
+            sendRangeKeyOffsets[sendRange] = index[range].id + static_cast<size_t>((static_cast<KmerPositionBit::uint128>(cutCost) * rangeKeys + rangeCost - 1) / rangeCost);
         }
         costBefore += rangeCost;
     }
@@ -2221,14 +2179,13 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         maxSendRangeKeys = std::max(maxSendRangeKeys, sendRangeKeyOffsets[sendRange + 1] - sendRangeKeyOffsets[sendRange]);
     }
     // a clusthashfast subset: the representative bits of the keys to send and merge
-    exchange.nodeKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
+    exchange.fileKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
     exchange.hasRepresentativeBits = FileUtil::fileExists((par.db1 + ".bits." + SSTR(MMseqsNode::rank)).c_str());
     // a result is complete once the master writes its dbtype
     if (MMseqsNode::isMaster() && FileUtil::fileExists((par.db2 + ".dbtype").c_str())) {
         FileUtil::remove((par.db2 + ".dbtype").c_str());
     }
 
-    // Application already raised the soft open file limit (FileUtil::fixRlimitNoFile)
     struct rlimit openFileLimit = {0, 0};
     getrlimit(RLIMIT_NOFILE, &openFileLimit);
     // a node reads the exchange file of every node while it writes its own, or its pref data and index
@@ -2249,7 +2206,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     // a k-mer record holds its hash in the top kmerBits bits, the hash of a whole sequence takes all 64
     exchange.kmerHashShift = 64 - getKmerBits(subMat, par.kmerSize);
 
-    // hash ranges are cut by the top bits of the hash, RANGES_PER_NODE a node and enough for the threads that write the k-mer file of a load
+    // hash ranges are equal parts of the 64 bit hash, RANGES_PER_NODE a node and enough for the threads that write the k-mer file of a load
     exchange.hashRangeCount = std::max(RANGES_PER_NODE * MMseqsNode::count, CHUNKS_PER_THREAD * par.threads);
     exchange.globalIdBits = getBitWidth(seqDbr.getSize() - 1);
     exchange.maxRepSeqs = 1 + (includeAdjacency ? par.adjIteration : 0);
@@ -2283,8 +2240,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     Timer phaseTimer;
     std::string sendValues;
     std::vector<size_t> sendRanges;
-    // the own rows stay in memory beside the loads and in the budget of a receiving pass, for as many of the first own hash ranges as are expected to fit
-    // and as a node half as fast as the others takes itself, ownItems * count / (2 * count - 1), so the other nodes can take the rest
+    // the own rows of the first own hash ranges that fit and that a node half as fast as the others takes itself
     OwnKmers ownKmers = {NULL, 0, getPassLimit(exchange.loadMemoryLimit - std::min(exchange.loadMemoryLimit, exchange.pairRowsMemory)),
                          std::vector<std::vector<KmerHashSubRange> >(exchange.hashRangeCount), std::vector<size_t>()};
     const size_t sendRangeKmerBytes = globalKmers / exchange.sendRangeCount * sizeof(KmerPositionBit);

@@ -1236,11 +1236,7 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(BufferInfo &bufferTo
     bufferToLoadInto.keys.swap(clusterKeys);
     bufferToLoadInto.compressedReadRequests.swap(compressedReadRequests);
     bufferToLoadInto.requestFirstKeys.swap(requestFirstKeys);
-    if (keys != NULL) {
-        bufferToLoadInto.requestedKeys = *keys;
-    } else {
-        bufferToLoadInto.requestedKeys.clear();
-    }
+    bufferToLoadInto.isKeyLoad = keys != NULL;
     bufferToLoadInto.isPrefetched = false;
     bufferToLoadInto.keyBegin = keyBegin;
     bufferToLoadInto.keyEnd = keyEnd;
@@ -1385,7 +1381,7 @@ template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key) {
                 return cached->second.destination + (fileOffset - cached->second.fileOffset);
             }
         }
-        const std::vector<int> &fds = loadedBuffer.requestedKeys.empty() ? dataFds : bufferedFds;
+        const std::vector<int> &fds = loadedBuffer.isKeyLoad ? bufferedFds : dataFds;
         const int fd = fds[index2dbfile[range]];
         const size_t requestEnd = std::upper_bound(loadedBuffer.requestFirstKeys.begin(), loadedBuffer.requestFirstKeys.end(), key) - loadedBuffer.requestFirstKeys.begin();
         if (requestEnd > 0) {
