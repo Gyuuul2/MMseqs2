@@ -2602,6 +2602,9 @@ static const size_t WINDOW_KEY_BYTES = 4 * sizeof(DBKeyType) + sizeof(unsigned i
 static const size_t FIRST_WINDOW_BYTES = 64 * 1024 * 1024;
 // the bytes of a slice that a thread writes at once
 static const size_t SLICE_WRITE_BYTES = 16 * 1024 * 1024;
+// the service threads of all nodes open about this many indexes a second, as a pass over the nodes opens two of every other node; a pass waits for 1.28 s at most
+static const size_t SERVICE_OPENS_PER_SECOND = 10000;
+static const size_t MAX_SERVICE_PASS_MICROSECONDS = 1280000;
 
 // offsets[0] is 0, offsets[1..count] become their sums from the front: every thread sums its part, then adds the parts before it
 static void sumOffsets(size_t *offsets, size_t count, int threads) {
@@ -3536,6 +3539,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         MMseqsNode::publishExchangeFlush(servedHandle, servedFiles[node], MMseqsNode::EXCHANGE_SLICE_HEADER_BYTES + sliceBytes, servedIndexes[node], servedLine);
                     }
                 }
+                usleep(std::min(MAX_SERVICE_PASS_MICROSECONDS, 2 * static_cast<size_t>(nodes) * nodes * 1000000 / SERVICE_OPENS_PER_SECOND));
                 // idle: poll again after up to 160 ms while the main thread may wait, else up to 1.28 s
                 if (hasWorked) {
                     polls = 0;

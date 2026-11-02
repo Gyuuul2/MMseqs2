@@ -1,7 +1,10 @@
 #ifndef MMSEQS_BATCHREADER_H
 #define MMSEQS_BATCHREADER_H
 
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
+#include <mutex>
 #include <thread>
 #include <vector>
 
@@ -81,6 +84,59 @@ private:
     unsigned int cqMask;
     io_uring_cqe *cqes;
 #endif
+};
+
+// write copies its bytes to a buffer and threads write the full buffers, sorted by file position, so the callers go on computing until all buffers wait for the storage
+class BatchWriter {
+public:
+    // memoryBytes: the buffers of BUFFER_SIZE, at least two, and one per write thread
+    BatchWriter(size_t memoryBytes, int maxIoThreads, int fdToDetectStorage);
+    ~BatchWriter();
+
+    void write(int fd, const char *fileName, const char *data, size_t bytes, size_t fileOffset);
+    // no caller is in write; afterwards all bytes are written
+    void waitWrites();
+    // the seconds that the callers of write waited for a buffer, summed over them
+    double getWaitSeconds() const {
+        return waitSeconds;
+    }
+
+private:
+    static const size_t BUFFER_SIZE = 64 * 1024 * 1024;
+    struct Piece {
+        int fd;
+        const char *fileName;
+        size_t bufferOffset;
+        size_t bytes;
+        size_t fileOffset;
+
+        static bool compareByFile(const Piece &first, const Piece &second) {
+            return first.fd < second.fd || (first.fd == second.fd && first.fileOffset < second.fileOffset);
+        }
+    };
+    struct Buffer {
+        char *data;
+        size_t bytes;
+        // the callers that still copy to it
+        size_t copies;
+        std::vector<Piece> pieces;
+    };
+    void queueCopiedBuffer(Buffer *buffer);
+    void writeBuffers(char *joinedPieces);
+
+    char *memory;
+    std::vector<Buffer> buffers;
+    std::vector<Buffer *> freeBuffers;
+    std::deque<Buffer *> fullBuffers;
+    Buffer *currentBuffer;
+    // the buffers that are not free
+    size_t busyBuffers;
+    bool isClosing;
+    double waitSeconds;
+    std::mutex bufferMutex;
+    std::condition_variable freeCondition;
+    std::condition_variable fullCondition;
+    std::vector<std::thread> writeThreads;
 };
 
 #endif

@@ -24,6 +24,8 @@
 #endif
 
 static const size_t KMER_FILE_BUFFER_SIZE = 16 * 1024 * 1024;
+// the writes that wait for the file system while the threads go on take the memory limit divided by this
+static const size_t WRITE_BEHIND_MEMORY_DIVISOR = 8;
 // the bit buffer keeps less than a byte between codes, so this many bits always fit in one step
 static const unsigned int KMER_FILE_STEP_BITS = 64 - CHAR_BIT;
 // open files besides the k-mer and sequence data files: standard streams and barrier files, with headroom
@@ -97,7 +99,7 @@ static void writeRowTable(FILE *file, const std::string &fileName, const std::ve
     }
 }
 
-// with fd -1 a buffer in memory, otherwise a buffer that is written at writePos of the file whenever it is full
+// with fd -1 a buffer in memory, otherwise a buffer that batchWriter writes at writePos of the file whenever it is full
 struct KmerCodeWriter {
     int fd;
     const char *fileName;
@@ -107,6 +109,7 @@ struct KmerCodeWriter {
     size_t writePos;
     uint64_t bitBuffer;
     unsigned int bitCount;
+    BatchWriter *batchWriter;
 };
 
 // with fd -1 a buffer in memory, otherwise a window of bufferSize bytes at fileOffset that getBits refills up to fileEnd
@@ -123,7 +126,7 @@ struct KmerCodeReader {
 };
 
 static void writeKmerCodeBuffer(KmerCodeWriter &kmerCodeWrite) {
-    FileUtil::pwriteAll(kmerCodeWrite.fd, kmerCodeWrite.fileName, kmerCodeWrite.buffer, kmerCodeWrite.bufferPos, kmerCodeWrite.writePos);
+    kmerCodeWrite.batchWriter->write(kmerCodeWrite.fd, kmerCodeWrite.fileName, kmerCodeWrite.buffer, kmerCodeWrite.bufferPos, kmerCodeWrite.writePos);
     kmerCodeWrite.writePos += kmerCodeWrite.bufferPos;
     kmerCodeWrite.bufferPos = 0;
 }
@@ -510,6 +513,7 @@ struct KmerExchange {
     std::vector<size_t> nodeKeyOffsets;
     bool hasRepresentativeBits;
     size_t memoryLimit;
+    size_t writeBehindMemory;
     size_t loadMemoryLimit;
     // the rows of a flush of pair records, a row per partition at most, which a receiving node holds until it writes them
     size_t pairRowsMemory;
@@ -590,6 +594,7 @@ static void getPassRows(const KmerExchange &exchange, const std::vector<std::vec
 struct AssignedPairFile {
     std::string name;
     FILE *file;
+    BatchWriter *batchWriter;
     size_t bytes;
     // the rows of every flush, written after its records as a block, and the rows of every send range
     std::vector<std::pair<size_t, size_t> > rowBlocks;
@@ -636,7 +641,7 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
 #ifdef OPENMP
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-        KmerCodeWriter pairWrite = {fileno(pairFile.file), pairFile.name.c_str(), writeBuffers + thread_idx * KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE, 0, rows[row].offsets[0], 0, 0};
+        KmerCodeWriter pairWrite = {fileno(pairFile.file), pairFile.name.c_str(), writeBuffers + thread_idx * KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE, 0, rows[row].offsets[0], 0, 0, pairFile.batchWriter};
         for (size_t code = 0; code < PAIR_CODE_COUNT; code++) {
             for (size_t i = rowRecordOffsets[row]; i < rowRecordOffsets[row + 1]; i++) {
                 putBytes(pairWrite, passBuffer + records[i].codeOffsets[code], records[i].codeBytes[code]);
@@ -644,7 +649,7 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
         }
         writeKmerCodeBuffer(pairWrite);
     }
-    FileUtil::pwriteAll(fileno(pairFile.file), pairFile.name.c_str(), reinterpret_cast<const char *>(rows.data()), rows.size() * sizeof(AssignedPairPartition), pairFile.bytes);
+    pairFile.batchWriter->write(fileno(pairFile.file), pairFile.name.c_str(), reinterpret_cast<const char *>(rows.data()), rows.size() * sizeof(AssignedPairPartition), pairFile.bytes);
     pairFile.rowBlocks.push_back(std::make_pair(pairFile.bytes, rows.size()));
     pairFile.bytes += rows.size() * sizeof(AssignedPairPartition);
 }
@@ -829,6 +834,7 @@ struct PrefFiles {
     FILE *dataFile;
     FILE *indexFile;
     char *writeBuffers;
+    BatchWriter *batchWriter;
 };
 
 // with threads: writes the entries of a merged partition at dataOffset and indexOffset of the pref files, a key chunk at a time
@@ -841,9 +847,9 @@ static void writePartition(const PrefFiles &prefFiles, size_t partitionFirstKey,
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
         char *writeBuffer = prefFiles.writeBuffers + 2 * (firstWriteBuffer + thread_idx) * KMER_FILE_BUFFER_SIZE;
-        KmerCodeWriter dataWrite = {fileno(prefFiles.dataFile), prefFiles.dataName.c_str(), writeBuffer, KMER_FILE_BUFFER_SIZE, 0, dataOffset + merge.keyChunkDataOffsets[keyChunk], 0, 0};
+        KmerCodeWriter dataWrite = {fileno(prefFiles.dataFile), prefFiles.dataName.c_str(), writeBuffer, KMER_FILE_BUFFER_SIZE, 0, dataOffset + merge.keyChunkDataOffsets[keyChunk], 0, 0, prefFiles.batchWriter};
         KmerCodeWriter indexWrite = {fileno(prefFiles.indexFile), prefFiles.indexName.c_str(), writeBuffer + KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE, 0,
-                                     indexOffset + merge.keyChunkEntryOffsets[keyChunk] * 2 * sizeof(uint64_t), 0, 0};
+                                     indexOffset + merge.keyChunkEntryOffsets[keyChunk] * 2 * sizeof(uint64_t), 0, 0, prefFiles.batchWriter};
         for (size_t key = merge.keyChunkOffsets[keyChunk]; key < merge.keyChunkOffsets[keyChunk + 1]; key++) {
             if (isRepresentative(partitionFirstKey + key)) {
                 writePrefEntry(partitionFirstKey + key, merge.targets + ((key > 0) ? merge.keyOffsets[key - 1] : 0), merge.targets + merge.keyOffsets[key], dataWrite, indexWrite);
@@ -882,6 +888,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
     std::vector<size_t> wholeSequenceOffsets(exchange.hashSubRangeCount + 1);
     char *kmerWriteBuffer = new(std::nothrow) char[par.threads * KMER_FILE_BUFFER_SIZE];
     Util::checkAllocation(kmerWriteBuffer, "Can not allocate kmerWriteBuffer memory in sendKmers");
+    BatchWriter batchWriter(exchange.writeBehindMemory, par.threads, fileno(kmerFileHandle));
     // the k-mers of the largest send range so far, kept for the next ones so their pages are not mapped again, while they fit with the group buffers
     KmerPositionBit *hashSeqPair = NULL;
     size_t hashSeqPairCapacity = 0;
@@ -1117,8 +1124,8 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                 for (size_t code = 0; code < KMER_CODE_COUNT; code++) {
                     const size_t writePos = hashSubRangeRow.offsets[code];
                     codeWrites[code] = isOwnLoadHashRange[row / exchange.rowsPerHashRange]
-                        ? KmerCodeWriter{-1, NULL, ownKmers.data + writePos, ownKmers.bytes - writePos, 0, writePos, 0, 0}
-                        : KmerCodeWriter{fileno(kmerFileHandle), kmerFile.c_str(), kmerWriteBuffer + thread_idx * KMER_FILE_BUFFER_SIZE + code * codeBufferSize, codeBufferSize, 0, writePos, 0, 0};
+                        ? KmerCodeWriter{-1, NULL, ownKmers.data + writePos, ownKmers.bytes - writePos, 0, writePos, 0, 0, NULL}
+                        : KmerCodeWriter{fileno(kmerFileHandle), kmerFile.c_str(), kmerWriteBuffer + thread_idx * KMER_FILE_BUFFER_SIZE + code * codeBufferSize, codeBufferSize, 0, writePos, 0, 0, &batchWriter};
                 }
                 const unsigned int hashDiffLowBits = getHashDiffLowBits(hashSubRange, exchange.hashSubRangeCount, hashShift, hashSubRangeRow.groupCount);
                 uint64_t prevHash = static_cast<uint64_t>(getHashSubRangeStart(hashSubRange, exchange.hashSubRangeCount, hashShift));
@@ -1187,6 +1194,8 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
         MMseqsNode::addPhaseTime(sendValues, "sending a send range", sendRangeTimer);
     }
     seqDbr.releaseDataPages();
+    batchWriter.waitWrites();
+    MMseqsNode::addPhaseSeconds(sendValues, "waiting to write k-mers", batchWriter.getWaitSeconds() / par.threads);
     delete[] kmerWriteBuffer;
     Util::releasePages(hashSeqPair, hashSeqPairCapacity * sizeof(KmerPositionBit));
     delete[] hashSeqPair;
@@ -1228,6 +1237,8 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     AssignedPairFile pairFile;
     pairFile.name = par.db2 + ".pairs." + SSTR(MMseqsNode::rank);
     pairFile.file = FileUtil::openAndDelete(pairFile.name.c_str(), "w+");
+    BatchWriter batchWriter(exchange.writeBehindMemory, par.threads, fileno(pairFile.file));
+    pairFile.batchWriter = &batchWriter;
     pairFile.bytes = 0;
     pairFile.sendRangeRowCounts.assign(exchange.sendRangeCount, 0);
     char *pairWriteBuffer = new(std::nothrow) char[par.threads * KMER_FILE_BUFFER_SIZE];
@@ -1526,8 +1537,8 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                     AssignedPairRecord *records = NULL;
                     size_t recordCapacity = 0;
                     size_t recordCount = 0;
-                    KmerCodeWriter indexWrite = {-1, NULL, NULL, 0, 0, 0, 0, 0};
-                    KmerCodeWriter targetWrite = {-1, NULL, NULL, 0, 0, 0, 0, 0};
+                    KmerCodeWriter indexWrite = {-1, NULL, NULL, 0, 0, 0, 0, 0, NULL};
+                    KmerCodeWriter targetWrite = {-1, NULL, NULL, 0, 0, 0, 0, 0, NULL};
                     // only the thread of an oversized flush writes alone
                     const auto flushRecords = [&]() {
                         SORT_SERIAL(records, records + recordCount, AssignedPairRecord::compareByPartition);
@@ -1758,6 +1769,8 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     }
     delete batchReader;
     closeReceivedFiles(receivedFiles);
+    batchWriter.waitWrites();
+    MMseqsNode::addPhaseSeconds(receiveValues, "waiting to write pairs", batchWriter.getWaitSeconds() / par.threads);
     Util::releasePages(passBuffer, outputBytes + 2 * codeBufferBytes);
     delete[] passBuffer;
     delete[] pairWriteBuffer;
@@ -1795,6 +1808,8 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     prefFiles.indexName = par.db2 + ".index." + SSTR(MMseqsNode::rank);
     prefFiles.dataFile = FileUtil::openAndDelete(prefFiles.dataName.c_str(), "w");
     prefFiles.indexFile = FileUtil::openAndDelete(prefFiles.indexName.c_str(), "w");
+    BatchWriter batchWriter(exchange.writeBehindMemory, par.threads, fileno(prefFiles.dataFile));
+    prefFiles.batchWriter = &batchWriter;
     size_t prefDataBytes = 0;
     size_t prefIndexBytes = 0;
     prefFiles.writeBuffers = new(std::nothrow) char[par.threads * 2 * KMER_FILE_BUFFER_SIZE];
@@ -2017,8 +2032,8 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                         const std::vector<KmerCodeReader> &pairReadStarts = merge.pairReadStarts;
                         const std::vector<size_t> &readRecords = merge.readRecords;
                         std::vector<size_t> &keyOffsets = merge.keyOffsets;
-                        KmerCodeWriter windowedDataWrite = {fileno(prefFiles.dataFile), prefFiles.dataName.c_str(), prefFiles.writeBuffers, KMER_FILE_BUFFER_SIZE, 0, prefDataBytes, 0, 0};
-                        KmerCodeWriter windowedIndexWrite = {fileno(prefFiles.indexFile), prefFiles.indexName.c_str(), prefFiles.writeBuffers + KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE, 0, prefIndexBytes, 0, 0};
+                        KmerCodeWriter windowedDataWrite = {fileno(prefFiles.dataFile), prefFiles.dataName.c_str(), prefFiles.writeBuffers, KMER_FILE_BUFFER_SIZE, 0, prefDataBytes, 0, 0, &batchWriter};
+                        KmerCodeWriter windowedIndexWrite = {fileno(prefFiles.indexFile), prefFiles.indexName.c_str(), prefFiles.writeBuffers + KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE, 0, prefIndexBytes, 0, 0, &batchWriter};
                         // the keys in intervals whose targets fit the second half of the buffer; the targets of key k end up before keyOffsets[k]
                         DBKeyType *intervalTargets = reinterpret_cast<DBKeyType *>(pairPassBuffer + pairPassLimit);
                         for (size_t intervalFirst = 0; intervalFirst < partitionKeys;) {
@@ -2139,6 +2154,8 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
         MMseqsNode::addPhaseTime(mergeValues, "merging a send range", mergeRangeTimer);
     }
     closeReceivedFiles(receivedPairFiles);
+    batchWriter.waitWrites();
+    MMseqsNode::addPhaseSeconds(mergeValues, "waiting to write the prefilter", batchWriter.getWaitSeconds() / par.threads);
     Util::releasePages(pairPassBuffer, pairPassBufferBytes);
     delete[] pairPassBuffer;
     Util::releasePages(pairPassTargets, pairPassTargetsSize * sizeof(DBKeyType));
@@ -2222,8 +2239,9 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     }
 
     const size_t representativeBitsMemory = exchange.hasRepresentativeBits ? ((maxSendRangeKeys + 63) / 64 + 1) * sizeof(uint64_t) : 0;
+    exchange.writeBehindMemory = memoryLimit / WRITE_BEHIND_MEMORY_DIVISOR;
     // every thread writes through two buffers at most
-    const size_t fixedMemory = representativeBitsMemory + 2 * par.threads * KMER_FILE_BUFFER_SIZE;
+    const size_t fixedMemory = representativeBitsMemory + 2 * par.threads * KMER_FILE_BUFFER_SIZE + exchange.writeBehindMemory;
     exchange.loadMemoryLimit = (fixedMemory < memoryLimit) ? static_cast<size_t>(static_cast<double>(memoryLimit - fixedMemory) * 0.95) : 0;
 
     // keys are in length descending order, so a record needs no length, and no position as the diagonal comes later
@@ -2340,9 +2358,6 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         MMseqsNode::printPhaseValues(mergeValues);
         mergeQueue.removeClaims();
         FileUtil::remove((par.db2 + ".pairs.done").c_str());
-        for (size_t node = 0; node < MMseqsNode::count; node++) {
-            FileUtil::remove((par.db2 + ".pairs." + SSTR(node)).c_str());
-        }
         // the partition rows of all nodes are sorted by key
         std::vector<char *> partitionRows;
         for (char *row = (char *) partitions.c_str(); *row != '\0'; row = Util::skipLine(row)) {
@@ -2363,6 +2378,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         MMseqsNode::waitForRunFile(par.db2 + ".merged");
         mergeQueue.removeClaims();
     }
+    // every node has read the pair file of this node; freeing a large file takes long, so no node does it for all
+    FileUtil::remove((par.db2 + ".pairs." + SSTR(MMseqsNode::rank)).c_str());
 }
 
 template void kmermatcherLinfinity<short, true, unsigned short>(Parameters &, DBReader<DBKeyType> &, BaseMatrix *, size_t);

@@ -1,5 +1,8 @@
 #include "BatchReader.h"
 #include "Debug.h"
+#include "FastSort.h"
+#include "FileUtil.h"
+#include "Timer.h"
 #include "Util.h"
 
 #include <algorithm>
@@ -331,3 +334,123 @@ void BatchReader::readWithRing(bool waitForAll) {
     } while (waitForAll && (inflightReadRequests > 0 || (readError == 0 && nextSplitReadRequest < splitReadRequests.size())));
 }
 #endif
+
+const size_t BatchWriter::BUFFER_SIZE;
+
+BatchWriter::BatchWriter(size_t memoryBytes, int maxIoThreads, int fdToDetectStorage) : currentBuffer(NULL), busyBuffers(0), isClosing(false), waitSeconds(0) {
+    // a thread also has a buffer for the pieces that it joins, so the threads take half of the memory at most
+    const size_t threads = std::max<size_t>(1, std::min<size_t>(std::min(storageConcurrency(getStorageKind(fdToDetectStorage), maxIoThreads), maxIoThreads), memoryBytes / BUFFER_SIZE / 2));
+    const size_t bufferCount = std::max<size_t>(2, memoryBytes / BUFFER_SIZE - std::min(memoryBytes / BUFFER_SIZE, threads));
+    memory = new(std::nothrow) char[(bufferCount + threads) * BUFFER_SIZE];
+    Util::checkAllocation(memory, "Can not allocate memory in BatchWriter");
+    buffers.resize(bufferCount);
+    for (size_t i = 0; i < bufferCount; i++) {
+        buffers[i].data = memory + i * BUFFER_SIZE;
+        buffers[i].bytes = 0;
+        buffers[i].copies = 0;
+        freeBuffers.push_back(&buffers[i]);
+    }
+    for (size_t i = 0; i < threads; i++) {
+        writeThreads.emplace_back(&BatchWriter::writeBuffers, this, memory + (bufferCount + i) * BUFFER_SIZE);
+    }
+}
+
+BatchWriter::~BatchWriter() {
+    waitWrites();
+    {
+        std::lock_guard<std::mutex> lock(bufferMutex);
+        isClosing = true;
+    }
+    fullCondition.notify_all();
+    for (size_t i = 0; i < writeThreads.size(); i++) {
+        writeThreads[i].join();
+    }
+    Util::releasePages(memory, (buffers.size() + writeThreads.size()) * BUFFER_SIZE);
+    delete[] memory;
+}
+
+// a buffer that takes no more bytes is written once all copies to it are done
+void BatchWriter::queueCopiedBuffer(Buffer *buffer) {
+    if (buffer != currentBuffer && buffer->copies == 0) {
+        fullBuffers.push_back(buffer);
+        fullCondition.notify_one();
+    }
+}
+
+void BatchWriter::write(int fd, const char *fileName, const char *data, size_t bytes, size_t fileOffset) {
+    for (size_t done = 0; done < bytes;) {
+        std::unique_lock<std::mutex> lock(bufferMutex);
+        if (currentBuffer == NULL && freeBuffers.empty()) {
+            Timer waitTimer;
+            freeCondition.wait(lock, [&]() { return currentBuffer != NULL || freeBuffers.empty() == false; });
+            waitSeconds += waitTimer.getTimediff();
+        }
+        if (currentBuffer == NULL) {
+            currentBuffer = freeBuffers.back();
+            freeBuffers.pop_back();
+            busyBuffers++;
+        }
+        Buffer *buffer = currentBuffer;
+        const size_t bufferOffset = buffer->bytes;
+        const size_t copyBytes = std::min(bytes - done, BUFFER_SIZE - bufferOffset);
+        const Piece piece = { fd, fileName, bufferOffset, copyBytes, fileOffset + done };
+        buffer->pieces.push_back(piece);
+        buffer->bytes += copyBytes;
+        buffer->copies++;
+        if (buffer->bytes == BUFFER_SIZE) {
+            currentBuffer = NULL;
+        }
+        lock.unlock();
+        memcpy(buffer->data + bufferOffset, data + done, copyBytes);
+        lock.lock();
+        buffer->copies--;
+        queueCopiedBuffer(buffer);
+        done += copyBytes;
+    }
+}
+
+void BatchWriter::waitWrites() {
+    std::unique_lock<std::mutex> lock(bufferMutex);
+    if (currentBuffer != NULL) {
+        Buffer *buffer = currentBuffer;
+        currentBuffer = NULL;
+        queueCopiedBuffer(buffer);
+    }
+    freeCondition.wait(lock, [&]() { return busyBuffers == 0; });
+}
+
+void BatchWriter::writeBuffers(char *joinedPieces) {
+    std::unique_lock<std::mutex> lock(bufferMutex);
+    while (true) {
+        fullCondition.wait(lock, [&]() { return fullBuffers.empty() == false || isClosing; });
+        if (fullBuffers.empty()) {
+            return;
+        }
+        Buffer *buffer = fullBuffers.front();
+        fullBuffers.pop_front();
+        lock.unlock();
+        std::vector<Piece> &pieces = buffer->pieces;
+        SORT_SERIAL(pieces.begin(), pieces.end(), Piece::compareByFile);
+        // the pieces that follow each other in their file are one write
+        for (size_t first = 0, last = 0; first < pieces.size(); first = last) {
+            size_t joinedBytes = 0;
+            for (last = first; last < pieces.size() && pieces[last].fd == pieces[first].fd && pieces[last].fileOffset == pieces[first].fileOffset + joinedBytes; last++) {
+                joinedBytes += pieces[last].bytes;
+            }
+            const char *writeData = buffer->data + pieces[first].bufferOffset;
+            if (last > first + 1) {
+                writeData = joinedPieces;
+                for (size_t piece = first, joinedPos = 0; piece < last; joinedPos += pieces[piece].bytes, piece++) {
+                    memcpy(joinedPieces + joinedPos, buffer->data + pieces[piece].bufferOffset, pieces[piece].bytes);
+                }
+            }
+            FileUtil::pwriteAll(pieces[first].fd, pieces[first].fileName, writeData, joinedBytes, pieces[first].fileOffset);
+        }
+        pieces.clear();
+        buffer->bytes = 0;
+        lock.lock();
+        freeBuffers.push_back(buffer);
+        busyBuffers--;
+        freeCondition.notify_all();
+    }
+}

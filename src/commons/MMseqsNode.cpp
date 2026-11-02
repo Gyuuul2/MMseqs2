@@ -977,19 +977,16 @@ void MMseqsNode::ClusterMemberLookup::find(DBKeyType key, Cursor &cursor) const 
     const Anchor *end = anchors.data() + range->lastAnchor;
     const Anchor *upper = std::lower_bound(begin, end, key,
         [](const Anchor &entry, DBKeyType target) { return entry.key < target; });
-    size_t low = (upper == begin) ? blocks[block].pos : (upper - 1)->offset;
-    size_t high = (upper == end) ? blocks[block].end : upper->offset + sizeof(ClusterPair);
-    while (low < high) {
-        const size_t middle = low + ((high - low) / sizeof(ClusterPair) / 2) * sizeof(ClusterPair);
-        if (readPair(block, middle).repKey < key) {
-            low = middle + sizeof(ClusterPair);
-        } else {
-            high = middle;
-        }
-    }
-    if (low < blocks[block].end && readPair(block, low).repKey == key) {
+    cursor.bufferBegin = (upper == begin) ? blocks[block].pos : (upper - 1)->offset;
+    cursor.bufferEnd = (upper == end) ? blocks[block].end : upper->offset + sizeof(ClusterPair);
+    // the pairs between the anchors in one read, which next goes on with
+    cursor.buffer.resize((cursor.bufferEnd - cursor.bufferBegin) / sizeof(ClusterPair));
+    FileUtil::preadAll(fileno(blocks[block].file), prefix.c_str(), reinterpret_cast<char *>(cursor.buffer.data()), cursor.bufferEnd - cursor.bufferBegin, cursor.bufferBegin);
+    const std::vector<ClusterPair>::const_iterator pair = std::lower_bound(cursor.buffer.cbegin(), cursor.buffer.cend(), key,
+        [](const ClusterPair &entry, DBKeyType target) { return entry.repKey < target; });
+    if (pair != cursor.buffer.cend() && pair->repKey == key) {
         cursor.block = block;
-        cursor.offset = low;
+        cursor.offset = cursor.bufferBegin + (pair - cursor.buffer.cbegin()) * sizeof(ClusterPair);
     }
 }
 
