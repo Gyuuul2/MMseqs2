@@ -1767,7 +1767,7 @@ static void runKmermatcherWithoutDiagonal(Parameters &par, DBReader<DBKeyType> &
 template <typename T, bool includeAdjacency, typename L>
 static void runKmermatcherWithDiagonal(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, size_t memoryLimit, size_t totalKmers) {
     size_t dbKeySize = seqDbr.getLastKey() +1 ;
-    size_t totalSizeNeeded = computeMemoryNeededLinearfilter<T, includeAdjacency, L>(totalKmers) * (par.needWriteBuffer ? 2 : 1);
+    size_t totalSizeNeeded = (sizeof(KmerPosition<T, includeAdjacency, L>) + (par.needWriteBuffer ? sizeof(KmerPosition<T, false, L>) : 0)) * totalKmers;
 
     size_t countTableMemory = 0;
     if (par.includeCountTable) {
