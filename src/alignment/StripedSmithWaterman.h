@@ -177,7 +177,7 @@ public:
                         const double filters,
                         EvalueComputation * filterd,
                         const int covMode, const float covThr, const float correlationScoreWeight,
-                        const int32_t maskLen, const s_align *forward = NULL, bool wordFirst = false);
+                        const int32_t maskLen, const s_align *forward = NULL, bool wordFirst = false, bool keepByteTraceback = false);
 
 
     /*!	@function computed ungapped alignment score
@@ -301,7 +301,7 @@ private:
                         const double filters,
                         EvalueComputation * filterd,
                         const int covMode, const float covThr, const float correlationScoreWeight,
-                        const int32_t maskLen, const s_align *forward, bool wordFirst);
+                        const int32_t maskLen, const s_align *forward, bool wordFirst, bool keepByteTraceback);
 
     template <unsigned int type>
     SmithWaterman::cigar *banded_sw(const unsigned char *db_sequence, const int8_t *query_sequence,

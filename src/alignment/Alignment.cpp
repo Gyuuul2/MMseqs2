@@ -308,8 +308,8 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
             std::string queryToWrap;
             queryToWrap.reserve(maxSeqLen * 2);
 
-            // --aligner-mode 1-3: the forward passes of the hits of a query, several at once (SWIPE)
-            const bool swipeLanes = (alignerMode != Parameters::ALIGNER_MODE_DEFAULT && wrappedScoring == false && gapOpen >= gapExtend
+            // --aligner-mode 1: the forward passes of the hits of a query, several at once (SWIPE)
+            const bool swipeLanes = (alignerMode == Parameters::ALIGNER_MODE_SWIPE && wrappedScoring == false && gapOpen >= gapExtend
                                      && Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_AMINO_ACIDS)
                                      && Parameters::isEqualDbtype(targetSeqType, Parameters::DBTYPE_AMINO_ACIDS));
             SwipeAligner *swipe = swipeLanes ? new SwipeAligner(m, maxMatcherSeqLen, compBiasCorrection, compBiasCorrectionScale, gapOpen, gapExtend) : NULL;
@@ -320,10 +320,6 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
             std::vector<s_align> swipeAligns;
             std::vector<long> swipeEntry;
             std::vector<size_t> swipeIds;
-            std::vector<size_t> swipePassed;
-            std::vector<const unsigned char *> swipeBackwardTargets;
-            std::vector<s_align> swipeBackwardAligns;
-            int swipeWord = 0;
 
             const char* words[10];
 
@@ -357,8 +353,7 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
                     qSeq.mapSequence(qId, queryDbKey, querySeqData, queryLen);
                     matcher.initQuery(&qSeq);
                     if (swipe != NULL) {
-                        // the hits that can be covered, in hit order; whole lane batches of them align in the lanes once there are two,
-                        // the rest one pair at a time
+                        // the hits that can be covered, in hit order; the incomplete lane batch is aligned one pair at a time
                         swipeSequences.clear();
                         swipeOffsets.clear();
                         swipeLengths.clear();
@@ -368,6 +363,10 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
                             Util::parseKey(hitData, buffer);
                             const DBKeyType dbKey = Util::fast_atoi<DBKeyType>(buffer);
                             const size_t dbId = tdbr->getId(dbKey);
+                            if (dbId == DB_ENTRY_NOT_FOUND) {
+                                Debug(Debug::ERROR) << "Sequence " << dbKey << " is required in the prefiltering, but is not contained in the target sequence database!\nPlease check your database.\n";
+                                EXIT(EXIT_FAILURE);
+                            }
                             const bool isIdentity = (queryDbKey == dbKey && (includeIdentity || sameQTDB));
                             swipeEntry.push_back(-1);
                             if (isIdentity == false && Util::canBeCovered(canCovThr, covMode, static_cast<float>(origQueryLen), static_cast<float>(tdbr->getSeqLen(dbId)))) {
@@ -375,16 +374,20 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
                                 swipeIds.push_back(dbId);
                             }
                         }
-                        // a fixed lane count, so that which hits align in the lanes does not depend on the queries of the thread before
                         const size_t lanes = VECSIZE_INT * 2;
-                        const size_t count = (swipeIds.size() < 2 * lanes) ? 0 : swipeIds.size() / lanes * lanes;
+                        const size_t count = swipeIds.size() / lanes * lanes;
                         for (size_t h = 0; h < swipeEntry.size(); h++) {
                             if (swipeEntry[h] >= static_cast<long>(count)) {
                                 swipeEntry[h] = -1;
                             }
                         }
                         for (size_t i = 0; i < count; i++) {
-                            dbSeq.mapSequence(swipeIds[i], tdbr->getDbKey(swipeIds[i]), tdbr->getData(swipeIds[i], thread_idx), tdbr->getSeqLen(swipeIds[i]));
+                            char *dbSeqData = tdbr->getData(swipeIds[i], thread_idx);
+                            if (dbSeqData == NULL) {
+                                Debug(Debug::ERROR) << "Sequence " << tdbr->getDbKey(swipeIds[i]) << " is required in the prefiltering, but is not contained in the target sequence database!\nPlease check your database.\n";
+                                EXIT(EXIT_FAILURE);
+                            }
+                            dbSeq.mapSequence(swipeIds[i], tdbr->getDbKey(swipeIds[i]), dbSeqData, tdbr->getSeqLen(swipeIds[i]));
                             swipeOffsets.push_back(swipeSequences.size());
                             swipeSequences.insert(swipeSequences.end(), dbSeq.numSequence, dbSeq.numSequence + dbSeq.L);
                             swipeLengths.push_back(dbSeq.L);
@@ -393,38 +396,11 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
                             swipe->initQuery(&qSeq);
                             swipeTargets.resize(count);
                             swipeAligns.resize(count);
-                            size_t wide = 0;
                             for (size_t i = 0; i < count; i++) {
                                 swipeTargets[i] = swipeSequences.data() + swipeOffsets[i];
-                                swipeAligns[i].word = swipeWord;
+                                swipeAligns[i].word = 0;
                             }
                             swipe->alignForward(count, swipeTargets.data(), swipeLengths.data(), swipeAligns.data());
-                            for (size_t i = 0; i < count; i++) {
-                                wide += (swipeAligns[i].word >= 1);
-                            }
-                            swipeWord = (2 * wide > count) ? 1 : 0;
-                            // backward passes of the forward passes that can still meet the e-value and coverage
-                            if (alignerMode != Parameters::ALIGNER_MODE_SWIPE_BLOCK && swMode != Matcher::SCORE_ONLY) {
-                                swipePassed.clear();
-                                for (size_t i = 0; i < count; i++) {
-                                    const s_align &forward = swipeAligns[i];
-                                    if (forward.word < 2 && forward.dbEndPos1 >= 0
-                                        && evaluer.computeEvalue(forward.score1, qSeq.L) <= evalThr
-                                        && Util::hasCoverage(covThr, covMode, SmithWaterman::computeCov(0, forward.qEndPos1, qSeq.L), SmithWaterman::computeCov(0, forward.dbEndPos1, swipeLengths[i]))) {
-                                        swipePassed.push_back(i);
-                                    }
-                                }
-                                swipeBackwardTargets.resize(swipePassed.size());
-                                swipeBackwardAligns.resize(swipePassed.size());
-                                for (size_t p = 0; p < swipePassed.size(); p++) {
-                                    swipeBackwardTargets[p] = swipeTargets[swipePassed[p]];
-                                    swipeBackwardAligns[p] = swipeAligns[swipePassed[p]];
-                                }
-                                swipe->alignBackward(swipePassed.size(), swipeBackwardTargets.data(), swipeBackwardAligns.data());
-                                for (size_t p = 0; p < swipePassed.size(); p++) {
-                                    swipeAligns[swipePassed[p]] = swipeBackwardAligns[p];
-                                }
-                            }
                         }
                     }
                 }
@@ -471,7 +447,8 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
 
                     // calculate Smith-Waterman alignment
 
-                    Matcher::result_t res = matcher.getSWResult(&dbSeq, static_cast<int>(diagonal), isReverse, covMode, covThr, evalThr, swMode, seqIdMode, isIdentity, wrappedScoring, forward);
+                    Matcher::result_t res = matcher.getSWResult(&dbSeq, static_cast<int>(diagonal), isReverse, covMode, covThr, evalThr, swMode, seqIdMode, isIdentity,
+                                                                 wrappedScoring, forward, false, forward != NULL);
                     alignmentsNum++;
 
                     if (isIdentity) {

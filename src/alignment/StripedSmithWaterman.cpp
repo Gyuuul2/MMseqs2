@@ -867,16 +867,16 @@ s_align SmithWaterman::ssw_align (
         const double  evalueThr,
         EvalueComputation * evaluer,
         const int covMode, const float covThr, const float correlationScoreWeight,
-        const int32_t maskLen, const s_align *forward, bool wordFirst) {
+        const int32_t maskLen, const s_align *forward, bool wordFirst, bool keepByteTraceback) {
     resizeTarget(db_length);
     s_align alignment;
     // check if both query and target are profiles
 	if (profile->isProfile) {
         alignment = ssw_align_private<SmithWaterman::PROFILE_SEQ>(db_num_sequence, db_length, backtrace, gap_open,
-                                                                  gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen, forward, wordFirst);
+                                                                  gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen, forward, wordFirst, keepByteTraceback);
     } else {
         alignment = ssw_align_private<SmithWaterman::SEQ_SEQ>(db_num_sequence, db_length, backtrace, gap_open,
-                                                              gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen, forward, wordFirst);
+                                                              gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen, forward, wordFirst, keepByteTraceback);
     }
     return alignment;
 }
@@ -893,12 +893,15 @@ s_align SmithWaterman::ssw_align_private (
 	const double  evalueThr,
 	EvalueComputation * evaluer,
 	const int covMode, const float covThr, const float correlationScoreWeight,
-	const int32_t maskLen, const s_align *forward, bool wordFirst) {
+	const int32_t maskLen, const s_align *forward, bool wordFirst, bool keepByteTraceback) {
 
 	int32_t query_length = profile->query_length;
 
 	// find the alignment position, unless the forward pass of several targets at once (SWIPE) found it
 	s_align align = (forward != NULL) ? *forward : alignScoreEndPos<type>(db_sequence, db_length, gap_open, gap_extend, maskLen, wordFirst);
+	if (forward != NULL && keepByteTraceback && align.word == 1 && align.score1 + profile->bias < UCHAR_MAX) {
+		align.word = 0;
+	}
 
 	// no residue could be aligned
 	if (align.dbEndPos1 == -1) {
@@ -916,8 +919,8 @@ s_align SmithWaterman::ssw_align_private (
 		return align;
 	}
 
-	// byte SW is faster than the block aligner on the short alignments it can score, a SWIPE start goes to the banded traceback
-	if (forward == NULL ? align.word == 0 : align.dbStartPos1 != -1) {
+	// Keep the byte traceback for SWIPE scores that the default forward pass would score in bytes.
+	if ((forward == NULL || keepByteTraceback) ? align.word == 0 : align.dbStartPos1 != -1) {
 		return alignStartPosBacktrace<type>(db_sequence, db_length, gap_open, gap_extend, alignmentMode, backtrace, align, evaluer, covMode, covThr, correlationScoreWeight, maskLen);
 	}
 
@@ -1326,9 +1329,9 @@ s_align SmithWaterman::alignStartPosBacktrace (
 }
 
 template
-s_align SmithWaterman::ssw_align_private<SmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t, const s_align*, bool);
+s_align SmithWaterman::ssw_align_private<SmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t, const s_align*, bool, bool);
 template
-s_align SmithWaterman::ssw_align_private<SmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t, const s_align*, bool);
+s_align SmithWaterman::ssw_align_private<SmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t, const s_align*, bool, bool);
 
 template
 s_align SmithWaterman::alignScoreEndPos<SmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const int32_t, bool);

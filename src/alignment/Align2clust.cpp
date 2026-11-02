@@ -1277,7 +1277,7 @@ static void printSwipeLanes() {
     }
 }
 
-// per thread buffers of --aligner-mode 1-3: the cluster members of a rep that go through the SWIPE lanes
+// per thread buffers of --align2clust-aligner-mode 1-3: the cluster members of a rep that go through the SWIPE lanes
 struct SwipeBatch {
     SwipeAligner aligner;
     EvalueComputation &evaluer;
@@ -1354,7 +1354,7 @@ struct SwipeBatch {
     }
 };
 
-// per thread buffers of --aligner-mode 3 on mode 3 DBs: the targets of the reps of a batch that alignTarget queued with their query and seed
+// per thread buffers of --align2clust-aligner-mode 3 on mode 3 DBs: the targets of the reps of a batch that alignTarget queued with their query and seed
 // for the SWIPE extensions, their backward extensions and the pairs that do not fit the lanes; a rep and its query go to the queue with
 // its first queued target
 struct SwipeTargets {
@@ -1454,7 +1454,7 @@ struct MemberGate {
     bool live;
 };
 
-// per thread buffers of the member gates; with SWIPE (--aligner-mode 1-3) the gates of all targets of a rep can wait and go in rounds
+// per thread buffers of the member gates; with SWIPE (--align2clust-aligner-mode 1-3) the gates of all targets of a rep can wait and go in rounds
 // that share the lanes (deferGates)
 struct ClusterMembers {
     std::vector<MemberGate> gates;
@@ -1742,7 +1742,7 @@ static bool alignMemberRound(const Parameters &par, BlockAligner &blockAligner, 
 
 // whether every --filter-cludb-file member of the cluster of the target of each gate meets the clustering criteria against the query
 // (MemberGate::live); the members that cannot be covered fail first and the most different lengths go next, with the decision of the
-// member order; with SWIPE (--aligner-mode 1-3) the gates go in rounds of 1, 2, 4, ... members each, and the gapped alignments of a
+// member order; with SWIPE (--align2clust-aligner-mode 1-3) the gates go in rounds of 1, 2, 4, ... members each, and the gapped alignments of a
 // round of all gates share the lanes once they fill them
 static void alignClusterMembers(const Parameters &par, BlockAligner &blockAligner, Matcher &matcher, bool &matcherInitialized, Sequence &query, Sequence &element,
                                 DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer,
@@ -1815,7 +1815,7 @@ static bool swipeExtensionsPass(const Parameters &par, SwipeTargets &swipe, size
     return Alignment::checkCriteria(result, false, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr);
 }
 
-// the gapped alignments of the targets that alignTarget queued (--aligner-mode 3) in SWIPE lanes, the steps of BlockAligner::bandedalign;
+// the gapped alignments of the targets that alignTarget queued (--align2clust-aligner-mode 3) in SWIPE lanes, the steps of BlockAligner::bandedalign;
 // the ones whose rep or which were assigned since are left out
 template <typename Assigned>
 static void alignTargetsSwipe(const Parameters &par, SwipeTargets &swipe, const Assigned &isAssigned, std::vector<ClusterPair> &pairs) {
@@ -3638,7 +3638,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             BlockAligner blockAligner(Parameters::DBTYPE_AMINO_ACIDS, maxSeqLen, scoring.subMat, &scoring.fastMatrix,
                                      &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
                                      -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
-            // --aligner-mode 3: the gapped alignments of the reps of a batch go through the SWIPE lanes together
+            // --align2clust-aligner-mode 3: the gapped alignments of the reps of a batch go through the SWIPE lanes together
             const bool swipeLanes = par.align2clustAlignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid();
             SwipeTargets swipe(par, scoring.subMat, scoring.evaluer, maxSeqLen);
             std::vector<ClusterPair> pairs;

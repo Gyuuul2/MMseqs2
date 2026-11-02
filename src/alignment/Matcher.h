@@ -157,7 +157,7 @@ public:
     // with the word pass first if the byte pass is expected to overflow
     result_t getSWResult(Sequence* dbSeq, const int diagonal, bool isReverse, const int covMode, const float covThr, const double evalThr,
                          unsigned int alignmentMode, unsigned int seqIdMode, bool isIdentical, bool wrappedScoring=false, const s_align *forward=NULL,
-                         bool wordFirst=false);
+                         bool wordFirst=false, bool keepByteTraceback=false);
 
     // need for sorting the results
     static bool compareHits(const result_t &first, const result_t &second) {
