@@ -37,6 +37,7 @@ static size_t sentOtherNodeExchangeBytes = 0;
 static std::map<std::string, std::vector<std::pair<char *, size_t> > > ownExchangeRecords;
 
 void MMseqsNode::init() {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     // mpirun (Open MPI, then PMI of MPICH/Intel MPI) before SLURM, whose variables mpirun tasks inherit from the allocation
     const char *rankVariables[][2] = { { "OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE" }, { "PMI_RANK", "PMI_SIZE" }, { "SLURM_PROCID", "SLURM_STEP_NUM_TASKS" } };
     for (size_t i = 0; i < sizeof(rankVariables) / sizeof(rankVariables[0]); i++) {
@@ -107,6 +108,8 @@ static bool isListed(const std::string &file) {
     return isFound;
 }
 
+static const time_t DIRECTORY_WAIT_SECONDS = 60;
+
 static int openReadOnly(const std::string &file, int flags = O_RDONLY) {
     int fd;
     do {
@@ -120,29 +123,46 @@ static int openReadOnly(const std::string &file, int flags = O_RDONLY) {
 // that a later publish replaces while it is read fails with ESTALE and is read again by the next poll
 static std::string readPolledFile(const std::string &file) {
     int fd = openReadOnly(file, O_RDONLY | O_CREAT);
-    const int openError = (fd < 0) ? errno : 0;
+    int openError = (fd < 0) ? errno : 0;
+    // with O_CREAT, ENOENT means that the directory does not exist on this machine, or that NFS still remembers it missing
+    const time_t start = time(NULL);
+    for (unsigned int polls = 0; openError == ENOENT; polls++) {
+        if (time(NULL) - start >= DIRECTORY_WAIT_SECONDS) {
+            Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(openError) << ". Its directory must be shared by all nodes\n";
+            EXIT(EXIT_FAILURE);
+        }
+        MMseqsNode::sleepBeforePoll(polls, 7);
+        FileUtil::refreshDirectory(FileUtil::dirName(file));
+        fd = openReadOnly(file, O_RDONLY | O_CREAT);
+        openError = (fd < 0) ? errno : 0;
+    }
     if (fd < 0) {
-        if (openError == ENOENT || openError == ESTALE) {
+        if (openError == ESTALE) {
             return std::string();
         }
-        Debug(Debug::ERROR) << "Cannot open " << file << "\n";
+        Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(openError) << "\n";
         EXIT(EXIT_FAILURE);
     }
     std::string content;
     struct stat sb;
     bool isStale = false;
     if (fstat(fd, &sb) != 0) {
-        isStale = errno == ESTALE;
+        const int statError = errno;
+        isStale = statError == ESTALE;
         if (isStale == false) {
-            Debug(Debug::ERROR) << "Cannot read " << file << "\n";
+            Debug(Debug::ERROR) << "Cannot read " << file << ": " << strerror(statError) << "\n";
             EXIT(EXIT_FAILURE);
         }
     }
     content.resize(isStale ? 0 : sb.st_size);
     for (size_t done = 0; done < content.size();) {
         const ssize_t count = pread(fd, &content[done], content.size() - done, done);
-        if (count < 0 && errno != ESTALE) {
-            Debug(Debug::ERROR) << "Cannot read " << file << "\n";
+        const int readError = (count < 0) ? errno : 0;
+        if (readError == EINTR) {
+            continue;
+        }
+        if (readError != 0 && readError != ESTALE) {
+            Debug(Debug::ERROR) << "Cannot read " << file << ": " << strerror(readError) << "\n";
             EXIT(EXIT_FAILURE);
         }
         if (count <= 0) {
@@ -155,20 +175,33 @@ static std::string readPolledFile(const std::string &file) {
     return isStale ? std::string() : content;
 }
 
-static const size_t WAIT_WARNING_SECONDS = 600;
+MMseqsNode::WaitWarning::WaitWarning(size_t seconds) : start(time(NULL)), firstSeconds(seconds), nextSeconds(seconds) {}
+
+void MMseqsNode::WaitWarning::reset() {
+    start = time(NULL);
+    nextSeconds = firstSeconds;
+}
+
+void MMseqsNode::WaitWarning::check(const std::string &what) {
+    if (static_cast<size_t>(time(NULL) - start) >= nextSeconds) {
+        Debug(Debug::ERROR) << "Node " << rank << " waited " << nextSeconds << " s for " << what << ". Check that no node has died and that all nodes share this directory\n";
+        nextSeconds *= 2;
+    }
+}
+
+// polls of a wait of up to 5 s are at most 160 ms apart, then twice as far every 32 polls, as all nodes wait in a long barrier
+static void sleepInWait(unsigned int polls) {
+    MMseqsNode::sleepBeforePoll(polls, std::min(8u, 4 + polls / 32));
+}
 
 // the content of file once it is published; a published file is never empty
 static std::string waitForFile(const std::string &file) {
     std::string content = readPolledFile(file);
-    Timer timer;
-    size_t warnSeconds = WAIT_WARNING_SECONDS;
+    MMseqsNode::WaitWarning warning;
     for (unsigned int polls = 0; content.empty(); polls++) {
-        MMseqsNode::sleepBeforePoll(polls);
+        sleepInWait(polls);
+        warning.check(file);
         content = readPolledFile(file);
-        if (content.empty() && timer.getTimediff() >= warnSeconds) {
-            Debug(Debug::WARNING) << "Waited " << warnSeconds << " s for " << file << "\n";
-            warnSeconds *= 2;
-        }
     }
     return content;
 }
@@ -193,8 +226,10 @@ std::string MMseqsNode::readFile(const std::string &file) {
 // a file of another run is read again until this run replaces it
 std::string MMseqsNode::waitForRunFile(const std::string &file) {
     std::string content = waitForFile(file);
+    WaitWarning warning;
     for (unsigned int polls = 0; content.compare(0, runId.size(), runId) != 0; polls++) {
-        sleepBeforePoll(polls);
+        sleepInWait(polls);
+        warning.check(file);
         content = waitForFile(file);
     }
     return content.substr(runId.size());
@@ -240,8 +275,10 @@ bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &by
 }
 
 void MMseqsNode::waitForLog(const std::string &log, size_t &key, size_t &bytes) {
+    WaitWarning warning;
     for (unsigned int polls = 0; readLogProgress(log, key, bytes) == false; polls++) {
-        sleepBeforePoll(polls);
+        sleepInWait(polls);
+        warning.check(log + ".progress");
     }
 }
 

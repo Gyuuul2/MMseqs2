@@ -8,6 +8,8 @@ notExists() {
    [ ! -f "$1" ]
 }
 
+# srun ends the other tasks of a step when one fails, they would wait for it forever
+export SLURM_KILL_BAD_EXIT=1
 
 if notExists "${TMP_PATH}/input.dbtype"; then
     # shellcheck disable=SC2086

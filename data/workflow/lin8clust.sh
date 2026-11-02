@@ -12,6 +12,9 @@ notExists() {
     return 0
 }
 
+# srun ends the other tasks of a step when one fails, they would wait for it forever
+export SLURM_KILL_BAD_EXIT=1
+
 [ "$#" -ne 3 ] && echo "Please provide <sequenceDB> <outDB> <tmp>" && exit 1;
 # check if files exist
 [ ! -f "$1.dbtype" ] && echo "$1.dbtype not found!" && exit 1;

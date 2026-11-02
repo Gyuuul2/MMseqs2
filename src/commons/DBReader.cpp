@@ -1789,6 +1789,10 @@ void DBReader<T>::removeDb(const std::string &databaseName){
     if (FileUtil::fileExists(nodeInfoFile.c_str())) {
         FileUtil::remove(nodeInfoFile.c_str());
     }
+    std::string mergedFile = databaseName + ".merged";
+    if (FileUtil::fileExists(mergedFile.c_str())) {
+        FileUtil::remove(mergedFile.c_str());
+    }
 }
 
 typedef void (*DbAction)(const std::string &, const std::string &);

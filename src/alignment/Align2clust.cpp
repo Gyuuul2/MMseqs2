@@ -3261,8 +3261,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             }
             std::vector<unsigned char> isReceived(nodes, 0);
             std::vector<time_t> missingSliceSince(nodes, 0);
+            std::vector<unsigned int> missingSliceAttempts(nodes, 0);
             std::vector<time_t> lastDirectoryRefresh(nodes, 0);
             std::vector<time_t> missingRequestSince(nodes, 0);
+            std::vector<unsigned int> missingRequestAttempts(nodes, 0);
             std::vector<time_t> lastRequestDirectoryRefresh(nodes, 0);
             std::vector<DBKeyType> requestKeys;
             std::vector<size_t> requestOffsets;
@@ -3274,6 +3276,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 size_t bytes;
             };
             std::vector<SliceRead> sliceReads;
+            // the attempts in a row, as the time alone includes the work between two attempts
+            const auto isMissingTooLong = [](time_t &missingSince, unsigned int &attempts, time_t now) {
+                if (attempts++ == 0) {
+                    missingSince = now;
+                }
+                return attempts >= 100 && now - missingSince >= 60;
+            };
+            MMseqsNode::WaitWarning waitWarning;
             RepWindow *requestedWindow = NULL;
             size_t flush = 0;
             bool isLastRequested = false;
@@ -3354,9 +3364,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 Debug(Debug::ERROR) << "Cannot open sequence slice " << receivedFiles[home] << ": " << strerror(lastError) << "\n";
                                 EXIT(EXIT_FAILURE);
                             }
-                            if (missingSliceSince[home] == 0) {
-                                missingSliceSince[home] = now;
-                            } else if (now - missingSliceSince[home] >= 60) {
+                            if (isMissingTooLong(missingSliceSince[home], missingSliceAttempts[home], now)) {
                                 Debug(Debug::ERROR) << "Cannot open complete sequence slice " << receivedFiles[home] << " (expected "
                                                     << MMseqsNode::EXCHANGE_SLICE_HEADER_BYTES + sliceEnd - sliceBegin << " bytes, observed "
                                                     << (observedBytes == SIZE_MAX ? std::string("unavailable") : std::to_string(observedBytes))
@@ -3421,9 +3429,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 if (sliceFailed[i] || closeError != 0) {
                                     isReceived[home] = 0;
                                     const time_t now = time(NULL);
-                                    if (missingSliceSince[home] == 0) {
-                                        missingSliceSince[home] = now;
-                                    } else if (now - missingSliceSince[home] >= 60) {
+                                    if (isMissingTooLong(missingSliceSince[home], missingSliceAttempts[home], now)) {
                                         Debug(Debug::ERROR) << "Cannot read complete sequence slice " << receivedFiles[home]
                                                             << " (generation " << nodeReceived[home] << "; error " << error << ")\n";
                                         EXIT(EXIT_FAILURE);
@@ -3431,7 +3437,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                     isComplete = false;
                                 } else {
                                     MMseqsNode::truncateExchangeSlice(receivedFiles[home]);
-                                    missingSliceSince[home] = 0;
+                                    missingSliceAttempts[home] = 0;
                                     nodeReceived[home]++;
                                 }
                             }
@@ -3491,9 +3497,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 Debug(Debug::ERROR) << "Cannot read sequence request " << requestFiles[node] << ": " << strerror(lastError) << "\n";
                                 EXIT(EXIT_FAILURE);
                             }
-                            if (missingRequestSince[node] == 0) {
-                                missingRequestSince[node] = now;
-                            } else if (now - missingRequestSince[node] >= 60) {
+                            if (isMissingTooLong(missingRequestSince[node], missingRequestAttempts[node], now)) {
                                 Debug(Debug::ERROR) << "Cannot read complete sequence request " << requestFiles[node] << " (expected "
                                                     << requestTotal << " bytes, observed "
                                                     << (observedBytes == SIZE_MAX ? std::string("unavailable") : std::to_string(observedBytes))
@@ -3504,7 +3508,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             }
                             break;
                         }
-                        missingRequestSince[node] = 0;
+                        missingRequestAttempts[node] = 0;
                         nodeRequests[node]++;
                         hasWorked = true;
                         requestOffsets.resize(requestKeys.size() + 1);
@@ -3537,6 +3541,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     polls = 0;
                 } else {
                     MMseqsNode::sleepBeforePoll(polls++, (requestedWindow != NULL || nextRequest != NULL) ? 4 : 7);
+                }
+                // the main thread aligns while it requests nothing, so that is no wait
+                if (hasWorked || (requestedWindow == NULL && nextRequest == NULL && isLastRequested == false)) {
+                    waitWarning.reset();
+                } else {
+                    waitWarning.check(requestedWindow != NULL ? served + " of other nodes" : (nextRequest != NULL ? assignedChanges : requests + " of other nodes"));
                 }
             }
         });
@@ -4101,6 +4111,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     size_t peakSetCoverMemberPoolBytes = 0;
     Timer clusterTimer;
     unsigned int polls = 0;
+    MMseqsNode::WaitWarning waitWarning;
     for (size_t clusteredKey = 0; clusteredKey < orderKeyEnd;) {
         Timer pollTimer;
         bool hasNewProgress = false;
@@ -4118,17 +4129,26 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             nodeLogBytes[node] = logBytes;
         }
         size_t doneRepKey = orderKeyEnd;
+        size_t slowestNode = 0;
         for (size_t node = 0; node < MMseqsNode::count; node++) {
-            doneRepKey = std::min(doneRepKey, nodeHasProgress[node] ? nodeRepKeys[node] : 0);
+            const size_t nodeRepKey = nodeHasProgress[node] ? nodeRepKeys[node] : 0;
+            if (nodeRepKey < doneRepKey) {
+                doneRepKey = nodeRepKey;
+                slowestNode = node;
+            }
         }
         if (doneRepKey <= clusteredKey) {
-            if (hasNewProgress == false) {
+            if (hasNewProgress) {
+                waitWarning.reset();
+            } else {
                 MMseqsNode::sleepBeforePoll(polls++);
+                waitWarning.check(accepted + "." + SSTR(slowestNode) + ".progress");
             }
             waitSeconds += pollTimer.getTimediff();
             continue;
         }
         polls = 0;
+        waitWarning.reset();
         Timer stepTimer;
 
         // read every log up to doneRepKey after its tail; past nodeStepWords a log ends the step before its next rep, but the rep of clusteredKey is read whole

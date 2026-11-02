@@ -51,6 +51,18 @@ public:
 
     // sleeps before poll number polls of a file that another node publishes: ten milliseconds, twice as long each poll, up to 10 << maxShift milliseconds
     static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
+    // every node tells of a wait for what that takes seconds, then twice as long each time, as Debug::WARNING prints on the master only
+    class WaitWarning {
+    public:
+        explicit WaitWarning(size_t seconds = 600);
+        void check(const std::string &what);
+        void reset();
+
+    private:
+        time_t start;
+        const size_t firstSeconds;
+        size_t nextSeconds;
+    };
     static void publishFile(const std::string &file, const std::string &content);
     // reads a file that an earlier step wrote
     static std::string readFile(const std::string &file);
