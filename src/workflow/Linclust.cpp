@@ -60,6 +60,9 @@ int linclust(int argc, const char **argv, const Command& command) {
         Debug(Debug::WARNING) << "--switch-consensus-rep requires --linclust-version 2; ignoring.\n";
         par.switchConsensusRep = false;
     }
+    if (par.alignerMode != Parameters::ALIGNER_MODE_DEFAULT && par.linclustVersion == Parameters::LINCLUST_VERSION2) {
+        Debug(Debug::WARNING) << "--aligner-mode applies to align, --linclust-version 2 uses --align2clust-aligner-mode; ignoring.\n";
+    }
     if (par.switchConsensusRep) {
         par.includeAlignFiles = true;
         par.addBacktrace = true;

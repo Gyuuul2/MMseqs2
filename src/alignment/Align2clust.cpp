@@ -1562,9 +1562,9 @@ static void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &mat
                 members.gates[members.poolGates[swipe.entries[l]]].live = false;
             }
         }
-        if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE) {
+        if (par.align2clustAlignerMode == Parameters::ALIGNER_MODE_SWIPE) {
             swipe.aligner.alignBackward(laneCount, swipe.targets.data(), swipe.aligns.data());
-        } else if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK) {
+        } else if (par.align2clustAlignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK) {
             swipe.backtraces.resize(laneCount);
             swipe.columnEnds.resize(laneCount);
             swipe.minScores.resize(laneCount);
@@ -1590,7 +1590,7 @@ static void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &mat
         Matcher::result_t res_element;
         if (l == SIZE_MAX || swipe.aligns[l].word >= 2) {
             res_element = matcher.getSWResult(&element, 0, false, par.covMode, par.covThr, par.evalThr, swMode, par.seqIdMode, false);
-        } else if (par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK) {
+        } else if (par.align2clustAlignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK) {
             res_element = swipeResult(par, swipe.evaluer, elementKey, swipe.minScores[l], swipe.aligns[l], query.L, element.L, swipe.backtraces[l]);
         } else {
             res_element = matcher.getSWResult(&element, 0, false, par.covMode, par.covThr, par.evalThr, swMode, par.seqIdMode, false, false, &swipe.aligns[l]);
@@ -2304,7 +2304,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                  -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
         std::vector<std::pair<size_t, unsigned short>> targetsWithDiagonal;
         targetsWithDiagonal.reserve(1000);
-        const bool swipeLanes = (par.alignerMode != Parameters::ALIGNER_MODE_DEFAULT && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid());
+        const bool swipeLanes = (par.align2clustAlignerMode != Parameters::ALIGNER_MODE_DEFAULT && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid());
         SwipeBatch swipe(par, scoring.subMat, scoring.evaluer, db_maxseqlen);
         // the member gates of a rep wait for its last target and go in rounds that share the lanes, unless the alignments are written in target order
         ClusterMembers members(swipeLanes ? &swipe : NULL, swipeLanes && cluDbr != NULL && alnWriter == nullptr);
@@ -2435,7 +2435,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             pushClusterResult(std::move(clusterResult));
         }
     }
-    if (par.alignerMode != Parameters::ALIGNER_MODE_DEFAULT) {
+    if (par.align2clustAlignerMode != Parameters::ALIGNER_MODE_DEFAULT) {
         printSwipeLanes();
     }
 
@@ -3222,7 +3222,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         query.mapSequence(repKey, repKey, getWindowData(window, repKey), seqDbr.getSeqLen(repKey));
         blockAligner.setQuery(&query);
     };
-    const bool extendMembers = par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid();
+    const bool extendMembers = par.align2clustAlignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid();
 
     // a service thread besides --threads gets the entries of a window from their homes and serves the keys of its blocks to the others
     const bool hasService = rank >= firstAlignNode;
@@ -3639,7 +3639,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                      &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
                                      -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
             // --aligner-mode 3: the gapped alignments of the reps of a batch go through the SWIPE lanes together
-            const bool swipeLanes = par.alignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid();
+            const bool swipeLanes = par.align2clustAlignerMode == Parameters::ALIGNER_MODE_SWIPE_TRACEBACK && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid();
             SwipeTargets swipe(par, scoring.subMat, scoring.evaluer, maxSeqLen);
             std::vector<ClusterPair> pairs;
             size_t threadAlignedPairs = 0;
@@ -3794,7 +3794,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                              -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
                     Matcher matcher(Parameters::DBTYPE_AMINO_ACIDS, maxMemberSeqLen, scoring.subMat, &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
                                     par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop);
-                    const bool swipeLanes = (par.alignerMode != Parameters::ALIGNER_MODE_DEFAULT && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid());
+                    const bool swipeLanes = (par.align2clustAlignerMode != Parameters::ALIGNER_MODE_DEFAULT && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid());
                     SwipeBatch swipe(par, scoring.subMat, scoring.evaluer, maxMemberSeqLen);
                     SwipeTargets memberTargets(par, scoring.subMat, scoring.evaluer, maxMemberSeqLen, true);
                     ClusterMembers memberBuffers(swipeLanes ? &swipe : NULL, true, extendMembers ? &memberTargets : NULL);
@@ -3913,7 +3913,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                              -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
                     Matcher matcher(Parameters::DBTYPE_AMINO_ACIDS, maxMemberSeqLen, scoring.subMat, &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
                                     par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop);
-                    const bool swipeLanes = (par.alignerMode != Parameters::ALIGNER_MODE_DEFAULT && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid());
+                    const bool swipeLanes = (par.align2clustAlignerMode != Parameters::ALIGNER_MODE_DEFAULT && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid());
                     SwipeBatch swipe(par, scoring.subMat, scoring.evaluer, maxMemberSeqLen);
                     SwipeTargets memberTargets(par, scoring.subMat, scoring.evaluer, maxMemberSeqLen, true);
                     ClusterMembers memberBuffers(swipeLanes ? &swipe : NULL, true, extendMembers ? &memberTargets : NULL);
@@ -4838,7 +4838,7 @@ static int align2clustLinfinity(Parameters &par) {
     }
     if (MMseqsNode::rank >= getFirstAlignNode()) {
         MMseqsNode::addPhaseTime(phaseValues, "aligning the rep targets", phaseValueTimer);
-        if (par.alignerMode != Parameters::ALIGNER_MODE_DEFAULT) {
+        if (par.align2clustAlignerMode != Parameters::ALIGNER_MODE_DEFAULT) {
             printSwipeLanes();
             MMseqsNode::addPhaseValue(phaseValues, "SWIPE member lane pairs", SSTR(swipeLanePairs.load()));
             MMseqsNode::addPhaseValue(phaseValues, "SWIPE member lane slots", SSTR(swipeLaneSlots.load()));
