@@ -20,6 +20,9 @@
 #include "nucleotide.out.h"
 #include "base64/base64.h"
 
+// how long a step on several machines waits for an input that a step before it wrote on another machine
+static const int INPUT_LATENCY_SECONDS = 120;
+
 #ifdef __CYGWIN__
 #include <sys/cygwin.h>
 #endif
@@ -2363,7 +2366,16 @@ void Parameters::checkIfDatabaseIsValid(const Command& command, int argc, const 
                     continue;
                 }
 
-                if (filenames[fileIdx] != "stdin" && FileUtil::fileExists((filenames[fileIdx]).c_str()) == false && FileUtil::fileExists((filenames[fileIdx] + ".dbtype").c_str()) == false) {
+                const auto isMissing = [&]() {
+                    FileUtil::refreshDirectory(filenames[fileIdx]);
+                    return filenames[fileIdx] != "stdin" && FileUtil::fileExists((filenames[fileIdx]).c_str()) == false && FileUtil::fileExists((filenames[fileIdx] + ".dbtype").c_str()) == false;
+                };
+                // a step on another machine may have written the input; like --latency-wait of Snakemake and exitReadTimeout of Nextflow
+                const char *stepTasks = getenv("SLURM_STEP_NUM_TASKS");
+                for (int second = 0; stepTasks != NULL && atoi(stepTasks) > 1 && second < INPUT_LATENCY_SECONDS && isMissing(); second++) {
+                    sleep(1);
+                }
+                if (isMissing()) {
                     regex_t regex;
                     compileRegex(&regex, "[a-zA-Z][a-zA-Z0-9+-.]*:\\/\\/");
                     int nomatch = regexec(&regex, filenames[fileIdx].c_str(), 0, NULL, 0);

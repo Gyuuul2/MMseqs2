@@ -39,6 +39,8 @@ public:
 
     static std::string dirName(const std::string &file);
 
+    static void refreshDirectory(const std::string &file);
+
     static std::string baseName(const std::string &file);
 
     static size_t getFreeSpace(const char *dir);

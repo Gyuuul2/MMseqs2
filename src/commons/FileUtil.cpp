@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include <sys/stat.h>
+#include <dirent.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -145,6 +146,14 @@ void FileUtil::writeFile(const std::string &pathToFile, const unsigned char *dat
     if (close(fd) != 0) {
         Debug(Debug::ERROR) << "Error closing file " << pathToFile << "!\n";
         EXIT(EXIT_FAILURE);
+    }
+}
+
+// opening a directory asks an NFS server for its state, so a name that this machine found missing before another machine wrote it is looked up again
+void FileUtil::refreshDirectory(const std::string &file) {
+    DIR *directory = opendir(dirName(file).c_str());
+    if (directory != NULL) {
+        closedir(directory);
     }
 }
 
