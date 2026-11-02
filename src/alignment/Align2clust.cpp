@@ -4173,17 +4173,14 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             }
         }
         if (doneRepKey <= clusteredKey) {
-            if (hasNewProgress) {
-                waitWarning.reset();
-            } else {
+            if (hasNewProgress == false) {
                 MMseqsNode::sleepBeforePoll(polls++);
-                waitWarning.check(accepted + "." + SSTR(slowestNode) + ".progress");
             }
+            waitWarning.check(accepted + "." + SSTR(slowestNode) + ".progress");
             waitSeconds += pollTimer.getTimediff();
             continue;
         }
         polls = 0;
-        waitWarning.reset();
         Timer stepTimer;
 
         // read every log up to doneRepKey after its tail; past nodeStepWords a log ends the step before its next rep, but the rep of clusteredKey is read whole
@@ -4600,6 +4597,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         changesBytes += changes.size() * sizeof(uint64_t);
         MMseqsNode::publishLog(changesHandle, assignedChanges, clusteredKey, changesBytes);
         publishSeconds += stepTimer.getTimediff();
+        waitWarning.reset();
     }
     MMseqsNode::addPhaseSeconds(phaseValues, "clustering the accepted pairs", clusterTimer.getTimediff() - waitSeconds);
     MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the aligning nodes", waitSeconds);

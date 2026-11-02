@@ -919,6 +919,9 @@ void MMseqsNode::closeExchangeFiles(std::vector<FILE *> &files, const std::strin
     }
 }
 
+// the bytes of pairs that a thread reads at once and holds in its cursor
+static const size_t LOOKUP_READ_BYTES = 1024 * 1024;
+
 MMseqsNode::ClusterMemberLookup::ClusterMemberLookup(const std::string &index, const std::string &prefix, size_t maxBytes) : prefix(prefix) {
     openExchange(index, prefix, blocks, files);
     size_t totalPairs = 0;
@@ -979,6 +982,15 @@ void MMseqsNode::ClusterMemberLookup::find(DBKeyType key, Cursor &cursor) const 
         [](const Anchor &entry, DBKeyType target) { return entry.key < target; });
     cursor.bufferBegin = (upper == begin) ? blocks[block].pos : (upper - 1)->offset;
     cursor.bufferEnd = (upper == end) ? blocks[block].end : upper->offset + sizeof(ClusterPair);
+    // few anchors leave a wide range between them, which single pairs narrow down first
+    while (cursor.bufferEnd - cursor.bufferBegin > LOOKUP_READ_BYTES) {
+        const size_t middle = cursor.bufferBegin + ((cursor.bufferEnd - cursor.bufferBegin) / sizeof(ClusterPair) / 2) * sizeof(ClusterPair);
+        if (readPair(block, middle).repKey < key) {
+            cursor.bufferBegin = middle + sizeof(ClusterPair);
+        } else {
+            cursor.bufferEnd = middle + sizeof(ClusterPair);
+        }
+    }
     // the pairs between the anchors in one read, which next goes on with
     cursor.buffer.resize((cursor.bufferEnd - cursor.bufferBegin) / sizeof(ClusterPair));
     FileUtil::preadAll(fileno(blocks[block].file), prefix.c_str(), reinterpret_cast<char *>(cursor.buffer.data()), cursor.bufferEnd - cursor.bufferBegin, cursor.bufferBegin);
@@ -1007,7 +1019,7 @@ bool MMseqsNode::ClusterMemberLookup::next(Cursor &cursor, DBKeyType &memberKey)
             FileUtil::preadAll(fileno(blocks[cursor.block].file), prefix.c_str(), reinterpret_cast<char *>(cursor.buffer.data()), bytes, cursor.offset);
             cursor.bufferBegin = cursor.offset;
             cursor.bufferEnd = cursor.offset + bytes;
-            cursor.nextReadBytes = std::min<size_t>(1024 * 1024, cursor.nextReadBytes * 4);
+            cursor.nextReadBytes = std::min(LOOKUP_READ_BYTES, cursor.nextReadBytes * 4);
         }
         const ClusterPair pair = cursor.buffer[(cursor.offset - cursor.bufferBegin) / sizeof(ClusterPair)];
         if (pair.repKey != cursor.key) {
