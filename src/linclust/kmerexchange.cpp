@@ -646,6 +646,8 @@ struct KmerExchange {
     unsigned int kmerHashShift;
     unsigned int globalIdBits;
     size_t maxRepSeqs;
+    // every node merges its first own send ranges, rank + i * count for i below this, itself and before the merge splits that the nodes take
+    size_t ownMergeRanges;
     size_t hashRangeCount;
     size_t hashSubRangesPerRange;
     size_t hashSubRangeCount;
@@ -738,12 +740,21 @@ static void getPassRows(const KmerExchange &exchange, const std::vector<std::vec
     }
 }
 
+// the rows that a node writes for its own merge send ranges, which it merges itself, in memory instead of its pair file up to limit bytes
+struct OwnPairs {
+    char *data;
+    size_t bytes;
+    size_t limit;
+    std::vector<std::vector<AssignedPairPartition> > sendRangeRows;
+};
+
 // the pair file of this node and its size
 struct AssignedPairFile {
     std::string name;
     FILE *file;
     BatchWriter *batchWriter;
     size_t bytes;
+    OwnPairs *ownPairs;
     // the rows of every flush are written after its records as a block: where the rows of every send range start in it, then its end, block after block
     std::vector<size_t> blockRowStarts;
     // the code bytes of every partition, send range after send range
@@ -838,7 +849,7 @@ static unsigned int getRepTargetGapBits(const AssignedPairRecord *records, size_
     return getBitWidth(maxGap);
 }
 
-// writes the records, sorted by rep, as a row per partition at reserved bytes of the pair file, then the rows as a block;
+// writes the records, sorted by rep, as a row per partition at reserved bytes of the pair file or of the own pairs, then the rows of the file as a block;
 // a thread writes through the first half of its write buffer and sorts the targets of a rep in the second half
 static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &pairFile, AssignedPairRecord *records, size_t recordCount, DBKeyType *targets,
                                char *writeBuffers, int threads) {
@@ -912,15 +923,34 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
             }
         }
     }
+    // the rows of an own merge send range stay in memory while they fit
+    OwnPairs &ownPairs = *pairFile.ownPairs;
+    const size_t ownBytesBefore = ownPairs.bytes;
+    std::vector<char> isOwnSendRange(exchange.sendRangeCount, false);
     for (size_t sendRange = 0; sendRange < exchange.sendRangeCount; sendRange++) {
+        size_t sendRangeBytes = 0;
         for (size_t row = sendRangeRows[sendRange]; row < sendRangeRows[sendRange + 1]; row++) {
-            rows[row].offsets[0] = pairFile.bytes;
+            for (size_t code = 0; code < PAIR_CODE_COUNT; code++) {
+                sendRangeBytes += rows[row].offsets[code + 1];
+            }
+        }
+        isOwnSendRange[sendRange] = sendRange % MMseqsNode::count == MMseqsNode::rank && sendRange / MMseqsNode::count < exchange.ownMergeRanges
+                                    && ownPairs.bytes + sendRangeBytes <= ownPairs.limit;
+        size_t &bytes = isOwnSendRange[sendRange] ? ownPairs.bytes : pairFile.bytes;
+        for (size_t row = sendRangeRows[sendRange]; row < sendRangeRows[sendRange + 1]; row++) {
+            rows[row].offsets[0] = bytes;
             for (size_t code = 0; code < PAIR_CODE_COUNT; code++) {
                 rows[row].offsets[code + 1] += rows[row].offsets[code];
             }
-            pairFile.bytes = rows[row].offsets[PAIR_CODE_COUNT];
-            pairFile.partitionBytes[sendRange * exchange.partitionsPerRange + rows[row].partition] += pairFile.bytes - rows[row].offsets[0];
+            bytes = rows[row].offsets[PAIR_CODE_COUNT];
+            if (isOwnSendRange[sendRange] == false) {
+                pairFile.partitionBytes[sendRange * exchange.partitionsPerRange + rows[row].partition] += bytes - rows[row].offsets[0];
+            }
         }
+    }
+    if (ownPairs.bytes > ownBytesBefore) {
+        ownPairs.data = static_cast<char *>(realloc(ownPairs.data, ownPairs.bytes));
+        Util::checkAllocation(ownPairs.data, "Can not allocate ownPairs memory in writeAssignedPairs");
     }
     // a record: the gap to the key after the record before, the target count, the first target and the bits of the gaps to the other targets
 #pragma omp parallel num_threads(threads)
@@ -935,9 +965,16 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
         merge.repTargetCapacity = KMER_FILE_BUFFER_SIZE / 2 / sizeof(DBKeyType);
 #pragma omp for schedule(dynamic, 1)
         for (size_t row = 0; row < rows.size(); row++) {
-            KmerCodeWriter indexWrite = {fileno(pairFile.file), pairFile.name.c_str(), writeBuffer, KMER_FILE_BUFFER_SIZE / 4, 0, rows[row].offsets[PAIR_INDEX_CODES], 0, 0, pairFile.batchWriter};
-            KmerCodeWriter targetWrite = {fileno(pairFile.file), pairFile.name.c_str(), writeBuffer + KMER_FILE_BUFFER_SIZE / 4, KMER_FILE_BUFFER_SIZE / 4, 0, rows[row].offsets[PAIR_TARGET_CODES],
-                                          0, 0, pairFile.batchWriter};
+            const bool isOwnRow = isOwnSendRange[std::upper_bound(sendRangeRows.begin(), sendRangeRows.end(), row) - sendRangeRows.begin() - 1];
+            KmerCodeWriter codeWrites[PAIR_CODE_COUNT];
+            for (size_t code = 0; code < PAIR_CODE_COUNT; code++) {
+                const size_t writePos = rows[row].offsets[code];
+                codeWrites[code] = isOwnRow
+                    ? KmerCodeWriter{-1, NULL, ownPairs.data + writePos, ownPairs.bytes - writePos, 0, writePos, 0, 0, NULL}
+                    : KmerCodeWriter{fileno(pairFile.file), pairFile.name.c_str(), writeBuffer + code * KMER_FILE_BUFFER_SIZE / 4, KMER_FILE_BUFFER_SIZE / 4, 0, writePos, 0, 0, pairFile.batchWriter};
+            }
+            KmerCodeWriter &indexWrite = codeWrites[PAIR_INDEX_CODES];
+            KmerCodeWriter &targetWrite = codeWrites[PAIR_TARGET_CODES];
             const unsigned int repKeyDiffLowBits = getRepKeyDiffLowBits(rowKeys[row], rows[row].recordCount);
             const size_t rowEnd = rowRecordOffsets[row + 1];
             size_t nextRepKey = 0;
@@ -973,15 +1010,24 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
             }
             putBits(indexWrite, 0, (CHAR_BIT - indexWrite.bitCount) % CHAR_BIT);
             putBits(targetWrite, 0, (CHAR_BIT - targetWrite.bitCount) % CHAR_BIT);
-            writeKmerCodeBuffer(indexWrite);
-            writeKmerCodeBuffer(targetWrite);
+            if (isOwnRow == false) {
+                writeKmerCodeBuffer(indexWrite);
+                writeKmerCodeBuffer(targetWrite);
+            }
         }
     }
-    pairFile.batchWriter->write(fileno(pairFile.file), pairFile.name.c_str(), reinterpret_cast<const char *>(rows.data()), rows.size() * sizeof(AssignedPairPartition), pairFile.bytes);
-    for (size_t sendRange = 0; sendRange <= exchange.sendRangeCount; sendRange++) {
-        pairFile.blockRowStarts.push_back(pairFile.bytes + sendRangeRows[sendRange] * sizeof(AssignedPairPartition));
+    for (size_t sendRange = 0; sendRange < exchange.sendRangeCount; sendRange++) {
+        pairFile.blockRowStarts.push_back(pairFile.bytes);
+        const AssignedPairPartition *sendRangeRowsStart = rows.data() + sendRangeRows[sendRange];
+        const size_t sendRangeRowCount = sendRangeRows[sendRange + 1] - sendRangeRows[sendRange];
+        if (isOwnSendRange[sendRange]) {
+            ownPairs.sendRangeRows[sendRange].insert(ownPairs.sendRangeRows[sendRange].end(), sendRangeRowsStart, sendRangeRowsStart + sendRangeRowCount);
+            continue;
+        }
+        pairFile.batchWriter->write(fileno(pairFile.file), pairFile.name.c_str(), reinterpret_cast<const char *>(sendRangeRowsStart), sendRangeRowCount * sizeof(AssignedPairPartition), pairFile.bytes);
+        pairFile.bytes += sendRangeRowCount * sizeof(AssignedPairPartition);
     }
-    pairFile.bytes += rows.size() * sizeof(AssignedPairPartition);
+    pairFile.blockRowStarts.push_back(pairFile.bytes);
 }
 
 // the output of a receiving node, kept over its passes and hash ranges and written once it is full: the threads take blocks of records from its start and of targets
@@ -1715,9 +1761,9 @@ struct ReceivedHashRange {
 // a chunk of a receiving pass is done, or stops at a group whose records do not fit the output that is full, or that do not fit the empty output either
 enum { CHUNK_DONE, CHUNK_OUTPUT_FULL, CHUNK_GROUP_TOO_BIG };
 
-// --createdb-mode 3 receiving: the nodes take the hash ranges one at a time, in passes, and write the pairs of the chosen reps to <pref>.pairs.<node>
+// --createdb-mode 3 receiving: the nodes take the hash ranges one at a time, in passes, and write the pairs of the chosen reps to <pref>.pairs.<node> or to ownPairs
 static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange, MMseqsNode::WorkQueue &hashQueue, std::vector<size_t> &hashRanges,
-                           std::string &receiveValues, size_t &pairBytes, const OwnKmers &ownKmers) {
+                           std::string &receiveValues, size_t &pairBytes, OwnKmers &ownKmers, OwnPairs &ownPairs) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
 
     AssignedPairFile pairFile;
@@ -1726,6 +1772,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     BatchWriter batchWriter(exchange.writeBehindMemory, par.threads, fileno(pairFile.file));
     pairFile.batchWriter = &batchWriter;
     pairFile.bytes = 0;
+    pairFile.ownPairs = &ownPairs;
     pairFile.partitionBytes.assign(exchange.sendRangeCount * exchange.partitionsPerRange, 0);
     char *pairWriteBuffer = new(std::nothrow) char[par.threads * KMER_FILE_BUFFER_SIZE];
     Util::checkAllocation(pairWriteBuffer, "Can not allocate pairWriteBuffer memory in receiveKmers");
@@ -1737,6 +1784,14 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
         openReceivedFile(receivedFiles[sender], exchange.hashRangeCount, 0);
     }
     receivedFiles[MMseqsNode::count].data = ownKmers.data;
+    // once the own hash ranges are received, the pairs of the own merge send ranges take the memory of the own k-mers
+    const auto releaseOwnKmers = [&]() {
+        Util::releasePages(ownKmers.data, ownKmers.bytes);
+        free(ownKmers.data);
+        ownKmers.data = NULL;
+        receivedFiles[MMseqsNode::count].data = NULL;
+        ownPairs.limit = ownKmers.bytes;
+    };
     size_t receivedBlocks = 0;
     for (size_t sender = 0; sender < MMseqsNode::count; sender++) {
         receivedBlocks += receivedFiles[sender].blockCount;
@@ -1852,6 +1907,9 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     bool isPrefetched = false;
     for (size_t taken = 0; hashRange < exchange.hashRangeCount; taken++) {
         hashRanges.push_back(hashRange);
+        if (taken == ownKmers.hashRanges.size()) {
+            releaseOwnKmers();
+        }
         const ReceivedHashRange &received = receivedHashRanges[taken % 2];
         ReceivedHashRange &nextReceived = receivedHashRanges[(taken + 1) % 2];
         const size_t passCount = received.passBytes.size();
@@ -2288,12 +2346,14 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
         punchedRanges += punchPassRows(receivedFiles, received.fileRows, hashRangeRows);
         hashRange = nextHashRange;
     }
+    releaseOwnKmers();
     flushPairOutput(exchange, pairFile, output, outputBlocks, pairWriteBuffer, par.threads);
     delete batchReader;
     closeReceivedFiles(receivedFiles);
     batchWriter.waitWrites();
     MMseqsNode::addPhaseSeconds(receiveValues, "waiting to write pairs", batchWriter.getWaitSeconds() / par.threads);
     MMseqsNode::addPhaseValue(receiveValues, "Pair flushes", SSTR(output.flushes));
+    MMseqsNode::addPhaseValue(receiveValues, "Pair bytes kept in memory", SSTR(ownPairs.bytes));
     MMseqsNode::addPhaseValue(receiveValues, "Passes read in windows", SSTR(windowedPasses));
     MMseqsNode::addPhaseValue(receiveValues, "Chunks with a group too big for the output", SSTR(aloneChunks));
     MMseqsNode::addPhaseValue(receiveValues, "K-mer file ranges freed", SSTR(punchedRanges));
@@ -2311,9 +2371,10 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     return receivedBytes;
 }
 
-// --createdb-mode 3 rep node: the nodes take the merge splits one at a time and merge their partitions from the pair file of every node into <pref>.<node>; returns its partition rows
+// --createdb-mode 3 rep node: every node merges its own merge send ranges, then the nodes take the merge splits one at a time and merge their partitions from the pair file
+// of every node and ownPairs into <pref>.<node>; returns its partition rows
 static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange, MMseqsNode::WorkQueue &mergeQueue, std::vector<size_t> &mergeSplits,
-                                      std::string &mergeValues) {
+                                      std::string &mergeValues, OwnPairs &ownPairs) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     PrefFiles prefFiles;
     prefFiles.dataName = par.db2 + "." + SSTR(MMseqsNode::rank);
@@ -2350,27 +2411,30 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     // the targets of the partitions of a pass, one after the other, kept like pairPassBuffer
     DBKeyType *pairPassTargets = NULL;
     size_t pairPassTargetsSize = 0;
-    // the pair file of every receiving node, open for the whole phase, and its rows of a send range
-    std::vector<ReceivedFile> receivedPairFiles(MMseqsNode::count);
+    // the pair file of every receiving node, open for the whole phase, then the own pairs in memory, and their rows of a send range
+    std::vector<ReceivedFile> receivedPairFiles(MMseqsNode::count + 1);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-    for (size_t receiver = 0; receiver < receivedPairFiles.size(); receiver++) {
+    for (size_t receiver = 0; receiver < MMseqsNode::count; receiver++) {
         receivedPairFiles[receiver].fileName = par.db2 + ".pairs." + SSTR(receiver);
         openReceivedFile(receivedPairFiles[receiver], exchange.sendRangeCount, exchange.sendRangeCount * exchange.partitionsPerRange);
     }
-    std::vector<std::vector<AssignedPairPartition> > pairFileRows(MMseqsNode::count);
-    // every node cuts the partitions of all send ranges into as many merge splits as send ranges, key ranges of whole partitions and about equal cost, like decomposeDomainByAminoAcid;
-    // a partition costs its pair bytes and an entry per key
+    receivedPairFiles[MMseqsNode::count].data = ownPairs.data;
+    std::vector<std::vector<AssignedPairPartition> > pairFileRows(MMseqsNode::count + 1);
+    // every node cuts the partitions of all send ranges but the own merge send ranges into as many merge splits as send ranges, key ranges of whole partitions and about
+    // equal cost, like decomposeDomainByAminoAcid; a partition costs its pair bytes and an entry per key
     const size_t partitionCount = exchange.sendRangeCount * exchange.partitionsPerRange;
     std::vector<size_t> partitionPairBytes(partitionCount, 0);
     std::vector<size_t> partitionCosts(partitionCount, 0);
     size_t globalCost = 0;
     for (size_t partition = 0; partition < partitionCount; partition++) {
-        for (size_t receiver = 0; receiver < receivedPairFiles.size(); receiver++) {
+        for (size_t receiver = 0; receiver < MMseqsNode::count; receiver++) {
             partitionPairBytes[partition] += receivedPairFiles[receiver].itemBytes[partition];
         }
         const size_t sendRange = partition / exchange.partitionsPerRange;
         const size_t rangePartition = partition % exchange.partitionsPerRange;
-        partitionCosts[partition] = partitionPairBytes[partition] + getPartitionFirstKey(exchange, sendRange, rangePartition + 1) - getPartitionFirstKey(exchange, sendRange, rangePartition);
+        if (sendRange / MMseqsNode::count >= exchange.ownMergeRanges) {
+            partitionCosts[partition] = partitionPairBytes[partition] + getPartitionFirstKey(exchange, sendRange, rangePartition + 1) - getPartitionFirstKey(exchange, sendRange, rangePartition);
+        }
         globalCost += partitionCosts[partition];
     }
     for (size_t receiver = 0; receiver < receivedPairFiles.size(); receiver++) {
@@ -2387,12 +2451,10 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
             splitPartitionOffsets[split] = partition + 1;
         }
     }
-    std::vector<size_t> splitPairBytes(mergeSplitCount, 0);
     std::vector<size_t> splitCosts(mergeSplitCount, 0);
     std::vector<size_t> mergeOrder(mergeSplitCount);
     for (size_t split = 0; split < mergeSplitCount; split++) {
         for (size_t partition = splitPartitionOffsets[split]; partition < splitPartitionOffsets[split + 1]; partition++) {
-            splitPairBytes[split] += partitionPairBytes[partition];
             splitCosts[split] += partitionCosts[partition];
         }
         mergeOrder[split] = split;
@@ -2408,23 +2470,49 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     MMseqsNode::addPhaseValue(mergeValues, "Largest merge split cost to average", SSTR(static_cast<double>(splitCosts[mergeOrder[0]]) * mergeSplitCount / std::max<size_t>(1, globalCost)));
     size_t mergedPairBytes = 0;
     size_t punchedRanges = 0;
-    for (size_t item = mergeQueue.claimNext(); item < mergeSplitCount; item = mergeQueue.claimNext()) {
-        const size_t mergeSplit = mergeOrder[item];
-        mergedPairBytes += splitPairBytes[mergeSplit];
-        mergeSplits.push_back(mergeSplit);
-        const size_t splitBegin = splitPartitionOffsets[mergeSplit];
-        const size_t splitEnd = splitPartitionOffsets[mergeSplit + 1];
+    // the own merge send ranges first, then the merge splits that this node takes without the own merge send ranges of every node
+    for (size_t ownMergeRange = 0;; ownMergeRange++) {
+        size_t splitBegin = 0;
+        size_t splitEnd = 0;
+        if (ownMergeRange < exchange.ownMergeRanges) {
+            splitBegin = (MMseqsNode::rank + ownMergeRange * MMseqsNode::count) * exchange.partitionsPerRange;
+            splitEnd = splitBegin + exchange.partitionsPerRange;
+        } else {
+            // the own pairs are merged
+            if (ownMergeRange == exchange.ownMergeRanges) {
+                Util::releasePages(ownPairs.data, ownPairs.bytes);
+                free(ownPairs.data);
+                ownPairs.data = NULL;
+                ownPairs.bytes = 0;
+                receivedPairFiles[MMseqsNode::count].data = NULL;
+            }
+            const size_t item = mergeQueue.claimNext();
+            if (item == mergeSplitCount) {
+                break;
+            }
+            const size_t mergeSplit = mergeOrder[item];
+            mergeSplits.push_back(mergeSplit);
+            splitBegin = splitPartitionOffsets[mergeSplit];
+            splitEnd = splitPartitionOffsets[mergeSplit + 1];
+        }
         for (size_t sendRange = splitBegin / exchange.partitionsPerRange; splitBegin < splitEnd && sendRange * exchange.partitionsPerRange < splitEnd; sendRange++) {
+            if (ownMergeRange >= exchange.ownMergeRanges && sendRange / MMseqsNode::count < exchange.ownMergeRanges) {
+                continue;
+            }
             // the partitions [firstPartition, endPartition) of the send range that the split holds
             const size_t firstPartition = std::max(splitBegin, sendRange * exchange.partitionsPerRange) - sendRange * exchange.partitionsPerRange;
             const size_t endPartition = std::min(splitEnd, (sendRange + 1) * exchange.partitionsPerRange) - sendRange * exchange.partitionsPerRange;
+            for (size_t partition = firstPartition; partition < endPartition; partition++) {
+                mergedPairBytes += partitionPairBytes[sendRange * exchange.partitionsPerRange + partition];
+            }
             setSendRange(par, exchange, sendRange);
             // the rows of the send range lie in every flush block of a pair file, so all of them are read in one batch
-            std::vector<std::vector<BatchReader::ReadRequest> > rowReadRequests(receivedPairFiles.size());
+            std::vector<std::vector<BatchReader::ReadRequest> > rowReadRequests(MMseqsNode::count);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-            for (size_t receiver = 0; receiver < receivedPairFiles.size(); receiver++) {
+            for (size_t receiver = 0; receiver < MMseqsNode::count; receiver++) {
                 readItemRows(receivedPairFiles[receiver], sendRange, pairFileRows[receiver], &rowReadRequests[receiver]);
             }
+            pairFileRows[MMseqsNode::count] = ownPairs.sendRangeRows[sendRange];
             for (size_t receiver = 1; receiver < rowReadRequests.size(); receiver++) {
                 rowReadRequests[0].insert(rowReadRequests[0].end(), rowReadRequests[receiver].begin(), rowReadRequests[receiver].end());
             }
@@ -2451,12 +2539,15 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                     if (partition < firstPartition || partition >= endPartition) {
                         continue;
                     }
-                    partitionCodeBytes[partition] += getRowEnd(rows[row]) - rows[row].offsets[0];
+                    // a pass reads the rows of the files to its code buffer
+                    if (receivedPairFiles[receiver].data == NULL) {
+                        partitionCodeBytes[partition] += getRowEnd(rows[row]) - rows[row].offsets[0];
+                    }
                     partitionTargets[partition] += rows[row].targetCount;
                     partitionRows[partition].push_back(std::make_pair(receiver, row));
                 }
             }
-            const size_t pairPassLimit = getPassLimit(exchange.loadMemoryLimit);
+            const size_t pairPassLimit = getPassLimit(exchange.loadMemoryLimit - ownPairs.bytes);
             // a partition takes its codes, its target ids, where the targets of every key start and its merge with a thread
             std::vector<size_t> partitionBytes(endPartition - firstPartition);
             for (size_t partition = firstPartition; partition < endPartition; partition++) {
@@ -2789,6 +2880,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     exchange.hashRangeCount = std::max(RANGES_PER_NODE * MMseqsNode::count, CHUNKS_PER_THREAD * par.threads);
     exchange.globalIdBits = getBitWidth(seqDbr.getSize() - 1);
     exchange.maxRepSeqs = 1 + (includeAdjacency ? par.adjIteration : 0);
+    // as many as a node half as fast as the others merges, like the own hash ranges
+    exchange.ownMergeRanges = exchange.sendRangeCount / MMseqsNode::count * MMseqsNode::count / (2 * MMseqsNode::count - 1);
     // a receiving node reads about a member id, a rep candidate and its index codes per record
     const size_t receiverKmerBytes = (2 * exchange.globalIdBits + exchange.adjKeyCodeBits + CHAR_BIT - 1) / CHAR_BIT;
     // a representative node reads a target id and sorts it, a record can be a target of every representative of its group
@@ -2867,9 +2960,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     if (MMseqsNode::isMaster()) {
         Debug(Debug::INFO) << "Receive k-mers in " << exchange.hashRangeCount << " hash ranges\n";
     }
-    const size_t receivedBytes = receiveKmers(par, seqDbr, exchange, hashQueue, hashRanges, receiveValues, pairBytes, ownKmers);
-    Util::releasePages(ownKmers.data, ownKmers.bytes);
-    free(ownKmers.data);
+    OwnPairs ownPairs = {NULL, 0, 0, std::vector<std::vector<AssignedPairPartition> >(exchange.sendRangeCount)};
+    const size_t receivedBytes = receiveKmers(par, seqDbr, exchange, hashQueue, hashRanges, receiveValues, pairBytes, ownKmers, ownPairs);
     MMseqsNode::addPhaseTime(receiveValues, "receiving k-mers", phaseTimer);
     MMseqsNode::addPhaseValue(receiveValues, "K-mer bytes received", SSTR(receivedBytes));
     MMseqsNode::addPhaseValue(receiveValues, "Pair bytes written", SSTR(pairBytes));
@@ -2891,7 +2983,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     if (MMseqsNode::isMaster()) {
         Debug(Debug::INFO) << "Merge pairs in " << exchange.sendRangeCount << " splits\n";
     }
-    const std::string partitionsData = mergeAssignedPairs(par, seqDbr, exchange, mergeQueue, mergeSplits, mergeValues);
+    const std::string partitionsData = mergeAssignedPairs(par, seqDbr, exchange, mergeQueue, mergeSplits, mergeValues, ownPairs);
     kmerFileRemoval.join();
     MMseqsNode::addPhaseTime(mergeValues, "merging pairs", phaseTimer);
     MMseqsNode::addPhaseValue(mergeValues, "Merge splits", SSTR(mergeSplits.size()));
