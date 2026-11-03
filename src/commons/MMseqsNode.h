@@ -133,6 +133,8 @@ public:
         size_t lastRecord;
         // the records that this node sent to itself, read from memory instead of file and freed once read
         char *ownRecords;
+        // where the bytes of the block in its file that are not freed yet start
+        size_t punchEnd;
     };
     // appends the offsets of a flush to indexData; nodeOffsets: where the bytes of every node start in the flush, then the flush size
     static void addExchangeFlush(std::string &indexData, size_t &writtenBytes, const std::vector<size_t> &nodeOffsets);
@@ -192,6 +194,7 @@ public:
     };
 
     // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered; nodeKeyOffsets: keys of every node
+    // the pairs for this node stay in memory, up to pairCapacity of them before the last flush
     struct ClusterPairWriter {
         ClusterPairWriter(const std::string &exchange, size_t pairCapacity, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets);
         ~ClusterPairWriter();
@@ -226,13 +229,15 @@ public:
         const std::vector<size_t> &nodeKeyOffsets;
         std::string indexData;
         size_t writtenBytes;
+        size_t keptPairCount;
     };
     // the representative of entry p becomes the one received for p in the exchange receivedIndex, receivedPrefix if given
     // representativeBits: the keys [firstKey, firstKey + keyCount) of clu, which holds no entries for clusters of one key: a received member without an entry
-    // goes on to its representative, and the bits left, those of the keys that stay alone or represent others, are published as <singletons>.bits.<node>
+    // goes on to its representative, and the bits left are those of the keys that stay alone or represent others
+    // cluKeyOffsets: the entries of keys [firstKey, firstKey + keyCount) are read from the parts of clu whose keys start there, without them those of <clu>.<node>
     static std::string sendClusterPairs(const std::string &clu, bool withRepresentative, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                                         const std::string &exchange, const std::string &receivedIndex = "", const std::string &receivedPrefix = "",
-                                        uint64_t *representativeBits = NULL, size_t firstKey = 0, size_t keyCount = 0, const std::string &singletons = "");
+                                        uint64_t *representativeBits = NULL, const std::vector<size_t> &cluKeyOffsets = std::vector<size_t>(), size_t firstKey = 0, size_t keyCount = 0);
     // --filter-cludb-file: a request { key, requesting node } of the exchange requestsIndex, requests gets the other members of key in <clu>.<node> as { key, member } through <members>.<node>
     static std::string sendClusterMembers(const std::string &clu, const std::string &requestsIndex, const std::string &requests, const std::string &members);
     // once every node has read lastExchange, a node removes its file of it; the master removes the indexes of exchanges and prints phaseValues
@@ -253,8 +258,8 @@ public:
                                         std::vector<std::string> &threadData, std::vector<std::vector<uint64_t> > &threadEntries, size_t &dataBytes, size_t &indexBytes);
     // writes the end entry (DB_KEY_INVALID, dataBytes) at indexBytes and closes dataFile and indexFile
     static void closeClusterFiles(FILE *dataFile, const std::string &dataFileName, FILE *indexFile, const std::string &indexFileName, size_t dataBytes, size_t indexBytes);
-    // writes the pairs of an exchange in rep order as the cluster database <clu>.<node>; singletonBits: bit k makes key firstKey + k a singleton
-    static void writeClusterPairs(const std::string &index, const std::string &prefix, const std::string &clu, const uint64_t *singletonBits, size_t firstKey, size_t keyCount);
+    // writes the pairs of an exchange in rep order as the cluster database <clu>.<node> and returns its line count; singletonBits: bit k makes key firstKey + k a singleton
+    static size_t writeClusterPairs(const std::string &index, const std::string &prefix, const std::string &clu, const uint64_t *singletonBits, size_t firstKey, size_t keyCount);
 };
 
 #endif

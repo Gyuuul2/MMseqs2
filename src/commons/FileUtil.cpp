@@ -133,6 +133,17 @@ void FileUtil::pwriteAll(int fd, const char *fileName, const char *data, size_t 
     }
 }
 
+void FileUtil::punchHole(int fd, size_t offset, size_t size) {
+#ifdef FALLOC_FL_PUNCH_HOLE
+    if (size > 0) {
+        // a file system without hole punching keeps the blocks until the file is removed
+        (void) fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size);
+    }
+#else
+    (void) fd; (void) offset; (void) size;
+#endif
+}
+
 void FileUtil::writeFile(const std::string &pathToFile, const unsigned char *data, size_t len) {
     int fd = open(pathToFile.c_str(), O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR | S_IXUSR);
     if (fd == -1) {

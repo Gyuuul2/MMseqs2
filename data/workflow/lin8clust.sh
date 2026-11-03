@@ -24,6 +24,7 @@ export SLURM_KILL_BAD_EXIT=1
 INPUT="$1"
 TMP_PATH="$3"
 SOURCE="$INPUT"
+PIDS=""
 
 if [ -n "$CLUSTHASH" ] || [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
     CLUDB="${TMP_PATH}/clu"
@@ -62,7 +63,8 @@ if notExists "${CLUDB}.dbtype" ${ITER2_PRODUCTS}; then
         || fail "align2clust died"
     if [ -n "$REMOVE_TMP" ]; then
         # shellcheck disable=SC2086
-        "$MMSEQS" rmdb "${TMP_PATH}/pref" ${VERBOSITY}
+        "$MMSEQS" rmdb "${TMP_PATH}/pref" ${VERBOSITY} &
+        PIDS="$PIDS $!"
     fi
 fi
 
@@ -81,11 +83,14 @@ if [ -n "$CLUSTHASH" ]; then
             || fail "mergeclusters died"
         if [ -n "$REMOVE_TMP" ]; then
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust" ${VERBOSITY} &
+            PIDS="$PIDS $!"
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust_redundancy" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust_redundancy" ${VERBOSITY} &
+            PIDS="$PIDS $!"
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY}
+            "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY} &
+            PIDS="$PIDS $!"
         fi
     fi
     CLUDB="$MERGED"
@@ -114,9 +119,11 @@ if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
             || fail "align2clust (representatives) died"
         if [ -n "$REMOVE_TMP" ]; then
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/pref_rep" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/pref_rep" ${VERBOSITY} &
+            PIDS="$PIDS $!"
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_rep" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/input_rep" ${VERBOSITY} &
+            PIDS="$PIDS $!"
         fi
     fi
 
@@ -127,12 +134,19 @@ if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
             || fail "mergeclusters died"
         if [ -n "$REMOVE_TMP" ]; then
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/clu_rep" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/clu_rep" ${VERBOSITY} &
+            PIDS="$PIDS $!"
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY}
+            "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY} &
+            PIDS="$PIDS $!"
         fi
     fi
 fi
+
+# the databases that the next steps do not read are removed in the background, a failed removal still fails the workflow
+for PID in $PIDS; do
+    wait "$PID"
+done
 
 if [ -n "$REMOVE_TMP" ]; then
     rm -f "${TMP_PATH}/lin8clust.sh"

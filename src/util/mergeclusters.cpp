@@ -29,40 +29,36 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         // clusthashfast writes no entries for clusters of one key, its representative bits hold them
         const std::string representativeDb = par.filenames[2] + "_redundancy";
         const bool hasRepresentativeBits = FileUtil::fileExists((representativeDb + ".dbtype").c_str());
-        // the members of the second clustering go to the nodes of their entries in the first
+        // where the parts of the first clustering, or its representative bits, start; a node reads the entries and bits of its keys from them
         const std::vector<size_t> firstClusteringKeyOffsets = (hasSecondClustering || hasRepresentativeBits)
                                                               ? MMseqsNode::getClusterKeyOffsets(par.db2 + ".keys", par.filenames[2], dbr.getSize(), hasRepresentativeBits ? representativeDb + ".bits." + SSTR(MMseqsNode::rank) : "")
-                                                              : nodeKeyOffsets;
+                                                              : std::vector<size_t>();
         dbr.close();
-        const size_t firstKey = firstClusteringKeyOffsets[MMseqsNode::rank];
-        const size_t keyCount = firstClusteringKeyOffsets[MMseqsNode::rank + 1] - firstKey;
+        const size_t firstKey = nodeKeyOffsets[MMseqsNode::rank];
+        const size_t keyCount = nodeKeyOffsets[MMseqsNode::rank + 1] - firstKey;
         uint64_t *representativeBits = hasRepresentativeBits ? MMseqsNode::readRepresentativeBits(representativeDb, firstClusteringKeyOffsets, firstKey, keyCount) : NULL;
         std::string phaseValues;
         Timer timer;
         const std::string sortedByMember = par.db2 + "_by_member";
-        const std::string sortedByMemberIndex = hasSecondClustering ? MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, firstClusteringKeyOffsets, sortedByMember) : "";
+        const std::string sortedByMemberIndex = hasSecondClustering ? MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, nodeKeyOffsets, sortedByMember) : "";
         const std::string sortedByRep = par.db2 + "_by_rep";
+        // the bits left are the singletons of this node
         const std::string sortedByRepIndex = MMseqsNode::sendClusterPairs(par.filenames[2], true, ClusterPair::compareByRep, nodeKeyOffsets, sortedByRep,
-                                                                          sortedByMemberIndex, hasSecondClustering ? sortedByMember : "", representativeBits, firstKey, keyCount, par.db2 + "_singletons");
-        delete[] representativeBits;
+                                                                          sortedByMemberIndex, hasSecondClustering ? sortedByMember : "", representativeBits, firstClusteringKeyOffsets, firstKey, keyCount);
         MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", timer);
         if (hasSecondClustering) {
             FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
         }
-        const size_t nodeKeys = nodeKeyOffsets[MMseqsNode::rank + 1] - nodeKeyOffsets[MMseqsNode::rank];
-        uint64_t *singletonBits = hasRepresentativeBits ? MMseqsNode::readRepresentativeBits(par.db2 + "_singletons", firstClusteringKeyOffsets, nodeKeyOffsets[MMseqsNode::rank], nodeKeys) : NULL;
-        MMseqsNode::writeClusterPairs(sortedByRepIndex, sortedByRep, par.db2, singletonBits, nodeKeyOffsets[MMseqsNode::rank], nodeKeys);
-        delete[] singletonBits;
+        const size_t clusterLines = MMseqsNode::writeClusterPairs(sortedByRepIndex, sortedByRep, par.db2, representativeBits, firstKey, keyCount);
+        delete[] representativeBits;
         MMseqsNode::addPhaseTime(phaseValues, "writing the clusters", timer);
+        MMseqsNode::addPhaseValue(phaseValues, "Cluster lines written", SSTR(clusterLines));
         std::vector<std::string> exchanges;
         exchanges.push_back(sortedByRep);
         if (hasSecondClustering) {
             exchanges.push_back(sortedByMember);
         }
         MMseqsNode::removeExchanges(par.db2, sortedByRep, exchanges, phaseValues);
-        if (hasRepresentativeBits) {
-            FileUtil::remove((par.db2 + "_singletons.bits." + SSTR(MMseqsNode::rank)).c_str());
-        }
         if (MMseqsNode::isMaster()) {
             DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_CLUSTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
         }
