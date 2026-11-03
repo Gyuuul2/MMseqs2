@@ -643,7 +643,8 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         std::string phaseValues;
         MMseqsNode::addPhaseTime(phaseValues, "hashing the sequences", timer);
         MMseqsNode::addPhaseValue(phaseValues, "Sequences hashed", SSTR(localKeySize));
-        MMseqsNode::publishRunFile(par.db2 + ".phases." + SSTR(MMseqsNode::rank), phaseValues);
+        MMseqsNode::printPhaseValues(phaseValues);
+        MMseqsNode::publishRunFile(par.db2 + ".phases." + SSTR(MMseqsNode::rank), "");
         MMseqsNode::closeClusterFiles(resultDataFile, resultDb, resultIndexFile, resultIndex, resultDataBytes, resultIndexBytes);
         MMseqsNode::writeRepresentativeBits(representativeDb, reader, representativeBits, localFirstKey, localKeySize);
     } else {
@@ -661,15 +662,17 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                 clusters += representativeReader.getRangeRepresentativeCount(range);
             }
             representativeReader.close();
-            MMseqsNode::printPhaseValues(MMseqsNode::gatherRunFiles(par.db2 + ".phases."));
+            MMseqsNode::gatherRunFiles(par.db2 + ".phases.");
             // a mode 3 subset only feeds the next pipeline steps, which read no headers, lookup or source
             DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_CLUSTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
         } else {
             DBReader<DBKeyType>::softlinkDb(par.db1, representativeDb, DBFiles::SEQUENCE_ANCILLARY);
         }
     }
-    Debug(Debug::INFO) << "Size of the sequence database: " << reader.getSize() << "\n";
-    Debug(Debug::INFO) << "Number of clusters: " << clusters << "\n";
+    if (MMseqsNode::isMaster()) {
+        Debug(Debug::INFO) << "Size of the sequence database: " << reader.getSize() << "\n";
+        Debug(Debug::INFO) << "Number of clusters: " << clusters << "\n";
+    }
     delete[] representativeBits;
     Util::releasePages(hashIdPairs, hashIdPairsSize * sizeof(HashEntry));
     delete[] hashIdPairs;

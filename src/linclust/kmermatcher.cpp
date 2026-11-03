@@ -2138,7 +2138,9 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     }
     std::vector<MMseqsParameter *> *params = command.params;
     par.printParameters(command.cmd, argc, argv, *params);
-    Debug(Debug::INFO) << "Database size: " << seqDbr.getSize() << " type: " << seqDbr.getDbTypeName() << "\n";
+    if (MMseqsNode::isMaster()) {
+        Debug(Debug::INFO) << "Database size: " << seqDbr.getSize() << " type: " << seqDbr.getDbTypeName() << "\n";
+    }
 
     
     if (par.includeCountTable || par.includeAdjacency) {
@@ -2746,11 +2748,13 @@ void setKmerLengthAndAlphabet(Parameters &parameters, size_t aaDbSize, int seqTy
             parameters.kmersPerSequence = 20;
         }
     }
-    Debug(Debug::INFO) << "k-mer length " << parameters.kmerSize
-                       << ", alphabet size " << ((Parameters::isEqualDbtype(seqTyp, Parameters::DBTYPE_NUCLEOTIDES))
-                                                 ? parameters.alphabetSize.values.nucleotide()
-                                                 : parameters.alphabetSize.values.aminoacid())
-                       << ", k-mers per sequence " << parameters.kmersPerSequence << "\n";
+    if (MMseqsNode::isMaster()) {
+        Debug(Debug::INFO) << "k-mer length " << parameters.kmerSize
+                           << ", alphabet size " << ((Parameters::isEqualDbtype(seqTyp, Parameters::DBTYPE_NUCLEOTIDES))
+                                                     ? parameters.alphabetSize.values.nucleotide()
+                                                     : parameters.alphabetSize.values.aminoacid())
+                           << ", k-mers per sequence " << parameters.kmersPerSequence << "\n";
+    }
 }
 
 template std::pair<size_t, size_t>  fillKmerPositionArray<0, short, true, short>(KmerPosition<short, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);

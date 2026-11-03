@@ -91,12 +91,12 @@ public:
     static std::string barrier(const std::string &file, const std::string &content = "");
     // this node has read file; the master removes it once every node has, the others do not wait
     static void removeOnceRead(const std::string &file);
-    // phase values that a node appends to the content of a barrier as lines name<TAB>node<TAB>value, for the master to print
+    // local phase values as lines name<TAB>node<TAB>value
     static void addPhaseValue(std::string &content, const std::string &name, const std::string &value);
     // the seconds since timer started, which then starts again
     static void addPhaseTime(std::string &content, const std::string &phase, Timer &timer);
     static void addPhaseSeconds(std::string &content, const std::string &phase, double seconds);
-    // the master prints every name of the gathered phase values with its largest value and node, and its smallest value
+    // prints this node's phase values through Debug::INFO, prefixed with its rank on multiple nodes
     static void printPhaseValues(const std::string &values);
     // the items of a work queue that this node takes: its own items rank, rank + count, ... from the front, then those of the others from the back, round-robin from rank + 1
     class WorkQueue {

@@ -61,11 +61,6 @@ void MMseqsNode::init() {
         Debug(Debug::ERROR) << "Invalid node rank " << rank << " for " << count << " nodes\n";
         EXIT(EXIT_FAILURE);
     }
-    if (isMaster() == false) {
-        Parameters &par = Parameters::getInstance();
-        par.verbosity = Debug::ERROR;
-        Debug::setDebugLevel(Debug::ERROR);
-    }
 }
 
 void MMseqsNode::publishFile(const std::string &file, const std::string &content) {
@@ -546,45 +541,24 @@ void MMseqsNode::addPhaseSeconds(std::string &content, const std::string &phase,
 }
 
 void MMseqsNode::printPhaseValues(const std::string &values) {
-    if (isMaster() == false) {
+    if (Debug::debugLevel < Debug::INFO) {
         return;
     }
-    std::vector<std::string> names;
-    std::vector<std::string> maxValues;
-    std::vector<std::string> maxNodes;
-    std::vector<std::string> minValues;
-    std::vector<size_t> lineCounts;
+    const std::string prefix = (count > 1) ? "[node " + SSTR(rank) + "] " : "";
+    std::string output;
     for (char *line = (char *) values.c_str(); *line != '\0'; line = Util::skipLine(line)) {
         const char *columns[3];
         if (Util::getFieldsOfLine(line, columns, 3) < 3) {
             Debug(Debug::ERROR) << "Cannot read the phase values\n";
             EXIT(EXIT_FAILURE);
         }
-        const std::string name(columns[0], columns[1] - 1);
-        const std::string node(columns[1], columns[2] - 1);
-        const std::string value(columns[2], strchr(columns[2], '\n'));
-        const size_t i = std::find(names.begin(), names.end(), name) - names.begin();
-        if (i == names.size()) {
-            names.push_back(name);
-            maxValues.push_back(value);
-            maxNodes.push_back(node);
-            minValues.push_back(value);
-            lineCounts.push_back(0);
-        } else if (strtod(value.c_str(), NULL) > strtod(maxValues[i].c_str(), NULL)) {
-            maxValues[i] = value;
-            maxNodes[i] = node;
-        } else if (strtod(value.c_str(), NULL) < strtod(minValues[i].c_str(), NULL)) {
-            minValues[i] = value;
-        }
-        lineCounts[i]++;
+        output += prefix;
+        output.append(columns[0], columns[1] - 1);
+        output += ": ";
+        output.append(columns[2], strchr(columns[2], '\n'));
+        output += '\n';
     }
-    for (size_t i = 0; i < names.size(); i++) {
-        if (lineCounts[i] == 1) {
-            Debug(Debug::INFO) << names[i] << ": " << maxValues[i] << ((count > 1) ? " (node " + maxNodes[i] + ")" : "") << "\n";
-        } else {
-            Debug(Debug::INFO) << names[i] << ": max " << maxValues[i] << " (node " << maxNodes[i] << ") min " << minValues[i] << "\n";
-        }
-    }
+    Debug(Debug::INFO) << output;
 }
 
 MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextItem(rank), itemsLeft(count, 0), nextNode((rank + 1) % count) {
@@ -1844,7 +1818,8 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
 void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues) {
     addPhaseValue(phaseValues, "Exchange bytes sent", SSTR(sentExchangeBytes));
     addPhaseValue(phaseValues, "Exchange bytes sent to other nodes", SSTR(sentOtherNodeExchangeBytes));
-    printPhaseValues(barrier(prefix + ".merged", phaseValues));
+    printPhaseValues(phaseValues);
+    barrier(prefix + ".merged");
     FileUtil::remove((lastExchange + "." + SSTR(rank)).c_str());
     publishFile(prefix + ".done." + SSTR(rank), runId);
     if (isMaster()) {

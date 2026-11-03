@@ -3960,10 +3960,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         waitForWindow(nextWindow, nextRepKey);
         std::swap(window, nextWindow);
     }
-    MMseqsNode::addPhaseValue(phaseValues, "Windows", SSTR(windowCount));
-    MMseqsNode::addPhaseValue(phaseValues, "Window keys", SSTR(windowKeys));
-    MMseqsNode::addPhaseValue(phaseValues, "Window keys kept", SSTR(windowKeptKeys));
-    MMseqsNode::addPhaseValue(phaseValues, "Window bytes kept", SSTR(windowKeptBytes));
+    MMseqsNode::addPhaseValue(phaseValues, "Sequence windows", SSTR(windowCount) + " (" + SSTR(windowKeys) + " keys, "
+                             + SSTR(windowKeptKeys) + " keys and " + SSTR(windowKeptBytes) + " bytes reused)");
     MMseqsNode::publishLog(acceptedHandle, acceptedFile, orderKeyEnd, acceptedBytes);
     if (fclose(acceptedHandle) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << acceptedFile << "\n";
@@ -4601,36 +4599,10 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         MMseqsNode::addPhaseValue(phaseValues, "Set-cover large-set spool written bytes", SSTR(largeSpool.bytesWritten()));
         MMseqsNode::addPhaseValue(phaseValues, "Set-cover large-set spool read bytes", SSTR(largeSpool.bytesRead()));
         MMseqsNode::addPhaseValue(phaseValues, "Set-cover large-set spool peak disk bytes", SSTR(largeSpool.peakDisk()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover pair spool runs", SSTR(pairSpool.runCount()));
         MMseqsNode::addPhaseValue(phaseValues, "Set-cover pair spool bytes", SSTR(pairSpool.writtenBytes()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover oversized pair batches", SSTR(pairSpool.oversizedBatchCount()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover demoted pairs", SSTR(pairSpool.demotedPairCount()));
-        MMseqsNode::addPhaseValue(phaseValues, "Peak set-cover size-class live members", sizeClasses.peaks());
-        MMseqsNode::addPhaseValue(phaseValues, "Peak set-cover exact-size candidates", sizeClasses.candidateCounts());
-        MMseqsNode::addPhaseValue(phaseValues, "Peak set-cover large-class candidates", sizeClasses.largeCandidateClasses());
-        MMseqsNode::addPhaseValue(phaseValues, "Peak set-cover large candidate bytes", SSTR(sizeClasses.peakLargeCandidates * sizeof(SetCoverCandidate)));
-        MMseqsNode::addPhaseValue(phaseValues, "Peak set-cover large member bytes", SSTR(sizeClasses.peakLargeMembers * sizeof(DBKeyType)));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover demoted sets", SSTR(sizeClasses.demotedSets));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover demoted members", SSTR(sizeClasses.demotedMembers));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover demotion classes", sizeClasses.demotionClasses());
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set spool runs", SSTR(smallSpool.totalRuns()));
         MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set spool written bytes", SSTR(smallSpool.totalWrittenBytes()));
         MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set spool read bytes", SSTR(smallSpool.totalReadBytes()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set spool read calls", SSTR(smallSpool.totalReadCalls()));
         MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set spool peak disk bytes", SSTR(smallSpool.peakBytesOnDisk()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set spool peak runs", SSTR(smallSpool.peakRunCount()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set spool peak files", SSTR(smallSpool.peakFileCount()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set spool peak staged bytes", SSTR(smallSpool.peakStagedMemoryBytes()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set spool peak run metadata bytes", SSTR(smallSpool.peakRunMetadataMemoryBytes()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set spool merge read budget bytes", SSTR(smallSpool.mergeReadBudgetBytes()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set initial records", SSTR(smallSpool.initialSetCount()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set demoted records", SSTR(smallSpool.demotedSetCount()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set initial bytes", SSTR(smallSpool.initialSetBytes()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set demoted bytes", SSTR(smallSpool.demotedSetBytes()));
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set sizes", smallSpool.sizeCounts());
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set runs by size", smallSpool.sizeRuns());
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set reads by size", smallSpool.sizeReads());
-        MMseqsNode::addPhaseValue(phaseValues, "Set-cover small-set demotions by size", smallSpool.demotionSizes());
     }
     if (fclose(changesHandle) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << assignedChanges << "\n";
@@ -4849,14 +4821,16 @@ static int align2clustLinfinity(Parameters &par) {
     if (MMseqsNode::rank >= getFirstAlignNode()) {
         MMseqsNode::addPhaseTime(phaseValues, "aligning the rep targets", phaseValueTimer);
         if (par.align2clustAlignerMode != Parameters::ALIGNER_MODE_DEFAULT) {
-            printSwipeLanes();
-            MMseqsNode::addPhaseValue(phaseValues, "SWIPE member lane pairs", SSTR(swipeLanePairs.load()));
-            MMseqsNode::addPhaseValue(phaseValues, "SWIPE member lane slots", SSTR(swipeLaneSlots.load()));
-            MMseqsNode::addPhaseValue(phaseValues, "SWIPE member scalar pairs", SSTR(swipeSinglePairs.load()));
-            MMseqsNode::addPhaseValue(phaseValues, "SWIPE target lane pairs", SSTR(swipeTargetPairs.load()));
-            MMseqsNode::addPhaseValue(phaseValues, "SWIPE target active lane rows", SSTR(swipeTargetLaneRows.load()));
-            MMseqsNode::addPhaseValue(phaseValues, "SWIPE target lane slot rows", SSTR(swipeTargetSlotRows.load()));
-            MMseqsNode::addPhaseValue(phaseValues, "SWIPE target long trace extensions", SSTR(swipeTargetLongPairs.load()));
+            MMseqsNode::addPhaseValue(phaseValues, "SWIPE member alignments", SSTR(swipeLanePairs.load()) + " in lanes ("
+                                     + SSTR(swipeLanePairs.load() * 100 / std::max<size_t>(1, swipeLaneSlots.load()))
+                                     + "% lane fill), " + SSTR(swipeSinglePairs.load()) + " scalar");
+            if (swipeMemberExtensions.load() > 0) {
+                MMseqsNode::addPhaseValue(phaseValues, "SWIPE member extensions", SSTR(swipeMemberExtensions.load()) + " in lanes ("
+                                         + SSTR(swipeMemberLaneRows.load() * 100 / std::max<size_t>(1, swipeMemberSlotRows.load())) + "% active lane rows)");
+            }
+            MMseqsNode::addPhaseValue(phaseValues, "SWIPE target alignments", SSTR(swipeTargetPairs.load()) + " in lanes ("
+                                     + SSTR(swipeTargetLaneRows.load() * 100 / std::max<size_t>(1, swipeTargetSlotRows.load()))
+                                     + "% active lane rows), " + SSTR(swipeTargetLongPairs.load()) + " long extensions");
         }
     }
     MMseqsNode::addPhaseValue(phaseValues, "Memory limit", SSTR(memoryLimit));

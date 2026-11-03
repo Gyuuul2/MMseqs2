@@ -1175,7 +1175,6 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
     size_t hashSeqPairCapacity = 0;
     std::vector<char> isOwnLoadHashRange(exchange.hashRangeCount);
     for (size_t sendRange = sendQueue.claimNext(); sendRange < exchange.sendRangeCount; sendRange = sendQueue.claimNext()) {
-        Timer sendRangeTimer;
         sendRanges.push_back(sendRange);
         setSendRange(par, exchange, sendRange);
         const size_t dbFrom = exchange.sendRangeKeyOffsets[sendRange];
@@ -1468,7 +1467,6 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
             }
         }
         delete[] groupBuffers;
-        MMseqsNode::addPhaseTime(sendValues, "sending a send range", sendRangeTimer);
     }
     seqDbr.releaseDataPages();
     batchWriter.waitWrites();
@@ -1616,7 +1614,6 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     size_t passCodeBuffer = 0;
     bool isPrefetched = false;
     for (size_t taken = 0; hashRange < exchange.hashRangeCount; taken++) {
-        Timer hashRangeTimer;
         hashRanges.push_back(hashRange);
         const ReceivedHashRange &received = receivedHashRanges[taken % 2];
         ReceivedHashRange &nextReceived = receivedHashRanges[(taken + 1) % 2];
@@ -2042,7 +2039,6 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
             }
         }
         hashRange = nextHashRange;
-        MMseqsNode::addPhaseTime(receiveValues, "receiving a hash range", hashRangeTimer);
     }
     delete batchReader;
     closeReceivedFiles(receivedFiles);
@@ -2119,7 +2115,6 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     }
     size_t mergedPairBytes = 0;
     for (size_t item = mergeQueue.claimNext(); item < exchange.sendRangeCount; item = mergeQueue.claimNext()) {
-        Timer mergeRangeTimer;
         const size_t sendRange = mergeOrder[item];
         mergedPairBytes += sendRangePairBytes[sendRange];
         mergeRanges.push_back(sendRange);
@@ -2359,7 +2354,6 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
             }
         }
         delete batchReader;
-        MMseqsNode::addPhaseTime(mergeValues, "merging a send range", mergeRangeTimer);
     }
     closeReceivedFiles(receivedPairFiles);
     batchWriter.waitWrites();
@@ -2477,7 +2471,9 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     for (size_t i = 0; i < ownHashRanges; i++) {
         ownKmers.hashRanges.push_back(MMseqsNode::rank + i * MMseqsNode::count);
     }
-    Debug(Debug::INFO) << "Send k-mers of " << exchange.sendRangeCount << " send ranges\n";
+    if (MMseqsNode::isMaster()) {
+        Debug(Debug::INFO) << "Send k-mers in " << exchange.sendRangeCount << " ranges\n";
+    }
     const size_t sentBytes = sendKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, sendQueue, representativeBitsMemory, sendRanges, sendValues, ownKmers);
     // no node takes hash ranges before the barrier, so claimNext takes the first own hash ranges in order
     for (size_t i = 0; i < ownKmers.hashRanges.size(); i++) {
@@ -2487,8 +2483,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     MMseqsNode::addPhaseValue(sendValues, "K-mer bytes sent", SSTR(sentBytes + ownKmers.bytes));
     MMseqsNode::addPhaseValue(sendValues, "K-mer bytes kept in memory", SSTR(ownKmers.bytes));
     MMseqsNode::addPhaseValue(sendValues, "Send ranges", SSTR(sendRanges.size()));
-    sendValues = MMseqsNode::barrier(par.db2 + ".kmers.done", sendValues);
     MMseqsNode::printPhaseValues(sendValues);
+    MMseqsNode::barrier(par.db2 + ".kmers.done");
     const double sendWaitSeconds = phaseTimer.getTimediff();
     // every node has passed the send ranges
     sendQueue.removeClaims();
@@ -2502,7 +2498,9 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     MMseqsNode::addPhaseSeconds(receiveValues, "waiting for the other nodes to send k-mers", sendWaitSeconds);
     std::vector<size_t> hashRanges;
     size_t pairBytes = 0;
-    Debug(Debug::INFO) << "Receive k-mers of " << exchange.hashRangeCount << " hash ranges\n";
+    if (MMseqsNode::isMaster()) {
+        Debug(Debug::INFO) << "Receive k-mers in " << exchange.hashRangeCount << " hash ranges\n";
+    }
     const size_t receivedBytes = receiveKmers(par, seqDbr, exchange, hashQueue, hashRanges, receiveValues, pairBytes, ownKmers);
     Util::releasePages(ownKmers.data, ownKmers.bytes);
     free(ownKmers.data);
@@ -2510,8 +2508,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     MMseqsNode::addPhaseValue(receiveValues, "K-mer bytes received", SSTR(receivedBytes));
     MMseqsNode::addPhaseValue(receiveValues, "Pair bytes written", SSTR(pairBytes));
     MMseqsNode::addPhaseValue(receiveValues, "Hash ranges", SSTR(hashRanges.size()));
-    receiveValues = MMseqsNode::barrier(par.db2 + ".pairs.done", receiveValues);
     MMseqsNode::printPhaseValues(receiveValues);
+    MMseqsNode::barrier(par.db2 + ".pairs.done");
     std::string mergeValues;
     MMseqsNode::addPhaseTime(mergeValues, "waiting for the other nodes to receive k-mers", phaseTimer);
     // every node has passed the hash ranges and read the k-mer file of this node
@@ -2524,13 +2522,15 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     }
 
     std::vector<size_t> mergeRanges;
-    Debug(Debug::INFO) << "Merge pairs of " << exchange.sendRangeCount << " send ranges\n";
+    if (MMseqsNode::isMaster()) {
+        Debug(Debug::INFO) << "Merge pairs in " << exchange.sendRangeCount << " ranges\n";
+    }
     const std::string partitionsData = mergeAssignedPairs(par, seqDbr, exchange, mergeQueue, mergeRanges, mergeValues);
     kmerFileRemoval.join();
     MMseqsNode::addPhaseTime(mergeValues, "merging pairs", phaseTimer);
     MMseqsNode::addPhaseValue(mergeValues, "Send ranges merged", SSTR(mergeRanges.size()));
+    MMseqsNode::printPhaseValues(mergeValues);
     MMseqsNode::publishRunFile(par.db2 + ".partitions." + SSTR(MMseqsNode::rank), partitionsData);
-    MMseqsNode::publishRunFile(par.db2 + ".merge." + SSTR(MMseqsNode::rank), mergeValues);
     // freeing a large file takes long, so every node removes its pair file while the master writes the partitions
     const std::string pairFile = par.db2 + ".pairs." + SSTR(MMseqsNode::rank);
     if (MMseqsNode::isMaster()) {
@@ -2538,10 +2538,9 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         const std::string partitions = MMseqsNode::gatherRunFiles(par.db2 + ".partitions.");
         std::string mergeWaitValues;
         MMseqsNode::addPhaseTime(mergeWaitValues, "waiting for the other nodes to merge pairs", phaseTimer);
-        mergeValues = MMseqsNode::gatherRunFiles(par.db2 + ".merge.") + mergeWaitValues;
         MMseqsNode::publishRunFile(par.db2 + ".merged", "");
         std::thread pairFileRemoval([&pairFile]() { FileUtil::remove(pairFile.c_str()); });
-        MMseqsNode::printPhaseValues(mergeValues);
+        MMseqsNode::printPhaseValues(mergeWaitValues);
         mergeQueue.removeClaims();
         FileUtil::remove((par.db2 + ".pairs.done").c_str());
         // the partition rows of all nodes are sorted by key

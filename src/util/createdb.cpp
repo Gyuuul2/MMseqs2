@@ -661,16 +661,9 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         currPos = nodePlanDataChar - nodePlanData.c_str();
     }
     FileUtil::remove(planFile.c_str());
-    std::string nodeFileNames;
-    for (size_t i = 0; i < nodePieces.size(); i++) {
-        if (i == 0 || nodePieces[i].file != nodePieces[i - 1].file) {
-            nodeFileNames.append(1, ' ');
-            nodeFileNames.append(filenames[nodePieces[i].file]);
-        }
+    if (MMseqsNode::isMaster()) {
+        Debug(Debug::INFO) << "Converting sequences from " << filenames.size() << " files on " << MMseqsNode::count << " nodes\n";
     }
-    Debug(Debug::INFO) << "Node " << MMseqsNode::rank << " reads" << nodeFileNames << "\n";
-
-    Debug(Debug::INFO) << "Converting sequences\n";
     std::string phaseValues;
     Timer timer;
     std::vector<std::vector<LengthBin>> pieceHistograms(nodePieces.size());
@@ -995,9 +988,10 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
         FileUtil::move(tmpFile.c_str(), hdrDataFile.c_str());
         MMseqsNode::addPhaseTime(phaseValues, "compressing the headers", timer);
-        MMseqsNode::publishRunFile(dataFile + ".compressed." + SSTR(MMseqsNode::rank), phaseValues);
+        MMseqsNode::printPhaseValues(phaseValues);
+        MMseqsNode::publishRunFile(dataFile + ".compressed." + SSTR(MMseqsNode::rank), "");
         if (MMseqsNode::isMaster()) {
-            MMseqsNode::printPhaseValues(MMseqsNode::gatherRunFiles(dataFile + ".compressed."));
+            MMseqsNode::gatherRunFiles(dataFile + ".compressed.");
         }
     }
     if (MMseqsNode::isMaster()) {

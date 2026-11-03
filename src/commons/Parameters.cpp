@@ -2165,7 +2165,7 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
         }
     }
 
-    if (MMseqsMPI::isMaster() && MMseqsNode::isMaster()) {
+    if (MMseqsMPI::isMaster()) {
         Debug::setDebugLevel(verbosity);
     }
 
@@ -2464,7 +2464,7 @@ void Parameters::checkIfDatabaseIsValid(const Command& command, int argc, const 
 
 void Parameters::printParameters(const std::string &module, int argc, const char* pargv[],
                                  const std::vector<MMseqsParameter*> &par){
-    if (Debug::debugLevel < Debug::INFO) {
+    if (Debug::debugLevel < Debug::INFO || MMseqsNode::isMaster() == false) {
         return;
     }
 
