@@ -912,6 +912,14 @@ template <typename T> size_t DBReader<T>::findIdRange(size_t id) {
     return (range < indexSize && index[range].id == key) ? range : range - 1;
 }
 
+template <typename T> size_t DBReader<T>::getSeqLenFromRange(size_t &range, size_t id) {
+    if (range == SIZE_MAX) {
+        range = findIdRange(id);
+    }
+    for (; range + 1 < indexSize && indexIdToNum(&index[range + 1].id) <= id; range++) {}
+    return index[range].length - 2;
+}
+
 template <typename T> size_t DBReader<T>::findEntryByCell(size_t column, size_t value) {
     if (clusterIndex == false || (column == 1 && value > dataSize)) {
         Debug(Debug::ERROR) << ((column == 0) ? "Key " : "Offset ") << value << " is not in the --createdb-mode 3 cluster or prefilter database " << dataFileName << "\n";

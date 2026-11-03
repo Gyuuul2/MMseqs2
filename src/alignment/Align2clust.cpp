@@ -2533,15 +2533,8 @@ static size_t getKeyGroup(const std::vector<size_t> &groupKeyOffsets, size_t key
     return std::upper_bound(groupKeyOffsets.begin(), groupKeyOffsets.end(), key) - groupKeyOffsets.begin() - 1;
 }
 
-// the groups go to the aligning nodes in turn, back and forth, which align the reps of their groups
-static size_t getGroupNode(size_t group) {
-    const size_t alignNodes = MMseqsNode::count - getFirstAlignNode();
-    const size_t turn = group % (2 * alignNodes);
-    return getFirstAlignNode() + std::min(turn, 2 * alignNodes - 1 - turn);
-}
-
-static size_t getAlignNode(const std::vector<size_t> &groupKeyOffsets, size_t key) {
-    return getGroupNode(getKeyGroup(groupKeyOffsets, key));
+static size_t getAlignNode(const std::vector<size_t> &groupKeyOffsets, const std::vector<unsigned int> &groupNodes, size_t key) {
+    return groupNodes[getKeyGroup(groupKeyOffsets, key)];
 }
 
 // the blocks of the sequences go to the aligning nodes in turn, which serve their keys to the others
@@ -3274,6 +3267,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::mutex publishMutex;
     std::mutex assignedChangesMutex;
     std::vector<size_t> batchOffsets;
+    std::vector<size_t> recordCosts;
     std::vector<unsigned char> batchDone;
     std::vector<std::vector<ClusterPair> > batchPairs;
     std::vector<ClusterPair> windowPairs;
@@ -3855,14 +3849,28 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         // batches of about the same rep length times targets, so the longest reps do not fall into one batch
         const size_t maxBatches = std::min(recordCount, par.threads * ALIGN_BATCHES_PER_THREAD);
         __extension__ typedef unsigned __int128 uint128;
-        size_t windowCost = 0;
-        for (size_t i = window.begin; i < window.end; i++) {
-            windowCost += seqDbr.getSeqLen(records[i].header.repFirstTarget.repKey % paddedDbSize) * records[i].header.targetCount;
+        // a record costs its rep length times its target lengths, like a partition
+        recordCosts.resize(recordCount);
+#pragma omp parallel for schedule(dynamic, 100)
+        for (size_t i = 0; i < recordCount; i++) {
+            const RepTargets &header = records[window.begin + i].header;
+            const DBKeyType *targets = chunkTargets[window.chunk].data() + records[window.begin + i].targetOffset;
+            size_t targetRange = SIZE_MAX;
+            size_t targetResidues = 0;
+            for (unsigned int j = 0; j < header.targetCount; j++) {
+                targetResidues += seqDbr.getSeqLenFromRange(targetRange, targets[j]);
+            }
+            recordCosts[i] = seqDbr.getSeqLen(header.repFirstTarget.repKey % paddedDbSize) * targetResidues;
+        }
+        uint128 windowCost = 0;
+        for (size_t i = 0; i < recordCount; i++) {
+            windowCost += recordCosts[i];
         }
         batchOffsets.assign(1, window.begin);
-        for (size_t i = window.begin, cost = 0; i + 1 < window.end; i++) {
-            cost += seqDbr.getSeqLen(records[i].header.repFirstTarget.repKey % paddedDbSize) * records[i].header.targetCount;
-            if (static_cast<uint128>(cost) * maxBatches >= static_cast<uint128>(windowCost) * batchOffsets.size()) {
+        uint128 cost = 0;
+        for (size_t i = window.begin; i + 1 < window.end; i++) {
+            cost += recordCosts[i - window.begin];
+            if (cost * maxBatches >= windowCost * batchOffsets.size()) {
                 batchOffsets.push_back(i + 1);
             }
         }
@@ -4285,7 +4293,7 @@ struct TakenLog {
 };
 
 // --createdb-mode 3: the master clusters the accepted pairs in order key order; returns the member count
-static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimit, const std::vector<size_t> &groupKeyOffsets, const DBReader<DBKeyType> &seqDbr,
+static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimit, const std::vector<size_t> &groupKeyOffsets, const std::vector<unsigned int> &groupNodes, const DBReader<DBKeyType> &seqDbr,
                                    const std::vector<unsigned int> &pageNodes, int mode, size_t paddedDbSize, size_t prefSizeBits,
                                    const std::string &accepted, const std::string &assignedChanges, const std::string &taken, const std::string &assignedBits, std::string &phaseValues) {
     const size_t assignedWords = (dbSize + 63) / 64;
@@ -4366,7 +4374,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     SetCoverSizeClasses sizeClasses;
     const auto takePair = [&](DBKeyType repKey, DBKeyType memberKey) {
         const ClusterPair pair = { repKey, memberKey };
-        TakenLog &nodeFile = nodeTaken[getAlignNode(groupKeyOffsets, repKey)];
+        TakenLog &nodeFile = nodeTaken[getAlignNode(groupKeyOffsets, groupNodes, repKey)];
         if (fwrite(&pair, sizeof(ClusterPair), 1, nodeFile.file) != 1) {
             Debug(Debug::ERROR) << "Cannot write " << taken << "\n";
             EXIT(EXIT_FAILURE);
@@ -4819,7 +4827,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                     }
                     const DBKeyType key = threadAssignedKeys[thread][i - threadKeyOffsets[thread]];
                     const size_t keyNode = getAssignedKeyNode(key);
-                    const size_t groupNode = getAlignNode(groupKeyOffsets, key);
+                    const size_t groupNode = getAlignNode(groupKeyOffsets, groupNodes, key);
                     const size_t keyPosition = nodeOffsets[keyNode]++;
                     const size_t groupPosition = (groupNode != keyNode) ? nodeOffsets[groupNode]++ : keyPosition;
                     if (pass == 1) {
@@ -4942,7 +4950,7 @@ static int align2clustLinfinity(Parameters &par) {
     const size_t masterMemoryLimit = nodeMemoryLimit / (masterAligns ? MASTER_MEMORY_DIVISOR : 1);
     const size_t masterMemory = (par.clusteringMode == Parameters::SET_COVER) ? masterMemoryLimit : getClusterStepMemory(dbSize, masterMemoryLimit);
 
-    // every partition of the prefilter is a group of keys, taken by the aligning nodes in turn so that they align close keys at the same time
+    // every partition of the prefilter is a group of keys, taken in key order by the aligning node with the fewest alignment cells so far, so that they align close keys at the same time
     const std::string partitionsFile = par.db2 + ".partitions";
     const std::string partitionsData = MMseqsNode::readFile(partitionsFile);
     std::vector<PrefPartition> partitions;
@@ -4957,13 +4965,24 @@ static int align2clustLinfinity(Parameters &par) {
         partition.node = Util::fast_atoi<size_t>(columns[4]);
         partitions.push_back(partition);
     }
+    __extension__ typedef unsigned __int128 uint128;
     std::vector<size_t> groupKeyOffsets(1, 0);
+    std::vector<unsigned int> groupNodes(std::max<size_t>(1, partitions.size()), getFirstAlignNode());
     std::vector<PrefPartition> nodePartitions;
+    std::priority_queue<std::pair<uint128, unsigned int>, std::vector<std::pair<uint128, unsigned int> >, std::greater<std::pair<uint128, unsigned int> > > nodeCosts;
+    for (unsigned int node = getFirstAlignNode(); node < MMseqsNode::count; node++) {
+        nodeCosts.push(std::make_pair(static_cast<uint128>(0), node));
+    }
     for (size_t i = 0; i < partitions.size(); i++) {
         if (i > 0) {
             groupKeyOffsets.push_back(partitions[i].firstKey);
         }
-        if (getGroupNode(i) == MMseqsNode::rank && partitions[i].cost > 0) {
+        std::pair<uint128, unsigned int> nodeCost = nodeCosts.top();
+        nodeCosts.pop();
+        groupNodes[i] = nodeCost.second;
+        nodeCost.first += partitions[i].cost;
+        nodeCosts.push(nodeCost);
+        if (groupNodes[i] == MMseqsNode::rank && partitions[i].cost > 0) {
             nodePartitions.push_back(partitions[i]);
         }
     }
@@ -4998,7 +5017,7 @@ static int align2clustLinfinity(Parameters &par) {
         pageEnd = lastPage + 1;
     }
     for (size_t group = 0; group + 1 < groupKeyOffsets.size(); group++) {
-        if (getGroupNode(group) == MMseqsNode::rank) {
+        if (groupNodes[group] == MMseqsNode::rank) {
             keepAssignedPages(groupKeyOffsets[group], groupKeyOffsets[group + 1]);
         }
     }
@@ -5086,7 +5105,7 @@ static int align2clustLinfinity(Parameters &par) {
 #ifdef OPENMP
             omp_set_num_threads(clusterThreads);
 #endif
-            memberCount = clusterAcceptedPairs(clusterThreads, dbSize, masterMemoryLimit, groupKeyOffsets, seqDbr, pageNodes, par.clusteringMode, paddedDbSize, prefSizeBits,
+            memberCount = clusterAcceptedPairs(clusterThreads, dbSize, masterMemoryLimit, groupKeyOffsets, groupNodes, seqDbr, pageNodes, par.clusteringMode, paddedDbSize, prefSizeBits,
                                                accepted, assignedChanges, taken, assignedBits, clusterPhaseValues);
         });
     }

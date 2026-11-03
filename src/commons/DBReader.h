@@ -573,6 +573,8 @@ public:
     // --createdb-mode 3: split s holds the keys [offsets[s], offsets[s + 1]) of [keyBegin, keyEnd) whose entries, keyBytes more per key, fit splitBytes, at least one key
     std::vector<size_t> getSplitKeyOffsets(size_t keyBegin, size_t keyEnd, size_t splitBytes, size_t keyBytes);
     size_t findIdRange(size_t id);
+    // --createdb-mode 3: the sequence length of id, whose range is searched from range on, or from the start if range is SIZE_MAX; ids in key order walk the ranges once
+    size_t getSeqLenFromRange(size_t &range, size_t id);
     // --createdb-mode 3: the representatives of a range, the sixth column of the index of a clusthashfast subset, otherwise all its keys
     size_t getRangeRepresentativeCount(size_t range) const {
         return rangeRepresentativeCounts[range];

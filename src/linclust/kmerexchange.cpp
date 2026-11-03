@@ -32,6 +32,10 @@ static const size_t CHUNKS_PER_THREAD = 2;
 static const size_t PARTITIONS_PER_THREAD = 4;
 // a thread of a receiving pass takes blocks of at most this part of its share of the output, so the blocks not yet filled when the output is full are a small part of it
 static const size_t OUTPUT_BLOCKS_PER_THREAD = 16;
+// a partition row ends once its alignment cells reach 1 / (nodes * this) of what its node merged
+static const size_t PARTITIONS_PER_NODE = 4;
+// a key chunk keeps fewer than twice this many places to cut a partition
+static const size_t CUTS_PER_CHUNK = 8;
 // the nodes take the send ranges and the hash ranges one at a time, about this many each, so a node that is faster takes more
 static const size_t RANGES_PER_NODE = 8;
 // sending a k-mer takes about as long as reading this many bytes of sequence
@@ -348,7 +352,38 @@ struct PairChunkStart {
     size_t bitPos[PAIR_CODE_COUNT];
 };
 
-// a partition that the rep node merges: its row readers, where they start every key chunk, key targets, key chunks with their entry and index offsets, cost
+// a place to cut a partition: the first key after it, the pref bytes and the alignment cells before it
+struct PartitionCut {
+    size_t key;
+    size_t prefBytes;
+    size_t cost;
+};
+
+// the cuts of a key chunk where its alignment cells passed a multiple of step, which doubles to keep fewer than twice CUTS_PER_CHUNK of them
+struct ChunkCuts {
+    ChunkCuts() : step(1) {}
+    std::vector<PartitionCut> cuts;
+    size_t step;
+
+    void add(const PartitionCut &cut) {
+        if (cut.cost / step == (cuts.empty() ? 0 : cuts.back().cost / step)) {
+            return;
+        }
+        cuts.push_back(cut);
+        while (cuts.size() >= 2 * CUTS_PER_CHUNK) {
+            step *= 2;
+            size_t kept = 0;
+            for (size_t i = 0; i < cuts.size(); i++) {
+                if (cuts[i].cost / step != ((kept > 0) ? cuts[kept - 1].cost / step : 0)) {
+                    cuts[kept++] = cuts[i];
+                }
+            }
+            cuts.resize(kept);
+        }
+    }
+};
+
+// a partition that the rep node merges: its row readers, where they start every key chunk, key targets, key chunks with their entry and index offsets, alignment cells and cuts, alignment cells
 struct PartitionMerge {
     std::vector<PairRowRead> rowReads;
     std::vector<PairChunkStart> chunkStarts;
@@ -357,6 +392,8 @@ struct PartitionMerge {
     std::vector<size_t> keyChunkOffsets;
     std::vector<size_t> keyChunkDataOffsets;
     std::vector<size_t> keyChunkEntryOffsets;
+    std::vector<size_t> keyChunkCostOffsets;
+    std::vector<ChunkCuts> keyChunkCuts;
     size_t cost;
 };
 
@@ -1220,7 +1257,8 @@ static void mergePartitionTargets(const KmerExchange &exchange, DBReader<DBKeyTy
     const size_t rowCount = merge.rowReads.size();
     merge.keyChunkDataOffsets.assign(keyChunks + 1, 0);
     merge.keyChunkEntryOffsets.assign(keyChunks + 1, 0);
-    std::vector<size_t> keyChunkCosts(keyChunks, 0);
+    merge.keyChunkCostOffsets.assign(keyChunks + 1, 0);
+    merge.keyChunkCuts.assign(keyChunks, ChunkCuts());
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
     for (size_t keyChunk = 0; keyChunk < keyChunks; keyChunk++) {
         std::vector<PairRowRead> reads(merge.rowReads);
@@ -1253,24 +1291,29 @@ static void mergePartitionTargets(const KmerExchange &exchange, DBReader<DBKeyTy
                 continue;
             }
             size_t entryBytes = getPrefKeyBytes(partitionFirstKey + key) + 1;
+            size_t targetRange = SIZE_MAX;
+            size_t targetResidues = 0;
             for (size_t target = 0; target < keyTargetCount; target++) {
                 entryBytes += getPrefKeyBytes(keyTargets[target] - ((target > 0) ? keyTargets[target - 1] : 0));
+                targetResidues += seqDbr.getSeqLenFromRange(targetRange, keyTargets[target]);
             }
             merge.keyChunkDataOffsets[keyChunk + 1] += entryBytes;
             merge.keyChunkEntryOffsets[keyChunk + 1]++;
             if (keyTargetCount > 0) {
-                keyChunkCosts[keyChunk] += (index[seqDbr.findIdRange(partitionFirstKey + key)].length - 2) * keyTargetCount;
+                merge.keyChunkCostOffsets[keyChunk + 1] += (index[seqDbr.findIdRange(partitionFirstKey + key)].length - 2) * targetResidues;
+                const PartitionCut cut = { key + 1, merge.keyChunkDataOffsets[keyChunk + 1], merge.keyChunkCostOffsets[keyChunk + 1] };
+                merge.keyChunkCuts[keyChunk].add(cut);
             }
         }
     }
     std::vector<PairRowRead>().swap(merge.rowReads);
     std::vector<PairChunkStart>().swap(merge.chunkStarts);
-    merge.cost = 0;
     for (size_t keyChunk = 0; keyChunk < keyChunks; keyChunk++) {
         merge.keyChunkDataOffsets[keyChunk + 1] += merge.keyChunkDataOffsets[keyChunk];
         merge.keyChunkEntryOffsets[keyChunk + 1] += merge.keyChunkEntryOffsets[keyChunk];
-        merge.cost += keyChunkCosts[keyChunk];
+        merge.keyChunkCostOffsets[keyChunk + 1] += merge.keyChunkCostOffsets[keyChunk];
     }
+    merge.cost = merge.keyChunkCostOffsets[keyChunks];
 }
 
 // the pref files of this node: the entries and their index cells, and a pair of write buffers per thread
@@ -2283,13 +2326,23 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     size_t prefIndexBytes = 0;
     prefFiles.writeBuffers = new(std::nothrow) char[par.threads * 2 * KMER_FILE_BUFFER_SIZE];
     Util::checkAllocation(prefFiles.writeBuffers, "Can not allocate prefWriteBuffer memory in mergeAssignedPairs");
-    // a row per partition with entries: firstKey, prefOffset, prefBytes, the representative lengths times their target counts and the node of its pref file
-    std::string partitionsData;
-    const auto addPartitionRow = [&](size_t partitionFirstKey, size_t prefOffset, size_t prefBytes, size_t cost) {
-        if (prefBytes == 0) {
-            return;
+    // a partition is its start, the starts and cuts of its key chunks and its end, with the pref bytes before them in the pref file and the alignment cells before them in the partition
+    std::vector<PartitionCut> partitionCuts;
+    std::vector<size_t> partitionCutOffsets(1, 0);
+    KmerPositionBit::uint128 mergedCost = 0;
+    const auto addKeyChunkCuts = [&](size_t partitionFirstKey, size_t chunkFirstKey, size_t chunkPrefOffset, size_t chunkCost, const ChunkCuts &chunkCuts) {
+        const PartitionCut chunkStart = { partitionFirstKey + chunkFirstKey, chunkPrefOffset, chunkCost };
+        partitionCuts.push_back(chunkStart);
+        for (size_t i = 0; i < chunkCuts.cuts.size(); i++) {
+            const PartitionCut cut = { partitionFirstKey + chunkCuts.cuts[i].key, chunkPrefOffset + chunkCuts.cuts[i].prefBytes, chunkCost + chunkCuts.cuts[i].cost };
+            partitionCuts.push_back(cut);
         }
-        partitionsData += SSTR(partitionFirstKey) + "\t" + SSTR(prefOffset) + "\t" + SSTR(prefBytes) + "\t" + SSTR(cost) + "\t" + SSTR(MMseqsNode::rank) + "\n";
+    };
+    const auto addPartitionEnd = [&](size_t prefEnd, size_t cost) {
+        const PartitionCut end = { 0, prefEnd, cost };
+        partitionCuts.push_back(end);
+        partitionCutOffsets.push_back(partitionCuts.size());
+        mergedCost += cost;
     };
     // the buffer of the largest send range so far, kept for the next ones so their pages are not mapped again
     char *pairPassBuffer = NULL;
@@ -2515,7 +2568,11 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                         const PartitionMerge &merge = partitionMerges[passPartition];
                         partitionDataOffsets[passPartition + 1] = partitionDataOffsets[passPartition] + merge.keyChunkDataOffsets.back();
                         partitionIndexOffsets[passPartition + 1] = partitionIndexOffsets[passPartition] + merge.keyChunkEntryOffsets.back() * 2 * sizeof(uint64_t);
-                        addPartitionRow(getPartitionFirstKey(exchange, sendRange, passFirstPartition + passPartition), partitionDataOffsets[passPartition], merge.keyChunkDataOffsets.back(), merge.cost);
+                        for (size_t keyChunk = 0; keyChunk + 1 < merge.keyChunkOffsets.size(); keyChunk++) {
+                            addKeyChunkCuts(getPartitionFirstKey(exchange, sendRange, passFirstPartition + passPartition), merge.keyChunkOffsets[keyChunk],
+                                            partitionDataOffsets[passPartition] + merge.keyChunkDataOffsets[keyChunk], merge.keyChunkCostOffsets[keyChunk], merge.keyChunkCuts[keyChunk]);
+                        }
+                        addPartitionEnd(partitionDataOffsets[passPartition + 1], merge.cost);
                     }
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
                     for (size_t i = 0; i < passPartitions; i++) {
@@ -2552,6 +2609,10 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                                                   partitionKeys, partitionTargets[partition], merge, mergeThreads);
                             mergePartitionTargets(exchange, seqDbr, partitionFirstKey, merge, pairPassTargets, mergeThreads);
                             writePartition(prefFiles, partitionFirstKey, merge, prefDataBytes, prefIndexBytes, 0, par.threads);
+                            for (size_t keyChunk = 0; keyChunk + 1 < merge.keyChunkOffsets.size(); keyChunk++) {
+                                addKeyChunkCuts(partitionFirstKey, merge.keyChunkOffsets[keyChunk], prefDataBytes + merge.keyChunkDataOffsets[keyChunk], merge.keyChunkCostOffsets[keyChunk],
+                                                merge.keyChunkCuts[keyChunk]);
+                            }
                             partitionEntryCount = merge.keyChunkEntryOffsets.back();
                             partitionCost = merge.cost;
                             prefDataBytes += merge.keyChunkDataOffsets.back();
@@ -2571,9 +2632,22 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                                 readPairRecord(reads[row], exchange.globalIdBits);
                                 repKeyQueue.push(FileRepKey(reads[row].repKey, row));
                             }
+                            // key chunks like those of a merge with all threads, so the partition gets as many places to cut
+                            const size_t windowedChunkKeys = std::max<size_t>(1, partitionKeys / (CHUNKS_PER_THREAD * par.threads));
+                            ChunkCuts windowedCuts;
+                            size_t chunkFirstKey = 0;
+                            size_t chunkPrefOffset = partitionDataOffset;
+                            size_t chunkCost = 0;
                             KmerCodeWriter windowedDataWrite = {fileno(prefFiles.dataFile), prefFiles.dataName.c_str(), prefFiles.writeBuffers, KMER_FILE_BUFFER_SIZE, 0, prefDataBytes, 0, 0, &batchWriter};
                             KmerCodeWriter windowedIndexWrite = {fileno(prefFiles.indexFile), prefFiles.indexName.c_str(), prefFiles.writeBuffers + KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE, 0, prefIndexBytes, 0, 0, &batchWriter};
                             for (size_t key = 0; key < partitionKeys; key++) {
+                                if (key == chunkFirstKey + windowedChunkKeys) {
+                                    addKeyChunkCuts(partitionFirstKey, chunkFirstKey, chunkPrefOffset, chunkCost, windowedCuts);
+                                    windowedCuts = ChunkCuts();
+                                    chunkFirstKey = key;
+                                    chunkPrefOffset = windowedDataWrite.writePos + windowedDataWrite.bufferPos;
+                                    chunkCost = partitionCost;
+                                }
                                 const bool isRep = isRepresentative(partitionFirstKey + key);
                                 if (isRep) {
                                     const uint64_t indexCell[2] = {static_cast<uint64_t>(partitionFirstKey + key), static_cast<uint64_t>(windowedDataWrite.writePos + windowedDataWrite.bufferPos)};
@@ -2582,10 +2656,13 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                                 }
                                 size_t keyTargetCount = 0;
                                 DBKeyType prevTarget = 0;
+                                size_t targetRange = SIZE_MAX;
+                                size_t targetResidues = 0;
                                 mergeKeyTargets(reads, repKeyQueue, targetQueue, keyRows, key, exchange.globalIdBits, [&](DBKeyType target) {
                                     if (isRep) {
                                         putPrefKey(windowedDataWrite, target - prevTarget);
                                         prevTarget = target;
+                                        targetResidues += seqDbr.getSeqLenFromRange(targetRange, target);
                                         keyTargetCount++;
                                     }
                                 });
@@ -2593,15 +2670,18 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                                     putBytes(windowedDataWrite, "", 1);
                                     partitionEntryCount++;
                                     if (keyTargetCount > 0) {
-                                        partitionCost += (index[seqDbr.findIdRange(partitionFirstKey + key)].length - 2) * keyTargetCount;
+                                        partitionCost += (index[seqDbr.findIdRange(partitionFirstKey + key)].length - 2) * targetResidues;
+                                        const PartitionCut cut = { key + 1, windowedDataWrite.writePos + windowedDataWrite.bufferPos - chunkPrefOffset, partitionCost - chunkCost };
+                                        windowedCuts.add(cut);
                                     }
                                 }
                             }
                             writeKmerCodeBuffer(windowedDataWrite);
                             writeKmerCodeBuffer(windowedIndexWrite);
                             prefDataBytes = windowedDataWrite.writePos;
+                            addKeyChunkCuts(partitionFirstKey, chunkFirstKey, chunkPrefOffset, chunkCost, windowedCuts);
                         }
-                        addPartitionRow(partitionFirstKey, partitionDataOffset, prefDataBytes - partitionDataOffset, partitionCost);
+                        addPartitionEnd(prefDataBytes, partitionCost);
                         prefIndexBytes += partitionEntryCount * 2 * sizeof(uint64_t);
                     }
                 }
@@ -2625,6 +2705,24 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     delete[] pairPassTargets;
     delete[] prefFiles.writeBuffers;
     MMseqsNode::closeClusterFiles(prefFiles.dataFile, prefFiles.dataName, prefFiles.indexFile, prefFiles.indexName, prefDataBytes, prefIndexBytes);
+    // a row per part of a partition with entries: firstKey, prefOffset, prefBytes, alignment cells (query times target lengths) and the node of its pref file;
+    // a part ends at the first cut where its cells reach 1 / (nodes * PARTITIONS_PER_NODE) of what this node merged, which is at most that share of what all nodes merged
+    const size_t rowCost = std::max<size_t>(1, static_cast<size_t>(mergedCost / (MMseqsNode::count * PARTITIONS_PER_NODE)));
+    std::string partitionsData;
+    for (size_t partition = 0; partition + 1 < partitionCutOffsets.size(); partition++) {
+        const PartitionCut *rowStart = &partitionCuts[partitionCutOffsets[partition]];
+        for (size_t i = partitionCutOffsets[partition] + 1; i < partitionCutOffsets[partition + 1]; i++) {
+            const PartitionCut &cut = partitionCuts[i];
+            if (i + 1 < partitionCutOffsets[partition + 1] && cut.cost - rowStart->cost < rowCost) {
+                continue;
+            }
+            if (cut.prefBytes > rowStart->prefBytes) {
+                partitionsData += SSTR(rowStart->key) + "\t" + SSTR(rowStart->prefBytes) + "\t" + SSTR(cut.prefBytes - rowStart->prefBytes) + "\t" + SSTR(cut.cost - rowStart->cost)
+                                  + "\t" + SSTR(MMseqsNode::rank) + "\n";
+            }
+            rowStart = &cut;
+        }
+    }
     return partitionsData;
 }
 
