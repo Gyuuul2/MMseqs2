@@ -82,18 +82,6 @@ struct KmerChunkStart {
     size_t bitPos[KMER_CODE_COUNT];
 };
 
-// after the rows at tableOffset in item order, writes where the rows of every item start and their end, then tableOffset; closes the file
-template <typename Row>
-static void writeRowTable(FILE *file, const std::string &fileName, const std::vector<size_t> &itemRowOffsets, size_t tableOffset) {
-    const size_t offsetsPos = tableOffset + itemRowOffsets.back() * sizeof(Row);
-    FileUtil::pwriteAll(fileno(file), fileName.c_str(), reinterpret_cast<const char *>(itemRowOffsets.data()), itemRowOffsets.size() * sizeof(size_t), offsetsPos);
-    FileUtil::pwriteAll(fileno(file), fileName.c_str(), reinterpret_cast<const char *>(&tableOffset), sizeof(size_t), offsetsPos + itemRowOffsets.size() * sizeof(size_t));
-    if (fclose(file) != 0) {
-        Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-}
-
 // with fd -1 a buffer in memory, otherwise a buffer that batchWriter writes at writePos of the file whenever it is full
 struct KmerCodeWriter {
     int fd;
@@ -361,6 +349,12 @@ struct PartitionMerge {
     size_t cost;
 };
 
+// a partition merge with threads holds per row its reader and its starts of the key chunks, and per thread a copy of the readers and their places in the queues
+static size_t getPartitionMergeBytes(size_t rowCount, size_t threads) {
+    return rowCount * (sizeof(PairRowRead) + CHUNKS_PER_THREAD * threads * sizeof(PairChunkStart)
+                       + threads * (sizeof(PairRowRead) + sizeof(FileRepKey) + sizeof(FileTargetId) + sizeof(unsigned int)));
+}
+
 static inline void queueNextKmerGroup(KmerHashQueue &queue, unsigned int row, KmerHashSubRangeRead &read) {
     if (read.group == read.groupEnd) {
         return;
@@ -372,12 +366,13 @@ static inline void queueNextKmerGroup(KmerHashQueue &queue, unsigned int row, Km
     queue.push(FileKmerHash(read.hash, row));
 }
 
-// the file of every node that a node reads for the whole phase, and where the rows of every item start in its row table
+// the file of every node that a node reads for the whole phase: where its row table starts, its row blocks and the code bytes of every item
 struct ReceivedFile {
     std::string fileName;
     FILE *file;
     size_t rowTableOffset;
-    std::vector<size_t> itemRowOffsets;
+    size_t blockCount;
+    std::vector<size_t> itemBytes;
     // without a file, the rows that this node sent to itself in memory
     char *data;
 };
@@ -387,32 +382,64 @@ static size_t getRowEnd(const Row &row) {
     return row.offsets[sizeof(row.offsets) / sizeof(size_t) - 1];
 }
 
-// opens the file and reads where the rows of every item start, written by writeRowTable with itemCount items
-template <typename Row>
+// writes at rowTableOffset where the rows of every item start in every block of rows, item after item, then the end of every block, the code bytes of every item,
+// blockCount and rowTableOffset; closes the file
+static void writeRowTable(FILE *file, const std::string &fileName, const std::vector<size_t> &itemRowStarts, const std::vector<size_t> &itemBytes, size_t blockCount, size_t rowTableOffset) {
+    std::vector<size_t> table(itemRowStarts);
+    table.insert(table.end(), itemBytes.begin(), itemBytes.end());
+    table.push_back(blockCount);
+    table.push_back(rowTableOffset);
+    FileUtil::pwriteAll(fileno(file), fileName.c_str(), reinterpret_cast<const char *>(table.data()), table.size() * sizeof(size_t), rowTableOffset);
+    if (fclose(file) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
+// opens the file and reads the code bytes of every item, the block count and where the row table starts, written by writeRowTable with itemCount items
 static void openReceivedFile(ReceivedFile &receivedFile, size_t itemCount) {
     receivedFile.file = FileUtil::openFileOrDie(receivedFile.fileName.c_str(), "r", true);
     struct stat sb;
-    const size_t tableBytes = (itemCount + 2) * sizeof(size_t);
-    if (fstat(fileno(receivedFile.file), &sb) != 0 || static_cast<size_t>(sb.st_size) < tableBytes) {
+    const size_t tailBytes = (itemCount + 2) * sizeof(size_t);
+    if (fstat(fileno(receivedFile.file), &sb) != 0 || static_cast<size_t>(sb.st_size) < tailBytes) {
         Debug(Debug::ERROR) << "Cannot read " << receivedFile.fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
-    receivedFile.itemRowOffsets.resize(itemCount + 2);
-    FileUtil::preadAll(fileno(receivedFile.file), receivedFile.fileName.c_str(), reinterpret_cast<char *>(receivedFile.itemRowOffsets.data()), tableBytes, sb.st_size - tableBytes);
-    receivedFile.rowTableOffset = receivedFile.itemRowOffsets.back();
-    receivedFile.itemRowOffsets.pop_back();
+    std::vector<size_t> tail(itemCount + 2);
+    FileUtil::preadAll(fileno(receivedFile.file), receivedFile.fileName.c_str(), reinterpret_cast<char *>(tail.data()), tailBytes, sb.st_size - tailBytes);
+    receivedFile.itemBytes.assign(tail.begin(), tail.begin() + itemCount);
+    receivedFile.blockCount = tail[itemCount];
+    receivedFile.rowTableOffset = tail[itemCount + 1];
     // every node must cut as many items
-    if (receivedFile.rowTableOffset + receivedFile.itemRowOffsets.back() * sizeof(Row) + tableBytes != static_cast<size_t>(sb.st_size)) {
+    if (receivedFile.rowTableOffset + (itemCount + 1) * receivedFile.blockCount * sizeof(size_t) + tailBytes != static_cast<size_t>(sb.st_size)) {
         Debug(Debug::ERROR) << "Data file " << receivedFile.fileName << " has other items than " << itemCount << "\n";
         EXIT(EXIT_FAILURE);
     }
 }
 
+// the rows of item, block after block, read now or added to readRequests for the caller to read
 template <typename Row>
-static void readItemRows(const ReceivedFile &receivedFile, size_t item, std::vector<Row> &rows) {
-    rows.resize(receivedFile.itemRowOffsets[item + 1] - receivedFile.itemRowOffsets[item]);
-    FileUtil::preadAll(fileno(receivedFile.file), receivedFile.fileName.c_str(), reinterpret_cast<char *>(rows.data()), rows.size() * sizeof(Row),
-                       receivedFile.rowTableOffset + receivedFile.itemRowOffsets[item] * sizeof(Row));
+static void readItemRows(const ReceivedFile &receivedFile, size_t item, std::vector<Row> &rows, std::vector<BatchReader::ReadRequest> *readRequests = NULL) {
+    const size_t blockCount = receivedFile.blockCount;
+    std::vector<size_t> rowStarts(2 * blockCount);
+    FileUtil::preadAll(fileno(receivedFile.file), receivedFile.fileName.c_str(), reinterpret_cast<char *>(rowStarts.data()), rowStarts.size() * sizeof(size_t),
+                       receivedFile.rowTableOffset + item * blockCount * sizeof(size_t));
+    size_t rowCount = 0;
+    for (size_t block = 0; block < blockCount; block++) {
+        rowCount += (rowStarts[blockCount + block] - rowStarts[block]) / sizeof(Row);
+    }
+    rows.resize(rowCount);
+    size_t row = 0;
+    for (size_t block = 0; block < blockCount; block++) {
+        const size_t bytes = rowStarts[blockCount + block] - rowStarts[block];
+        if (readRequests == NULL) {
+            FileUtil::preadAll(fileno(receivedFile.file), receivedFile.fileName.c_str(), reinterpret_cast<char *>(rows.data() + row), bytes, rowStarts[block]);
+        } else if (bytes > 0) {
+            const BatchReader::ReadRequest readRequest = {fileno(receivedFile.file), receivedFile.fileName.c_str(), reinterpret_cast<char *>(rows.data() + row), rowStarts[block], bytes, bytes};
+            readRequests->push_back(readRequest);
+        }
+        row += bytes / sizeof(Row);
+    }
 }
 
 static void closeReceivedFiles(std::vector<ReceivedFile> &receivedFiles) {
@@ -603,9 +630,9 @@ struct AssignedPairFile {
     FILE *file;
     BatchWriter *batchWriter;
     size_t bytes;
-    // the rows of every flush, written after its records as a block, and the rows of every send range
-    std::vector<std::pair<size_t, size_t> > rowBlocks;
-    std::vector<size_t> sendRangeRowCounts;
+    // the rows of every flush are written after its records as a block: where the rows of every send range start in it, then its end, block after block
+    std::vector<size_t> blockRowStarts;
+    std::vector<size_t> sendRangeBytes;
 };
 
 // the Rice parameter of the key gaps of a row: the keys of its partition per record, rounded down to a power of two
@@ -709,6 +736,8 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
     std::vector<size_t> rowFirstKeys;
     std::vector<size_t> rowKeys;
     std::vector<AssignedPairPartition> rows;
+    // the first row of every send range, then the row count
+    std::vector<size_t> sendRangeRows;
     while (rowRecordOffsets.back() < recordCount) {
         const size_t rep = records[rowRecordOffsets.back()].rep;
         const size_t sendRange = std::upper_bound(sendRangeKeyOffsets.begin(), sendRangeKeyOffsets.end(), rep) - sendRangeKeyOffsets.begin() - 1;
@@ -717,9 +746,13 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
         rowKeys.push_back(getPartitionFirstKey(exchange, sendRange, partition + 1) - rowFirstKeys.back());
         rowRecordOffsets.push_back(std::partition_point(records + rowRecordOffsets.back(), records + recordCount,
                                                         [&](const AssignedPairRecord &record) { return record.rep < rowFirstKeys.back() + rowKeys.back(); }) - records);
-        const AssignedPairPartition row = {{0, 0, 0}, sendRange * exchange.partitionsPerRange + partition, 0, 0};
+        while (sendRangeRows.size() <= sendRange) {
+            sendRangeRows.push_back(rows.size());
+        }
+        const AssignedPairPartition row = {{0, 0, 0}, partition, 0, 0};
         rows.push_back(row);
     }
+    sendRangeRows.resize(exchange.sendRangeCount + 1, rows.size());
     const unsigned int targetGapBitsWidth = getBitWidth(exchange.globalIdBits);
     // the bytes of every code of a row; the sorted targets go back to the slots of the records, so the write takes them in order
 #pragma omp parallel num_threads(threads)
@@ -764,13 +797,15 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
             }
         }
     }
-    for (size_t row = 0; row < rows.size(); row++) {
-        rows[row].offsets[0] = pairFile.bytes;
-        for (size_t code = 0; code < PAIR_CODE_COUNT; code++) {
-            rows[row].offsets[code + 1] += rows[row].offsets[code];
+    for (size_t sendRange = 0; sendRange < exchange.sendRangeCount; sendRange++) {
+        for (size_t row = sendRangeRows[sendRange]; row < sendRangeRows[sendRange + 1]; row++) {
+            rows[row].offsets[0] = pairFile.bytes;
+            for (size_t code = 0; code < PAIR_CODE_COUNT; code++) {
+                rows[row].offsets[code + 1] += rows[row].offsets[code];
+            }
+            pairFile.bytes = rows[row].offsets[PAIR_CODE_COUNT];
+            pairFile.sendRangeBytes[sendRange] += pairFile.bytes - rows[row].offsets[0];
         }
-        pairFile.bytes = rows[row].offsets[PAIR_CODE_COUNT];
-        pairFile.sendRangeRowCounts[rows[row].partition / exchange.partitionsPerRange]++;
     }
     // a record: the gap to the key after the record before, the target count, the first target and the bits of the gaps to the other targets
 #pragma omp parallel num_threads(threads)
@@ -828,7 +863,9 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
         }
     }
     pairFile.batchWriter->write(fileno(pairFile.file), pairFile.name.c_str(), reinterpret_cast<const char *>(rows.data()), rows.size() * sizeof(AssignedPairPartition), pairFile.bytes);
-    pairFile.rowBlocks.push_back(std::make_pair(pairFile.bytes, rows.size()));
+    for (size_t sendRange = 0; sendRange <= exchange.sendRangeCount; sendRange++) {
+        pairFile.blockRowStarts.push_back(pairFile.bytes + sendRangeRows[sendRange] * sizeof(AssignedPairPartition));
+    }
     pairFile.bytes += rows.size() * sizeof(AssignedPairPartition);
 }
 
@@ -1439,18 +1476,25 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
     delete[] kmerWriteBuffer;
     Util::releasePages(hashSeqPair, hashSeqPairCapacity * sizeof(KmerPositionBit));
     delete[] hashSeqPair;
-    // the rows of the k-mer file by hash range, which the receiving nodes read after the barrier
-    std::vector<size_t> hashRangeRowOffsets(1, 0);
+    // the rows of the k-mer file by hash range as one block, which the receiving nodes read after the barrier
+    std::vector<size_t> hashRangeRowStarts(1, kmerFileBytes);
+    std::vector<size_t> hashRangeBytes(exchange.hashRangeCount, 0);
+    size_t rowCount = 0;
     for (size_t hashRange = 0; hashRange < exchange.hashRangeCount; hashRange++) {
-        std::vector<KmerHashSubRange> &rows = kmerFileRows[hashRange];
-        if (rows.empty() == false) {
-            FileUtil::pwriteAll(fileno(kmerFileHandle), kmerFile.c_str(), reinterpret_cast<const char *>(rows.data()),
-                                rows.size() * sizeof(KmerHashSubRange), kmerFileBytes + hashRangeRowOffsets.back() * sizeof(KmerHashSubRange));
-        }
-        hashRangeRowOffsets.push_back(hashRangeRowOffsets.back() + rows.size());
-        std::vector<KmerHashSubRange>().swap(rows);
+        rowCount += kmerFileRows[hashRange].size();
     }
-    writeRowTable<KmerHashSubRange>(kmerFileHandle, kmerFile, hashRangeRowOffsets, kmerFileBytes);
+    std::vector<KmerHashSubRange> rows;
+    rows.reserve(rowCount);
+    for (size_t hashRange = 0; hashRange < exchange.hashRangeCount; hashRange++) {
+        for (size_t row = 0; row < kmerFileRows[hashRange].size(); row++) {
+            hashRangeBytes[hashRange] += getRowEnd(kmerFileRows[hashRange][row]) - kmerFileRows[hashRange][row].offsets[0];
+        }
+        rows.insert(rows.end(), kmerFileRows[hashRange].begin(), kmerFileRows[hashRange].end());
+        std::vector<KmerHashSubRange>().swap(kmerFileRows[hashRange]);
+        hashRangeRowStarts.push_back(kmerFileBytes + rows.size() * sizeof(KmerHashSubRange));
+    }
+    FileUtil::pwriteAll(fileno(kmerFileHandle), kmerFile.c_str(), reinterpret_cast<const char *>(rows.data()), rows.size() * sizeof(KmerHashSubRange), kmerFileBytes);
+    writeRowTable(kmerFileHandle, kmerFile, hashRangeRowStarts, hashRangeBytes, 1, hashRangeRowStarts.back());
     return kmerFileBytes;
 }
 
@@ -1478,7 +1522,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     BatchWriter batchWriter(exchange.writeBehindMemory, par.threads, fileno(pairFile.file));
     pairFile.batchWriter = &batchWriter;
     pairFile.bytes = 0;
-    pairFile.sendRangeRowCounts.assign(exchange.sendRangeCount, 0);
+    pairFile.sendRangeBytes.assign(exchange.sendRangeCount, 0);
     char *pairWriteBuffer = new(std::nothrow) char[par.threads * KMER_FILE_BUFFER_SIZE];
     Util::checkAllocation(pairWriteBuffer, "Can not allocate pairWriteBuffer memory in receiveKmers");
     // the k-mer file of every sender, open for the whole phase, then the own rows in memory
@@ -1486,7 +1530,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
     for (size_t sender = 0; sender < MMseqsNode::count; sender++) {
         receivedFiles[sender].fileName = par.db2 + ".kmers." + SSTR(sender);
-        openReceivedFile<KmerHashSubRange>(receivedFiles[sender], exchange.hashRangeCount);
+        openReceivedFile(receivedFiles[sender], exchange.hashRangeCount);
     }
     receivedFiles[MMseqsNode::count].data = ownKmers.data;
 
@@ -2007,27 +2051,15 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     Util::releasePages(passBuffer, outputBytes + 2 * codeBufferBytes);
     delete[] passBuffer;
     delete[] pairWriteBuffer;
-    // the row table: the rows of every flush, a block in send range order, go to their send range in file order
-    std::vector<size_t> sendRangeRowOffsets(exchange.sendRangeCount + 1, 0);
-    for (size_t sendRange = 0; sendRange < exchange.sendRangeCount; sendRange++) {
-        sendRangeRowOffsets[sendRange + 1] = sendRangeRowOffsets[sendRange] + pairFile.sendRangeRowCounts[sendRange];
-    }
-    std::vector<size_t> sendRangeRowPos(sendRangeRowOffsets.begin(), sendRangeRowOffsets.end() - 1);
-    std::vector<AssignedPairPartition> rows;
-    for (size_t block = 0; block < pairFile.rowBlocks.size(); block++) {
-        rows.resize(pairFile.rowBlocks[block].second);
-        FileUtil::preadAll(fileno(pairFile.file), pairFile.name.c_str(), reinterpret_cast<char *>(rows.data()), rows.size() * sizeof(AssignedPairPartition), pairFile.rowBlocks[block].first);
-        for (size_t row = 0, rowEnd = 0; row < rows.size(); row = rowEnd) {
-            const size_t sendRange = rows[row].partition / exchange.partitionsPerRange;
-            for (rowEnd = row; rowEnd < rows.size() && rows[rowEnd].partition / exchange.partitionsPerRange == sendRange; rowEnd++) {
-                rows[rowEnd].partition %= exchange.partitionsPerRange;
-            }
-            FileUtil::pwriteAll(fileno(pairFile.file), pairFile.name.c_str(), reinterpret_cast<const char *>(rows.data() + row), (rowEnd - row) * sizeof(AssignedPairPartition),
-                                pairFile.bytes + sendRangeRowPos[sendRange] * sizeof(AssignedPairPartition));
-            sendRangeRowPos[sendRange] += rowEnd - row;
+    // the row table: where the rows of every send range start in every block, send range after send range
+    const size_t blockCount = pairFile.blockRowStarts.size() / (exchange.sendRangeCount + 1);
+    std::vector<size_t> sendRangeRowStarts(pairFile.blockRowStarts.size());
+    for (size_t block = 0; block < blockCount; block++) {
+        for (size_t sendRange = 0; sendRange <= exchange.sendRangeCount; sendRange++) {
+            sendRangeRowStarts[sendRange * blockCount + block] = pairFile.blockRowStarts[block * (exchange.sendRangeCount + 1) + sendRange];
         }
     }
-    writeRowTable<AssignedPairPartition>(pairFile.file, pairFile.name, sendRangeRowOffsets, pairFile.bytes);
+    writeRowTable(pairFile.file, pairFile.name, sendRangeRowStarts, pairFile.sendRangeBytes, blockCount, pairFile.bytes);
     pairBytes = pairFile.bytes;
     return receivedBytes;
 }
@@ -2066,17 +2098,43 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
     for (size_t receiver = 0; receiver < receivedPairFiles.size(); receiver++) {
         receivedPairFiles[receiver].fileName = par.db2 + ".pairs." + SSTR(receiver);
-        openReceivedFile<AssignedPairPartition>(receivedPairFiles[receiver], exchange.sendRangeCount);
+        openReceivedFile(receivedPairFiles[receiver], exchange.sendRangeCount);
     }
     std::vector<std::vector<AssignedPairPartition> > pairFileRows(MMseqsNode::count);
-    for (size_t sendRange = mergeQueue.claimNext(); sendRange < exchange.sendRangeCount; sendRange = mergeQueue.claimNext()) {
+    // the nodes take the send ranges with the most pair bytes first, as pairs gather on the long sequences, so the ones taken last are small
+    std::vector<size_t> sendRangePairBytes(exchange.sendRangeCount, 0);
+    std::vector<size_t> mergeOrder(exchange.sendRangeCount);
+    for (size_t sendRange = 0; sendRange < exchange.sendRangeCount; sendRange++) {
+        for (size_t receiver = 0; receiver < receivedPairFiles.size(); receiver++) {
+            sendRangePairBytes[sendRange] += receivedPairFiles[receiver].itemBytes[sendRange];
+        }
+        mergeOrder[sendRange] = sendRange;
+    }
+    SORT_SERIAL(mergeOrder.begin(), mergeOrder.end(), [&](size_t first, size_t second) {
+        return sendRangePairBytes[first] > sendRangePairBytes[second] || (sendRangePairBytes[first] == sendRangePairBytes[second] && first < second);
+    });
+    // own items are rank + j * count, so every other group of count items is reversed and no node takes the largest of every group
+    for (size_t group = MMseqsNode::count; group < mergeOrder.size(); group += 2 * MMseqsNode::count) {
+        std::reverse(mergeOrder.begin() + group, mergeOrder.begin() + std::min(group + MMseqsNode::count, mergeOrder.size()));
+    }
+    size_t mergedPairBytes = 0;
+    for (size_t item = mergeQueue.claimNext(); item < exchange.sendRangeCount; item = mergeQueue.claimNext()) {
         Timer mergeRangeTimer;
+        const size_t sendRange = mergeOrder[item];
+        mergedPairBytes += sendRangePairBytes[sendRange];
         mergeRanges.push_back(sendRange);
         setSendRange(par, exchange, sendRange);
+        // the rows of the send range lie in every flush block of a pair file, so all of them are read in one batch
+        std::vector<std::vector<BatchReader::ReadRequest> > rowReadRequests(receivedPairFiles.size());
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
         for (size_t receiver = 0; receiver < receivedPairFiles.size(); receiver++) {
-            readItemRows(receivedPairFiles[receiver], sendRange, pairFileRows[receiver]);
+            readItemRows(receivedPairFiles[receiver], sendRange, pairFileRows[receiver], &rowReadRequests[receiver]);
         }
+        for (size_t receiver = 1; receiver < rowReadRequests.size(); receiver++) {
+            rowReadRequests[0].insert(rowReadRequests[0].end(), rowReadRequests[receiver].begin(), rowReadRequests[receiver].end());
+        }
+        BatchReader *batchReader = new BatchReader(par.threads, fileno(receivedPairFiles[0].file));
+        batchReader->readSync(rowReadRequests[0]);
         std::vector<size_t> partitionCodeBytes(exchange.partitionsPerRange, 0);
         std::vector<size_t> partitionTargets(exchange.partitionsPerRange, 0);
         // the received file and row of every row of a partition
@@ -2101,11 +2159,12 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
             }
         }
         const size_t pairPassLimit = getPassLimit(exchange.loadMemoryLimit);
-        // a partition takes its codes, its target ids and where the targets of every key start
+        // a partition takes its codes, its target ids, where the targets of every key start and its merge with a thread
         std::vector<size_t> partitionBytes(exchange.partitionsPerRange);
         for (size_t partition = 0; partition < exchange.partitionsPerRange; partition++) {
             const size_t partitionKeys = getPartitionFirstKey(exchange, sendRange, partition + 1) - getPartitionFirstKey(exchange, sendRange, partition);
-            partitionBytes[partition] = partitionCodeBytes[partition] + partitionTargets[partition] * sizeof(DBKeyType) + (partitionKeys + 1) * sizeof(size_t);
+            partitionBytes[partition] = partitionCodeBytes[partition] + partitionTargets[partition] * sizeof(DBKeyType) + (partitionKeys + 1) * sizeof(size_t)
+                                        + getPartitionMergeBytes(partitionRowCounts[partition], 1);
         }
         // a pass and the prefetched codes of the next one fit their limit; a bigger partition is a pass that reads its codes in windows
         std::vector<size_t> passPartitionOffsets;
@@ -2146,7 +2205,6 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
             pairPassTargets = new(std::nothrow) DBKeyType[pairPassTargetsSize];
             Util::checkAllocation(pairPassTargets, "Can not allocate pairPassTargets memory in mergeAssignedPairs");
         }
-        BatchReader *batchReader = NULL;
         // the rows of a pass, partition after partition, and where the rows of every partition start
         std::vector<PassRow> pairPassRows[2];
         std::vector<size_t> pairPassRowOffsets[2];
@@ -2235,11 +2293,16 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                     size_t partitionEntryCount = 0;
                     size_t partitionCost = 0;
                     if (isWindowedPass == false) {
+                        // the pass fits with the merge of the partition, fewer threads if their reader copies do not fit
+                        int mergeThreads = par.threads;
+                        while (mergeThreads > 1 && pairPassBytes[pass] - getPartitionMergeBytes(partitionRowCount, 1) + getPartitionMergeBytes(partitionRowCount, mergeThreads) > pairPassLimit) {
+                            mergeThreads--;
+                        }
                         partitionMerges.resize(1);
                         PartitionMerge &merge = partitionMerges[0];
                         countPartitionTargets(exchange, receivedPairFiles, pairFileRows, partitionPassRows.data() + partitionPassRowOffsets[passPartition], partitionRowCount, codeBuffer,
-                                              partitionKeys, partitionTargets[partition], merge, par.threads);
-                        mergePartitionTargets(exchange, seqDbr, partitionFirstKey, merge, pairPassTargets, par.threads);
+                                              partitionKeys, partitionTargets[partition], merge, mergeThreads);
+                        mergePartitionTargets(exchange, seqDbr, partitionFirstKey, merge, pairPassTargets, mergeThreads);
                         writePartition(prefFiles, partitionFirstKey, merge, prefDataBytes, prefIndexBytes, 0, par.threads);
                         partitionEntryCount = merge.keyChunkEntryOffsets.back();
                         partitionCost = merge.cost;
@@ -2301,6 +2364,7 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     closeReceivedFiles(receivedPairFiles);
     batchWriter.waitWrites();
     MMseqsNode::addPhaseSeconds(mergeValues, "waiting to write the prefilter", batchWriter.getWaitSeconds() / par.threads);
+    MMseqsNode::addPhaseValue(mergeValues, "Pair bytes merged", SSTR(mergedPairBytes));
     Util::releasePages(pairPassBuffer, pairPassBufferBytes);
     delete[] pairPassBuffer;
     Util::releasePages(pairPassTargets, pairPassTargetsSize * sizeof(DBKeyType));
@@ -2467,37 +2531,40 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     MMseqsNode::addPhaseValue(mergeValues, "Send ranges merged", SSTR(mergeRanges.size()));
     MMseqsNode::publishRunFile(par.db2 + ".partitions." + SSTR(MMseqsNode::rank), partitionsData);
     MMseqsNode::publishRunFile(par.db2 + ".merge." + SSTR(MMseqsNode::rank), mergeValues);
+    // freeing a large file takes long, so every node removes its pair file while the master writes the partitions
+    const std::string pairFile = par.db2 + ".pairs." + SSTR(MMseqsNode::rank);
     if (MMseqsNode::isMaster()) {
         // every node has merged its send ranges and read the pair files
         const std::string partitions = MMseqsNode::gatherRunFiles(par.db2 + ".partitions.");
         std::string mergeWaitValues;
         MMseqsNode::addPhaseTime(mergeWaitValues, "waiting for the other nodes to merge pairs", phaseTimer);
         mergeValues = MMseqsNode::gatherRunFiles(par.db2 + ".merge.") + mergeWaitValues;
+        MMseqsNode::publishRunFile(par.db2 + ".merged", "");
+        std::thread pairFileRemoval([&pairFile]() { FileUtil::remove(pairFile.c_str()); });
         MMseqsNode::printPhaseValues(mergeValues);
         mergeQueue.removeClaims();
         FileUtil::remove((par.db2 + ".pairs.done").c_str());
         // the partition rows of all nodes are sorted by key
-        std::vector<char *> partitionRows;
+        std::vector<std::pair<size_t, char *> > partitionRows;
         for (char *row = (char *) partitions.c_str(); *row != '\0'; row = Util::skipLine(row)) {
-            partitionRows.push_back(row);
+            partitionRows.push_back(std::make_pair(Util::fast_atoi<size_t>(row), row));
         }
-        SORT_SERIAL(partitionRows.begin(), partitionRows.end(), [](const char *first, const char *second) {
-            return Util::fast_atoi<size_t>(first) < Util::fast_atoi<size_t>(second);
-        });
+        SORT_SERIAL(partitionRows.begin(), partitionRows.end());
         std::string sortedPartitions;
         for (size_t i = 0; i < partitionRows.size(); i++) {
-            sortedPartitions.append(partitionRows[i], Util::skipLine(partitionRows[i]) - partitionRows[i]);
+            sortedPartitions.append(partitionRows[i].second, Util::skipLine(partitionRows[i].second) - partitionRows[i].second);
         }
         MMseqsNode::publishFile(par.db2 + ".partitions", sortedPartitions);
+        MMseqsNode::removeOnceRead(par.db2 + ".merged");
         DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_PREFILTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
-        MMseqsNode::publishRunFile(par.db2 + ".merged", "");
+        pairFileRemoval.join();
     } else {
-        // the master publishes this once every node has merged, so no node takes merge ranges any more
+        // the master publishes this once every node has merged, so no node takes merge ranges or reads the pair file of this node any more
         MMseqsNode::waitForRunFile(par.db2 + ".merged");
+        MMseqsNode::removeOnceRead(par.db2 + ".merged");
         mergeQueue.removeClaims();
+        FileUtil::remove(pairFile.c_str());
     }
-    // every node has read the pair file of this node; freeing a large file takes long, so no node does it for all
-    FileUtil::remove((par.db2 + ".pairs." + SSTR(MMseqsNode::rank)).c_str());
 }
 
 template void kmermatcherLinfinity<short, true, unsigned short>(Parameters &, DBReader<DBKeyType> &, BaseMatrix *, size_t);

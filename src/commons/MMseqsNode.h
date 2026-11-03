@@ -88,6 +88,8 @@ public:
     static void truncateExchangeSlice(const std::string &file);
     // every node publishes content as file + "." + node; returns all contents in node order, gathered by the master into file
     static std::string barrier(const std::string &file, const std::string &content = "");
+    // this node has read file; the master removes it once every node has, the others do not wait
+    static void removeOnceRead(const std::string &file);
     // phase values that a node appends to the content of a barrier as lines name<TAB>node<TAB>value, for the master to print
     static void addPhaseValue(std::string &content, const std::string &name, const std::string &value);
     // the seconds since timer started, which then starts again

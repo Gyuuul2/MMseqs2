@@ -241,11 +241,17 @@ void MMseqsNode::publishRunFile(const std::string &file, const std::string &cont
 }
 
 std::string MMseqsNode::gatherRunFiles(const std::string &prefix) {
-    std::string content;
-    for (unsigned int node = 0; node < MMseqsNode::count; node++) {
+    std::vector<std::string> nodeContents(count);
+    // the threads wait for the files at once, so their reads do not add up node after node
+#pragma omp parallel for schedule(dynamic, 1)
+    for (unsigned int node = 0; node < count; node++) {
         const std::string file = prefix + SSTR(node);
-        content += waitForRunFile(file);
+        nodeContents[node] = waitForRunFile(file);
         FileUtil::remove(file.c_str());
+    }
+    std::string content;
+    for (unsigned int node = 0; node < count; node++) {
+        content += nodeContents[node];
     }
     return content;
 }
@@ -503,6 +509,14 @@ void MMseqsNode::truncateExchangeSlice(const std::string &file) {
     }
     Debug(Debug::ERROR) << "Cannot truncate " << file << " after " << MAX_READ_POLLS << " polls\n";
     EXIT(EXIT_FAILURE);
+}
+
+void MMseqsNode::removeOnceRead(const std::string &file) {
+    publishRunFile(file + ".read." + SSTR(rank), "");
+    if (isMaster()) {
+        gatherRunFiles(file + ".read.");
+        FileUtil::remove(file.c_str());
+    }
 }
 
 std::string MMseqsNode::barrier(const std::string &file, const std::string &content) {
@@ -1598,12 +1612,7 @@ std::vector<size_t> MMseqsNode::getClusterKeyOffsets(const std::string &file, co
         EXIT(EXIT_FAILURE);
     }
     const std::string firstKeys = barrier(file, SSTR(firstCell[0]) + "\n");
-    // the master removes file once every node has read it
-    publishRunFile(file + ".read." + SSTR(rank), "");
-    if (isMaster()) {
-        gatherRunFiles(file + ".read.");
-        FileUtil::remove(file.c_str());
-    }
+    removeOnceRead(file);
     std::vector<size_t> offsets(count + 1, keyCount);
     char *line = (char *) firstKeys.c_str();
     for (size_t node = 0; node < count; node++, line = Util::skipLine(line)) {
