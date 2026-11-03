@@ -12,8 +12,6 @@
 #include "FileUtil.h"
 #include "Timer.h"
 
-#include <limits>
-
 #ifdef OPENMP
 #include <omp.h>
 #endif
@@ -110,6 +108,16 @@ static size_t fillHashIdPairs(DBReader<DBKeyType> &reader, const BaseMatrix *sub
     return seqCount;
 }
 
+// loads the read chunk from readChunkBegin of keys [firstKey, firstKey + seqCount), prefetches the next one and returns the end of the loaded one
+static size_t loadReadChunk(DBReader<DBKeyType> &reader, size_t firstKey, size_t seqCount, size_t readChunkSeqCount, size_t readChunkBegin) {
+    const size_t readChunkEnd = std::min(readChunkBegin + readChunkSeqCount, seqCount);
+    reader.loadData(firstKey + readChunkBegin, firstKey + readChunkEnd);
+    if (readChunkEnd < seqCount) {
+        reader.prefetchData(firstKey + readChunkEnd, firstKey + std::min(readChunkEnd + readChunkSeqCount, seqCount));
+    }
+    return readChunkEnd;
+}
+
 // counts the sequences of each hash bucket of keys [firstKey, firstKey + seqCount), read readChunkSeqCount at a time,
 // and cuts the buckets into hash ranges of at most maxRangeSeqCount sequences, like kmermatcher setupKmerSplits
 static std::vector<std::pair<size_t, size_t>> setupHashRanges(DBReader<DBKeyType> &reader, const BaseMatrix *subMat, size_t maxSeqLen,
@@ -118,11 +126,7 @@ static std::vector<std::pair<size_t, size_t>> setupHashRanges(DBReader<DBKeyType
     Util::checkAllocation(hashDist, "Can not allocate hashDist memory");
     memset(hashDist, 0, sizeof(size_t) * (USHRT_MAX + 1));
     for (size_t readChunkBegin = 0; readChunkBegin < seqCount; readChunkBegin += readChunkSeqCount) {
-        const size_t readChunkEnd = std::min(readChunkBegin + readChunkSeqCount, seqCount);
-        reader.loadData(firstKey + readChunkBegin, firstKey + readChunkEnd);
-        if (readChunkEnd < seqCount) {
-            reader.prefetchData(firstKey + readChunkEnd, firstKey + std::min(readChunkEnd + readChunkSeqCount, seqCount));
-        }
+        const size_t readChunkEnd = loadReadChunk(reader, firstKey, seqCount, readChunkSeqCount, readChunkBegin);
 #pragma omp parallel
         {
             unsigned int thread_idx = 0;
@@ -163,11 +167,7 @@ static size_t fillHashRange(DBReader<DBKeyType> &reader, const BaseMatrix *subMa
                             const std::pair<size_t, size_t> &hashRange, HashEntry *hashIdPairs, MemberBits *memberBits) {
     size_t rangeSeqCount = 0;
     for (size_t readChunkBegin = 0; readChunkBegin < seqCount; readChunkBegin += readChunkSeqCount) {
-        const size_t readChunkEnd = std::min(readChunkBegin + readChunkSeqCount, seqCount);
-        reader.loadData(firstKey + readChunkBegin, firstKey + readChunkEnd);
-        if (readChunkEnd < seqCount) {
-            reader.prefetchData(firstKey + readChunkEnd, firstKey + std::min(readChunkEnd + readChunkSeqCount, seqCount));
-        }
+        const size_t readChunkEnd = loadReadChunk(reader, firstKey, seqCount, readChunkSeqCount, readChunkBegin);
 #pragma omp parallel
         {
             unsigned int thread_idx = 0;
@@ -212,11 +212,7 @@ static size_t hashAndSortLength(DBReader<DBKeyType> &reader, const BaseMatrix *s
                                 HashEntry *hashIdPairs, uint64_t *representativeBits, size_t localFirstKey) {
     const size_t length = reader.getSeqLen(firstKey);
     for (size_t readChunkBegin = 0; readChunkBegin < seqCount; readChunkBegin += readChunkSeqCount) {
-        const size_t readChunkEnd = std::min(readChunkBegin + readChunkSeqCount, seqCount);
-        reader.loadData(firstKey + readChunkBegin, firstKey + readChunkEnd);
-        if (readChunkEnd < seqCount) {
-            reader.prefetchData(firstKey + readChunkEnd, firstKey + std::min(readChunkEnd + readChunkSeqCount, seqCount));
-        }
+        const size_t readChunkEnd = loadReadChunk(reader, firstKey, seqCount, readChunkSeqCount, readChunkBegin);
         const LengthRange readChunkRanges[2] = { { firstKey + readChunkBegin, 0, length + 2 }, { firstKey + readChunkEnd, 0, 0 } };
         fillHashIdPairs(reader, subMat, maxSeqLen, readChunkRanges, 1, hashIdPairs + readChunkBegin);
     }
@@ -256,11 +252,7 @@ static void loadBlockSeqs(DBReader<DBKeyType> &reader, size_t firstKey, size_t s
         memberCount += __builtin_popcountll(memberBits[i].isMember);
     }
     for (size_t readChunkBegin = 0; readChunkBegin < seqCount; readChunkBegin += readChunkSeqCount) {
-        const size_t readChunkEnd = std::min(readChunkBegin + readChunkSeqCount, seqCount);
-        reader.loadData(firstKey + readChunkBegin, firstKey + readChunkEnd);
-        if (readChunkEnd < seqCount) {
-            reader.prefetchData(firstKey + readChunkEnd, firstKey + std::min(readChunkEnd + readChunkSeqCount, seqCount));
-        }
+        const size_t readChunkEnd = loadReadChunk(reader, firstKey, seqCount, readChunkSeqCount, readChunkBegin);
 #pragma omp parallel
         {
             unsigned int thread_idx = 0;
@@ -429,8 +421,10 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             hashIdPairsSize = hashedSeqCapacity;
         }
 
-        // [first, second) of hash buckets of a split length, or of hashIdPairs (blocks) of a split mode 3 length whose hashIdPairs fit
+        // [first, second) of hash buckets of a split length
         std::vector<std::pair<size_t, size_t>> hashRanges(1, std::make_pair(0, USHRT_MAX + 1));
+        // block b holds hashIdPairs [blockOffsets[b], blockOffsets[b + 1]) of a split mode 3 length whose hashIdPairs fit
+        std::vector<size_t> blockOffsets(1, 0);
         MemberBits *memberBits = NULL;
         char *blockSeqs = NULL;
         if (isSplitLength) {
@@ -441,8 +435,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             const size_t candidateCount = hashAndSortLength(reader, &subMat, par.maxSeqLen, loadFirstKey, loadSeqCount, readChunkSeqCount, hashIdPairs, representativeBits, localFirstKey);
             // the candidates are cut at hash bins into blocks whose copies fit
             const size_t copyCapacity = (hashedSeqCapacity - candidateCount) * sizeof(HashEntry) / length;
-            hashRanges.clear();
-            size_t blockBegin = 0;
             for (size_t hashBinBegin = 0; hashBinBegin < candidateCount;) {
                 size_t hashBinEnd = hashBinBegin + 1;
                 while (hashBinEnd < candidateCount && hashIdPairs[hashBinEnd].hash == hashIdPairs[hashBinBegin].hash) {
@@ -453,14 +445,13 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     hashIdPairsFit = false;
                     break;
                 }
-                if (hashBinEnd - blockBegin > copyCapacity) {
-                    hashRanges.emplace_back(blockBegin, hashBinBegin);
-                    blockBegin = hashBinBegin;
+                if (hashBinEnd - blockOffsets.back() > copyCapacity) {
+                    blockOffsets.push_back(hashBinBegin);
                 }
                 hashBinBegin = hashBinEnd;
             }
-            if (candidateCount > blockBegin) {
-                hashRanges.emplace_back(blockBegin, candidateCount);
+            if (candidateCount > blockOffsets.back()) {
+                blockOffsets.push_back(candidateCount);
             }
             blockSeqs = reinterpret_cast<char *>(hashIdPairs + candidateCount);
         }
@@ -475,14 +466,15 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                 reader.prefetchData(nodeSeqRange[loadOffsets[load + 1]].startKey, nodeSeqRange[loadOffsets[load + 2]].startKey);
             }
         }
-        needsSort |= hashRanges.size() > 1;
-        for (size_t range = 0; range < hashRanges.size(); range++) {
+        const size_t rangeCount = (copiesSeqs && hashIdPairsFit) ? blockOffsets.size() - 1 : hashRanges.size();
+        needsSort |= rangeCount > 1;
+        for (size_t range = 0; range < rangeCount; range++) {
             HashEntry *rangeHashIdPairs = hashIdPairs;
             size_t hashedSeqCount = 0;
             if (copiesSeqs && hashIdPairsFit) {
                 // hashIdPairs of a block are sorted by hash and id already
-                rangeHashIdPairs = hashIdPairs + hashRanges[range].first;
-                hashedSeqCount = hashRanges[range].second - hashRanges[range].first;
+                rangeHashIdPairs = hashIdPairs + blockOffsets[range];
+                hashedSeqCount = blockOffsets[range + 1] - blockOffsets[range];
             } else {
                 hashedSeqCount = isSplitLength
                                ? fillHashRange(reader, &subMat, par.maxSeqLen, loadFirstKey, loadSeqCount, readChunkSeqCount, hashRanges[range], hashIdPairs, memberBits)

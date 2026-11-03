@@ -20,7 +20,6 @@
 #include "Matcher.h"
 #include "SwipeAligner.h"
 #include "BlockAligner.h"
-#include "EvalueComputation.h"
 
 const char* binary_name = "test_alignment";
 DEFAULT_PARAMETER_SINGLETON_INIT

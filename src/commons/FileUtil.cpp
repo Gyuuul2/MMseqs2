@@ -122,6 +122,9 @@ void FileUtil::preadAll(int fd, const char *fileName, char *data, size_t size, s
 void FileUtil::pwriteAll(int fd, const char *fileName, const char *data, size_t size, size_t offset) {
     for (size_t done = 0; done < size;) {
         const ssize_t count = pwrite(fd, data + done, size - done, offset + done);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
         if (count <= 0) {
             Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
             EXIT(EXIT_FAILURE);

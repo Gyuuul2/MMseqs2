@@ -246,9 +246,9 @@ public:
         if (local2id != NULL) {
             length=index[local2id[id]].length;
         }else if (index2dbfile != NULL) {
-            if (headerOffsetsFileNames.empty() == false) {
-                const size_t headerOffsetsPos = findLoadedHeaderOffsetsPos(id);
-                length=loadedBuffer.headerOffsets[headerOffsetsPos + 1] - loadedBuffer.headerOffsets[headerOffsetsPos];
+            if (entryOffsetsFileNames.empty() == false) {
+                const size_t entryOffsetsPos = findLoadedEntryOffsetsPos(id);
+                length=loadedBuffer.entryOffsets[entryOffsetsPos + 1] - loadedBuffer.entryOffsets[entryOffsetsPos];
             } else {
                 length=index[findIdRange(id)].length;
             }
@@ -274,9 +274,9 @@ public:
         if (local2id != NULL) {
             return index[local2id[id]].length;
         }else if (index2dbfile != NULL) {
-            if (headerOffsetsFileNames.empty() == false) {
-                const size_t headerOffsetsPos = findLoadedHeaderOffsetsPos(id);
-                return loadedBuffer.headerOffsets[headerOffsetsPos + 1] - loadedBuffer.headerOffsets[headerOffsetsPos];
+            if (entryOffsetsFileNames.empty() == false) {
+                const size_t entryOffsetsPos = findLoadedEntryOffsetsPos(id);
+                return loadedBuffer.entryOffsets[entryOffsetsPos + 1] - loadedBuffer.entryOffsets[entryOffsetsPos];
             }
             return index[findIdRange(id)].length;
         }else{
@@ -427,8 +427,8 @@ public:
 
 
     Index* getIndex() {
-        if (headerOffsetsFileNames.empty() == false) {
-            Debug(Debug::ERROR) << "Call of getIndex is not allowed for the headers of a --createdb-mode 3 database " << dataFileName << "\n";
+        if (entryOffsetsFileNames.empty() == false) {
+            Debug(Debug::ERROR) << "Call of getIndex is not allowed for the headers or clusters of a --createdb-mode 3 database " << dataFileName << "\n";
             EXIT(EXIT_FAILURE);
         }
         return index;
@@ -574,10 +574,10 @@ public:
 
 private:
     void checkClosed() const;
-    size_t findLoadedHeaderOffsetsPos(size_t id);
+    size_t findLoadedEntryOffsetsPos(size_t id);
     // the first (key, offset) cell of the entries, or the end cell, whose cell[column] is value or larger
     size_t findEntryByCell(size_t column, size_t value);
-    size_t planReadRequests(size_t keyBegin, size_t keyEnd, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &headerOffsets, std::vector<size_t> &keys, std::vector<BatchReader::ReadRequest> &compressedReadRequests, std::vector<size_t> &requestFirstKeys);
+    size_t planReadRequests(size_t keyBegin, size_t keyEnd, bool readOffsets, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &entryOffsets, std::vector<size_t> &keys, std::vector<BatchReader::ReadRequest> &compressedReadRequests, std::vector<size_t> &requestFirstKeys);
     size_t planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys);
     // a load of keys [keyBegin, keyEnd), only the given keys of them if keys is not NULL
     void loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
@@ -634,8 +634,8 @@ private:
 
     // --createdb-mode 3: range i holds keys index[i].id .. index[i + 1].id - 1 of one length, from index[i].offset in <db>.<index2dbfile[i]>
     unsigned int * index2dbfile;
-    // headers: <db>_h.index.<file> holds uint64 name starts in <db>_h.<file> and its size; their fds follow the data fds
-    std::vector<std::string> headerOffsetsFileNames;
+    // headers: <db>_h.index.<file> holds uint64 name starts in <db>_h.<file> and its size, clusters: the index of clusterIndex; their fds follow the data fds
+    std::vector<std::string> entryOffsetsFileNames;
     std::vector<size_t> rangeRepresentativeCounts;
     // cluster or prefilter database of a node: <clu>.index.<node> holds uint64 (key, offset) per entry, then (DB_KEY_INVALID, data size); it is read like the header offsets
     bool clusterIndex;
@@ -652,7 +652,7 @@ private:
         size_t keyBegin;
         size_t keyEnd;
         std::vector<BatchReader::ReadRequest> readRequests;
-        std::vector<size_t> headerOffsets;
+        std::vector<size_t> entryOffsets;
         std::vector<size_t> keys;
         std::vector<BatchReader::ReadRequest> compressedReadRequests;
         // the first key of every read request, they follow in key order

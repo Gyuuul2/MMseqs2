@@ -14,13 +14,9 @@
 #include "Masker.h"
 #include "MMseqsNode.h"
 
-#define ZSTD_STATIC_LINKING_ONLY
-#include <zstd.h>
 #include "zstd/contrib/seekable_format/zstd_seekable.h"
-#include <unistd.h>
 #include <sys/stat.h>
 #include <algorithm>
-#include <cstring>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -355,7 +351,7 @@ void processSeqBatch(Parameters & par, DBWriter &seqWriter, DBWriter &hdrWriter,
 struct LengthBin {
     size_t length;
     size_t sequenceCount;
-    size_t headerSize;
+    size_t headerBytes;
     size_t startKey;
     size_t offset;
     size_t headerOffset;
@@ -382,11 +378,11 @@ static size_t getSegmentHeadersSize(size_t entryCount, size_t lengthCount, size_
     return (DATA_FILE_TYPES * (std::min(entryCount, lengthCount) + 1) + dataSize / MAX_SEGMENT_SIZE) * SEGMENT_HEADER_SIZE;
 }
 
-static std::vector<LengthBin> makeLengthBins(const std::vector<size_t> &sequenceCount, const std::vector<size_t> &headerSize) {
+static std::vector<LengthBin> makeLengthBins(const std::vector<size_t> &sequenceCount, const std::vector<size_t> &headerBytes) {
     std::vector<LengthBin> histogram;
     for (size_t length = sequenceCount.size(); length-- > 0; ) {
         if (sequenceCount[length] > 0) {
-            LengthBin bin = {length, sequenceCount[length], headerSize[length], 0, 0, 0, 0, 0};
+            LengthBin bin = {length, sequenceCount[length], headerBytes[length], 0, 0, 0, 0, 0};
             histogram.push_back(bin);
         }
     }
@@ -401,14 +397,14 @@ static std::vector<LengthBin> mergeLengthHistograms(const std::vector<std::vecto
         }
     }
     std::vector<size_t> sequenceCount(maxLength + 1, 0);
-    std::vector<size_t> headerSize(maxLength + 1, 0);
+    std::vector<size_t> headerBytes(maxLength + 1, 0);
     for (size_t i = 0; i < histograms.size(); i++) {
         for (size_t j = 0; j < histograms[i].size(); j++) {
             sequenceCount[histograms[i][j].length] += histograms[i][j].sequenceCount;
-            headerSize[histograms[i][j].length] += histograms[i][j].headerSize;
+            headerBytes[histograms[i][j].length] += histograms[i][j].headerBytes;
         }
     }
-    return makeLengthBins(sequenceCount, headerSize);
+    return makeLengthBins(sequenceCount, headerBytes);
 }
 
 static std::vector<LengthBin> getLengthToBin(const std::vector<LengthBin> &histogram) {
@@ -432,7 +428,7 @@ static void splitStarts(const std::vector<LengthBin> &starts, std::vector<std::v
             bin.file = start.file;
             start.startKey += bin.sequenceCount;
             start.offset += bin.sequenceCount * (bin.length + 2);
-            start.headerOffset += bin.headerSize;
+            start.headerOffset += bin.headerBytes;
             start.headerIndexOffset += bin.sequenceCount * sizeof(uint64_t);
         }
     }
@@ -550,28 +546,27 @@ static void flushBufferToExchange(const char *buffer, size_t bufferPos, char *so
     FileUtil::pwriteAll(fileno(exchangeFile), exchangeFileName.c_str(), sortedBuffer + ownEnd, sortedPos - ownEnd, exchangeOffset + ownBegin);
 }
 
-template <typename T>
-static std::vector<T> readLinfinityFile(const std::string &file) {
-    const std::string linfinityData = MMseqsNode::waitForRunFile(file);
-    char *linfinityDataChar = (char *) linfinityData.c_str();
-    const size_t linfinityDataSize = linfinityData.size();
-    const size_t columns = sizeof(T) / sizeof(size_t);
-    std::vector<T> entries;
+static std::vector<LengthBin> readLengthBins(const std::string &file) {
+    const std::string binData = MMseqsNode::waitForRunFile(file);
+    char *binDataChar = (char *) binData.c_str();
+    std::vector<LengthBin> bins;
     size_t currPos = 0;
-    const char *cols[columns];
-    while (currPos < linfinityDataSize) {
-        const size_t colCount = Util::getWordsOfLine(linfinityDataChar, cols, columns);
-        size_t values[columns] = {};
-        for (size_t i = 0; i < colCount; i++) {
-            values[i] = Util::fast_atoi<size_t>(cols[i]);
+    const char *cols[8];
+    while (currPos < binData.size()) {
+        const size_t columns = Util::getWordsOfLine(binDataChar, cols, 8);
+        LengthBin bin = {Util::fast_atoi<size_t>(cols[0]), Util::fast_atoi<size_t>(cols[1]), Util::fast_atoi<size_t>(cols[2]), 0, 0, 0, 0, 0};
+        if (columns == 8) {
+            bin.startKey = Util::fast_atoi<size_t>(cols[3]);
+            bin.offset = Util::fast_atoi<size_t>(cols[4]);
+            bin.headerOffset = Util::fast_atoi<size_t>(cols[5]);
+            bin.headerIndexOffset = Util::fast_atoi<size_t>(cols[6]);
+            bin.file = Util::fast_atoi<size_t>(cols[7]);
         }
-        T entry;
-        memcpy(&entry, values, sizeof(T));
-        entries.push_back(entry);
-        linfinityDataChar = Util::skipLine(linfinityDataChar);
-        currPos = linfinityDataChar - linfinityData.c_str();
+        bins.push_back(bin);
+        binDataChar = Util::skipLine(binDataChar);
+        currPos = binDataChar - binData.c_str();
     }
-    return entries;
+    return bins;
 }
 
 static int createdbLinfinity(Parameters &par, const std::vector<std::string> &filenames, const std::string &dataFile) {
@@ -653,7 +648,18 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
     }
     const std::string planFile = planPrefix + SSTR(MMseqsNode::rank);
-    const std::vector<InputPiece> nodePieces = readLinfinityFile<InputPiece>(planFile);
+    const std::string nodePlanData = MMseqsNode::waitForRunFile(planFile);
+    char *nodePlanDataChar = (char *) nodePlanData.c_str();
+    std::vector<InputPiece> nodePieces;
+    size_t currPos = 0;
+    const char *cols[3];
+    while (currPos < nodePlanData.size()) {
+        Util::getWordsOfLine(nodePlanDataChar, cols, 3);
+        InputPiece piece = {Util::fast_atoi<size_t>(cols[0]), Util::fast_atoi<size_t>(cols[1]), Util::fast_atoi<size_t>(cols[2])};
+        nodePieces.push_back(piece);
+        nodePlanDataChar = Util::skipLine(nodePlanDataChar);
+        currPos = nodePlanDataChar - nodePlanData.c_str();
+    }
     FileUtil::remove(planFile.c_str());
     std::string nodeFileNames;
     for (size_t i = 0; i < nodePieces.size(); i++) {
@@ -671,7 +677,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
     for (size_t i = 0; i < nodePieces.size(); i++) {
         std::vector<size_t> sequenceCount;
-        std::vector<size_t> headerSize;
+        std::vector<size_t> headerBytes;
         KSeqWrapper *kseq = KSeqFactory(filenames[nodePieces[i].file].c_str(), nodePieces[i].start, nodePieces[i].end);
         while (kseq->ReadEntry()) {
             const KSeqWrapper::KSeqEntry &e = kseq->entry;
@@ -683,13 +689,13 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             const size_t length = e.sequence.l;
             if (length >= sequenceCount.size()) {
                 sequenceCount.resize(length + 1, 0);
-                headerSize.resize(length + 1, 0);
+                headerBytes.resize(length + 1, 0);
             }
             sequenceCount[length]++;
-            headerSize[length] += nameLength + 2;
+            headerBytes[length] += nameLength + 2;
         }
         delete kseq;
-        pieceHistograms[i] = makeLengthBins(sequenceCount, headerSize);
+        pieceHistograms[i] = makeLengthBins(sequenceCount, headerBytes);
     }
 
     const std::vector<LengthBin> localNodeHistogram = mergeLengthHistograms(pieceHistograms);
@@ -698,7 +704,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     const std::string startsPrefix = dataFile + ".starts.";
     std::string histogramData;
     for (size_t i = 0; i < localNodeHistogram.size(); i++) {
-        histogramData += SSTR(localNodeHistogram[i].length) + "\t" + SSTR(localNodeHistogram[i].sequenceCount) + "\t" + SSTR(localNodeHistogram[i].headerSize) + "\n";
+        histogramData += SSTR(localNodeHistogram[i].length) + "\t" + SSTR(localNodeHistogram[i].sequenceCount) + "\t" + SSTR(localNodeHistogram[i].headerBytes) + "\n";
     }
     MMseqsNode::publishRunFile(histogramPrefix + SSTR(MMseqsNode::rank), histogramData);
     MMseqsNode::addPhaseTime(phaseValues, "counting the lengths", timer);
@@ -706,7 +712,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         std::vector<std::vector<LengthBin>> nodeHistograms(MMseqsNode::count);
         for (unsigned int node = 0; node < MMseqsNode::count; node++) {
             const std::string histogramFile = histogramPrefix + SSTR(node);
-            nodeHistograms[node] = readLinfinityFile<LengthBin>(histogramFile);
+            nodeHistograms[node] = readLengthBins(histogramFile);
             FileUtil::remove(histogramFile.c_str());
         }
 
@@ -751,7 +757,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             bin.headerOffset = dataFileSizes[HEADER_DATA * MMseqsNode::count + file];
             bin.headerIndexOffset = dataFileSizes[HEADER_OFFSETS * MMseqsNode::count + file];
             dataFileSizes[SEQUENCE_DATA * MMseqsNode::count + file] += bin.sequenceCount * (bin.length + 2);
-            dataFileSizes[HEADER_DATA * MMseqsNode::count + file] += bin.headerSize;
+            dataFileSizes[HEADER_DATA * MMseqsNode::count + file] += bin.headerBytes;
             dataFileSizes[HEADER_OFFSETS * MMseqsNode::count + file] += bin.sequenceCount * sizeof(uint64_t);
             indexData += SSTR(bin.startKey) + "\t" + SSTR(bin.offset) + "\t" + SSTR(bin.length + 2) + "\t" + SSTR(bin.sequenceCount) + "\t" + SSTR(bin.file) + "\n";
         }
@@ -767,7 +773,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             std::string startsData;
             for (size_t i = 0; i < nodeHistograms[node].size(); i++) {
                 const LengthBin &bin = nodeHistograms[node][i];
-                startsData += SSTR(bin.length) + "\t" + SSTR(bin.sequenceCount) + "\t" + SSTR(bin.headerSize) + "\t" + SSTR(bin.startKey) + "\t" + SSTR(bin.offset) + "\t" + SSTR(bin.headerOffset) + "\t" + SSTR(bin.headerIndexOffset) + "\t" + SSTR(bin.file) + "\n";
+                startsData += SSTR(bin.length) + "\t" + SSTR(bin.sequenceCount) + "\t" + SSTR(bin.headerBytes) + "\t" + SSTR(bin.startKey) + "\t" + SSTR(bin.offset) + "\t" + SSTR(bin.headerOffset) + "\t" + SSTR(bin.headerIndexOffset) + "\t" + SSTR(bin.file) + "\n";
             }
             MMseqsNode::publishRunFile(startsPrefix + SSTR(node), startsData);
         }
@@ -775,7 +781,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         MMseqsNode::publishFile(dataFile + ".nodeinfo", nodeInfoData);
     }
     const std::string startsFile = startsPrefix + SSTR(MMseqsNode::rank);
-    const std::vector<LengthBin> localNodeStarts = readLinfinityFile<LengthBin>(startsFile);
+    const std::vector<LengthBin> localNodeStarts = readLengthBins(startsFile);
     FileUtil::remove(startsFile.c_str());
     timer.reset();
     for (size_t i = 0; i < pieceHistograms.size(); i++) {
@@ -796,7 +802,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         const LengthBin &bin = localNodeStarts[i];
         if (bin.file == MMseqsNode::rank) {
             dataFileSizes[SEQUENCE_DATA] = std::max(dataFileSizes[SEQUENCE_DATA], bin.offset + bin.sequenceCount * (bin.length + 2));
-            dataFileSizes[HEADER_DATA] = std::max(dataFileSizes[HEADER_DATA], bin.headerOffset + bin.headerSize);
+            dataFileSizes[HEADER_DATA] = std::max(dataFileSizes[HEADER_DATA], bin.headerOffset + bin.headerBytes);
             dataFileSizes[HEADER_OFFSETS] = std::max(dataFileSizes[HEADER_OFFSETS], bin.headerIndexOffset + bin.sequenceCount * sizeof(uint64_t));
         }
     }
@@ -811,7 +817,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         size_t pieceSize = 0;
         size_t pieceEntryCount = 0;
         for (size_t j = 0; j < pieceHistograms[i].size(); j++) {
-            pieceSize += pieceHistograms[i][j].sequenceCount * (pieceHistograms[i][j].length + 2 + sizeof(uint64_t)) + pieceHistograms[i][j].headerSize;
+            pieceSize += pieceHistograms[i][j].sequenceCount * (pieceHistograms[i][j].length + 2 + sizeof(uint64_t)) + pieceHistograms[i][j].headerBytes;
             pieceEntryCount += pieceHistograms[i][j].sequenceCount;
         }
         const size_t lengthCount = pieceHistograms[i].empty() ? 0 : pieceHistograms[i][0].length + 1;
@@ -987,10 +993,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             Debug(Debug::ERROR) << "Cannot close data file " << hdrDataFile << "\n";
             EXIT(EXIT_FAILURE);
         }
-        if (rename(tmpFile.c_str(), hdrDataFile.c_str()) != 0) {
-            Debug(Debug::ERROR) << "Cannot rename " << tmpFile << " to " << hdrDataFile << "\n";
-            EXIT(EXIT_FAILURE);
-        }
+        FileUtil::move(tmpFile.c_str(), hdrDataFile.c_str());
         MMseqsNode::addPhaseTime(phaseValues, "compressing the headers", timer);
         MMseqsNode::publishRunFile(dataFile + ".compressed." + SSTR(MMseqsNode::rank), phaseValues);
         if (MMseqsNode::isMaster()) {

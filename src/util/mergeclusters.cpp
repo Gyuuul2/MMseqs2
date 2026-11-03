@@ -5,7 +5,6 @@
 #include "itoa.h"
 #include "FileUtil.h"
 #include "MMseqsNode.h"
-#include "FastSort.h"
 
 #include <list>
 

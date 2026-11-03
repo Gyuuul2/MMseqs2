@@ -2,15 +2,11 @@
 #include "Debug.h"
 #include "FastSort.h"
 #include "FileUtil.h"
-#include "Timer.h"
 #include "Util.h"
 
 #include <algorithm>
 #include <cerrno>
-#include <cstdio>
 #include <cstdlib>
-#include <cstring>
-#include <unistd.h>
 
 #ifdef __linux__
 #include <sys/stat.h>

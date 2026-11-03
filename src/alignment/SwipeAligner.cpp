@@ -1,12 +1,9 @@
 #include "SwipeAligner.h"
 #include "SubstitutionMatrix.h"
 #include "Sequence.h"
-#include "Util.h"
 #include "Debug.h"
 
 #include <algorithm>
-#include <climits>
-#include <cstring>
 
 template <typename T>
 struct SwipeLanes;
