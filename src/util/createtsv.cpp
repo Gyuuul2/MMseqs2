@@ -52,7 +52,7 @@ static void growBuffer(T *&buffer, size_t &capacity, size_t size) {
     }
 }
 
-// sorts a flush, appends it to file and adds its index lines; ownExchange: the last flush keeps the records for this node in memory for that exchange
+// sorts a flush, appends it to file and adds its offsets; ownExchange: the last flush keeps the records for this node in memory for that exchange
 static void writeMemberAccessions(MemberAccession *memberAccessions, size_t accessionCount, const char *accessions, const std::vector<size_t> &nodeKeyOffsets,
                                   FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes, const std::string *ownExchange = NULL) {
     SORT_PARALLEL(memberAccessions, memberAccessions + accessionCount, MemberAccession::compareByRep);

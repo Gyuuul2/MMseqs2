@@ -117,7 +117,7 @@ public:
     // a barrier that returns the smallest memoryLimit of all nodes, so they all cut the same splits; with threads all nodes must run with as many
     static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0);
 
-    // an exchange file <prefix>.<node> holds flushes sorted by receiving node, each with an index line of the node, where the part of every node starts and the end; a block is a part
+    // an exchange file <prefix>.<node> holds flushes sorted by receiving node, then P + 1 columns of one offset per flush: column c is where the part of node c starts, the last column where the flush ends; a block is a part
     struct ExchangeBlock {
         FILE *file;
         size_t pos;
@@ -131,11 +131,11 @@ public:
         // the records that this node sent to itself, read from memory instead of file and freed once read
         char *ownRecords;
     };
-    // nodeOffsets: where the bytes of every node start in the flush, then the flush size
+    // appends the offsets of a flush to indexData; nodeOffsets: where the bytes of every node start in the flush, then the flush size
     static void addExchangeFlush(std::string &indexData, size_t &writtenBytes, const std::vector<size_t> &nodeOffsets);
     // openExchange reads records, from malloc, as the records that this node sends to itself through exchange in its last flush
     static void keepOwnExchangeRecords(const std::string &exchange, char *records, size_t bytes);
-    // closes the file of this node and returns the index lines of all nodes once every node has closed its file
+    // appends the offsets of indexData to the file of this node, closes it and returns a line of every node, its record bytes and flush count, once every node has closed its file
     static std::string closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData);
     static void openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeBlock> &blocks, std::vector<FILE *> &files);
     // the smallest buffer of a block in readExchangeRange
@@ -210,7 +210,7 @@ public:
             return reserved;
         }
         void flush();
-        // writes the buffered pairs but keeps those for this node in memory, and returns the index lines of all nodes
+        // writes the buffered pairs but keeps those for this node in memory, and returns the line of every node from closeExchange
         std::string close();
 
         const std::string exchange;
