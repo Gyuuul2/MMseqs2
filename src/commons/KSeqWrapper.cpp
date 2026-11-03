@@ -1,3 +1,4 @@
+#define ZSTD_STATIC_LINKING_ONLY
 #include "KSeqWrapper.h"
 #include "kseq.h"
 #include "FileUtil.h"
@@ -199,10 +200,45 @@ namespace KSEQZSTD {
     }
 
     KSEQ_INIT(KSeqZstd::ZstdFile*, zstdread)
+
+    // the first pzstd frame that starts from pos to limit, a skippable frame { ZSTD_MAGIC_SKIPPABLE_START, 4, size } then a zstd frame of size bytes, followed by the next such frame or the file end; limit if none
+    static size_t findFrame(FILE *file, const char *fileName, size_t pos, size_t limit) {
+        const size_t fileSize = FileUtil::getFileSize(fileName);
+        limit = std::min(limit, fileSize);
+        const size_t scanSize = 1024 * 1024;
+        std::vector<char> buffer(scanSize + 4 * sizeof(uint32_t));
+        for (; pos < limit; pos += scanSize) {
+            const size_t bytes = std::min(buffer.size(), fileSize - pos);
+            FileUtil::preadAll(fileno(file), fileName, buffer.data(), bytes, pos);
+            for (size_t i = 0; i < scanSize && pos + i < limit && i + 4 * sizeof(uint32_t) <= bytes; i++) {
+                uint32_t header[4];
+                memcpy(header, buffer.data() + i, sizeof(header));
+                if (header[0] != ZSTD_MAGIC_SKIPPABLE_START || header[1] != 4 || header[3] != ZSTD_MAGICNUMBER) {
+                    continue;
+                }
+                const size_t next = pos + i + 3 * sizeof(uint32_t) + header[2];
+                uint32_t nextHeader[2] = {0, 0};
+                if (next + sizeof(nextHeader) <= fileSize) {
+                    FileUtil::preadAll(fileno(file), fileName, reinterpret_cast<char *>(nextHeader), sizeof(nextHeader), next);
+                }
+                if (next == fileSize || (nextHeader[0] == ZSTD_MAGIC_SKIPPABLE_START && nextHeader[1] == 4)) {
+                    return pos + i;
+                }
+            }
+        }
+        return limit;
+    }
 }
 
 KSeqZstd::KSeqZstd(const char* fileName, size_t start, size_t end) {
     file.file = FileUtil::openFileOrDie(fileName, "r", true);
+    // a piece of a pzstd file holds the frames that start from its start to its end, so a piece without one is empty and its scan stops at its end
+    if (start > 0) {
+        start = KSEQZSTD::findFrame(file.file, fileName, start, end);
+    }
+    if (end != SIZE_MAX && start < end) {
+        end = KSEQZSTD::findFrame(file.file, fileName, end, SIZE_MAX);
+    }
     if (start > 0 && fseek(file.file, start, SEEK_SET) != 0) {
         Debug(Debug::ERROR) << "Cannot seek in file " << fileName << "\n";
         EXIT(EXIT_FAILURE);
