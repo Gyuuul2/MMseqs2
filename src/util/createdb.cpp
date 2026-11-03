@@ -438,18 +438,23 @@ static void splitStarts(const std::vector<LengthBin> &starts, std::vector<std::v
     }
 }
 
-// copies data behind the written bytes of the segments that start at segments, skipping the header of every segment
-static void copyToSegments(char *segments, size_t &written, const char *data, size_t size) {
+// copies data behind the written bytes of a bin, leaving room for the segment headers of a bin that goes to another node
+static void copyToBin(char *buffer, size_t &written, const char *data, size_t size, bool segmented) {
+    if (segmented == false) {
+        memcpy(buffer + written, data, size);
+        written += size;
+        return;
+    }
     while (size > 0) {
         const size_t bytes = std::min(size, MAX_SEGMENT_SIZE - written % MAX_SEGMENT_SIZE);
-        memcpy(segments + (written / MAX_SEGMENT_SIZE + 1) * SEGMENT_HEADER_SIZE + written, data, bytes);
+        memcpy(buffer + (written / MAX_SEGMENT_SIZE + 1) * SEGMENT_HEADER_SIZE + written, data, bytes);
         written += bytes;
         data += bytes;
         size -= bytes;
     }
 }
 
-// sorts the entries of buffer into segments of the data files in sortedBuffer; writes those of this node to its data files and appends the others to the exchange file with their index line
+// sorts entries into sortedBuffer; writes this node's bins directly and appends the others as segments to the exchange file
 static void flushBufferToExchange(const char *buffer, size_t bufferPos, char *sortedBuffer, std::vector<LengthBin> &lengthToBin, FILE *const *dataFiles, const std::string *dataFileNames,
                                   FILE *exchangeFile, const std::string &exchangeFileName, std::string &indexData, size_t &exchangeBytes) {
     const size_t lengthCount = lengthToBin.size();
@@ -480,8 +485,12 @@ static void flushBufferToExchange(const char *buffer, size_t bufferPos, char *so
             for (size_t length = lengthEnd; length-- > lengthBegin; ) {
                 const size_t bin = fileType * lengthCount + length;
                 const LengthBin &lengthBin = lengthToBin[length];
-                const size_t offset = (fileType == SEQUENCE_DATA) ? lengthBin.offset : ((fileType == HEADER_DATA) ? lengthBin.headerOffset : lengthBin.headerIndexOffset);
                 binStarts[bin] = sortedPos;
+                if (dataFile == MMseqsNode::rank) {
+                    sortedPos += binSizes[bin];
+                    continue;
+                }
+                const size_t offset = (fileType == SEQUENCE_DATA) ? lengthBin.offset : ((fileType == HEADER_DATA) ? lengthBin.headerOffset : lengthBin.headerIndexOffset);
                 for (size_t segment = 0; segment * MAX_SEGMENT_SIZE < binSizes[bin]; segment++) {
                     const uint64_t segmentHeader[3] = { fileType, offset + segment * MAX_SEGMENT_SIZE, std::min(MAX_SEGMENT_SIZE, binSizes[bin] - segment * MAX_SEGMENT_SIZE) };
                     memcpy(sortedBuffer + sortedPos, segmentHeader, SEGMENT_HEADER_SIZE);
@@ -502,10 +511,21 @@ static void flushBufferToExchange(const char *buffer, size_t bufferPos, char *so
         const size_t hdrBin = HEADER_DATA * lengthCount + seqSize - 2;
         const size_t offsetBin = HEADER_OFFSETS * lengthCount + seqSize - 2;
         const uint64_t headerOffset = lengthToBin[seqSize - 2].headerOffset + binWritten[hdrBin];
-        copyToSegments(sortedBuffer + binStarts[seqBin], binWritten[seqBin], buffer + pos, seqSize);
-        copyToSegments(sortedBuffer + binStarts[hdrBin], binWritten[hdrBin], buffer + pos + seqSize, hdrSize);
-        copyToSegments(sortedBuffer + binStarts[offsetBin], binWritten[offsetBin], reinterpret_cast<const char *>(&headerOffset), sizeof(uint64_t));
+        const bool segmented = lengthToBin[seqSize - 2].file != MMseqsNode::rank;
+        copyToBin(sortedBuffer + binStarts[seqBin], binWritten[seqBin], buffer + pos, seqSize, segmented);
+        copyToBin(sortedBuffer + binStarts[hdrBin], binWritten[hdrBin], buffer + pos + seqSize, hdrSize, segmented);
+        copyToBin(sortedBuffer + binStarts[offsetBin], binWritten[offsetBin], reinterpret_cast<const char *>(&headerOffset), sizeof(uint64_t), segmented);
         pos += seqSize + hdrSize;
+    }
+    for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
+        for (size_t length = lengthCount; length-- > 0; ) {
+            const size_t bin = fileType * lengthCount + length;
+            const LengthBin &lengthBin = lengthToBin[length];
+            if (lengthBin.file == MMseqsNode::rank && binSizes[bin] > 0) {
+                const size_t offset = (fileType == SEQUENCE_DATA) ? lengthBin.offset : ((fileType == HEADER_DATA) ? lengthBin.headerOffset : lengthBin.headerIndexOffset);
+                FileUtil::pwriteAll(fileno(dataFiles[fileType]), dataFileNames[fileType].c_str(), sortedBuffer + binStarts[bin], binSizes[bin], offset);
+            }
+        }
     }
     for (size_t length = 0; length < lengthCount; length++) {
         lengthToBin[length].offset += binSizes[SEQUENCE_DATA * lengthCount + length];
@@ -514,12 +534,6 @@ static void flushBufferToExchange(const char *buffer, size_t bufferPos, char *so
     }
     const size_t ownBegin = nodeOffsets[MMseqsNode::rank];
     const size_t ownEnd = nodeOffsets[MMseqsNode::rank + 1];
-    for (size_t pos = ownBegin; pos < ownEnd; ) {
-        uint64_t segmentHeader[3];
-        memcpy(segmentHeader, sortedBuffer + pos, SEGMENT_HEADER_SIZE);
-        FileUtil::pwriteAll(fileno(dataFiles[segmentHeader[0]]), dataFileNames[segmentHeader[0]].c_str(), sortedBuffer + pos + SEGMENT_HEADER_SIZE, segmentHeader[2], segmentHeader[1]);
-        pos += SEGMENT_HEADER_SIZE + segmentHeader[2];
-    }
     if (ownEnd - ownBegin == sortedPos) {
         return;
     }
