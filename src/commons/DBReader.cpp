@@ -28,7 +28,7 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         indexFileName(strdup(indexFileName_)), size(0), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), indexSize(0), index(NULL), id2local(NULL), local2id(NULL),
-        index2dbfile(NULL), clusterIndex(false), batchReader(NULL), loadedBuffer(), prefetchBuffer(), blockCacheBytes(0), cachedBlockBytes(0), blockReadBytes(0), keyReadBytes(0), dataMapped(false), accessType(0), externalData(false), didMlock(false)
+        index2dbfile(NULL), clusterIndex(false), batchReader(NULL), loadedBuffer(), prefetchBuffer(), partKeyEnd(0), partBytes(0), blockCacheBytes(0), cachedBlockBytes(0), blockReadBytes(0), keyReadBytes(0), dataMapped(false), accessType(0), externalData(false), didMlock(false)
 {}
 
 template <typename T>
@@ -37,7 +37,7 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         threads(threads), dataMode(USE_INDEX), dataFileName(NULL), indexFileName(NULL),
         size(size), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), indexSize(size), index(index), sortedByOffset(true),
-        id2local(NULL), local2id(NULL), index2dbfile(NULL), clusterIndex(false), batchReader(NULL), loadedBuffer(), prefetchBuffer(), blockCacheBytes(0), cachedBlockBytes(0), blockReadBytes(0), keyReadBytes(0), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
+        id2local(NULL), local2id(NULL), index2dbfile(NULL), clusterIndex(false), batchReader(NULL), loadedBuffer(), prefetchBuffer(), partKeyEnd(0), partBytes(0), blockCacheBytes(0), cachedBlockBytes(0), blockReadBytes(0), keyReadBytes(0), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
 {}
 
 template <typename T>
@@ -1275,6 +1275,69 @@ template <typename T> void DBReader<T>::prefetchData(size_t keyBegin, size_t key
         batchReader->readAsync(frameOffsets.empty() ? prefetchBuffer.readRequests : prefetchBuffer.compressedReadRequests);
         prefetchBuffer.isPrefetched = true;
     }
+}
+
+template <typename T> void DBReader<T>::startLoadData(size_t keyBegin, size_t keyEnd, size_t readBytes) {
+    if (entryOffsetsFileNames.empty() == false) {
+        Debug(Debug::ERROR) << "Call of startLoadData is not allowed for the headers or clusters of a --createdb-mode 3 database " << dataFileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    partKeyEnd = keyEnd;
+    partBytes = readBytes;
+    if (prefetchBuffer.isPrefetched && prefetchBuffer.keyBegin == keyBegin && prefetchBuffer.keyEnd == keyEnd) {
+        loadKeys(keyBegin, keyEnd, NULL);
+    } else if (prepareBufferToLoad(loadedBuffer, keyBegin, keyEnd, NULL)) {
+        partKeyEnd = keyBegin;
+        waitForLoadedData();
+    }
+}
+
+template <typename T> size_t DBReader<T>::waitForLoadedData() {
+    if (batchReader != NULL) {
+        batchReader->waitAsyncRead();
+    }
+    const size_t readKeyEnd = partKeyEnd;
+    if (readKeyEnd >= loadedBuffer.keyEnd) {
+        return readKeyEnd;
+    }
+    const size_t keyBegin = readKeyEnd;
+    size_t keyEnd = keyBegin;
+    size_t bytes = 0;
+    for (size_t range = findIdRange(keyBegin); keyEnd < loadedBuffer.keyEnd && bytes < partBytes; range++) {
+        const size_t rangeEnd = std::min((range + 1 < indexSize) ? indexIdToNum(&index[range + 1].id) : size, loadedBuffer.keyEnd);
+        const size_t keys = std::min(rangeEnd - keyEnd, (partBytes - bytes + index[range].length - 1) / index[range].length);
+        keyEnd += keys;
+        bytes += keys * index[range].length;
+    }
+    // a part ends at the end of the page where the entry of its end key starts, so parts stay aligned for O_DIRECT and no page is read twice
+    const size_t pageSize = Util::getPageSize();
+    const size_t beginRange = findIdRange(keyBegin);
+    const size_t beginOffset = (index[beginRange].offset + (keyBegin - indexIdToNum(&index[beginRange].id)) * index[beginRange].length + pageSize - 1) / pageSize * pageSize;
+    const size_t endRange = (keyEnd < loadedBuffer.keyEnd) ? findIdRange(keyEnd) : beginRange;
+    const size_t endOffset = (index[endRange].offset + (keyEnd - indexIdToNum(&index[endRange].id)) * index[endRange].length + pageSize - 1) / pageSize * pageSize;
+    std::vector<BatchReader::ReadRequest> partRequests;
+    for (size_t i = 0; i < loadedBuffer.readRequests.size(); i++) {
+        const BatchReader::ReadRequest &request = loadedBuffer.readRequests[i];
+        const size_t requestKeyBegin = loadedBuffer.requestFirstKeys[i];
+        const size_t requestKeyEnd = (i + 1 < loadedBuffer.requestFirstKeys.size()) ? loadedBuffer.requestFirstKeys[i + 1] : loadedBuffer.keyEnd;
+        if (requestKeyEnd <= keyBegin || requestKeyBegin >= keyEnd) {
+            continue;
+        }
+        const size_t begin = (keyBegin <= requestKeyBegin) ? request.fileOffset : beginOffset;
+        const size_t end = (keyEnd >= requestKeyEnd) ? request.fileOffset + request.bytesToRead : endOffset;
+        const size_t minEnd = std::min(end, request.fileOffset + request.minBytesToRead);
+        if (begin < minEnd) {
+            const BatchReader::ReadRequest partRequest = { request.fileToRead, request.fileName, request.destination + (begin - request.fileOffset), begin, end - begin, minEnd - begin };
+            partRequests.push_back(partRequest);
+        }
+    }
+    partKeyEnd = keyEnd;
+    batchReader->readAsync(partRequests);
+    return readKeyEnd;
+}
+
+template <typename T> size_t DBReader<T>::getBufferSizeToPrefetch(size_t keyBegin, size_t keyEnd) {
+    return loadedBuffer.allocatedBytes + std::max(prefetchBuffer.allocatedBytes, getBufferSizeToLoad(keyBegin, keyEnd));
 }
 
 template <typename T> void DBReader<T>::loadData(const std::vector<DBKeyType> &keys) {

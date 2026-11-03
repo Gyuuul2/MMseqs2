@@ -291,6 +291,12 @@ public:
     // --createdb-mode 3: reads keys [keyBegin, keyEnd) into memory for getData
     void loadData(size_t keyBegin, size_t keyEnd);
     void prefetchData(size_t keyBegin, size_t keyEnd);
+    // --createdb-mode 3 sequences: loadData that returns at once and reads about readBytes at a time;
+    // waitForLoadedData waits for the read in flight, starts the next one and returns the end of the keys read so far
+    void startLoadData(size_t keyBegin, size_t keyEnd, size_t readBytes);
+    size_t waitForLoadedData();
+    // the bytes of the loaded and the prefetch buffer once keys [keyBegin, keyEnd) are prefetched
+    size_t getBufferSizeToPrefetch(size_t keyBegin, size_t keyEnd);
     // --createdb-mode 3 sequences: reads the ascending keys, entries less than a page apart in one request, through the buffered fds
     void loadData(const std::vector<DBKeyType> &keys);
     // --createdb-mode 3 sequences: loads by keys read the whole block of a key while the blocks fit cacheBytes; blocks below the loaded and the requested keys are freed when new blocks need their room
@@ -665,6 +671,9 @@ private:
         std::vector<size_t> blocks;
     };
     BufferInfo loadedBuffer, prefetchBuffer;
+    // startLoadData: the keys below partKeyEnd are read or in flight, the parts are of about partBytes
+    size_t partKeyEnd;
+    size_t partBytes;
     void cacheBlocks(BufferInfo &buffer);
     void freeBlocks(size_t keyEnd, size_t neededBytes);
     // --createdb-mode 3 sequences: block b holds the keys [blockKeyOffsets[b], blockKeyOffsets[b + 1]) whose entries start in the same MAX_READ_REQUEST_SIZE bytes of a data file
