@@ -2567,7 +2567,7 @@ static void collectUniqueKeys(const std::vector<std::vector<DBKeyType> > &thread
 }
 
 static const size_t PUBLISH_BYTES = 4 * 1024 * 1024;
-static const time_t PUBLISH_SECONDS = 10;
+static const time_t PUBLISH_SECONDS = 3;
 static const time_t READ_SECONDS = 1;
 // batches per thread of the records aligned at once, taken in rep order
 static const size_t ALIGN_BATCHES_PER_THREAD = 64;
@@ -2947,14 +2947,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             const size_t ownKey = getOwnKey(group, key);
             return ((__atomic_load_n(&ownWords[ownKey / 64], __ATOMIC_RELAXED) >> (ownKey % 64)) & 1) != 0;
         }
-        const size_t word = orderKey / 64;
         const size_t firstWord = __atomic_load_n(&ringFirstWord, __ATOMIC_ACQUIRE);
-        if (word < firstWord || word - firstWord >= ring.size()) {
+        // an assigned key is set at all its order keys, so the first from the ring start on tells
+        const size_t ringStart = firstWord * 64;
+        const size_t word = (key + ((ringStart > key) ? (ringStart - key + paddedDbSize - 1) / paddedDbSize * paddedDbSize : 0)) / 64;
+        if (word - firstWord >= ring.size()) {
             return false;
         }
         const uint64_t bits = __atomic_load_n(&ring[word % ring.size()], __ATOMIC_ACQUIRE);
         // the ring may have moved on and reused the slot
-        return __atomic_load_n(&ringFirstWord, __ATOMIC_ACQUIRE) == firstWord && ((bits >> (orderKey % 64)) & 1) != 0;
+        return __atomic_load_n(&ringFirstWord, __ATOMIC_ACQUIRE) == firstWord && ((bits >> (key % 64)) & 1) != 0;
     };
     const auto setRingKey = [&](size_t key) {
         const size_t word = key / 64;
