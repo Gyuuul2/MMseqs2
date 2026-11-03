@@ -1775,6 +1775,10 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                     std::vector<size_t> repCandidatesLeft;
                     // the representatives of a group in choice order as the position of their row in groupRows and their member index there
                     std::vector<std::pair<size_t, size_t> > repMembers;
+                    // the rep candidates of a group as their adjKey and their member like in repMembers
+                    typedef std::pair<unsigned int, std::pair<size_t, size_t> > GroupRepCandidate;
+                    std::vector<GroupRepCandidate> repCandidates;
+                    repCandidates.reserve(KMER_FILE_BUFFER_SIZE / sizeof(GroupRepCandidate));
                     std::vector<DBKeyType> repSeqIds;
                     KmerAdjKeyQueue adjKeyQueue;
                     // the readers of a code of the group rows go back to the group start
@@ -1864,36 +1868,60 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                 if (isWholeSequence) {
                                     repMembers.push_back(std::make_pair(0, 0));
                                 } else {
-                                    selectGroupRepSeqs(repMembers, groupMaxRepSeqs, [&](const auto &visit) {
+                                    size_t groupRepCandidateCount = 0;
+                                    for (size_t row = 0; row < groupRows.size(); row++) {
+                                        groupRepCandidateCount += reads[groupRows[row]].groupRepCandidateCount;
+                                    }
+                                    // rep candidates up to a thread write buffer, the second one of fixedMemory that receiving does not allocate, are read once and sorted in the order of the row merge below
+                                    if (groupRepCandidateCount <= KMER_FILE_BUFFER_SIZE / sizeof(GroupRepCandidate)) {
+                                        repCandidates.clear();
                                         rewindGroupReads(KMER_REP_CANDIDATE_CODES, groupRepCandidateStarts);
-                                        if (groupRows.size() == 1) {
-                                            KmerHashSubRangeRead &read = reads[groupRows[0]];
+                                        for (size_t row = 0; row < groupRows.size(); row++) {
+                                            KmerHashSubRangeRead &read = reads[groupRows[row]];
                                             const unsigned int memberIndexBits = getBitWidth(read.groupMemberCount - 1);
                                             for (size_t repCandidate = 0; repCandidate < read.groupRepCandidateCount; repCandidate++) {
                                                 const unsigned int adjKey = getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], exchange.adjKeyBits);
-                                                visit(adjKey, std::pair<size_t, size_t>(0, getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], memberIndexBits)));
-                                            }
-                                        } else {
-                                            // the rows merged by adjKey, at the same adjKey in row order
-                                            repCandidatesLeft.resize(groupRows.size());
-                                            for (size_t row = 0; row < groupRows.size(); row++) {
-                                                KmerHashSubRangeRead &read = reads[groupRows[row]];
-                                                repCandidatesLeft[row] = read.groupRepCandidateCount - 1;
-                                                adjKeyQueue.push(FileKmerAdjKey(getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], exchange.adjKeyBits), row));
-                                            }
-                                            while (adjKeyQueue.empty() == false) {
-                                                const FileKmerAdjKey repCandidate = adjKeyQueue.top();
-                                                adjKeyQueue.pop();
-                                                KmerHashSubRangeRead &read = reads[groupRows[repCandidate.row]];
-                                                const size_t memberIndex = getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], getBitWidth(read.groupMemberCount - 1));
-                                                visit(repCandidate.adjKey, std::pair<size_t, size_t>(repCandidate.row, memberIndex));
-                                                if (repCandidatesLeft[repCandidate.row] > 0) {
-                                                    repCandidatesLeft[repCandidate.row]--;
-                                                    adjKeyQueue.push(FileKmerAdjKey(getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], exchange.adjKeyBits), repCandidate.row));
-                                                }
+                                                repCandidates.push_back(GroupRepCandidate(adjKey, std::pair<size_t, size_t>(row, getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], memberIndexBits))));
                                             }
                                         }
-                                    }, std::less<std::pair<size_t, size_t> >());
+                                        SORT_SERIAL(repCandidates.begin(), repCandidates.end());
+                                        selectGroupRepSeqs(repMembers, groupMaxRepSeqs, [&](const auto &visit) {
+                                            for (size_t repCandidate = 0; repCandidate < repCandidates.size(); repCandidate++) {
+                                                visit(repCandidates[repCandidate].first, repCandidates[repCandidate].second);
+                                            }
+                                        }, std::less<std::pair<size_t, size_t> >());
+                                    } else {
+                                        selectGroupRepSeqs(repMembers, groupMaxRepSeqs, [&](const auto &visit) {
+                                            rewindGroupReads(KMER_REP_CANDIDATE_CODES, groupRepCandidateStarts);
+                                            if (groupRows.size() == 1) {
+                                                KmerHashSubRangeRead &read = reads[groupRows[0]];
+                                                const unsigned int memberIndexBits = getBitWidth(read.groupMemberCount - 1);
+                                                for (size_t repCandidate = 0; repCandidate < read.groupRepCandidateCount; repCandidate++) {
+                                                    const unsigned int adjKey = getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], exchange.adjKeyBits);
+                                                    visit(adjKey, std::pair<size_t, size_t>(0, getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], memberIndexBits)));
+                                                }
+                                            } else {
+                                                // the rows merged by adjKey, at the same adjKey in row order
+                                                repCandidatesLeft.resize(groupRows.size());
+                                                for (size_t row = 0; row < groupRows.size(); row++) {
+                                                    KmerHashSubRangeRead &read = reads[groupRows[row]];
+                                                    repCandidatesLeft[row] = read.groupRepCandidateCount - 1;
+                                                    adjKeyQueue.push(FileKmerAdjKey(getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], exchange.adjKeyBits), row));
+                                                }
+                                                while (adjKeyQueue.empty() == false) {
+                                                    const FileKmerAdjKey repCandidate = adjKeyQueue.top();
+                                                    adjKeyQueue.pop();
+                                                    KmerHashSubRangeRead &read = reads[groupRows[repCandidate.row]];
+                                                    const size_t memberIndex = getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], getBitWidth(read.groupMemberCount - 1));
+                                                    visit(repCandidate.adjKey, std::pair<size_t, size_t>(repCandidate.row, memberIndex));
+                                                    if (repCandidatesLeft[repCandidate.row] > 0) {
+                                                        repCandidatesLeft[repCandidate.row]--;
+                                                        adjKeyQueue.push(FileKmerAdjKey(getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], exchange.adjKeyBits), repCandidate.row));
+                                                    }
+                                                }
+                                            }
+                                        }, std::less<std::pair<size_t, size_t> >());
+                                    }
                                 }
                                 // the id of a member index is at its position in the fixed width member codes
                                 repSeqIds.clear();
