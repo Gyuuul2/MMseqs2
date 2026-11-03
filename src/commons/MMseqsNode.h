@@ -75,18 +75,19 @@ public:
     static void publishLog(FILE *file, const std::string &log, size_t key, size_t bytes);
     static bool readLogProgress(const std::string &log, size_t &key, size_t &bytes);
     static void waitForLog(const std::string &log, size_t &key, size_t &bytes);
-    // without wait, returns false at once instead of polling until the bytes are readable
-    static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true);
+    // without wait, returns false at once instead of polling until the bytes are readable; the last reader of the bytes from punchFrom to to releases their whole PUNCH_ALIGNMENT blocks
+    static const size_t PUNCH_ALIGNMENT = 1024 * 1024;
+    static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true, size_t punchFrom = SIZE_MAX);
     // closes file, a flush of bytes that only this node writes, then appends line with its last word set to this run's magic to indexFile
     static void publishExchangeFlush(FILE *file, const std::string &fileName, size_t bytes, const std::string &indexFile, const std::vector<uint64_t> &line);
-    // reads line number flush, of line.size() words, of indexFile from a new open; false until this run's line is there
-    static bool readExchangeFlush(const std::string &indexFile, size_t flush, std::vector<uint64_t> &line);
+    // reads the lines flush, flush + 1, ... of lineWords words of indexFile that fit lines from a new open; the number of this run's lines there in a row
+    static size_t readExchangeFlushes(const std::string &indexFile, size_t flush, size_t lineWords, std::vector<uint64_t> &lines);
     static const size_t EXCHANGE_SLICE_HEADER_BYTES = 2 * sizeof(uint64_t);
     static void writeExchangeSliceHeader(FILE *file, const std::string &fileName, uint64_t generation);
+    // opens a published slice read and write, so its reader can punch the bytes it has read
     static int tryOpenExchangeSlice(const std::string &file, size_t expectedBytes, uint64_t expectedGeneration, time_t &lastDirectoryRefresh,
                                     size_t &observedBytes, uint64_t &observedGeneration, int &lastError);
     static bool tryReadExchangeSlice(int fd, char *data, size_t bytes, size_t offset, int &readError);
-    static void truncateExchangeSlice(const std::string &file);
     // every node publishes content as file + "." + node; returns all contents in node order, gathered by the master into file
     static std::string barrier(const std::string &file, const std::string &content = "");
     // this node has read file; the master removes it once every node has, the others do not wait

@@ -113,7 +113,7 @@ static bool isListed(const std::string &file) {
 
 static const time_t DIRECTORY_WAIT_SECONDS = 60;
 
-static int openReadOnly(const std::string &file, int flags = O_RDONLY) {
+static int openFile(const std::string &file, int flags = O_RDONLY) {
     int fd;
     do {
         fd = open(file.c_str(), flags, 0666);
@@ -125,7 +125,7 @@ static int openReadOnly(const std::string &file, int flags = O_RDONLY) {
 // exists, a name it found missing can stay missing, so a poll creates the empty file that the rename of the publish replaces; a file
 // that a later publish replaces while it is read fails with ESTALE and is read again by the next poll
 static std::string readPolledFile(const std::string &file) {
-    int fd = openReadOnly(file, O_RDONLY | O_CREAT);
+    int fd = openFile(file, O_RDONLY | O_CREAT);
     int openError = (fd < 0) ? errno : 0;
     // with O_CREAT, ENOENT means that the directory does not exist on this machine, or that NFS still remembers it missing
     const time_t start = time(NULL);
@@ -136,7 +136,7 @@ static std::string readPolledFile(const std::string &file) {
         }
         MMseqsNode::sleepBeforePoll(polls, 7);
         FileUtil::refreshDirectory(FileUtil::dirName(file));
-        fd = openReadOnly(file, O_RDONLY | O_CREAT);
+        fd = openFile(file, O_RDONLY | O_CREAT);
         openError = (fd < 0) ? errno : 0;
     }
     if (fd < 0) {
@@ -291,17 +291,20 @@ void MMseqsNode::waitForLog(const std::string &log, size_t &key, size_t &bytes) 
     }
 }
 
-bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *data, bool wait) {
+bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *data, bool wait, size_t punchFrom) {
     const size_t bytes = to - from;
     if (bytes == 0) {
         return true;
     }
+    const size_t punchBegin = (punchFrom <= from) ? (punchFrom + PUNCH_ALIGNMENT - 1) / PUNCH_ALIGNMENT * PUNCH_ALIGNMENT : to;
+    const size_t punchEnd = to / PUNCH_ALIGNMENT * PUNCH_ALIGNMENT;
+    const int flags = (punchBegin < punchEnd) ? O_RDWR : O_RDONLY;
     // NFS can expose the progress file before the flushed log is visible
     for (unsigned int polls = 0; polls < MAX_READ_POLLS; polls++) {
-        int fd = openReadOnly(log);
+        int fd = openFile(log, flags);
         int openError = (fd < 0) ? errno : 0;
         if (openError == ENOENT && isListed(log)) {
-            fd = openReadOnly(log);
+            fd = openFile(log, flags);
             openError = (fd < 0) ? errno : 0;
         }
         if (fd < 0) {
@@ -325,12 +328,16 @@ bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
                     break;
                 }
             }
+            if (done == bytes && readError == 0 && flags == O_RDWR) {
+                FileUtil::punchHole(fd, punchBegin, punchEnd - punchBegin);
+            }
             const int closeError = (close(fd) != 0) ? errno : 0;
             if ((readError != 0 && readError != ESTALE) || (closeError != 0 && closeError != ESTALE && closeError != EINTR)) {
                 Debug(Debug::ERROR) << "Cannot read " << log << ": " << strerror(readError != 0 ? readError : closeError) << "\n";
                 EXIT(EXIT_FAILURE);
             }
-            if (done == bytes && readError == 0 && closeError == 0) {
+            // punched bytes are never read again, whatever close reports
+            if (done == bytes && readError == 0 && (closeError == 0 || flags == O_RDWR)) {
                 return true;
             }
         }
@@ -361,36 +368,41 @@ void MMseqsNode::publishExchangeFlush(FILE *file, const std::string &fileName, s
     }
 }
 
-bool MMseqsNode::readExchangeFlush(const std::string &indexFile, size_t flush, std::vector<uint64_t> &line) {
-    const size_t lineBytes = line.size() * sizeof(uint64_t);
-    int fd = openReadOnly(indexFile);
+size_t MMseqsNode::readExchangeFlushes(const std::string &indexFile, size_t flush, size_t lineWords, std::vector<uint64_t> &lines) {
+    const size_t lineBytes = lineWords * sizeof(uint64_t);
+    int fd = openFile(indexFile);
     int openError = (fd < 0) ? errno : 0;
     // a listing refreshes an NFS negative lookup before the index is opened again
     if (openError == ENOENT && isListed(indexFile)) {
-        fd = openReadOnly(indexFile);
+        fd = openFile(indexFile);
         openError = (fd < 0) ? errno : 0;
     }
     if (fd < 0) {
         if (openError == ENOENT || openError == ESTALE) {
-            return false;
+            return 0;
         }
         Debug(Debug::ERROR) << "Cannot open " << indexFile << ": " << strerror(openError) << "\n";
         EXIT(EXIT_FAILURE);
     }
     ssize_t readBytes;
     do {
-        readBytes = pread(fd, line.data(), lineBytes, flush * lineBytes);
+        readBytes = pread(fd, lines.data(), lines.size() * sizeof(uint64_t), flush * lineBytes);
     } while (readBytes < 0 && errno == EINTR);
     const int readError = (readBytes < 0) ? errno : 0;
     const int closeError = (close(fd) != 0) ? errno : 0;
     if (readError == ESTALE || closeError == ESTALE || closeError == EINTR) {
-        return false;
+        return 0;
     }
     if (readError != 0 || closeError != 0) {
         Debug(Debug::ERROR) << "Cannot read " << indexFile << ": " << strerror(readError != 0 ? readError : closeError) << "\n";
         EXIT(EXIT_FAILURE);
     }
-    return static_cast<size_t>(readBytes) == lineBytes && line[0] == flush && line.back() == exchangeSliceMagic();
+    size_t lineCount = 0;
+    while ((lineCount + 1) * lineBytes <= static_cast<size_t>(readBytes) && lines[lineCount * lineWords] == flush + lineCount
+           && lines[(lineCount + 1) * lineWords - 1] == exchangeSliceMagic()) {
+        lineCount++;
+    }
+    return lineCount;
 }
 
 struct ExchangeSliceHeader {
@@ -422,14 +434,14 @@ int MMseqsNode::tryOpenExchangeSlice(const std::string &file, size_t expectedByt
     observedBytes = SIZE_MAX;
     observedGeneration = UINT64_MAX;
     lastError = 0;
-    int fd = openReadOnly(file, O_RDONLY | O_CLOEXEC);
+    int fd = openFile(file, O_RDWR | O_CLOEXEC);
     int openError = (fd < 0) ? errno : 0;
     if (openError == ENOENT) {
         const time_t now = time(NULL);
         if (now != lastDirectoryRefresh) {
             lastDirectoryRefresh = now;
             if (isListed(file)) {
-                fd = openReadOnly(file, O_RDONLY | O_CLOEXEC);
+                fd = openFile(file, O_RDWR | O_CLOEXEC);
                 openError = (fd < 0) ? errno : 0;
             }
         }
@@ -484,36 +496,6 @@ bool MMseqsNode::tryReadExchangeSlice(int fd, char *data, size_t bytes, size_t o
     }
     readError = 0;
     return true;
-}
-
-void MMseqsNode::truncateExchangeSlice(const std::string &file) {
-    time_t lastDirectoryRefresh = 0;
-    for (unsigned int polls = 0; polls < MAX_READ_POLLS; polls++) {
-        if (truncate(file.c_str(), 0) == 0) {
-            return;
-        }
-        int error = errno;
-        if (error == EINTR) {
-            continue;
-        }
-        const time_t now = time(NULL);
-        if (error == ENOENT && now != lastDirectoryRefresh) {
-            lastDirectoryRefresh = now;
-            if (isListed(file)) {
-                if (truncate(file.c_str(), 0) == 0) {
-                    return;
-                }
-                error = errno;
-            }
-        }
-        if (error != ENOENT && error != ESTALE) {
-            Debug(Debug::ERROR) << "Cannot truncate " << file << ": " << strerror(error) << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        sleepBeforePoll(polls);
-    }
-    Debug(Debug::ERROR) << "Cannot truncate " << file << " after " << MAX_READ_POLLS << " polls\n";
-    EXIT(EXIT_FAILURE);
 }
 
 void MMseqsNode::removeOnceRead(const std::string &file) {
