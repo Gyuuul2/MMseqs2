@@ -297,6 +297,7 @@ public:
     void setBlockCacheBytes(size_t cacheBytes);
     // the block of setBlockCacheBytes that holds key
     size_t getKeyBlock(size_t key) const;
+    const std::vector<size_t> &getBlockKeyOffsets() const { return blockKeyOffsets; }
     size_t getBlockReadBytes() { return blockReadBytes; }
     size_t getKeyReadBytes() { return keyReadBytes; }
     size_t getBufferSizeToLoad(size_t keyBegin, size_t keyEnd);

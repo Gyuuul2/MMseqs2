@@ -289,10 +289,10 @@ void MMseqsNode::waitForLog(const std::string &log, size_t &key, size_t &bytes) 
     }
 }
 
-void MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *data) {
+bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *data, bool wait) {
     const size_t bytes = to - from;
     if (bytes == 0) {
-        return;
+        return true;
     }
     // NFS can expose the progress file before the flushed log is visible
     for (unsigned int polls = 0; polls < MAX_READ_POLLS; polls++) {
@@ -329,8 +329,11 @@ void MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
                 EXIT(EXIT_FAILURE);
             }
             if (done == bytes && readError == 0 && closeError == 0) {
-                return;
+                return true;
             }
+        }
+        if (wait == false) {
+            return false;
         }
         sleepBeforePoll(polls);
     }
