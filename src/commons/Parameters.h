@@ -313,7 +313,6 @@ public:
     // aligner mode
     static const int ALIGNER_MODE_DEFAULT = 0;
     static const int ALIGNER_MODE_SWIPE = 1;
-    static const int ALIGNER_MODE_SWIPE_TRACEBACK = 3;
 
     // rescorediagonal
     static const int RESCORE_MODE_HAMMING = 0;

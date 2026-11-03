@@ -554,14 +554,15 @@ static void readPassRows(const std::vector<ReceivedFile> &receivedFiles, const s
     }
 }
 
-// frees the codes of passRows in their files once they are read and processed, rows that follow each other in a file at once and within whole
-// PUNCH_ALIGNMENT bytes, so no file system block is zeroed; returns the ranges freed
+// frees the codes of passRows in their files or memory once they are read and processed, rows that follow each other at once and within whole PUNCH_ALIGNMENT
+// bytes of a file or whole pages of memory, so no file system block is zeroed and no page of other rows released; returns the file ranges freed and adds the
+// memory bytes released to releasedBytes
 template <typename Row>
-static size_t punchPassRows(const std::vector<ReceivedFile> &receivedFiles, const std::vector<std::vector<Row> > &fileRows, const std::vector<PassRow> &passRows) {
+static size_t punchPassRows(const std::vector<ReceivedFile> &receivedFiles, const std::vector<std::vector<Row> > &fileRows, const std::vector<PassRow> &passRows, size_t &releasedBytes) {
     std::vector<std::pair<size_t, std::pair<size_t, size_t> > > fileRanges;
     for (size_t i = 0; i < passRows.size(); i++) {
         const Row &codeRow = fileRows[passRows[i].file][passRows[i].row];
-        if (receivedFiles[passRows[i].file].data == NULL && getRowEnd(codeRow) > codeRow.offsets[0]) {
+        if (getRowEnd(codeRow) > codeRow.offsets[0]) {
             fileRanges.push_back(std::make_pair(passRows[i].file, std::make_pair(codeRow.offsets[0], getRowEnd(codeRow))));
         }
     }
@@ -569,15 +570,24 @@ static size_t punchPassRows(const std::vector<ReceivedFile> &receivedFiles, cons
     size_t punchedRanges = 0;
     for (size_t i = 0; i < fileRanges.size();) {
         const size_t file = fileRanges[i].first;
-        const size_t start = (fileRanges[i].second.first + PUNCH_ALIGNMENT - 1) / PUNCH_ALIGNMENT * PUNCH_ALIGNMENT;
+        // memory is aligned at its addresses
+        const size_t base = reinterpret_cast<size_t>(receivedFiles[file].data);
+        const size_t alignment = (receivedFiles[file].data == NULL) ? PUNCH_ALIGNMENT : Util::getPageSize();
+        const size_t start = (base + fileRanges[i].second.first + alignment - 1) / alignment * alignment;
         size_t end = fileRanges[i].second.second;
         for (i++; i < fileRanges.size() && fileRanges[i].first == file && fileRanges[i].second.first == end; i++) {
             end = fileRanges[i].second.second;
         }
-        end = end / PUNCH_ALIGNMENT * PUNCH_ALIGNMENT;
-        if (end > start) {
+        end = (base + end) / alignment * alignment;
+        if (end <= start) {
+            continue;
+        }
+        if (receivedFiles[file].data == NULL) {
             FileUtil::punchHole(fileno(receivedFiles[file].file), start, end - start);
             punchedRanges++;
+        } else {
+            Util::releasePages(reinterpret_cast<char *>(start), end - start);
+            releasedBytes += end - start;
         }
     }
     return punchedRanges;
@@ -1333,7 +1343,7 @@ static void mergePartitionTargets(const KmerExchange &exchange, DBReader<DBKeyTy
             if (keyOffsets[key] + keyTargetCount < keyOffsets[key + 1]) {
                 keyTargets[keyTargetCount] = DB_KEY_INVALID;
             }
-            if (isRepresentative(partitionFirstKey + key) == false) {
+            if (keyTargetCount == 0 || isRepresentative(partitionFirstKey + key) == false) {
                 continue;
             }
             size_t entryBytes = getPrefKeyBytes(partitionFirstKey + key) + 1;
@@ -1345,11 +1355,9 @@ static void mergePartitionTargets(const KmerExchange &exchange, DBReader<DBKeyTy
             }
             merge.keyChunkDataOffsets[keyChunk + 1] += entryBytes;
             merge.keyChunkEntryOffsets[keyChunk + 1]++;
-            if (keyTargetCount > 0) {
-                merge.keyChunkCostOffsets[keyChunk + 1] += (index[seqDbr.findIdRange(partitionFirstKey + key)].length - 2) * targetResidues;
-                const PartitionCut cut = { key + 1, merge.keyChunkDataOffsets[keyChunk + 1], merge.keyChunkCostOffsets[keyChunk + 1] };
-                merge.keyChunkCuts[keyChunk].add(cut);
-            }
+            merge.keyChunkCostOffsets[keyChunk + 1] += (index[seqDbr.findIdRange(partitionFirstKey + key)].length - 2) * targetResidues;
+            const PartitionCut cut = { key + 1, merge.keyChunkDataOffsets[keyChunk + 1], merge.keyChunkCostOffsets[keyChunk + 1] };
+            merge.keyChunkCuts[keyChunk].add(cut);
         }
     }
     std::vector<PairRowRead>().swap(merge.rowReads);
@@ -1386,7 +1394,7 @@ static void writePartition(const PrefFiles &prefFiles, size_t partitionFirstKey,
         KmerCodeWriter indexWrite = {fileno(prefFiles.indexFile), prefFiles.indexName.c_str(), writeBuffer + KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE, 0,
                                      indexOffset + merge.keyChunkEntryOffsets[keyChunk] * 2 * sizeof(uint64_t), 0, 0, prefFiles.batchWriter};
         for (size_t key = merge.keyChunkOffsets[keyChunk]; key < merge.keyChunkOffsets[keyChunk + 1]; key++) {
-            if (isRepresentative(partitionFirstKey + key)) {
+            if (merge.keyOffsets[key + 1] > merge.keyOffsets[key] && isRepresentative(partitionFirstKey + key)) {
                 writePrefEntry(partitionFirstKey + key, merge.targets + merge.keyOffsets[key], merge.targets + merge.keyOffsets[key + 1], dataWrite, indexWrite);
             }
         }
@@ -2339,11 +2347,11 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                 }
             }
         }
-        // the receiving node of the hash range is the only reader of its codes
+        // the receiving node of the hash range is the only reader of its codes; the pairs of the own merge send ranges take the memory of the own rows
         std::vector<PassRow> hashRangeRows;
         std::vector<size_t> hashRangeRowOffsets;
         getPassRows(exchange, received.fileRows, 0, exchange.rowsPerHashRange, hashRangeRows, hashRangeRowOffsets);
-        punchedRanges += punchPassRows(receivedFiles, received.fileRows, hashRangeRows);
+        punchedRanges += punchPassRows(receivedFiles, received.fileRows, hashRangeRows, ownPairs.limit);
         hashRange = nextHashRange;
     }
     releaseOwnKmers();
@@ -2470,6 +2478,7 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     MMseqsNode::addPhaseValue(mergeValues, "Largest merge split cost to average", SSTR(static_cast<double>(splitCosts[mergeOrder[0]]) * mergeSplitCount / std::max<size_t>(1, globalCost)));
     size_t mergedPairBytes = 0;
     size_t punchedRanges = 0;
+    size_t releasedOwnPairBytes = 0;
     // the own merge send ranges first, then the merge splits that this node takes without the own merge send ranges of every node
     for (size_t ownMergeRange = 0;; ownMergeRange++) {
         size_t splitBegin = 0;
@@ -2739,32 +2748,28 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                                     chunkPrefOffset = windowedDataWrite.writePos + windowedDataWrite.bufferPos;
                                     chunkCost = partitionCost;
                                 }
-                                const bool isRep = isRepresentative(partitionFirstKey + key);
-                                if (isRep) {
+                                const bool hasEntry = repKeyQueue.empty() == false && repKeyQueue.top().repKey == key && isRepresentative(partitionFirstKey + key);
+                                if (hasEntry) {
                                     const uint64_t indexCell[2] = {static_cast<uint64_t>(partitionFirstKey + key), static_cast<uint64_t>(windowedDataWrite.writePos + windowedDataWrite.bufferPos)};
                                     putBytes(windowedIndexWrite, reinterpret_cast<const char *>(indexCell), sizeof(indexCell));
                                     putPrefKey(windowedDataWrite, partitionFirstKey + key);
                                 }
-                                size_t keyTargetCount = 0;
                                 DBKeyType prevTarget = 0;
                                 size_t targetRange = SIZE_MAX;
                                 size_t targetResidues = 0;
                                 mergeKeyTargets(reads, repKeyQueue, targetQueue, keyRows, key, exchange.globalIdBits, [&](DBKeyType target) {
-                                    if (isRep) {
+                                    if (hasEntry) {
                                         putPrefKey(windowedDataWrite, target - prevTarget);
                                         prevTarget = target;
                                         targetResidues += seqDbr.getSeqLenFromRange(targetRange, target);
-                                        keyTargetCount++;
                                     }
                                 });
-                                if (isRep) {
+                                if (hasEntry) {
                                     putBytes(windowedDataWrite, "", 1);
                                     partitionEntryCount++;
-                                    if (keyTargetCount > 0) {
-                                        partitionCost += (index[seqDbr.findIdRange(partitionFirstKey + key)].length - 2) * targetResidues;
-                                        const PartitionCut cut = { key + 1, windowedDataWrite.writePos + windowedDataWrite.bufferPos - chunkPrefOffset, partitionCost - chunkCost };
-                                        windowedCuts.add(cut);
-                                    }
+                                    partitionCost += (index[seqDbr.findIdRange(partitionFirstKey + key)].length - 2) * targetResidues;
+                                    const PartitionCut cut = { key + 1, windowedDataWrite.writePos + windowedDataWrite.bufferPos - chunkPrefOffset, partitionCost - chunkCost };
+                                    windowedCuts.add(cut);
                                 }
                             }
                             writeKmerCodeBuffer(windowedDataWrite);
@@ -2782,7 +2787,7 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
             std::vector<PassRow> splitRows;
             std::vector<size_t> splitRowOffsets;
             getPairPassRows(partitionRows, firstPartition, endPartition, splitRows, splitRowOffsets);
-            punchedRanges += punchPassRows(receivedPairFiles, pairFileRows, splitRows);
+            punchedRanges += punchPassRows(receivedPairFiles, pairFileRows, splitRows, releasedOwnPairBytes);
         }
     }
     closeReceivedFiles(receivedPairFiles);

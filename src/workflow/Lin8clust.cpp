@@ -41,6 +41,11 @@ int lin8clust(int argc, const char **argv, const Command& command) {
                             << "Use createdb --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " or easy-lin8clust.\n";
         EXIT(EXIT_FAILURE);
     }
+    // align2clust leaves out the singletons of a subset with representative bits, so lin8clust takes whole databases only
+    if (FileUtil::fileExists((par.db1 + ".bits.0").c_str())) {
+        Debug(Debug::ERROR) << "lin8clust clusters whole --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases, not subsets such as clusthashfast or createsubdb output\n";
+        EXIT(EXIT_FAILURE);
+    }
 
     const bool nonSymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
     if (par.PARAM_CLUSTER_MODE.wasSet == false) {
