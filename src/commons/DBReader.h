@@ -299,6 +299,8 @@ public:
     size_t getBufferSizeToPrefetch(size_t keyBegin, size_t keyEnd);
     // --createdb-mode 3 sequences: reads the ascending keys, entries less than a page apart in one request, through the buffered fds
     void loadData(const std::vector<DBKeyType> &keys);
+    // --createdb-mode 3 sequences without a block cache: loadData of the same keys takes this read
+    void prefetchData(const std::vector<DBKeyType> &keys);
     // --createdb-mode 3 sequences: loads by keys read the whole block of a key while the blocks fit cacheBytes; blocks below the loaded and the requested keys are freed when new blocks need their room
     void setBlockCacheBytes(size_t cacheBytes);
     // the block of setBlockCacheBytes that holds key
@@ -673,6 +675,8 @@ private:
         std::vector<size_t> blocks;
     };
     BufferInfo loadedBuffer, prefetchBuffer;
+    // the keys of prefetchBuffer if it is a load of keys
+    std::vector<DBKeyType> prefetchedKeys;
     // startLoadData: the keys below partKeyEnd are read or in flight, the parts are of about partBytes
     size_t partKeyEnd;
     size_t partBytes;

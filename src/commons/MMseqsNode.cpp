@@ -28,6 +28,7 @@ unsigned int MMseqsNode::rank = 0;
 unsigned int MMseqsNode::count = 1;
 const size_t MMseqsNode::EXCHANGE_BUFFER_SIZE;
 const size_t MMseqsNode::EXCHANGE_SLICE_HEADER_BYTES;
+const size_t MMseqsNode::EXCHANGE_WRITE_BYTES;
 // the first line of every barrier file, so a file that a killed run left is told apart from one of this run
 static std::string runId;
 // the exchange bytes that this node sent, all of them and those for other nodes, reported by removeExchanges
@@ -291,20 +292,17 @@ void MMseqsNode::waitForLog(const std::string &log, size_t &key, size_t &bytes) 
     }
 }
 
-bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *data, bool wait, size_t punchFrom) {
+bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *data, bool wait) {
     const size_t bytes = to - from;
     if (bytes == 0) {
         return true;
     }
-    const size_t punchBegin = (punchFrom <= from) ? (punchFrom + PUNCH_ALIGNMENT - 1) / PUNCH_ALIGNMENT * PUNCH_ALIGNMENT : to;
-    const size_t punchEnd = to / PUNCH_ALIGNMENT * PUNCH_ALIGNMENT;
-    const int flags = (punchBegin < punchEnd) ? O_RDWR : O_RDONLY;
     // NFS can expose the progress file before the flushed log is visible
     for (unsigned int polls = 0; polls < MAX_READ_POLLS; polls++) {
-        int fd = openFile(log, flags);
+        int fd = openFile(log);
         int openError = (fd < 0) ? errno : 0;
         if (openError == ENOENT && isListed(log)) {
-            fd = openFile(log, flags);
+            fd = openFile(log);
             openError = (fd < 0) ? errno : 0;
         }
         if (fd < 0) {
@@ -328,16 +326,12 @@ bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
                     break;
                 }
             }
-            if (done == bytes && readError == 0 && flags == O_RDWR) {
-                FileUtil::punchHole(fd, punchBegin, punchEnd - punchBegin);
-            }
             const int closeError = (close(fd) != 0) ? errno : 0;
             if ((readError != 0 && readError != ESTALE) || (closeError != 0 && closeError != ESTALE && closeError != EINTR)) {
                 Debug(Debug::ERROR) << "Cannot read " << log << ": " << strerror(readError != 0 ? readError : closeError) << "\n";
                 EXIT(EXIT_FAILURE);
             }
-            // punched bytes are never read again, whatever close reports
-            if (done == bytes && readError == 0 && (closeError == 0 || flags == O_RDWR)) {
+            if (done == bytes && readError == 0 && closeError == 0) {
                 return true;
             }
         }
@@ -357,8 +351,8 @@ void MMseqsNode::publishExchangeFlush(FILE *file, const std::string &fileName, s
         Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
-    sentExchangeBytes += bytes;
-    sentOtherNodeExchangeBytes += bytes;
+    __sync_fetch_and_add(&sentExchangeBytes, bytes);
+    __sync_fetch_and_add(&sentOtherNodeExchangeBytes, bytes);
     FILE *handle = FileUtil::openFileOrDie(indexFile.c_str(), "a", true);
     const uint64_t magic = exchangeSliceMagic();
     if (fwrite(line.data(), sizeof(uint64_t), line.size() - 1, handle) != line.size() - 1
@@ -429,19 +423,30 @@ void MMseqsNode::writeExchangeSliceHeader(FILE *file, const std::string &fileNam
     }
 }
 
+void MMseqsNode::writeExchangeFlush(const std::string &fileName, uint64_t generation, const char *data, size_t bytes, const std::string &indexFile,
+                                    const std::vector<uint64_t> &line, int threads) {
+    FILE *file = FileUtil::openAndDelete(fileName.c_str(), "w");
+    writeExchangeSliceHeader(file, fileName, generation);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+    for (size_t offset = 0; offset < bytes; offset += EXCHANGE_WRITE_BYTES) {
+        FileUtil::pwriteAll(fileno(file), fileName.c_str(), data + offset, std::min(EXCHANGE_WRITE_BYTES, bytes - offset), EXCHANGE_SLICE_HEADER_BYTES + offset);
+    }
+    publishExchangeFlush(file, fileName, EXCHANGE_SLICE_HEADER_BYTES + bytes, indexFile, line);
+}
+
 int MMseqsNode::tryOpenExchangeSlice(const std::string &file, size_t expectedBytes, uint64_t expectedGeneration, time_t &lastDirectoryRefresh,
                                      size_t &observedBytes, uint64_t &observedGeneration, int &lastError) {
     observedBytes = SIZE_MAX;
     observedGeneration = UINT64_MAX;
     lastError = 0;
-    int fd = openFile(file, O_RDWR | O_CLOEXEC);
+    int fd = openFile(file, O_RDONLY | O_CLOEXEC);
     int openError = (fd < 0) ? errno : 0;
     if (openError == ENOENT) {
         const time_t now = time(NULL);
         if (now != lastDirectoryRefresh) {
             lastDirectoryRefresh = now;
             if (isListed(file)) {
-                fd = openFile(file, O_RDWR | O_CLOEXEC);
+                fd = openFile(file, O_RDONLY | O_CLOEXEC);
                 openError = (fd < 0) ? errno : 0;
             }
         }
@@ -627,13 +632,13 @@ void MMseqsNode::addExchangeFlush(std::string &indexData, size_t &writtenBytes, 
         indexData.append(reinterpret_cast<const char *>(&offset), sizeof(offset));
     }
     writtenBytes += nodeOffsets.back();
-    sentExchangeBytes += nodeOffsets.back();
-    sentOtherNodeExchangeBytes += nodeOffsets.back() - (nodeOffsets[rank + 1] - nodeOffsets[rank]);
+    __sync_fetch_and_add(&sentExchangeBytes, nodeOffsets.back());
+    __sync_fetch_and_add(&sentOtherNodeExchangeBytes, nodeOffsets.back() - (nodeOffsets[rank + 1] - nodeOffsets[rank]));
 }
 
 void MMseqsNode::keepOwnExchangeRecords(const std::string &exchange, char *records, size_t bytes) {
     ownExchangeRecords[exchange].push_back(std::make_pair(records, bytes));
-    sentExchangeBytes += bytes;
+    __sync_fetch_and_add(&sentExchangeBytes, bytes);
 }
 
 std::string MMseqsNode::closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData) {

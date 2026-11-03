@@ -75,16 +75,19 @@ public:
     static void publishLog(FILE *file, const std::string &log, size_t key, size_t bytes);
     static bool readLogProgress(const std::string &log, size_t &key, size_t &bytes);
     static void waitForLog(const std::string &log, size_t &key, size_t &bytes);
-    // without wait, returns false at once instead of polling until the bytes are readable; the last reader of the bytes from punchFrom to to releases their whole PUNCH_ALIGNMENT blocks
-    static const size_t PUNCH_ALIGNMENT = 1024 * 1024;
-    static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true, size_t punchFrom = SIZE_MAX);
+    // without wait, returns false at once instead of polling until the bytes are readable
+    static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true);
     // closes file, a flush of bytes that only this node writes, then appends line with its last word set to this run's magic to indexFile
     static void publishExchangeFlush(FILE *file, const std::string &fileName, size_t bytes, const std::string &indexFile, const std::vector<uint64_t> &line);
     // reads the lines flush, flush + 1, ... of lineWords words of indexFile that fit lines from a new open; the number of this run's lines there in a row
     static size_t readExchangeFlushes(const std::string &indexFile, size_t flush, size_t lineWords, std::vector<uint64_t> &lines);
     static const size_t EXCHANGE_SLICE_HEADER_BYTES = 2 * sizeof(uint64_t);
     static void writeExchangeSliceHeader(FILE *file, const std::string &fileName, uint64_t generation);
-    // opens a published slice read and write, so its reader can punch the bytes it has read
+    // the bytes of a flush that a thread writes at once
+    static const size_t EXCHANGE_WRITE_BYTES = 16 * 1024 * 1024;
+    // writes bytes of data as flush generation of fileName from threads threads, then publishes it with line to indexFile
+    static void writeExchangeFlush(const std::string &fileName, uint64_t generation, const char *data, size_t bytes, const std::string &indexFile,
+                                   const std::vector<uint64_t> &line, int threads);
     static int tryOpenExchangeSlice(const std::string &file, size_t expectedBytes, uint64_t expectedGeneration, time_t &lastDirectoryRefresh,
                                     size_t &observedBytes, uint64_t &observedGeneration, int &lastError);
     static bool tryReadExchangeSlice(int fd, char *data, size_t bytes, size_t offset, int &readError);
