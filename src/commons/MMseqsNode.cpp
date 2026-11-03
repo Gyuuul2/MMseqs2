@@ -1155,7 +1155,34 @@ static void writeKeyBits(const std::string &bitsFile, const uint64_t *bits, size
     }
 }
 
-// loads <clu>.<rank> split by split, prefetching the next, and calls processSplit(cluDb, splitBegin, splitEnd, entryKeys); a larger entry is a split of its own
+// reads the next keys of entry that fit a split and moves entry past them, false once all are read; a key cut off by the read is read again with the next
+static bool readEntryKeys(DBReader<DBKeyType> &cluDb, DBReader<DBKeyType>::Index &entry, size_t memoryLimit, std::vector<char> &buffer, std::vector<DBKeyType> &keys) {
+    buffer.resize(std::min(memoryLimit / CLUSTER_SPLIT_MEMORY_DIVISOR, MAX_INFLIGHT_READ_SIZE));
+    // the entry ends with '\0' after its last newline
+    const size_t bytes = std::min(buffer.size() - 1, entry.length - 1);
+    if (bytes == 0) {
+        std::vector<char>().swap(buffer);
+        return false;
+    }
+    cluDb.readData(entry.offset, bytes, buffer.data());
+    size_t keyBytes = bytes;
+    while (buffer[keyBytes - 1] != '\n') {
+        keyBytes--;
+    }
+    buffer[keyBytes] = '\0';
+    keys.clear();
+    char keyBuffer[255];
+    for (char *data = buffer.data(); *data != '\0'; data = Util::skipLine(data)) {
+        Util::parseKey(data, keyBuffer);
+        keys.push_back(Util::fast_atoi<DBKeyType>(keyBuffer));
+    }
+    entry.offset += keyBytes;
+    entry.length -= keyBytes;
+    return true;
+}
+
+// loads <clu>.<rank> split by split, prefetching the next, and calls processSplit(cluDb, splitBegin, splitEnd, entryKeys, streamedEntry);
+// a larger entry is a split of its own that is not loaded, streamedEntry for readEntryKeys, otherwise NULL
 template<typename ProcessSplit>
 static void readClusterSplits(const std::string &clu, size_t memoryLimit, ProcessSplit processSplit) {
     DBReader<DBKeyType> cluDb((clu + "." + SSTR(MMseqsNode::rank)).c_str(), (clu + ".index." + SSTR(MMseqsNode::rank)).c_str(), Parameters::getInstance().threads,
@@ -1163,25 +1190,35 @@ static void readClusterSplits(const std::string &clu, size_t memoryLimit, Proces
     cluDb.open(DBReader<DBKeyType>::NOSORT);
     const size_t splitBytes = memoryLimit / CLUSTER_SPLIT_MEMORY_DIVISOR;
     const size_t splitEntries = std::max<size_t>(1, memoryLimit / CLUSTER_SPLIT_MEMORY_DIVISOR / (2 * sizeof(uint64_t) + 2 * sizeof(size_t)));
+    // an empty split if its first entry is larger than splitBytes
     const auto findSplitEnd = [&](size_t splitBegin, size_t splitOffset) {
-        const size_t bytesEnd = (splitOffset + splitBytes >= cluDb.getDataSize()) ? cluDb.getSize() : std::max(splitBegin + 1, cluDb.findEntryByOffset(splitOffset + splitBytes + 1) - 1);
+        const size_t bytesEnd = (splitOffset + splitBytes >= cluDb.getDataSize()) ? cluDb.getSize() : cluDb.findEntryByOffset(splitOffset + splitBytes + 1) - 1;
         return std::min(bytesEnd, splitBegin + splitEntries);
     };
     std::vector<DBKeyType> entryKeys;
+    DBReader<DBKeyType>::Index entry;
     size_t splitOffset = 0;
     for (size_t splitBegin = 0, splitEnd = findSplitEnd(0, 0), nextSplitEnd; splitBegin < cluDb.getSize(); splitBegin = splitEnd, splitEnd = nextSplitEnd) {
-        cluDb.loadData(splitBegin, splitEnd);
-        entryKeys.resize(splitEnd - splitBegin);
+        const bool isStreamed = splitEnd == splitBegin;
+        if (isStreamed) {
+            entry = cluDb.getIndexEntry(splitBegin);
+            entryKeys.assign(1, entry.id);
+            splitOffset += entry.length;
+            splitEnd++;
+        } else {
+            cluDb.loadData(splitBegin, splitEnd);
+            entryKeys.resize(splitEnd - splitBegin);
 #pragma omp parallel for schedule(static) reduction(+:splitOffset)
-        for (size_t i = splitBegin; i < splitEnd; i++) {
-            entryKeys[i - splitBegin] = cluDb.getDbKey(i);
-            splitOffset += cluDb.getEntryLen(i);
+            for (size_t i = splitBegin; i < splitEnd; i++) {
+                entryKeys[i - splitBegin] = cluDb.getDbKey(i);
+                splitOffset += cluDb.getEntryLen(i);
+            }
         }
         nextSplitEnd = findSplitEnd(splitEnd, splitOffset);
-        if (splitEnd < cluDb.getSize()) {
+        if (nextSplitEnd > splitEnd) {
             cluDb.prefetchData(splitEnd, nextSplitEnd);
         }
-        processSplit(cluDb, splitBegin, splitEnd, entryKeys);
+        processSplit(cluDb, splitBegin, splitEnd, entryKeys, isStreamed ? &entry : NULL);
     }
     cluDb.close();
 }
@@ -1213,7 +1250,9 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
             }
         }
     };
-    readClusterSplits(clu, memoryLimit, [&](DBReader<DBKeyType> &cluDb, size_t splitBegin, size_t splitEnd, const std::vector<DBKeyType> &entryKeys) {
+    std::vector<char> entryBuffer;
+    std::vector<DBKeyType> streamedKeys;
+    readClusterSplits(clu, memoryLimit, [&](DBReader<DBKeyType> &cluDb, size_t splitBegin, size_t splitEnd, const std::vector<DBKeyType> &entryKeys, DBReader<DBKeyType>::Index *streamedEntry) {
         repKeys = entryKeys;
         if (representativeBits != NULL) {
             for (size_t i = 0; i < entryKeys.size(); i++) {
@@ -1245,6 +1284,16 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
                 sendMembersWithoutEntry(receivedPairs, receivedCount);
             }
         }
+        if (streamedEntry != NULL) {
+            while (readEntryKeys(cluDb, *streamedEntry, memoryLimit, entryBuffer, streamedKeys)) {
+                for (size_t i = 0; i < streamedKeys.size(); i++) {
+                    if (withRepresentative || streamedKeys[i] != entryKeys[0]) {
+                        pairWriter.add(repKeys[0], streamedKeys[i]);
+                    }
+                }
+            }
+            return;
+        }
         pairOffsets.resize(splitEnd - splitBegin + 1);
         pairOffsets[0] = 0;
 #pragma omp parallel
@@ -1265,23 +1314,8 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
             const size_t firstPair = pairOffsets[firstEntry - splitBegin];
             const size_t endEntry = splitBegin + (std::upper_bound(pairOffsets.begin() + (firstEntry - splitBegin) + 1, pairOffsets.end(),
                                                                    firstPair + pairWriter.pairCapacity - pairWriter.pairCount) - pairOffsets.begin()) - 1;
-            if (endEntry == firstEntry && pairWriter.pairCount > 0) {
-                pairWriter.flush();
-                continue;
-            }
-            // a cluster with more pairs than fit into memory is sent in several flushes
             if (endEntry == firstEntry) {
-                const DBKeyType entryKey = cluDb.getDbKey(firstEntry);
-                char keyBuffer[255];
-                for (char *data = cluDb.getData(firstEntry, 0); *data != '\0'; data = Util::skipLine(data)) {
-                    Util::parseKey(data, keyBuffer);
-                    const DBKeyType key = Util::fast_atoi<DBKeyType>(keyBuffer);
-                    if (withRepresentative == false && key == entryKey) {
-                        continue;
-                    }
-                    pairWriter.add(repKeys[firstEntry - splitBegin], key);
-                }
-                firstEntry++;
+                pairWriter.flush();
                 continue;
             }
 #pragma omp parallel
@@ -1357,12 +1391,21 @@ std::string MMseqsNode::sendClusterMembers(const std::string &clu, const std::st
     std::vector<size_t> memberCounts;
     std::vector<size_t> memberOffsets;
     ClusterPair previousRequest = { DB_KEY_INVALID, DB_KEY_INVALID };
-    readClusterSplits(clu, memoryLimit, [&](DBReader<DBKeyType> &cluDb, size_t splitBegin, size_t, const std::vector<DBKeyType> &entryKeys) {
+    std::vector<char> requestingNodes(count, 0);
+    std::vector<char> entryBuffer;
+    std::vector<DBKeyType> streamedKeys;
+    readClusterSplits(clu, memoryLimit, [&](DBReader<DBKeyType> &cluDb, size_t splitBegin, size_t, const std::vector<DBKeyType> &entryKeys, DBReader<DBKeyType>::Index *streamedEntry) {
         const ClusterPair splitLast = { entryKeys.back(), DB_KEY_INVALID };
         size_t requestCount;
         while ((requestCount = readExchangeRange(requestBlocks, memoryLimit / RECEIVED_MEMORY_DIVISOR, ClusterPair::recordSize, ClusterPair::compareByRep, splitLast, received, NULL, requests)) > 0) {
             // a node gets the members of a key once
             ClusterPair *requestPairs = reinterpret_cast<ClusterPair *>(received.data());
+            if (streamedEntry != NULL) {
+                for (size_t i = 0; i < requestCount; i++) {
+                    requestingNodes[requestPairs[i].memberKey] = 1;
+                }
+                continue;
+            }
             SORT_PARALLEL(requestPairs, requestPairs + requestCount, ClusterPair::compareByRep);
             requestEntries.resize(requestCount);
             memberCounts.assign(requestCount, 0);
@@ -1394,30 +1437,6 @@ std::string MMseqsNode::sendClusterMembers(const std::string &clu, const std::st
             }
             previousRequest = requestPairs[requestCount - 1];
             for (size_t firstRequest = 0; firstRequest < requestCount;) {
-                // a request with more members than fit into memory is sent in several flushes
-                if (memberCounts[firstRequest] > memberCapacity) {
-                    const DBKeyType key = requestPairs[firstRequest].repKey;
-                    const size_t node = requestPairs[firstRequest].memberKey;
-                    nodeMembers.resize(memberCapacity);
-                    size_t memberCount = 0;
-                    char keyBuffer[255];
-                    for (char *data = cluDb.getData(requestEntries[firstRequest], 0); *data != '\0'; data = Util::skipLine(data)) {
-                        Util::parseKey(data, keyBuffer);
-                        const ClusterPair pair = { key, Util::fast_atoi<DBKeyType>(keyBuffer) };
-                        if (pair.memberKey != key) {
-                            nodeMembers[memberCount++] = pair;
-                        }
-                        if (memberCount == memberCapacity || (memberCount > 0 && *Util::skipLine(data) == '\0')) {
-                            for (size_t i = 0; i <= count; i++) {
-                                nodeOffsets[i] = (i <= node) ? 0 : memberCount;
-                            }
-                            writeMembers(memberCount);
-                            memberCount = 0;
-                        }
-                    }
-                    firstRequest++;
-                    continue;
-                }
                 // the requests whose members fit go in requesting node order, each node's in key order
                 size_t endRequest = firstRequest;
                 for (size_t memberCount = 0; endRequest < requestCount && memberCount + memberCounts[endRequest] <= memberCapacity; endRequest++) {
@@ -1465,6 +1484,28 @@ std::string MMseqsNode::sendClusterMembers(const std::string &clu, const std::st
                 }
                 firstRequest = endRequest;
             }
+        }
+        // a streamed entry is read once for all requesting nodes
+        if (streamedEntry != NULL && std::count(requestingNodes.begin(), requestingNodes.end(), 1) > 0) {
+            while (readEntryKeys(cluDb, *streamedEntry, memoryLimit, entryBuffer, streamedKeys)) {
+                nodeMembers.clear();
+                for (size_t i = 0; i < streamedKeys.size(); i++) {
+                    const ClusterPair pair = { entryKeys[0], streamedKeys[i] };
+                    if (pair.memberKey != pair.repKey) {
+                        nodeMembers.push_back(pair);
+                    }
+                }
+                for (size_t node = 0; node < count && nodeMembers.empty() == false; node++) {
+                    if (requestingNodes[node] == 0) {
+                        continue;
+                    }
+                    for (size_t i = 0; i <= count; i++) {
+                        nodeOffsets[i] = (i <= node) ? 0 : nodeMembers.size();
+                    }
+                    writeMembers(nodeMembers.size());
+                }
+            }
+            std::fill(requestingNodes.begin(), requestingNodes.end(), 0);
         }
     });
     const ClusterPair lastPair = { DB_KEY_INVALID, DB_KEY_INVALID };

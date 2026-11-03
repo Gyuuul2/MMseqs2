@@ -310,6 +310,10 @@ public:
     size_t findEntryByKey(size_t key) {
         return findEntryByCell(0, key);
     }
+    // --createdb-mode 3 cluster databases: the key, offset and length of entry id, read from the index
+    Index getIndexEntry(size_t id);
+    // --createdb-mode 3 cluster databases: reads bytes at offset of the data file to destination
+    void readData(size_t offset, size_t bytes, char *destination);
     char *getDataFromLoadedBuffer(size_t key);
 
     size_t bsearch(const Index * index, size_t size, T value);

@@ -936,6 +936,19 @@ template <typename T> size_t DBReader<T>::findEntryByCell(size_t column, size_t 
     return entry;
 }
 
+template <typename T> typename DBReader<T>::Index DBReader<T>::getIndexEntry(size_t id) {
+    uint64_t cells[4];
+    FileUtil::preadAll(bufferedFds[dataFileNames.size()], indexFileName, reinterpret_cast<char *>(cells), sizeof(cells), id * 2 * sizeof(uint64_t));
+    Index entry = { T(), cells[1], cells[3] - cells[1] };
+    entry.id += cells[0];
+    return entry;
+}
+
+template <typename T> void DBReader<T>::readData(size_t offset, size_t bytes, char *destination) {
+    const BatchReader::ReadRequest request = { bufferedFds[0], dataFileNames[0].c_str(), destination, offset, bytes, bytes };
+    batchReader->readSync(std::vector<BatchReader::ReadRequest>(1, request));
+}
+
 template <typename T> size_t DBReader<T>::getNamesSize(size_t keyBegin, size_t keyEnd) {
     if (clusterIndex || headerOffsetsFileNames.empty() || bufferedFds.empty()) {
         Debug(Debug::ERROR) << "Call of getNamesSize is only allowed for the headers of a --createdb-mode 3 database opened with data " << dataFileName << "\n";

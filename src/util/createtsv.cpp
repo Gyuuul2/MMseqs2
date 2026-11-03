@@ -153,6 +153,16 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
     // a key also holds its name offset in the read buffer and in the split
     const size_t keyBytes = headers.getNamesSize(localFirstKey, localEndKey) / std::max<size_t>(1, localEndKey - localFirstKey) + sizeof(uint64_t) + sizeof(size_t);
     const size_t splitKeys = std::max<size_t>(1, memoryLimit / 8 / keyBytes);
+    // the average sizes the first candidate; uneven names must still fit the split
+    std::vector<size_t> splitKeyOffsets(1, localFirstKey);
+    while (splitKeyOffsets.back() < localEndKey) {
+        const size_t keyBegin = splitKeyOffsets.back();
+        size_t keyEnd = keyBegin + std::min(splitKeys, localEndKey - keyBegin);
+        while (keyEnd - keyBegin > 1 && headers.getNamesSize(keyBegin, keyEnd) + (keyEnd - keyBegin) * (sizeof(uint64_t) + sizeof(size_t)) > memoryLimit / 8) {
+            keyEnd = keyBegin + (keyEnd - keyBegin) / 2;
+        }
+        splitKeyOffsets.push_back(keyEnd);
+    }
 
     const std::string sortedByRepFile = sortedByRep + "." + SSTR(MMseqsNode::rank);
     FILE *sortedByRepHandle = FileUtil::openAndDelete(sortedByRepFile.c_str(), "w");
@@ -169,11 +179,12 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
     std::vector<size_t> threadAccessionOffsets(threads + 1);
     std::vector<char> received;
     DBKeyType previousMemberKey = DB_KEY_INVALID;
-    for (size_t keyBegin = localFirstKey; keyBegin < localEndKey; keyBegin += splitKeys) {
-        const size_t keyEnd = std::min(localEndKey, keyBegin + splitKeys);
+    for (size_t split = 0; split + 1 < splitKeyOffsets.size(); split++) {
+        const size_t keyBegin = splitKeyOffsets[split];
+        const size_t keyEnd = splitKeyOffsets[split + 1];
         headers.loadData(keyBegin, keyEnd);
-        if (keyEnd < localEndKey) {
-            headers.prefetchData(keyEnd, std::min(localEndKey, keyEnd + splitKeys));
+        if (split + 2 < splitKeyOffsets.size()) {
+            headers.prefetchData(keyEnd, splitKeyOffsets[split + 2]);
         }
         const ClusterPair splitLast = { static_cast<DBKeyType>(keyEnd - 1), static_cast<DBKeyType>(keyEnd - 1) };
         size_t pairCount;
@@ -256,6 +267,7 @@ static void writeRepresentativeEntries(const std::string &sortedByRepIndex, cons
     size_t memberAccessionCapacity = 0;
     std::vector<std::string> threadLines(par.threads);
     std::vector<size_t> threadLineOffsets(par.threads + 1);
+    const size_t writeBufferSize = std::min(MAX_READ_REQUEST_SIZE, std::max<size_t>(1, memoryLimit / 8 / par.threads));
     // the accession of the representative whose cluster the previous range ended in
     std::string repAccession;
     DBKeyType previousRepKey = DB_KEY_INVALID;
@@ -272,50 +284,63 @@ static void writeRepresentativeEntries(const std::string &sortedByRepIndex, cons
             memberAccession.accessionOffset = recordOffsets[i] + MEMBER_ACCESSION_SIZE;
         }
         SORT_PARALLEL(memberAccessions, memberAccessions + recordCount, MemberAccession::compareByRep);
+        // count the bytes first: a long representative name can make the TSV much larger than the received records
+        for (int pass = 0; pass < 2; pass++) {
 #pragma omp parallel for schedule(dynamic, 1)
-        for (int thread = 0; thread < par.threads; thread++) {
-            std::string &lines = threadLines[thread];
-            lines.clear();
-            const size_t begin = recordCount * thread / par.threads;
-            const size_t end = recordCount * (thread + 1) / par.threads;
-            if (begin == end) {
-                continue;
-            }
-            DBKeyType repKey = (begin > 0) ? memberAccessions[begin - 1].repKey : previousRepKey;
-            const char *repName = repAccession.data();
-            size_t repLength = repAccession.size();
-            // a cluster that continues from the part before has its representative line earlier in this range or in a previous range
-            const MemberAccession repLine = { repKey, repKey, 0, 0 };
-            const size_t repLinePos = std::lower_bound(memberAccessions, memberAccessions + begin, repLine, MemberAccession::compareByRep) - memberAccessions;
-            if (repLinePos < begin && memberAccessions[repLinePos].memberKey == repKey) {
-                repName = records.data() + memberAccessions[repLinePos].accessionOffset;
-                repLength = memberAccessions[repLinePos].accessionLength;
-            }
-            for (size_t i = begin; i < end; i++) {
-                const MemberAccession &memberAccession = memberAccessions[i];
-                if (memberAccession.repKey != repKey) {
-                    // the representative itself comes first
-                    if (memberAccession.memberKey != memberAccession.repKey) {
-                        Debug(Debug::ERROR) << "The cluster of key " << memberAccession.repKey << " has no line for its representative\n";
-                        EXIT(EXIT_FAILURE);
-                    }
-                    repKey = memberAccession.repKey;
-                    repName = records.data() + memberAccession.accessionOffset;
-                    repLength = memberAccession.accessionLength;
+            for (int thread = 0; thread < par.threads; thread++) {
+                std::string &lines = threadLines[thread];
+                lines.clear();
+                const size_t begin = recordCount * thread / par.threads;
+                const size_t end = recordCount * (thread + 1) / par.threads;
+                DBKeyType repKey = (begin > 0) ? memberAccessions[begin - 1].repKey : previousRepKey;
+                const char *repName = repAccession.data();
+                size_t repLength = repAccession.size();
+                // a cluster that continues from the part before has its representative line earlier in this range or in a previous range
+                const MemberAccession repLine = { repKey, repKey, 0, 0 };
+                const size_t repLinePos = std::lower_bound(memberAccessions, memberAccessions + begin, repLine, MemberAccession::compareByRep) - memberAccessions;
+                if (repLinePos < begin && memberAccessions[repLinePos].memberKey == repKey) {
+                    repName = records.data() + memberAccessions[repLinePos].accessionOffset;
+                    repLength = memberAccessions[repLinePos].accessionLength;
                 }
-                lines.append(repName, repLength);
-                lines.push_back('\t');
-                lines.append(records.data() + memberAccession.accessionOffset, memberAccession.accessionLength);
-                lines.push_back('\n');
+                size_t writeOffset = (pass == 0) ? 0 : threadLineOffsets[thread];
+                for (size_t i = begin; i < end; i++) {
+                    const MemberAccession &memberAccession = memberAccessions[i];
+                    if (memberAccession.repKey != repKey) {
+                        // the representative itself comes first
+                        if (memberAccession.memberKey != memberAccession.repKey) {
+                            Debug(Debug::ERROR) << "The cluster of key " << memberAccession.repKey << " has no line for its representative\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        repKey = memberAccession.repKey;
+                        repName = records.data() + memberAccession.accessionOffset;
+                        repLength = memberAccession.accessionLength;
+                    }
+                    if (pass == 0) {
+                        writeOffset += repLength + memberAccession.accessionLength + 2;
+                        continue;
+                    }
+                    lines.append(repName, repLength);
+                    lines.push_back('\t');
+                    lines.append(records.data() + memberAccession.accessionOffset, memberAccession.accessionLength);
+                    lines.push_back('\n');
+                    if (lines.size() >= writeBufferSize) {
+                        FileUtil::pwriteAll(fileno(tsvHandle), tsvFile.c_str(), lines.data(), lines.size(), writeOffset);
+                        writeOffset += lines.size();
+                        lines.clear();
+                    }
+                }
+                if (pass == 0) {
+                    threadLineOffsets[thread + 1] = writeOffset;
+                } else {
+                    FileUtil::pwriteAll(fileno(tsvHandle), tsvFile.c_str(), lines.data(), lines.size(), writeOffset);
+                }
             }
-        }
-        threadLineOffsets[0] = tsvSize;
-        for (int thread = 0; thread < par.threads; thread++) {
-            threadLineOffsets[thread + 1] = threadLineOffsets[thread] + threadLines[thread].size();
-        }
-#pragma omp parallel for schedule(dynamic, 1)
-        for (int thread = 0; thread < par.threads; thread++) {
-            FileUtil::pwriteAll(fileno(tsvHandle), tsvFile.c_str(), threadLines[thread].data(), threadLines[thread].size(), threadLineOffsets[thread]);
+            if (pass == 0) {
+                threadLineOffsets[0] = tsvSize;
+                for (int thread = 0; thread < par.threads; thread++) {
+                    threadLineOffsets[thread + 1] += threadLineOffsets[thread];
+                }
+            }
         }
         tsvSize = threadLineOffsets[par.threads];
         previousRepKey = memberAccessions[recordCount - 1].repKey;
@@ -364,6 +389,7 @@ int createtsv(int argc, const char **argv, const Command &command) {
         MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", timer);
         const std::string sortedByRep = par.db4 + "_by_rep";
         const std::string sortedByRepIndex = readMemberAccessions(sortedByMemberIndex, sortedByMember, headers, nodeKeyOffsets, Util::computeMemory(par.splitMemoryLimit), sortedByRep);
+        headers.close();
         MMseqsNode::addPhaseTime(phaseValues, "sending the member accessions", timer);
         FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
         writeRepresentativeEntries(sortedByRepIndex, sortedByRep, par.db4, par);
@@ -372,7 +398,6 @@ int createtsv(int argc, const char **argv, const Command &command) {
         exchanges.push_back(sortedByMember);
         exchanges.push_back(sortedByRep);
         MMseqsNode::removeExchanges(sortedByRep, sortedByRep, exchanges, phaseValues);
-        headers.close();
         return EXIT_SUCCESS;
     }
 
