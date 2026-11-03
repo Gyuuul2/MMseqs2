@@ -13,6 +13,7 @@
 #include "FastSort.h"
 #include "Masker.h"
 #include "MMseqsNode.h"
+#include "BatchReader.h"
 
 #include "zstd/contrib/seekable_format/zstd_seekable.h"
 #include <sys/stat.h>
@@ -930,11 +931,13 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         std::vector<MMseqsNode::ExchangeBlock> blocks;
         std::vector<FILE *> exchangeFiles;
         MMseqsNode::openExchange(exchangeIndex, exchange, blocks, exchangeFiles);
-        // the send buffers are freed, so the receive takes the same budget: half of it buffers the blocks, so each read of a block is large
+        // the send buffers are freed, so the receive takes the same budget: half of it buffers the blocks, so each read of a block is large,
+        // and the writes of a window go on behind the reads of the next one
         const size_t receiveMemory = static_cast<size_t>(memoryLimit * 0.95);
         const size_t blockMemory = receiveMemory / 2;
         const size_t windowSize = receiveMemory / 8;
         const size_t writeSize = std::max<size_t>(1, windowSize / par.threads);
+        BatchWriter batchWriter(windowSize, par.threads, fileno(dataFiles[SEQUENCE_DATA]));
         // a segment that starts in the window ends at most MAX_SEGMENT_SIZE behind it
         char *window = NULL;
         if (blocks.empty() == false || par.compressHeaders) {
@@ -1006,7 +1009,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     }
 #pragma omp parallel for schedule(dynamic, 1)
                     for (size_t part = 0; part < partCount; part++) {
-                        FileUtil::pwriteAll(fileno(zstdFile), zstdFileName.c_str(), frames + part * partFrames * frameBound, partOffsets[part + 1] - partOffsets[part], compressedBytes + partOffsets[part]);
+                        batchWriter.write(fileno(zstdFile), zstdFileName.c_str(), frames + part * partFrames * frameBound, partOffsets[part + 1] - partOffsets[part], compressedBytes + partOffsets[part]);
                     }
                     compressedBytes += partOffsets.back();
                     memmove(window, window + (frameEnd - windowBegin), windowEnd - frameEnd);
@@ -1024,12 +1027,13 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     }
 #pragma omp parallel for schedule(dynamic, 1)
                     for (size_t i = 0; i < writes.size(); i++) {
-                        FileUtil::pwriteAll(fileno(dataFiles[fileType]), dataFileNames[fileType].c_str(), window + (writes[i].first - windowBegin), writes[i].second, writes[i].first);
+                        batchWriter.write(fileno(dataFiles[fileType]), dataFileNames[fileType].c_str(), window + (writes[i].first - windowBegin), writes[i].second, writes[i].first);
                     }
                     windowBegin = nextOffset;
                 }
             }
         }
+        batchWriter.waitWrites();
         Util::releasePages(window, windowSize + MAX_SEGMENT_SIZE);
         delete[] window;
         MMseqsNode::closeExchangeFiles(exchangeFiles, exchange);
