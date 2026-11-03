@@ -2604,7 +2604,7 @@ static const size_t ASSIGNED_PAGE_KEYS = 32768;
 static const size_t FIRST_WINDOW_BYTES = 64 * 1024 * 1024;
 // the bytes of a slice that a thread writes at once
 static const size_t SLICE_WRITE_BYTES = 16 * 1024 * 1024;
-// a served entry takes 5 bits per byte when all its bytes have a code here, else its slot starts with PACKED_RAW_CODE and its bytes follow the slots of its slice
+// a slice starts with a bit per key that is set when the key is assigned and not served; a served entry takes 5 bits per byte when all its bytes have a code here, else its slot starts with PACKED_RAW_CODE and its bytes follow the slots of its slice
 static const char PACKED_ENTRY_BYTES[] = "\0\nABCDEFGHIJKLMNOPQRSTUVWXYZ*-";
 static const unsigned char PACKED_RAW_CODE = 31;
 
@@ -2655,11 +2655,13 @@ static void unpackEntry(const char *slot, size_t entryLen, char *entry) {
     }
 }
 
-// writes the entries at entryOffsets of data from the packed slots of keyCount keys, then their raw entries
-static void unpackEntries(const char *slots, size_t keyCount, const size_t *entryOffsets, char *data, int threads) {
+// writes the entries at entryOffsets of data from the slice of keyCount keys: zeros for the assigned keys, else their packed slots, then their raw entries
+static void unpackEntries(const char *slice, size_t keyCount, const size_t *entryOffsets, char *data, int threads) {
+    const char *slots = slice + (keyCount + 7) / 8;
     std::vector<size_t> slotOffsets(keyCount + 1, 0);
     for (size_t i = 0; i < keyCount; i++) {
-        slotOffsets[i + 1] = slotOffsets[i] + getPackedEntryBytes(entryOffsets[i + 1] - entryOffsets[i]);
+        const bool isAssigned = (static_cast<unsigned char>(slice[i / 8]) >> (i % 8)) & 1;
+        slotOffsets[i + 1] = slotOffsets[i] + (isAssigned ? 0 : getPackedEntryBytes(entryOffsets[i + 1] - entryOffsets[i]));
     }
     std::vector<std::vector<size_t> > threadRawEntries(threads);
 #pragma omp parallel num_threads(threads)
@@ -2670,7 +2672,9 @@ static void unpackEntries(const char *slots, size_t keyCount, const size_t *entr
 #endif
 #pragma omp for schedule(static)
         for (size_t i = 0; i < keyCount; i++) {
-            if ((static_cast<unsigned char>(slots[slotOffsets[i]]) & 31) == PACKED_RAW_CODE) {
+            if (slotOffsets[i + 1] == slotOffsets[i]) {
+                memset(data + entryOffsets[i], 0, entryOffsets[i + 1] - entryOffsets[i]);
+            } else if ((static_cast<unsigned char>(slots[slotOffsets[i]]) & 31) == PACKED_RAW_CODE) {
                 threadRawEntries[thread_idx].push_back(i);
             } else {
                 unpackEntry(slots + slotOffsets[i], entryOffsets[i + 1] - entryOffsets[i], data + entryOffsets[i]);
@@ -3092,9 +3096,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<unsigned int> keyHomes;
     std::vector<size_t> threadHomeOffsets;
     const size_t serviceKeyCount = (rank >= firstAlignNode) ? memoryLimit / WINDOW_MEMORY_DIVISOR / WINDOW_KEY_BYTES : 0;
-    // a served flush cut after a window plus a request and the received slices of a window, a request at most packed slots plus raw entries
+    // a served flush cut after a window of slice bytes plus a request and the received slices of a window, a request at most its bits, packed slots and raw entries
     const size_t remoteServiceBytes = (rank >= firstAlignNode && alignNodes > 1)
-        ? memoryLimit / WINDOW_MEMORY_DIVISOR + 2 * (getPackedEntryBytes(memoryLimit / WINDOW_MEMORY_DIVISOR) + memoryLimit / WINDOW_MEMORY_DIVISOR)
+        ? memoryLimit / WINDOW_MEMORY_DIVISOR + 2 * ((serviceKeyCount + 7) / 8 + getPackedEntryBytes(memoryLimit / WINDOW_MEMORY_DIVISOR) + memoryLimit / WINDOW_MEMORY_DIVISOR)
           + 4 * serviceKeyCount * (sizeof(DBKeyType) + sizeof(size_t)) : 0;
     // the block cache takes the memory left by the members, chunks, windows and a member part
     const size_t reservedMemory = ((members != NULL) ? members->memoryBytes() : 0)
@@ -3313,7 +3317,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<DBKeyType> loadKeys;
     std::vector<std::vector<size_t> > threadRawEntries(serviceThreads);
     size_t partialSlicePolls = 0;
-    size_t filteredSequenceBytes = 0;
+    size_t unservedSequenceBytes = 0;
     // copies or, with rawKeys, packs the entries of keys to data at offsets on the service threads; an assigned key gets zeros, rawKeys gets the keys without codes
     const auto copyEntries = [&](const DBKeyType *keys, size_t keyCount, const size_t *offsets, char *data, std::vector<DBKeyType> *rawKeys) {
         for (size_t first = 0; first < keyCount;) {
@@ -3323,9 +3327,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             }
             loadKeys.clear();
             for (size_t i = loadFirst; i < first; i++) {
-                if (isAssigned(keys[i])) {
-                    filteredSequenceBytes += seqDbr.getEntryLen(keys[i]);
-                } else {
+                if (isAssigned(keys[i]) == false) {
                     loadKeys.push_back(keys[i]);
                 }
             }
@@ -3640,14 +3642,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         }
                     }
                 }
-                // the requests of the polled nodes are served together, until they hold a window of entries
+                // the requests of the polled nodes are served together, until their slices hold a window of bytes
                 flushKeys.clear();
                 flushKeyOffsets.assign(1, 0);
                 nodeFlushRequests.assign(nodes, SIZE_MAX);
-                size_t flushEntryBytes = 0;
+                size_t flushSliceBytes = 0;
                 for (size_t i = 0; i < polledNodes; i++) {
                     const unsigned int node = (rank + 1 + (i + pollTurn) % (nodes - 1)) % nodes;
-                    while (isRequesting[node] && flushEntryBytes < memoryLimit / WINDOW_MEMORY_DIVISOR
+                    while (isRequesting[node] && flushSliceBytes < memoryLimit / WINDOW_MEMORY_DIVISOR
                            && MMseqsNode::readExchangeFlushes(requestIndexes[node], nodeRequests[node], requestLine.size(), requestLine) == 1) {
                         // a node requests once it has read its slices before, so a flush file goes once all its slices are read
                         if (unreadFlushes[node] != SIZE_MAX) {
@@ -3719,15 +3721,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         hasWorked = true;
                         nodeFlushRequests[node] = flushKeyOffsets.size() - 1;
                         flushKeyOffsets.push_back(flushKeys.size());
-                        size_t requestEntryBytes = 0;
-#pragma omp parallel for schedule(static) num_threads(serviceThreads) reduction(+:requestEntryBytes)
+                        size_t requestSliceBytes = (flushKeys.size() - keyOffset + 7) / 8;
+#pragma omp parallel for schedule(static) num_threads(serviceThreads) reduction(+:requestSliceBytes)
                         for (size_t j = keyOffset; j < flushKeys.size(); j++) {
-                            requestEntryBytes += seqDbr.getEntryLen(flushKeys[j]);
+                            requestSliceBytes += isAssigned(flushKeys[j]) ? 0 : getPackedEntryBytes(seqDbr.getEntryLen(flushKeys[j]));
                         }
-                        flushEntryBytes += requestEntryBytes;
+                        flushSliceBytes += requestSliceBytes;
                     }
                 }
-                // the requests in node order, each its packed slots then its raw entries; a flush is cut once it holds a window of bytes
+                // the requests in node order, each its assigned bits, the packed slots of its other keys, then their raw entries; a flush is cut once it holds a window of bytes
                 size_t sliceBytes = 0;
                 size_t flushSlices = 0;
                 size_t requestsLeft = flushKeyOffsets.size() - 1;
@@ -3739,21 +3741,36 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     const DBKeyType *keys = flushKeys.data() + flushKeyOffsets[nodeFlushRequests[node]];
                     const size_t keyCount = flushKeyOffsets[nodeFlushRequests[node] + 1] - flushKeyOffsets[nodeFlushRequests[node]];
                     requestOffsets.resize(keyCount + 1);
-                    requestOffsets[0] = 0;
-#pragma omp parallel for schedule(static) num_threads(serviceThreads)
+                    requestOffsets[0] = (keyCount + 7) / 8;
+                    size_t requestUnservedBytes = 0;
+#pragma omp parallel for schedule(static) num_threads(serviceThreads) reduction(+:requestUnservedBytes)
                     for (size_t j = 0; j < keyCount; j++) {
-                        requestOffsets[j + 1] = getPackedEntryBytes(seqDbr.getEntryLen(keys[j]));
+                        const size_t packedBytes = getPackedEntryBytes(seqDbr.getEntryLen(keys[j]));
+                        const bool isServed = isAssigned(keys[j]) == false;
+                        requestOffsets[j + 1] = isServed ? packedBytes : 0;
+                        requestUnservedBytes += isServed ? 0 : packedBytes;
                     }
+                    unservedSequenceBytes += requestUnservedBytes;
                     for (size_t j = 0; j < keyCount; j++) {
                         requestOffsets[j + 1] += requestOffsets[j];
                     }
                     if (slice.size() < sliceBytes + requestOffsets[keyCount]) {
                         slice.resize(sliceBytes + requestOffsets[keyCount]);
                     }
+                    // a served entry has at least one byte, so an empty slot marks an assigned key; bits are never cleared, so copyEntries writes nothing for it
+#pragma omp parallel for schedule(static) num_threads(serviceThreads)
+                    for (size_t byte = 0; byte < requestOffsets[0]; byte++) {
+                        unsigned char bits = 0;
+                        for (size_t j = 8 * byte; j < std::min(keyCount, 8 * byte + 8); j++) {
+                            bits |= static_cast<unsigned char>(requestOffsets[j + 1] == requestOffsets[j]) << (j % 8);
+                        }
+                        slice[sliceBytes + byte] = static_cast<char>(bits);
+                    }
                     rawKeys.clear();
                     copyEntries(keys, keyCount, requestOffsets.data(), slice.data() + sliceBytes, &rawKeys);
                     sliceBytes += requestOffsets[keyCount];
                     requestOffsets.resize(rawKeys.size() + 1);
+                    requestOffsets[0] = 0;
                     for (size_t j = 0; j < rawKeys.size(); j++) {
                         requestOffsets[j + 1] = requestOffsets[j] + seqDbr.getEntryLen(rawKeys[j]);
                     }
@@ -4218,7 +4235,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     MMseqsNode::addPhaseValue(phaseValues, "Block read bytes", SSTR(seqDbr.getBlockReadBytes()));
     MMseqsNode::addPhaseValue(phaseValues, "Key read bytes", SSTR(seqDbr.getKeyReadBytes()));
     MMseqsNode::addPhaseValue(phaseValues, "Assigned change bytes read", SSTR(changeReadBytes));
-    MMseqsNode::addPhaseValue(phaseValues, "Assigned sequence bytes filtered", SSTR(filteredSequenceBytes));
+    MMseqsNode::addPhaseValue(phaseValues, "Assigned packed sequence bytes not served", SSTR(unservedSequenceBytes));
     // the master still finds the nodes of keys in the blocks of seqDbr
     seqDbr.releaseDataPages();
     if (MMseqsNode::rank >= getFirstAlignNode()) {
