@@ -920,15 +920,15 @@ template <typename T> size_t DBReader<T>::getSeqLenFromRange(size_t &range, size
     return index[range].length - 2;
 }
 
-template <typename T> size_t DBReader<T>::findEntryByCell(size_t column, size_t value) {
+template <typename T> size_t DBReader<T>::findEntryByCell(size_t column, size_t value, size_t first, size_t last) {
     if (clusterIndex == false || (column == 1 && value > dataSize)) {
         Debug(Debug::ERROR) << ((column == 0) ? "Key " : "Offset ") << value << " is not in the --createdb-mode 3 cluster or prefilter database " << dataFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
     // the first of the (key, offset) cells of the entries and the end cell whose cell[column] is not smaller
     const int fd = bufferedFds[dataFileNames.size()];
-    size_t entry = 0;
-    for (size_t cells = size + 1; cells > 0;) {
+    size_t entry = first;
+    for (size_t cells = std::min(last, size + 1) - first; cells > 0;) {
         const size_t half = cells / 2;
         uint64_t cell[2];
         FileUtil::preadAll(fd, indexFileName, reinterpret_cast<char *>(cell), sizeof(cell), (entry + half) * sizeof(cell));

@@ -315,14 +315,16 @@ public:
     size_t findEntryByOffset(size_t offset) {
         return findEntryByCell(1, offset);
     }
-    // the first entry whose key is key or larger, the entry count after the last
-    size_t findEntryByKey(size_t key) {
-        return findEntryByCell(0, key);
+    // the first entry of [first, last) whose key is key or larger, otherwise last; by default the entry count after the last
+    size_t findEntryByKey(size_t key, size_t first = 0, size_t last = SIZE_MAX) {
+        return findEntryByCell(0, key, first, last);
     }
     // --createdb-mode 3 cluster databases: the key, offset and length of entry id, read from the index
     Index getIndexEntry(size_t id);
     // --createdb-mode 3 cluster databases: reads bytes at offset of the data file to destination
     void readData(size_t offset, size_t bytes, char *destination);
+    // --createdb-mode 3 cluster databases: the data file fd without O_DIRECT, for preads of any thread
+    int getBufferedFd() const { return bufferedFds[0]; }
     char *getDataFromLoadedBuffer(size_t key);
 
     size_t bsearch(const Index * index, size_t size, T value);
@@ -585,8 +587,8 @@ public:
 private:
     void checkClosed() const;
     size_t findLoadedEntryOffsetsPos(size_t id);
-    // the first (key, offset) cell of the entries, or the end cell, whose cell[column] is value or larger
-    size_t findEntryByCell(size_t column, size_t value);
+    // the first (key, offset) cell in [first, last) of the entries and the end cell whose cell[column] is value or larger, otherwise last
+    size_t findEntryByCell(size_t column, size_t value, size_t first = 0, size_t last = SIZE_MAX);
     size_t planReadRequests(size_t keyBegin, size_t keyEnd, bool readOffsets, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &entryOffsets, std::vector<size_t> &keys, std::vector<BatchReader::ReadRequest> &compressedReadRequests, std::vector<size_t> &requestFirstKeys);
     size_t planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys);
     // a load of keys [keyBegin, keyEnd), only the given keys of them if keys is not NULL

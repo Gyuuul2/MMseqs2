@@ -158,45 +158,6 @@ public:
     static size_t readExchangeSegments(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t maxSegmentSize, uint64_t fileType, size_t windowBegin, size_t windowEnd,
                                        char *window, std::vector<std::pair<size_t, size_t> > &segments, const std::string &prefix);
     static void closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix);
-    class ClusterMemberLookup {
-    public:
-        struct Cursor {
-            size_t block;
-            size_t offset;
-            DBKeyType key;
-            size_t bufferBegin;
-            size_t bufferEnd;
-            size_t nextReadBytes;
-            std::vector<ClusterPair> buffer;
-        };
-
-        ClusterMemberLookup(const std::string &index, const std::string &prefix, size_t maxBytes);
-        ~ClusterMemberLookup();
-        void find(DBKeyType key, Cursor &cursor) const;
-        bool next(Cursor &cursor, DBKeyType &memberKey) const;
-        size_t memoryBytes() const;
-
-    private:
-        struct Range {
-            DBKeyType firstKey;
-            DBKeyType lastKey;
-            size_t firstAnchor;
-            size_t lastAnchor;
-        };
-        struct Anchor {
-            DBKeyType key;
-            size_t offset;
-        };
-        ClusterPair readPair(size_t block, size_t offset) const;
-        ClusterMemberLookup(const ClusterMemberLookup &);
-        ClusterMemberLookup &operator=(const ClusterMemberLookup &);
-
-        const std::string prefix;
-        std::vector<ExchangeBlock> blocks;
-        std::vector<FILE *> files;
-        std::vector<Range> ranges;
-        std::vector<Anchor> anchors;
-    };
 
     // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered; nodeKeyOffsets: keys of every node
     // the pairs for this node stay in memory, up to pairCapacity of them before the last flush
@@ -243,8 +204,6 @@ public:
     static std::string sendClusterPairs(const std::string &clu, bool withRepresentative, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                                         const std::string &exchange, const std::string &receivedIndex = "", const std::string &receivedPrefix = "",
                                         uint64_t *representativeBits = NULL, const std::vector<size_t> &cluKeyOffsets = std::vector<size_t>(), size_t firstKey = 0, size_t keyCount = 0);
-    // --filter-cludb-file: a request { key, requesting node } of the exchange requestsIndex, requests gets the other members of key in <clu>.<node> as { key, member } through <members>.<node>
-    static std::string sendClusterMembers(const std::string &clu, const std::string &requestsIndex, const std::string &requests, const std::string &members);
     // once every node has read lastExchange, a node removes its file of it; the master removes the indexes of exchanges and prints phaseValues
     static void removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues = "");
     // ORs the bits of keys [from, to) of a file, bit k at fileOffset = key fileFirstKey + k, into bit key - firstKey of bits, a word longer than its keys
