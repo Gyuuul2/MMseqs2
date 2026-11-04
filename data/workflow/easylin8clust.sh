@@ -8,6 +8,8 @@ notExists() {
    [ ! -f "$1" ]
 }
 
+# srun ends the other tasks of a step when one fails, they would wait for it forever
+export SLURM_KILL_BAD_EXIT=1
 
 if notExists "${TMP_PATH}/input.dbtype"; then
     # shellcheck disable=SC2086
@@ -21,6 +23,7 @@ if notExists "${TMP_PATH}/clu.dbtype"; then
         || fail "Search died"
 fi
 
+# the outputs are one file per node and a killed step can leave some of them, so a .done marker tells that a step finished
 if notExists "${TMP_PATH}/createtsv.done"; then
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" createtsv "${TMP_PATH}/input" "${TMP_PATH}/input" "${TMP_PATH}/clu" "${TMP_PATH}/cluster.tsv" ${CREATETSV_PAR} \

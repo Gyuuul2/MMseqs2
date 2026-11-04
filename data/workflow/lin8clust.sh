@@ -4,13 +4,16 @@ fail() {
     exit 1
 }
 
-# true if none of the files exists
+# true if none of the files exists; an output removed once a later step consumed it counts as present, so the later step's outputs are checked too
 notExists() {
     for FILE in "$@"; do
         [ -f "$FILE" ] && return 1
     done
     return 0
 }
+
+# srun ends the other tasks of a step when one fails, they would wait for it forever
+export SLURM_KILL_BAD_EXIT=1
 
 [ "$#" -ne 3 ] && echo "Please provide <sequenceDB> <outDB> <tmp>" && exit 1;
 # check if files exist
@@ -21,6 +24,7 @@ notExists() {
 INPUT="$1"
 TMP_PATH="$3"
 SOURCE="$INPUT"
+PIDS=""
 
 if [ -n "$CLUSTHASH" ] || [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
     CLUDB="${TMP_PATH}/clu"
@@ -59,11 +63,8 @@ if notExists "${CLUDB}.dbtype" ${ITER2_PRODUCTS}; then
         || fail "align2clust died"
     if [ -n "$REMOVE_TMP" ]; then
         # shellcheck disable=SC2086
-        "$MMSEQS" rmdb "${TMP_PATH}/pref" ${VERBOSITY}
-        if [ -n "$CLUSTHASH" ]; then
-            # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust_redundancy" ${VERBOSITY}
-        fi
+        "$MMSEQS" rmdb "${TMP_PATH}/pref" ${VERBOSITY} &
+        PIDS="$PIDS $!"
     fi
 fi
 
@@ -82,9 +83,14 @@ if [ -n "$CLUSTHASH" ]; then
             || fail "mergeclusters died"
         if [ -n "$REMOVE_TMP" ]; then
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust" ${VERBOSITY} &
+            PIDS="$PIDS $!"
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust_redundancy" ${VERBOSITY} &
+            PIDS="$PIDS $!"
+            # shellcheck disable=SC2086
+            "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY} &
+            PIDS="$PIDS $!"
         fi
     fi
     CLUDB="$MERGED"
@@ -113,9 +119,11 @@ if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
             || fail "align2clust (representatives) died"
         if [ -n "$REMOVE_TMP" ]; then
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/pref_rep" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/pref_rep" ${VERBOSITY} &
+            PIDS="$PIDS $!"
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_rep" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/input_rep" ${VERBOSITY} &
+            PIDS="$PIDS $!"
         fi
     fi
 
@@ -126,12 +134,19 @@ if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
             || fail "mergeclusters died"
         if [ -n "$REMOVE_TMP" ]; then
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/clu_rep" ${VERBOSITY}
+            "$MMSEQS" rmdb "${TMP_PATH}/clu_rep" ${VERBOSITY} &
+            PIDS="$PIDS $!"
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY}
+            "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY} &
+            PIDS="$PIDS $!"
         fi
     fi
 fi
+
+# the databases that the next steps do not read are removed in the background, a failed removal still fails the workflow
+for PID in $PIDS; do
+    wait "$PID"
+done
 
 if [ -n "$REMOVE_TMP" ]; then
     rm -f "${TMP_PATH}/lin8clust.sh"
