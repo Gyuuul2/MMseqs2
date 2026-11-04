@@ -2564,6 +2564,8 @@ static void collectUniqueKeys(const std::vector<std::vector<DBKeyType> > &thread
 static const size_t PUBLISH_BYTES = 4 * 1024 * 1024;
 static const time_t PUBLISH_SECONDS = 1;
 static const time_t READ_SECONDS = 1;
+// the nodes publish and read the changes right after the turn of a second, before the master step that answers them; a batch start reads them this often to see it soon
+static const double BATCH_READ_SECONDS = PUBLISH_SECONDS / 4.0;
 // batches per thread of the records aligned at once, taken in rep order
 static const size_t ALIGN_BATCHES_PER_THREAD = 64;
 static const int CLUSTER_THREADS = 4;
@@ -3304,6 +3306,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t publishedBytes = 0;
     time_t publishTime = time(NULL);
     time_t changesTime = publishTime;
+    Timer changesTimer;
+    double batchReadSeconds = 0;
     std::mutex acceptedMutex;
     std::mutex publishMutex;
     std::mutex assignedChangesMutex;
@@ -3970,6 +3974,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #pragma omp for schedule(dynamic, 1)
             for (size_t batch = 0; batch < batchCount; batch++) {
                 Timer batchTimer;
+                {
+                    std::unique_lock<std::mutex> changesLock(assignedChangesMutex, std::try_to_lock);
+                    if (changesLock.owns_lock() && changesTimer.getTimediff() - batchReadSeconds >= BATCH_READ_SECONDS) {
+                        readAssignedChanges(false);
+                        batchReadSeconds = changesTimer.getTimediff();
+                    }
+                }
                 pairs.clear();
                 for (size_t i = batchOffsets[batch]; i < batchOffsets[batch + 1]; i++) {
                     const RepTargetsRecord &record = records[i];
