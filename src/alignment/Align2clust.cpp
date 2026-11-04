@@ -4585,7 +4585,17 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     std::vector<uint64_t> changes;
     std::vector<uint64_t> writtenChanges;
     std::thread changesWriter;
+    std::atomic<bool> isWritingChanges(false);
     std::vector<size_t> threadKeyOffsets(threads + 1, 0);
+    const auto writeChanges = [&](size_t clusteredKey) {
+        if (fwrite(writtenChanges.data(), sizeof(uint64_t), writtenChanges.size(), changesHandle) != writtenChanges.size()) {
+            Debug(Debug::ERROR) << "Cannot write " << assignedChanges << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        changesBytes += writtenChanges.size() * sizeof(uint64_t);
+        MMseqsNode::publishLog(changesHandle, assignedChanges, clusteredKey, changesBytes);
+        isWritingChanges = false;
+    };
     std::vector<std::vector<size_t> > sliceNodeOffsets(threads, std::vector<size_t>(MMseqsNode::count));
     size_t memberCount = 0;
     // --cluster-mode 0: the open sets in a heap as in clusterThreadFuncSetcover, the sets of two as pairs
@@ -4619,7 +4629,15 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     double waitSeconds = 0;
     double mergeSeconds = 0;
     double decisionSeconds = 0;
-    double publishSeconds = 0;
+    double placingSeconds = 0;
+    double logReadSeconds = 0;
+    double tailEraseSeconds = 0;
+    size_t tailMovedWords = 0;
+    size_t freePairs = 0;
+    size_t sharingRepPairs = 0;
+    double takenWriteSeconds = 0;
+    size_t peakChangeBytes = 0;
+    size_t stepCount = 0;
     size_t peakSetCoverStateBytes = 0;
     size_t peakSetCoverLiveMembers = 0;
     size_t peakSetCoverCandidates = 0;
@@ -4628,6 +4646,17 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     unsigned int polls = 0;
     MMseqsNode::WaitWarning waitWarning;
     for (size_t clusteredKey = 0; clusteredKey < orderKeyEnd;) {
+        // the steps decided while the writer is busy are written and published together, waiting for it once they reach stepWords
+        if (changes.empty() == false && (isWritingChanges == false || changes.size() >= stepWords)) {
+            if (changesWriter.joinable()) {
+                changesWriter.join();
+            }
+            peakChangeBytes = std::max(peakChangeBytes, changes.size() * sizeof(uint64_t));
+            changes.swap(writtenChanges);
+            changes.clear();
+            isWritingChanges = true;
+            changesWriter = std::thread(writeChanges, clusteredKey);
+        }
         Timer pollTimer;
         bool hasNewProgress = false;
 #pragma omp parallel for schedule(dynamic, 1) reduction(||:hasNewProgress)
@@ -4681,7 +4710,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         }
 
         // read every log up to doneRepKey after its tail, the logs at once; past nodeStepWords a log ends before its next rep, but the rep of clusteredKey is read whole
-#pragma omp parallel for schedule(dynamic, 1) reduction(+:logReadBytes)
+#pragma omp parallel for schedule(dynamic, 1) reduction(+:logReadBytes, logReadSeconds)
         for (size_t node = 0; node < MMseqsNode::count; node++) {
             std::vector<uint64_t> &nodeWords = nodeTails[node];
             std::vector<size_t> &repStarts = nodeRepStarts[node];
@@ -4710,7 +4739,9 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                     }
                     const size_t to = std::min(nodeLogBytes[node], from + partBytes);
                     nodeWords.resize(word + (to - from) / sizeof(uint64_t));
+                    Timer readTimer;
                     MMseqsNode::readLog(log, from, to, reinterpret_cast<char *>(nodeWords.data() + word));
+                    logReadSeconds += readTimer.getTimediff();
                     logReadBytes += to - from;
                     from = to;
                 }
@@ -4738,11 +4769,14 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             stepWordCount += nodeTakenCounts[node];
         }
         logWords.resize(stepWordCount);
-#pragma omp parallel for schedule(dynamic, 1)
+#pragma omp parallel for schedule(dynamic, 1) reduction(+:tailEraseSeconds, tailMovedWords)
         for (size_t node = 0; node < MMseqsNode::count; node++) {
             std::vector<uint64_t> &nodeWords = nodeTails[node];
             std::copy(nodeWords.begin(), nodeWords.begin() + nodeTakenCounts[node], logWords.begin() + nodeWordOffsets[node]);
+            Timer eraseTimer;
+            tailMovedWords += nodeWords.size() - nodeTakenCounts[node];
             nodeWords.erase(nodeWords.begin(), nodeWords.begin() + nodeTakenCounts[node]);
+            tailEraseSeconds += eraseTimer.getTimediff();
             std::vector<size_t> &repStarts = nodeRepStarts[node];
             for (size_t rep = 0; rep < repStarts.size(); rep++) {
                 repStarts[rep] += nodeWordOffsets[node];
@@ -4801,7 +4835,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         // a pair with an assigned rep or member stays out, as bits are never cleared
         pairIsFree.resize(logWords.size());
         repKeyOffsets.assign(repCount + 1, 0);
-#pragma omp parallel for schedule(dynamic, 1024)
+#pragma omp parallel for schedule(dynamic, 1024) reduction(+:freePairs)
         for (size_t rep = 0; rep < repCount; rep++) {
             const bool repIsFree = isAssigned(reps[rep].repKey % paddedDbSize) == false;
             size_t freeCount = 0;
@@ -4810,6 +4844,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                 freeCount += pairIsFree[i];
             }
             repKeyOffsets[rep + 1] = (freeCount > 0) ? freeCount + 1 : 0;
+            freePairs += freeCount;
         }
         if (repCount > 16384 && threads > 1) {
             sumOffsets(repKeyOffsets.data(), repCount, threads);
@@ -4986,6 +5021,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             for (size_t rep = 0; rep < repCount; rep++) {
                 if (repKeyOffsets[rep + 1] != repKeyOffsets[rep] && repSharesKey[rep] != 0) {
                     sharingReps.push_back(rep);
+                    sharingRepPairs += reps[rep].end - reps[rep].begin;
                 }
             }
             for (size_t sharingRep = 0; sharingRep < sharingReps.size(); sharingRep++) {
@@ -5015,6 +5051,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                     }
                 }
             }
+            Timer takenTimer;
             for (size_t node = 0; node < MMseqsNode::count; node++) {
                 TakenLog &nodeFile = nodeTaken[node];
                 words.clear();
@@ -5036,8 +5073,10 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                 }
                 nodeFile.bytes += words.size() * sizeof(uint64_t);
             }
+            takenWriteSeconds += takenTimer.getTimediff();
         }
         decisionSeconds += stepTimer.getTimediff();
+        stepCount++;
         stepTimer.reset();
         clusteredKey = stepRepKey;
 
@@ -5047,6 +5086,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         }
         const size_t stepKeys = threadKeyOffsets[threads];
         const size_t headerWords = 2 * MMseqsNode::count + 2;
+        const size_t stepStart = changes.size();
         for (int pass = 0; pass < 2; pass++) {
 #pragma omp parallel for schedule(static)
             for (int slice = 0; slice < threads; slice++) {
@@ -5074,23 +5114,23 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                 }
             }
             if (pass == 0) {
-                changes.resize(headerWords);
-                changes[0] = clusteredKey;
+                changes.resize(stepStart + headerWords);
+                changes[stepStart] = clusteredKey;
                 size_t nodeKeyOffset = 0;
                 for (size_t node = 0; node < MMseqsNode::count; node++) {
-                    changes[1 + node] = nodeReadBytes[node];
-                    changes[1 + MMseqsNode::count + node] = nodeKeyOffset;
+                    changes[stepStart + 1 + node] = nodeReadBytes[node];
+                    changes[stepStart + 1 + MMseqsNode::count + node] = nodeKeyOffset;
                     for (int slice = 0; slice < threads; slice++) {
                         const size_t count = sliceNodeOffsets[slice][node];
-                        sliceNodeOffsets[slice][node] = headerWords + nodeKeyOffset;
+                        sliceNodeOffsets[slice][node] = stepStart + headerWords + nodeKeyOffset;
                         nodeKeyOffset += count;
                     }
                     nodeKeyOffset += nodeGroupRangeKeys[node].size();
                 }
-                changes[1 + 2 * MMseqsNode::count] = nodeKeyOffset;
-                changes.resize(headerWords + nodeKeyOffset);
+                changes[stepStart + 1 + 2 * MMseqsNode::count] = nodeKeyOffset;
+                changes.resize(stepStart + headerWords + nodeKeyOffset);
                 for (size_t node = 0; node < MMseqsNode::count; node++) {
-                    std::copy(nodeGroupRangeKeys[node].begin(), nodeGroupRangeKeys[node].end(), changes.begin() + headerWords + changes[2 + MMseqsNode::count + node] - nodeGroupRangeKeys[node].size());
+                    std::copy(nodeGroupRangeKeys[node].begin(), nodeGroupRangeKeys[node].end(), changes.begin() + stepStart + headerWords + changes[stepStart + 2 + MMseqsNode::count + node] - nodeGroupRangeKeys[node].size());
                     nodeGroupRangeKeys[node].clear();
                 }
             }
@@ -5098,30 +5138,30 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         for (int thread = 0; thread < threads; thread++) {
             threadAssignedKeys[thread].clear();
         }
-        // the next step is decided while this one is written; the steps are published in order, each once it is synced
-        if (changesWriter.joinable()) {
-            changesWriter.join();
-        }
-        changes.swap(writtenChanges);
-        changesWriter = std::thread([&, clusteredKey]() {
-            if (fwrite(writtenChanges.data(), sizeof(uint64_t), writtenChanges.size(), changesHandle) != writtenChanges.size()) {
-                Debug(Debug::ERROR) << "Cannot write " << assignedChanges << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            changesBytes += writtenChanges.size() * sizeof(uint64_t);
-            MMseqsNode::publishLog(changesHandle, assignedChanges, clusteredKey, changesBytes);
-        });
-        publishSeconds += stepTimer.getTimediff();
+        placingSeconds += stepTimer.getTimediff();
         waitWarning.reset();
     }
     if (changesWriter.joinable()) {
         changesWriter.join();
     }
+    if (changes.empty() == false) {
+        peakChangeBytes = std::max(peakChangeBytes, changes.size() * sizeof(uint64_t));
+        changes.swap(writtenChanges);
+        writeChanges(orderKeyEnd);
+    }
     MMseqsNode::addPhaseSeconds(phaseValues, "clustering the accepted pairs", clusterTimer.getTimediff() - waitSeconds);
     MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the aligning nodes", waitSeconds);
     MMseqsNode::addPhaseSeconds(phaseValues, "merging accepted logs", mergeSeconds);
     MMseqsNode::addPhaseSeconds(phaseValues, "deciding accepted pairs", decisionSeconds);
-    MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the assigned changes writer", publishSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "placing the assigned changes", placingSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "cumulative accepted log read time", logReadSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "cumulative accepted log tail erase time", tailEraseSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "writing the taken bits", takenWriteSeconds);
+    MMseqsNode::addPhaseValue(phaseValues, "Clustering steps", SSTR(stepCount));
+    MMseqsNode::addPhaseValue(phaseValues, "Accepted log tail words moved", SSTR(tailMovedWords));
+    MMseqsNode::addPhaseValue(phaseValues, "Free pairs", SSTR(freePairs));
+    MMseqsNode::addPhaseValue(phaseValues, "Pairs of sharing reps", SSTR(sharingRepPairs));
+    MMseqsNode::addPhaseValue(phaseValues, "Peak assigned change bytes", SSTR(peakChangeBytes));
     MMseqsNode::addPhaseValue(phaseValues, "Clustered pairs", SSTR(clusteredPairs));
     MMseqsNode::addPhaseValue(phaseValues, "Accepted log bytes read", SSTR(logReadBytes));
     if (mode == Parameters::SET_COVER) {
