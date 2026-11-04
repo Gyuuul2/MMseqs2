@@ -344,6 +344,11 @@ bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
     EXIT(EXIT_FAILURE);
 }
 
+void MMseqsNode::removeLog(const std::string &log) {
+    FileUtil::remove(log.c_str());
+    FileUtil::remove((log + ".progress").c_str());
+}
+
 static uint64_t exchangeSliceMagic();
 
 void MMseqsNode::publishExchangeFlush(FILE *file, const std::string &fileName, size_t bytes, const std::string &indexFile, const std::vector<uint64_t> &line) {

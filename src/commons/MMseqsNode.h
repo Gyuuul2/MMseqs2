@@ -77,6 +77,7 @@ public:
     static void waitForLog(const std::string &log, size_t &key, size_t &bytes);
     // without wait, returns false at once instead of polling until the bytes are readable
     static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true);
+    static void removeLog(const std::string &log);
     // closes file, a flush of bytes that only this node writes, then appends line with its last word set to this run's magic to indexFile
     static void publishExchangeFlush(FILE *file, const std::string &fileName, size_t bytes, const std::string &indexFile, const std::vector<uint64_t> &line);
     // reads the lines flush, flush + 1, ... of lineWords words of indexFile that fit lines from a new open; the number of this run's lines there in a row
