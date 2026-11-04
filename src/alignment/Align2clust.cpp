@@ -2519,13 +2519,12 @@ struct RepTargetsRecord {
     }
 };
 
-// the master only clusters from this many nodes on, below that it aligns too, as its machine would idle
-static const size_t CLUSTER_ONLY_NODES = 16;
 // group ranges per aligning node
 static const size_t GROUP_RANGES_PER_NODE = 64;
 
+// the master only clusters while other nodes align
 static size_t getFirstAlignNode() {
-    return (MMseqsNode::count >= CLUSTER_ONLY_NODES) ? 1 : 0;
+    return (MMseqsNode::count > 1) ? 1 : 0;
 }
 
 // the blocks of the sequences go to the aligning nodes in turn, which serve their keys to the others
@@ -5244,8 +5243,8 @@ static int align2clustLinfinity(Parameters &par) {
     // an aligning node keeps the pages of the blocks that it serves and of its group ranges, about twice its share of the pages if the nodes are about as fast
     const size_t assignedPageCount = (MMseqsNode::rank >= getFirstAlignNode()) ? std::min(pageCount, 2 * ((pageCount + alignNodes - 1) / alignNodes)) : 0;
     const size_t assignedMemory = assignedPageCount * (ASSIGNED_PAGE_KEYS / 8) + ((assignedPageCount > 0) ? pageCount * sizeof(uint64_t *) : 0) + pageNodes.size() * sizeof(unsigned int);
-    const size_t memoryLimit = nodeMemoryLimit - std::min(nodeMemoryLimit, ((masterAligns && MMseqsNode::isMaster()) ? std::min(masterMemoryLimit, masterMemory) : 0) + assignedMemory);
-    const int clusterThreads = masterAligns ? std::min(par.threads, static_cast<int>(CLUSTER_THREADS * MMseqsNode::count)) : par.threads;
+    const size_t memoryLimit = nodeMemoryLimit - std::min(nodeMemoryLimit, (masterAligns ? std::min(masterMemoryLimit, masterMemory) : 0) + assignedMemory);
+    const int clusterThreads = masterAligns ? std::min(par.threads, CLUSTER_THREADS) : par.threads;
 
     // a clusthashfast subset has bits; its sixth index column counts the representatives for the e-values
     const bool hasRepresentativeBits = FileUtil::fileExists((par.db1 + ".bits." + SSTR(MMseqsNode::rank)).c_str());
