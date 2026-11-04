@@ -3312,6 +3312,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::mutex publishMutex;
     std::mutex assignedChangesMutex;
     std::vector<size_t> batchOffsets;
+    std::vector<unsigned int> batchFirstTargets;
     std::vector<size_t> recordCosts;
     std::vector<unsigned char> batchDone;
     std::vector<std::vector<ClusterPair> > batchPairs;
@@ -3927,8 +3928,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         const size_t nextRepKey = getFirstRepKey(nextWindow);
         const std::vector<RepTargetsRecord> &records = chunkRecords[window.chunk];
         const size_t recordCount = window.end - window.begin;
-        // batches of about the same rep length times targets, so the longest reps do not fall into one batch
-        const size_t maxBatches = std::min(recordCount, par.threads * ALIGN_BATCHES_PER_THREAD);
+        // batches of about the same cost; batch b starts at target batchFirstTargets[b] of record batchOffsets[b], so a rep that costs more than a batch goes to several
+        const size_t maxBatches = par.threads * ALIGN_BATCHES_PER_THREAD;
         // a record costs its rep length times its target lengths, like a partition
         recordCosts.resize(recordCount);
 #pragma omp parallel for schedule(dynamic, 100)
@@ -3947,14 +3948,31 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             windowCost += recordCosts[i];
         }
         batchOffsets.assign(1, window.begin);
+        batchFirstTargets.assign(1, 0);
         uint128 cost = 0;
-        for (size_t i = window.begin; i + 1 < window.end; i++) {
-            cost += recordCosts[i - window.begin];
-            if (cost * maxBatches >= windowCost * batchOffsets.size()) {
+        for (size_t i = window.begin; i < window.end; i++) {
+            const uint128 recordEndCost = cost + recordCosts[i - window.begin];
+            if (recordEndCost * maxBatches > windowCost * batchOffsets.size()) {
+                const RepTargetsRecord &record = records[i];
+                const DBKeyType *targets = chunkTargets[window.chunk].data() + record.targetOffset;
+                const size_t repLength = seqDbr.getSeqLen(record.repFirstTarget.repKey % paddedDbSize);
+                size_t targetRange = SIZE_MAX;
+                for (unsigned int j = 0; j + 1 < record.targetCount && recordEndCost * maxBatches > windowCost * batchOffsets.size(); j++) {
+                    cost += repLength * seqDbr.getSeqLenFromRange(targetRange, targets[j]);
+                    if (cost * maxBatches >= windowCost * batchOffsets.size()) {
+                        batchOffsets.push_back(i);
+                        batchFirstTargets.push_back(j + 1);
+                    }
+                }
+            }
+            cost = recordEndCost;
+            if (i + 1 < window.end && cost * maxBatches >= windowCost * batchOffsets.size()) {
                 batchOffsets.push_back(i + 1);
+                batchFirstTargets.push_back(0);
             }
         }
         batchOffsets.push_back(window.end);
+        batchFirstTargets.push_back(0);
         const size_t batchCount = batchOffsets.size() - 1;
         repBatchCount += batchCount;
         batchDone.assign(batchCount, 0);
@@ -3982,8 +4000,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                 }
                 pairs.clear();
-                for (size_t i = batchOffsets[batch]; i < batchOffsets[batch + 1]; i++) {
+                for (size_t i = batchOffsets[batch]; i < batchOffsets[batch + 1] + (batchFirstTargets[batch + 1] > 0); i++) {
                     const RepTargetsRecord &record = records[i];
+                    const unsigned int endTarget = (i == batchOffsets[batch + 1]) ? batchFirstTargets[batch + 1] : record.targetCount;
                     const size_t repKey = record.repFirstTarget.repKey % paddedDbSize;
                     const char *repData = getWindowData(window, repKey);
                     if (isAssigned(record.repFirstTarget.repKey) || repData == NULL) {
@@ -3994,7 +4013,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     bool blockAlignerInitialized = false;
                     swipe.startRep(record.repFirstTarget.repKey);
                     const DBKeyType *targets = chunkTargets[window.chunk].data() + record.targetOffset;
-                    for (unsigned int j = 0; j < record.targetCount && isAssigned(record.repFirstTarget.repKey) == false; j++) {
+                    for (unsigned int j = (i == batchOffsets[batch]) ? batchFirstTargets[batch] : 0; j < endTarget && isAssigned(record.repFirstTarget.repKey) == false; j++) {
                         const DBKeyType targetKey = targets[j];
                         const char *targetData = getWindowData(window, targetKey);
                         if (isAssigned(targetKey) || targetData == NULL) {
