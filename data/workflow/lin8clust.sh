@@ -4,7 +4,7 @@ fail() {
     exit 1
 }
 
-# true if none of the files exists
+# true if none of the files exists; an output removed once a later step consumed it counts as present, so the later step's outputs are checked too
 notExists() {
     for FILE in "$@"; do
         [ -f "$FILE" ] && return 1

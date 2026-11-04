@@ -20,8 +20,6 @@ public:
 
     // score1, qEndPos1, dbEndPos1 and word of every target, starting with 8 bit lanes if word is 0 and 16 bit if 1; word 2 if 16 bit saturates
     void alignForward(size_t count, const unsigned char *const *targets, const int *targetLengths, s_align *aligns);
-    // qStartPos1 and dbStartPos1 from the forward results of alignForward
-    void alignBackward(size_t count, const unsigned char *const *targets, s_align *aligns);
 
     // banded around diagonals (target - query position) with backtrace; a band grows while its score is below minScores
     void alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals,
@@ -38,15 +36,12 @@ private:
         int columnEnd;
     };
 
-    template <typename T, bool Reverse>
+    template <typename T>
     void alignFull(const std::vector<size_t> &jobs, const unsigned char *const *targets, const int *targetLengths, s_align *aligns);
 
     template <typename T>
     void alignBand(const BandJob *jobs, size_t jobCount, const unsigned char *const *targets, const int *targetLengths,
-                   int *bests, int *rows, int *columns, int *firstRows, int *firstColumns, std::string *backtraces, uint32_t *ids);
-
-    void runBanded(std::vector<BandJob> &jobs, const unsigned char *const *targets, const int *targetLengths,
-                   s_align *aligns, std::string *backtraces, const int *minScores);
+                   s_align *aligns, std::string *backtraces);
 
     BaseMatrix *subMat;
     int alphabetSize;
@@ -57,9 +52,7 @@ private:
 
     int queryLength;
     std::vector<unsigned char> query;
-    std::vector<unsigned char> queryRev;
     std::vector<int8_t> bias;
-    std::vector<int8_t> biasRev;
     float *tmpBias;
 
     // per query letter, the scores of the target letters 0-15 and 16-31 for 8 bit lanes and biased by 64 for 16 bit lanes
@@ -71,15 +64,11 @@ private:
     size_t capacity;
     simd_int *rowBias8;
     simd_int *rowBias16;
-    simd_int *rowBiasRev8;
-    simd_int *rowBiasRev16;
     // 64 - composition bias of the query rows, subtracted with saturation from the 16 bit scores biased by 64
     simd_int *rowSub16;
-    simd_int *rowSubRev16;
     simd_int *rowIndex;
     simd_int *hColumn;
     simd_int *eColumn;
-    simd_int *rowMask;
     // the lane scores of each query letter for the columns of a pass
     simd_int *columnScores;
     simd_int *ring;
@@ -92,12 +81,6 @@ private:
 
     std::vector<size_t> jobBuffer;
     std::vector<BandJob> bandJobs;
-    std::vector<int> bestScores;
-    std::vector<int> bestRows;
-    std::vector<int> bestColumns;
-    std::vector<int> startRows;
-    std::vector<int> startColumns;
-    std::vector<uint32_t> identities;
 
     void resize(size_t length);
 };

@@ -1252,6 +1252,15 @@ static void sortKmerGroup(KmerPosition<T, includeAdjacency, L> *groupStart, Kmer
     SORT_SERIAL(groupStart, groupEnd, KmerPosition<T, includeAdjacency, L>::compareKmerAndAdjKeyAndSeqLenAndIdAndPos);
 }
 
+struct KmerGroupRepSeq {
+    DBKeyType repSeqId;
+    size_t groupStart;
+
+    static bool compareRepSequence(const KmerGroupRepSeq &first, const KmerGroupRepSeq &second) {
+        return first.repSeqId < second.repSeqId;
+    }
+};
+
 template <typename KmerPositionType>
 static size_t assignGroupWithoutDiagonal(KmerPositionType *hashSeqPair, int maxRepSeqs, int threads, std::vector<size_t> &threadOffsets,
                                          KmerGroupRepSeq *groupRepSeqs) {

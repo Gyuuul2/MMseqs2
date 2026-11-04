@@ -279,10 +279,6 @@ template <typename T> bool DBReader<T>::open(int accessType){
                 index[i].offset = isHeader ? 0 : Util::fast_atoi<size_t>(cols[1]);
                 index[i].length = isHeader ? 0 : Util::fast_atoi<size_t>(cols[2]);
                 const size_t count = Util::fast_atoi<size_t>(cols[isHeader ? 1 : 3]);
-                if (size + count > DB_KEY_INVALID) {
-                    Debug(Debug::ERROR) << "Database " << dataFileName << " has more sequences than keys of this build; compile MMseqs2 with -DMMSEQS_INT64_IDS=1\n";
-                    EXIT(EXIT_FAILURE);
-                }
                 index2dbfile[i] = isHeader ? static_cast<unsigned int>(i) : Util::fast_atoi<unsigned int>(cols[4]);
                 if (isHeader) {
                     entryOffsetsFileNames.push_back(std::string(dataFileName) + ".index." + SSTR(i));
@@ -1135,10 +1131,6 @@ template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<
     size_t bytes = 0;
     // entries less than a page apart are read in one request, so the buffer is at most about twice their pages
     for (size_t i = 0; i < keys.size(); i++) {
-        if (keys[i] >= size || (i > 0 && keys[i] <= keys[i - 1])) {
-            Debug(Debug::ERROR) << "loadData: keys are not ascending keys of " << dataFileName << "\n";
-            EXIT(EXIT_FAILURE);
-        }
         const size_t range = findIdRange(keys[i]);
         const size_t begin = index[range].offset + (keys[i] - indexIdToNum(&index[range].id)) * index[range].length;
         const size_t end = begin + index[range].length;

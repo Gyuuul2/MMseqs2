@@ -826,7 +826,7 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
     const size_t bufferSize = std::max(EXCHANGE_BUFFER_SIZE, bufferMemory / 2 / std::max<size_t>(1, blocks.size()));
     // with fewer blocks than threads, the threads share the reads and copies of a block
     const size_t threads = static_cast<size_t>(Parameters::getInstance().threads);
-    const bool isClusterPair = recordSize == ClusterPair::recordSize;
+    const bool isClusterPair = recordSize == NULL;
     std::vector<char> isRead(blocks.size());
     for (size_t i = 0; i < blocks.size(); i++) {
         const ExchangeBlock &block = blocks[i];
@@ -852,7 +852,7 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
                 block.recordEnd += (block.bufferEnd - block.recordEnd) / sizeof(ClusterPair) * sizeof(ClusterPair);
                 block.lastRecord = block.recordEnd - sizeof(ClusterPair);
             }
-            for (size_t size; (size = recordSize(data + block.recordEnd, block.bufferEnd - block.recordEnd)) > 0; block.recordEnd += size) {
+            for (size_t size; isClusterPair == false && (size = recordSize(data + block.recordEnd, block.bufferEnd - block.recordEnd)) > 0; block.recordEnd += size) {
                 block.lastRecord = block.recordEnd;
             }
             if (block.recordEnd > block.bufferPos || getUnreadBytes(block) == 0) {
@@ -931,7 +931,7 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
             size_t pos = blockByteOffsets[i];
             for (size_t record = blockRecordOffsets[i]; record < blockRecordOffsets[i + 1]; record++) {
                 (*recordOffsets)[record] = pos;
-                pos += recordSize(records.data() + pos, blockByteOffsets[i + 1] - pos);
+                pos += isClusterPair ? sizeof(ClusterPair) : recordSize(records.data() + pos, blockByteOffsets[i + 1] - pos);
             }
         }
         block.bufferPos = rangeEnds[i];
@@ -1164,7 +1164,6 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
     std::vector<DBKeyType> repKeys;
     std::vector<size_t> pairOffsets;
     std::vector<char> received;
-    DBKeyType previousReceivedKey = DB_KEY_INVALID;
     const auto clearRepresentativeBit = [&](DBKeyType key) {
         representativeBits[(key - firstKey) / 64] &= ~(1ULL << ((key - firstKey) % 64));
     };
@@ -1188,7 +1187,7 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
         }
         const ClusterPair splitLast = { entryKeys.back(), entryKeys.back() };
         size_t receivedCount;
-        while ((receivedCount = readExchangeRange(receivedBlocks, memoryLimit / RECEIVED_MEMORY_DIVISOR, ClusterPair::recordSize, ClusterPair::compareByMember, splitLast, received, NULL, receivedPrefix)) > 0) {
+        while ((receivedCount = readExchangeRange(receivedBlocks, memoryLimit / RECEIVED_MEMORY_DIVISOR, NULL, ClusterPair::compareByMember, splitLast, received, NULL, receivedPrefix)) > 0) {
             ClusterPair *receivedPairs = reinterpret_cast<ClusterPair *>(received.data());
             SORT_PARALLEL(receivedPairs, receivedPairs + receivedCount, ClusterPair::compareByMember);
 #pragma omp parallel for schedule(static)
@@ -1196,9 +1195,8 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
                 const DBKeyType memberKey = receivedPairs[i].memberKey;
                 const size_t entry = std::lower_bound(entryKeys.begin(), entryKeys.end(), memberKey) - entryKeys.begin();
                 const bool isEntry = entry < entryKeys.size() && entryKeys[entry] == memberKey;
-                // a received member is an entry of this node once, and the entries are in key order
-                if ((isEntry == false && representativeBits == NULL) || memberKey == ((i > 0) ? receivedPairs[i - 1].memberKey : previousReceivedKey)) {
-                    Debug(Debug::ERROR) << "Key " << memberKey << " of " << receivedPrefix << " is no entry of " << clu << "." << rank << " in key order\n";
+                if (isEntry == false && representativeBits == NULL) {
+                    Debug(Debug::ERROR) << "Key " << memberKey << " of " << receivedPrefix << " is no entry of " << clu << "." << rank << "\n";
                     EXIT(EXIT_FAILURE);
                 }
                 if (isEntry) {
@@ -1206,7 +1204,6 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
                     receivedPairs[i].repKey = DB_KEY_INVALID;
                 }
             }
-            previousReceivedKey = receivedPairs[receivedCount - 1].memberKey;
             if (representativeBits != NULL) {
                 sendMembersWithoutEntry(receivedPairs, receivedCount);
             }
@@ -1275,7 +1272,7 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
     });
     const ClusterPair lastPair = { DB_KEY_INVALID, DB_KEY_INVALID };
     size_t receivedCount;
-    while ((receivedCount = readExchangeRange(receivedBlocks, memoryLimit / RECEIVED_MEMORY_DIVISOR, ClusterPair::recordSize, ClusterPair::compareByMember, lastPair, received, NULL, receivedPrefix)) > 0) {
+    while ((receivedCount = readExchangeRange(receivedBlocks, memoryLimit / RECEIVED_MEMORY_DIVISOR, NULL, ClusterPair::compareByMember, lastPair, received, NULL, receivedPrefix)) > 0) {
         if (representativeBits == NULL) {
             Debug(Debug::ERROR) << "Key " << reinterpret_cast<ClusterPair *>(received.data())->memberKey << " of " << receivedPrefix << " is no entry of " << clu << "." << rank << "\n";
             EXIT(EXIT_FAILURE);
@@ -1500,7 +1497,7 @@ size_t MMseqsNode::writeClusterPairs(const std::string &index, const std::string
         size_t nextSingletonKey = splitBegin;
         size_t pairCount;
         do {
-            pairCount = readExchangeRange(repBlocks, memoryLimit / 8, ClusterPair::recordSize, ClusterPair::compareByRep, lastPair, records, NULL, prefix);
+            pairCount = readExchangeRange(repBlocks, memoryLimit / 8, NULL, ClusterPair::compareByRep, lastPair, records, NULL, prefix);
             ClusterPair *pairs = reinterpret_cast<ClusterPair *>(records.data());
             SORT_PARALLEL(pairs, pairs + pairCount, ClusterPair::compareByRep);
             singletons.clear();
@@ -1602,12 +1599,8 @@ void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &l
     printPhaseValues(phaseValues);
     barrier(prefix + ".merged");
     FileUtil::remove((lastExchange + "." + SSTR(rank)).c_str());
-    publishFile(prefix + ".done." + SSTR(rank), runId);
-    if (isMaster()) {
-        gatherRunFiles(prefix + ".done.");
-        for (size_t i = 0; i < exchanges.size(); i++) {
-            FileUtil::remove((exchanges[i] + ".index").c_str());
-        }
-        FileUtil::remove((prefix + ".merged").c_str());
+    for (size_t i = 0; isMaster() && i < exchanges.size(); i++) {
+        FileUtil::remove((exchanges[i] + ".index").c_str());
     }
+    removeOnceRead(prefix + ".merged");
 }

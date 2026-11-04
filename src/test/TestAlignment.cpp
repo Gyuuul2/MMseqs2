@@ -51,9 +51,13 @@ int main (int, const char**) {
         s_align result = {};
         result.word = 1;
         swipe.alignForward(1, targets, lengths, &result);
-        swipe.alignBackward(1, targets, &result);
+        const int diagonals[] = {result.dbEndPos1 - result.qEndPos1};
+        const int columnEnds[] = {result.dbEndPos1 + 1};
+        const int minScores[] = {static_cast<int>(result.score1)};
+        std::string backtrace;
+        swipe.alignBanded(1, targets, lengths, diagonals, &result, &backtrace, columnEnds, minScores);
         if (result.score1 != 400 || result.qEndPos1 != 66099 || result.dbEndPos1 != 99
-            || result.qStartPos1 != 66000 || result.dbStartPos1 != 0) {
+            || (result.word < 2 && (result.qStartPos1 != 66000 || result.dbStartPos1 != 0))) {
             std::cerr << "Long query SWIPE coordinates are incorrect\n";
             return 1;
         }

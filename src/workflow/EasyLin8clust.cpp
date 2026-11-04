@@ -29,6 +29,10 @@ int easylin8clust(int argc, const char **argv, const Command &command) {
 
     setEasyLinclustDefaults(&par);
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_VARIADIC, 0);
+    if (par.PARAM_CREATEDB_MODE.wasSet && par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) {
+        Debug(Debug::WARNING) << "easy-lin8clust clusters --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases only\n";
+        Debug(Debug::WARNING) << "We recompute with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << "\n";
+    }
     setEasyLinclustMustPassAlong(&par);
 
     std::string tmpDir = par.filenames.back();
@@ -39,7 +43,6 @@ int easylin8clust(int argc, const char **argv, const Command &command) {
     tmpDir = FileUtil::createTemporaryDirectory(tmpDir, hash);
     par.filenames.pop_back();
 
-    Debug(Debug::INFO) << "easy-lin8clust runs createdb with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << "\n";
     par.createdbMode = Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH;
 
     CommandCaller cmd;

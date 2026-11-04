@@ -318,7 +318,7 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
             std::vector<const unsigned char *> swipeTargets;
             std::vector<int> swipeLengths;
             std::vector<s_align> swipeAligns;
-            std::vector<long> swipeEntry;
+            std::vector<size_t> swipeEntry;
             std::vector<size_t> swipeIds;
 
             const char* words[10];
@@ -368,26 +368,21 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
                                 EXIT(EXIT_FAILURE);
                             }
                             const bool isIdentity = (queryDbKey == dbKey && (includeIdentity || sameQTDB));
-                            swipeEntry.push_back(-1);
+                            swipeEntry.push_back(SIZE_MAX);
                             if (isIdentity == false && Util::canBeCovered(canCovThr, covMode, static_cast<float>(origQueryLen), static_cast<float>(tdbr->getSeqLen(dbId)))) {
-                                swipeEntry.back() = static_cast<long>(swipeIds.size());
+                                swipeEntry.back() = swipeIds.size();
                                 swipeIds.push_back(dbId);
                             }
                         }
                         const size_t lanes = VECSIZE_INT * 2;
                         const size_t count = swipeIds.size() / lanes * lanes;
                         for (size_t h = 0; h < swipeEntry.size(); h++) {
-                            if (swipeEntry[h] >= static_cast<long>(count)) {
-                                swipeEntry[h] = -1;
+                            if (swipeEntry[h] >= count) {
+                                swipeEntry[h] = SIZE_MAX;
                             }
                         }
                         for (size_t i = 0; i < count; i++) {
-                            char *dbSeqData = tdbr->getData(swipeIds[i], thread_idx);
-                            if (dbSeqData == NULL) {
-                                Debug(Debug::ERROR) << "Sequence " << tdbr->getDbKey(swipeIds[i]) << " is required in the prefiltering, but is not contained in the target sequence database!\nPlease check your database.\n";
-                                EXIT(EXIT_FAILURE);
-                            }
-                            dbSeq.mapSequence(swipeIds[i], tdbr->getDbKey(swipeIds[i]), dbSeqData, tdbr->getSeqLen(swipeIds[i]));
+                            dbSeq.mapSequence(swipeIds[i], tdbr->getDbKey(swipeIds[i]), tdbr->getData(swipeIds[i], thread_idx), tdbr->getSeqLen(swipeIds[i]));
                             swipeOffsets.push_back(swipeSequences.size());
                             swipeSequences.insert(swipeSequences.end(), dbSeq.numSequence, dbSeq.numSequence + dbSeq.L);
                             swipeLengths.push_back(dbSeq.L);
@@ -411,7 +406,7 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
                 size_t hitIdx = 0;
                 while (*data != '\0' && passedNum < maxAccept && rejected < maxReject) {
                     const s_align *forward = NULL;
-                    if (swipe != NULL && swipeEntry[hitIdx] >= 0 && swipeAligns[swipeEntry[hitIdx]].word < 2) {
+                    if (swipe != NULL && swipeEntry[hitIdx] != SIZE_MAX && swipeAligns[swipeEntry[hitIdx]].word < 2) {
                         forward = &swipeAligns[swipeEntry[hitIdx]];
                     }
                     hitIdx++;
@@ -448,7 +443,7 @@ void Alignment::run(const std::string &outDB, const std::string &outDBIndex, con
                     // calculate Smith-Waterman alignment
 
                     Matcher::result_t res = matcher.getSWResult(&dbSeq, static_cast<int>(diagonal), isReverse, covMode, covThr, evalThr, swMode, seqIdMode, isIdentity,
-                                                                 wrappedScoring, forward, false, forward != NULL);
+                                                                 wrappedScoring, forward);
                     alignmentsNum++;
 
                     if (isIdentity) {

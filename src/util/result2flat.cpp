@@ -205,7 +205,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
     }
 
     if (fclose(fastaFP) != 0) {
-        Debug(Debug::ERROR) << "Cannot close file " << par.db4 << "\n";
+        Debug(Debug::ERROR) << "Cannot close file " << fastaFile << "\n";
         EXIT(EXIT_FAILURE);
     }
     if (isLinfinity) {

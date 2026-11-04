@@ -238,15 +238,6 @@ struct __attribute__((__packed__)) KmerPosition {
     }
 };
 
-struct KmerGroupRepSeq {
-    DBKeyType repSeqId;
-    size_t groupStart;
-
-    static bool compareRepSequence(const KmerGroupRepSeq &first, const KmerGroupRepSeq &second) {
-        return first.repSeqId < second.repSeqId;
-    }
-};
-
 struct __attribute__((__packed__)) KmerEntry {
     DBKeyType seqId;
     short diagonal;

@@ -6,6 +6,9 @@
 
 #include <string>
 
+#define ZSTD_STATIC_LINKING_ONLY // ZSTD_MAGIC_SKIPPABLE_START
+#include <zstd.h>
+
 class KSeqWrapper {
 public:
     struct KSeqEntry {
@@ -87,8 +90,6 @@ public:
 private:
     kseq_buffer_t d;
 };
-
-#include <zstd.h>
 
 class KSeqZstd : public KSeqWrapper {
 public:

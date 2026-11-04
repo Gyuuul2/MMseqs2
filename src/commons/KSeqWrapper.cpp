@@ -1,4 +1,3 @@
-#define ZSTD_STATIC_LINKING_ONLY
 #include "KSeqWrapper.h"
 #include "kseq.h"
 #include "FileUtil.h"

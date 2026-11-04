@@ -130,8 +130,7 @@ static void appendAlignmentResult(std::string &alnResultBuffer, char *lineBuffer
 // Compact setCoverMemberPool in place when over a quarter is dead. (member count, rep) orders the candidates strictly, so the rebuilt heap pops as before.
 static const size_t ALIGN2CLUST_MIN_COMPACTION_DEAD_MEMBERS = 16 * 1024 * 1024 / sizeof(DBLocalId);
 
-template <typename T>
-static void compactSetCoverMemberPool(std::vector<SetCoverCandidate> &candidates, std::vector<T> &memberPool, size_t liveMemberCount) {
+static void compactSetCoverMemberPool(std::vector<SetCoverCandidate> &candidates, std::vector<DBLocalId> &memberPool, size_t liveMemberCount) {
     const size_t deadMemberCount = memberPool.size() - liveMemberCount;
     if (memberPool.empty() ||
         deadMemberCount < ALIGN2CLUST_MIN_COMPACTION_DEAD_MEMBERS ||
@@ -153,15 +152,94 @@ static void compactSetCoverMemberPool(std::vector<SetCoverCandidate> &candidates
 
 static const size_t PREFETCH_DISTANCE = 16;
 
+// the sorted runs of a spool file of records of recordSize elements; merge takes the records largest first by less, with a read buffer per run
+template <typename T>
+class SetCoverSpoolRuns {
+public:
+    SetCoverSpoolRuns() : writtenRecords(0) {}
+
+    void add(size_t records) {
+        Run run = { writtenRecords, writtenRecords + records, 0, std::vector<T>() };
+        runs.push_back(run);
+        writtenRecords += records;
+    }
+    bool empty() const { return runs.empty(); }
+    size_t records() const { return writtenRecords; }
+
+    // reads and removes the file; returns the bytes read
+    template <typename Less, typename Prefetch, typename Take>
+    size_t merge(const std::string &fileName, size_t recordSize, size_t readBytes, Less less, Prefetch prefetch, Take take) {
+        FILE *reader = FileUtil::openFileOrDie(fileName.c_str(), "rb", true);
+        const size_t chunkRecords = std::max<size_t>(1, readBytes / (recordSize * sizeof(T)) / runs.size());
+        const auto headLess = [&](const Head &first, const Head &second) { return less(first.record, second.record); };
+        std::priority_queue<Head, std::vector<Head>, decltype(headLess)> heads(headLess);
+        size_t bytesRead = 0;
+        for (size_t run = 0; run < runs.size(); run++) {
+            if (current(runs[run], fileno(reader), fileName, recordSize, chunkRecords, bytesRead)) {
+                heads.push(Head{ runs[run].buffer.data(), run });
+            }
+        }
+        while (heads.empty() == false) {
+            const Head head = heads.top();
+            heads.pop();
+            Run &run = runs[head.run];
+            if ((run.bufferPosition + PREFETCH_DISTANCE) * recordSize < run.buffer.size()) {
+                prefetch(run.buffer.data() + (run.bufferPosition + PREFETCH_DISTANCE) * recordSize);
+            }
+            take(head.record);
+            run.bufferPosition++;
+            if (current(run, fileno(reader), fileName, recordSize, chunkRecords, bytesRead)) {
+                heads.push(Head{ run.buffer.data() + run.bufferPosition * recordSize, head.run });
+            }
+        }
+        if (fclose(reader) != 0) {
+            Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        FileUtil::remove(fileName.c_str());
+        std::vector<Run>().swap(runs);
+        return bytesRead;
+    }
+
+private:
+    struct Run {
+        size_t next;
+        size_t end;
+        size_t bufferPosition;
+        std::vector<T> buffer;
+    };
+    struct Head {
+        const T *record;
+        size_t run;
+    };
+
+    static bool current(Run &run, int fd, const std::string &fileName, size_t recordSize, size_t chunkRecords, size_t &bytesRead) {
+        if (run.bufferPosition * recordSize == run.buffer.size()) {
+            if (run.next == run.end) {
+                return false;
+            }
+            const size_t records = std::min(chunkRecords, run.end - run.next);
+            run.buffer.resize(records * recordSize);
+            const size_t bytes = run.buffer.size() * sizeof(T);
+            FileUtil::preadAll(fd, fileName.c_str(), reinterpret_cast<char *>(run.buffer.data()), bytes, run.next * recordSize * sizeof(T));
+            bytesRead += bytes;
+            run.next += records;
+            run.bufferPosition = 0;
+        }
+        return true;
+    }
+
+    size_t writtenRecords;
+    std::vector<Run> runs;
+};
+
 class SetCoverPairSpool {
 public:
     SetCoverPairSpool(std::vector<ClusterPair> &pairs, const std::string &fileName, size_t maxPairs, size_t memoryLimit, const uint64_t *assigned)
-        : pairs(pairs), fileName(fileName), maxPairs(std::max<size_t>(1, maxPairs)), memoryLimit(memoryLimit), assigned(assigned), file(NULL), writtenPairs(0),
-          oversizedBatches(0), demotedPairs(0) {}
+        : pairs(pairs), fileName(fileName), maxPairs(std::max<size_t>(1, maxPairs)), memoryLimit(memoryLimit), assigned(assigned), file(NULL) {}
 
     bool prepareBatch(size_t count) {
         if (count > maxPairs) {
-            oversizedBatches++;
             flush();
             return false;
         }
@@ -176,11 +254,6 @@ public:
             flush();
         }
         pairs.push_back(pair);
-    }
-
-    void pushDemoted(const ClusterPair &pair) {
-        demotedPairs++;
-        push(pair);
     }
 
     template <typename TakePair>
@@ -201,57 +274,15 @@ public:
             EXIT(EXIT_FAILURE);
         }
         file = NULL;
-        FILE *reader = FileUtil::openFileOrDie(fileName.c_str(), "rb", true);
-        const size_t readBytes = std::min<size_t>(memoryLimit / 64, 4ULL * 1024 * 1024 * 1024);
-        const size_t chunkPairs = std::max<size_t>(1, readBytes / sizeof(ClusterPair) / runs.size());
-        std::priority_queue<Head, std::vector<Head>, HeadLess> heads;
-        for (size_t run = 0; run < runs.size(); run++) {
-            ClusterPair pair;
-            if (nextPair(run, fileno(reader), chunkPairs, pair)) {
-                heads.push(Head{ pair, run });
-            }
-        }
-        while (heads.empty() == false) {
-            const Head head = heads.top();
-            heads.pop();
-            const Run &run = runs[head.run];
-            if (run.bufferPosition + PREFETCH_DISTANCE < run.buffer.size()) {
-                prefetchPair(run.buffer[run.bufferPosition + PREFETCH_DISTANCE]);
-            }
-            takePair(head.pair);
-            ClusterPair pair;
-            if (nextPair(head.run, fileno(reader), chunkPairs, pair)) {
-                heads.push(Head{ pair, head.run });
-            }
-        }
-        if (fclose(reader) != 0) {
-            Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        FileUtil::remove(fileName.c_str());
+        runs.merge(fileName, 1, std::min<size_t>(memoryLimit / 64, 4ULL * 1024 * 1024 * 1024),
+                   [](const ClusterPair *first, const ClusterPair *second) { return ClusterPair::compareByRep(*first, *second); },
+                   [&](const ClusterPair *pair) { prefetchPair(*pair); },
+                   [&](const ClusterPair *pair) { takePair(*pair); });
     }
 
-    size_t runCount() const { return runs.size(); }
-    size_t writtenBytes() const { return writtenPairs * sizeof(ClusterPair); }
-    size_t oversizedBatchCount() const { return oversizedBatches; }
-    size_t demotedPairCount() const { return demotedPairs; }
+    size_t writtenBytes() const { return runs.records() * sizeof(ClusterPair); }
 
 private:
-    struct Run {
-        size_t next;
-        size_t end;
-        size_t bufferPosition;
-        std::vector<ClusterPair> buffer;
-    };
-    struct Head {
-        ClusterPair pair;
-        size_t run;
-    };
-    struct HeadLess {
-        bool operator()(const Head &first, const Head &second) const {
-            return ClusterPair::compareByRep(first.pair, second.pair);
-        }
-    };
     static bool compareDescending(const ClusterPair &first, const ClusterPair &second) {
         return ClusterPair::compareByRep(second, first);
     }
@@ -281,27 +312,8 @@ private:
             Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
             EXIT(EXIT_FAILURE);
         }
-        Run run = { writtenPairs, writtenPairs + pairs.size(), 0, std::vector<ClusterPair>() };
-        runs.push_back(run);
-        writtenPairs += pairs.size();
+        runs.add(pairs.size());
         pairs.clear();
-    }
-
-    bool nextPair(size_t runIndex, int fd, size_t chunkPairs, ClusterPair &pair) {
-        Run &run = runs[runIndex];
-        if (run.bufferPosition == run.buffer.size()) {
-            if (run.next == run.end) {
-                return false;
-            }
-            const size_t count = std::min(chunkPairs, run.end - run.next);
-            run.buffer.resize(count);
-            FileUtil::preadAll(fd, fileName.c_str(), reinterpret_cast<char *>(run.buffer.data()), count * sizeof(ClusterPair),
-                               run.next * sizeof(ClusterPair));
-            run.next += count;
-            run.bufferPosition = 0;
-        }
-        pair = run.buffer[run.bufferPosition++];
-        return true;
     }
 
     std::vector<ClusterPair> &pairs;
@@ -310,114 +322,24 @@ private:
     const size_t memoryLimit;
     const uint64_t *assigned;
     FILE *file;
-    size_t writtenPairs;
-    size_t oversizedBatches;
-    size_t demotedPairs;
-    std::vector<Run> runs;
+    SetCoverSpoolRuns<ClusterPair> runs;
 };
 
 struct SetCoverSizeClasses {
-    size_t live[8 * sizeof(size_t)] = {};
-    size_t peak[8 * sizeof(size_t)] = {};
-    size_t liveLargeClassCandidates[8 * sizeof(size_t)] = {};
-    size_t peakLargeClassCandidates[8 * sizeof(size_t)] = {};
-    size_t liveExactCandidates[65] = {};
-    size_t peakExactCandidates[65] = {};
-    size_t demotions[8 * sizeof(size_t)][8 * sizeof(size_t)] = {};
-    size_t demotedSets = 0;
-    size_t demotedMembers = 0;
     size_t liveAllCandidates = 0;
     size_t peakAllCandidates = 0;
     size_t liveAllMembers = 0;
     size_t peakAllMembers = 0;
-    size_t liveLargeCandidates = 0;
-    size_t peakLargeCandidates = 0;
-    size_t liveLargeMembers = 0;
-    size_t peakLargeMembers = 0;
 
-    static size_t index(size_t count) {
-        return 8 * sizeof(size_t) - 1 - __builtin_clzl(count);
-    }
     void add(size_t count) {
-        const size_t sizeClass = index(count);
         liveAllCandidates++;
         liveAllMembers += count;
         peakAllCandidates = std::max(peakAllCandidates, liveAllCandidates);
         peakAllMembers = std::max(peakAllMembers, liveAllMembers);
-        live[sizeClass] += count;
-        peak[sizeClass] = std::max(peak[sizeClass], live[sizeClass]);
-        if (count <= 64) {
-            liveExactCandidates[count]++;
-            peakExactCandidates[count] = std::max(peakExactCandidates[count], liveExactCandidates[count]);
-        } else {
-            liveLargeCandidates++;
-            liveLargeMembers += count;
-            liveLargeClassCandidates[sizeClass]++;
-            peakLargeClassCandidates[sizeClass] = std::max(peakLargeClassCandidates[sizeClass], liveLargeClassCandidates[sizeClass]);
-            peakLargeCandidates = std::max(peakLargeCandidates, liveLargeCandidates);
-            peakLargeMembers = std::max(peakLargeMembers, liveLargeMembers);
-        }
     }
     void remove(size_t count) {
-        const size_t sizeClass = index(count);
         liveAllCandidates--;
         liveAllMembers -= count;
-        live[sizeClass] -= count;
-        if (count <= 64) {
-            liveExactCandidates[count]--;
-        } else {
-            liveLargeCandidates--;
-            liveLargeMembers -= count;
-            liveLargeClassCandidates[sizeClass]--;
-        }
-    }
-    void demote(size_t oldCount, size_t newCount) {
-        demotions[index(oldCount)][index(newCount)]++;
-        demotedSets++;
-        demotedMembers += oldCount - newCount;
-    }
-    std::string peaks() const {
-        std::string result;
-        for (size_t sizeClass = 0; sizeClass < 8 * sizeof(size_t); sizeClass++) {
-            if (peak[sizeClass] == 0) {
-                continue;
-            }
-            if (result.empty() == false) {
-                result += ",";
-            }
-            result += SSTR(static_cast<size_t>(1) << sizeClass) + ":" + SSTR(peak[sizeClass]);
-        }
-        return result.empty() ? "none" : result;
-    }
-    std::string candidateCounts() const {
-        std::string result;
-        for (size_t count = 3; count <= 64; count++) {
-            if (peakExactCandidates[count] != 0) {
-                result += (result.empty() ? "" : ",") + SSTR(count) + ":" + SSTR(peakExactCandidates[count]);
-            }
-        }
-        return result.empty() ? "none" : result;
-    }
-    std::string largeCandidateClasses() const {
-        std::string result;
-        for (size_t sizeClass = index(65); sizeClass < 8 * sizeof(size_t); sizeClass++) {
-            if (peakLargeClassCandidates[sizeClass] != 0) {
-                result += (result.empty() ? "" : ",") + SSTR(static_cast<size_t>(1) << sizeClass) + ":" + SSTR(peakLargeClassCandidates[sizeClass]);
-            }
-        }
-        return result.empty() ? "none" : result;
-    }
-    std::string demotionClasses() const {
-        std::string result;
-        for (size_t source = 0; source < 8 * sizeof(size_t); source++) {
-            for (size_t destination = 0; destination < 8 * sizeof(size_t); destination++) {
-                if (demotions[source][destination] != 0) {
-                    result += (result.empty() ? "" : ",") + SSTR(static_cast<size_t>(1) << source) + ">" +
-                              SSTR(static_cast<size_t>(1) << destination) + ":" + SSTR(demotions[source][destination]);
-                }
-            }
-        }
-        return result.empty() ? "none" : result;
     }
 };
 
@@ -426,30 +348,16 @@ public:
     static const size_t MAX_SIZE = 64;
 
     SetCoverSmallSetSpool(const std::string &prefix, size_t memoryLimit, const uint64_t *assigned)
-        : prefix(prefix), memoryLimit(memoryLimit), assigned(assigned), buckets(MAX_SIZE + 1), writtenBytes(0), readBytes(0), readCalls(0),
-          liveDiskBytes(0), peakDiskBytes(0), runCount(0), peakActiveRuns(0), activeRuns(0), activeFiles(0), peakActiveFiles(0),
-          initialRecords(0), demotedRecords(0), initialBytes(0), demotedBytes(0), stagedBytes(0), peakStagedBytes(0),
-          runMetadataBytes(0), peakRunMetadataBytes(0) {}
+        : prefix(prefix), memoryLimit(memoryLimit), assigned(assigned), buckets(MAX_SIZE + 1), writtenBytes(0), readBytes(0),
+          liveDiskBytes(0), peakDiskBytes(0) {}
 
-    void append(size_t count, const DBKeyType *members, size_t sourceCount = 0) {
+    void append(size_t count, const DBKeyType *members) {
         Bucket &bucket = buckets[count];
         const size_t bucketBytes = std::max<size_t>(count * sizeof(DBKeyType), memoryLimit / 64 / (MAX_SIZE - 2));
         if (bucket.words.size() / count >= std::max<size_t>(1, bucketBytes / sizeof(DBKeyType) / count)) {
             flush(count);
         }
-        const size_t oldCapacity = bucket.words.capacity();
         bucket.words.insert(bucket.words.end(), members, members + count);
-        stagedBytes += (bucket.words.capacity() - oldCapacity) * sizeof(DBKeyType);
-        peakStagedBytes = std::max(peakStagedBytes, stagedBytes);
-        recordsBySize[count]++;
-        if (sourceCount == 0) {
-            initialRecords++;
-            initialBytes += count * sizeof(DBKeyType);
-        } else {
-            demotedRecords++;
-            demotedBytes += count * sizeof(DBKeyType);
-            demotionsBySize[std::min(sourceCount, MAX_SIZE + 1)][count]++;
-        }
     }
 
     template <typename TakeSet>
@@ -459,84 +367,18 @@ public:
         }
     }
 
-    size_t totalRuns() const { return runCount; }
     size_t totalWrittenBytes() const { return writtenBytes; }
     size_t totalReadBytes() const { return readBytes; }
-    size_t totalReadCalls() const { return readCalls; }
     size_t peakBytesOnDisk() const { return peakDiskBytes; }
-    size_t peakRunCount() const { return peakActiveRuns; }
-    size_t peakFileCount() const { return peakActiveFiles; }
-    size_t initialSetCount() const { return initialRecords; }
-    size_t demotedSetCount() const { return demotedRecords; }
-    size_t initialSetBytes() const { return initialBytes; }
-    size_t demotedSetBytes() const { return demotedBytes; }
-    size_t peakStagedMemoryBytes() const { return peakStagedBytes; }
-    size_t peakRunMetadataMemoryBytes() const { return peakRunMetadataBytes; }
     size_t mergeReadBudgetBytes() const { return std::min<size_t>(memoryLimit / 64, 4ULL * 1024 * 1024 * 1024); }
 
-    std::string sizeCounts() const {
-        std::string result;
-        for (size_t count = 3; count <= MAX_SIZE; count++) {
-            if (recordsBySize[count] != 0) {
-                result += (result.empty() ? "" : ",") + SSTR(count) + ":" + SSTR(recordsBySize[count]);
-            }
-        }
-        return result.empty() ? "none" : result;
-    }
-    std::string sizeRuns() const {
-        std::string result;
-        for (size_t count = 3; count <= MAX_SIZE; count++) {
-            if (runsBySize[count] != 0) {
-                result += (result.empty() ? "" : ",") + SSTR(count) + ":" + SSTR(runsBySize[count]);
-            }
-        }
-        return result.empty() ? "none" : result;
-    }
-    std::string sizeReads() const {
-        std::string result;
-        for (size_t count = 3; count <= MAX_SIZE; count++) {
-            if (readCallsBySize[count] != 0) {
-                result += (result.empty() ? "" : ",") + SSTR(count) + ":" + SSTR(readCallsBySize[count]) + ":" + SSTR(readBytesBySize[count]);
-            }
-        }
-        return result.empty() ? "none" : result;
-    }
-    std::string demotionSizes() const {
-        std::string result;
-        for (size_t source = 3; source <= MAX_SIZE + 1; source++) {
-            for (size_t destination = 3; destination <= MAX_SIZE; destination++) {
-                if (demotionsBySize[source][destination] != 0) {
-                    result += (result.empty() ? "" : ",") + SSTR(source) + ">" + SSTR(destination) + ":" +
-                              SSTR(demotionsBySize[source][destination]);
-                }
-            }
-        }
-        return result.empty() ? "none" : result;
-    }
-
 private:
-    struct Run {
-        size_t next;
-        size_t end;
-        size_t bufferPosition;
-        std::vector<DBKeyType> buffer;
-    };
     struct Bucket {
         std::vector<DBKeyType> words;
-        std::vector<Run> runs;
+        SetCoverSpoolRuns<DBKeyType> runs;
         FILE *writer;
-        size_t writtenRecords;
         bool drained;
-        Bucket() : writer(NULL), writtenRecords(0), drained(false) {}
-    };
-    struct Head {
-        DBKeyType repKey;
-        size_t run;
-    };
-    struct HeadLess {
-        bool operator()(const Head &first, const Head &second) const {
-            return first.repKey < second.repKey;
-        }
+        Bucket() : writer(NULL), drained(false) {}
     };
 
     std::string fileName(size_t count) const {
@@ -556,8 +398,6 @@ private:
         const std::string path = fileName(count);
         if (bucket.writer == NULL) {
             bucket.writer = FileUtil::openAndDelete(path.c_str(), "wb");
-            activeFiles++;
-            peakActiveFiles = std::max(peakActiveFiles, activeFiles);
         }
         const size_t writeWords = std::max<size_t>(count, (4ULL * 1024 * 1024 / sizeof(DBKeyType) / count) * count);
         std::vector<DBKeyType> output;
@@ -577,40 +417,12 @@ private:
             Debug(Debug::ERROR) << "Cannot write " << path << "\n";
             EXIT(EXIT_FAILURE);
         }
-        Run run = { bucket.writtenRecords, bucket.writtenRecords + recordCount, 0, std::vector<DBKeyType>() };
-        const size_t oldRunCapacity = bucket.runs.capacity();
-        bucket.runs.push_back(run);
-        runMetadataBytes += (bucket.runs.capacity() - oldRunCapacity) * sizeof(Run);
-        peakRunMetadataBytes = std::max(peakRunMetadataBytes, runMetadataBytes);
-        bucket.writtenRecords += recordCount;
-        runsBySize[count]++;
-        runCount++;
-        activeRuns++;
-        peakActiveRuns = std::max(peakActiveRuns, activeRuns);
+        bucket.runs.add(recordCount);
         const size_t bytes = recordCount * count * sizeof(DBKeyType);
         writtenBytes += bytes;
         liveDiskBytes += bytes;
         peakDiskBytes = std::max(peakDiskBytes, liveDiskBytes);
         bucket.words.clear();
-    }
-    bool current(size_t count, Run &run, int fd, size_t chunkRecords) {
-        if (run.bufferPosition * count == run.buffer.size()) {
-            if (run.next == run.end) {
-                return false;
-            }
-            const size_t records = std::min(chunkRecords, run.end - run.next);
-            run.buffer.resize(records * count);
-            const size_t bytes = run.buffer.size() * sizeof(DBKeyType);
-            FileUtil::preadAll(fd, fileName(count).c_str(), reinterpret_cast<char *>(run.buffer.data()), bytes,
-                               run.next * count * sizeof(DBKeyType));
-            readBytes += bytes;
-            readCalls++;
-            readBytesBySize[count] += bytes;
-            readCallsBySize[count]++;
-            run.next += records;
-            run.bufferPosition = 0;
-        }
-        return true;
     }
     template <typename TakeSet>
     void drainSize(size_t count, TakeSet takeSet) {
@@ -622,10 +434,7 @@ private:
         bucket.drained = true;
         const std::string path = fileName(count);
         if (bucket.writer == NULL) {
-            if (unlink(path.c_str()) != 0 && errno != ENOENT) {
-                Debug(Debug::ERROR) << "Cannot remove " << path << ": " << strerror(errno) << "\n";
-                EXIT(EXIT_FAILURE);
-            }
+            unlink(path.c_str());
             return;
         }
         if (fclose(bucket.writer) != 0) {
@@ -633,42 +442,15 @@ private:
             EXIT(EXIT_FAILURE);
         }
         bucket.writer = NULL;
-        FILE *reader = FileUtil::openFileOrDie(path.c_str(), "rb", true);
-        const size_t readBudget = mergeReadBudgetBytes();
-        const size_t chunkRecords = std::max<size_t>(1, readBudget / sizeof(DBKeyType) / count / bucket.runs.size());
-        std::priority_queue<Head, std::vector<Head>, HeadLess> heads;
-        for (size_t run = 0; run < bucket.runs.size(); run++) {
-            if (current(count, bucket.runs[run], fileno(reader), chunkRecords)) {
-                heads.push(Head{ bucket.runs[run].buffer[0], run });
-            }
-        }
-        while (heads.empty() == false) {
-            const Head head = heads.top();
-            heads.pop();
-            Run &run = bucket.runs[head.run];
-            if ((run.bufferPosition + PREFETCH_DISTANCE) * count < run.buffer.size()) {
-                const DBKeyType *ahead = run.buffer.data() + (run.bufferPosition + PREFETCH_DISTANCE) * count;
-                for (size_t member = 0; member < count; member++) {
-                    __builtin_prefetch(&assigned[ahead[member] / 64]);
-                }
-            }
-            takeSet(count, run.buffer.data() + run.bufferPosition * count);
-            run.bufferPosition++;
-            if (current(count, run, fileno(reader), chunkRecords)) {
-                heads.push(Head{ run.buffer[run.bufferPosition * count], head.run });
-            }
-        }
-        if (fclose(reader) != 0) {
-            Debug(Debug::ERROR) << "Cannot close " << path << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        FileUtil::remove(path.c_str());
-        liveDiskBytes -= bucket.writtenRecords * count * sizeof(DBKeyType);
-        activeRuns -= bucket.runs.size();
-        activeFiles--;
-        runMetadataBytes -= bucket.runs.capacity() * sizeof(Run);
-        stagedBytes -= bucket.words.capacity() * sizeof(DBKeyType);
-        std::vector<Run>().swap(bucket.runs);
+        readBytes += bucket.runs.merge(path, count, mergeReadBudgetBytes(),
+                                       [](const DBKeyType *first, const DBKeyType *second) { return first[0] < second[0]; },
+                                       [&](const DBKeyType *ahead) {
+                                           for (size_t member = 0; member < count; member++) {
+                                               __builtin_prefetch(&assigned[ahead[member] / 64]);
+                                           }
+                                       },
+                                       [&](const DBKeyType *members) { takeSet(count, members); });
+        liveDiskBytes -= bucket.runs.records() * count * sizeof(DBKeyType);
         std::vector<DBKeyType>().swap(bucket.words);
     }
 
@@ -678,27 +460,8 @@ private:
     std::vector<Bucket> buckets;
     size_t writtenBytes;
     size_t readBytes;
-    size_t readCalls;
     size_t liveDiskBytes;
     size_t peakDiskBytes;
-    size_t runCount;
-    size_t peakActiveRuns;
-    size_t activeRuns;
-    size_t activeFiles;
-    size_t peakActiveFiles;
-    size_t initialRecords;
-    size_t demotedRecords;
-    size_t initialBytes;
-    size_t demotedBytes;
-    size_t stagedBytes;
-    size_t peakStagedBytes;
-    size_t runMetadataBytes;
-    size_t peakRunMetadataBytes;
-    size_t recordsBySize[MAX_SIZE + 1] = {};
-    size_t runsBySize[MAX_SIZE + 1] = {};
-    size_t readCallsBySize[MAX_SIZE + 1] = {};
-    size_t readBytesBySize[MAX_SIZE + 1] = {};
-    size_t demotionsBySize[MAX_SIZE + 2][MAX_SIZE + 1] = {};
 };
 
 class SetCoverLargeSetSpool {
@@ -782,13 +545,10 @@ public:
                 }
             }
             if (validCount > 1) {
-                if (validCount < count) {
-                    classes.demote(count, validCount);
-                }
                 if (validCount == 2) {
-                    pairSpool.pushDemoted(ClusterPair{repKey, survivors[1]});
+                    pairSpool.push(ClusterPair{repKey, survivors[1]});
                 } else if (validCount <= SetCoverSmallSetSpool::MAX_SIZE) {
-                    smallSpool.append(validCount, survivors.data(), count);
+                    smallSpool.append(validCount, survivors.data());
                     classes.add(validCount);
                 } else if (validCount < count) {
                     if (validCount > memoryBudget / sizeof(DBKeyType)) {
@@ -844,7 +604,7 @@ public:
                     FileUtil::remove(source.path.c_str());
                     runBufferBytes -= source.buffer.capacity() * sizeof(DBKeyType);
                     runPathBytes -= source.path.capacity();
-                    Run().swap(source);
+                    source = Run();
                     freeRuns.push_back(run);
                 } else {
                     pushHead(run);
@@ -875,15 +635,6 @@ private:
         std::vector<DBKeyType> buffer;
         FILE *reader = NULL;
         std::list<size_t>::iterator openPosition;
-        void swap(Run &other) {
-            path.swap(other.path);
-            std::swap(words, other.words);
-            std::swap(position, other.position);
-            std::swap(bufferStart, other.bufferStart);
-            buffer.swap(other.buffer);
-            std::swap(reader, other.reader);
-            std::swap(openPosition, other.openPosition);
-        }
     };
     struct Head {
         size_t count;
@@ -912,7 +663,7 @@ private:
     }
     void writeWord(FILE *file, DBKeyType word) {
         writeBuffer.push_back(word);
-        if (writeBuffer.size() == 8192) {
+        if (writeBuffer.size() == 4 * 1024 * 1024 / sizeof(DBKeyType)) {
             flushWrites(file);
         }
         writtenBytes += sizeof(word);
@@ -1014,20 +765,15 @@ private:
     std::vector<DBKeyType> writeBuffer;
 };
 
-// takes the largest sets with more than maxSetSize members whose members are all unassigned; a set that lost members goes back, to pairSets if given and two are left
+// takes the largest sets with more than maxSetSize members whose members are all unassigned; a set that lost members goes back
 template <typename T, typename IsAssigned, typename TakeMember>
 static void takeSetCoverCandidates(std::vector<SetCoverCandidate> &candidates, std::vector<T> &memberPool, size_t &liveMemberCount, size_t maxSetSize,
-                                   std::vector<ClusterPair> *pairSets, IsAssigned isAssigned, TakeMember takeMember,
-                                   SetCoverPairSpool *pairSpool = NULL, SetCoverSizeClasses *sizeClasses = NULL,
-                                   SetCoverSmallSetSpool *smallSpool = NULL) {
+                                   IsAssigned isAssigned, TakeMember takeMember) {
     while (candidates.empty() == false && candidates.front().memberCount > maxSetSize) {
         std::pop_heap(candidates.begin(), candidates.end(), SetCoverComparator());
         SetCoverCandidate candidate = candidates.back();
         candidates.pop_back();
         liveMemberCount -= candidate.memberCount;
-        if (sizeClasses != NULL) {
-            sizeClasses->remove(candidate.memberCount);
-        }
         if (isAssigned(candidate.representativeId)) {
             continue;
         }
@@ -1041,30 +787,9 @@ static void takeSetCoverCandidates(std::vector<SetCoverCandidate> &candidates, s
         if (validCount <= 1) {
             continue;
         }
-        if (sizeClasses != NULL && validCount < candidate.memberCount) {
-            sizeClasses->demote(candidate.memberCount, validCount);
-        }
-        // the rep stays first
-        if (pairSets != NULL && validCount == 2) {
-            const ClusterPair pairSet = { members[0], members[1] };
-            if (pairSpool != NULL) {
-                pairSpool->pushDemoted(pairSet);
-            } else {
-                pairSets->push_back(pairSet);
-            }
-            continue;
-        }
         if (validCount != candidate.memberCount) {
-            if (smallSpool != NULL && validCount <= SetCoverSmallSetSpool::MAX_SIZE) {
-                smallSpool->append(validCount, members, candidate.memberCount);
-                sizeClasses->add(validCount);
-                continue;
-            }
             candidate.memberCount = validCount;
             liveMemberCount += validCount;
-            if (sizeClasses != NULL) {
-                sizeClasses->add(validCount);
-            }
             candidates.push_back(candidate);
             std::push_heap(candidates.begin(), candidates.end(), SetCoverComparator());
             continue;
@@ -1073,23 +798,6 @@ static void takeSetCoverCandidates(std::vector<SetCoverCandidate> &candidates, s
             takeMember(candidate.representativeId, members[i]);
         }
     }
-}
-
-// Env override for the reorder-buffer size; 0 (unset/invalid) means size from memory.
-static size_t getReorderBufferLimitFromEnv() {
-    const char *envValue = getenv("MMSEQS_ALIGN2CLUST_REORDER_LIMIT");
-    if (envValue == nullptr || *envValue == '\0') {
-        return 0;
-    }
-
-    char *end = nullptr;
-    unsigned long long parsedValue = strtoull(envValue, &end, 10);
-    if (end == envValue || *end != '\0' || parsedValue == 0) {
-        Debug(Debug::WARNING) << "Ignoring invalid MMSEQS_ALIGN2CLUST_REORDER_LIMIT=" << envValue
-                              << "; sizing the reorder buffer automatically\n";
-        return 0;
-    }
-    return static_cast<size_t>(parsedValue);
 }
 
 static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int mode, size_t resultCount) {
@@ -1106,10 +814,6 @@ static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int m
     const size_t bytesPerResult = sizeof(ClusterResult) + (par.maxResListLen + 1) * sizeof(DBLocalId);
 
     size_t capacity = std::min(resultCount, std::max<size_t>(1, budget / bytesPerResult));
-    const size_t userCap = getReorderBufferLimitFromEnv();  // 0 == auto
-    if (userCap != 0) {
-        capacity = std::min(capacity, userCap);
-    }
     capacity = std::max<size_t>(1, capacity);
 
     Debug(Debug::INFO) << "Reorder buffer sizing: memory limit " << memoryLimit << " byte, reserved (fixed) "
@@ -2074,7 +1778,7 @@ void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
         }
 
         // 2) assign candidates guaranteed to be the currently largest set
-        takeSetCoverCandidates(setCoverCandidates, setCoverMemberPool, setCoverLiveMemberCount, allCalculationsDone ? 0 : currentPrefSize, NULL,
+        takeSetCoverCandidates(setCoverCandidates, setCoverMemberPool, setCoverLiveMemberCount, allCalculationsDone ? 0 : currentPrefSize,
                                [&](DBLocalId id) { return loadAssignedCluster(assignedCluster, id) != DB_LOCAL_ID_INVALID; },
                                [&](DBLocalId representativeId, DBLocalId memberId) { storeAssignedCluster(assignedCluster, memberId, representativeId); });
 
@@ -2559,6 +2263,10 @@ static const size_t ALIGN_BATCHES_PER_THREAD = 64;
 static const int CLUSTER_THREADS = 4;
 // an accepted log: the order key of every rep with this bit, then its accepted targets
 static const uint64_t ACCEPTED_REP_BIT = 1ULL << 63;
+// a step of the assigned changes log: the clustered key, the clustered accepted log bytes of every node, where the keys of every node start, then their end
+static size_t getChangeHeaderWords() {
+    return 2 * MMseqsNode::count + 2;
+}
 
 // each of these takes the memory limit divided by its divisor
 static const size_t MASTER_MEMORY_DIVISOR = 2;
@@ -2572,6 +2280,8 @@ static const size_t MEMBER_BATCH_SIZE = 4096;
 static const size_t STEP_MEMORY_DIVISOR = 4;
 static const size_t STEP_PAIRS_MEMORY_DIVISOR = 16;
 static const size_t LOG_PART_MEMORY_DIVISOR = 64;
+// the stdio buffer of every taken log of the master
+static const size_t TAKEN_BUFFER_BYTES = 16 * 1024 * 1024;
 static const size_t CLUSTER_PAIRS_MEMORY_DIVISOR = 16;
 static const size_t ANCHOR_MEMORY_DIVISOR = 64;
 // --filter-cludb-file: the (key, offset) cells of a 4 KiB page from one anchor to the next at least, and the bytes of an entry read at once
@@ -3082,12 +2792,37 @@ private:
     }
 };
 
+// the aligners of a thread for the member gates of --filter-cludb-file
+struct MemberAligners {
+    Sequence query;
+    Sequence element;
+    BlockAligner blockAligner;
+    Matcher matcher;
+    SwipeBatch swipe;
+    SwipeTargets memberTargets;
+    ClusterMembers memberBuffers;
+
+    MemberAligners(const Parameters &par, AlignmentScoring &scoring, size_t maxSeqLen, bool swipeLanes)
+        : query(maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection),
+          element(maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection),
+          blockAligner(Parameters::DBTYPE_AMINO_ACIDS, maxSeqLen, scoring.subMat, &scoring.fastMatrix,
+                       &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
+                       -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid()),
+          matcher(Parameters::DBTYPE_AMINO_ACIDS, maxSeqLen, scoring.subMat, &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
+                  par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop),
+          swipe(par, scoring.subMat, scoring.evaluer, maxSeqLen),
+          memberTargets(par, scoring.subMat, scoring.evaluer, maxSeqLen, true),
+          memberBuffers(swipeLanes ? &swipe : NULL, true, swipeLanes ? &memberTargets : NULL) {}
+};
+
 // --createdb-mode 3: aligns the records window by window and logs the accepted pairs
 static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTargetsReader &repTargetsReader,
                             size_t memoryLimit, size_t masterMemoryLimit, size_t flushEntryBytes, size_t representativeResidues,
-                            size_t paddedDbSize, size_t prefSizeBits, const std::string &accepted,
-                            const std::string &assignedChanges, const std::string &requests, const std::string &served,
-                            ClusterMemberLookup *members, DBReader<DBKeyType> *memberDbr, std::string &phaseValues) {
+                            size_t paddedDbSize, size_t prefSizeBits, ClusterMemberLookup *members, DBReader<DBKeyType> *memberDbr, std::string &phaseValues) {
+    const std::string accepted = par.db3 + "_accepted";
+    const std::string assignedChanges = par.db3 + "_assigned";
+    const std::string requests = par.db3 + "_sequence_requests";
+    const std::string served = par.db3 + "_served_sequences";
     const size_t dbSize = seqDbr.getSize();
     const size_t orderKeyEnd = (prefSizeBits - 1) * paddedDbSize + dbSize;
     const size_t maxSeqLen = seqDbr.getMaxSeqLen();
@@ -3125,8 +2860,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         const uint64_t *page = __atomic_load_n(&assignedPages[key / ASSIGNED_PAGE_KEYS], __ATOMIC_ACQUIRE);
         return page != NULL && ((__atomic_load_n(&page[key % ASSIGNED_PAGE_KEYS / 64], __ATOMIC_RELAXED) >> (key % 64)) & 1) != 0;
     };
-    // step header: clustered key, the clustered accepted log bytes of every node, where the keys of every node start, then their end
-    const size_t headerWords = 2 * MMseqsNode::count + 2;
+    const size_t headerWords = getChangeHeaderWords();
     const size_t changeReadWords = 1024 * 1024;
     size_t changesBytes = 0;
     size_t changeReadBytes = 0;
@@ -4291,21 +4025,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         continue;
                     }
                     const size_t repKey = pair.repKey % paddedDbSize;
-                    Sequence query(maxMemberSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection);
-                    Sequence element(maxMemberSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection);
-                    BlockAligner blockAligner(Parameters::DBTYPE_AMINO_ACIDS, maxMemberSeqLen, scoring.subMat, &scoring.fastMatrix,
-                                             &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
-                                             -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
-                    Matcher matcher(Parameters::DBTYPE_AMINO_ACIDS, maxMemberSeqLen, scoring.subMat, &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
-                                    par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop);
-                    SwipeBatch swipe(par, scoring.subMat, scoring.evaluer, maxMemberSeqLen);
-                    SwipeTargets memberTargets(par, scoring.subMat, scoring.evaluer, maxMemberSeqLen, true);
-                    ClusterMembers memberBuffers(swipeLanes ? &swipe : NULL, true, swipeLanes ? &memberTargets : NULL);
+                    MemberAligners aligners(par, scoring, maxMemberSeqLen, swipeLanes);
                     const std::vector<size_t> repGateOffsets = {0, 1};
                     const std::vector<DBKeyType> repKeys(1, repKey);
-                    mapRep(query, blockAligner, repKey);
+                    mapRep(aligners.query, aligners.blockAligner, repKey);
                     bool matcherInitialized = false;
-                    swipe.startRep();
+                    aligners.swipe.startRep();
                     partCursor.start(memberEntries[first]);
                     DBKeyType memberKey;
                     bool hasMember = members->next(partCursor, memberKey);
@@ -4328,13 +4053,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         SORT_PARALLEL(partKeys.begin(), partKeys.end());
                         partKeys.erase(std::unique(partKeys.begin(), partKeys.end()), partKeys.end());
                         memberDbr->loadData(partKeys);
-                        memberBuffers.gateCount = 0;
-                        MemberGate &gate = memberBuffers.addGate(first, 0);
+                        aligners.memberBuffers.gateCount = 0;
+                        MemberGate &gate = aligners.memberBuffers.addGate(first, 0);
                         gate.memberKeys = partMembers;
                         if (swipeLanes) {
-                            alignMemberGatesSwipe(par, blockAligner, matcher, query, element, memberDbr, swMode, 0, memberBuffers, repGateOffsets, repKeys, mapRep);
+                            alignMemberGatesSwipe(par, aligners.blockAligner, aligners.matcher, aligners.query, aligners.element, memberDbr, swMode, 0, aligners.memberBuffers, repGateOffsets, repKeys, mapRep);
                         } else {
-                            alignClusterMembers(par, blockAligner, matcher, matcherInitialized, query, element, memberDbr, swMode, 0, false, NULL, memberBuffers);
+                            alignClusterMembers(par, aligners.blockAligner, aligners.matcher, matcherInitialized, aligners.query, aligners.element, memberDbr, swMode, 0, false, NULL, aligners.memberBuffers);
                         }
                         passed = gate.live;
                     }
@@ -4381,21 +4106,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #ifdef OPENMP
                     thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-                    Sequence query(maxMemberSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection);
-                    Sequence element(maxMemberSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection);
-                    BlockAligner blockAligner(Parameters::DBTYPE_AMINO_ACIDS, maxMemberSeqLen, scoring.subMat, &scoring.fastMatrix,
-                                             &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
-                                             -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
-                    Matcher matcher(Parameters::DBTYPE_AMINO_ACIDS, maxMemberSeqLen, scoring.subMat, &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
-                                    par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(), 0.0, par.zdrop);
-                    SwipeBatch swipe(par, scoring.subMat, scoring.evaluer, maxMemberSeqLen);
-                    SwipeTargets memberTargets(par, scoring.subMat, scoring.evaluer, maxMemberSeqLen, true);
-                    ClusterMembers memberBuffers(swipeLanes ? &swipe : NULL, true, swipeLanes ? &memberTargets : NULL);
+                    MemberAligners aligners(par, scoring, maxMemberSeqLen, swipeLanes);
                     std::vector<size_t> repGateOffsets;
                     std::vector<DBKeyType> repKeys;
 #pragma omp for schedule(dynamic, 1)
                     for (size_t batch = 0; batch < memberBatchCount; batch++) {
-                        memberBuffers.gateCount = 0;
+                        aligners.memberBuffers.gateCount = 0;
                         repGateOffsets.assign(1, 0);
                         repKeys.clear();
                         for (size_t group = batchGroupOffsets[batch]; group < batchGroupOffsets[batch + 1]; group++) {
@@ -4404,26 +4120,26 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 if (hasMemberGate[i] == false || isAssigned(pair.repKey) || isAssigned(pair.memberKey)) {
                                     continue;
                                 }
-                                MemberGate &gate = memberBuffers.addGate(i, 0);
+                                MemberGate &gate = aligners.memberBuffers.addGate(i, 0);
                                 for (size_t member = memberOffsets[i]; member < memberOffsets[i + 1]; member++) {
                                     gate.memberKeys.push_back(partMembers[member - memberOffsets[first]]);
                                 }
                             }
-                            if (memberBuffers.gateCount > repGateOffsets.back()) {
-                                repGateOffsets.push_back(memberBuffers.gateCount);
+                            if (aligners.memberBuffers.gateCount > repGateOffsets.back()) {
+                                repGateOffsets.push_back(aligners.memberBuffers.gateCount);
                                 repKeys.push_back(windowPairs[repGroups[group]].repKey % paddedDbSize);
                             }
                         }
                         if (swipeLanes) {
-                            alignMemberGatesSwipe(par, blockAligner, matcher, query, element, memberDbr, swMode, thread_idx, memberBuffers, repGateOffsets, repKeys, mapRep);
-                        } else if (memberBuffers.gateCount > 0) {
-                            mapRep(query, blockAligner, repKeys[0]);
+                            alignMemberGatesSwipe(par, aligners.blockAligner, aligners.matcher, aligners.query, aligners.element, memberDbr, swMode, thread_idx, aligners.memberBuffers, repGateOffsets, repKeys, mapRep);
+                        } else if (aligners.memberBuffers.gateCount > 0) {
+                            mapRep(aligners.query, aligners.blockAligner, repKeys[0]);
                             bool matcherInitialized = false;
-                            swipe.startRep();
-                            alignClusterMembers(par, blockAligner, matcher, matcherInitialized, query, element, memberDbr, swMode, thread_idx, false, NULL, memberBuffers);
+                            aligners.swipe.startRep();
+                            alignClusterMembers(par, aligners.blockAligner, aligners.matcher, matcherInitialized, aligners.query, aligners.element, memberDbr, swMode, thread_idx, false, NULL, aligners.memberBuffers);
                         }
-                        for (size_t g = 0; g < memberBuffers.gateCount; g++) {
-                            membersPassed[memberBuffers.gates[g].targetId] = memberBuffers.gates[g].live;
+                        for (size_t g = 0; g < aligners.memberBuffers.gateCount; g++) {
+                            membersPassed[aligners.memberBuffers.gates[g].targetId] = aligners.memberBuffers.gates[g].live;
                         }
                     }
                 }
@@ -4518,6 +4234,7 @@ struct TakenLog {
     size_t bytes;
     uint64_t carry;
     unsigned int carryBits;
+    char *buffer;
 };
 
 // --createdb-mode 3: the master clusters the accepted pairs in order key order; returns the member count
@@ -4558,7 +4275,9 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     std::vector<std::vector<uint64_t> > nodeTakenBits(MMseqsNode::count);
     std::vector<size_t> nodeTakenCounts(MMseqsNode::count, 0);
     for (size_t node = 0; node < MMseqsNode::count; node++) {
-        const TakenLog takenLog = { FileUtil::openAndDelete((taken + "." + SSTR(node)).c_str(), "w"), 0, 0, 0 };
+        const TakenLog takenLog = { FileUtil::openAndDelete((taken + "." + SSTR(node)).c_str(), "w"), 0, 0, 0, new(std::nothrow) char[TAKEN_BUFFER_BYTES] };
+        Util::checkAllocation(takenLog.buffer, "Cannot allocate the buffer of " + taken);
+        setvbuf(takenLog.file, takenLog.buffer, _IOFBF, TAKEN_BUFFER_BYTES);
         nodeTaken[node] = takenLog;
     }
     FILE *changesHandle = FileUtil::openAndDelete(assignedChanges.c_str(), "w");
@@ -4924,12 +4643,11 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                     return;
                 }
                 if (validCount < setSize) {
-                    sizeClasses.demote(setSize, validCount);
                     if (validCount == 2) {
                         const ClusterPair pairSet = { validMembers[0], validMembers[1] };
-                        pairSpool.pushDemoted(pairSet);
+                        pairSpool.push(pairSet);
                     } else {
-                        smallSpool.append(validCount, validMembers, setSize);
+                        smallSpool.append(validCount, validMembers);
                         sizeClasses.add(validCount);
                     }
                     return;
@@ -5085,7 +4803,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             threadKeyOffsets[thread + 1] = threadKeyOffsets[thread] + threadAssignedKeys[thread].size();
         }
         const size_t stepKeys = threadKeyOffsets[threads];
-        const size_t headerWords = 2 * MMseqsNode::count + 2;
+        const size_t headerWords = getChangeHeaderWords();
         const size_t stepStart = changes.size();
         for (int pass = 0; pass < 2; pass++) {
 #pragma omp parallel for schedule(static)
@@ -5206,6 +4924,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             Debug(Debug::ERROR) << "Cannot close " << takenFile << "\n";
             EXIT(EXIT_FAILURE);
         }
+        delete[] nodeTaken[node].buffer;
     }
     return memberCount;
 }
@@ -5231,7 +4950,8 @@ static int align2clustLinfinity(Parameters &par) {
     const size_t nodeMemoryLimit = std::max(Util::computeMemory(par.splitMemoryLimit), localCopyMemory) - localCopyMemory;
     const bool masterAligns = getFirstAlignNode() == 0;
     const size_t masterMemoryLimit = nodeMemoryLimit / (masterAligns ? MASTER_MEMORY_DIVISOR : 1);
-    const size_t masterMemory = (par.clusteringMode == Parameters::SET_COVER) ? masterMemoryLimit : (dbSize + 63) / 64 * sizeof(uint64_t) + masterMemoryLimit / STEP_MEMORY_DIVISOR;
+    const size_t masterMemory = ((par.clusteringMode == Parameters::SET_COVER) ? masterMemoryLimit : (dbSize + 63) / 64 * sizeof(uint64_t) + masterMemoryLimit / STEP_MEMORY_DIVISOR)
+                                + MMseqsNode::count * TAKEN_BUFFER_BYTES;
 
     // the groups in key order are cut into ranges of about equal cost that the aligning nodes claim in key order
     const std::string partitionsData = MMseqsNode::readFile(par.db2 + ".partitions");
@@ -5374,7 +5094,7 @@ static int align2clustLinfinity(Parameters &par) {
     }
     phaseValueTimer.reset();
     alignRepTargets(par, seqDbr, repTargetsReader, memoryLimit, masterMemoryLimit, flushEntryBytes, representativeResidues, paddedDbSize, prefSizeBits,
-                    accepted, assignedChanges, requests, served, members, memberDbr, phaseValues);
+                    members, memberDbr, phaseValues);
     delete members;
     repTargetsReader.close(phaseValues);
     if (MMseqsNode::rank >= getFirstAlignNode()) {

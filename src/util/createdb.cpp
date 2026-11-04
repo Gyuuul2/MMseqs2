@@ -361,7 +361,7 @@ struct LengthBin {
 };
 
 enum DataFileType { SEQUENCE_DATA, HEADER_DATA, HEADER_OFFSETS, DATA_FILE_TYPES };
-const char *const dataFileSuffixes[DATA_FILE_TYPES] = {".", "_h.", "_h.index."};
+static const char *const dataFileSuffixes[DATA_FILE_TYPES] = {".", "_h.", "_h.index."};
 
 struct InputPiece {
     size_t file;
@@ -617,7 +617,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             cuts.push_back(fileSizes[i]);
         }
         if (unsplitFiles > 0) {
-            Debug(Debug::WARNING) << unsplitFiles << " input files are larger than " << pieceSize << " bytes but cannot be split, so fewer threads read them. "
+            Debug(Debug::WARNING) << unsplitFiles << " input files are larger than " << pieceSize << " bytes but cannot be split, so fewer threads and one node read them. "
                                   << "Give FASTA uncompressed or compressed with pzstd\n";
         }
         std::vector<InputPiece> pieces;
@@ -1145,8 +1145,8 @@ int createdb(int argc, const char **argv, const Command& command) {
             Debug(Debug::ERROR) << "Only one database can be used with database input\n";
             EXIT(EXIT_FAILURE);
         }
-        if (MMseqsNode::count > 1) {
-            Debug(Debug::ERROR) << "Database input cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " on multiple nodes\n";
+        if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) {
+            Debug(Debug::ERROR) << "Database input cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << "\n";
             EXIT(EXIT_FAILURE);
         }
         dbInput = true;
@@ -1178,7 +1178,7 @@ int createdb(int argc, const char **argv, const Command& command) {
 
     if ((par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT || par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) && par.filenames[0] == "stdin") {
         if (MMseqsNode::count > 1) {
-            Debug(Debug::ERROR) << "Stdin input cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " on multiple nodes\n";
+            Debug(Debug::ERROR) << "Stdin input cannot be combined with --createdb-mode " << par.createdbMode << " on multiple nodes\n";
             EXIT(EXIT_FAILURE);
         }
         Debug(Debug::WARNING) << "Stdin input cannot be combined with --createdb-mode " << par.createdbMode << "\n";

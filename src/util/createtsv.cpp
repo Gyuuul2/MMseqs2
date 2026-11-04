@@ -179,7 +179,6 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
     std::vector<std::string> threadAccessions(threads);
     std::vector<size_t> threadAccessionOffsets(threads + 1);
     std::vector<char> received;
-    DBKeyType previousMemberKey = DB_KEY_INVALID;
     // the records for this node of the flushes before the last stay in memory up to a quarter of it, the last flush keeps all of them as its buffers are freed
     size_t keptOwnBytes = 0;
     for (size_t split = 0; split + 1 < splitKeyOffsets.size(); split++) {
@@ -191,7 +190,7 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
         }
         const ClusterPair splitLast = { static_cast<DBKeyType>(keyEnd - 1), static_cast<DBKeyType>(keyEnd - 1) };
         size_t pairCount;
-        while ((pairCount = MMseqsNode::readExchangeRange(memberBlocks, memoryLimit / 64, ClusterPair::recordSize, ClusterPair::compareByMember, splitLast, received, NULL, sortedByMember)) > 0) {
+        while ((pairCount = MMseqsNode::readExchangeRange(memberBlocks, memoryLimit / 64, NULL, ClusterPair::compareByMember, splitLast, received, NULL, sortedByMember)) > 0) {
             ClusterPair *pairs = reinterpret_cast<ClusterPair *>(received.data());
             SORT_PARALLEL(pairs, pairs + pairCount, ClusterPair::compareByMember);
             const size_t firstAccession = accessionCount;
@@ -208,10 +207,6 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
                     threadAccessions[thread].clear();
                     for (size_t i = pairCount * thread / threads; i < pairCount * (thread + 1) / threads; i++) {
                         const DBKeyType memberKey = pairs[i].memberKey;
-                        if (memberKey == ((i > 0) ? pairs[i - 1].memberKey : previousMemberKey)) {
-                            Debug(Debug::ERROR) << "Key " << memberKey << " is in two clusters\n";
-                            EXIT(EXIT_FAILURE);
-                        }
                         const std::string accession = Util::parseFastaHeader(headers.getData(memberKey, thread_idx));
                         const MemberAccession memberAccession = { pairs[i].repKey, memberKey, threadAccessions[thread].size(), static_cast<unsigned int>(accession.size()) };
                         memberAccessions[firstAccession + i] = memberAccession;
@@ -232,7 +227,6 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
                     memberAccessions[firstAccession + i].accessionOffset += threadAccessionOffsets[thread];
                 }
             }
-            previousMemberKey = pairs[pairCount - 1].memberKey;
             // the flush is copied once more into the write buffer
             if (accessionsSize + accessionCount * sizeof(MemberAccession) >= memoryLimit / 8) {
                 keptOwnBytes += writeMemberAccessions(memberAccessions, accessionCount, accessions, nodeKeyOffsets, sortedByRepHandle, sortedByRepFile, sortedByRepIndexData, writtenBytes,
@@ -243,7 +237,7 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
         }
     }
     const ClusterPair lastPair = { DB_KEY_INVALID, DB_KEY_INVALID };
-    if (MMseqsNode::readExchangeRange(memberBlocks, memoryLimit / 64, ClusterPair::recordSize, ClusterPair::compareByMember, lastPair, received, NULL, sortedByMember) > 0) {
+    if (MMseqsNode::readExchangeRange(memberBlocks, memoryLimit / 64, NULL, ClusterPair::compareByMember, lastPair, received, NULL, sortedByMember) > 0) {
         Debug(Debug::ERROR) << "Key " << reinterpret_cast<ClusterPair *>(received.data())->memberKey << " of the clustering is not in the sequence database\n";
         EXIT(EXIT_FAILURE);
     }
@@ -313,10 +307,6 @@ static size_t writeRepresentativeEntries(const std::string &sortedByRepIndex, co
                     const MemberAccession &memberAccession = memberAccessions[i];
                     if (memberAccession.repKey != repKey) {
                         // the representative itself comes first
-                        if (memberAccession.memberKey != memberAccession.repKey) {
-                            Debug(Debug::ERROR) << "The cluster of key " << memberAccession.repKey << " has no line for its representative\n";
-                            EXIT(EXIT_FAILURE);
-                        }
                         repKey = memberAccession.repKey;
                         repName = records.data() + memberAccession.accessionOffset;
                         repLength = memberAccession.accessionLength;
@@ -373,14 +363,6 @@ int createtsv(int argc, const char **argv, const Command &command) {
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_VARIADIC, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
-        if (par.filenames.size() <= 3 || par.db2.compare(par.db1) != 0) {
-            Debug(Debug::ERROR) << "createtsv needs the --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " database as both query and target database: createtsv DB DB clu tsv\n";
-            EXIT(EXIT_FAILURE);
-        }
-        if (par.fullHeader || par.targetTsvColumn != 1 || par.idxSeqSrc != 0 || par.dbOut) {
-            Debug(Debug::ERROR) << "--full-header, --target-column, --idx-seq-src and --db-output are not supported for --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
-            EXIT(EXIT_FAILURE);
-        }
         const int clusterDbtype = FileUtil::parseDbType(par.db3.c_str());
         if (Parameters::isEqualDbtype(clusterDbtype, Parameters::DBTYPE_CLUSTER_RES) == false
             || (DBReader<DBKeyType>::getExtendedDbtype(clusterDbtype) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {

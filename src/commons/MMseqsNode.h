@@ -20,11 +20,6 @@ struct ClusterPair {
         return first.memberKey < second.memberKey;
     }
 
-    // the size of the pair at record, 0 if bytes do not hold all of it
-    static size_t recordSize(const char *, size_t bytes) {
-        return (bytes >= sizeof(ClusterPair)) ? sizeof(ClusterPair) : 0;
-    }
-
     // the representative itself first, so it is the first line of its entry
     static bool compareByRep(const ClusterPair &first, const ClusterPair &second) {
         if (first.repKey != second.repKey) {
@@ -155,7 +150,7 @@ public:
     static void openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeBlock> &blocks, std::vector<FILE *> &files);
     // the smallest buffer of a block in readExchangeRange
     static const size_t EXCHANGE_BUFFER_SIZE = 1024 * 1024;
-    // moves the buffered records up to last of every block to records, recordOffsets their starts then the end; returns their count, 0 once none is left
+    // moves the buffered records up to last of every block to records, recordOffsets their starts then the end; returns their count, 0 once none is left; recordSize NULL: ClusterPair records
     static size_t readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t (*recordSize)(const char *, size_t),
                                     bool (*compare)(const ClusterPair &, const ClusterPair &), const ClusterPair &last,
                                     std::vector<char> &records, std::vector<size_t> *recordOffsets, const std::string &prefix);
@@ -164,8 +159,7 @@ public:
                                        char *window, std::vector<std::pair<size_t, size_t> > &segments, const std::string &prefix);
     static void closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix);
 
-    // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered; nodeKeyOffsets: keys of every node
-    // the pairs for this node stay in memory, up to pairCapacity of them before the last flush
+    // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered, those for this node kept in memory; nodeKeyOffsets: keys of every node
     struct ClusterPairWriter {
         ClusterPairWriter(const std::string &exchange, size_t pairCapacity, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets);
         ~ClusterPairWriter();
@@ -202,10 +196,7 @@ public:
         size_t writtenBytes;
         size_t keptPairCount;
     };
-    // the representative of entry p becomes the one received for p in the exchange receivedIndex, receivedPrefix if given
-    // representativeBits: the keys [firstKey, firstKey + keyCount) of clu, which holds no entries for clusters of one key: a received member without an entry
-    // goes on to its representative, and the bits left are those of the keys that stay alone or represent others
-    // cluKeyOffsets: the entries of keys [firstKey, firstKey + keyCount) are read from the parts of clu whose keys start there, without them those of <clu>.<node>
+    // the representative of entry p becomes the one received for p in receivedIndex if given; representativeBits: keys [firstKey, firstKey + keyCount) of clu, which has no entries of one key, left set for keys neither entries nor received; cluKeyOffsets: where the parts of clu start, without them <clu>.<node>
     static std::string sendClusterPairs(const std::string &clu, bool withRepresentative, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                                         const std::string &exchange, const std::string &receivedIndex = "", const std::string &receivedPrefix = "",
                                         uint64_t *representativeBits = NULL, const std::vector<size_t> &cluKeyOffsets = std::vector<size_t>(), size_t firstKey = 0, size_t keyCount = 0);
@@ -221,8 +212,7 @@ public:
     static std::vector<size_t> getClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount, const std::string &firstKeyFile = "");
     // the entry keys in [keyBegin, keyEnd) of the parts <clu>.<node>, whose keys start at cluKeyOffsets, in key order
     static void readClusterKeys(const std::string &clu, const std::vector<size_t> &cluKeyOffsets, size_t keyBegin, size_t keyEnd, std::vector<DBKeyType> &keys);
-    // --createdb-mode 3 cluster databases: <clu>.index.<node> holds uint64 (key, offset) per entry in key order, then (DB_KEY_INVALID, data size)
-    // appends the data and (key, offset in the data of the thread) entries of every thread to dataFile and indexFile, which hold dataBytes and indexBytes, on all threads
+    // appends the data and (key, offset) entries of every thread to dataFile and indexFile of a cluster database, uint64 (key, offset) per entry in key order then (DB_KEY_INVALID, data size)
     static void writeClusterThreadParts(FILE *dataFile, const std::string &dataFileName, FILE *indexFile, const std::string &indexFileName,
                                         std::vector<std::string> &threadData, std::vector<std::vector<uint64_t> > &threadEntries, size_t &dataBytes, size_t &indexBytes);
     // writes the end entry (DB_KEY_INVALID, dataBytes) at indexBytes and closes dataFile and indexFile

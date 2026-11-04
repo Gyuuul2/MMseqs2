@@ -287,7 +287,7 @@ static void diagonalMaxScores(const T* queryProfile, const unsigned char* dbSequ
         }
     }
     for (int c = 0; c < vectorCount; c++) {
-        simdi_store((simd_int*) (maxScores + c * vectorSize), vMaxScore[c]);
+        simdi_storeu((simd_int*) (maxScores + c * vectorSize), vMaxScore[c]);
     }
 }
 
@@ -300,7 +300,7 @@ static void diagonalMaxScoresTwoGroups(const int8_t* queryProfile, const unsigne
         vScore[c] = vMaxScore[c] = simdi8_set(-128);
     }
     // an AVX2 vector straddles the two groups at lane 48
-    int8_t secondGroupBytes[VECSIZE_INT * 4] __attribute__((aligned(64)));
+    int8_t secondGroupBytes[VECSIZE_INT * 4];
     for (int lane = 0; lane < vectorSize; lane++) {
         secondGroupBytes[lane] = (lane >= DIAG_GROUP % vectorSize) ? -1 : 0;
     }
@@ -345,7 +345,7 @@ static void diagonalMaxScoresTwoGroups(const int8_t* queryProfile, const unsigne
         }
     }
     for (int c = 0; c < vectorCount; c++) {
-        simdi_store((simd_int*) (maxScores + c * vectorSize), vMaxScore[c]);
+        simdi_storeu((simd_int*) (maxScores + c * vectorSize), vMaxScore[c]);
     }
 }
 
@@ -372,8 +372,8 @@ unsigned short BlockAligner::bestDiagonal(Sequence* currentTarget, int minDiag, 
     const int endDiag = std::min(maxDiag + 1, queryLength);
     int64_t maxScore = -1;
     int maxDiagonal = 0;
-    int8_t maxScoresByte[2 * DIAG_GROUP + VECSIZE_INT * 4] __attribute__((aligned(64)));
-    int16_t maxScoresWord[DIAG_GROUP + VECSIZE_INT * 2] __attribute__((aligned(64)));
+    int8_t maxScoresByte[2 * DIAG_GROUP + VECSIZE_INT * 4];
+    int16_t maxScoresWord[DIAG_GROUP + VECSIZE_INT * 2];
     for (int d0 = std::max(minDiag, -(dbLength - 1)); d0 < endDiag;) {
         // profileRow[j + lane] subScores query position d0 + j + lane against dbSequence[j]
         const int dbStart = std::max(0, -(d0 + DIAG_GROUP - 1));

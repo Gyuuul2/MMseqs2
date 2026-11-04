@@ -126,7 +126,8 @@ void FileUtil::pwriteAll(int fd, const char *fileName, const char *data, size_t 
             continue;
         }
         if (count <= 0) {
-            Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
+            const int writeError = (count < 0) ? errno : 0;
+            Debug(Debug::ERROR) << "Cannot write " << fileName << " at offset " << offset + done << ": " << (writeError == 0 ? "no bytes written" : strerror(writeError)) << "\n";
             EXIT(EXIT_FAILURE);
         }
         done += count;
@@ -135,9 +136,10 @@ void FileUtil::pwriteAll(int fd, const char *fileName, const char *data, size_t 
 
 void FileUtil::punchHole(int fd, size_t offset, size_t size) {
 #ifdef FALLOC_FL_PUNCH_HOLE
-    if (size > 0) {
-        // a file system without hole punching keeps the blocks until the file is removed
-        (void) fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size);
+    static int warned = 0;
+    if (size > 0 && fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size) != 0 && errno == EOPNOTSUPP
+        && __sync_bool_compare_and_swap(&warned, 0, 1)) {
+        Debug(Debug::WARNING) << "Exchange files are not freed while read on this file system\n";
     }
 #else
     (void) fd; (void) offset; (void) size;

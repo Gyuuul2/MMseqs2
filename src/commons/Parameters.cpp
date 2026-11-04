@@ -177,7 +177,7 @@ Parameters::Parameters():
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_ITERATIONS(PARAM_LINCLUST_ITERATIONS_ID, "--linclust-iterations", "Linclust iterations", "k-mer matching rounds linclust2 and lin8clust run: 2 reclusters the first round representatives, 1 stops after the first round", typeid(int), (void *) &linclustIterations, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJACENCY_ALPH_SIZE(PARAM_ADJACENCY_ALPH_SIZE_ID, "--adjacency-alph-size", "Alphabet the adjacent residues are stored in", "Alphabet size the adjacent residues are stored and scored in, 0 keeps --alph-size", typeid(int), (void *) &adjacencyAlphabetSize, "^(0|[2-9]|1[0-9]|2[01])$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: take the alignment diagonal from the k-mer match\n1: find the best diagonal by an ungapped scan in align2clust", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: take the alignment diagonal from the k-mer match\n1: find the best diagonal by an ungapped scan in align2clust, kmermatcher runs on MPI rank 0 only", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ALIGN2CLUST_ALIGNER_MODE(PARAM_ALIGN2CLUST_ALIGNER_MODE_ID, "--align2clust-aligner-mode", "Align2clust aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: forward pass and traceback of several targets at once (SWIPE), also the seed extensions of the rep targets of mode 3 DBs", typeid(int), (void *) &align2clustAlignerMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ALIGNER_MODE(PARAM_ALIGNER_MODE_ID, "--aligner-mode", "Aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: SWIPE forward pass for full lane batches, then the same Farrar or block backward pass and traceback as mode 0", typeid(int), (void *) &alignerMode, "^[0-1]$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_KMER_POS_FILTER(PARAM_KMER_POS_FILTER_ID, "--kmer-pos-filter", "K-mer position filter", "Drop k-mer matches whose diagonal cannot reach the coverage", typeid(bool), (void *) &kmerPosFilter, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -671,10 +671,10 @@ Parameters::Parameters():
     createtsv.push_back(&PARAM_IDX_SEQ_SRC);
     createtsv.push_back(&PARAM_DB_OUTPUT);
     createtsv.push_back(&PARAM_PRELOAD_MODE);
+    createtsv.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     createtsv.push_back(&PARAM_THREADS);
     createtsv.push_back(&PARAM_COMPRESSED);
     createtsv.push_back(&PARAM_V);
-    createtsv.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
 
     //result2stats
     result2stats.push_back(&PARAM_STAT);

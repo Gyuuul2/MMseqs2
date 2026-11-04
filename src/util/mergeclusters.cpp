@@ -18,10 +18,6 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
     par.parseParameters(argc, argv, command, true, true, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
-        if (par.filenames.size() > 4) {
-            Debug(Debug::ERROR) << "mergeclusters merges at most two --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " clusterings\n";
-            EXIT(EXIT_FAILURE);
-        }
         DBReader<DBKeyType> dbr(par.hdr1.c_str(), (par.db1 + ".nodeinfo").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
         dbr.open(DBReader<DBKeyType>::NOSORT);
         const std::vector<size_t> nodeKeyOffsets = dbr.getNodeKeyOffsets(MMseqsNode::count);
