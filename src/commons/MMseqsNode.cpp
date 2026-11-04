@@ -560,7 +560,7 @@ void MMseqsNode::printPhaseValues(const std::string &values) {
     Debug(Debug::INFO) << output;
 }
 
-MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextItem(rank), itemsLeft(count, 0), nextNode((rank + 1) % count) {
+MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextItem(rank), nextOrderedItem(0), itemsLeft(count, 0), nextNode((rank + 1) % count) {
     for (size_t owner = 0; owner < count; owner++) {
         if (owner != rank && owner < itemCount) {
             itemsLeft[owner] = (itemCount - 1 - owner) / count + 1;
@@ -575,7 +575,7 @@ bool MMseqsNode::WorkQueue::claim(size_t item) {
     if (fd < 0 && errno == EEXIST) {
         return false;
     }
-    if (fd < 0 || close(fd) != 0) {
+    if (fd < 0 || write(fd, &rank, sizeof(rank)) != static_cast<ssize_t>(sizeof(rank)) || close(fd) != 0) {
         Debug(Debug::ERROR) << "Cannot create " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
@@ -605,6 +605,31 @@ size_t MMseqsNode::WorkQueue::claimNext() {
         itemsLeft[owner] = 0;
     }
     return itemCount;
+}
+
+size_t MMseqsNode::WorkQueue::claimInOrder() {
+    for (; nextOrderedItem < itemCount; nextOrderedItem++) {
+        if (claim(nextOrderedItem)) {
+            return nextOrderedItem++;
+        }
+    }
+    return itemCount;
+}
+
+unsigned int MMseqsNode::WorkQueue::getNode(size_t item) const {
+    unsigned int node = count;
+    const std::string file = name + "." + SSTR(item);
+    int fd = openFile(file);
+    if (fd < 0 && errno == ENOENT && isListed(file)) {
+        fd = openFile(file);
+    }
+    if (fd >= 0) {
+        if (pread(fd, &node, sizeof(node), 0) != static_cast<ssize_t>(sizeof(node))) {
+            node = count;
+        }
+        close(fd);
+    }
+    return node;
 }
 
 void MMseqsNode::WorkQueue::removeClaims() {

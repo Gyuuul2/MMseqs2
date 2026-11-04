@@ -107,8 +107,12 @@ public:
     class WorkQueue {
     public:
         WorkQueue(const std::string &name, size_t itemCount);
-        // the next item that this node has taken by creating <name>.<item> exclusively, itemCount once none is left
+        // the next item that this node has taken by creating <name>.<item> exclusively with its rank, itemCount once none is left
         size_t claimNext();
+        // the first item that no node has taken, for a queue that all nodes take in order, so its taken items are always the first ones
+        size_t claimInOrder();
+        // the node that took item, count while that is not readable
+        unsigned int getNode(size_t item) const;
         // removes <name>.<item> of the own items of this node, while no node takes items of the queue
         void removeClaims();
 
@@ -118,6 +122,7 @@ public:
         const std::string name;
         const size_t itemCount;
         size_t nextItem;
+        size_t nextOrderedItem;
         // the items of every other node not tried yet from the back, and the node to try next
         std::vector<size_t> itemsLeft;
         size_t nextNode;
