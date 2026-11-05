@@ -5,14 +5,18 @@
 #include "BatchReader.h"
 
 #include <cstddef>
+#include <cerrno>
 #include <cstring>
 #include <climits>
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
 
 #include <sys/stat.h>
+#include <dirent.h>
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/mman.h>
@@ -103,8 +107,14 @@ void FileUtil::deleteTempFiles(const std::list<std::string> &tmpFiles) {
 void FileUtil::preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset) {
     for (size_t done = 0; done < size;) {
         const ssize_t count = pread(fd, data + done, size - done, offset + done);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
         if (count <= 0) {
-            Debug(Debug::ERROR) << "Cannot read " << fileName << "\n";
+            const int readError = (count < 0) ? errno : 0;
+            Debug(Debug::ERROR) << "Cannot read " << fileName << " at offset " << offset + done
+                                << " (" << size - done << " bytes remaining): "
+                                << (readError == 0 ? "end of file" : strerror(readError)) << "\n";
             EXIT(EXIT_FAILURE);
         }
         done += count;
@@ -114,12 +124,28 @@ void FileUtil::preadAll(int fd, const char *fileName, char *data, size_t size, s
 void FileUtil::pwriteAll(int fd, const char *fileName, const char *data, size_t size, size_t offset) {
     for (size_t done = 0; done < size;) {
         const ssize_t count = pwrite(fd, data + done, size - done, offset + done);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
         if (count <= 0) {
-            Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
+            const int writeError = (count < 0) ? errno : 0;
+            Debug(Debug::ERROR) << "Cannot write " << fileName << " at offset " << offset + done << ": " << (writeError == 0 ? "no bytes written" : strerror(writeError)) << "\n";
             EXIT(EXIT_FAILURE);
         }
         done += count;
     }
+}
+
+void FileUtil::punchHole(int fd, size_t offset, size_t size) {
+#ifdef FALLOC_FL_PUNCH_HOLE
+    static int warned = 0;
+    if (size > 0 && fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size) != 0 && errno == EOPNOTSUPP
+        && __sync_bool_compare_and_swap(&warned, 0, 1)) {
+        Debug(Debug::WARNING) << "Exchange files are not freed while read on this file system\n";
+    }
+#else
+    (void) fd; (void) offset; (void) size;
+#endif
 }
 
 void FileUtil::writeFile(const std::string &pathToFile, const unsigned char *data, size_t len) {
@@ -138,6 +164,41 @@ void FileUtil::writeFile(const std::string &pathToFile, const unsigned char *dat
     if (close(fd) != 0) {
         Debug(Debug::ERROR) << "Error closing file " << pathToFile << "!\n";
         EXIT(EXIT_FAILURE);
+    }
+}
+
+// NFS caches that a name is missing; Lustre, GPFS and local file systems are coherent across machines, unknown storage counts as NFS
+bool FileUtil::needsDirectoryRefresh(const std::string &file) {
+    static std::mutex directoriesMutex;
+    static std::map<std::string, bool> directories;
+    const std::string directory = dirName(file);
+    std::lock_guard<std::mutex> lock(directoriesMutex);
+    std::map<std::string, bool>::const_iterator it = directories.find(directory);
+    if (it != directories.end()) {
+        return it->second;
+    }
+    bool needsRefresh = true;
+#ifdef __linux__
+    const int fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        return true;
+    }
+    const StorageKind storage = getStorageKind(fd);
+    close(fd);
+    needsRefresh = storage == STORAGE_NFS || storage == STORAGE_UNKNOWN;
+#endif
+    directories[directory] = needsRefresh;
+    return needsRefresh;
+}
+
+// opening a directory asks an NFS server for its state, so a name that this machine found missing before another machine wrote it is looked up again
+void FileUtil::refreshDirectory(const std::string &file) {
+    if (needsDirectoryRefresh(file) == false) {
+        return;
+    }
+    DIR *directory = opendir(dirName(file).c_str());
+    if (directory != NULL) {
+        closedir(directory);
     }
 }
 

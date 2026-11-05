@@ -36,8 +36,14 @@ public:
 
     static void preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset);
     static void pwriteAll(int fd, const char *fileName, const char *data, size_t size, size_t offset);
+    // frees the disk blocks of a read range nobody needs again; the fd must be open for writing
+    static void punchHole(int fd, size_t offset, size_t size);
 
     static std::string dirName(const std::string &file);
+
+    // whether polls for a file that another machine writes in the directory of file need refreshDirectory and the other NFS workarounds
+    static bool needsDirectoryRefresh(const std::string &file);
+    static void refreshDirectory(const std::string &file);
 
     static std::string baseName(const std::string &file);
 

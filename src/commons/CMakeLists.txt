@@ -2,6 +2,7 @@ set(commons_header_files
         commons/A3MReader.h
         commons/AminoAcidLookupTables.h
         commons/BacktraceTranslator.h
+        commons/BatchReader.h
         commons/ByteParser.h
         commons/CSProfile.h
         commons/CSProfile.cpp
@@ -20,7 +21,6 @@ set(commons_header_files
         commons/GpuUtil.h
         commons/HeaderSummarizer.h
         commons/IndexReader.h
-        commons/BatchReader.h
         commons/itoa.h
         commons/KSeqBufferReader.h
         commons/KSeqWrapper.h
@@ -55,6 +55,7 @@ set(commons_source_files
         commons/A3MReader.cpp
         commons/Application.cpp
         commons/BaseMatrix.cpp
+        commons/BatchReader.cpp
         commons/Command.cpp
         commons/CommandCaller.cpp
         commons/DBConcat.cpp
@@ -66,7 +67,6 @@ set(commons_source_files
         commons/FileUtil.cpp
         commons/GpuUtil.cpp
         commons/HeaderSummarizer.cpp
-        commons/BatchReader.cpp
         commons/KSeqWrapper.cpp
         commons/LambdaCalculation.cpp
         commons/Masker.cpp

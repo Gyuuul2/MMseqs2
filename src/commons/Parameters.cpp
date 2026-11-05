@@ -5,6 +5,7 @@
 #include "CommandCaller.h"
 #include "ByteParser.h"
 #include "FileUtil.h"
+#include "MMseqsNode.h"
 
 #include <map>
 #include <iomanip>
@@ -26,6 +27,9 @@
 #ifdef OPENMP
 #include <omp.h>
 #endif
+
+// how long a step on several machines waits for an input that a step before it wrote on another machine
+static const int INPUT_LATENCY_SECONDS = 120;
 
 Parameters* Parameters::instance = NULL;
 
@@ -173,7 +177,9 @@ Parameters::Parameters():
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_ITERATIONS(PARAM_LINCLUST_ITERATIONS_ID, "--linclust-iterations", "Linclust iterations", "k-mer matching rounds linclust2 and lin8clust run: 2 reclusters the first round representatives, 1 stops after the first round", typeid(int), (void *) &linclustIterations, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJACENCY_ALPH_SIZE(PARAM_ADJACENCY_ALPH_SIZE_ID, "--adjacency-alph-size", "Alphabet the adjacent residues are stored in", "Alphabet size the adjacent residues are stored and scored in, 0 keeps --alph-size", typeid(int), (void *) &adjacencyAlphabetSize, "^(0|[2-9]|1[0-9]|2[01])$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: take the alignment diagonal from the k-mer match\n1: find the best diagonal by an ungapped scan in align2clust", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: take the alignment diagonal from the k-mer match\n1: find the best diagonal by an ungapped scan in align2clust, kmermatcher runs on MPI rank 0 only", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_ALIGN2CLUST_ALIGNER_MODE(PARAM_ALIGN2CLUST_ALIGNER_MODE_ID, "--align2clust-aligner-mode", "Align2clust aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: forward pass and traceback of several targets at once (SWIPE), also the seed extensions of the rep targets of mode 3 DBs", typeid(int), (void *) &align2clustAlignerMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_ALIGNER_MODE(PARAM_ALIGNER_MODE_ID, "--aligner-mode", "Aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: SWIPE forward pass for full lane batches, then the same Farrar or block backward pass and traceback as mode 0", typeid(int), (void *) &alignerMode, "^[0-1]$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_KMER_POS_FILTER(PARAM_KMER_POS_FILTER_ID, "--kmer-pos-filter", "K-mer position filter", "Drop k-mer matches whose diagonal cannot reach the coverage", typeid(bool), (void *) &kmerPosFilter, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
@@ -431,6 +437,7 @@ Parameters::Parameters():
     align.push_back(&PARAM_SUB_MAT);
     align.push_back(&PARAM_ADD_BACKTRACE);
     align.push_back(&PARAM_ALIGNMENT_MODE);
+    align.push_back(&PARAM_ALIGNER_MODE);
     align.push_back(&PARAM_ALIGNMENT_OUTPUT_MODE);
     align.push_back(&PARAM_WRAPPED_SCORING);
     align.push_back(&PARAM_E);
@@ -486,6 +493,7 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_LOCAL_DB_DIR);
     align2clust.push_back(&PARAM_INCLUDE_ALIGN_FILES);
     align2clust.push_back(&PARAM_DIAGONAL_MODE);
+    align2clust.push_back(&PARAM_ALIGN2CLUST_ALIGNER_MODE);
 
     // prefilter
     prefilter.push_back(&PARAM_SUB_MAT);
@@ -666,10 +674,10 @@ Parameters::Parameters():
     createtsv.push_back(&PARAM_IDX_SEQ_SRC);
     createtsv.push_back(&PARAM_DB_OUTPUT);
     createtsv.push_back(&PARAM_PRELOAD_MODE);
+    createtsv.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     createtsv.push_back(&PARAM_THREADS);
     createtsv.push_back(&PARAM_COMPRESSED);
     createtsv.push_back(&PARAM_V);
-    createtsv.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
 
     //result2stats
     result2stats.push_back(&PARAM_STAT);
@@ -1558,6 +1566,7 @@ Parameters::Parameters():
     // lin8clust workflow
     lin8clustworkflow = removeParameter(linclustworkflow, PARAM_RUNNER);
     lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_DIAGONAL_MODE);
+    lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_ALIGNER_MODE);
     lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_LINCLUST_VERSION);
     lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_KMER_POS_FILTER);
     lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_INCLUDE_COUNTTABLE);
@@ -2373,7 +2382,16 @@ void Parameters::checkIfDatabaseIsValid(const Command& command, int argc, const 
                     continue;
                 }
 
-                if (filenames[fileIdx] != "stdin" && FileUtil::fileExists((filenames[fileIdx]).c_str()) == false && FileUtil::fileExists((filenames[fileIdx] + ".dbtype").c_str()) == false) {
+                const auto isMissing = [&]() {
+                    FileUtil::refreshDirectory(filenames[fileIdx]);
+                    return filenames[fileIdx] != "stdin" && FileUtil::fileExists((filenames[fileIdx]).c_str()) == false && FileUtil::fileExists((filenames[fileIdx] + ".dbtype").c_str()) == false;
+                };
+                // a step on another machine may have written the input; like --latency-wait of Snakemake and exitReadTimeout of Nextflow
+                const char *stepTasks = getenv("SLURM_STEP_NUM_TASKS");
+                for (int second = 0; stepTasks != NULL && atoi(stepTasks) > 1 && second < INPUT_LATENCY_SECONDS && isMissing(); second++) {
+                    sleep(1);
+                }
+                if (isMissing()) {
                     regex_t regex;
                     compileRegex(&regex, "[a-zA-Z][a-zA-Z0-9+-.]*:\\/\\/");
                     int nomatch = regexec(&regex, filenames[fileIdx].c_str(), 0, NULL, 0);
@@ -2460,7 +2478,7 @@ void Parameters::checkIfDatabaseIsValid(const Command& command, int argc, const 
 
 void Parameters::printParameters(const std::string &module, int argc, const char* pargv[],
                                  const std::vector<MMseqsParameter*> &par){
-    if (Debug::debugLevel < Debug::INFO) {
+    if (Debug::debugLevel < Debug::INFO || MMseqsNode::isMaster() == false) {
         return;
     }
 
@@ -2854,6 +2872,8 @@ void Parameters::setDefaults() {
     linclustIterations = 2;
     adjacencyAlphabetSize = 21;
     diagonalMode = DIAGONAL_MODE_KMER;
+    align2clustAlignerMode = ALIGNER_MODE_DEFAULT;
+    alignerMode = ALIGNER_MODE_DEFAULT;
     kmerPosFilter = true;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;
