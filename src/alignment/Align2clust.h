@@ -73,6 +73,8 @@ extern std::atomic<size_t> swipeTargetLongPairs;
 extern std::atomic<size_t> swipeByteLaneRows;
 extern std::atomic<size_t> swipeByteSlotRows;
 extern std::atomic<size_t> swipeRerunPairs;
+extern std::atomic<size_t> swipeMemberNanos[5];
+extern std::atomic<size_t> swipeTargetNanos[5];
 
 // per thread buffers of --align2clust-aligner-mode 1: the cluster members of a rep that go through the SWIPE lanes
 struct SwipeBatch {
@@ -188,6 +190,9 @@ struct SwipeTargets {
             swipeByteLaneRows += extender.extendByteLaneRows;
             swipeByteSlotRows += extender.extendByteSlotRows;
             swipeRerunPairs += extender.extendRerunJobs;
+            for (int i = 0; i < 5; i++) {
+                swipeMemberNanos[i] += extender.extendNanos[i];
+            }
             return;
         }
         swipeTargetPairs += targetPairs;
@@ -197,6 +202,9 @@ struct SwipeTargets {
         swipeByteLaneRows += extender.extendByteLaneRows;
         swipeByteSlotRows += extender.extendByteSlotRows;
         swipeRerunPairs += extender.extendRerunJobs;
+        for (int i = 0; i < 5; i++) {
+            swipeTargetNanos[i] += extender.extendNanos[i];
+        }
     }
 
     void addTarget(Sequence &query, Sequence &target, DBKeyType targetKey, int seedQuery, int seedTarget) {

@@ -119,6 +119,9 @@ public:
     size_t extendByteSlotRows;
     size_t extendLongJobs;
     size_t extendRerunJobs;
+    // nanoseconds of the lane loads and finishes with backtrace, and of every SWIPE_TIMER_ROWS-th row times it in cell scores, cells,
+    // lane bookkeeping and the trace of long extensions
+    size_t extendNanos[5];
 
 private:
     struct ExtendJob {
@@ -131,6 +134,9 @@ private:
         // in 16 bit lanes
         bool wide;
     };
+
+    // the nanoseconds of a clock read
+    long long timerNanos;
 
     template <typename T>
     void extendBand(const ExtendJob *jobs, size_t jobCount, bool backward, int xDrop, const unsigned char *const *targets, const int *targetLengths,

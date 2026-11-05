@@ -300,6 +300,9 @@ std::atomic<size_t> swipeTargetLongPairs(0);
 std::atomic<size_t> swipeByteLaneRows(0);
 std::atomic<size_t> swipeByteSlotRows(0);
 std::atomic<size_t> swipeRerunPairs(0);
+// the SwipeExtender::extendNanos of the member and the target extensions
+std::atomic<size_t> swipeMemberNanos[5];
+std::atomic<size_t> swipeTargetNanos[5];
 
 static void printSwipeLanes() {
     Debug(Debug::INFO) << "SWIPE member gapped alignments: " << swipeLanePairs.load() << " in lanes ("

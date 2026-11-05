@@ -3525,6 +3525,12 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     return memberCount;
 }
 
+// the extension seconds of all threads by section, SwipeExtender::extendNanos
+static std::string formatSwipeNanos(const std::atomic<size_t> *nanos) {
+    return SSTR(nanos[0].load() / 1e9) + " lane loads and finishes, " + SSTR(nanos[1].load() / 1e9) + " cell scores, " + SSTR(nanos[2].load() / 1e9) + " cells, "
+           + SSTR(nanos[3].load() / 1e9) + " lane bookkeeping, " + SSTR(nanos[4].load() / 1e9) + " long traces";
+}
+
 // --createdb-mode 3: the nodes align the reps of their targets while the master clusters
 int align2clustLinfinity(Parameters &par) {
     Timer timer;
@@ -3703,10 +3709,12 @@ int align2clustLinfinity(Parameters &par) {
             if (swipeMemberExtensions.load() > 0) {
                 MMseqsNode::addPhaseValue(phaseValues, "SWIPE member extensions", SSTR(swipeMemberExtensions.load()) + " in lanes ("
                                          + SSTR(swipeMemberLaneRows.load() * 100 / std::max<size_t>(1, swipeMemberSlotRows.load())) + "% active lane rows)");
+                MMseqsNode::addPhaseValue(phaseValues, "SWIPE member extension seconds", formatSwipeNanos(swipeMemberNanos));
             }
             MMseqsNode::addPhaseValue(phaseValues, "SWIPE target alignments", SSTR(swipeTargetPairs.load()) + " in lanes ("
                                      + SSTR(swipeTargetLaneRows.load() * 100 / std::max<size_t>(1, swipeTargetSlotRows.load()))
                                      + "% active lane rows), " + SSTR(swipeTargetLongPairs.load()) + " long extensions");
+            MMseqsNode::addPhaseValue(phaseValues, "SWIPE target extension seconds", formatSwipeNanos(swipeTargetNanos));
             MMseqsNode::addPhaseValue(phaseValues, "SWIPE extensions in 8 bit lanes", SSTR(swipeByteSlotRows.load() * 100 / std::max<size_t>(1, swipeMemberSlotRows.load() + swipeTargetSlotRows.load()))
                                      + "% of the lane rows (" + SSTR(swipeByteLaneRows.load() * 100 / std::max<size_t>(1, swipeByteSlotRows.load())) + "% active), "
                                      + SSTR(swipeRerunPairs.load()) + " again in 16 bit lanes");

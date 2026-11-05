@@ -4,6 +4,7 @@
 #include "Debug.h"
 
 #include <algorithm>
+#include <chrono>
 
 template <typename T>
 struct SwipeLanes;
@@ -728,6 +729,12 @@ static const int SWIPE_SCORE_ROW = 32;
 static const int SWIPE_MAX_WIDTH = 4096;
 // the band cells of a lane in the trace of the last rows of SwipeExtender, the same on every ISA
 static const size_t SWIPE_MAX_TRACE_CELLS = 4 * 1024 * 1024;
+// the rows of SwipeExtender that time their sections
+static const size_t SWIPE_TIMER_ROWS = 16;
+
+static inline size_t swipeNanos() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 // a where the bits of mask are set and b elsewhere, whole lanes on x86; NEON selects without the sign spread of every byte of simdi8_blend
 static inline simd_int laneSelect(simd_int mask, simd_int a, simd_int b) {
@@ -960,7 +967,7 @@ inline void laneCellScores<uint8_t>(const unsigned char *const *letters, const i
 #undef SWIPE_WIDEN
 
 SwipeExtender::SwipeExtender(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend)
-    : extendLaneRows(0), extendSlotRows(0), extendByteLaneRows(0), extendByteSlotRows(0), extendLongJobs(0), extendRerunJobs(0),
+    : extendLaneRows(0), extendSlotRows(0), extendByteLaneRows(0), extendByteSlotRows(0), extendLongJobs(0), extendRerunJobs(0), extendNanos(), timerNanos(0),
       subMat(subMat), aaBiasCorrection(aaBiasCorrection), aaBiasCorrectionScale(aaBiasCorrectionScale), gapOpen(gapOpen), gapExtend(gapExtend), matrixBias(0),
       band(NULL), bandCapacity(0), trace(NULL), traceCapacity(0), laneTargets(ExtendLanes<uint8_t>::COUNT), laneTraces(ExtendLanes<uint8_t>::COUNT) {
     const int alphabetSize = subMat->alphabetSize;
@@ -969,6 +976,11 @@ SwipeExtender::SwipeExtender(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCo
         EXIT(EXIT_FAILURE);
     }
     tmpBias = new float[maxSeqLen + 1];
+    const size_t timerStart = swipeNanos();
+    for (int i = 0; i < 1000; i++) {
+        swipeNanos();
+    }
+    timerNanos = (swipeNanos() - timerStart) / 1001;
     scoreRows = new int8_t[SWIPE_SCORE_ROW * SWIPE_SCORE_ROW];
     for (int a = 0; a < SWIPE_SCORE_ROW; a++) {
         for (int t = 0; t < SWIPE_SCORE_ROW; t++) {
@@ -1070,6 +1082,9 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
     }
     size_t next = 0;
     size_t step = 0;
+    const auto nanosSince = [&](size_t start) {
+        return static_cast<size_t>(std::max(0LL, static_cast<long long>(swipeNanos() - start) - timerNanos));
+    };
 
     const auto load = [&](int l, const ExtendJob &job) {
         const int targetLength = targetLengths[job.id];
@@ -1192,6 +1207,9 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
     int validBegin = 0;
     int validEnd = width;
     while (true) {
+        const bool timed = (extendSlotRows / lanes) % SWIPE_TIMER_ROWS == 0;
+        const size_t rowStart = timed ? swipeNanos() : 0;
+        const size_t rowLoadNanos = extendNanos[0];
         if (step >= fullStep) {
             // a free lane takes the next job; the band columns of any active lane, the others are not read, and the ones of all lanes, which skip the mask
             fullStep = SIZE_MAX;
@@ -1208,11 +1226,15 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
                         if (next == jobCount) {
                             break;
                         }
+                        const size_t loadStart = swipeNanos();
                         load(l, jobs[next++]);
+                        extendNanos[0] += nanosSince(loadStart);
                     }
                     const int i = laneRows[l];
                     if (i >= laneEnds[l]) {
+                        const size_t finishStart = swipeNanos();
                         finish(l);
+                        extendNanos[0] += nanosSince(finishStart);
                         continue;
                     }
                     const int lo = std::max(0, columnBeginRows[l] - i);
@@ -1292,6 +1314,7 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
         simd_int vEdgeLeft = simdi_loadu(reinterpret_cast<const simd_int *>(edgeLefts));
         simd_int vEdgeRight = simdi_loadu(reinterpret_cast<const simd_int *>(edgeRights));
         simd_int *traceRow = trace + step % traceSteps * traceWidth;
+        const size_t traceStart = timed ? swipeNanos() : 0;
         // a lane keeps its row of the trace that this row overwrites, none before traceStep
         for (int l = 0; step >= traceStep && l < lanes; l++) {
             if (laneJobs[l] != NULL && step - laneStarts[l] >= traceSteps) {
@@ -1302,11 +1325,13 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
                 }
             }
         }
+        const size_t cellStart = timed ? swipeNanos() : 0;
         simd_int codes = vZero;
         simd_int vHl = vZero;
         simd_int vE = vZero;
         simd_int vRowMax = vZero;
-        int kb = columnBegin / block * block;
+        const int firstBlock = columnBegin / block * block;
+        int kb = firstBlock;
         simd_int vPos = vZero;
         simd_int vK = V::set(kb + V::COLUMN_BIAS);
         simd_int hDiag = hRow[kb];
@@ -1367,6 +1392,7 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
                 traceRow[width / codesPerLane] = codes;
             }
         }
+        const size_t bookkeepingStart = timed ? swipeNanos() : 0;
         // ties go to the larger target position, then the later row, so an extension ends at the farthest cell of its best score; BlockAligner does so only within the step that raised it
         if (simd_any(simdi_andnot(V::gt(vBest, vRowMax), vActive))) {
             simdi_storeu(reinterpret_cast<simd_int *>(rowMax), vRowMax);
@@ -1415,12 +1441,29 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
                     extendRerunJobs++;
                     fullStep = step + 1;
                 } else if (laneFlags[l] != 0) {
+                    const size_t finishStart = swipeNanos();
                     finish(l);
+                    extendNanos[0] += nanosSince(finishStart);
                     fullStep = step + 1;
                 }
             }
         }
         step++;
+        if (timed) {
+            const size_t rowEnd = swipeNanos();
+            // the cell scores of the row again, as they mix with the cells
+            for (int b = firstBlock; b < columnEnd; b += block) {
+                laneCellScores<T>(letters, rows, scoreAdds, b, scores);
+            }
+            // every section holds one clock read, the cells hold the cell scores
+            const long long scoreNanos = swipeNanos() - rowEnd;
+            const long long sections[4] = {scoreNanos - timerNanos, static_cast<long long>(bookkeepingStart - cellStart) - scoreNanos,
+                                           static_cast<long long>(traceStart - rowStart + rowEnd - bookkeepingStart - (extendNanos[0] - rowLoadNanos)) - 2 * timerNanos,
+                                           static_cast<long long>(cellStart - traceStart) - timerNanos};
+            for (int i = 0; i < 4; i++) {
+                extendNanos[i + 1] += SWIPE_TIMER_ROWS * std::max(0LL, sections[i]);
+            }
+        }
     }
 }
 
