@@ -19,6 +19,13 @@
 #define SIZE_T_MAX ((size_t) -1)
 #endif
 
+#include <sys/resource.h>
+struct ProfSeg { double wall = 0, cpu = 0; };
+static double profCpu() { struct rusage u; getrusage(RUSAGE_SELF, &u); return u.ru_utime.tv_sec + u.ru_utime.tv_usec * 1e-6 + u.ru_stime.tv_sec + u.ru_stime.tv_usec * 1e-6; }
+struct ProfScope { ProfSeg &seg; Timer t; double c0; ProfScope(ProfSeg &s) : seg(s), c0(profCpu()) {} ~ProfScope() { seg.wall += t.getTimediff(); seg.cpu += profCpu() - c0; } };
+static ProfSeg profPlan, profDecode, profMerge, profFlush, profPunch, profRead, profSendLoad, profSendWrite;
+static void profPrint(std::string &v, const char *n, const ProfSeg &s) { MMseqsNode::addPhaseValue(v, std::string("PROF ") + n, SSTR(s.wall) + " s wall " + SSTR(s.cpu) + " s cpu " + SSTR(s.wall > 0 ? s.cpu / s.wall : 0) + " cores"); }
+
 static const size_t KMER_FILE_BUFFER_SIZE = 16 * 1024 * 1024;
 // the writes that wait for the file system while the threads go on take the memory limit divided by this
 static const size_t WRITE_BEHIND_MEMORY_DIVISOR = 8;
@@ -1908,6 +1915,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                 getPassRows(exchange, received.fileRows, passFirstHashSubRange, received.passHashSubRangeOffsets[pass + 1], passRows[passCodeBuffer], passRowOffsets[passCodeBuffer]);
             } else {
                 Timer readTimer;
+                ProfScope profScope(profRead);
                 if (isPrefetched == false) {
                     readPass(received, pass, passCodeBuffer, false);
                 } else {
@@ -1917,6 +1925,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
             }
             // the last pass takes the next hash range, so its first pass is read while this one is merged
             if (pass + 1 == passCount) {
+                ProfScope profScope(profPlan);
                 nextHashRange = takeHashRange();
                 if (nextHashRange < exchange.hashRangeCount) {
                     planHashRange(nextReceived, nextHashRange);
@@ -1937,6 +1946,9 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
             const auto isWholeSequenceHashSubRange = [&](size_t passHashSubRange) {
                 return passFirstHashSubRange + passHashSubRange >= exchange.hashSubRangesPerRange;
             };
+            ProfSeg *profCurrent = &profDecode;
+            Timer profT; double profC = profCpu();
+            const auto profSwitch = [&](ProfSeg &next) { profCurrent->wall += profT.getTimediff(); profCurrent->cpu += profCpu() - profC; profT.reset(); profC = profCpu(); profCurrent = &next; };
             std::vector<size_t> hashSubRangeChunkOffsets(passHashSubRanges + 1, 0);
             // the chunk starts of a hash sub range: a start per row for every chunk and then the end of every row
             std::vector<size_t> chunkStartOffsets(passHashSubRanges + 1, 0);
@@ -2021,7 +2033,9 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
             std::vector<std::vector<KmerChunkStart> > chunkResumes(passChunks);
             std::vector<char> chunkStops(passChunks, CHUNK_DONE);
             std::vector<size_t> tooBigChunks;
+            profSwitch(profMerge);
             for (bool isAlone = false; roundChunks.empty() == false;) {
+                profSwitch(profMerge);
 #pragma omp parallel num_threads(isAlone ? 1 : par.threads)
                 {
                     unsigned int thread_idx = 0;
@@ -2295,6 +2309,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                 }
                 // the output is full, or the chunks that go on alone start with an empty output
                 isAlone = fullChunks.empty();
+                profSwitch(profFlush);
                 if (isAlone == false || tooBigChunks.empty() == false) {
                     flushPairOutput(exchange, pairFile, output, outputBlocks, pairWriteBuffer, par.threads);
                 }
@@ -2304,7 +2319,9 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                     tooBigChunks.clear();
                 }
             }
+            profSwitch(profMerge);
         }
+        ProfScope profPunchScope(profPunch);
         // the receiving node of the hash range is the only reader of its codes; the pairs of the own merge send ranges take the memory of the own rows
         std::vector<PassRow> hashRangeRows;
         std::vector<size_t> hashRangeRowOffsets;
@@ -2318,6 +2335,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     closeReceivedFiles(receivedFiles);
     batchWriter.waitWrites();
     MMseqsNode::addPhaseSeconds(receiveValues, "waiting to read k-mers", readWaitSeconds);
+    profPrint(receiveValues, "read", profRead); profPrint(receiveValues, "plan", profPlan); profPrint(receiveValues, "decode", profDecode); profPrint(receiveValues, "merge", profMerge); profPrint(receiveValues, "flush", profFlush); profPrint(receiveValues, "punch", profPunch);
     MMseqsNode::addPhaseSeconds(receiveValues, "waiting to write pairs", batchWriter.getWaitSeconds() / par.threads);
     MMseqsNode::addPhaseValue(receiveValues, "Pair flushes", SSTR(output.flushes));
     MMseqsNode::addPhaseValue(receiveValues, "Pair bytes kept in memory", SSTR(ownPairs.bytes));
