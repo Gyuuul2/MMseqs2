@@ -93,6 +93,9 @@ void MMseqsNode::sleepBeforePoll(unsigned int polls, unsigned int maxShift) {
 // saw missing is answered from its cache for up to 60 s (Nextflow lists the work directory before it reads .exitcode, too); a listing refreshes
 // the directory for all threads, so a process lists at most once a second and treats a file as not listed in between
 static bool isListed(const std::string &file) {
+    if (FileUtil::needsDirectoryRefresh(file) == false) {
+        return false;
+    }
     static time_t lastListing = 0;
     const time_t now = time(NULL);
     const time_t last = __atomic_load_n(&lastListing, __ATOMIC_RELAXED);
@@ -124,24 +127,25 @@ static int openFile(const std::string &file, int flags = O_RDONLY) {
 
 // the content of file, or an empty string while it is not published; NFS only promises that open sees the latest state of a file that
 // exists, a name it found missing can stay missing, so a poll creates the empty file that the rename of the publish replaces; a file
-// that a later publish replaces while it is read fails with ESTALE and is read again by the next poll
+// that a later publish replaces while it is read fails with ESTALE and is read again by the next poll; other file systems see the rename at once
 static std::string readPolledFile(const std::string &file) {
-    int fd = openFile(file, O_RDONLY | O_CREAT);
+    const int flags = FileUtil::needsDirectoryRefresh(file) ? (O_RDONLY | O_CREAT) : O_RDONLY;
+    int fd = openFile(file, flags);
     int openError = (fd < 0) ? errno : 0;
     // with O_CREAT, ENOENT means that the directory does not exist on this machine, or that NFS still remembers it missing
     const time_t start = time(NULL);
-    for (unsigned int polls = 0; openError == ENOENT; polls++) {
+    for (unsigned int polls = 0; openError == ENOENT && (flags & O_CREAT) != 0; polls++) {
         if (time(NULL) - start >= DIRECTORY_WAIT_SECONDS) {
             Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(openError) << ". Its directory must be shared by all nodes\n";
             EXIT(EXIT_FAILURE);
         }
         MMseqsNode::sleepBeforePoll(polls, 7);
         FileUtil::refreshDirectory(FileUtil::dirName(file));
-        fd = openFile(file, O_RDONLY | O_CREAT);
+        fd = openFile(file, flags);
         openError = (fd < 0) ? errno : 0;
     }
     if (fd < 0) {
-        if (openError == ESTALE) {
+        if (openError == ESTALE || openError == ENOENT) {
             return std::string();
         }
         Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(openError) << "\n";

@@ -9,6 +9,8 @@
 #include <cstring>
 #include <climits>
 #include <algorithm>
+#include <map>
+#include <mutex>
 #include <stdio.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -165,8 +167,35 @@ void FileUtil::writeFile(const std::string &pathToFile, const unsigned char *dat
     }
 }
 
+// NFS caches that a name is missing; Lustre, GPFS and local file systems are coherent across machines, unknown storage counts as NFS
+bool FileUtil::needsDirectoryRefresh(const std::string &file) {
+    static std::mutex directoriesMutex;
+    static std::map<std::string, bool> directories;
+    const std::string directory = dirName(file);
+    std::lock_guard<std::mutex> lock(directoriesMutex);
+    std::map<std::string, bool>::const_iterator it = directories.find(directory);
+    if (it != directories.end()) {
+        return it->second;
+    }
+    bool needsRefresh = true;
+#ifdef __linux__
+    const int fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) {
+        return true;
+    }
+    const StorageKind storage = getStorageKind(fd);
+    close(fd);
+    needsRefresh = storage == STORAGE_NFS || storage == STORAGE_UNKNOWN;
+#endif
+    directories[directory] = needsRefresh;
+    return needsRefresh;
+}
+
 // opening a directory asks an NFS server for its state, so a name that this machine found missing before another machine wrote it is looked up again
 void FileUtil::refreshDirectory(const std::string &file) {
+    if (needsDirectoryRefresh(file) == false) {
+        return;
+    }
     DIR *directory = opendir(dirName(file).c_str());
     if (directory != NULL) {
         closedir(directory);

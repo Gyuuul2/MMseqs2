@@ -41,6 +41,8 @@ public:
 
     static std::string dirName(const std::string &file);
 
+    // whether polls for a file that another machine writes in the directory of file need refreshDirectory and the other NFS workarounds
+    static bool needsDirectoryRefresh(const std::string &file);
     static void refreshDirectory(const std::string &file);
 
     static std::string baseName(const std::string &file);

@@ -4937,7 +4937,8 @@ static int align2clustLinfinity(Parameters &par) {
     std::string seqDb = par.db1;
     std::vector<std::string> localCopies;
     size_t localCopyMemory = 0;
-    if (par.localDbDir.empty() == false) {
+    // a master that only clusters reads the index, not the sequences
+    if (par.localDbDir.empty() == false && MMseqsNode::rank >= getFirstAlignNode()) {
         seqDb = FileUtil::copyToLocalDir(par.db1, par.localDbDir + "/" + FileUtil::baseName(par.db3) + "." + SSTR(MMseqsNode::rank), par.threads, localCopies, localCopyMemory);
         MMseqsNode::addPhaseTime(phaseValues, "copying the sequences to --local-db-dir", phaseValueTimer);
     }
