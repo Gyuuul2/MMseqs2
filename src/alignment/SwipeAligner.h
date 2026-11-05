@@ -55,13 +55,18 @@ private:
     std::vector<int8_t> bias;
     float *tmpBias;
 
-    // per query letter, the scores of the target letters 0-15 and 16-31 for 8 bit lanes and biased by 64 for 16 bit lanes
+    // minus the lowest score, and the bias that makes the 8 bit scores non-negative with the composition bias, as SSW profile->bias
+    int matrixBias;
+    int byteBias;
+
+    // per query letter, the scores of the target letters 0-15 and 16-31 biased by matrixBias for 8 bit lanes and by 64 for 16 bit lanes
     simd_int *scoreLo8;
     simd_int *scoreHi8;
     simd_int *scoreLo16;
     simd_int *scoreHi16;
 
     size_t capacity;
+    // the composition bias of the query rows, less its lowest value below 0 for 8 bit lanes and less 64 for 16 bit lanes
     simd_int *rowBias8;
     simd_int *rowBias16;
     // 64 - composition bias of the query rows, subtracted with saturation from the 16 bit scores biased by 64

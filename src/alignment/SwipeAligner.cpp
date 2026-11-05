@@ -8,16 +8,18 @@
 template <typename T>
 struct SwipeLanes;
 
+// 8 bit lanes are unsigned with scores biased by byteBias like SSW sw_sse2_byte, so they reach UINT8_MAX - byteBias
 template <>
-struct SwipeLanes<int8_t> {
+struct SwipeLanes<uint8_t> {
     static const int COUNT = VECSIZE_INT * 4;
-    static const int MAX = INT8_MAX;
+    static const int MAX = UINT8_MAX;
     static inline simd_int set(int x) { return simdi8_set(static_cast<char>(x)); }
-    static inline simd_int adds(simd_int a, simd_int b) { return simdi8_adds(a, b); }
-    static inline simd_int max(simd_int a, simd_int b) { return simdi8_max(a, b); }
-    static inline simd_int gt(simd_int a, simd_int b) { return simdi8_gt(a, b); }
+    static inline simd_int addScore(simd_int a, simd_int b, simd_int bias) { return simdui8_subs(simdui8_adds(a, b), bias); }
+    static inline simd_int subs(simd_int a, simd_int b) { return simdui8_subs(a, b); }
+    static inline simd_int max(simd_int a, simd_int b) { return simdui8_max(a, b); }
+    static inline simd_int gt(simd_int a, simd_int b) { return simdi8_gt(simdi_xor(a, simdi8_set(-128)), simdi_xor(b, simdi8_set(-128))); }
     static inline simd_int eq(simd_int a, simd_int b) { return simdi8_eq(a, b); }
-    static inline simd_int addBias(simd_int a, simd_int b) { return simdi8_adds(a, b); }
+    static inline simd_int addBias(simd_int a, simd_int b) { return simdui8_adds(a, b); }
 };
 
 template <>
@@ -25,7 +27,8 @@ struct SwipeLanes<int16_t> {
     static const int COUNT = VECSIZE_INT * 2;
     static const int MAX = INT16_MAX;
     static inline simd_int set(int x) { return simdi16_set(static_cast<short>(x)); }
-    static inline simd_int adds(simd_int a, simd_int b) { return simdi16_adds(a, b); }
+    static inline simd_int addScore(simd_int a, simd_int b, simd_int) { return simdi16_max(simdi16_adds(a, b), simdi_setzero()); }
+    static inline simd_int subs(simd_int a, simd_int b) { return simdi16_subs(a, b); }
     static inline simd_int max(simd_int a, simd_int b) { return simdi16_max(a, b); }
     static inline simd_int gt(simd_int a, simd_int b) { return simdi16_gt(a, b); }
     static inline simd_int eq(simd_int a, simd_int b) { return simdi16_eq(a, b); }
@@ -92,7 +95,7 @@ static void reserveVectors(simd_int *&buffer, size_t &capacity, size_t size) {
 
 SwipeAligner::SwipeAligner(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend)
     : subMat(subMat), alphabetSize(subMat->alphabetSize), aaBiasCorrection(aaBiasCorrection), aaBiasCorrectionScale(aaBiasCorrectionScale),
-      gapOpen(gapOpen), gapExtend(gapExtend), queryLength(0), capacity(0), rowBias8(NULL), rowBias16(NULL), rowSub16(NULL), rowIndex(NULL),
+      gapOpen(gapOpen), gapExtend(gapExtend), queryLength(0), matrixBias(0), byteBias(0), capacity(0), rowBias8(NULL), rowBias16(NULL), rowSub16(NULL), rowIndex(NULL),
       hColumn(NULL), eColumn(NULL), ring(NULL), ringCapacity(0), band(NULL), bandCapacity(0), trace(NULL), traceCapacity(0) {
     if (alphabetSize > 32) {
         Debug(Debug::ERROR) << "SWIPE supports alphabets of at most 32 letters\n";
@@ -106,14 +109,19 @@ SwipeAligner::SwipeAligner(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorr
     scoreHi16 = malloc_simd_int(alphabetSize * sizeof(simd_int));
     const int bytes = sizeof(simd_int);
     for (int a = 0; a < alphabetSize; a++) {
+        for (int b = 0; b < alphabetSize; b++) {
+            matrixBias = std::max(matrixBias, -static_cast<int>(subMat->subMatrix[a][b]));
+        }
+    }
+    for (int a = 0; a < alphabetSize; a++) {
         unsigned char lo8[sizeof(simd_int)], hi8[sizeof(simd_int)], lo16[sizeof(simd_int)], hi16[sizeof(simd_int)];
         for (int p = 0; p < bytes; p++) {
             const int bLo = p % 16;
             const int bHi = 16 + p % 16;
             const int sLo = (bLo < alphabetSize) ? subMat->subMatrix[bLo][a] : 0;
             const int sHi = (bHi < alphabetSize) ? subMat->subMatrix[bHi][a] : 0;
-            lo8[p] = static_cast<unsigned char>(static_cast<int8_t>(sLo));
-            hi8[p] = static_cast<unsigned char>(static_cast<int8_t>(sHi));
+            lo8[p] = static_cast<unsigned char>(sLo + matrixBias);
+            hi8[p] = static_cast<unsigned char>(sHi + matrixBias);
             lo16[p] = static_cast<unsigned char>(sLo + 64);
             hi16[p] = static_cast<unsigned char>(sHi + 64);
         }
@@ -166,8 +174,13 @@ void SwipeAligner::initQuery(const Sequence *q) {
     resize(static_cast<size_t>(queryLength) + 1);
     query.assign(q->numSequence, q->numSequence + queryLength);
     queryBias(subMat, q, aaBiasCorrection, aaBiasCorrectionScale, tmpBias, bias);
+    int minBias = 0;
     for (int i = 0; i < queryLength; i++) {
-        rowBias8[i] = simdi8_set(static_cast<char>(bias[i]));
+        minBias = std::min(minBias, static_cast<int>(bias[i]));
+    }
+    byteBias = matrixBias - minBias;
+    for (int i = 0; i < queryLength; i++) {
+        rowBias8[i] = simdi8_set(static_cast<char>(bias[i] - minBias));
         rowBias16[i] = simdi16_set(static_cast<short>(bias[i] - 64));
         rowSub16[i] = simdi16_set(static_cast<short>(64 - bias[i]));
     }
@@ -183,10 +196,8 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
     const simd_int *scoreLo = (sizeof(T) == 1) ? scoreLo8 : scoreLo16;
     const simd_int *scoreHi = (sizeof(T) == 1) ? scoreHi8 : scoreHi16;
     const simd_int vZero = simdi_setzero();
-    const simd_int vGapO = V::set(-gapOpen);
-    const simd_int vGapE = V::set(-gapExtend);
     // the 16 bit lanes subtract up to 192 from a score saturated at INT16_MAX, so they count as saturated 255 below it
-    const int saturated = (sizeof(T) == 2) ? V::MAX - 255 : V::MAX;
+    const int saturated = (sizeof(T) == 2) ? V::MAX - 255 : V::MAX - byteBias;
     for (int i = 0; i < Lq; i++) {
         hColumn[i] = vZero;
         eColumn[i] = vZero;
@@ -308,21 +319,22 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
             }
         } else {
             const simd_int *W = columnScores;
+            const simd_int vBias = V::set(byteBias);
             simd_int vHd = vZero;
             simd_int vF = vZero;
             for (int i = 0; i < Lq; i++) {
                 const simd_int s = V::addBias(W[rowLetters[i]], rowBias[i]);
                 const simd_int e = eColumn[i];
                 // H before F gives the next F (F - gap open is below F - gap extend), so F stays off the H chain
-                const simd_int hp = V::max(V::max(V::adds(vHd, s), e), vZero);
+                const simd_int hp = V::max(V::addScore(vHd, s, vBias), e);
                 const simd_int h = V::max(hp, vF);
                 vHd = hColumn[i];
                 hColumn[i] = h;
-                const simd_int gt = V::gt(h, vColMax[0]);
-                vColMax[0] = V::max(vColMax[0], h);
-                vColPos[0] = simdi8_blend(vColPos[0], rowIndex[i], gt);
-                eColumn[i] = V::max(V::adds(e, vGapE), V::adds(h, vGapO));
-                vF = V::max(V::adds(vF, vGapE), V::adds(hp, vGapO));
+                const simd_int colMax = V::max(vColMax[0], h);
+                vColPos[0] = simdi8_blend(rowIndex[i], vColPos[0], V::eq(colMax, vColMax[0]));
+                vColMax[0] = colMax;
+                eColumn[i] = V::max(V::subs(e, vGapExtend), V::subs(h, vGapOpen));
+                vF = V::max(V::subs(vF, vGapExtend), V::subs(hp, vGapOpen));
             }
         }
         for (int c = 0; c < columnCount; c++) {
@@ -394,7 +406,7 @@ void SwipeAligner::alignForward(size_t count, const unsigned char *const *target
     }
     if (jobBuffer.empty() == false) {
         std::sort(jobBuffer.begin(), jobBuffer.end(), longestFirst);
-        alignFull<int8_t>(jobBuffer, targets, targetLengths, aligns);
+        alignFull<uint8_t>(jobBuffer, targets, targetLengths, aligns);
     }
     jobBuffer.clear();
     for (size_t i = 0; i < count; i++) {
@@ -429,8 +441,9 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
     const simd_int *scoreLo = (sizeof(T) == 1) ? scoreLo8 : scoreLo16;
     const simd_int *scoreHi = (sizeof(T) == 1) ? scoreHi8 : scoreHi16;
     const simd_int vZero = simdi_setzero();
-    const simd_int vGapO = V::set(-gapOpen);
-    const simd_int vGapE = V::set(-gapExtend);
+    const simd_int vGapOpen = V::set(gapOpen);
+    const simd_int vGapExtend = V::set(gapExtend);
+    const simd_int vBias = V::set(byteBias);
 
     int bests[SWIPE_MAX_LANES];
     int rows[SWIPE_MAX_LANES];
@@ -502,22 +515,22 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
         for (int k = 0; k < width; k++) {
             const int slot = (r + k) & ringMask;
             const simd_int s = V::addBias(laneScores(tLo, tHi, ringLo[slot], ringHi[slot]), rb);
-            const simd_int diag = V::adds(hRow[k], s);
+            const simd_int diag = V::addScore(hRow[k], s, vBias);
             // H before E of the left cell gives E (E - gap open is below E - gap extend), so E stays off the H chain
-            const simd_int eo = V::adds(vHl, vGapO);
-            const simd_int ee = V::adds(vE, vGapE);
+            const simd_int eo = V::subs(vHl, vGapOpen);
+            const simd_int ee = V::subs(vE, vGapExtend);
             vE = V::max(eo, ee);
-            const simd_int fo = V::adds(hRow[k + 1], vGapO);
-            const simd_int fe = V::adds(fRow[k + 1], vGapE);
+            const simd_int fo = V::subs(hRow[k + 1], vGapOpen);
+            const simd_int fe = V::subs(fRow[k + 1], vGapExtend);
             const simd_int f = V::max(fo, fe);
-            const simd_int hp = simdi_and(V::max(V::max(diag, f), vZero), ringValid[slot]);
+            const simd_int hp = simdi_and(V::max(diag, f), ringValid[slot]);
             const simd_int h = simdi_and(V::max(hp, vE), ringValid[slot]);
             // H from 0 (H is 0), 1 (diagonal), 2 (E) or 3 (F), 4 if E extends and 8 if F extends
             simd_int code = simdi8_blend(vThree, vTwo, V::eq(h, vE));
             code = simdi8_blend(code, vOne, V::eq(h, diag));
             code = simdi_andnot(V::eq(h, vZero), code);
-            code = simdi_or(code, simdi_andnot(V::gt(eo, ee), vFour));
-            code = simdi_or(code, simdi_andnot(V::gt(fo, fe), vEight));
+            code = simdi_or(code, simdi_and(V::eq(vE, ee), vFour));
+            code = simdi_or(code, simdi_and(V::eq(f, fe), vEight));
             codes = (k % codesPerLane == 0) ? code : simdi_or(simdi16_slli(codes, 4), code);
             if (k % codesPerLane == codesPerLane - 1) {
                 traceRow[k / codesPerLane] = codes;
@@ -615,7 +628,7 @@ void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets
         if (a.word >= 2) {
             continue;
         }
-        a.word = (minScores[i] >= SwipeLanes<int8_t>::MAX) ? 1 : 0;
+        a.word = (minScores[i] >= SwipeLanes<uint8_t>::MAX - byteBias) ? 1 : 0;
         a.qStartPos1 = -1;
         a.dbStartPos1 = -1;
         a.score2 = 0;
@@ -653,7 +666,7 @@ void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets
         size_t start = 0;
         while (start < bandJobs.size()) {
             const int word = aligns[bandJobs[start].id].word;
-            const int lanes = (word == 0) ? SwipeLanes<int8_t>::COUNT : SwipeLanes<int16_t>::COUNT;
+            const int lanes = (word == 0) ? SwipeLanes<uint8_t>::COUNT : SwipeLanes<int16_t>::COUNT;
             size_t end = start + 1;
             while (end < bandJobs.size() && end - start < static_cast<size_t>(lanes) && bandJobs[end].width == bandJobs[start].width
                    && aligns[bandJobs[end].id].word == word) {
@@ -669,7 +682,7 @@ void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets
                 continue;
             }
             if (word == 0) {
-                alignBand<int8_t>(&bandJobs[start], end - start, targets, targetLengths, aligns, backtraces);
+                alignBand<uint8_t>(&bandJobs[start], end - start, targets, targetLengths, aligns, backtraces);
             } else {
                 alignBand<int16_t>(&bandJobs[start], end - start, targets, targetLengths, aligns, backtraces);
             }
@@ -677,7 +690,7 @@ void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets
                 const BandJob &job = bandJobs[l];
                 s_align &a = aligns[job.id];
                 const int best = a.score1;
-                const int maxScore = (word == 0) ? SwipeLanes<int8_t>::MAX : SwipeLanes<int16_t>::MAX;
+                const int maxScore = (word == 0) ? SwipeLanes<uint8_t>::MAX - byteBias : SwipeLanes<int16_t>::MAX;
                 if (best >= maxScore) {
                     a.word = word + 1;
                     if (a.word == 1) {

@@ -298,6 +298,7 @@ typedef __m256i simd_int;
 #define simdi32_add(x,y)    _mm256_add_epi32(x,y)
 #define simdi16_add(x,y)    _mm256_add_epi16(x,y)
 #define simdi16_adds(x,y)   _mm256_adds_epi16(x,y)
+#define simdi16_subs(x,y)   _mm256_subs_epi16(x,y)
 #define simdi8_adds(x,y)    _mm256_adds_epi8(x,y)
 #define simdi16_sub(x,y)    _mm256_sub_epi16(x,y)
 #define simdui8_adds(x,y)   _mm256_adds_epu8(x,y)
@@ -593,6 +594,7 @@ typedef __m128i simd_int;
 #define simdi16_sub(x,y)    _mm_sub_epi16(x,y)
 
 #define simdi16_adds(x,y)   _mm_adds_epi16(x,y)
+#define simdi16_subs(x,y)   _mm_subs_epi16(x,y)
 #define simdi8_adds(x,y)    _mm_adds_epi8(x,y)
 #define simdui8_adds(x,y)   _mm_adds_epu8(x,y)
 #define simdi32_sub(x,y)    _mm_sub_epi32(x,y)
