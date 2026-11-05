@@ -1281,6 +1281,7 @@ s_align SmithWaterman::alignStartPosBacktrace (
 
     // only start and end point are needed
     if (alignmentMode == 1 || hasLowerCoverage) {
+        r.identicalAACnt = 0;
         return r;
     }
 
