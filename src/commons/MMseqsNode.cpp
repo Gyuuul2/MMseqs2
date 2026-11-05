@@ -1381,6 +1381,46 @@ std::vector<size_t> MMseqsNode::getClusterKeyOffsets(const std::string &file, co
     return offsets;
 }
 
+std::vector<size_t> MMseqsNode::getBalancedClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount) {
+    if (isMaster()) {
+        std::vector<size_t> partOffsets(count + 1, 0);
+        for (size_t node = 0; node < count; node++) {
+            DBReader<DBKeyType> cluDb((clu + "." + SSTR(node)).c_str(), (clu + ".index." + SSTR(node)).c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
+            cluDb.open(DBReader<DBKeyType>::NOSORT);
+            partOffsets[node + 1] = partOffsets[node] + cluDb.getDataSize();
+            cluDb.close();
+        }
+        std::string firstKeys;
+        size_t split = 1;
+        for (size_t node = 0; node < count && split < count; node++) {
+            if (partOffsets[count] * split / count >= partOffsets[node + 1]) {
+                continue;
+            }
+            DBReader<DBKeyType> cluDb((clu + "." + SSTR(node)).c_str(), (clu + ".index." + SSTR(node)).c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
+            cluDb.open(DBReader<DBKeyType>::NOSORT);
+            for (; split < count && partOffsets[count] * split / count < partOffsets[node + 1]; split++) {
+                const size_t entry = cluDb.findEntryByOffset(partOffsets[count] * split / count - partOffsets[node]);
+                const size_t firstKey = (entry < cluDb.getSize()) ? static_cast<size_t>(cluDb.getIndexEntry(entry).id) : static_cast<size_t>(cluDb.getIndexEntry(cluDb.getSize() - 1).id) + 1;
+                firstKeys += SSTR(firstKey) + "\n";
+            }
+            cluDb.close();
+        }
+        for (; split < count; split++) {
+            firstKeys += SSTR(keyCount) + "\n";
+        }
+        publishRunFile(file, firstKeys);
+    }
+    const std::string firstKeys = waitForRunFile(file);
+    removeOnceRead(file);
+    std::vector<size_t> offsets(count + 1, keyCount);
+    offsets[0] = 0;
+    char *line = (char *) firstKeys.c_str();
+    for (size_t node = 1; node < count; node++, line = Util::skipLine(line)) {
+        offsets[node] = Util::fast_atoi<size_t>(line);
+    }
+    return offsets;
+}
+
 void MMseqsNode::readClusterKeys(const std::string &clu, const std::vector<size_t> &cluKeyOffsets, size_t keyBegin, size_t keyEnd, std::vector<DBKeyType> &keys) {
     keys.clear();
     // the (key, offset) cells in key order that a thread reads at once
