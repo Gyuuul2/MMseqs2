@@ -43,8 +43,7 @@ public:
         Sequence* target,
         const unsigned short diagonal
     );
-    // exact best ungapped diagonal (queryPos - dbPos) of the current query among diagonals
-    // within [minDiag, maxDiag]
+    // heuristic best ungapped diagonal (queryPos - dbPos); clips below -2 and samples every eight residues
     unsigned short bestDiagonal(Sequence* target, int minDiag, int maxDiag);
     BlockAligner::UngappedAln_res hammingDistance(
         Sequence* target, const unsigned short diagonal);

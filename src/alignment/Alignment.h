@@ -92,6 +92,7 @@ private:
     const unsigned int maxAccept;
     const unsigned int maxReject;
     const bool wrappedScoring;
+    const int alignerMode;
 
     BaseMatrix *m;
     // costs to open a gap

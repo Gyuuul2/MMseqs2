@@ -138,6 +138,9 @@ std::pair<alignment_end, alignment_end> sw_sse2_byte(
 	/* 16 byte insertion extension vector */
 	simd_int vGapE = simdi8_set(gap_extend);
 
+	/* F from H before F decays by the smaller gap penalty, which equals F from H after F also when gap open is below gap extend */
+	simd_int vGapF = simdi8_set(std::min(gap_open, gap_extend));
+
 	/* 16 byte bias vector */
 	simd_int vBias = simdi8_set(bias);
 
@@ -181,6 +184,7 @@ std::pair<alignment_end, alignment_end> sw_sse2_byte(
 			/* Get max from vH, vE and vF. */
 			e = simdi_load(pvE + j);
 			vH = simdui8_max(vH, e);
+			const simd_int hp = vH;
 			vH = simdui8_max(vH, vF);
 			vMaxColumn = simdui8_max(vMaxColumn, vH);
 
@@ -193,9 +197,8 @@ std::pair<alignment_end, alignment_end> sw_sse2_byte(
 			e = simdui8_max(e, vH);
 			simdi_store(pvE + j, e);
 
-			/* Update vF value. */
-			vF = simdui8_subs(vF, vGapE);
-			vF = simdui8_max(vF, vH);
+			/* Update vF value, from H before F, off the H chain. */
+			vF = simdui8_max(simdui8_subs(vF, vGapF), simdui8_subs(hp, vGapO));
 			/* Load the next vH. */
 			vH = simdi_load(pvHLoad + j);
 		}
@@ -337,6 +340,9 @@ std::pair<alignment_end, alignment_end> sw_sse2_word(
 	/* 16 byte insertion extension vector */
 	simd_int vGapE = simdi16_set(gap_extend);
 
+	/* F from H before F decays by the smaller gap penalty, which equals F from H after F also when gap open is below gap extend */
+	simd_int vGapF = simdi16_set(std::min(gap_open, gap_extend));
+
 	simd_int vMaxScore = vZero; /* Trace the highest score of the whole SW matrix. */
 	simd_int vMaxMark = vZero; /* Trace the highest score till the previous column. */
 	int32_t edge, begin = 0, end = db_length, step = 1;
@@ -374,6 +380,7 @@ std::pair<alignment_end, alignment_end> sw_sse2_word(
 			/* Get max from vH, vE and vF. */
 			e = simdi_load(pvE + j);
 			vH = simdi16_max(vH, e);
+			const simd_int hp = vH;
 			vH = simdi16_max(vH, vF);
 			vMaxColumn = simdi16_max(vMaxColumn, vH);
 
@@ -386,9 +393,8 @@ std::pair<alignment_end, alignment_end> sw_sse2_word(
 			e = simdi16_max(e, vH);
 			simdi_store(pvE + j, e);
 
-			/* Update vF value. */
-			vF = simdui16_subs(vF, vGapE);
-			vF = simdi16_max(vF, vH);
+			/* Update vF value, from H before F, off the H chain. */
+			vF = simdi16_max(simdui16_subs(vF, vGapF), simdui16_subs(hp, vGapO));
 
 			/* Load the next vH. */
 			vH = simdi_load(pvHLoad + j);
@@ -821,16 +827,16 @@ s_align SmithWaterman::ssw_align (
         const double  evalueThr,
         EvalueComputation * evaluer,
         const int covMode, const float covThr, const float correlationScoreWeight,
-        const int32_t maskLen) {
+        const int32_t maskLen, const s_align *forward, bool wordFirst) {
     resizeTarget(db_length);
     s_align alignment;
     // check if both query and target are profiles
 	if (profile->isProfile) {
         alignment = ssw_align_private<SmithWaterman::PROFILE_SEQ>(db_num_sequence, db_length, backtrace, gap_open,
-                                                                  gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen);
+                                                                  gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen, forward, wordFirst);
     } else {
         alignment = ssw_align_private<SmithWaterman::SEQ_SEQ>(db_num_sequence, db_length, backtrace, gap_open,
-                                                              gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen);
+                                                              gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen, forward, wordFirst);
     }
     return alignment;
 }
@@ -847,12 +853,16 @@ s_align SmithWaterman::ssw_align_private (
 	const double  evalueThr,
 	EvalueComputation * evaluer,
 	const int covMode, const float covThr, const float correlationScoreWeight,
-	const int32_t maskLen) {
+	const int32_t maskLen, const s_align *forward, bool wordFirst) {
 
 	int32_t query_length = profile->query_length;
 
-	// find the alignment position
-	s_align align = alignScoreEndPos<type>(db_sequence, db_length, gap_open, gap_extend, maskLen);
+	// find the alignment position, unless the forward pass of several targets at once (SWIPE) found it
+	s_align align = (forward != NULL) ? *forward : alignScoreEndPos<type>(db_sequence, db_length, gap_open, gap_extend, maskLen, wordFirst);
+	// SWIPE starts 16 bit lanes where the byte pass would not have overflowed
+	if (forward != NULL && align.word == 1 && align.score1 + profile->bias < UCHAR_MAX) {
+		align.word = 0;
+	}
 
 	// no residue could be aligned
 	if (align.dbEndPos1 == -1) {
@@ -902,7 +912,8 @@ s_align SmithWaterman::alignScoreEndPos (
 		int32_t db_length,
 		const uint8_t gap_open,
 		const uint8_t gap_extend,
-		const int32_t maskLen) {
+		const int32_t maskLen,
+		bool wordFirst) {
 	int32_t query_length = profile->query_length;
 
 	s_align r;
@@ -915,15 +926,21 @@ s_align SmithWaterman::alignScoreEndPos (
 	if (!profile->profile_byte) {
 		Debug(Debug::ERROR) << "Not initialized profile\n";
 	}
-	// 1. byte
-	bests = sw_sse2_byte<type>(db_sequence, 0, db_length, query_length, gap_open, gap_extend,
-				profile->profile_byte, UCHAR_MAX, profile->bias, maskLen, simdData);
+	// 1. byte, unless the caller expects it to overflow
 	r.word = 0;
-	// 2. word
-	if (bests.first.score == 255) {
+	if (wordFirst == false) {
+		bests = sw_sse2_byte<type>(db_sequence, 0, db_length, query_length, gap_open, gap_extend,
+					profile->profile_byte, UCHAR_MAX, profile->bias, maskLen, simdData);
+	}
+	// 2. word, with the byte result if the byte pass would not have overflowed
+	if (wordFirst || bests.first.score == 255) {
 		bests = sw_sse2_word<type>(db_sequence, 0, db_length, query_length, gap_open, gap_extend,
                     profile->profile_word, INT16_MAX, maskLen, simdData);
         r.word = 1;
+		if (bests.first.score + profile->bias < 255) {
+			r.word = 0;
+			bests.first.ref = (bests.first.score == 0) ? -1 : bests.first.ref;
+		}
 	}
 	// 3. int
 	if (bests.first.score == INT16_MAX) {
@@ -1268,14 +1285,14 @@ s_align SmithWaterman::alignStartPosBacktrace (
 }
 
 template
-s_align SmithWaterman::ssw_align_private<SmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t);
+s_align SmithWaterman::ssw_align_private<SmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t, const s_align*, bool);
 template
-s_align SmithWaterman::ssw_align_private<SmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t);
+s_align SmithWaterman::ssw_align_private<SmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, std::string&, const uint8_t, const uint8_t, const uint8_t, const double, EvalueComputation*, const int, const float, const float, const int32_t, const s_align*, bool);
 
 template
-s_align SmithWaterman::alignScoreEndPos<SmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const int32_t);
+s_align SmithWaterman::alignScoreEndPos<SmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const int32_t, bool);
 template
-s_align SmithWaterman::alignScoreEndPos<SmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const int32_t);
+s_align SmithWaterman::alignScoreEndPos<SmithWaterman::PROFILE_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, const int32_t, bool);
 
 template
 s_align SmithWaterman::alignStartPosBacktraceBlock<SmithWaterman::SEQ_SEQ>(const unsigned char*, int32_t, const uint8_t, const uint8_t, std::string&, s_align);
