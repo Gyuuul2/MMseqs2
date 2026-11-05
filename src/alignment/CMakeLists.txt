@@ -1,4 +1,5 @@
 set(alignment_header_files
+        alignment/Align2clust.h
         alignment/Alignment.h
         alignment/CompressedA3M.h
         alignment/EvalueComputation.h
@@ -18,6 +19,7 @@ set(alignment_header_files
 set(alignment_source_files
         alignment/Alignment.cpp
         alignment/Align2clust.cpp
+        alignment/Align2clustLinfinity.cpp
         alignment/CompressedA3M.cpp
         alignment/Main.cpp
         alignment/Matcher.cpp
