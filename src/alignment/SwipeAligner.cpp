@@ -1181,57 +1181,97 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
     T laneFlags[SWIPE_MAX_LANES];
     T overflows[SWIPE_MAX_LANES];
     simd_int scores[SWIPE_MAX_LANES];
+    // the rows before fullStep only step the lanes on, the band end of the endingCount lanes in columnEndSteps goes down a column a row
+    size_t fullStep = 0;
+    size_t traceStep = SIZE_MAX;
+    T columnEndSteps[SWIPE_MAX_LANES];
+    int activeCount = 0;
+    int endingCount = 0;
+    int columnBegin = width;
+    int columnEnd = 0;
+    int validBegin = 0;
+    int validEnd = width;
     while (true) {
-        // a free lane takes the next job; the band columns of any active lane, the others are not read, and the ones of all lanes, which skip the mask
-        int activeCount = 0;
-        int columnBegin = width;
-        int columnEnd = 0;
-        int validBegin = 0;
-        int validEnd = width;
-        for (int l = 0; l < lanes; l++) {
-            while (true) {
-                if (laneJobs[l] == NULL) {
-                    if (next == jobCount) {
-                        break;
+        if (step >= fullStep) {
+            // a free lane takes the next job; the band columns of any active lane, the others are not read, and the ones of all lanes, which skip the mask
+            fullStep = SIZE_MAX;
+            traceStep = SIZE_MAX;
+            activeCount = 0;
+            endingCount = 0;
+            columnBegin = width;
+            columnEnd = 0;
+            validBegin = 0;
+            validEnd = width;
+            for (int l = 0; l < lanes; l++) {
+                while (true) {
+                    if (laneJobs[l] == NULL) {
+                        if (next == jobCount) {
+                            break;
+                        }
+                        load(l, jobs[next++]);
                     }
-                    load(l, jobs[next++]);
+                    const int i = laneRows[l];
+                    if (i >= laneEnds[l]) {
+                        finish(l);
+                        continue;
+                    }
+                    const int lo = std::max(0, columnBeginRows[l] - i);
+                    const int hi = std::min(width, columnEndRows[l] - i);
+                    const bool first = (laneStarts[l] == step);
+                    const int maskBegin = first ? lo : 0;
+                    const int bias = laneBiases[l][i];
+                    activeCount++;
+                    endingCount += (hi < width);
+                    columnBegin = std::min(columnBegin, lo);
+                    columnEnd = std::max(columnEnd, hi);
+                    validBegin = std::max(validBegin, maskBegin);
+                    validEnd = std::min(validEnd, hi);
+                    fullStep = std::min(fullStep, step + (first ? 1 : laneEnds[l] - i));
+                    if (hi == width) {
+                        fullStep = std::min(fullStep, step + (columnEndRows[l] - width + 1 - i));
+                    }
+                    traceStep = std::min(traceStep, laneStarts[l] + traceSteps);
+                    active[l] = static_cast<T>(-1);
+                    maskBegins[l] = static_cast<T>(maskBegin + V::COLUMN_BIAS);
+                    columnEnds[l] = static_cast<T>(hi + V::COLUMN_BIAS);
+                    columnEndSteps[l] = (hi < width);
+                    scoreAdds[l] = matrixBias + std::max(0, bias);
+                    scoreSubs[l] = matrixBias + std::max(0, -bias);
+                    rows[l] = scoreRows + SWIPE_SCORE_ROW * laneQueries[l][i];
+                    letters[l] = laneLetters[l] + (step - laneStarts[l]);
+                    break;
                 }
-                const int i = laneRows[l];
-                if (i >= laneEnds[l]) {
-                    finish(l);
-                    continue;
+                // a free lane runs on garbage that only it reads and the next job resets
+                if (laneJobs[l] == NULL) {
+                    active[l] = 0;
+                    maskBegins[l] = static_cast<T>(V::COLUMN_BIAS);
+                    columnEnds[l] = static_cast<T>(width + V::COLUMN_BIAS);
+                    columnEndSteps[l] = 0;
+                    scoreAdds[l] = 0;
+                    scoreSubs[l] = 0;
+                    rows[l] = scoreRows;
+                    letters[l] = zeroLetters.data();
                 }
-                const int lo = std::max(0, columnBeginRows[l] - i);
-                const int hi = std::min(width, columnEndRows[l] - i);
-                const int maskBegin = (laneStarts[l] == step) ? lo : 0;
-                const int bias = laneBiases[l][i];
-                activeCount++;
-                columnBegin = std::min(columnBegin, lo);
-                columnEnd = std::max(columnEnd, hi);
-                validBegin = std::max(validBegin, maskBegin);
-                validEnd = std::min(validEnd, hi);
-                active[l] = static_cast<T>(-1);
-                maskBegins[l] = static_cast<T>(maskBegin + V::COLUMN_BIAS);
-                columnEnds[l] = static_cast<T>(hi + V::COLUMN_BIAS);
-                scoreAdds[l] = matrixBias + std::max(0, bias);
-                scoreSubs[l] = matrixBias + std::max(0, -bias);
-                rows[l] = scoreRows + SWIPE_SCORE_ROW * laneQueries[l][i];
-                letters[l] = laneLetters[l] + (step - laneStarts[l]);
+            }
+            if (activeCount == 0) {
                 break;
             }
-            // a free lane runs on garbage that only it reads and the next job resets
-            if (laneJobs[l] == NULL) {
-                active[l] = 0;
-                maskBegins[l] = static_cast<T>(V::COLUMN_BIAS);
-                columnEnds[l] = static_cast<T>(width + V::COLUMN_BIAS);
-                scoreAdds[l] = 0;
-                scoreSubs[l] = 0;
-                rows[l] = scoreRows;
-                letters[l] = zeroLetters.data();
+        } else {
+            columnBegin = std::max(0, columnBegin - 1);
+            columnEnd -= (endingCount == activeCount);
+            validEnd -= (endingCount > 0);
+            simdi_storeu(reinterpret_cast<simd_int *>(columnEnds), V::sub(simdi_loadu(reinterpret_cast<const simd_int *>(columnEnds)),
+                                                                        simdi_loadu(reinterpret_cast<const simd_int *>(columnEndSteps))));
+            for (int l = 0; l < lanes; l++) {
+                if (active[l]) {
+                    const int i = laneRows[l];
+                    const int bias = laneBiases[l][i];
+                    scoreAdds[l] = matrixBias + std::max(0, bias);
+                    scoreSubs[l] = matrixBias + std::max(0, -bias);
+                    rows[l] = scoreRows + SWIPE_SCORE_ROW * laneQueries[l][i];
+                    letters[l]++;
+                }
             }
-        }
-        if (activeCount == 0) {
-            break;
         }
         extendLaneRows += activeCount;
         extendSlotRows += lanes;
@@ -1252,8 +1292,8 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
         simd_int vEdgeLeft = simdi_loadu(reinterpret_cast<const simd_int *>(edgeLefts));
         simd_int vEdgeRight = simdi_loadu(reinterpret_cast<const simd_int *>(edgeRights));
         simd_int *traceRow = trace + step % traceSteps * traceWidth;
-        // a lane keeps its row of the trace that this row overwrites
-        for (int l = 0; l < lanes; l++) {
+        // a lane keeps its row of the trace that this row overwrites, none before traceStep
+        for (int l = 0; step >= traceStep && l < lanes; l++) {
             if (laneJobs[l] != NULL && step - laneStarts[l] >= traceSteps) {
                 extendLongJobs += (step - laneStarts[l] == traceSteps);
                 std::vector<uint16_t> &laneTrace = laneTraces[l];
@@ -1332,14 +1372,10 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
             simdi_storeu(reinterpret_cast<simd_int *>(rowMax), vRowMax);
             simdi_storeu(reinterpret_cast<simd_int *>(rowPos), vPos);
             for (int l = 0; l < lanes; l++) {
-                if (active[l] == 0 || rowMax[l] < laneBests[l]) {
-                    continue;
-                }
                 const int pos = static_cast<T>(rowPos[l] - V::COLUMN_BIAS);
-                if (rowMax[l] > laneBests[l] || laneRows[l] + pos >= bestRows[l] + bestColumns[l]) {
-                    bestRows[l] = laneRows[l];
-                    bestColumns[l] = pos;
-                }
+                const bool better = active[l] && (rowMax[l] > laneBests[l] || (rowMax[l] == laneBests[l] && laneRows[l] + pos >= bestRows[l] + bestColumns[l]));
+                bestRows[l] = better ? laneRows[l] : bestRows[l];
+                bestColumns[l] = better ? pos : bestColumns[l];
             }
             vBest = V::max(vBest, vRowMax);
         }
@@ -1359,23 +1395,29 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
         simdi_storeu(reinterpret_cast<simd_int *>(laneDropped), vDropped);
         simdi_storeu(reinterpret_cast<simd_int *>(edgeLefts), vEdgeLeft);
         simdi_storeu(reinterpret_cast<simd_int *>(edgeRights), vEdgeRight);
-        simdi_storeu(reinterpret_cast<simd_int *>(laneFlags), stop);
-        simdi_storeu(reinterpret_cast<simd_int *>(overflows), overflow);
+        // the free lanes step on garbage that the next job resets
         for (int l = 0; l < lanes; l++) {
-            if (active[l] == 0) {
-                continue;
-            }
             floors[l] += rises[l];
-            if (overflows[l] != 0) {
-                ExtendJob rerun = *laneJobs[l];
-                rerun.wide = true;
-                extendPending.push_back(rerun);
-                laneJobs[l] = NULL;
-                extendRerunJobs++;
-            } else if (laneFlags[l] != 0) {
-                finish(l);
-            } else {
-                laneRows[l]++;
+            laneRows[l]++;
+        }
+        if (simd_any(simdi_and(simdi_or(stop, overflow), vActive))) {
+            simdi_storeu(reinterpret_cast<simd_int *>(laneFlags), stop);
+            simdi_storeu(reinterpret_cast<simd_int *>(overflows), overflow);
+            for (int l = 0; l < lanes; l++) {
+                if (active[l] == 0) {
+                    continue;
+                }
+                if (overflows[l] != 0) {
+                    ExtendJob rerun = *laneJobs[l];
+                    rerun.wide = true;
+                    extendPending.push_back(rerun);
+                    laneJobs[l] = NULL;
+                    extendRerunJobs++;
+                    fullStep = step + 1;
+                } else if (laneFlags[l] != 0) {
+                    finish(l);
+                    fullStep = step + 1;
+                }
             }
         }
         step++;
