@@ -371,6 +371,13 @@ void SwipeAligner::alignFull(const std::vector<size_t> &jobs, const unsigned cha
 }
 
 void SwipeAligner::alignForward(size_t count, const unsigned char *const *targets, const int *targetLengths, s_align *aligns) {
+    // the longest targets go first so the short ones fill the lanes that become free
+    const auto longestFirst = [targetLengths](size_t a, size_t b) {
+        if (targetLengths[a] != targetLengths[b]) {
+            return targetLengths[a] > targetLengths[b];
+        }
+        return a < b;
+    };
     jobBuffer.clear();
     for (size_t i = 0; i < count; i++) {
         aligns[i].score1 = 0;
@@ -386,6 +393,7 @@ void SwipeAligner::alignForward(size_t count, const unsigned char *const *target
         }
     }
     if (jobBuffer.empty() == false) {
+        std::sort(jobBuffer.begin(), jobBuffer.end(), longestFirst);
         alignFull<int8_t>(jobBuffer, targets, targetLengths, aligns);
     }
     jobBuffer.clear();
@@ -395,6 +403,7 @@ void SwipeAligner::alignForward(size_t count, const unsigned char *const *target
         }
     }
     if (jobBuffer.empty() == false) {
+        std::sort(jobBuffer.begin(), jobBuffer.end(), longestFirst);
         alignFull<int16_t>(jobBuffer, targets, targetLengths, aligns);
     }
 }
