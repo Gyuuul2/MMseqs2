@@ -603,6 +603,9 @@ void SwipeAligner::alignBanded(size_t count, const unsigned char *const *targets
     bandJobs.clear();
     for (size_t i = 0; i < count; i++) {
         s_align &a = aligns[i];
+        if (a.word >= 2) {
+            continue;
+        }
         a.word = (minScores[i] >= SwipeLanes<int8_t>::MAX) ? 1 : 0;
         a.qStartPos1 = -1;
         a.dbStartPos1 = -1;

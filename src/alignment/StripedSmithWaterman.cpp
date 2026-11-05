@@ -935,9 +935,6 @@ s_align SmithWaterman::ssw_align_private (
 
 	if (blockAlignFailed) {
 		Debug(Debug::WARNING) << "Block alignment failed, falling back to Smith-Waterman\n";
-		if (forward != NULL) {
-			align = alignScoreEndPos<type>(db_sequence, db_length, gap_open, gap_extend, maskLen, wordFirst);
-		}
 		align = alignStartPosBacktrace<type>(db_sequence, db_length, gap_open, gap_extend, alignmentMode, backtrace, align, evaluer, covMode, covThr, correlationScoreWeight, maskLen);
 	}
 

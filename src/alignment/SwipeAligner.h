@@ -21,7 +21,7 @@ public:
     // score1, qEndPos1, dbEndPos1 and word of every target, starting with 8 bit lanes if word is 0 and 16 bit if 1; word 2 if 16 bit saturates
     void alignForward(size_t count, const unsigned char *const *targets, const int *targetLengths, s_align *aligns);
 
-    // banded around diagonals (target - query position) with backtrace; a band grows while its score is below minScores
+    // banded around diagonals (target - query position) with backtrace; a band grows while its score is below minScores; word 2 lanes are skipped
     void alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals,
                      s_align *aligns, std::string *backtraces, const int *columnEnds, const int *minScores);
 
