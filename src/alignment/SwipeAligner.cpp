@@ -838,7 +838,9 @@ static inline simd_int addTraceCode(simd_int codes, simd_int fromE, simd_int fro
 #if defined(AVX2)
 #define SWIPE_LOAD_LETTERS(p) _mm_loadu_si128(reinterpret_cast<const __m128i *>(p))
 #define SWIPE_WIDEN(x) _mm256_cvtepi8_epi16(x)
+#define SWIPE_LOAD_LANES(a, b) _mm256_inserti128_si256(_mm256_castsi128_si256(SWIPE_LOAD_LETTERS(a)), SWIPE_LOAD_LETTERS(b), 1)
 #else
+#define SWIPE_LOAD_LANES(a, b) _mm_loadu_si128(reinterpret_cast<const __m128i *>(a))
 #define SWIPE_LOAD_LETTERS(p) _mm_loadl_epi64(reinterpret_cast<const __m128i *>(p))
 #define SWIPE_WIDEN(x) _mm_cvtepi8_epi16(x)
 #endif
@@ -905,7 +907,7 @@ inline void laneCellScores<uint16_t>(const unsigned char *const *letters, const 
         const __m128i lo = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(rows[l])), index);
         const __m128i hi = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(rows[l] + 16)), index);
         // the shift moves bit 4 of the letters 16-31 to the bit 7 that the blend reads
-        scores[l] = simdi16_add(SWIPE_WIDEN(_mm_blendv_epi8(lo, hi, _mm_slli_epi16(index, 3))), simdi16_set(adds[l]));
+        scores[l] = SWIPE_WIDEN(_mm_blendv_epi8(lo, hi, _mm_slli_epi16(index, 3)));
 #endif
     }
     transposeLanes8(scores);
@@ -917,9 +919,16 @@ inline void laneCellScores<uint16_t>(const unsigned char *const *letters, const 
         scores[c + 8] = _mm256_permute2x128_si256(low, scores[c + 8], 0x31);
     }
 #endif
+#if !defined(SIMDE_ARM_NEON_A64V8_NATIVE) || defined(AVX2)
+    // x86 broadcasts on the shuffle port, so the lanes add their bias after the transpose
+    const simd_int vAdds = simdi_loadu(reinterpret_cast<const simd_int *>(adds));
+    for (int c = 0; c < lanes; c++) {
+        scores[c] = simdi16_add(scores[c], vAdds);
+    }
+#endif
 }
 
-// 8 bit lanes take 16 band columns at once, with AVX2 lane l in the low and lane l + 16 in the high 128 bits of scores[l]
+// 8 bit lanes take 16 band columns at once, with AVX2 lane l in the low and lane l + 16 in the high 128 bits of scores[l] before the transpose
 template <>
 inline void laneCellScores<uint8_t>(const unsigned char *const *letters, const int8_t *const *rows, const uint8_t *adds, int kb, simd_int *scores) {
 #if defined(SIMDE_ARM_NEON_A64V8_NATIVE) && !defined(AVX2)
@@ -927,28 +936,27 @@ inline void laneCellScores<uint8_t>(const unsigned char *const *letters, const i
         const int8x16x2_t row = {{vld1q_s8(rows[l]), vld1q_s8(rows[l] + 16)}};
         scores[l] = vreinterpretq_s64_u8(vaddq_u8(vreinterpretq_u8_s8(vqtbl2q_s8(row, vld1q_u8(letters[l] + kb))), vdupq_n_u8(adds[l])));
     }
-#else
-    __m128i laneScores[ExtendLanes<uint8_t>::COUNT];
-    for (int l = 0; l < ExtendLanes<uint8_t>::COUNT; l++) {
-        const __m128i index = _mm_loadu_si128(reinterpret_cast<const __m128i *>(letters[l] + kb));
-        const __m128i lo = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(rows[l])), index);
-        const __m128i hi = _mm_shuffle_epi8(_mm_loadu_si128(reinterpret_cast<const __m128i *>(rows[l] + 16)), index);
-        laneScores[l] = _mm_add_epi8(_mm_blendv_epi8(lo, hi, _mm_slli_epi16(index, 3)), _mm_set1_epi8(static_cast<char>(adds[l])));
-    }
-    for (int l = 0; l < 16; l++) {
-#if defined(AVX2)
-        scores[l] = _mm256_inserti128_si256(_mm256_castsi128_si256(laneScores[l]), laneScores[l + 16], 1);
-#else
-        scores[l] = laneScores[l];
-#endif
-    }
-#endif
     transposeLanes16(scores);
+#else
+    // AVX2 looks up lanes l and l + 16 in one shuffle
+    for (int l = 0; l < 16; l++) {
+        const simd_int index = SWIPE_LOAD_LANES(letters[l] + kb, letters[l + 16] + kb);
+        const simd_int lo = simdi8_shuffle(SWIPE_LOAD_LANES(rows[l], rows[l + 16]), index);
+        const simd_int hi = simdi8_shuffle(SWIPE_LOAD_LANES(rows[l] + 16, rows[l + 16] + 16), index);
+        scores[l] = simdi8_blend(lo, hi, simdi16_slli(index, 3));
+    }
+    transposeLanes16(scores);
+    const simd_int vAdds = simdi_loadu(reinterpret_cast<const simd_int *>(adds));
+    for (int c = 0; c < 16; c++) {
+        scores[c] = ExtendLanes<uint8_t>::add(scores[c], vAdds);
+    }
+#endif
 }
 #undef SWIPE_ZIP
 #undef SWIPE_LO
 #undef SWIPE_HI
 #undef SWIPE_LOAD_LETTERS
+#undef SWIPE_LOAD_LANES
 #undef SWIPE_WIDEN
 
 SwipeExtender::SwipeExtender(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend)
