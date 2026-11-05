@@ -817,8 +817,10 @@ struct RepTargetsRecord {
     }
 };
 
-// group ranges per aligning node
-static const size_t GROUP_RANGES_PER_NODE = 64;
+// group ranges per aligning node; at 1 T a range is about a minute of one node's work, so the nodes align next to each other
+static const size_t GROUP_RANGES_PER_NODE = 4096;
+// the group ranges read 8 MiB of the prefilter on average at least, which sets their count below 32 GiB of prefilter per aligning node
+static const size_t MIN_GROUP_RANGE_PREF_BYTES = 8 * 1024 * 1024;
 
 // the master only clusters while other nodes align
 static size_t getFirstAlignNode() {
@@ -852,6 +854,8 @@ static const time_t PUBLISH_SECONDS = 1;
 static const time_t READ_SECONDS = 1;
 // the nodes publish and read the changes right after the turn of a second, before the master step that answers them; a batch start reads them this often to see it soon
 static const double BATCH_READ_SECONDS = PUBLISH_SECONDS / 4.0;
+// a chunk claims group ranges of about this much work of its node, unless one range is more
+static const double CLAIM_SECONDS = 2.0 * PUBLISH_SECONDS;
 // batches per thread of the records aligned at once, taken in rep order
 static const size_t ALIGN_BATCHES_PER_THREAD = 64;
 static const int CLUSTER_THREADS = 4;
@@ -1122,8 +1126,8 @@ struct RepTargetsReader {
           paddedDbSize(paddedDbSize), prefSizeBits(prefSizeBits), maxChunkBytes(std::max<size_t>(1, memoryLimit / CHUNK_MEMORY_DIVISOR)),
           // a record holds at most maxRecordTargets targets, so they fit maxRecordBytes as pages
           maxRecordTargets(std::min<size_t>(UINT_MAX, std::max<size_t>(1, maxRecordBytes / std::max<size_t>(seqDbr.getMaxSeqLen() + 2, Util::getPageSize())))),
-          splitPos(0), passClasses(~0ULL), endClass(0), classBytes(prefSizeBits, 0), prefDb(NULL), prefNode(0), chunkRecordCount(0), chunkTargetCount(0), chunkReadBytes(0), entryTargetOffsets(NULL),
-          entryRecordOffsets(NULL), allocatedEntries(0), prefReadBytes(0), claimedGroupRanges(0), nextGroupRange(0), readSeconds(0) {}
+          splitPos(0), passClasses(~0ULL), endClass(0), classBytes(prefSizeBits, 0), prefDb(NULL), prefNode(0), chunkRecordCount(0), chunkTargetCount(0), chunkReadBytes(0), chunkClaimedCost(0),
+          entryTargetOffsets(NULL), entryRecordOffsets(NULL), allocatedEntries(0), prefReadBytes(0), prefReads(0), chunkCount(0), claimedGroupRanges(0), readSeconds(0) {}
 
     // adds the splits of the next group ranges that this node claims, up to one with splits; false once none is left
     bool claimGroupRange() {
@@ -1139,7 +1143,9 @@ struct RepTargetsReader {
                 break;
             }
             claimedGroupRanges++;
-            nextGroupRange = groupRange + 1;
+            for (size_t i = groupRangePartitionOffsets[groupRange]; i < groupRangePartitionOffsets[groupRange + 1]; i++) {
+                chunkClaimedCost += partitions[i].cost;
+            }
             for (size_t i = groupRangePartitionOffsets[groupRange]; i < groupRangePartitionOffsets[groupRange + 1];) {
                 if (partitions[i].cost == 0) {
                     i++;
@@ -1204,19 +1210,19 @@ struct RepTargetsReader {
     }
 
     // the next records in order key order, about maxChunkBytes of them unless the pass ends; none once no record is left
-    // a chunk claims more group ranges while their reads stay below maxReadBytes and, as in guided scheduling, they are fewer than the ranges left per aligning node
-    void loadChunk(std::vector<RepTargetsRecord> &records, std::vector<DBKeyType> &targets, size_t maxReadBytes) {
-        const size_t chunkFirstRange = claimedGroupRanges;
-        const size_t alignNodes = MMseqsNode::count - getFirstAlignNode();
+    // a chunk claims more group ranges while their reads stay below maxReadBytes and their cost below claimCost
+    void loadChunk(std::vector<RepTargetsRecord> &records, std::vector<DBKeyType> &targets, size_t maxReadBytes, size_t claimCost) {
         records.reserve(maxChunkBytes / sizeof(RepTargetsRecord));
         targets.reserve(maxChunkBytes / sizeof(DBKeyType));
         chunkRecordCount = 0;
         chunkTargetCount = 0;
         chunkReadBytes = 0;
+        chunkClaimedCost = 0;
+        chunkCount++;
         while (chunkRecordCount * sizeof(RepTargetsRecord) + chunkTargetCount * sizeof(DBKeyType) < maxChunkBytes) {
             if (splitPos < prefSplits.size()) {
                 loadSplit(records, targets);
-            } else if (chunkRecordCount > 0 && (chunkReadBytes >= maxReadBytes || (claimedGroupRanges - chunkFirstRange) * alignNodes >= groupRangePartitionOffsets.size() - 1 - nextGroupRange)) {
+            } else if (chunkRecordCount > 0 && (chunkReadBytes >= maxReadBytes || chunkClaimedCost >= claimCost)) {
                 break;
             } else if (claimGroupRange() == false && (chunkRecordCount > 0 || startPass() == false)) {
                 break;
@@ -1232,7 +1238,7 @@ struct RepTargetsReader {
         delete[] entryTargetOffsets;
         delete[] entryRecordOffsets;
         MMseqsNode::addPhaseSeconds(phaseValues, "reading the prefilter", readSeconds);
-        MMseqsNode::addPhaseValue(phaseValues, "Prefilter read bytes", SSTR(prefReadBytes));
+        MMseqsNode::addPhaseValue(phaseValues, "Prefilter read bytes", SSTR(prefReadBytes) + " in " + SSTR(prefReads) + " reads, " + SSTR(chunkCount) + " chunks");
         MMseqsNode::addPhaseValue(phaseValues, "Claimed group ranges", SSTR(claimedGroupRanges) + " of " + SSTR(groupRangePartitionOffsets.size() - 1));
     }
 
@@ -1259,13 +1265,15 @@ private:
     size_t chunkRecordCount;
     size_t chunkTargetCount;
     size_t chunkReadBytes;
+    size_t chunkClaimedCost;
     // not zeroed, as each split overwrites all of its part of them
     size_t *entryTargetOffsets;
     size_t *entryRecordOffsets;
     size_t allocatedEntries;
     size_t prefReadBytes;
+    size_t prefReads;
+    size_t chunkCount;
     size_t claimedGroupRanges;
-    size_t nextGroupRange;
     double readSeconds;
 
     void openPrefDb(size_t node) {
@@ -1316,6 +1324,7 @@ private:
         openPrefDb(split.prefNode);
         prefDb->loadData(split.firstEntry, split.endEntry);
         prefReadBytes += split.prefBytes;
+        prefReads++;
         splitPos = findPassSplit(splitPos + 1);
         // a thread that ends before the reads of its io_uring finish can fail them, so this thread prefetches
         if (splitPos < prefSplits.size() && prefSplits[splitPos].prefNode == split.prefNode) {
@@ -1717,7 +1726,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     nextWindow.homeKeyOffsets.assign(nodes + 2, 0);
     // the service thread and the chunk loader take a quarter of the threads for their parallel parts
     const int serviceThreads = std::max(1, par.threads / 4);
-    repTargetsReader.loadChunk(chunkRecords[0], chunkTargets[0], maxWindowBytes);
+    // the alignment cells, as the cost of a partition, that this node aligns per second
+    std::atomic<double> alignedCostPerSecond(0);
+    repTargetsReader.loadChunk(chunkRecords[0], chunkTargets[0], maxWindowBytes, 0);
     loadedChunks = 1;
     usedChunks = 1;
     // the loader ends with the first empty chunk
@@ -1730,7 +1741,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 std::unique_lock<std::mutex> lock(chunkMutex);
                 chunkCondition.wait(lock, [&]() { return usedChunks >= next; });
             }
-            repTargetsReader.loadChunk(chunkRecords[next % 3], chunkTargets[next % 3], maxWindowBytes);
+            repTargetsReader.loadChunk(chunkRecords[next % 3], chunkTargets[next % 3], maxWindowBytes, static_cast<size_t>(alignedCostPerSecond.load() * CLAIM_SECONDS));
             const bool isLast = chunkRecords[next % 3].empty();
             {
                 std::lock_guard<std::mutex> lock(chunkMutex);
@@ -1782,6 +1793,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t skippedMemberGates = 0;
     double repBatchLockWaitSeconds = 0;
     double repBatchLongestSeconds = 0;
+    double alignedCost = 0;
+    double alignSeconds = 0;
     const auto mapRep = [&](Sequence &query, BlockAligner &blockAligner, size_t repKey) {
         query.mapSequence(repKey, repKey, getWindowData(window, repKey), seqDbr.getSeqLen(repKey));
         blockAligner.setQuery(&query);
@@ -2367,6 +2380,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     while (window.end > window.begin) {
         readWindow(nextWindow, window);
         fetchWindow(nextWindow);
+        Timer alignTimer;
         const size_t nextRepKey = getFirstRepKey(nextWindow);
         const std::vector<RepTargetsRecord> &records = chunkRecords[window.chunk];
         const size_t recordCount = window.end - window.begin;
@@ -2754,6 +2768,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 readAssignedChanges(true);
             }
         }
+        alignedCost += static_cast<double>(windowCost);
+        alignSeconds += alignTimer.getTimediff();
+        alignedCostPerSecond.store(alignedCost / std::max(alignSeconds, 1e-3));
         windowCount++;
         windowKeys += window.keys.size();
         waitForWindow(nextWindow, nextRepKey);
@@ -2804,6 +2821,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         MMseqsNode::addPhaseValue(phaseValues, "Member gates skipped before reading", SSTR(skippedMemberGates));
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the accepted log mutex", repBatchLockWaitSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Aligned pairs", SSTR(alignedPairs));
+        MMseqsNode::addPhaseValue(phaseValues, "Claim seconds", SSTR(CLAIM_SECONDS) + " (" + SSTR(alignedCostPerSecond.load()) + " cells per second, " + SSTR(alignSeconds) + " s aligning)");
     }
 }
 
@@ -3565,7 +3583,11 @@ int align2clustLinfinity(Parameters &par) {
         totalCost += partition.cost;
     }
     const size_t alignNodes = MMseqsNode::count - getFirstAlignNode();
-    const size_t maxGroupRangeCount = GROUP_RANGES_PER_NODE * alignNodes;
+    size_t totalPrefBytes = 0;
+    for (size_t i = 0; i < partitions.size(); i++) {
+        totalPrefBytes += partitions[i].prefBytes;
+    }
+    const size_t maxGroupRangeCount = std::max<size_t>(1, std::min(GROUP_RANGES_PER_NODE * alignNodes, totalPrefBytes / MIN_GROUP_RANGE_PREF_BYTES));
     std::vector<size_t> groupRangePartitionOffsets(1, 0);
     std::vector<size_t> groupRangeKeyOffsets(1, 0);
     uint128 cost = 0;

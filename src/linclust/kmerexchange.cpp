@@ -32,8 +32,8 @@ static const size_t CHUNKS_PER_THREAD = 2;
 static const size_t PARTITIONS_PER_THREAD = 4;
 // a thread of a receiving pass takes blocks of at most this part of its share of the output, so the blocks not yet filled when the output is full are a small part of it
 static const size_t OUTPUT_BLOCKS_PER_THREAD = 16;
-// a partition row ends once its alignment cells reach 1 / (nodes * this) of what its node merged
-static const size_t PARTITIONS_PER_NODE = 4;
+// a partition row ends once its alignment cells reach 1 / this of what its node merged, four times the group ranges per aligning node of align2clust, which can only cut at rows
+static const size_t PARTITION_ROWS_PER_NODE = 16384;
 // a key chunk keeps fewer than twice this many places to cut a partition
 static const size_t CUTS_PER_CHUNK = 8;
 // the nodes take the send ranges and the hash ranges one at a time, about this many each, so a node that is faster takes more
@@ -2755,8 +2755,8 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     delete[] prefFiles.writeBuffers;
     MMseqsNode::closeClusterFiles(prefFiles.dataFile, prefFiles.dataName, prefFiles.indexFile, prefFiles.indexName, prefDataBytes, prefIndexBytes);
     // a row per part of a partition with entries: firstKey, prefOffset, prefBytes, alignment cells (query times target lengths) and the node of its pref file;
-    // a part ends at the first cut where its cells reach 1 / (nodes * PARTITIONS_PER_NODE) of what this node merged, which is at most that share of what all nodes merged
-    const size_t rowCost = std::max<size_t>(1, static_cast<size_t>(mergedCost / (MMseqsNode::count * PARTITIONS_PER_NODE)));
+    // a part ends at the first cut where its cells reach 1 / PARTITION_ROWS_PER_NODE of what this node merged
+    const size_t rowCost = std::max<size_t>(1, static_cast<size_t>(mergedCost / PARTITION_ROWS_PER_NODE));
     std::string partitionsData;
     for (size_t partition = 0; partition + 1 < partitionCutOffsets.size(); partition++) {
         const PartitionCut *rowStart = &partitionCuts[partitionCutOffsets[partition]];
