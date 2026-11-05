@@ -90,10 +90,12 @@ private:
     void resize(size_t length);
 };
 
-// banded X-drop extensions from seeds with backtrace in 16 bit SWIPE lanes, as BlockAligner::bandedalign; every lane takes the next
-// extension of any query once it is free
+// banded X-drop extensions from seeds with backtrace in 8 bit SWIPE lanes (16 bit for wide bands and saturated lanes), as BlockAligner::bandedalign; every lane takes the next extension of any query once it is free
 class SwipeExtender {
 public:
+    // the lanes of a vector of the extensions
+    static const int LANES = VECSIZE_INT * 4;
+
     SwipeExtender(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend);
     ~SwipeExtender();
 
@@ -110,10 +112,13 @@ public:
         return subMat->subMatrix[queries[position]][targetLetter] + biases[position];
     }
 
-    // the lane rows that extended a target and all lane rows, and the extensions with more rows than the trace of the last rows holds
+    // the lane rows that extended a target and all lane rows, the same in 8 bit lanes, the extensions longer than the lane trace and the ones redone in 16 bit lanes
     size_t extendLaneRows;
     size_t extendSlotRows;
+    size_t extendByteLaneRows;
+    size_t extendByteSlotRows;
     size_t extendLongJobs;
+    size_t extendRerunJobs;
 
 private:
     struct ExtendJob {
@@ -123,8 +128,11 @@ private:
         int seedColumn;
         int left;
         int right;
+        // in 16 bit lanes
+        bool wide;
     };
 
+    template <typename T>
     void extendBand(const ExtendJob *jobs, size_t jobCount, bool backward, int xDrop, const unsigned char *const *targets, const int *targetLengths,
                     s_align *aligns, std::string *backtraces);
 
@@ -133,6 +141,8 @@ private:
     float aaBiasCorrectionScale;
     int gapOpen;
     int gapExtend;
+    // minus the lowest score
+    int matrixBias;
 
     // the queries, each forward then reversed, and their composition bias at the same positions
     std::vector<unsigned char> queries;
