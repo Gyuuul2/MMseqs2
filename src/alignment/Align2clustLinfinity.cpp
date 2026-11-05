@@ -1784,6 +1784,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     double waitSeconds = 0;
     double sequenceWaitSeconds = 0;
     size_t alignedPairs = 0;
+    size_t assignedRepSkips = 0;
+    size_t unservedRepSkips = 0;
+    size_t assignedTargetSkips = 0;
+    size_t unservedTargetSkips = 0;
     size_t repBatchCount = 0;
     double repBatchWorkerSeconds = 0;
     double repBatchWallSeconds = 0;
@@ -1816,7 +1820,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t unservedSequenceBytes = 0;
     size_t servedFlushCount = 0;
     size_t largestServedFlushBytes = 0;
+    size_t servedBytes = 0;
     size_t receivedSliceCount = 0;
+    size_t receivedSliceBytes = 0;
+    size_t requestFlushCount = 0;
     double servingSeconds = 0;
     double writingSeconds = 0;
     double flushWriterWaitSeconds = 0;
@@ -2019,6 +2026,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 requestBytes += keyCount * sizeof(DBKeyType);
                             }
                             requestLine[0] = flush++;
+                            requestFlushCount++;
                             requestLine[1] = isLast;
                             requestLine[2 + nodes] = requestBytes;
                             MMseqsNode::publishExchangeFlush(requestHandle, requestFiles[rank], requestBytes, requestIndexes[rank], requestLine);
@@ -2150,6 +2158,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                     sliceFlushes[home] = SIZE_MAX;
                                     missingSliceAttempts[home] = 0;
                                     receivedSliceCount++;
+                                    receivedSliceBytes += sliceReads[i].bytes;
                                     hasWorked = true;
                                     if (homeReceivedKeys[home] < requestedWindow->homeKeyOffsets[home + 1] - requestedWindow->homeKeyOffsets[home]) {
                                         isComplete = false;
@@ -2330,6 +2339,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     servedFlush++;
                     servedFlushCount++;
                     largestServedFlushBytes = std::max(largestServedFlushBytes, sliceBytes);
+                    servedBytes += sliceBytes;
                     hasWorked = true;
                 }
                 pollTurn += polledNodes;
@@ -2435,7 +2445,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         batchPairs.assign(batchCount, std::vector<ClusterPair>());
         Timer repBatchTimer;
         size_t firstUnfinishedBatch = 0;
-#pragma omp parallel reduction(+:alignedPairs, repBatchWorkerSeconds, repBatchLockWaitSeconds) reduction(max:repBatchLongestSeconds)
+#pragma omp parallel reduction(+:alignedPairs, assignedRepSkips, unservedRepSkips, assignedTargetSkips, unservedTargetSkips, repBatchWorkerSeconds, repBatchLockWaitSeconds) reduction(max:repBatchLongestSeconds)
         {
             Sequence query(maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection);
             Sequence target(maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection);
@@ -2461,7 +2471,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     const unsigned int endTarget = (i == batchOffsets[batch + 1]) ? batchFirstTargets[batch + 1] : record.targetCount;
                     const size_t repKey = record.repFirstTarget.repKey % paddedDbSize;
                     const char *repData = getWindowData(window, repKey);
-                    if (isAssigned(record.repFirstTarget.repKey) || repData == NULL) {
+                    const bool isAssignedRep = isAssigned(record.repFirstTarget.repKey);
+                    if (isAssignedRep || repData == NULL) {
+                        (isAssignedRep ? assignedRepSkips : unservedRepSkips)++;
                         continue;
                     }
                     query.mapSequence(repKey, repKey, repData, seqDbr.getSeqLen(repKey));
@@ -2472,7 +2484,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     for (unsigned int j = (i == batchOffsets[batch]) ? batchFirstTargets[batch] : 0; j < endTarget && isAssigned(record.repFirstTarget.repKey) == false; j++) {
                         const DBKeyType targetKey = targets[j];
                         const char *targetData = getWindowData(window, targetKey);
-                        if (isAssigned(targetKey) || targetData == NULL) {
+                        const bool isAssignedTarget = isAssigned(targetKey);
+                        if (isAssignedTarget || targetData == NULL) {
+                            (isAssignedTarget ? assignedTargetSkips : unservedTargetSkips)++;
                             continue;
                         }
                         target.mapSequence(targetKey, targetKey, targetData, seqDbr.getSeqLen(targetKey));
@@ -2789,6 +2803,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         serviceThread.join();
         MMseqsNode::addPhaseValue(phaseValues, "Served sequence flushes", SSTR(servedFlushCount) + " (largest " + SSTR(largestServedFlushBytes) + " bytes)");
         MMseqsNode::addPhaseValue(phaseValues, "Received sequence slices", SSTR(receivedSliceCount));
+        MMseqsNode::addPhaseValue(phaseValues, "Sequence exchange bytes", SSTR(servedBytes) + " served, " + SSTR(receivedSliceBytes) + " received, " + SSTR(requestFlushCount) + " requests");
         MMseqsNode::addPhaseSeconds(phaseValues, "service: serving the slices", servingSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: writing the served flushes", writingSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: waiting for the flush writer", flushWriterWaitSeconds);
@@ -2821,6 +2836,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         MMseqsNode::addPhaseValue(phaseValues, "Member gates skipped before reading", SSTR(skippedMemberGates));
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the accepted log mutex", repBatchLockWaitSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Aligned pairs", SSTR(alignedPairs));
+        MMseqsNode::addPhaseValue(phaseValues, "Skipped reps", SSTR(assignedRepSkips) + " assigned, " + SSTR(unservedRepSkips) + " not served");
+        MMseqsNode::addPhaseValue(phaseValues, "Skipped targets", SSTR(assignedTargetSkips) + " assigned, " + SSTR(unservedTargetSkips) + " not served");
         MMseqsNode::addPhaseValue(phaseValues, "Claim seconds", SSTR(CLAIM_SECONDS) + " (" + SSTR(alignedCostPerSecond.load()) + " cells per second, " + SSTR(alignSeconds) + " s aligning)");
     }
 }
@@ -2965,6 +2982,8 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     double tailEraseSeconds = 0;
     size_t tailMovedWords = 0;
     size_t freePairs = 0;
+    size_t assignedRepPairs = 0;
+    size_t assignedMemberPairs = 0;
     size_t sharingRepPairs = 0;
     double takenWriteSeconds = 0;
     size_t peakChangeBytes = 0;
@@ -3166,7 +3185,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         // a pair with an assigned rep or member stays out, as bits are never cleared
         pairIsFree.resize(logWords.size());
         repKeyOffsets.assign(repCount + 1, 0);
-#pragma omp parallel for schedule(dynamic, 1024) reduction(+:freePairs)
+#pragma omp parallel for schedule(dynamic, 1024) reduction(+:freePairs, assignedRepPairs, assignedMemberPairs)
         for (size_t rep = 0; rep < repCount; rep++) {
             const bool repIsFree = isAssigned(reps[rep].repKey % paddedDbSize) == false;
             size_t freeCount = 0;
@@ -3176,6 +3195,8 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             }
             repKeyOffsets[rep + 1] = (freeCount > 0) ? freeCount + 1 : 0;
             freePairs += freeCount;
+            assignedRepPairs += repIsFree ? 0 : reps[rep].end - reps[rep].begin;
+            assignedMemberPairs += repIsFree ? reps[rep].end - reps[rep].begin - freeCount : 0;
         }
         if (repCount > 16384 && threads > 1) {
             sumOffsets(repKeyOffsets.data(), repCount, threads);
@@ -3490,6 +3511,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     MMseqsNode::addPhaseValue(phaseValues, "Clustering steps", SSTR(stepCount));
     MMseqsNode::addPhaseValue(phaseValues, "Accepted log tail words moved", SSTR(tailMovedWords));
     MMseqsNode::addPhaseValue(phaseValues, "Free pairs", SSTR(freePairs));
+    MMseqsNode::addPhaseValue(phaseValues, "Pairs of assigned reps", SSTR(assignedRepPairs) + ", of assigned members " + SSTR(assignedMemberPairs));
     MMseqsNode::addPhaseValue(phaseValues, "Pairs of sharing reps", SSTR(sharingRepPairs));
     MMseqsNode::addPhaseValue(phaseValues, "Peak assigned change bytes", SSTR(peakChangeBytes));
     MMseqsNode::addPhaseValue(phaseValues, "Clustered pairs", SSTR(clusteredPairs));
