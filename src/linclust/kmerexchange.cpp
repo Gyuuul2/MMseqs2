@@ -1797,6 +1797,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     size_t windowedPasses = 0;
     size_t aloneChunks = 0;
     size_t punchedRanges = 0;
+    double readWaitSeconds = 0;
     // the buffer of the largest hash range so far, kept for the next ones so their pages are not mapped again
     char *passBuffer = NULL;
     size_t codeBufferBytes = 0;
@@ -1905,10 +1906,14 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                     EXIT(EXIT_FAILURE);
                 }
                 getPassRows(exchange, received.fileRows, passFirstHashSubRange, received.passHashSubRangeOffsets[pass + 1], passRows[passCodeBuffer], passRowOffsets[passCodeBuffer]);
-            } else if (isPrefetched == false) {
-                readPass(received, pass, passCodeBuffer, false);
             } else {
-                batchReader->waitAsyncRead();
+                Timer readTimer;
+                if (isPrefetched == false) {
+                    readPass(received, pass, passCodeBuffer, false);
+                } else {
+                    batchReader->waitAsyncRead();
+                }
+                readWaitSeconds += readTimer.getTimediff();
             }
             // the last pass takes the next hash range, so its first pass is read while this one is merged
             if (pass + 1 == passCount) {
@@ -2312,6 +2317,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     delete batchReader;
     closeReceivedFiles(receivedFiles);
     batchWriter.waitWrites();
+    MMseqsNode::addPhaseSeconds(receiveValues, "waiting to read k-mers", readWaitSeconds);
     MMseqsNode::addPhaseSeconds(receiveValues, "waiting to write pairs", batchWriter.getWaitSeconds() / par.threads);
     MMseqsNode::addPhaseValue(receiveValues, "Pair flushes", SSTR(output.flushes));
     MMseqsNode::addPhaseValue(receiveValues, "Pair bytes kept in memory", SSTR(ownPairs.bytes));
@@ -2431,6 +2437,7 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     MMseqsNode::addPhaseValue(mergeValues, "Largest merge split cost to average", SSTR(static_cast<double>(splitCosts[mergeOrder[0]]) * mergeSplitCount / std::max<size_t>(1, globalCost)));
     size_t mergedPairBytes = 0;
     size_t punchedRanges = 0;
+    double readWaitSeconds = 0;
     size_t releasedOwnPairBytes = 0;
     // the own merge send ranges first, then the merge splits that this node takes without the own merge send ranges of every node
     for (size_t ownMergeRange = 0;; ownMergeRange++) {
@@ -2479,7 +2486,9 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                 rowReadRequests[0].insert(rowReadRequests[0].end(), rowReadRequests[receiver].begin(), rowReadRequests[receiver].end());
             }
             BatchReader *batchReader = new BatchReader(par.threads, fileno(receivedPairFiles[0].file));
+            Timer readTimer;
             batchReader->readSync(rowReadRequests[0]);
+            readWaitSeconds += readTimer.getTimediff();
             std::vector<size_t> partitionCodeBytes(exchange.partitionsPerRange, 0);
             std::vector<size_t> partitionTargets(exchange.partitionsPerRange, 0);
             // the received file and row of every row of a partition
@@ -2578,11 +2587,13 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                     codeBuffer = pairPassBuffer;
                     getPairPassRows(partitionRows, passFirstPartition, passPartitionOffsets[pass + 1], pairPassRows[pass % 2], pairPassRowOffsets[pass % 2]);
                 } else {
+                    readTimer.reset();
                     if (isPrefetched == false) {
                         readPairPass(pass, false);
                     } else {
                         batchReader->waitAsyncRead();
                     }
+                    readWaitSeconds += readTimer.getTimediff();
                     isPrefetched = pass + 1 < pairPassCount && pairPassBytes[pass + 1] <= pairPassLimit && pairPassCodeBytes[pass + 1] > 0;
                     if (isPrefetched) {
                         readPairPass(pass + 1, true);
@@ -2745,6 +2756,7 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
     }
     closeReceivedFiles(receivedPairFiles);
     batchWriter.waitWrites();
+    MMseqsNode::addPhaseSeconds(mergeValues, "waiting to read pairs", readWaitSeconds);
     MMseqsNode::addPhaseSeconds(mergeValues, "waiting to write the prefilter", batchWriter.getWaitSeconds() / par.threads);
     MMseqsNode::addPhaseValue(mergeValues, "Pair bytes merged", SSTR(mergedPairBytes));
     MMseqsNode::addPhaseValue(mergeValues, "Pair file ranges freed", SSTR(punchedRanges));
