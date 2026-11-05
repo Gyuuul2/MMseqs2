@@ -369,8 +369,8 @@ struct InputPiece {
     size_t end;
 };
 
-// a segment of a data file goes to the node of the file as { data file type, offset, size } then its bytes
-static const size_t SEGMENT_HEADER_SIZE = 3 * sizeof(uint64_t);
+// a segment of a data file goes to the node of the file as { data file type, offset, size, stored size } then its bytes, compressed with zstd if that is smaller
+static const size_t SEGMENT_HEADER_SIZE = 4 * sizeof(uint64_t);
 // the most bytes of a segment, so the buffers of the exchange blocks stay small
 static const size_t MAX_SEGMENT_SIZE = 64 * 1024;
 
@@ -451,8 +451,8 @@ static void copyToBin(char *buffer, size_t &written, const char *data, size_t si
     }
 }
 
-// sorts entries into sortedBuffer; writes this node's bins directly and appends the others as segments to the exchange file
-static void flushBufferToExchange(const char *buffer, size_t bufferPos, char *sortedBuffer, std::vector<LengthBin> &lengthToBin, FILE *const *dataFiles, const std::string *dataFileNames,
+// sorts entries into sortedBuffer; writes this node's bins directly and appends the others as segments to the exchange file, compressed into buffer
+static void flushBufferToExchange(char *buffer, size_t bufferPos, char *sortedBuffer, ZSTD_CCtx *cctx, std::vector<LengthBin> &lengthToBin, FILE *const *dataFiles, const std::string *dataFileNames,
                                   FILE *exchangeFile, const std::string &exchangeFileName, std::string &indexData, size_t &exchangeBytes) {
     const size_t lengthCount = lengthToBin.size();
     std::vector<size_t> binSizes(DATA_FILE_TYPES * lengthCount, 0);
@@ -489,7 +489,8 @@ static void flushBufferToExchange(const char *buffer, size_t bufferPos, char *so
                 }
                 const size_t offset = (fileType == SEQUENCE_DATA) ? lengthBin.offset : ((fileType == HEADER_DATA) ? lengthBin.headerOffset : lengthBin.headerIndexOffset);
                 for (size_t segment = 0; segment * MAX_SEGMENT_SIZE < binSizes[bin]; segment++) {
-                    const uint64_t segmentHeader[3] = { fileType, offset + segment * MAX_SEGMENT_SIZE, std::min(MAX_SEGMENT_SIZE, binSizes[bin] - segment * MAX_SEGMENT_SIZE) };
+                    const size_t segmentSize = std::min(MAX_SEGMENT_SIZE, binSizes[bin] - segment * MAX_SEGMENT_SIZE);
+                    const uint64_t segmentHeader[4] = { fileType, offset + segment * MAX_SEGMENT_SIZE, segmentSize, segmentSize };
                     memcpy(sortedBuffer + sortedPos, segmentHeader, SEGMENT_HEADER_SIZE);
                     sortedPos += SEGMENT_HEADER_SIZE + segmentHeader[2];
                 }
@@ -534,17 +535,39 @@ static void flushBufferToExchange(const char *buffer, size_t bufferPos, char *so
     if (ownEnd - ownBegin == sortedPos) {
         return;
     }
-    for (node = MMseqsNode::rank + 1; node <= MMseqsNode::count; node++) {
-        nodeOffsets[node] -= ownEnd - ownBegin;
+    // the segments of the other nodes are compressed into buffer, which the entries left; a segment that does not get smaller stays as it is
+    size_t compressedPos = 0;
+    for (node = 0; node < MMseqsNode::count; node++) {
+        size_t pos = nodeOffsets[node];
+        const size_t end = nodeOffsets[node + 1];
+        nodeOffsets[node] = compressedPos;
+        if (node == MMseqsNode::rank) {
+            continue;
+        }
+        while (pos < end) {
+            uint64_t segmentHeader[4];
+            memcpy(segmentHeader, sortedBuffer + pos, SEGMENT_HEADER_SIZE);
+            const char *data = sortedBuffer + pos + SEGMENT_HEADER_SIZE;
+            char *compressed = buffer + compressedPos + SEGMENT_HEADER_SIZE;
+            size_t storedSize = ZSTD_compressCCtx(cctx, compressed, segmentHeader[2] - 1, data, segmentHeader[2], 1);
+            if (ZSTD_isError(storedSize)) {
+                memcpy(compressed, data, segmentHeader[2]);
+                storedSize = segmentHeader[2];
+            }
+            segmentHeader[3] = storedSize;
+            memcpy(buffer + compressedPos, segmentHeader, SEGMENT_HEADER_SIZE);
+            compressedPos += SEGMENT_HEADER_SIZE + storedSize;
+            pos += SEGMENT_HEADER_SIZE + segmentHeader[2];
+        }
     }
+    nodeOffsets[MMseqsNode::count] = compressedPos;
     size_t exchangeOffset;
 #pragma omp critical
     {
         exchangeOffset = exchangeBytes;
         MMseqsNode::addExchangeFlush(indexData, exchangeBytes, nodeOffsets);
     }
-    FileUtil::pwriteAll(fileno(exchangeFile), exchangeFileName.c_str(), sortedBuffer, ownBegin, exchangeOffset);
-    FileUtil::pwriteAll(fileno(exchangeFile), exchangeFileName.c_str(), sortedBuffer + ownEnd, sortedPos - ownEnd, exchangeOffset + ownBegin);
+    FileUtil::pwriteAll(fileno(exchangeFile), exchangeFileName.c_str(), buffer, compressedPos, exchangeOffset);
 }
 
 static std::vector<LengthBin> readLengthBins(const std::string &file) {
@@ -878,6 +901,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         Util::checkAllocation(buffer, "Can not allocate buffer memory in createdb");
         char *sortedBuffer = new(std::nothrow) char[bufferSize];
         Util::checkAllocation(sortedBuffer, "Can not allocate sortedBuffer memory in createdb");
+        ZSTD_CCtx *cctx = ZSTD_createCCtx();
 #pragma omp for schedule(dynamic, 1)
         for (size_t i = 0; i < nodePieces.size(); i++) {
             std::vector<LengthBin> lengthToBin = getLengthToBin(pieceHistograms[i]);
@@ -897,7 +921,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                         Debug(Debug::ERROR) << "Not enough memory for entry " << e.name.s << "\n";
                         EXIT(EXIT_FAILURE);
                     }
-                    flushBufferToExchange(buffer, bufferPos, sortedBuffer, lengthToBin, dataFiles, dataFileNames, exchangeHandle, exchangeFile, exchangeIndexData, exchangeBytes);
+                    flushBufferToExchange(buffer, bufferPos, sortedBuffer, cctx, lengthToBin, dataFiles, dataFileNames, exchangeHandle, exchangeFile, exchangeIndexData, exchangeBytes);
                     bufferPos = 0;
                     entryCount = 0;
                 }
@@ -913,7 +937,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 entryCount++;
             }
             if (bufferPos > 0) {
-                flushBufferToExchange(buffer, bufferPos, sortedBuffer, lengthToBin, dataFiles, dataFileNames, exchangeHandle, exchangeFile, exchangeIndexData, exchangeBytes);
+                flushBufferToExchange(buffer, bufferPos, sortedBuffer, cctx, lengthToBin, dataFiles, dataFileNames, exchangeHandle, exchangeFile, exchangeIndexData, exchangeBytes);
             }
             delete kseq;
         }
@@ -921,6 +945,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         Util::releasePages(sortedBuffer, bufferSize);
         delete[] buffer;
         delete[] sortedBuffer;
+        ZSTD_freeCCtx(cctx);
     }
     const std::string exchangeIndex = MMseqsNode::closeExchange(exchangeHandle, exchangeFile, exchange + ".index", exchangeIndexData);
     MMseqsNode::addPhaseTime(phaseValues, "sending the sequences", timer);

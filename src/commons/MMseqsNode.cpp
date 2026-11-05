@@ -8,6 +8,8 @@
 #include "itoa.h"
 #include "Timer.h"
 
+#include <zstd.h>
+
 #include <cerrno>
 #include <cstdio>
 #include <ctime>
@@ -946,15 +948,16 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
 
 size_t MMseqsNode::readExchangeSegments(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t maxSegmentSize, uint64_t fileType, size_t windowBegin, size_t windowEnd,
                                         char *window, std::vector<std::pair<size_t, size_t> > &segments, const std::string &prefix) {
-    const size_t bufferSize = std::max(3 * sizeof(uint64_t) + maxSegmentSize, bufferMemory / std::max<size_t>(1, blocks.size()));
+    const size_t bufferSize = std::max(4 * sizeof(uint64_t) + maxSegmentSize, bufferMemory / std::max<size_t>(1, blocks.size()));
     size_t nextOffset = SIZE_MAX;
 #pragma omp parallel reduction(min:nextOffset)
     {
         std::vector<std::pair<size_t, size_t> > threadSegments;
+        ZSTD_DCtx *dctx = ZSTD_createDCtx();
 #pragma omp for schedule(dynamic, 1) nowait
         for (size_t i = 0; i < blocks.size(); i++) {
             ExchangeBlock &block = blocks[i];
-            uint64_t segment[3];
+            uint64_t segment[4];
             for (;;) {
                 bufferExchangeBlock(block, sizeof(segment), bufferSize, prefix);
                 if (block.bufferEnd - block.bufferPos < sizeof(segment)) {
@@ -967,17 +970,24 @@ size_t MMseqsNode::readExchangeSegments(std::vector<ExchangeBlock> &blocks, size
                     }
                     break;
                 }
-                bufferExchangeBlock(block, sizeof(segment) + segment[2], bufferSize, prefix);
-                if (block.bufferEnd - block.bufferPos < sizeof(segment) + segment[2]) {
+                bufferExchangeBlock(block, sizeof(segment) + segment[3], bufferSize, prefix);
+                if (block.bufferEnd - block.bufferPos < sizeof(segment) + segment[3]) {
                     Debug(Debug::ERROR) << "Cannot read " << prefix << ": a record ends after its block\n";
                     EXIT(EXIT_FAILURE);
                 }
-                memcpy(window + (segment[1] - windowBegin), getBlockData(block) + block.bufferPos + sizeof(segment), segment[2]);
+                const char *data = getBlockData(block) + block.bufferPos + sizeof(segment);
+                if (segment[3] == segment[2]) {
+                    memcpy(window + (segment[1] - windowBegin), data, segment[2]);
+                } else if (ZSTD_decompressDCtx(dctx, window + (segment[1] - windowBegin), segment[2], data, segment[3]) != segment[2]) {
+                    Debug(Debug::ERROR) << "Cannot decompress a record of " << prefix << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
                 threadSegments.push_back(std::make_pair(segment[1], segment[2]));
-                block.bufferPos += sizeof(segment) + segment[2];
+                block.bufferPos += sizeof(segment) + segment[3];
             }
             releaseReadBlock(block);
         }
+        ZSTD_freeDCtx(dctx);
 #pragma omp critical
         segments.insert(segments.end(), threadSegments.begin(), threadSegments.end());
     }
