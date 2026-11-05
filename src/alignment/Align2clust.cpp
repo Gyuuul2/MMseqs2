@@ -296,6 +296,10 @@ std::atomic<size_t> swipeTargetPairs(0);
 std::atomic<size_t> swipeTargetLaneRows(0);
 std::atomic<size_t> swipeTargetSlotRows(0);
 std::atomic<size_t> swipeTargetLongPairs(0);
+// the lane rows of the member and target extensions in 8 bit lanes that extended a target, all of them, and the extensions whose 8 bit lanes saturated
+std::atomic<size_t> swipeByteLaneRows(0);
+std::atomic<size_t> swipeByteSlotRows(0);
+std::atomic<size_t> swipeRerunPairs(0);
 
 static void printSwipeLanes() {
     Debug(Debug::INFO) << "SWIPE member gapped alignments: " << swipeLanePairs.load() << " in lanes ("

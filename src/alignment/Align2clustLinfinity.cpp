@@ -858,6 +858,8 @@ static const double BATCH_READ_SECONDS = PUBLISH_SECONDS / 4.0;
 static const double CLAIM_SECONDS = 2.0 * PUBLISH_SECONDS;
 // batches per thread of the records aligned at once, taken in rep order
 static const size_t ALIGN_BATCHES_PER_THREAD = 64;
+// the SWIPE lanes that ALIGN_BATCHES_PER_THREAD is for, more lanes take larger batches with as many extensions per lane
+static const size_t ALIGN_BATCH_LANES = 16;
 static const int CLUSTER_THREADS = 4;
 // an accepted log: the order key of every rep with this bit, then its accepted targets
 static const uint64_t ACCEPTED_REP_BIT = 1ULL << 63;
@@ -2395,7 +2397,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         const std::vector<RepTargetsRecord> &records = chunkRecords[window.chunk];
         const size_t recordCount = window.end - window.begin;
         // batches of about the same cost; batch b starts at target batchFirstTargets[b] of record batchOffsets[b], so a rep that costs more than a batch goes to several
-        const size_t maxBatches = par.threads * ALIGN_BATCHES_PER_THREAD;
+        const size_t maxBatches = par.threads * (swipeLanes ? ALIGN_BATCHES_PER_THREAD * ALIGN_BATCH_LANES / SwipeExtender::LANES : ALIGN_BATCHES_PER_THREAD);
         // a record costs its rep length times its target lengths, like a partition
         recordCosts.resize(recordCount);
 #pragma omp parallel for schedule(dynamic, 100)
@@ -3749,6 +3751,9 @@ int align2clustLinfinity(Parameters &par) {
             MMseqsNode::addPhaseValue(phaseValues, "SWIPE target alignments", SSTR(swipeTargetPairs.load()) + " in lanes ("
                                      + SSTR(swipeTargetLaneRows.load() * 100 / std::max<size_t>(1, swipeTargetSlotRows.load()))
                                      + "% active lane rows), " + SSTR(swipeTargetLongPairs.load()) + " long extensions");
+            MMseqsNode::addPhaseValue(phaseValues, "SWIPE extensions in 8 bit lanes", SSTR(swipeByteSlotRows.load() * 100 / std::max<size_t>(1, swipeMemberSlotRows.load() + swipeTargetSlotRows.load()))
+                                     + "% of the lane rows (" + SSTR(swipeByteLaneRows.load() * 100 / std::max<size_t>(1, swipeByteSlotRows.load())) + "% active), "
+                                     + SSTR(swipeRerunPairs.load()) + " again in 16 bit lanes");
         }
     }
     MMseqsNode::addPhaseValue(phaseValues, "Memory limit", SSTR(memoryLimit));

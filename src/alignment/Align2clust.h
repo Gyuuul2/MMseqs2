@@ -70,6 +70,9 @@ extern std::atomic<size_t> swipeTargetPairs;
 extern std::atomic<size_t> swipeTargetLaneRows;
 extern std::atomic<size_t> swipeTargetSlotRows;
 extern std::atomic<size_t> swipeTargetLongPairs;
+extern std::atomic<size_t> swipeByteLaneRows;
+extern std::atomic<size_t> swipeByteSlotRows;
+extern std::atomic<size_t> swipeRerunPairs;
 
 // per thread buffers of --align2clust-aligner-mode 1: the cluster members of a rep that go through the SWIPE lanes
 struct SwipeBatch {
@@ -182,12 +185,18 @@ struct SwipeTargets {
             swipeMemberExtensions += targetPairs;
             swipeMemberLaneRows += extender.extendLaneRows;
             swipeMemberSlotRows += extender.extendSlotRows;
+            swipeByteLaneRows += extender.extendByteLaneRows;
+            swipeByteSlotRows += extender.extendByteSlotRows;
+            swipeRerunPairs += extender.extendRerunJobs;
             return;
         }
         swipeTargetPairs += targetPairs;
         swipeTargetLaneRows += extender.extendLaneRows;
         swipeTargetSlotRows += extender.extendSlotRows;
         swipeTargetLongPairs += extender.extendLongJobs;
+        swipeByteLaneRows += extender.extendByteLaneRows;
+        swipeByteSlotRows += extender.extendByteSlotRows;
+        swipeRerunPairs += extender.extendRerunJobs;
     }
 
     void addTarget(Sequence &query, Sequence &target, DBKeyType targetKey, int seedQuery, int seedTarget) {
