@@ -734,49 +734,48 @@ static unsigned int getRepKeyDiffLowBits(size_t partitionKeys, size_t recordCoun
     return getBitWidth(std::max<size_t>(1, partitionKeys / std::max<size_t>(1, recordCount))) - 1;
 }
 
-// the targets of the records of a rep that a thread merges: up to repTargetCapacity in repTargets, more from the records by targetQueue
+// the targets of the records of a rep that a thread merges: up to repTargetCapacity sorted in repTargets for the records from sortedRepStart, more from the records by targetQueue
 struct RepTargetMerge {
     DBKeyType *repTargets;
     size_t repTargetCapacity;
+    size_t sortedRepStart;
+    size_t sortedRepTargetCount;
     std::vector<size_t> recordTargets;
     RowValueQueue targetQueue;
 };
 
-// the targets of the records [repStart, repEnd) of a rep that fit repTargets go back to the slots of the records sorted without repeats, so they follow each other in order
-static void sortRepTargets(AssignedPairRecord *records, size_t repStart, size_t repEnd, DBKeyType *targets, RepTargetMerge &merge) {
-    if (repEnd - repStart == 1) {
-        return;
-    }
-    DBKeyType *repTargetsEnd = merge.repTargets;
-    for (size_t record = repStart; record < repEnd; record++) {
-        if (static_cast<size_t>(repTargetsEnd - merge.repTargets) + records[record].targetCount > merge.repTargetCapacity) {
-            return;
-        }
-        repTargetsEnd = std::copy(targets + records[record].targetOffset, targets + records[record].targetOffset + records[record].targetCount, repTargetsEnd);
-    }
-    SORT_SERIAL(merge.repTargets, repTargetsEnd);
-    repTargetsEnd = std::unique(merge.repTargets, repTargetsEnd);
-    const DBKeyType *repTarget = merge.repTargets;
-    for (size_t record = repStart; record < repEnd; record++) {
-        records[record].targetCount = std::min<size_t>(records[record].targetCount, repTargetsEnd - repTarget);
-        std::copy(repTarget, repTarget + records[record].targetCount, targets + records[record].targetOffset);
-        repTarget += records[record].targetCount;
-    }
-}
-
-// gives the targets of the records [repStart, repEnd) of a rep to addTarget in id order without repeats: one after the other if they fit repTargets, as a record and
-// sortRepTargets keep them so, otherwise merged from the records
+// gives the targets of the records [repStart, repEnd) of a rep to addTarget in id order without repeats and without the rep, as a record is the slice of the members of a
+// group that it covers: from a record alone, sorted in repTargets if they fit, otherwise merged from the records
 template <typename AddTarget>
 static void mergeRepTargets(const AssignedPairRecord *records, size_t repStart, size_t repEnd, const DBKeyType *targets, RepTargetMerge &merge, AddTarget addTarget) {
-    size_t repTargetCount = 0;
-    for (size_t record = repStart; record < repEnd; record++) {
-        repTargetCount += records[record].targetCount;
-    }
-    if (repEnd - repStart == 1 || repTargetCount <= merge.repTargetCapacity) {
-        for (size_t record = repStart; record < repEnd; record++) {
-            for (size_t target = 0; target < records[record].targetCount; target++) {
-                addTarget(targets[records[record].targetOffset + target]);
+    const DBKeyType rep = records[repStart].rep;
+    if (repEnd - repStart == 1) {
+        for (size_t target = 0; target < records[repStart].targetCount; target++) {
+            if (targets[records[repStart].targetOffset + target] != rep) {
+                addTarget(targets[records[repStart].targetOffset + target]);
             }
+        }
+        return;
+    }
+    if (merge.sortedRepStart != repStart) {
+        size_t repTargetCount = 0;
+        for (size_t record = repStart; record < repEnd; record++) {
+            repTargetCount += records[record].targetCount;
+        }
+        if (repTargetCount <= merge.repTargetCapacity) {
+            DBKeyType *repTargetsEnd = merge.repTargets;
+            for (size_t record = repStart; record < repEnd; record++) {
+                repTargetsEnd = std::copy(targets + records[record].targetOffset, targets + records[record].targetOffset + records[record].targetCount, repTargetsEnd);
+            }
+            SORT_SERIAL(merge.repTargets, repTargetsEnd);
+            repTargetsEnd = std::unique(merge.repTargets, repTargetsEnd);
+            merge.sortedRepTargetCount = static_cast<size_t>(std::remove(merge.repTargets, repTargetsEnd, rep) - merge.repTargets);
+            merge.sortedRepStart = repStart;
+        }
+    }
+    if (merge.sortedRepStart == repStart) {
+        for (size_t target = 0; target < merge.sortedRepTargetCount; target++) {
+            addTarget(merge.repTargets[target]);
         }
         return;
     }
@@ -790,7 +789,7 @@ static void mergeRepTargets(const AssignedPairRecord *records, size_t repStart, 
     while (targetQueue.empty() == false) {
         const RowValue target = targetQueue.top();
         targetQueue.pop();
-        if (target.value != prevTarget) {
+        if (target.value != prevTarget && target.value != rep) {
             addTarget(target.value);
             prevTarget = target.value;
         }
@@ -848,7 +847,7 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
     }
     sendRangeRows.resize(exchange.sendRangeCount + 1, rows.size());
     const unsigned int targetGapBitsWidth = getBitWidth(exchange.globalIdBits);
-    // the bytes of every code of a row; the sorted targets go back to the slots of the records, so the write takes them in order
+    // the bytes of every code of a row
 #pragma omp parallel num_threads(threads)
     {
         unsigned int thread_idx = 0;
@@ -858,6 +857,7 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
         RepTargetMerge merge;
         merge.repTargets = reinterpret_cast<DBKeyType *>(writeBuffers + thread_idx * KMER_FILE_BUFFER_SIZE + KMER_FILE_BUFFER_SIZE / 2);
         merge.repTargetCapacity = KMER_FILE_BUFFER_SIZE / 2 / sizeof(DBKeyType);
+        merge.sortedRepStart = SIZE_MAX;
 #pragma omp for schedule(dynamic, 1)
         for (size_t row = 0; row < rows.size(); row++) {
             const size_t rowEnd = rowRecordOffsets[row + 1];
@@ -876,7 +876,6 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
                     __builtin_prefetch(targets + records[i].targetOffset);
                 }
                 const size_t repKey = records[repStart].rep - rowFirstKeys[row];
-                sortRepTargets(records, repStart, repEnd, targets, merge);
                 size_t repTargetCount = 0;
                 const unsigned int targetGapBits = getRepTargetGapBits(records, repStart, repEnd, targets, merge, repTargetCount);
                 codeBits[PAIR_INDEX_CODES] += ((repKey - nextRepKey) >> repKeyDiffLowBits) + 1 + repKeyDiffLowBits + 2 * getBitWidth(repTargetCount) - 1 + exchange.globalIdBits
@@ -931,6 +930,7 @@ static void writeAssignedPairs(const KmerExchange &exchange, AssignedPairFile &p
         RepTargetMerge merge;
         merge.repTargets = reinterpret_cast<DBKeyType *>(writeBuffer + KMER_FILE_BUFFER_SIZE / 2);
         merge.repTargetCapacity = KMER_FILE_BUFFER_SIZE / 2 / sizeof(DBKeyType);
+        merge.sortedRepStart = SIZE_MAX;
 #pragma omp for schedule(dynamic, 1)
         for (size_t row = 0; row < rows.size(); row++) {
             const bool isOwnRow = isOwnSendRange[std::upper_bound(sendRangeRows.begin(), sendRangeRows.end(), row) - sendRangeRows.begin() - 1];
@@ -1770,10 +1770,10 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     const size_t passLimit = getPassLimit(exchange.loadMemoryLimit - std::min(exchange.loadMemoryLimit, exchange.pairRowsMemory + ownKmers.bytes + receivedRowsMemory));
     // the records and targets of the passes until the output is full, written then and at the end
     const size_t outputBytes = passLimit;
-    // a thread that is alone with a group too big for the output takes half of it for records and half for targets
+    // a thread that is alone with a group too big for the output takes half of it for records, at least one per representative, and half for targets
     const size_t halfRecords = outputBytes / 2 / sizeof(AssignedPairRecord);
     const size_t halfTargets = (outputBytes - halfRecords * sizeof(AssignedPairRecord)) / sizeof(DBKeyType);
-    if (halfRecords == 0 || halfTargets == 0) {
+    if (halfRecords < exchange.maxRepSeqs || halfTargets == 0) {
         Debug(Debug::ERROR) << "Not enough memory to receive the k-mers. Raise --split-memory-limit.\n";
         EXIT(EXIT_FAILURE);
     }
@@ -2044,6 +2044,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                     std::vector<GroupRepCandidate> repCandidates;
                     repCandidates.reserve(KMER_FILE_BUFFER_SIZE / sizeof(GroupRepCandidate));
                     std::vector<DBKeyType> repSeqIds;
+                    std::vector<std::pair<DBKeyType, DBKeyType> > repCoveredKeys;
                     RowValueQueue adjKeyQueue;
                     // the readers of a code of the group rows go back to the group start
                     const auto rewindGroupReads = [&](size_t code, const std::vector<KmerCodeReader> &groupStarts) {
@@ -2123,9 +2124,9 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                 seekKmerCodeBits(memberRead, getKmerCodeBitPos(memberRead) + memberBits);
                                 seekKmerCodeBits(repCandidateRead, getKmerCodeBitPos(repCandidateRead) + repCandidateBits);
                             } else {
-                                // the records and targets of the group at most: a record per representative with every member as its target
+                                // the records and targets of the group at most: a record per representative and every member once
                                 const size_t groupRecords = groupMaxRepSeqs;
-                                const size_t groupTargets = groupMaxRepSeqs * memberCount;
+                                const size_t groupTargets = memberCount;
                                 if (isAlone == false && takePairOutput(output, block, groupRecords, groupTargets) == false) {
                                     chunkStops[chunk] = (groupRecords * sizeof(AssignedPairRecord) + groupTargets * sizeof(DBKeyType) > output.bytes) ? CHUNK_GROUP_TOO_BIG : CHUNK_OUTPUT_FULL;
                                     break;
@@ -2209,10 +2210,10 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                     seekKmerCodeBits(memberRead, getKmerCodeBitPos(groupMemberStarts[repMembers[rep].first]) + repMembers[rep].second * read.hashSubRangeRow->idBits);
                                     repSeqIds.push_back(getBits(memberRead, read.hashSubRangeRow->idBits) + read.hashSubRangeRow->loadFirstKey);
                                 }
-                                // a pair record per representative: the members with a length it can cover, without itself, in id order without repeats as the rows of a group are loads in key order with distinct ids in order
+                                // the keys [first, second) of the members with a length that a representative can cover
+                                repCoveredKeys.clear();
                                 for (size_t rep = 0; rep < repSeqIds.size(); rep++) {
-                                    const DBKeyType repId = repSeqIds[rep];
-                                    const size_t repRange = seqDbr.findIdRange(repId);
+                                    const size_t repRange = seqDbr.findIdRange(repSeqIds[rep]);
                                     const float repLength = static_cast<float>(index[repRange].length - 2);
                                     const auto isCovered = [&](const DBReader<DBKeyType>::Index &range) {
                                         return Util::canBeCovered(par.covThr, par.covMode, repLength, static_cast<float>(range.length - 2));
@@ -2221,41 +2222,35 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                     const DBReader<DBKeyType>::Index *coveredFirstRange = std::partition_point(index, index + repRange,
                                                                                                                [&](const DBReader<DBKeyType>::Index &range) { return isCovered(range) == false; });
                                     const DBReader<DBKeyType>::Index *coveredEndRange = std::partition_point(index + repRange, index + seqDbr.getIndexSize(), isCovered);
-                                    const size_t coveredFrom = coveredFirstRange->id;
-                                    const size_t coveredTo = (coveredEndRange < index + seqDbr.getIndexSize()) ? static_cast<size_t>(coveredEndRange->id) : seqDbr.getSize();
-                                    AssignedPairRecord record = {repId, 0, 0};
-                                    const auto startRecord = [&]() {
-                                        if (block.recordPos == block.recordEnd) {
-                                            flushAloneOutput();
-                                        }
-                                        record.targetOffset = block.targetPos;
-                                        record.targetCount = 0;
-                                    };
-                                    const auto endRecord = [&]() {
-                                        if (record.targetCount > 0) {
-                                            output.records[block.recordPos++] = record;
-                                        }
-                                    };
-                                    rewindGroupReads(KMER_MEMBER_CODES, groupMemberStarts);
-                                    startRecord();
-                                    for (size_t row = 0; row < groupRows.size(); row++) {
+                                    const DBKeyType coveredTo = (coveredEndRange < index + seqDbr.getIndexSize()) ? coveredEndRange->id : static_cast<DBKeyType>(seqDbr.getSize());
+                                    repCoveredKeys.push_back(std::make_pair(coveredFirstRange->id, coveredTo));
+                                }
+                                // the members go to the output once, in id order without repeats as the rows of a group are loads in key order with distinct ids in order, and a pair
+                                // record per representative is the slice of them it covers, with itself that writeAssignedPairs leaves out
+                                rewindGroupReads(KMER_MEMBER_CODES, groupMemberStarts);
+                                for (size_t row = 0, member = 0; row < groupRows.size();) {
+                                    // a group that outgrows the output of a thread that is alone continues in the next flush
+                                    if (block.recordEnd - block.recordPos < repSeqIds.size() || block.targetPos == block.targetEnd) {
+                                        flushAloneOutput();
+                                    }
+                                    const DBKeyType *members = output.targets + block.targetPos;
+                                    while (row < groupRows.size() && block.targetPos < block.targetEnd) {
                                         KmerHashSubRangeRead &read = reads[groupRows[row]];
-                                        for (size_t member = 0; member < read.groupMemberCount; member++) {
-                                            const size_t id = getBits(read.codeReads[KMER_MEMBER_CODES], read.hashSubRangeRow->idBits) + read.hashSubRangeRow->loadFirstKey;
-                                            if (id == repId || id < coveredFrom || id >= coveredTo) {
-                                                continue;
-                                            }
-                                            // a record that outgrows the output of a thread that is alone continues in the next flush
-                                            if (block.targetPos == block.targetEnd) {
-                                                endRecord();
-                                                flushAloneOutput();
-                                                startRecord();
-                                            }
-                                            output.targets[block.targetPos++] = id;
-                                            record.targetCount++;
+                                        output.targets[block.targetPos++] = getBits(read.codeReads[KMER_MEMBER_CODES], read.hashSubRangeRow->idBits) + read.hashSubRangeRow->loadFirstKey;
+                                        if (++member == read.groupMemberCount) {
+                                            row++;
+                                            member = 0;
                                         }
                                     }
-                                    endRecord();
+                                    const DBKeyType *membersEnd = output.targets + block.targetPos;
+                                    for (size_t rep = 0; rep < repSeqIds.size(); rep++) {
+                                        const DBKeyType *covered = std::lower_bound(members, membersEnd, repCoveredKeys[rep].first);
+                                        const DBKeyType *coveredEnd = std::lower_bound(covered, membersEnd, repCoveredKeys[rep].second);
+                                        if (coveredEnd - covered > (std::binary_search(covered, coveredEnd, repSeqIds[rep]) ? 1 : 0)) {
+                                            const AssignedPairRecord record = {repSeqIds[rep], static_cast<size_t>(covered - output.targets), static_cast<size_t>(coveredEnd - covered)};
+                                            output.records[block.recordPos++] = record;
+                                        }
+                                    }
                                 }
                             }
                             for (size_t row = 0; row < groupRows.size(); row++) {
