@@ -5,7 +5,6 @@
 #include "itoa.h"
 #include "FileUtil.h"
 #include "MMseqsNode.h"
-#include "FastSort.h"
 
 #include <list>
 
@@ -14,36 +13,42 @@
 #endif
 
 int mergeclusters(int argc, const char **argv, const Command &command) {
+    MMseqsNode::init();
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, true, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
-        MMseqsNode::init();
-        if (par.filenames.size() > 4) {
-            Debug(Debug::ERROR) << "mergeclusters merges at most two --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " clusterings\n";
-            EXIT(EXIT_FAILURE);
-        }
-        // the header index has a line for every data file, also for one without sequences
         DBReader<DBKeyType> dbr(par.hdr1.c_str(), (par.db1 + ".nodeinfo").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
         dbr.open(DBReader<DBKeyType>::NOSORT);
         const std::vector<size_t> nodeKeyOffsets = dbr.getNodeKeyOffsets(MMseqsNode::count);
         const bool hasSecondClustering = par.filenames.size() > 3;
-        // the members of the second clustering go to the nodes of their entries in the first
-        const std::vector<size_t> firstClusteringKeyOffsets = hasSecondClustering ? MMseqsNode::getClusterKeyOffsets(par.db2 + ".keys", par.filenames[2], dbr.getSize()) : nodeKeyOffsets;
+        // clusthashfast writes no entries for clusters of one key, its representative bits hold them
+        const std::string representativeDb = par.filenames[2] + "_redundancy";
+        const bool hasRepresentativeBits = FileUtil::fileExists((representativeDb + ".dbtype").c_str());
+        // where the parts of the first clustering, or its representative bits, start; a node reads the entries and bits of its keys from them
+        const std::vector<size_t> firstClusteringKeyOffsets = (hasSecondClustering || hasRepresentativeBits)
+                                                              ? MMseqsNode::getClusterKeyOffsets(par.db2 + ".keys", par.filenames[2], dbr.getSize(), hasRepresentativeBits ? representativeDb + ".bits." + SSTR(MMseqsNode::rank) : "")
+                                                              : std::vector<size_t>();
         dbr.close();
+        const size_t firstKey = nodeKeyOffsets[MMseqsNode::rank];
+        const size_t keyCount = nodeKeyOffsets[MMseqsNode::rank + 1] - firstKey;
+        uint64_t *representativeBits = hasRepresentativeBits ? MMseqsNode::readRepresentativeBits(representativeDb, firstClusteringKeyOffsets, firstKey, keyCount) : NULL;
         std::string phaseValues;
         Timer timer;
-        const std::string sortedByMember = par.db2 + "_swap_0";
-        const std::string sortedByMemberIndex = hasSecondClustering ? MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, firstClusteringKeyOffsets, sortedByMember) : "";
-        const std::string sortedByRep = par.db2 + "_swap_1";
+        const std::string sortedByMember = par.db2 + "_by_member";
+        const std::string sortedByMemberIndex = hasSecondClustering ? MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, nodeKeyOffsets, sortedByMember) : "";
+        const std::string sortedByRep = par.db2 + "_by_rep";
+        // the bits left are the singletons of this node
         const std::string sortedByRepIndex = MMseqsNode::sendClusterPairs(par.filenames[2], true, ClusterPair::compareByRep, nodeKeyOffsets, sortedByRep,
-                                                                          sortedByMemberIndex, hasSecondClustering ? sortedByMember : "");
+                                                                          sortedByMemberIndex, hasSecondClustering ? sortedByMember : "", representativeBits, firstClusteringKeyOffsets, firstKey, keyCount);
         MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", timer);
         if (hasSecondClustering) {
             FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
         }
-        MMseqsNode::writeClusterPairs(sortedByRepIndex, sortedByRep, par.db2, NULL, nodeKeyOffsets[MMseqsNode::rank], nodeKeyOffsets[MMseqsNode::rank + 1] - nodeKeyOffsets[MMseqsNode::rank]);
+        const size_t clusterLines = MMseqsNode::writeClusterPairs(sortedByRepIndex, sortedByRep, par.db2, representativeBits, firstKey, keyCount);
+        delete[] representativeBits;
         MMseqsNode::addPhaseTime(phaseValues, "writing the clusters", timer);
+        MMseqsNode::addPhaseValue(phaseValues, "Cluster lines written", SSTR(clusterLines));
         std::vector<std::string> exchanges;
         exchanges.push_back(sortedByRep);
         if (hasSecondClustering) {
