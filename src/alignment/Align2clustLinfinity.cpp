@@ -1244,6 +1244,10 @@ struct RepTargetsReader {
         MMseqsNode::addPhaseValue(phaseValues, "Claimed group ranges", SSTR(claimedGroupRanges) + " of " + SSTR(groupRangePartitionOffsets.size() - 1));
     }
 
+    size_t getOrderedClaims() const {
+        return groupRangeQueue.getOrderedClaims();
+    }
+
     const size_t maxRecordBytes;
 
 private:
@@ -1440,6 +1444,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t acceptedBytes = 0;
     std::vector<uint64_t> acceptedWords;
     DBKeyType loggedRepKey = DB_KEY_INVALID;
+    const auto publishAccepted = [&](size_t repKey, size_t bytes) {
+        MMseqsNode::publishLog(acceptedHandle, acceptedFile, repKey, bytes, repTargetsReader.getOrderedClaims());
+    };
     const auto logAcceptedPairs = [&](const ClusterPair *pairs, size_t pairCount) {
         acceptedWords.clear();
         for (size_t i = 0; i < pairCount; i++) {
@@ -1756,7 +1763,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
     });
     readWindow(window, nextWindow);
-    MMseqsNode::publishLog(acceptedHandle, acceptedFile, getFirstRepKey(window), 0);
+    publishAccepted(getFirstRepKey(window), 0);
     size_t publishedBytes = 0;
     time_t publishTime = time(NULL);
     time_t changesTime = publishTime;
@@ -2376,7 +2383,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             return;
         }
         lock.unlock();
-        MMseqsNode::publishLog(acceptedHandle, acceptedFile, doneRepKey, acceptedBytes);
+        publishAccepted(doneRepKey, acceptedBytes);
         publishedBytes = acceptedBytes;
         publishTime = time(NULL);
         Timer waitTimer;
@@ -2537,7 +2544,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                 }
                 if (publishLock.owns_lock()) {
-                    MMseqsNode::publishLog(acceptedHandle, acceptedFile, doneRepKey, doneBytes);
+                    publishAccepted(doneRepKey, doneBytes);
                     publishLock.unlock();
                 }
                 if (readsChanges) {
@@ -2776,7 +2783,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 }
             }
             logAcceptedPairs(windowPairs.data(), acceptedCount);
-            MMseqsNode::publishLog(acceptedHandle, acceptedFile, nextRepKey, acceptedBytes);
+            publishAccepted(nextRepKey, acceptedBytes);
             publishedBytes = acceptedBytes;
             publishTime = time(NULL);
             if (nextRepKey < orderKeyEnd) {
@@ -2795,7 +2802,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     chunkLoader.join();
     MMseqsNode::addPhaseValue(phaseValues, "Sequence windows", SSTR(windowCount) + " (" + SSTR(windowKeys) + " keys, "
                              + SSTR(windowKeptKeys) + " keys and " + SSTR(windowKeptBytes) + " bytes reused)");
-    MMseqsNode::publishLog(acceptedHandle, acceptedFile, orderKeyEnd, acceptedBytes);
+    publishAccepted(orderKeyEnd, acceptedBytes);
     if (fclose(acceptedHandle) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << acceptedFile << "\n";
         EXIT(EXIT_FAILURE);
@@ -2997,6 +3004,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     Timer clusterTimer;
     unsigned int polls = 0;
     MMseqsNode::WaitWarning waitWarning;
+    size_t orderedClaims = 0;
     for (size_t clusteredKey = 0; clusteredKey < orderKeyEnd;) {
         // the steps decided while the writer is busy are written and published together, waiting for it once they reach stepWords
         if (changes.empty() == false && (isWritingChanges == false || changes.size() >= stepWords)) {
@@ -3011,13 +3019,17 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         }
         Timer pollTimer;
         bool hasNewProgress = false;
-#pragma omp parallel for schedule(dynamic, 1) reduction(||:hasNewProgress)
+#pragma omp parallel for schedule(dynamic, 1) reduction(||:hasNewProgress) reduction(max:orderedClaims)
         for (size_t node = 0; node < MMseqsNode::count; node++) {
             const std::string log = accepted + "." + SSTR(node);
             size_t repKey;
             size_t logBytes;
-            if ((nodeHasProgress[node] && nodeRepKeys[node] == orderKeyEnd) || MMseqsNode::readLogProgress(log, repKey, logBytes) == false
-                || (nodeHasProgress[node] && repKey <= nodeRepKeys[node] && logBytes <= nodeLogBytes[node])) {
+            size_t nodeClaims;
+            if ((nodeHasProgress[node] && nodeRepKeys[node] == orderKeyEnd) || MMseqsNode::readLogProgress(log, repKey, logBytes, &nodeClaims) == false) {
+                continue;
+            }
+            orderedClaims = std::max(orderedClaims, nodeClaims);
+            if (nodeHasProgress[node] && repKey <= nodeRepKeys[node] && logBytes <= nodeLogBytes[node]) {
                 continue;
             }
             hasNewProgress = true;
@@ -3044,9 +3056,15 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         }
         polls = 0;
         Timer stepTimer;
-        // a node that claimed a group range gets the keys of it assigned before this step, then those that its steps assign
-        while (groupRangeNodes.size() + 1 < groupRangeKeyOffsets.size()) {
-            const unsigned int node = groupRangeQueue.getNode(groupRangeNodes.size());
+        // a node that claimed a group range gets the keys of it assigned before this step, then those that its steps assign; the claim files below the logged cursor are read at once
+        const size_t firstNewRange = groupRangeNodes.size();
+        std::vector<unsigned int> claimNodes(std::max(firstNewRange, std::min(orderedClaims, groupRangeKeyOffsets.size() - 1)) - firstNewRange);
+#pragma omp parallel for schedule(dynamic, 1)
+        for (size_t i = 0; i < claimNodes.size(); i++) {
+            claimNodes[i] = groupRangeQueue.getNode(firstNewRange + i);
+        }
+        for (size_t i = 0; i < claimNodes.size(); i++) {
+            const unsigned int node = claimNodes[i];
             if (node >= MMseqsNode::count) {
                 break;
             }

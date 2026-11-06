@@ -263,28 +263,31 @@ std::string MMseqsNode::gatherRunFiles(const std::string &prefix) {
     return content;
 }
 
-void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t bytes) {
+void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t bytes, size_t orderedClaims) {
     if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
         Debug(Debug::ERROR) << "Cannot flush " << log << "\n";
         EXIT(EXIT_FAILURE);
     }
-    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(bytes) + "\n");
+    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(bytes) + "\t" + SSTR(orderedClaims) + "\n");
 }
 
-bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &bytes) {
+bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &bytes, size_t *orderedClaims) {
     const std::string file = log + ".progress";
     // NFS may fail to read a progress file that was just replaced; the next poll reads it again
     const std::string content = readPolledFile(file);
     if (content.compare(0, runId.size(), runId) != 0) {
         return false;
     }
-    const char *columns[2];
-    if (Util::getWordsOfLine((char *) content.c_str() + runId.size(), columns, 2) < 2) {
+    const char *columns[3];
+    if (Util::getWordsOfLine((char *) content.c_str() + runId.size(), columns, 3) < 3) {
         Debug(Debug::ERROR) << "Cannot read " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
     key = Util::fast_atoi<size_t>(columns[0]);
     bytes = Util::fast_atoi<size_t>(columns[1]);
+    if (orderedClaims != NULL) {
+        *orderedClaims = Util::fast_atoi<size_t>(columns[2]);
+    }
     return true;
 }
 
@@ -612,12 +615,16 @@ size_t MMseqsNode::WorkQueue::claimNext() {
 }
 
 size_t MMseqsNode::WorkQueue::claimInOrder() {
-    for (; nextOrderedItem < itemCount; nextOrderedItem++) {
-        if (claim(nextOrderedItem)) {
-            return nextOrderedItem++;
-        }
+    size_t item = nextOrderedItem;
+    while (item < itemCount && claim(item) == false) {
+        item++;
     }
-    return itemCount;
+    __atomic_store_n(&nextOrderedItem, std::min(item + 1, itemCount), __ATOMIC_RELAXED);
+    return item;
+}
+
+size_t MMseqsNode::WorkQueue::getOrderedClaims() const {
+    return __atomic_load_n(&nextOrderedItem, __ATOMIC_RELAXED);
 }
 
 unsigned int MMseqsNode::WorkQueue::getNode(size_t item) const {

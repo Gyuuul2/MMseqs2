@@ -67,8 +67,9 @@ public:
     // waits for prefix + node of every node and returns their content in node order; the files are removed
     static std::string gatherRunFiles(const std::string &prefix);
     // a log that one node appends to while another reads it: its synced byte count and a key are published as <log>.progress, read from a new open
-    static void publishLog(FILE *file, const std::string &log, size_t key, size_t bytes);
-    static bool readLogProgress(const std::string &log, size_t &key, size_t &bytes);
+    // orderedClaims: the first items of an ordered work queue that are taken, so the reader opens only their files
+    static void publishLog(FILE *file, const std::string &log, size_t key, size_t bytes, size_t orderedClaims = 0);
+    static bool readLogProgress(const std::string &log, size_t &key, size_t &bytes, size_t *orderedClaims = NULL);
     static void waitForLog(const std::string &log, size_t &key, size_t &bytes);
     // without wait, returns false at once instead of polling until the bytes are readable
     static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true);
@@ -106,6 +107,8 @@ public:
         size_t claimNext();
         // the first item that no node has taken, for a queue that all nodes take in order, so its taken items are always the first ones
         size_t claimInOrder();
+        // the number of first items that some node has taken; any thread of this node may read it while claimInOrder runs
+        size_t getOrderedClaims() const;
         // the node that took item, count while that is not readable
         unsigned int getNode(size_t item) const;
         // removes <name>.<item> of the own items of this node, while no node takes items of the queue
