@@ -1585,17 +1585,19 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                + 2 * std::max(windowBytes, repTargetsReader.maxRecordBytes) + windowBytes
                + ((rank >= firstAlignNode && alignNodes > 1) ? 3 * maxFlushBytes + 5 * sliceKeyLimit * sizeof(size_t) : 0);
     };
-    // the largest window that keeps the memory limit and, if any window can, leaves a block cache for the band of the home
+    // the largest window that keeps the memory limit and, if any window can, leaves a block cache for the band of the home, down to a record for the share of the home
     const bool canCacheBand = isCacheTooSmall(memoryLimit - std::min(memoryLimit, getReservedMemory(0))) == false;
+    const size_t homeShareBytes = rangeByteOffsets[rangeCount] / alignNodes;
     size_t maxWindowBytes = memoryLimit / WINDOW_MEMORY_DIVISOR;
-    while (maxWindowBytes > 1 && (getReservedMemory(maxWindowBytes) > memoryLimit || (canCacheBand && isCacheTooSmall(memoryLimit - getReservedMemory(maxWindowBytes))))) {
+    while (maxWindowBytes > 1 && (getReservedMemory(maxWindowBytes) > memoryLimit || (canCacheBand && isCacheTooSmall(memoryLimit - getReservedMemory(maxWindowBytes)))
+                                  || (alignNodes > 1 && maxWindowBytes > repTargetsReader.maxRecordBytes && memoryLimit - std::min(memoryLimit, getReservedMemory(maxWindowBytes)) < homeShareBytes))) {
         maxWindowBytes /= 2;
     }
     const size_t blockCacheBytes = memoryLimit - std::min(memoryLimit, getReservedMemory(maxWindowBytes));
     seqDbr.setBlockCacheBytes(blockCacheBytes);
     const bool readsDirectly = isCacheTooSmall(blockCacheBytes);
     if (rank >= firstAlignNode) {
-        MMseqsNode::addPhaseValue(phaseValues, "Block cache", SSTR(blockCacheBytes) + " bytes for a band of " + SSTR(static_cast<size_t>(homeBandBytes)) + " bytes of the home"
+        MMseqsNode::addPhaseValue(phaseValues, "Block cache", SSTR(blockCacheBytes) + " bytes for a band of " + SSTR(static_cast<size_t>(homeBandBytes)) + " bytes and a share of " + SSTR(homeShareBytes) + " bytes of the home"
                                  + (readsDirectly ? ", the sequences are read directly" : ""));
     }
     size_t windowLimit = std::min(maxWindowBytes / 64, FIRST_WINDOW_BYTES);
