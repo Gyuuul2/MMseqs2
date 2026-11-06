@@ -850,7 +850,7 @@ static const time_t READ_SECONDS = 1;
 // the nodes publish and read the changes right after the turn of a second, before the master step that answers them; a batch start reads them this often to see it soon
 static const double BATCH_READ_SECONDS = PUBLISH_SECONDS / 4.0;
 // a chunk claims group ranges of about this much work of its node, unless one range is more
-static const double CLAIM_SECONDS = 2.0 * PUBLISH_SECONDS;
+static const double CLAIM_SECONDS = 8.0 * PUBLISH_SECONDS;
 // batches per thread of the records aligned at once, taken in rep order
 static const size_t ALIGN_BATCHES_PER_THREAD = 64;
 // the SWIPE lanes that ALIGN_BATCHES_PER_THREAD is for, more lanes take larger batches with as many extensions per lane
