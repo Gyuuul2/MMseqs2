@@ -1037,8 +1037,9 @@ struct ClusterMemberLookup {
         }
     };
 
-    ClusterMemberLookup(const std::string &clu, const std::vector<size_t> &nodeKeyOffsets, const std::string &anchorKeys, size_t anchorEntries)
-        : nodeKeyOffsets(nodeKeyOffsets), anchorEntries(anchorEntries), parts(MMseqsNode::count), nodeAnchorOffsets(MMseqsNode::count + 1, 0), anchors(anchorKeys.size() / sizeof(DBKeyType)) {
+    ClusterMemberLookup(const std::string &clu, const std::string &anchorKeys, size_t anchorEntries)
+        : anchorEntries(anchorEntries), parts(MMseqsNode::count), partKeyOffsets(MMseqsNode::count + 1, SIZE_MAX), nodeAnchorOffsets(MMseqsNode::count + 1, 0),
+          anchors(anchorKeys.size() / sizeof(DBKeyType)) {
         memcpy(anchors.data(), anchorKeys.data(), anchorKeys.size());
         for (size_t node = 0; node < MMseqsNode::count; node++) {
             parts[node] = new DBReader<DBKeyType>((clu + "." + SSTR(node)).c_str(), (clu + ".index." + SSTR(node)).c_str(), 1,
@@ -1046,6 +1047,11 @@ struct ClusterMemberLookup {
             parts[node]->open(DBReader<DBKeyType>::NOSORT);
             nodeAnchorOffsets[node + 1] = nodeAnchorOffsets[node] + (parts[node]->getSize() + anchorEntries - 1) / anchorEntries;
         }
+        // the first anchor of a part is its first entry key; a part without entries starts where the next part starts
+        for (size_t node = MMseqsNode::count; node > 0; node--) {
+            partKeyOffsets[node - 1] = (nodeAnchorOffsets[node - 1] < nodeAnchorOffsets[node]) ? static_cast<size_t>(anchors[nodeAnchorOffsets[node - 1]]) : partKeyOffsets[node];
+        }
+        partKeyOffsets[0] = 0;
     }
 
     ~ClusterMemberLookup() {
@@ -1056,7 +1062,7 @@ struct ClusterMemberLookup {
     }
 
     Entry find(DBKeyType key) const {
-        const size_t node = std::upper_bound(nodeKeyOffsets.begin(), nodeKeyOffsets.end(), key) - nodeKeyOffsets.begin() - 1;
+        const size_t node = std::upper_bound(partKeyOffsets.begin(), partKeyOffsets.end(), key) - partKeyOffsets.begin() - 1;
         Entry entry = { node, 0, 0, key };
         const DBKeyType *begin = anchors.data() + nodeAnchorOffsets[node];
         const size_t anchor = std::lower_bound(begin, anchors.data() + nodeAnchorOffsets[node + 1], key) - begin;
@@ -1098,14 +1104,15 @@ struct ClusterMemberLookup {
     }
 
     size_t memoryBytes() const {
-        return sizeof(*this) + nodeKeyOffsets.capacity() * sizeof(size_t) + parts.size() * sizeof(DBReader<DBKeyType>) + nodeAnchorOffsets.capacity() * sizeof(size_t)
+        return sizeof(*this) + partKeyOffsets.capacity() * sizeof(size_t) + parts.size() * sizeof(DBReader<DBKeyType>) + nodeAnchorOffsets.capacity() * sizeof(size_t)
                + anchors.capacity() * sizeof(DBKeyType);
     }
 
 private:
-    const std::vector<size_t> nodeKeyOffsets;
     const size_t anchorEntries;
     std::vector<DBReader<DBKeyType> *> parts;
+    // where the keys of every part start, then SIZE_MAX
+    std::vector<size_t> partKeyOffsets;
     std::vector<size_t> nodeAnchorOffsets;
     std::vector<DBKeyType> anchors;
 };
@@ -3730,7 +3737,7 @@ int align2clustLinfinity(Parameters &par) {
         const std::string anchors = MMseqsNode::barrier(par.db3 + ".anchors", std::string(reinterpret_cast<const char *>(anchorKeys.data()), anchorKeys.size() * sizeof(DBKeyType)));
         MMseqsNode::removeOnceRead(par.db3 + ".anchors");
         if (MMseqsNode::rank >= getFirstAlignNode()) {
-            members = new ClusterMemberLookup(par.filterCluDBFile, nodeKeyOffsets, anchors, anchorEntries);
+            members = new ClusterMemberLookup(par.filterCluDBFile, anchors, anchorEntries);
         }
         memberDbr = new DBReader<DBKeyType>(par.filterSeqDBFile.c_str(), (par.filterSeqDBFile + ".index").c_str(), par.threads,
                                             DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);

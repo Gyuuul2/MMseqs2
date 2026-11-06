@@ -162,9 +162,11 @@ public:
                                        char *window, std::vector<std::pair<size_t, size_t> > &segments, const std::string &prefix);
     static void closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix);
 
-    // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered, those for this node kept in memory; nodeKeyOffsets: keys of every node
+    // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered, those for this node kept in memory; nodeKeyOffsets: keys of every node;
+    // balancedKeyOffsets: all pairs are written and close sets it to keys of every node cut so that the nodes get about equal lines
     struct ClusterPairWriter {
-        ClusterPairWriter(const std::string &exchange, size_t pairCapacity, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets);
+        ClusterPairWriter(const std::string &exchange, size_t pairCapacity, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
+                          std::vector<size_t> *balancedKeyOffsets = NULL);
         ~ClusterPairWriter();
         void add(DBKeyType repKey, DBKeyType memberKey) {
             if (pairCount == pairCapacity) {
@@ -184,8 +186,8 @@ public:
             return reserved;
         }
         void flush();
-        // writes the buffered pairs but keeps those for this node in memory, and returns the line of every node from closeExchange
-        std::string close();
+        // writes the buffered pairs, keeping those for this node in memory unless balancedKeyOffsets is set, then bit k of singletonBits counts as a line of key firstKey + k; returns the line of every node from closeExchange
+        std::string close(const uint64_t *singletonBits = NULL, size_t firstKey = 0, size_t keyCount = 0);
 
         const std::string exchange;
         const std::string fileName;
@@ -195,14 +197,18 @@ public:
         size_t pairCount;
         bool (*compare)(const ClusterPair &, const ClusterPair &);
         const std::vector<size_t> &nodeKeyOffsets;
+        std::vector<size_t> *balancedKeyOffsets;
+        // where the pairs of every bin start in each flush, then its pair count
+        std::vector<size_t> binOffsets;
         std::string indexData;
         size_t writtenBytes;
         size_t keptPairCount;
     };
-    // the representative of entry p becomes the one received for p in receivedIndex if given; representativeBits: keys [firstKey, firstKey + keyCount) of clu, which has no entries of one key, left set for keys neither entries nor received; cluKeyOffsets: where the parts of clu start, without them <clu>.<node>
+    // the representative of entry p becomes the one received for p in receivedIndex if given; representativeBits: keys [firstKey, firstKey + keyCount) of clu, which has no entries of one key, left set for keys neither entries nor received; cluKeyOffsets: where the parts of clu start, without them <clu>.<node>; balancedKeyOffsets: set to where the keys of every node start, cut so that the nodes get about equal lines; the representative bits left are written to <exchange>.bits.<node>
     static std::string sendClusterPairs(const std::string &clu, bool withRepresentative, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                                         const std::string &exchange, const std::string &receivedIndex = "", const std::string &receivedPrefix = "",
-                                        uint64_t *representativeBits = NULL, const std::vector<size_t> &cluKeyOffsets = std::vector<size_t>(), size_t firstKey = 0, size_t keyCount = 0);
+                                        uint64_t *representativeBits = NULL, const std::vector<size_t> &cluKeyOffsets = std::vector<size_t>(), size_t firstKey = 0, size_t keyCount = 0,
+                                        std::vector<size_t> *balancedKeyOffsets = NULL);
     // once every node has read lastExchange, a node removes its file of it; the master removes the indexes of exchanges and prints phaseValues
     static void removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues = "");
     // ORs the bits of keys [from, to) of a file, bit k at fileOffset = key fileFirstKey + k, into bit key - firstKey of bits, a word longer than its keys
