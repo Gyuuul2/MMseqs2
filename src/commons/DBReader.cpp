@@ -211,7 +211,6 @@ template <typename T> bool DBReader<T>::open(int accessType){
             Debug(Debug::ERROR) << "Cannot read index file " << indexFileName << "\n";
             EXIT(EXIT_FAILURE);
         }
-        const uint64_t lastOffset = lastCell[1];
         const size_t indexBytes = ftell(indexFile);
         // the index ends with (DB_KEY_INVALID, data size), unless its writer stopped early
         if (indexBytes % sizeof(lastCell) != 0 || lastCell[0] != static_cast<uint64_t>(DB_KEY_INVALID)) {
@@ -223,7 +222,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
             EXIT(EXIT_FAILURE);
         }
         size = indexBytes / (2 * sizeof(uint64_t)) - 1;
-        dataSize = lastOffset;
+        dataSize = lastCell[1];
         maxSeqLen = 0;
         lastKey = T();
         sortedByOffset = true;
@@ -333,11 +332,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
             int fd = -1;
 #ifdef O_DIRECT
             const StorageKind storage = getStorageKind(bufferedFd);
-            const bool localDevice = (storage == STORAGE_LOCAL_FLASH || storage == STORAGE_LOCAL_DISK);
-            const bool direct = (ioMode == IO_MODE_DIRECT)
-                                || (ioMode == IO_MODE_AUTO && ((dataMode & USE_DIRECT_IO)
-                                    || ((dataMode & USE_BUFFERED_IO) == 0 && localDevice && fileBytes[fileIdx] > pageCacheLimit)));
-            if (direct) {
+            if (ioMode == IO_MODE_DIRECT || (ioMode == IO_MODE_AUTO && (storage == STORAGE_LOCAL_FLASH || storage == STORAGE_LOCAL_DISK) && fileBytes[fileIdx] > pageCacheLimit)) {
                 fd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
                 directFiles += (fd >= 0);
             }
@@ -921,7 +916,6 @@ template <typename T> size_t DBReader<T>::findEntryByCell(size_t column, size_t 
         Debug(Debug::ERROR) << ((column == 0) ? "Key " : "Offset ") << value << " is not in the --createdb-mode 3 cluster or prefilter database " << dataFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
-    // the first of the (key, offset) cells of the entries and the end cell whose cell[column] is not smaller
     const int fd = bufferedFds[dataFileNames.size()];
     size_t entry = first;
     for (size_t cells = std::min(last, size + 1) - first; cells > 0;) {

@@ -2178,14 +2178,12 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
         }
     }
     
-    if (isLinfinity && par.diagonalMode != Parameters::DIAGONAL_MODE_UNGAPPED) {
-        if (par.PARAM_DIAGONAL_MODE.wasSet) {
+    if (isLinfinity) {
+        if (par.diagonalMode != Parameters::DIAGONAL_MODE_UNGAPPED && par.PARAM_DIAGONAL_MODE.wasSet) {
             Debug(Debug::WARNING) << "--diagonal-mode 0 cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
             Debug(Debug::WARNING) << "We recompute with --diagonal-mode 1\n";
         }
         par.diagonalMode = Parameters::DIAGONAL_MODE_UNGAPPED;
-    }
-    if (isLinfinity) {
         par.kmerPosFilter = false;
     }
     if (par.diagonalMode == Parameters::DIAGONAL_MODE_UNGAPPED) {

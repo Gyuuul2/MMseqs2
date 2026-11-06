@@ -73,12 +73,6 @@ static void cutThreadOffsets(const HashEntry *hashIdPairs, size_t begin, size_t 
     threadOffsets[threads] = end;
 }
 
-// consecutive lengths fit in one load when their sequence buffer is at most a third of the limit and their hashIdPairs fit next to two buffers
-static bool fitsInLoad(const LengthRange *begin, const LengthRange *end, bool isLinfinity, size_t seqBufferLimit, size_t hashIdPairsLimit) {
-    const size_t seqBufferBytes = isLinfinity ? end->offset - begin->offset + 2 * Util::getPageSize() : 0;
-    return seqBufferBytes <= seqBufferLimit && (end->startKey - begin->startKey) * sizeof(HashEntry) <= hashIdPairsLimit;
-}
-
 static size_t seqHash(Sequence &seq, size_t id, const char *data, size_t length) {
     seq.mapSequence(id, 0, data, length);
     return hashWithLength(Util::hash(seq.numSequence, seq.L), length);
@@ -244,19 +238,6 @@ static size_t fillHashRange(DBReader<DBKeyType> &reader, const BaseMatrix *subMa
     return rangeSeqCount;
 }
 
-// hashes and sorts keys [firstKey, firstKey + seqCount) of one length, read readChunkSeqCount at a time, and removes the singletons
-static size_t hashAndSortLength(DBReader<DBKeyType> &reader, const BaseMatrix *subMat, size_t maxSeqLen, size_t firstKey, size_t seqCount, size_t readChunkSeqCount,
-                                HashEntry *hashIdPairs, uint64_t *representativeBits, size_t localFirstKey, std::vector<size_t> &partOffsets) {
-    const size_t length = reader.getSeqLen(firstKey);
-    const LengthRange lengthRanges[2] = { { firstKey, 0, length + 2 }, { firstKey + seqCount, 0, 0 } };
-    for (size_t readChunkBegin = 0; readChunkBegin < seqCount; readChunkBegin += readChunkSeqCount) {
-        const size_t readChunkEnd = loadReadChunk(reader, firstKey, seqCount, readChunkSeqCount, readChunkBegin);
-        fillHashIdPairs(reader, subMat, maxSeqLen, lengthRanges, 1, firstKey + readChunkBegin, firstKey + readChunkEnd, hashIdPairs + readChunkBegin);
-    }
-    SORT_PARALLEL(hashIdPairs, hashIdPairs + seqCount, HashEntry::compareByHashAndId);
-    return removeSingletons(hashIdPairs, seqCount, representativeBits, localFirstKey, partOffsets);
-}
-
 // copies the sequences of blockHashIdPairs, keys of [firstKey, firstKey + seqCount), to their slots in blockSeqs, reading only their pages of each readChunkSeqCount keys
 static void loadBlockSeqs(DBReader<DBKeyType> &reader, size_t firstKey, size_t seqCount, size_t readChunkSeqCount, const HashEntry *blockHashIdPairs, size_t blockSeqCount,
                           MemberBits *memberBits, char *blockSeqs) {
@@ -412,7 +393,9 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             // a split mode 3 length keeps its hashIdPairs and, after its candidates, the sequences of a block in hashIdPairs
             hashIdPairsCapacity[i] = (splitMemoryLimit - keptBytes - readChunkBufferBytes - pairBytes) / sizeof(HashEntry);
         }
-        if (loadOffsets.empty() || fitsInLoad(&nodeSeqRange[loadOffsets.back()], &nodeSeqRange[i + 1], isLinfinity, seqBufferLimit, hashIdPairsLimit) == false) {
+        if (loadOffsets.empty()
+            || (isLinfinity ? nodeSeqRange[i + 1].offset - nodeSeqRange[loadOffsets.back()].offset + 2 * Util::getPageSize() : 0) > seqBufferLimit
+            || (nodeSeqRange[i + 1].startKey - nodeSeqRange[loadOffsets.back()].startKey) * sizeof(HashEntry) > hashIdPairsLimit) {
             loadOffsets.push_back(i);
         }
     }
@@ -471,7 +454,12 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             Util::checkAllocation(memberBits, "Can not allocate member bit memory");
         }
         if (copiesSeqs && hashIdPairsFit) {
-            const size_t candidateCount = hashAndSortLength(reader, &subMat, par.maxSeqLen, loadFirstKey, loadSeqCount, readChunkSeqCount, hashIdPairs, representativeBits, localFirstKey, partOffsets);
+            for (size_t readChunkBegin = 0; readChunkBegin < loadSeqCount; readChunkBegin += readChunkSeqCount) {
+                const size_t readChunkEnd = loadReadChunk(reader, loadFirstKey, loadSeqCount, readChunkSeqCount, readChunkBegin);
+                fillHashIdPairs(reader, &subMat, par.maxSeqLen, nodeSeqRange.data() + loadOffsets[load], loadOffsets[load + 1] - loadOffsets[load], loadFirstKey + readChunkBegin, loadFirstKey + readChunkEnd, hashIdPairs + readChunkBegin);
+            }
+            SORT_PARALLEL(hashIdPairs, hashIdPairs + loadSeqCount, HashEntry::compareByHashAndId);
+            const size_t candidateCount = removeSingletons(hashIdPairs, loadSeqCount, representativeBits, localFirstKey, partOffsets);
             // the candidates are cut at hash bins into blocks whose copies fit
             const size_t copyCapacity = (hashedSeqCapacity - candidateCount) * sizeof(HashEntry) / length;
             for (size_t hashBinBegin = 0; hashBinBegin < candidateCount;) {
@@ -610,12 +598,12 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                         // the clusters of a split mode 3 length are written in key order after its last hash range, the representative first
                         if (copiesSeqs) {
                             for (size_t i = clusterBegin; i < clusterEnd; i++) {
-                                const ClusterPair pair = { reader.getDbKey(repId), reader.getDbKey(rangeHashIdPairs[i].id) };
+                                const ClusterPair pair = { repId, rangeHashIdPairs[i].id };
                                 loadPairs[loadPairCount + i] = pair;
                             }
                         } else if (isLinfinity == false || clusterEnd - clusterBegin > 1) {
                             // a mode 3 representative without members has its bit and no entry
-                            entries.push_back(isLinfinity ? static_cast<uint64_t>(reader.getDbKey(repId)) : repId);
+                            entries.push_back(repId);
                             entries.push_back(data.size());
                             for (size_t i = clusterBegin; i < clusterEnd; i++) {
                                 char *end = Itoa::u64toa_sse2(static_cast<uint64_t>(reader.getDbKey(rangeHashIdPairs[i].id)), keyBuffer);
@@ -727,8 +715,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         } else {
             DBReader<DBKeyType>::softlinkDb(par.db1, representativeDb, DBFiles::SEQUENCE_ANCILLARY);
         }
-    }
-    if (MMseqsNode::isMaster()) {
         Debug(Debug::INFO) << "Size of the sequence database: " << reader.getSize() << "\n";
         Debug(Debug::INFO) << "Number of clusters: " << clusters << "\n";
     }

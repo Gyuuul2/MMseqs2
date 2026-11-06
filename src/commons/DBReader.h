@@ -246,12 +246,7 @@ public:
         if (local2id != NULL) {
             length=index[local2id[id]].length;
         }else if (index2dbfile != NULL) {
-            if (entryOffsetsFileNames.empty() == false) {
-                const size_t entryOffsetsPos = findLoadedEntryOffsetsPos(id);
-                length=loadedBuffer.entryOffsets[entryOffsetsPos + 1] - loadedBuffer.entryOffsets[entryOffsetsPos];
-            } else {
-                length=index[findIdRange(id)].length;
-            }
+            length=getEntryLen(id);
         }else{
             length=index[id].length;
         }
@@ -371,8 +366,6 @@ public:
     static const unsigned int USE_SOURCE     = 32;
     static const unsigned int USE_SOURCE_REV = 64;
     static const unsigned int USE_LINFINITY  = 128;
-    static const unsigned int USE_BUFFERED_IO = 256;
-    static const unsigned int USE_DIRECT_IO   = 512;
 
 
     // compressed

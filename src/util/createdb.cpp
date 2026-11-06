@@ -349,19 +349,17 @@ void processSeqBatch(Parameters & par, DBWriter &seqWriter, DBWriter &hdrWriter,
     }
 }
 
+enum DataFileType { SEQUENCE_DATA, HEADER_DATA, HEADER_OFFSETS, DATA_FILE_TYPES };
+static const char *const dataFileSuffixes[DATA_FILE_TYPES] = {".", "_h.", "_h.index."};
+
 struct LengthBin {
     size_t length;
     size_t sequenceCount;
     size_t headerBytes;
     size_t startKey;
-    size_t offset;
-    size_t headerOffset;
-    size_t headerIndexOffset;
+    size_t offsets[DATA_FILE_TYPES];
     size_t file;
 };
-
-enum DataFileType { SEQUENCE_DATA, HEADER_DATA, HEADER_OFFSETS, DATA_FILE_TYPES };
-static const char *const dataFileSuffixes[DATA_FILE_TYPES] = {".", "_h.", "_h.index."};
 
 struct InputPiece {
     size_t file;
@@ -383,7 +381,7 @@ static std::vector<LengthBin> makeLengthBins(const std::vector<size_t> &sequence
     std::vector<LengthBin> histogram;
     for (size_t length = sequenceCount.size(); length-- > 0; ) {
         if (sequenceCount[length] > 0) {
-            LengthBin bin = {length, sequenceCount[length], headerBytes[length], 0, 0, 0, 0, 0};
+            LengthBin bin = {length, sequenceCount[length], headerBytes[length], 0, {}, 0};
             histogram.push_back(bin);
         }
     }
@@ -423,14 +421,12 @@ static void splitStarts(const std::vector<LengthBin> &starts, std::vector<std::v
             LengthBin &bin = splits[i][j];
             LengthBin &start = lengthToStart[bin.length];
             bin.startKey = start.startKey;
-            bin.offset = start.offset;
-            bin.headerOffset = start.headerOffset;
-            bin.headerIndexOffset = start.headerIndexOffset;
+            std::copy(start.offsets, start.offsets + DATA_FILE_TYPES, bin.offsets);
             bin.file = start.file;
             start.startKey += bin.sequenceCount;
-            start.offset += bin.sequenceCount * (bin.length + 2);
-            start.headerOffset += bin.headerBytes;
-            start.headerIndexOffset += bin.sequenceCount * sizeof(uint64_t);
+            start.offsets[SEQUENCE_DATA] += bin.sequenceCount * (bin.length + 2);
+            start.offsets[HEADER_DATA] += bin.headerBytes;
+            start.offsets[HEADER_OFFSETS] += bin.sequenceCount * sizeof(uint64_t);
         }
     }
 }
@@ -481,13 +477,12 @@ static void flushBufferToExchange(char *buffer, size_t bufferPos, char *sortedBu
         for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
             for (size_t length = lengthEnd; length-- > lengthBegin; ) {
                 const size_t bin = fileType * lengthCount + length;
-                const LengthBin &lengthBin = lengthToBin[length];
                 binStarts[bin] = sortedPos;
                 if (dataFile == MMseqsNode::rank) {
                     sortedPos += binSizes[bin];
                     continue;
                 }
-                const size_t offset = (fileType == SEQUENCE_DATA) ? lengthBin.offset : ((fileType == HEADER_DATA) ? lengthBin.headerOffset : lengthBin.headerIndexOffset);
+                const size_t offset = lengthToBin[length].offsets[fileType];
                 for (size_t segment = 0; segment * MAX_SEGMENT_SIZE < binSizes[bin]; segment++) {
                     const uint64_t segmentHeader[4] = { fileType, offset + segment * MAX_SEGMENT_SIZE, std::min(MAX_SEGMENT_SIZE, binSizes[bin] - segment * MAX_SEGMENT_SIZE) };
                     memcpy(sortedBuffer + sortedPos, segmentHeader, SEGMENT_HEADER_SIZE);
@@ -507,7 +502,7 @@ static void flushBufferToExchange(char *buffer, size_t bufferPos, char *sortedBu
         const size_t seqBin = SEQUENCE_DATA * lengthCount + seqSize - 2;
         const size_t hdrBin = HEADER_DATA * lengthCount + seqSize - 2;
         const size_t offsetBin = HEADER_OFFSETS * lengthCount + seqSize - 2;
-        const uint64_t headerOffset = lengthToBin[seqSize - 2].headerOffset + binWritten[hdrBin];
+        const uint64_t headerOffset = lengthToBin[seqSize - 2].offsets[HEADER_DATA] + binWritten[hdrBin];
         const bool segmented = lengthToBin[seqSize - 2].file != MMseqsNode::rank;
         copyToBin(sortedBuffer + binStarts[seqBin], binWritten[seqBin], buffer + pos, seqSize, segmented);
         copyToBin(sortedBuffer + binStarts[hdrBin], binWritten[hdrBin], buffer + pos + seqSize, hdrSize, segmented);
@@ -517,17 +512,13 @@ static void flushBufferToExchange(char *buffer, size_t bufferPos, char *sortedBu
     for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
         for (size_t length = lengthCount; length-- > 0; ) {
             const size_t bin = fileType * lengthCount + length;
-            const LengthBin &lengthBin = lengthToBin[length];
-            if (lengthBin.file == MMseqsNode::rank && binSizes[bin] > 0) {
-                const size_t offset = (fileType == SEQUENCE_DATA) ? lengthBin.offset : ((fileType == HEADER_DATA) ? lengthBin.headerOffset : lengthBin.headerIndexOffset);
-                FileUtil::pwriteAll(fileno(dataFiles[fileType]), dataFileNames[fileType].c_str(), sortedBuffer + binStarts[bin], binSizes[bin], offset);
+            if (lengthToBin[length].file == MMseqsNode::rank && binSizes[bin] > 0) {
+                FileUtil::pwriteAll(fileno(dataFiles[fileType]), dataFileNames[fileType].c_str(), sortedBuffer + binStarts[bin], binSizes[bin], lengthToBin[length].offsets[fileType]);
             }
         }
     }
-    for (size_t length = 0; length < lengthCount; length++) {
-        lengthToBin[length].offset += binSizes[SEQUENCE_DATA * lengthCount + length];
-        lengthToBin[length].headerOffset += binSizes[HEADER_DATA * lengthCount + length];
-        lengthToBin[length].headerIndexOffset += binSizes[HEADER_OFFSETS * lengthCount + length];
+    for (size_t bin = 0; bin < binSizes.size(); bin++) {
+        lengthToBin[bin % lengthCount].offsets[bin / lengthCount] += binSizes[bin];
     }
     if (nodeOffsets[MMseqsNode::rank + 1] - nodeOffsets[MMseqsNode::rank] == sortedPos) {
         return;
@@ -575,12 +566,12 @@ static std::vector<LengthBin> readLengthBins(const std::string &file) {
     const char *cols[8];
     while (currPos < binData.size()) {
         const size_t columns = Util::getWordsOfLine(binDataChar, cols, 8);
-        LengthBin bin = {Util::fast_atoi<size_t>(cols[0]), Util::fast_atoi<size_t>(cols[1]), Util::fast_atoi<size_t>(cols[2]), 0, 0, 0, 0, 0};
+        LengthBin bin = {Util::fast_atoi<size_t>(cols[0]), Util::fast_atoi<size_t>(cols[1]), Util::fast_atoi<size_t>(cols[2]), 0, {}, 0};
         if (columns == 8) {
             bin.startKey = Util::fast_atoi<size_t>(cols[3]);
-            bin.offset = Util::fast_atoi<size_t>(cols[4]);
-            bin.headerOffset = Util::fast_atoi<size_t>(cols[5]);
-            bin.headerIndexOffset = Util::fast_atoi<size_t>(cols[6]);
+            for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
+                bin.offsets[fileType] = Util::fast_atoi<size_t>(cols[4 + fileType]);
+            }
             bin.file = Util::fast_atoi<size_t>(cols[7]);
         }
         bins.push_back(bin);
@@ -594,16 +585,14 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     const std::string planPrefix = dataFile + ".splitplan.";
     if (MMseqsNode::isMaster()) {
         std::vector<size_t> fileSizes(filenames.size());
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+        size_t totalSize = 0;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+:totalSize)
         for (size_t i = 0; i < filenames.size(); i++) {
             fileSizes[i] = FileUtil::getFileSize(filenames[i]);
             if (fileSizes[i] == SIZE_MAX) {
                 Debug(Debug::ERROR) << "File " << filenames[i] << " does not exist\n";
                 EXIT(EXIT_FAILURE);
             }
-        }
-        size_t totalSize = 0;
-        for (size_t i = 0; i < filenames.size(); i++) {
             totalSize += fileSizes[i];
         }
         const size_t pieceSize = std::max<size_t>(1, totalSize / (MMseqsNode::count * par.threads));
@@ -641,29 +630,29 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                                   << "Give FASTA uncompressed or compressed with pzstd\n";
         }
         std::vector<InputPiece> pieces;
-        std::vector<size_t> pieceOffset(1, 0);
+        std::vector<size_t> pieceOffsets(1, 0);
         for (size_t i = 0; i < filenames.size(); i++) {
             for (size_t j = 0; j + 1 < fileCuts[i].size(); j++) {
                 InputPiece piece = {i, fileCuts[i][j], fileCuts[i][j + 1]};
                 pieces.push_back(piece);
-                pieceOffset.push_back(pieceOffset.back() + (piece.end - piece.start));
+                pieceOffsets.push_back(pieceOffsets.back() + (piece.end - piece.start));
             }
         }
         const size_t pieceCount = pieces.size();
-        std::vector<size_t> pieceBoundaries(MMseqsNode::count + 1, pieceCount);
-        pieceBoundaries[0] = 0;
+        std::vector<size_t> nodePieceOffsets(MMseqsNode::count + 1, pieceCount);
+        nodePieceOffsets[0] = 0;
         for (unsigned int node = 0; node + 1 < MMseqsNode::count; node++) {
             const size_t targetSize = totalSize / MMseqsNode::count * (node + 1);
             const size_t maxPieceEnd = (pieceCount >= MMseqsNode::count) ? pieceCount - (MMseqsNode::count - node - 1) : pieceCount;
-            size_t nearestEnd = std::lower_bound(pieceOffset.begin(), pieceOffset.end(), targetSize) - pieceOffset.begin();
-            if (nearestEnd > 0 && targetSize - pieceOffset[nearestEnd - 1] <= pieceOffset[nearestEnd] - targetSize) {
+            size_t nearestEnd = std::lower_bound(pieceOffsets.begin(), pieceOffsets.end(), targetSize) - pieceOffsets.begin();
+            if (nearestEnd > 0 && targetSize - pieceOffsets[nearestEnd - 1] <= pieceOffsets[nearestEnd] - targetSize) {
                 nearestEnd--;
             }
-            pieceBoundaries[node + 1] = std::min(std::max(nearestEnd, pieceBoundaries[node] + 1), maxPieceEnd);
+            nodePieceOffsets[node + 1] = std::min(std::max(nearestEnd, nodePieceOffsets[node] + 1), maxPieceEnd);
         }
         for (unsigned int node = 0; node < MMseqsNode::count; node++) {
             std::string planData;
-            for (size_t i = pieceBoundaries[node]; i < pieceBoundaries[node + 1]; i++) {
+            for (size_t i = nodePieceOffsets[node]; i < nodePieceOffsets[node + 1]; i++) {
                 planData += SSTR(pieces[i].file) + "\t" + SSTR(pieces[i].start) + "\t" + SSTR(pieces[i].end) + "\n";
             }
             MMseqsNode::publishRunFile(planPrefix + SSTR(node), planData);
@@ -791,13 +780,13 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             }
             fill += binBytes[i];
             bin.file = file;
-            bin.offset = dataFileSizes[SEQUENCE_DATA * MMseqsNode::count + file];
-            bin.headerOffset = dataFileSizes[HEADER_DATA * MMseqsNode::count + file];
-            bin.headerIndexOffset = dataFileSizes[HEADER_OFFSETS * MMseqsNode::count + file];
+            for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
+                bin.offsets[fileType] = dataFileSizes[fileType * MMseqsNode::count + file];
+            }
             dataFileSizes[SEQUENCE_DATA * MMseqsNode::count + file] += bin.sequenceCount * (bin.length + 2);
             dataFileSizes[HEADER_DATA * MMseqsNode::count + file] += bin.headerBytes;
             dataFileSizes[HEADER_OFFSETS * MMseqsNode::count + file] += bin.sequenceCount * sizeof(uint64_t);
-            indexData += SSTR(bin.startKey) + "\t" + SSTR(bin.offset) + "\t" + SSTR(bin.length + 2) + "\t" + SSTR(bin.sequenceCount) + "\t" + SSTR(bin.file) + "\n";
+            indexData += SSTR(bin.startKey) + "\t" + SSTR(bin.offsets[SEQUENCE_DATA]) + "\t" + SSTR(bin.length + 2) + "\t" + SSTR(bin.sequenceCount) + "\t" + SSTR(bin.file) + "\n";
         }
         std::string nodeInfoData;
         size_t fileFirstKey = 0;
@@ -838,7 +827,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             std::string startsData;
             for (size_t i = 0; i < nodeHistograms[node].size(); i++) {
                 const LengthBin &bin = nodeHistograms[node][i];
-                startsData += SSTR(bin.length) + "\t" + SSTR(bin.sequenceCount) + "\t" + SSTR(bin.headerBytes) + "\t" + SSTR(bin.startKey) + "\t" + SSTR(bin.offset) + "\t" + SSTR(bin.headerOffset) + "\t" + SSTR(bin.headerIndexOffset) + "\t" + SSTR(bin.file) + "\n";
+                startsData += SSTR(bin.length) + "\t" + SSTR(bin.sequenceCount) + "\t" + SSTR(bin.headerBytes) + "\t" + SSTR(bin.startKey) + "\t" + SSTR(bin.offsets[SEQUENCE_DATA]) + "\t" + SSTR(bin.offsets[HEADER_DATA]) + "\t" + SSTR(bin.offsets[HEADER_OFFSETS]) + "\t" + SSTR(bin.file) + "\n";
             }
             MMseqsNode::publishRunFile(startsPrefix + SSTR(node), startsData);
         }
@@ -1084,7 +1073,6 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             }
         }
     }
-    const size_t writtenBytes = dataFileSizes[SEQUENCE_DATA] + dataFileSizes[HEADER_DATA] + dataFileSizes[HEADER_OFFSETS];
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < DATA_FILE_TYPES; i++) {
         if (fclose(dataFiles[i]) != 0) {
@@ -1097,7 +1085,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         MMseqsNode::addPhaseSeconds(phaseValues, "compressing the headers", compressSeconds);
     }
     MMseqsNode::addPhaseSeconds(phaseValues, "writing the sequences", timer.getTimediff() - compressSeconds);
-    MMseqsNode::addPhaseValue(phaseValues, "Bytes written", SSTR(writtenBytes));
+    MMseqsNode::addPhaseValue(phaseValues, "Bytes written", SSTR(dataFileSizes[SEQUENCE_DATA] + dataFileSizes[HEADER_DATA] + dataFileSizes[HEADER_OFFSETS]));
     MMseqsNode::removeExchanges(dataFile, exchange, std::vector<std::string>(1, exchange), phaseValues);
     if (MMseqsNode::isMaster()) {
         std::string sourceData;

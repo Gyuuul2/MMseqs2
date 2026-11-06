@@ -46,16 +46,15 @@ public:
 
     // sleeps before poll number polls of a file that another node publishes: ten milliseconds, twice as long each poll, up to 10 << maxShift milliseconds
     static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
-    // every node tells of a wait for what that takes seconds, then twice as long each time, as Debug::ERROR so that every node prints it
+    // every node tells of a wait for what that takes 600 s, then twice as long each time, as Debug::ERROR so that every node prints it
     class WaitWarning {
     public:
-        explicit WaitWarning(size_t seconds = 600);
+        WaitWarning();
         void check(const std::string &what);
         void reset();
 
     private:
         time_t start;
-        const size_t firstSeconds;
         size_t nextSeconds;
     };
     static void publishFile(const std::string &file, const std::string &content);
@@ -151,8 +150,6 @@ public:
     // appends the offsets of indexData to the file of this node, closes it and returns a line of every node, its record bytes and flush count, once every node has closed its file
     static std::string closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData);
     static void openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeBlock> &blocks, std::vector<FILE *> &files);
-    // the smallest buffer of a block in readExchangeRange
-    static const size_t EXCHANGE_BUFFER_SIZE = 1024 * 1024;
     // moves the buffered records up to last of every block to records, recordOffsets their starts then the end; returns their count, 0 once none is left; recordSize NULL: ClusterPair records
     static size_t readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t (*recordSize)(const char *, size_t),
                                     bool (*compare)(const ClusterPair &, const ClusterPair &), const ClusterPair &last,

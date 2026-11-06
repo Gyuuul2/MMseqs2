@@ -19,10 +19,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
     par.parseParameters(argc, argv, command, true, 0, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     // --createdb-mode 3: every node writes the representatives of its cluster database <clu>.<node> with their sequences to <out>.<node>
-    std::string nodeSuffix;
-    if (isLinfinity) {
-        nodeSuffix = "." + SSTR(MMseqsNode::rank);
-    }
+    const std::string nodeSuffix = isLinfinity ? "." + SSTR(MMseqsNode::rank) : "";
 
     DBReader<DBKeyType> querydb_header(par.hdr1.c_str(), isLinfinity ? (par.db1 + ".nodeinfo").c_str() : par.hdr1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
     querydb_header.open(DBReader<DBKeyType>::NOSORT);
@@ -218,11 +215,9 @@ int result2flat(int argc, const char **argv, const Command &command) {
         seqDbr.close();
     } else {
         targetdb_header.close();
-    }
-    querydb_header.close();
-    if (isLinfinity == false) {
         dbr_data.close();
     }
+    querydb_header.close();
 
     return EXIT_SUCCESS;
 }
