@@ -2985,6 +2985,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     size_t logReadBytes = 0;
     double waitSeconds = 0;
     double mergeSeconds = 0;
+    double profGroupRange = 0, profReadCut = 0, profCutBook = 0, profTails = 0, profHeap = 0, profRepTable = 0;
     double decisionSeconds = 0;
     double placingSeconds = 0;
     double logReadSeconds = 0;
@@ -3056,6 +3057,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         }
         polls = 0;
         Timer stepTimer;
+        Timer profTimer;
         // a node that claimed a group range gets the keys of it assigned before this step, then those that its steps assign; the claim files below the logged cursor are read at once
         const size_t firstNewRange = groupRangeNodes.size();
         std::vector<unsigned int> claimNodes(std::max(firstNewRange, std::min(orderedClaims, groupRangeKeyOffsets.size() - 1)) - firstNewRange);
@@ -3079,6 +3081,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             groupRangeNodes.push_back(node);
         }
 
+        profGroupRange += profTimer.getTimediff(); profTimer.reset();
         // read every log up to doneRepKey after its tail, the logs at once; past nodeStepWords a log ends before its next rep, but the rep of clusteredKey is read whole
 #pragma omp parallel for schedule(dynamic, 1) reduction(+:logReadBytes, logReadSeconds)
         for (size_t node = 0; node < MMseqsNode::count; node++) {
@@ -3118,6 +3121,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             }
             repStarts.push_back(word);
         }
+        profReadCut += profTimer.getTimediff(); profTimer.reset();
         // the step ends at the first cut rep, the same as reading the logs one after another with the smallest cut so far
         size_t stepRepKey = doneRepKey;
         for (size_t node = 0; node < MMseqsNode::count; node++) {
@@ -3139,6 +3143,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             stepWordCount += nodeTakenCounts[node];
         }
         logWords.resize(stepWordCount);
+        profCutBook += profTimer.getTimediff(); profTimer.reset();
 #pragma omp parallel for schedule(dynamic, 1) reduction(+:tailEraseSeconds, tailMovedWords)
         for (size_t node = 0; node < MMseqsNode::count; node++) {
             std::vector<uint64_t> &nodeWords = nodeTails[node];
@@ -3154,6 +3159,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             nodeReadBytes[node] += nodeTakenCounts[node] * sizeof(uint64_t);
             nodeTakenBits[node].assign((nodeTakenCounts[node] + 63) / 64, 0);
         }
+        profTails += profTimer.getTimediff(); profTimer.reset();
         // merge the reps of the logs in order key order, a node giving its reps up to the next rep of another node at once
         std::priority_queue<std::pair<size_t, unsigned int>, std::vector<std::pair<size_t, unsigned int> >, std::greater<std::pair<size_t, unsigned int> > > nextReps;
         for (unsigned int node = 0; node < MMseqsNode::count; node++) {
@@ -3181,6 +3187,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             }
         }
         reps.resize(repCount);
+        profHeap += profTimer.getTimediff(); profTimer.reset();
         const size_t repChunk = 1024;
 #pragma omp parallel for schedule(static)
         for (size_t first = 0; first < repCount; first += repChunk) {
@@ -3199,6 +3206,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                 merged++;
             }
         }
+        profRepTable += profTimer.getTimediff();
         mergeSeconds += stepTimer.getTimediff();
         stepTimer.reset();
 
@@ -3523,6 +3531,12 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     MMseqsNode::addPhaseSeconds(phaseValues, "clustering the accepted pairs", clusterTimer.getTimediff() - waitSeconds);
     MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the aligning nodes", waitSeconds);
     MMseqsNode::addPhaseSeconds(phaseValues, "merging accepted logs", mergeSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "PROF merge: group range keys", profGroupRange);
+    MMseqsNode::addPhaseSeconds(phaseValues, "PROF merge: read and cut logs", profReadCut);
+    MMseqsNode::addPhaseSeconds(phaseValues, "PROF merge: cut bookkeeping", profCutBook);
+    MMseqsNode::addPhaseSeconds(phaseValues, "PROF merge: tails", profTails);
+    MMseqsNode::addPhaseSeconds(phaseValues, "PROF merge: heap", profHeap);
+    MMseqsNode::addPhaseSeconds(phaseValues, "PROF merge: rep table", profRepTable);
     MMseqsNode::addPhaseSeconds(phaseValues, "deciding accepted pairs", decisionSeconds);
     MMseqsNode::addPhaseSeconds(phaseValues, "placing the assigned changes", placingSeconds);
     MMseqsNode::addPhaseSeconds(phaseValues, "cumulative accepted log read time", logReadSeconds);
