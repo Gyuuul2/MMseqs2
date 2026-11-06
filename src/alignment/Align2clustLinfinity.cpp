@@ -1583,7 +1583,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         return ((members != NULL) ? members->memoryBytes() + (par.threads + 1) * MEMBER_READ_BYTES : 0) + 3 * 2 * (memoryLimit / CHUNK_MEMORY_DIVISOR)
                + ((memberDbr != NULL) ? 2 * (memoryLimit / MEMBER_PART_MEMORY_DIVISOR) : 0)
                + 2 * std::max(windowBytes, repTargetsReader.maxRecordBytes) + windowBytes
-               + ((rank >= firstAlignNode && alignNodes > 1) ? 3 * maxFlushBytes + 5 * sliceKeyLimit * sizeof(size_t) : 0);
+               + ((rank >= firstAlignNode && alignNodes > 1) ? 3 * maxFlushBytes + 6 * sliceKeyLimit * sizeof(size_t) : 0);
     };
     // the largest window that keeps the memory limit and, if any window can, leaves a block cache for the band of the home, down to a record for the share of the home
     const bool canCacheBand = isCacheTooSmall(memoryLimit - std::min(memoryLimit, getReservedMemory(0))) == false;
@@ -1939,18 +1939,21 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             std::vector<time_t> missingRequestSince(nodes, 0);
             std::vector<unsigned int> missingRequestAttempts(nodes, 0);
             std::vector<time_t> lastRequestDirectoryRefresh(nodes, 0);
-            // a request this home serves slice by slice: its node, its request flush, where its keys for this home start in the request file, their count, the request file bytes and the keys served so far
+            // a request this home serves slice by slice: its node, its request flush, where its key codes for this home start, where the next one is and where they end in the request file, the request file bytes, the keys served so far and the last of them
             struct ServedRequest {
                 unsigned int node;
                 size_t flush;
-                size_t keyStart;
-                size_t keyCount;
+                size_t codeStart;
+                size_t codeOffset;
+                size_t codeEnd;
                 size_t requestBytes;
                 size_t servedKeys;
+                DBKeyType lastKey;
             };
             std::vector<ServedRequest> servedRequests;
             std::vector<unsigned char> isServing(nodes, 0);
             std::vector<DBKeyType> sliceKeys;
+            std::vector<char> requestCodes((alignNodes > 1) ? sliceKeyLimit * sizeof(DBKeyType) + 10 : 0);
             // the flushes with a slice of every node not read yet, and the unread slices of every flush
             std::vector<std::vector<size_t> > nodeUnreadFlushes(nodes);
             std::map<size_t, size_t> flushUnreadSlices;
@@ -2036,12 +2039,20 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             size_t requestBytes = MMseqsNode::EXCHANGE_SLICE_HEADER_BYTES;
                             for (unsigned int node = 0; node < nodes; node++) {
                                 requestLine[2 + node] = requestBytes;
-                                const size_t keyCount = (node != rank) ? nextRequest->homeKeyOffsets[node + 1] - nextRequest->homeKeyOffsets[node] : 0;
-                                if (fwrite(nextRequest->keys.data() + nextRequest->homeKeyOffsets[node], sizeof(DBKeyType), keyCount, requestHandle) != keyCount) {
-                                    Debug(Debug::ERROR) << "Cannot write " << requestFiles[rank] << "\n";
-                                    EXIT(EXIT_FAILURE);
+                                const size_t keyBegin = nextRequest->homeKeyOffsets[node];
+                                const size_t keyEnd = (node != rank) ? nextRequest->homeKeyOffsets[node + 1] : keyBegin;
+                                // the keys of a home ascend, so they go as gaps, in parts that fit requestCodes
+                                for (size_t i = keyBegin; i < keyEnd;) {
+                                    size_t codeBytes = 0;
+                                    for (; i < keyEnd && codeBytes + 10 <= requestCodes.size(); i++) {
+                                        codeBytes += Util::putPrefKey(requestCodes.data() + codeBytes, nextRequest->keys[i] - ((i > keyBegin) ? nextRequest->keys[i - 1] : 0));
+                                    }
+                                    if (fwrite(requestCodes.data(), sizeof(char), codeBytes, requestHandle) != codeBytes) {
+                                        Debug(Debug::ERROR) << "Cannot write " << requestFiles[rank] << "\n";
+                                        EXIT(EXIT_FAILURE);
+                                    }
+                                    requestBytes += codeBytes;
                                 }
-                                requestBytes += keyCount * sizeof(DBKeyType);
                             }
                             requestLine[0] = flush++;
                             requestFlushCount++;
@@ -2220,8 +2231,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         if (requestLine[1] != 0) {
                             isRequesting[node] = 0;
                         } else if (requestLine[3 + rank] > requestLine[2 + rank]) {
-                            const ServedRequest request = { node, nodeRequests[node], requestLine[2 + rank], (requestLine[3 + rank] - requestLine[2 + rank]) / sizeof(DBKeyType),
-                                                            requestLine[2 + nodes], 0 };
+                            const ServedRequest request = { node, nodeRequests[node], requestLine[2 + rank], requestLine[2 + rank], requestLine[3 + rank], requestLine[2 + nodes], 0, 0 };
                             servedRequests.push_back(request);
                             isServing[node] = 1;
                         }
@@ -2241,7 +2251,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         continue;
                     }
                     ServedRequest &servedRequest = servedRequests[request++];
-                    const size_t readKeys = std::min(std::min(sliceKeyLimit, servedRequest.keyCount - servedRequest.servedKeys), 2 * share / averageEntryBytes + 1);
+                    const size_t readKeys = std::min(sliceKeyLimit, 2 * share / averageEntryBytes + 1);
+                    // up to 8 B a key at first, then the bytes a key of this request took so far, and at least a longest code
+                    const double keyCodeBytes = (servedRequest.servedKeys > 0) ? static_cast<double>(servedRequest.codeOffset - servedRequest.codeStart) / servedRequest.servedKeys : sizeof(DBKeyType);
+                    const size_t codeBytes = std::min(std::min(servedRequest.codeEnd - servedRequest.codeOffset, requestCodes.size()), static_cast<size_t>(readKeys * keyCodeBytes) + 10);
                     sliceKeys.resize(readKeys);
                     size_t observedBytes;
                     uint64_t observedGeneration;
@@ -2255,8 +2268,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                     bool readRequest = requestFd >= 0;
                     if (readRequest) {
-                        readRequest = MMseqsNode::tryReadExchangeSlice(requestFd, reinterpret_cast<char *>(sliceKeys.data()), readKeys * sizeof(DBKeyType),
-                                                                        servedRequest.keyStart + servedRequest.servedKeys * sizeof(DBKeyType), lastError);
+                        readRequest = MMseqsNode::tryReadExchangeSlice(requestFd, requestCodes.data(), codeBytes, servedRequest.codeOffset, lastError);
                         if (close(requestFd) != 0 && readRequest) {
                             lastError = errno;
                             readRequest = false;
@@ -2275,14 +2287,26 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     missingRequestAttempts[node] = 0;
                     Timer servingTimer;
                     const DBKeyType *keys = sliceKeys.data();
+                    // the read may end inside a code; only the last byte of a code is below 0x80
+                    const char *codeEnd = requestCodes.data() + codeBytes;
+                    while (codeEnd > requestCodes.data() && static_cast<unsigned char>(codeEnd[-1]) >= 0x80) {
+                        codeEnd--;
+                    }
+                    const char *code = requestCodes.data();
                     size_t keyCount = 0;
-                    for (size_t entryBytes = 0; keyCount < readKeys; keyCount++) {
-                        const size_t keyBytes = isAssigned(keys[keyCount]) ? 0 : seqDbr.getEntryLen(keys[keyCount]);
+                    for (size_t entryBytes = 0; keyCount < readKeys && code < codeEnd; keyCount++) {
+                        const char *nextCode = code;
+                        const DBKeyType key = ((keyCount > 0) ? keys[keyCount - 1] : servedRequest.lastKey) + Util::getPrefKey(nextCode);
+                        const size_t keyBytes = isAssigned(key) ? 0 : seqDbr.getEntryLen(key);
                         if (keyCount > 0 && entryBytes + keyBytes > share) {
                             break;
                         }
+                        sliceKeys[keyCount] = key;
+                        code = nextCode;
                         entryBytes += keyBytes;
                     }
+                    servedRequest.codeOffset += code - requestCodes.data();
+                    servedRequest.lastKey = keys[keyCount - 1];
                     requestOffsets.resize(keyCount + 1);
                     requestOffsets[0] = (keyCount + 7) / 8;
                     size_t requestUnservedBytes = 0;
@@ -2329,7 +2353,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     flushSlices++;
                 }
                 for (size_t request = 0; request < servedRequests.size();) {
-                    if (servedRequests[request].servedKeys == servedRequests[request].keyCount) {
+                    if (servedRequests[request].codeOffset == servedRequests[request].codeEnd) {
                         isServing[servedRequests[request].node] = 0;
                         servedRequests.erase(servedRequests.begin() + request);
                     } else {
