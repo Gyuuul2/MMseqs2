@@ -1021,10 +1021,23 @@ static size_t getBinKey(size_t keyEnd, size_t bin) {
     return keyEnd / bins * bin + keyEnd % bins * bin / bins;
 }
 
-// sorts a flush of pairs, appends it to file and adds its offsets; keeps up to ownPairLimit of the pairs for this node at the start of pairs instead and returns their count
+// adds where the pairs of every bin start in a sorted flush, then its pair count, to binOffsets
+static void addBinOffsets(const ClusterPair *pairs, size_t pairCount, bool (*compare)(const ClusterPair &, const ClusterPair &), size_t keyEnd, std::vector<size_t> &binOffsets) {
+    const size_t bins = BALANCE_BINS_PER_NODE * MMseqsNode::count;
+    const size_t flushBegin = binOffsets.size();
+    binOffsets.resize(flushBegin + bins + 1);
+#pragma omp parallel for schedule(static)
+    for (size_t bin = 0; bin < bins; bin++) {
+        const DBKeyType binKey = static_cast<DBKeyType>(getBinKey(keyEnd, bin));
+        const ClusterPair binFirstPair = { binKey, binKey };
+        binOffsets[flushBegin + bin] = std::lower_bound(pairs, pairs + pairCount, binFirstPair, compare) - pairs;
+    }
+    binOffsets[flushBegin + bins] = pairCount;
+}
+
+// appends a sorted flush of pairs to file and adds its offsets; keeps up to ownPairLimit of the pairs for this node at the start of pairs instead and returns their count
 static size_t writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                          FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes, size_t ownPairLimit) {
-    SORT_PARALLEL(pairs, pairs + pairCount, compare);
     std::vector<size_t> nodeOffsets(MMseqsNode::count + 1, pairCount * sizeof(ClusterPair));
     for (size_t node = 0; node < MMseqsNode::count; node++) {
         const ClusterPair nodeFirstPair = { static_cast<DBKeyType>(nodeKeyOffsets[node]), static_cast<DBKeyType>(nodeKeyOffsets[node]) };
@@ -1058,18 +1071,9 @@ MMseqsNode::ClusterPairWriter::~ClusterPairWriter() {
 }
 
 void MMseqsNode::ClusterPairWriter::flush() {
+    SORT_PARALLEL(pairs, pairs + pairCount, compare);
     if (balancedKeyOffsets != NULL) {
-        SORT_PARALLEL(pairs, pairs + pairCount, compare);
-        const size_t bins = BALANCE_BINS_PER_NODE * count;
-        const size_t flushBegin = binOffsets.size();
-        binOffsets.resize(flushBegin + bins + 1);
-#pragma omp parallel for schedule(static)
-        for (size_t bin = 0; bin < bins; bin++) {
-            const DBKeyType binKey = static_cast<DBKeyType>(getBinKey(nodeKeyOffsets[count], bin));
-            const ClusterPair binFirstPair = { binKey, binKey };
-            binOffsets[flushBegin + bin] = std::lower_bound(pairs, pairs + pairCount, binFirstPair, compare) - pairs;
-        }
-        binOffsets[flushBegin + bins] = pairCount;
+        addBinOffsets(pairs, pairCount, compare, nodeKeyOffsets[count], binOffsets);
         if (fwrite(pairs, sizeof(ClusterPair), pairCount, file) != pairCount) {
             Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
             EXIT(EXIT_FAILURE);
@@ -1090,13 +1094,10 @@ void MMseqsNode::ClusterPairWriter::flush() {
 }
 
 std::string MMseqsNode::ClusterPairWriter::close(const uint64_t *singletonBits, size_t firstKey, size_t keyCount) {
+    SORT_PARALLEL(pairs, pairs + pairCount, compare);
     if (balancedKeyOffsets != NULL) {
-        if (pairCount > 0) {
-            flush();
-        }
-        Util::releasePages(pairs, pairCapacity * sizeof(ClusterPair));
-        free(pairs);
-        pairs = NULL;
+        // the buffered pairs are counted now and written once the nodes are cut, so that those for this node stay in memory
+        addBinOffsets(pairs, pairCount, compare, nodeKeyOffsets[count], binOffsets);
         const size_t bins = BALANCE_BINS_PER_NODE * count;
         const size_t keyEnd = nodeKeyOffsets[count];
         std::vector<uint64_t> binLines(bins, 0);
@@ -1144,18 +1145,17 @@ std::string MMseqsNode::ClusterPairWriter::close(const uint64_t *singletonBits, 
             (*balancedKeyOffsets)[node] = getBinKey(keyEnd, cutBins[node]);
         }
         std::vector<size_t> nodeOffsets(count + 1);
-        for (size_t flushBegin = 0; flushBegin < binOffsets.size(); flushBegin += bins + 1) {
+        for (size_t flushBegin = 0; flushBegin + bins + 1 < binOffsets.size(); flushBegin += bins + 1) {
             for (size_t node = 0; node <= count; node++) {
                 nodeOffsets[node] = binOffsets[flushBegin + cutBins[node]] * sizeof(ClusterPair);
             }
             addExchangeFlush(indexData, writtenBytes, nodeOffsets);
         }
         std::vector<size_t>().swap(binOffsets);
-        return closeExchange(file, fileName, exchange + ".index", indexData);
     }
     size_t ownPairCount = 0;
     if (pairCount > 0) {
-        ownPairCount = writePairs(pairs, pairCount, compare, nodeKeyOffsets, file, fileName, indexData, writtenBytes, pairCount);
+        ownPairCount = writePairs(pairs, pairCount, compare, (balancedKeyOffsets != NULL) ? *balancedKeyOffsets : nodeKeyOffsets, file, fileName, indexData, writtenBytes, pairCount);
         pairCount = 0;
     }
     // the buffer, cut to the pairs for this node, becomes their records
@@ -1274,7 +1274,7 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
         openExchange(receivedIndex, receivedPrefix, receivedBlocks, receivedFiles);
     }
     const size_t memoryLimit = Util::computeMemory(Parameters::getInstance().splitMemoryLimit);
-    // half for the buffered pairs and half for those that the writer keeps for this node
+    // half for the buffered pairs and half for those kept for this node
     ClusterPairWriter pairWriter(exchange, memoryLimit / SENT_PAIRS_MEMORY_DIVISOR / 2 / sizeof(ClusterPair), compare, nodeKeyOffsets, balancedKeyOffsets);
 
     std::vector<DBKeyType> repKeys;

@@ -163,7 +163,7 @@ public:
     static void closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix);
 
     // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered, those for this node kept in memory; nodeKeyOffsets: keys of every node;
-    // balancedKeyOffsets: all pairs are written and close sets it to keys of every node cut so that the nodes get about equal lines
+    // balancedKeyOffsets: full flushes are written whole and close sets it to keys of every node cut so that the nodes get about equal lines, then cuts the last flush at it
     struct ClusterPairWriter {
         ClusterPairWriter(const std::string &exchange, size_t pairCapacity, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                           std::vector<size_t> *balancedKeyOffsets = NULL);
@@ -186,7 +186,7 @@ public:
             return reserved;
         }
         void flush();
-        // writes the buffered pairs, keeping those for this node in memory unless balancedKeyOffsets is set, then bit k of singletonBits counts as a line of key firstKey + k; returns the line of every node from closeExchange
+        // writes the buffered pairs, keeping those for this node in memory; with balancedKeyOffsets, bit k of singletonBits counts as a line of key firstKey + k; returns the line of every node from closeExchange
         std::string close(const uint64_t *singletonBits = NULL, size_t firstKey = 0, size_t keyCount = 0);
 
         const std::string exchange;
