@@ -40,8 +40,6 @@ static const size_t CUTS_PER_CHUNK = 8;
 static const size_t RANGES_PER_NODE = 8;
 // sending a k-mer takes about as long as reading this many bytes of sequence
 static const size_t SEND_KMER_BYTES = 12;
-// the largest file on ext4, and on a Lustre object of a single stripe
-static const size_t LARGE_FILE_BYTES = 16ULL << 40;
 // the bytes of an exchange file are freed in whole parts of this size
 static const size_t PUNCH_ALIGNMENT = 1024 * 1024;
 
@@ -1373,7 +1371,7 @@ struct OwnKmers {
 // --createdb-mode 3 sending: the nodes take the send ranges one at a time, the k-mers of a send range in loads, written to <pref>.kmers.<node>
 template <typename T, bool includeAdjacency, typename L>
 static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, MMseqsNode::WorkQueue &sendQueue,
-                        size_t representativeBitsMemory, std::vector<size_t> &sendRanges, std::string &sendValues, OwnKmers &ownKmers) {
+                        size_t representativeBitsMemory, size_t nodeKmerFileBytes, std::vector<size_t> &sendRanges, std::string &sendValues, OwnKmers &ownKmers) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     const float kmersPerSequenceScale = par.kmersPerSequenceScale.values.aminoacid();
     const size_t readChunkBytes = std::min(MAX_INFLIGHT_READ_SIZE, exchange.loadMemoryLimit / 4);
@@ -1381,6 +1379,12 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
     const size_t loadKeyLimit = (1ULL << (128 - 1 - 64 - exchange.adjKeyBits)) - 1;
     const std::string kmerFile = par.db2 + ".kmers." + SSTR(MMseqsNode::rank);
     FILE *kmerFileHandle = FileUtil::openAndDelete(kmerFile.c_str(), "w");
+    // a file system that limits the file size, like ext4 at 16 TiB, refuses it here and not after hours of writing
+    if (ftruncate(fileno(kmerFileHandle), nodeKmerFileBytes) != 0 || ftruncate(fileno(kmerFileHandle), 0) != 0) {
+        Debug(Debug::ERROR) << "Cannot resize " << kmerFile << " to " << nodeKmerFileBytes << " bytes, the estimated size of the k-mer file of a node: " << strerror(errno) << "\n"
+                            << "Run on more nodes, or on Lustre stripe the tmp directory over all OSTs with lfs setstripe -c -1 " << FileUtil::dirName(kmerFile) << " before the run\n";
+        EXIT(EXIT_FAILURE);
+    }
     size_t kmerFileBytes = 0;
     // the rows of every load are written after its codes as a block: where the rows of every hash range start in it, then its end, block after block
     std::vector<size_t> blockRowStarts;
@@ -2896,14 +2900,10 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     }
     if (MMseqsNode::isMaster()) {
         Debug(Debug::INFO) << "Send k-mers in " << exchange.sendRangeCount << " ranges\n";
-        // a sent k-mer takes a member id, a rep candidate and about a byte of index codes
-        const size_t nodeKmerFileBytes = globalKmers * ((exchange.globalIdBits + exchange.adjKeyCodeBits) / CHAR_BIT + 1) / MMseqsNode::count;
-        if (nodeKmerFileBytes > LARGE_FILE_BYTES) {
-            Debug(Debug::WARNING) << "The k-mer file of a node can reach " << nodeKmerFileBytes << " bytes, more than the " << LARGE_FILE_BYTES << " bytes of a file on ext4 or of a Lustre object.\n"
-                                  << "Run on more nodes, or on Lustre stripe the tmp directory over all OSTs with lfs setstripe -c -1 <tmpDir> before the run.\n";
-        }
     }
-    const size_t sentBytes = sendKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, sendQueue, representativeBitsMemory, sendRanges, sendValues, ownKmers);
+    // a sent k-mer takes a member id, a rep candidate and about a byte of index codes
+    const size_t nodeKmerFileBytes = globalKmers * ((exchange.globalIdBits + exchange.adjKeyCodeBits) / CHAR_BIT + 1) / MMseqsNode::count;
+    const size_t sentBytes = sendKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, sendQueue, representativeBitsMemory, nodeKmerFileBytes, sendRanges, sendValues, ownKmers);
     // no node takes hash ranges before the barrier, so claimNext takes the first own hash ranges in order
     for (size_t i = 0; i < ownKmers.hashRanges.size(); i++) {
         hashQueue.claimNext();

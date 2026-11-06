@@ -169,11 +169,15 @@ The workflow can also be run step by step. `createdb --createdb-mode 3` writes o
 
 The input can be FASTA files, also compressed with `.gz`, `.bz2` or `.zst`. Large files are split over the threads and nodes only if they are uncompressed or compressed with `pzstd`. `.gz`, `.bz2` and other `.zst` files are each read by one thread on one node, and `createdb` warns about such large files.
 
-A file on ext4 and a Lustre object are limited to 16 TiB, and at large scale the k-mer file that each node writes to the temporary folder can exceed this (`kmermatcher` warns). On Lustre, stripe the temporary folder over all OSTs before the run, or run on more nodes, which makes the file of each node smaller:
+A file on ext4 and a Lustre object are limited to 16 TiB. At about 1 trillion sequences the k-mer, pair and prefilter files that each node writes to the temporary folder can pass this, and `kmermatcher` stops right at its start if the file system refuses the expected size of the k-mer file. On Lustre, stripe the temporary folder over all OSTs before the run, or run on more nodes, which makes the files of each node smaller:
 
     lfs setstripe -c -1 /shared/tmp
 
 The memory limits default to 90 % of the physical memory of the machine and do not see the SLURM `--mem` limit. If several tasks share a machine, set `--split-memory-limit` per task. `clusthashfast`, `kmermatcher`, `align2clust`, `mergeclusters`, `createtsv` and `result2flat` follow it, `createdb --createdb-mode 3` always sizes its buffers from the physical memory.
+
+The first node (rank 0) needs more memory than the others, about 480 GB or more at 1 trillion sequences. The largest prefilter entry at 1 billion sequences was 3.19 MB, and at 1 trillion the prefilter entries it holds can take up to about 335 GB on top of its other work.
+
+`align2clust` with the default `--cov-mode 1` is fast when every aligning node holds its share of the sequence database in memory, that is the sequence bytes divided by the aligning nodes. Otherwise it reads the sequences key by key. With two or more nodes the first node does not align, so choose the number of nodes such that (nodes - 1) x 0.6 x node memory is at least the size of the sequence database, which is about 190 bytes per sequence for MGnify-like data.
 
 ## Contributors
 
