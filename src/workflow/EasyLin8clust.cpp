@@ -26,6 +26,7 @@ int easylin8clust(int argc, const char **argv, const Command &command) {
     }
     par.PARAM_THREADS.removeCategory(MMseqsParameter::COMMAND_EXPERT);
     par.PARAM_V.removeCategory(MMseqsParameter::COMMAND_EXPERT);
+    par.PARAM_NODE_RUNNER.removeCategory(MMseqsParameter::COMMAND_EXPERT);
 
     setEasyLinclustDefaults(&par);
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_VARIADIC, 0);

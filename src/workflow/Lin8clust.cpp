@@ -24,6 +24,7 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     par.PARAM_MAX_ACCEPT.addCategory(MMseqsParameter::COMMAND_EXPERT);
     par.overrideParameterDescription(par.PARAM_S, "Sensitivity will be automatically determined but can be adjusted", NULL, par.PARAM_S.category | MMseqsParameter::COMMAND_EXPERT);
     par.PARAM_INCLUDE_ONLY_EXTENDABLE.addCategory(MMseqsParameter::COMMAND_EXPERT);
+    par.PARAM_NODE_RUNNER.removeCategory(MMseqsParameter::COMMAND_EXPERT);
 
     par.parseParameters(argc, argv, command, true, 0, 0);
     std::string tmpDir = par.db3;
@@ -56,6 +57,11 @@ int lin8clust(int argc, const char **argv, const Command& command) {
         }
         std::string cluMode = (par.clusteringMode == Parameters::GREEDY_MEM) ? "GREEDY MEM" : "SET COVER";
         Debug(Debug::INFO) << "Set cluster mode " << cluMode << ".\n";
+    }
+    if (par.clusteringMode != Parameters::SET_COVER && par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
+        Debug(Debug::ERROR) << "align2clust supports only --cluster-mode " << Parameters::SET_COVER << ", " << Parameters::GREEDY << " and " << Parameters::GREEDY_MEM
+                            << " for --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
+        EXIT(EXIT_FAILURE);
     }
     if (par.PARAM_ALPH_SIZE.wasSet == false) {
         par.alphabetSize = MultiParam<NuclAA<int>>(NuclAA<int>(Parameters::CLUST_LINEAR_DEFAULT_ALPH_SIZE, 5));
