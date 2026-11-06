@@ -151,6 +151,30 @@ To search with multiple servers, call the `search` or `cluster` workflow with th
 
     RUNNER="mpirun -pernode -np 42" mmseqs search queryDB targetDB resultDB tmp
 
+### Clustering billions of sequences on many nodes (lin8clust)
+`easy-lin8clust` and `lin8clust` run the steps of `linclust --linclust-version 2` (`clusthashfast`, `kmermatcher`, `align2clust` and `mergeclusters`) on one or many nodes. They cluster protein sequences only. The nodes exchange data only through files, so the database, the temporary folder and the output have to be on storage shared by all nodes.
+
+Inside a SLURM allocation, pass the command that starts one task per node with `--node-runner`. `srun` steps do not inherit `--cpus-per-task`, so give `-c`:
+
+    mmseqs easy-lin8clust *.fasta result /shared/tmp --node-runner "srun --kill-on-bad-exit=1 -N 4 --ntasks-per-node=1 -c 64"
+
+Without `--node-runner` everything runs on one node. Each node writes its own part of the result: `result_cluster.tsv.<node>` holds the clusters whose representative the node holds and `result_rep_seq.fasta.<node>` these representatives.
+
+The workflow can also be run step by step. `createdb --createdb-mode 3` writes one data file per node, so every later step has to run on the same number of nodes (`lin8clust` stops with an error otherwise):
+
+    NODE_RUNNER="srun --kill-on-bad-exit=1 -N 4 --ntasks-per-node=1 -c 64"
+    $NODE_RUNNER mmseqs createdb *.fasta sequenceDB --createdb-mode 3
+    mmseqs lin8clust sequenceDB clusterDB /shared/tmp --node-runner "$NODE_RUNNER"
+    $NODE_RUNNER mmseqs createtsv sequenceDB sequenceDB clusterDB clu.tsv   # clu.tsv.<node>
+
+The input can be FASTA files, also compressed with `.gz`, `.bz2` or `.zst`. Large files are split over the threads and nodes only if they are uncompressed or compressed with `pzstd`. `.gz`, `.bz2` and other `.zst` files are each read by one thread on one node, and `createdb` warns about such large files.
+
+A file on ext4 and a Lustre object are limited to 16 TiB, and at large scale the k-mer file that each node writes to the temporary folder can exceed this (`kmermatcher` warns). On Lustre, stripe the temporary folder over all OSTs before the run, or run on more nodes, which makes the file of each node smaller:
+
+    lfs setstripe -c -1 /shared/tmp
+
+The memory limits default to 90 % of the physical memory of the machine and do not see the SLURM `--mem` limit. If several tasks share a machine, set `--split-memory-limit` per task. `clusthashfast`, `kmermatcher`, `align2clust`, `mergeclusters`, `createtsv` and `result2flat` follow it, `createdb --createdb-mode 3` always sizes its buffers from the physical memory.
+
 ## Contributors
 
 MMseqs2 exists thanks to all the people who contribute. 
