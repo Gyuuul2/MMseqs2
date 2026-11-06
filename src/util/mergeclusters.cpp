@@ -30,19 +30,22 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
                                                               ? MMseqsNode::getClusterKeyOffsets(par.db2 + ".keys", par.filenames[2], dbr.getSize(), hasRepresentativeBits ? representativeDb + ".bits." + SSTR(MMseqsNode::rank) : "")
                                                               : std::vector<size_t>();
         dbr.close();
-        const size_t firstKey = nodeKeyOffsets[MMseqsNode::rank];
-        const size_t keyCount = nodeKeyOffsets[MMseqsNode::rank + 1] - firstKey;
+        // a first clustering without representative bits, an earlier output, keeps its parts, so a node reads and writes the keys of its part and only pairs whose representative changes move
+        const bool keepsFirstClusteringParts = hasSecondClustering && hasRepresentativeBits == false;
+        const std::vector<size_t> &partKeyOffsets = keepsFirstClusteringParts ? firstClusteringKeyOffsets : nodeKeyOffsets;
+        const size_t firstKey = partKeyOffsets[MMseqsNode::rank];
+        const size_t keyCount = partKeyOffsets[MMseqsNode::rank + 1] - firstKey;
         uint64_t *representativeBits = hasRepresentativeBits ? MMseqsNode::readRepresentativeBits(representativeDb, firstClusteringKeyOffsets, firstKey, keyCount) : NULL;
         std::string phaseValues;
         Timer timer;
         const std::string sortedByMember = par.db2 + "_by_member";
-        const std::string sortedByMemberIndex = hasSecondClustering ? MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, nodeKeyOffsets, sortedByMember) : "";
+        const std::string sortedByMemberIndex = hasSecondClustering ? MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, partKeyOffsets, sortedByMember) : "";
         const std::string sortedByRep = par.db2 + "_by_rep";
         // the nodes write the representatives of repKeyOffsets, and the bits left, the singletons of the keys of this node, go to <sortedByRep>.bits.<node>
-        std::vector<size_t> repKeyOffsets;
-        const std::string sortedByRepIndex = MMseqsNode::sendClusterPairs(par.filenames[2], true, ClusterPair::compareByRep, nodeKeyOffsets, sortedByRep,
+        std::vector<size_t> repKeyOffsets = partKeyOffsets;
+        const std::string sortedByRepIndex = MMseqsNode::sendClusterPairs(par.filenames[2], true, ClusterPair::compareByRep, partKeyOffsets, sortedByRep,
                                                                           sortedByMemberIndex, hasSecondClustering ? sortedByMember : "", representativeBits, firstClusteringKeyOffsets, firstKey, keyCount,
-                                                                          &repKeyOffsets);
+                                                                          keepsFirstClusteringParts ? NULL : &repKeyOffsets);
         delete[] representativeBits;
         MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", timer);
         if (hasSecondClustering) {
