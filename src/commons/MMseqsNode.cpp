@@ -33,6 +33,7 @@ static std::string runId;
 // the exchange bytes that this node sent, all of them and those for other nodes, reported by removeExchanges
 static size_t sentExchangeBytes = 0;
 static size_t sentOtherNodeExchangeBytes = 0;
+static size_t exchangeIndexOpens = 0;
 // the records and their bytes that this node sent to itself in the last flush of an exchange, until openExchange reads them
 static std::map<std::string, std::vector<std::pair<char *, size_t> > > ownExchangeRecords;
 static const unsigned int MAX_READ_POLLS = 400;
@@ -370,6 +371,7 @@ void MMseqsNode::publishExchangeFlush(FILE *file, const std::string &fileName, s
 size_t MMseqsNode::readExchangeFlushes(const std::string &indexFile, size_t flush, size_t lineWords, std::vector<uint64_t> &lines) {
     const size_t lineBytes = lineWords * sizeof(uint64_t);
     int fd = openFile(indexFile);
+    __sync_fetch_and_add(&exchangeIndexOpens, 1);
     int openError = (fd < 0) ? errno : 0;
     // a listing refreshes an NFS negative lookup before the index is opened again
     if (openError == ENOENT && isListed(indexFile)) {
@@ -1732,6 +1734,7 @@ size_t MMseqsNode::writeClusterPairs(const std::string &index, const std::string
 void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues) {
     addPhaseValue(phaseValues, "Exchange bytes sent", SSTR(sentExchangeBytes));
     addPhaseValue(phaseValues, "Exchange bytes sent to other nodes", SSTR(sentOtherNodeExchangeBytes));
+    addPhaseValue(phaseValues, "Exchange index opens", SSTR(exchangeIndexOpens));
     printPhaseValues(phaseValues);
     barrier(prefix + ".merged");
     FileUtil::remove((lastExchange + "." + SSTR(rank)).c_str());

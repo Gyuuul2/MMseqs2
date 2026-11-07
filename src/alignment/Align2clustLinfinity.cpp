@@ -3905,6 +3905,8 @@ int align2clustLinfinity(Parameters &par) {
     }
     MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", phaseValueTimer);
     if (memberDbr != NULL) {
+        MMseqsNode::addPhaseValue(phaseValues, "Member block read bytes", SSTR(memberDbr->getBlockReadBytes()));
+        MMseqsNode::addPhaseValue(phaseValues, "Member key read bytes", SSTR(memberDbr->getKeyReadBytes()));
         memberDbr->close();
         delete memberDbr;
     }
