@@ -8,6 +8,7 @@
 
 #include <climits>
 #include <queue>
+#include <type_traits>
 #ifndef SIZE_T_MAX
 #define SIZE_T_MAX ((size_t) -1)
 #endif
@@ -184,6 +185,42 @@ private:
     }
 };
 
+// [ rep id | id | diagonal + 2^(bits of T - 1) ] in integer order, the order of KmerPosition::compareRepSequenceAndIdAndDiag;
+// the rep id field is wider than the id and read sign-extended, so the 0xFF fill of initKmerPositionArray reads as SIZE_T_MAX
+template <typename T, typename Upper>
+struct __attribute__((__packed__)) KmerPositionPairBit {
+    typedef typename std::make_unsigned<T>::type UnsignedT;
+    static const unsigned int ID_SHIFT = 8 * sizeof(T);
+    static const unsigned int BITS = 64 + 8 * sizeof(Upper);
+    static const UnsignedT DIAGONAL_OFFSET = static_cast<UnsignedT>(1) << (ID_SHIFT - 1);
+    static unsigned int repShift;
+    __extension__ typedef unsigned __int128 uint128;
+    __extension__ typedef __int128 int128;
+    uint64_t lower;
+    Upper upper;
+
+    void setRepSequenceAndIdAndDiag(size_t repSeqId, DBKeyType id, T diagonal) {
+        const uint128 value = (static_cast<uint128>(repSeqId) << repShift) | (static_cast<uint128>(id) << ID_SHIFT)
+                              | static_cast<UnsignedT>(static_cast<UnsignedT>(diagonal) ^ DIAGONAL_OFFSET);
+        lower = static_cast<uint64_t>(value);
+        upper = static_cast<Upper>(value >> 64);
+    }
+
+    size_t getKmer() const { return static_cast<int128>(getValue() << (128 - BITS)) >> (128 - BITS + repShift); }
+    DBKeyType getId() const { return (getValue() >> ID_SHIFT) & ((static_cast<uint128>(1) << (repShift - ID_SHIFT)) - 1); }
+    size_t getPos() const { return static_cast<T>(static_cast<UnsignedT>(lower) ^ DIAGONAL_OFFSET); }
+
+    bool operator<(const KmerPositionPairBit &other) const {
+        return (upper != other.upper) ? upper < other.upper : lower < other.lower;
+    }
+
+private:
+    uint128 getValue() const { return (static_cast<uint128>(upper) << 64) | lower; }
+};
+
+template <typename T, typename Upper>
+unsigned int KmerPositionPairBit<T, Upper>::repShift = 0;
+
 template <typename T, bool includeAdjacency = false, typename L = T>
 struct __attribute__((__packed__)) KmerPosition {
     size_t kmer;
@@ -211,6 +248,11 @@ struct __attribute__((__packed__)) KmerPosition {
     size_t getSeqLen() const { return seqLen; }
     DBKeyType getId() const { return id; }
     size_t getPos() const { return pos; }
+    void setRepSequenceAndIdAndDiag(size_t repSeqId, DBKeyType id, T diagonal) {
+        kmer = repSeqId;
+        this->id = id;
+        pos = diagonal;
+    }
 
     static bool compareKmer(const KmerPosition &first, const KmerPosition &second) {
         return first.kmer < second.kmer;
@@ -360,11 +402,11 @@ size_t queueNextEntry(KmerPositionQueue &queue, int file, size_t offsetPos, T *e
 
 void setKmerLengthAndAlphabet(Parameters &parameters, size_t aaDbSize, int seqType);
 
-template <int TYPE, typename T, typename posType, bool includeAdjacency, typename L>
-void writeKmersToDisk(std::string tmpFile, KmerPosition<posType, includeAdjacency, L> *kmers, size_t totalKmers, int numThreads = 1, std::vector<size_t> *threadQueryOffsets = NULL, int iteration = 0);
+template <int TYPE, typename T, typename posType, typename KmerPositionType>
+void writeKmersToDisk(std::string tmpFile, KmerPositionType *kmers, size_t totalKmers, int numThreads = 1, std::vector<size_t> *threadQueryOffsets = NULL, int iteration = 0);
 
-template <int TYPE, typename T, bool includeAdjacency = false, typename L = T>
-void writeKmerMatcherResult(DBWriter & dbw, KmerPosition<T, includeAdjacency, L> *hashSeqPair, size_t totalKmers,
+template <int TYPE, typename T, typename KmerPositionType>
+void writeKmerMatcherResult(DBWriter & dbw, KmerPositionType *hashSeqPair, size_t totalKmers,
                             std::vector<char> &repSequence, size_t threads);
 
 
