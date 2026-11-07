@@ -831,6 +831,17 @@ static size_t getKeyNode(const DBReader<DBKeyType> &seqDbr, size_t key) {
     return getBlockNode(seqDbr.getKeyBlock(key));
 }
 
+// a home serves its blocks in this many intervals of keys at once, the same on every node whatever its threads
+static const size_t SERVE_SLICES = 64;
+
+// the slices of the blocks of every node follow in node order
+static size_t getKeySlice(const DBReader<DBKeyType> &seqDbr, size_t key) {
+    const size_t alignNodes = MMseqsNode::count - getFirstAlignNode();
+    const size_t block = seqDbr.getKeyBlock(key);
+    const size_t homeBlocks = (seqDbr.getBlockKeyOffsets().size() - 1 + alignNodes - 1) / alignNodes;
+    return getBlockNode(block) * SERVE_SLICES + block / alignNodes * SERVE_SLICES / homeBlocks;
+}
+
 // --createdb-mode 3: the records [begin, end) of a chunk aligned at once; chunk is its place in the ring of chunks, loadedChunk its number
 struct RepWindow {
     RepWindow() : chunk(0), loadedChunk(0), begin(0), end(0) {}
@@ -849,13 +860,12 @@ struct ChunkSequences {
     size_t allocatedBytes;
 };
 
-// --createdb-mode 3: the group ranges [rangeBegin, rangeEnd) of the pass of sizeClass whose sequences the homes serve at once, its order keys from firstOrderKey on, and the bytes of an extent of a range
+// --createdb-mode 3: the group ranges [rangeBegin, rangeEnd) of the pass of sizeClass whose sequences the homes serve at once, and its order keys from firstOrderKey on
 struct SequenceEpoch {
     size_t firstOrderKey;
     size_t sizeClass;
     size_t rangeBegin;
     size_t rangeEnd;
-    size_t extentBytes;
 
     static bool compareByOrderKey(size_t orderKey, const SequenceEpoch &epoch) {
         return orderKey < epoch.firstOrderKey;
@@ -896,13 +906,10 @@ static size_t getChangeHeaderWords() {
 static const size_t MASTER_MEMORY_DIVISOR = 2;
 static const size_t CHUNK_MEMORY_DIVISOR = 32;
 // the sequences of a chunk; the targets of a group range fit the memory limit divided by this
-static const size_t CHUNK_SEQUENCES_MEMORY_DIVISOR = 12;
-// the requests that a node sorts at once and the entries that a home reads at once, and the extent buffers of a home
+static const size_t CHUNK_SEQUENCES_MEMORY_DIVISOR = 16;
+// the requests that a node sorts at once, and the entries that a home reads at once and their items
 static const size_t SERVICE_MEMORY_DIVISOR = 32;
-static const size_t EXTENT_MEMORY_DIVISOR = 16;
-// an extent buffer holds at least this before a home writes it, so an epoch holds at most the extent memory divided by this of group ranges
-static const size_t MIN_EXTENT_BYTES = 1024 * 1024;
-// an aligning node: 3 chunks of records 6/32, 3 chunk sequences and the read of one 4/12, the request records and requests 4/32, the reads and slots of a served batch 2/32, the request runs 1/32, extent buffers 2/32, member parts 4/32; 0.93 of the memory limit
+// an aligning node: 3 chunks of records 6/32, 3 chunk sequences and the read of one 4/16, the request records and requests 4/32, the reads, slots and items of a served batch and the next 4/32, the request runs 1/32, member parts 4/32; 0.84 of the memory limit, a share of a home that fits the rest and the reads instead
 static const size_t WINDOW_MEMORY_DIVISOR = 8;
 // the records are the same whatever window a node takes, as the reads of a record fit the smallest memory limit divided by this
 static const size_t RECORD_MEMORY_DIVISOR = 32;
@@ -1871,6 +1878,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     const std::string servedIndex = served + ".index." + SSTR(rank);
     const size_t maxRequests = std::max<size_t>(1, memoryLimit / SERVICE_MEMORY_DIVISOR / sizeof(std::pair<DBKeyType, size_t>));
     const size_t maxServeBytes = std::max<size_t>(1, memoryLimit / SERVICE_MEMORY_DIVISOR);
+    // a home whose share and its keys fit besides the other shares reads it once for every epoch
+    const std::vector<size_t> &blockKeyOffsets = seqDbr.getBlockKeyOffsets();
+    size_t shareMemory = 8 * (memoryLimit / CHUNK_MEMORY_DIVISOR) + 4 * (memoryLimit / CHUNK_SEQUENCES_MEMORY_DIVISOR) + 5 * maxServeBytes
+                         + ((memberDbr != NULL) ? 2 * (memoryLimit / MEMBER_PART_MEMORY_DIVISOR) : 0);
+    for (size_t block = 0; hasService && block + 1 < blockKeyOffsets.size(); block++) {
+        if (getBlockNode(block) == rank) {
+            shareMemory += seqDbr.getBufferSizeToLoad(blockKeyOffsets[block], blockKeyOffsets[block + 1]) + (blockKeyOffsets[block + 1] - blockKeyOffsets[block]) * sizeof(DBKeyType);
+        }
+    }
+    const bool isShareLoaded = hasService && shareMemory <= memoryLimit;
     size_t requestFlushCount = 0;
     size_t requestedKeys = 0;
     size_t requestBytes = 0;
@@ -1894,13 +1911,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             std::vector<RepTargetsRecord> requestRecords;
             std::vector<DBKeyType> requestTargets;
             std::vector<std::pair<DBKeyType, size_t> > sequenceRequests;
-            std::vector<std::pair<DBKeyType, size_t> > homeRequests;
+            std::vector<std::pair<DBKeyType, size_t> > sliceRequests;
             std::vector<std::vector<std::pair<DBKeyType, size_t> > > threadRequests(serviceThreads);
-            std::vector<unsigned int> requestHomes;
-            std::vector<size_t> threadHomeOffsets;
-            std::vector<std::string> homeCodes(nodes);
+            std::vector<unsigned int> requestSlices;
+            const size_t slices = nodes * SERVE_SLICES;
+            std::vector<size_t> threadSliceOffsets;
+            std::vector<std::string> sliceCodes(slices);
             std::vector<uint64_t> epochLine(epochLineWords);
-            // the request file of an epoch: its flushes, each the requests of every home in key order as their key gaps and group ranges in the epoch, then where the homes of every flush start and the flush ends
+            // the request file of an epoch: its flushes, each the requests of every slice of every home in key order as their key gaps and group ranges in the epoch, then where the slices of every flush start and the flush ends
             std::string requestFile;
             FILE *requestHandle = NULL;
             size_t requestFileBytes = 0;
@@ -1909,47 +1927,47 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 SORT_PARALLEL(sequenceRequests.begin(), sequenceRequests.end());
                 sequenceRequests.erase(std::unique(sequenceRequests.begin(), sequenceRequests.end()), sequenceRequests.end());
                 const size_t requestCount = sequenceRequests.size();
-                requestHomes.resize(requestCount);
-                homeRequests.resize(requestCount);
-                // the requests go to their homes in key order, every thread placing its static part after those of the lower threads
-                threadHomeOffsets.assign(nodes * serviceThreads + 1, 0);
+                requestSlices.resize(requestCount);
+                sliceRequests.resize(requestCount);
+                // the requests go to the slices of their homes in key order, every thread placing its static part after those of the lower threads
+                threadSliceOffsets.assign(slices * serviceThreads + 1, 0);
 #pragma omp parallel
                 {
                     unsigned int thread_idx = 0;
 #ifdef OPENMP
                     thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-                    std::vector<size_t> homeOffsets(nodes, 0);
+                    std::vector<size_t> sliceOffsets(slices, 0);
 #pragma omp for schedule(static)
                     for (size_t i = 0; i < requestCount; i++) {
-                        requestHomes[i] = static_cast<unsigned int>(getKeyNode(seqDbr, sequenceRequests[i].first));
-                        homeOffsets[requestHomes[i]]++;
+                        requestSlices[i] = static_cast<unsigned int>(getKeySlice(seqDbr, sequenceRequests[i].first));
+                        sliceOffsets[requestSlices[i]]++;
                     }
-                    for (unsigned int home = 0; home < nodes; home++) {
-                        threadHomeOffsets[home * serviceThreads + thread_idx + 1] = homeOffsets[home];
+                    for (size_t slice = 0; slice < slices; slice++) {
+                        threadSliceOffsets[slice * serviceThreads + thread_idx + 1] = sliceOffsets[slice];
                     }
 #pragma omp barrier
 #pragma omp single
-                    for (size_t i = 0; i + 1 < threadHomeOffsets.size(); i++) {
-                        threadHomeOffsets[i + 1] += threadHomeOffsets[i];
+                    for (size_t i = 0; i + 1 < threadSliceOffsets.size(); i++) {
+                        threadSliceOffsets[i + 1] += threadSliceOffsets[i];
                     }
-                    for (unsigned int home = 0; home < nodes; home++) {
-                        homeOffsets[home] = threadHomeOffsets[home * serviceThreads + thread_idx];
+                    for (size_t slice = 0; slice < slices; slice++) {
+                        sliceOffsets[slice] = threadSliceOffsets[slice * serviceThreads + thread_idx];
                     }
 #pragma omp for schedule(static)
                     for (size_t i = 0; i < requestCount; i++) {
-                        homeRequests[homeOffsets[requestHomes[i]]++] = sequenceRequests[i];
+                        sliceRequests[sliceOffsets[requestSlices[i]]++] = sequenceRequests[i];
                     }
 #pragma omp for schedule(dynamic, 1)
-                    for (unsigned int home = 0; home < nodes; home++) {
-                        homeCodes[home].clear();
+                    for (size_t slice = 0; slice < slices; slice++) {
+                        sliceCodes[slice].clear();
                         DBKeyType lastKey = 0;
                         char code[20];
-                        for (size_t i = threadHomeOffsets[home * serviceThreads]; i < threadHomeOffsets[(home + 1) * serviceThreads]; i++) {
-                            size_t codeBytes = Util::putPrefKey(code, homeRequests[i].first - lastKey);
-                            codeBytes += Util::putPrefKey(code + codeBytes, homeRequests[i].second - rangeBegin);
-                            homeCodes[home].append(code, codeBytes);
-                            lastKey = homeRequests[i].first;
+                        for (size_t i = threadSliceOffsets[slice * serviceThreads]; i < threadSliceOffsets[(slice + 1) * serviceThreads]; i++) {
+                            size_t codeBytes = Util::putPrefKey(code, sliceRequests[i].first - lastKey);
+                            codeBytes += Util::putPrefKey(code + codeBytes, sliceRequests[i].second - rangeBegin);
+                            sliceCodes[slice].append(code, codeBytes);
+                            lastKey = sliceRequests[i].first;
                         }
                     }
                 }
@@ -1960,20 +1978,20 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     requestFileBytes = MMseqsNode::EXCHANGE_SLICE_HEADER_BYTES;
                     requestTable.clear();
                 }
-                for (unsigned int home = 0; home < nodes; home++) {
+                for (size_t slice = 0; slice < slices; slice++) {
                     requestTable.push_back(requestFileBytes);
-                    if (fwrite(homeCodes[home].data(), sizeof(char), homeCodes[home].size(), requestHandle) != homeCodes[home].size()) {
+                    if (fwrite(sliceCodes[slice].data(), sizeof(char), sliceCodes[slice].size(), requestHandle) != sliceCodes[slice].size()) {
                         Debug(Debug::ERROR) << "Cannot write " << requestFile << "\n";
                         EXIT(EXIT_FAILURE);
                     }
-                    requestFileBytes += homeCodes[home].size();
+                    requestFileBytes += sliceCodes[slice].size();
                 }
                 requestTable.push_back(requestFileBytes);
                 requestFlushCount++;
                 requestedKeys += requestCount;
                 sequenceRequests.clear();
             };
-            // the runs of requests for this home, one of every flush of the request file of every node, read in parts
+            // the runs of requests for every slice of this home, one of every flush of the request file of every node, read in parts
             struct RequestRun {
                 size_t file;
                 size_t pos;
@@ -1983,15 +2001,28 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 size_t bufferEnd;
                 DBKeyType lastKey;
             };
-            std::vector<RequestRun> runs;
+            std::vector<std::vector<RequestRun> > sliceRuns(SERVE_SLICES);
             std::vector<int> requestFds;
             std::vector<std::string> requestFiles;
             std::vector<size_t> requestFilesBytes;
             typedef std::pair<std::pair<DBKeyType, size_t>, size_t> QueuedRequest;
-            std::vector<DBKeyType> batchKeys;
-            std::vector<std::pair<size_t, size_t> > batchItems;
-            std::vector<unsigned char> isServed;
-            std::vector<DBKeyType> loadKeys;
+            std::vector<std::priority_queue<QueuedRequest, std::vector<QueuedRequest>, std::greater<QueuedRequest> > > sliceQueues(SERVE_SLICES);
+            std::vector<std::pair<DBKeyType, size_t> > sliceLastRequests(SERVE_SLICES);
+            // the keys of a batch and its items, a key and a group range, of every slice, then its keys in key order and those to read
+            struct ServedBatch {
+                ServedBatch() : sliceKeys(SERVE_SLICES), sliceItems(SERVE_SLICES), sliceKeyOffsets(SERVE_SLICES + 1, 0) {}
+                std::vector<std::vector<DBKeyType> > sliceKeys;
+                std::vector<std::vector<std::pair<size_t, size_t> > > sliceItems;
+                std::vector<size_t> sliceKeyOffsets;
+                std::vector<DBKeyType> keys;
+                std::vector<unsigned char> isServed;
+                std::vector<DBKeyType> loadKeys;
+            };
+            ServedBatch batches[2];
+            std::vector<size_t> cellFirstIds;
+            std::vector<DBKeyType> cellLastKeys;
+            std::vector<size_t> cellOffsets;
+            std::vector<char> servedBuffer;
             std::vector<size_t> slotOffsets;
             std::vector<size_t> slotBytes;
             std::vector<char> slots;
@@ -2074,29 +2105,45 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 requestHandle = NULL;
                 requestBytes += requestFileBytes;
                 requestingSeconds += requestTimer.getTimediff();
+                if (epoch == 0 && isShareLoaded) {
+                    Timer shareTimer;
+                    std::vector<DBKeyType> shareKeys;
+                    for (size_t block = 0; block + 1 < blockKeyOffsets.size(); block++) {
+                        for (size_t key = blockKeyOffsets[block]; getBlockNode(block) == rank && key < blockKeyOffsets[block + 1]; key++) {
+                            shareKeys.push_back(key);
+                        }
+                    }
+                    seqDbr.loadData(shareKeys);
+                    servingSeconds += shareTimer.getTimediff();
+                }
 
                 // the request file of the epoch of every aligning node is open while it holds requests for this home, so a home keeps at most one file of every node open
                 Timer waitTimer;
+                size_t runCount = 0;
                 for (unsigned int node = firstAlignNode; node < nodes; node++) {
                     MMseqsNode::waitForExchangeFlush(requests + ".index." + SSTR(node), epoch, epochLine);
                     const std::string nodeFile = requests + "." + SSTR(node) + "." + SSTR(epoch);
                     const int fd = MMseqsNode::openExchangeSlice(nodeFile, epochLine[1], epoch);
                     std::vector<uint64_t> table((epochLine[1] - epochLine[2]) / sizeof(uint64_t));
                     MMseqsNode::readExchangeSlice(fd, nodeFile, epochLine[1], epoch, reinterpret_cast<char *>(table.data()), epochLine[1] - epochLine[2], epochLine[2]);
-                    const size_t runCount = runs.size();
-                    for (size_t flush = 0; flush < table.size(); flush += nodes + 1) {
-                        if (table[flush + rank] < table[flush + rank + 1]) {
-                            RequestRun run;
-                            run.file = requestFds.size();
-                            run.pos = table[flush + rank];
-                            run.end = table[flush + rank + 1];
-                            run.bufferPos = 0;
-                            run.bufferEnd = 0;
-                            run.lastKey = 0;
-                            runs.push_back(run);
+                    const size_t nodeRunCount = runCount;
+                    for (size_t flush = 0; flush < table.size(); flush += slices + 1) {
+                        for (size_t slice = 0; slice < SERVE_SLICES; slice++) {
+                            const size_t tablePos = flush + rank * SERVE_SLICES + slice;
+                            if (table[tablePos] < table[tablePos + 1]) {
+                                RequestRun run;
+                                run.file = requestFds.size();
+                                run.pos = table[tablePos];
+                                run.end = table[tablePos + 1];
+                                run.bufferPos = 0;
+                                run.bufferEnd = 0;
+                                run.lastKey = 0;
+                                sliceRuns[slice].push_back(run);
+                                runCount++;
+                            }
                         }
                     }
-                    if (runs.size() > runCount) {
+                    if (runCount > nodeRunCount) {
                         requestFds.push_back(fd);
                         requestFiles.push_back(nodeFile);
                         requestFilesBytes.push_back(epochLine[1]);
@@ -2111,9 +2158,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 }
                 lastRequestFile = requestFile;
 
-                // the requests in key order: a batch of keys is read at once, a key once for all its group ranges, entries less than a page apart in one read
+                // the requests of every slice in key order: a batch of keys is read at once, a key once for all its group ranges, entries less than a page apart in one read
                 Timer servingTimer;
-                const size_t runBufferBytes = std::max<size_t>(64 * 1024, std::min(MMseqsNode::EXCHANGE_WRITE_BYTES, maxRequests * sizeof(std::pair<DBKeyType, size_t>) / std::max<size_t>(1, runs.size())));
+                const size_t runBufferBytes = std::max<size_t>(64 * 1024, std::min(MMseqsNode::EXCHANGE_WRITE_BYTES, maxRequests * sizeof(std::pair<DBKeyType, size_t>) / std::max<size_t>(1, runCount)));
                 const auto readRequest = [&](RequestRun &run, std::pair<DBKeyType, size_t> &request) {
                     // a request is two codes of at most 10 bytes
                     if (run.bufferEnd - run.bufferPos < 20 && run.pos < run.end) {
@@ -2140,102 +2187,168 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 FILE *servedHandle = FileUtil::openAndDelete(servedFile.c_str(), "w");
                 MMseqsNode::writeExchangeSliceHeader(servedHandle, servedFile, epoch);
                 size_t servedFileBytes = MMseqsNode::EXCHANGE_SLICE_HEADER_BYTES;
-                std::vector<std::vector<char> > extentBuffers(sequenceEpoch.rangeEnd - sequenceEpoch.rangeBegin);
-                std::vector<DBKeyType> extentLastKeys(extentBuffers.size(), 0);
                 std::vector<SequenceExtent> extents;
-                const auto writeExtent = [&](size_t range) {
-                    if (fwrite(extentBuffers[range].data(), sizeof(char), extentBuffers[range].size(), servedHandle) != extentBuffers[range].size()) {
-                        Debug(Debug::ERROR) << "Cannot write " << servedFile << "\n";
-                        EXIT(EXIT_FAILURE);
-                    }
-                    const SequenceExtent extent = { sequenceEpoch.rangeBegin + range, servedFileBytes, extentBuffers[range].size() };
-                    extents.push_back(extent);
-                    servedFileBytes += extentBuffers[range].size();
-                    extentBuffers[range].clear();
-                    extentLastKeys[range] = 0;
-                };
-                // an assigned key gets a bit, a served one its packed entry, or its raw entry if it has a byte without a code
-                const auto serveBatch = [&]() {
-                    const size_t keyCount = batchKeys.size();
-                    isServed.resize(keyCount);
-                    slotOffsets.resize(keyCount + 1);
-                    slotOffsets[0] = 0;
-                    loadKeys.clear();
-                    for (size_t i = 0; i < keyCount; i++) {
-                        isServed[i] = isAssigned(batchKeys[i]) == false;
-                        slotOffsets[i + 1] = slotOffsets[i] + (isServed[i] ? 1 + seqDbr.getEntryLen(batchKeys[i]) : 0);
-                        if (isServed[i]) {
-                            loadKeys.push_back(batchKeys[i]);
+                const size_t rangeCount = sequenceEpoch.rangeEnd - sequenceEpoch.rangeBegin;
+                const size_t sliceServeBytes = std::max<size_t>(1, maxServeBytes / SERVE_SLICES);
+                // every slice takes keys while their reads and items fit its part of a batch, at least one; an assigned key is not read
+                const auto mergeBatch = [&](ServedBatch &batch) {
+#pragma omp parallel for schedule(dynamic, 1)
+                    for (size_t slice = 0; slice < SERVE_SLICES; slice++) {
+                        std::vector<DBKeyType> &keys = batch.sliceKeys[slice];
+                        std::vector<std::pair<size_t, size_t> > &items = batch.sliceItems[slice];
+                        keys.clear();
+                        items.clear();
+                        size_t readBytes = 0;
+                        size_t itemBytes = 0;
+                        while (sliceQueues[slice].empty() == false) {
+                            const QueuedRequest next = sliceQueues[slice].top();
+                            // a group range is read by one node, but its requests may be in several flushes
+                            if (next.first != sliceLastRequests[slice]) {
+                                const size_t entryLen = seqDbr.getEntryLen(next.first.first);
+                                if (keys.empty() || keys.back() != next.first.first) {
+                                    // a key reads at most its entry and two pages
+                                    if (keys.empty() == false && (readBytes + entryLen + 2 * pageSize > sliceServeBytes || itemBytes > sliceServeBytes)) {
+                                        break;
+                                    }
+                                    keys.push_back(next.first.first);
+                                    readBytes += entryLen + 2 * pageSize;
+                                }
+                                items.push_back(std::make_pair(keys.size() - 1, next.first.second));
+                                // an item is at most a code of 10 bytes, the raw code and the entry
+                                itemBytes += 11 + entryLen;
+                                sliceLastRequests[slice] = next.first;
+                            }
+                            sliceQueues[slice].pop();
+                            std::pair<DBKeyType, size_t> request;
+                            if (readRequest(sliceRuns[slice][next.second], request)) {
+                                sliceQueues[slice].push(std::make_pair(request, next.second));
+                            }
                         }
                     }
-                    seqDbr.loadData(loadKeys);
+                    for (size_t slice = 0; slice < SERVE_SLICES; slice++) {
+                        batch.sliceKeyOffsets[slice + 1] = batch.sliceKeyOffsets[slice] + batch.sliceKeys[slice].size();
+                    }
+                    const size_t keyCount = batch.sliceKeyOffsets[SERVE_SLICES];
+                    batch.keys.resize(keyCount);
+                    batch.isServed.resize(keyCount);
+#pragma omp parallel for schedule(dynamic, 1)
+                    for (size_t slice = 0; slice < SERVE_SLICES; slice++) {
+                        for (size_t i = 0; i < batch.sliceKeys[slice].size(); i++) {
+                            const size_t id = batch.sliceKeyOffsets[slice] + i;
+                            batch.keys[id] = batch.sliceKeys[slice][i];
+                            batch.isServed[id] = isAssigned(batch.keys[id]) == false;
+                        }
+                    }
+                    batch.loadKeys.clear();
+                    for (size_t i = 0; isShareLoaded == false && i < keyCount; i++) {
+                        if (batch.isServed[i]) {
+                            batch.loadKeys.push_back(batch.keys[i]);
+                        }
+                    }
+                    return keyCount > 0;
+                };
+                // an assigned key gets a bit, a served one its packed entry, or its raw entry if it has a byte without a code
+                const auto serveBatch = [&](const ServedBatch &batch) {
+                    const size_t keyCount = batch.keys.size();
+                    slotOffsets.resize(keyCount + 1);
+                    slotOffsets[0] = 0;
+#pragma omp parallel for schedule(static)
+                    for (size_t i = 0; i < keyCount; i++) {
+                        slotOffsets[i + 1] = batch.isServed[i] ? 1 + seqDbr.getEntryLen(batch.keys[i]) : 0;
+                    }
+                    sumOffsets(slotOffsets.data(), keyCount, serviceThreads);
                     slots.resize(slotOffsets[keyCount]);
                     slotBytes.resize(keyCount);
 #pragma omp parallel for schedule(dynamic, 1024)
                     for (size_t i = 0; i < keyCount; i++) {
-                        const size_t entryLen = seqDbr.getEntryLen(batchKeys[i]);
+                        const size_t entryLen = seqDbr.getEntryLen(batch.keys[i]);
                         char *slot = slots.data() + slotOffsets[i];
-                        if (isServed[i] && packEntry(seqDbr.getData(batchKeys[i], 0), entryLen, slot) == false) {
+                        if (batch.isServed[i] && packEntry(seqDbr.getData(batch.keys[i], 0), entryLen, slot) == false) {
                             slot[0] = PACKED_RAW_CODE;
-                            memcpy(slot + 1, seqDbr.getData(batchKeys[i], 0), entryLen);
+                            memcpy(slot + 1, seqDbr.getData(batch.keys[i], 0), entryLen);
                         }
-                        slotBytes[i] = isServed[i] ? getServedEntryBytes(slot, entryLen) : 0;
+                        slotBytes[i] = batch.isServed[i] ? getServedEntryBytes(slot, entryLen) : 0;
                     }
-                    for (size_t i = 0; i < batchItems.size(); i++) {
-                        const size_t id = batchItems[i].first;
-                        const size_t range = batchItems[i].second;
-                        if (extentBuffers[range].empty() == false && extentBuffers[range].size() + 10 + slotBytes[id] > sequenceEpoch.extentBytes) {
-                            writeExtent(range);
+                    // the items go to their group ranges, the slices of a range in order, so its keys ascend and their gaps go on from slice to slice; a cell is a group range and a slice
+                    const size_t cells = rangeCount * SERVE_SLICES;
+                    cellFirstIds.assign(cells, SIZE_MAX);
+                    cellLastKeys.resize(cells);
+                    cellOffsets.assign(cells, 0);
+                    size_t itemCount = 0;
+#pragma omp parallel for schedule(dynamic, 1) reduction(+:itemCount)
+                    for (size_t slice = 0; slice < SERVE_SLICES; slice++) {
+                        for (size_t i = 0; i < batch.sliceItems[slice].size(); i++) {
+                            const size_t id = batch.sliceKeyOffsets[slice] + batch.sliceItems[slice][i].first;
+                            const size_t cell = batch.sliceItems[slice][i].second * SERVE_SLICES + slice;
+                            char code[10];
+                            cellOffsets[cell] += slotBytes[id] + ((cellFirstIds[cell] == SIZE_MAX) ? 0 : Util::putPrefKey(code, (static_cast<uint64_t>(batch.keys[id] - cellLastKeys[cell]) << 1) | (batch.isServed[id] ? 0 : 1)));
+                            cellFirstIds[cell] = std::min(cellFirstIds[cell], id);
+                            cellLastKeys[cell] = batch.keys[id];
                         }
-                        if (extentBuffers[range].capacity() == 0) {
-                            extentBuffers[range].reserve(sequenceEpoch.extentBytes);
-                        }
-                        char code[10];
-                        const size_t codeBytes = Util::putPrefKey(code, (static_cast<uint64_t>(batchKeys[id] - extentLastKeys[range]) << 1) | (isServed[id] ? 0 : 1));
-                        extentBuffers[range].insert(extentBuffers[range].end(), code, code + codeBytes);
-                        extentBuffers[range].insert(extentBuffers[range].end(), slots.data() + slotOffsets[id], slots.data() + slotOffsets[id] + slotBytes[id]);
-                        extentLastKeys[range] = batchKeys[id];
-                        unservedSequenceBytes += isServed[id] ? 0 : getPackedEntryBytes(seqDbr.getEntryLen(batchKeys[id]));
+                        itemCount += batch.sliceItems[slice].size();
                     }
+                    size_t outputBytes = 0;
+                    for (size_t range = 0; range < rangeCount; range++) {
+                        const size_t rangeOffset = outputBytes;
+                        DBKeyType lastKey = 0;
+                        for (size_t cell = range * SERVE_SLICES; cell < (range + 1) * SERVE_SLICES; cell++) {
+                            if (cellFirstIds[cell] == SIZE_MAX) {
+                                continue;
+                            }
+                            const size_t id = cellFirstIds[cell];
+                            char code[10];
+                            const size_t cellBytes = cellOffsets[cell] + Util::putPrefKey(code, (static_cast<uint64_t>(batch.keys[id] - lastKey) << 1) | (batch.isServed[id] ? 0 : 1));
+                            cellOffsets[cell] = outputBytes;
+                            outputBytes += cellBytes;
+                            // the cell starts after the key before it and ends at its last key
+                            std::swap(lastKey, cellLastKeys[cell]);
+                        }
+                        if (outputBytes > rangeOffset) {
+                            const SequenceExtent extent = { sequenceEpoch.rangeBegin + range, servedFileBytes + rangeOffset, outputBytes - rangeOffset };
+                            extents.push_back(extent);
+                        }
+                    }
+                    servedBuffer.resize(outputBytes);
+                    size_t unservedBytes = 0;
+#pragma omp parallel for schedule(dynamic, 1) reduction(+:unservedBytes)
+                    for (size_t slice = 0; slice < SERVE_SLICES; slice++) {
+                        for (size_t i = 0; i < batch.sliceItems[slice].size(); i++) {
+                            const size_t id = batch.sliceKeyOffsets[slice] + batch.sliceItems[slice][i].first;
+                            const size_t cell = batch.sliceItems[slice][i].second * SERVE_SLICES + slice;
+                            char *item = servedBuffer.data() + cellOffsets[cell];
+                            const size_t codeBytes = Util::putPrefKey(item, (static_cast<uint64_t>(batch.keys[id] - cellLastKeys[cell]) << 1) | (batch.isServed[id] ? 0 : 1));
+                            memcpy(item + codeBytes, slots.data() + slotOffsets[id], slotBytes[id]);
+                            cellOffsets[cell] += codeBytes + slotBytes[id];
+                            cellLastKeys[cell] = batch.keys[id];
+                            unservedBytes += batch.isServed[id] ? 0 : getPackedEntryBytes(seqDbr.getEntryLen(batch.keys[id]));
+                        }
+                    }
+                    if (fwrite(servedBuffer.data(), sizeof(char), outputBytes, servedHandle) != outputBytes) {
+                        Debug(Debug::ERROR) << "Cannot write " << servedFile << "\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    servedFileBytes += outputBytes;
+                    unservedSequenceBytes += unservedBytes;
                     servedKeys += keyCount;
-                    servedItems += batchItems.size();
-                    batchKeys.clear();
-                    batchItems.clear();
+                    servedItems += itemCount;
                 };
-                std::priority_queue<QueuedRequest, std::vector<QueuedRequest>, std::greater<QueuedRequest> > queue;
-                for (size_t i = 0; i < runs.size(); i++) {
-                    std::pair<DBKeyType, size_t> request;
-                    if (readRequest(runs[i], request)) {
-                        queue.push(std::make_pair(request, i));
-                    }
-                }
-                size_t batchBytes = 0;
-                for (std::pair<DBKeyType, size_t> lastRequest(0, SIZE_MAX); queue.empty() == false;) {
-                    const QueuedRequest next = queue.top();
-                    queue.pop();
-                    std::pair<DBKeyType, size_t> request;
-                    if (readRequest(runs[next.second], request)) {
-                        queue.push(std::make_pair(request, next.second));
-                    }
-                    // a group range is read by one node, but its requests may be in several flushes
-                    if (next.first == lastRequest) {
-                        continue;
-                    }
-                    lastRequest = next.first;
-                    if (batchKeys.empty() || batchKeys.back() != next.first.first) {
-                        // a key reads at most its entry and two pages
-                        const size_t keyBytes = seqDbr.getEntryLen(next.first.first) + 2 * pageSize;
-                        if (batchKeys.empty() == false && batchBytes + keyBytes > maxServeBytes) {
-                            serveBatch();
-                            batchBytes = 0;
+#pragma omp parallel for schedule(dynamic, 1)
+                for (size_t slice = 0; slice < SERVE_SLICES; slice++) {
+                    sliceLastRequests[slice] = std::make_pair(0, SIZE_MAX);
+                    for (size_t i = 0; i < sliceRuns[slice].size(); i++) {
+                        std::pair<DBKeyType, size_t> request;
+                        if (readRequest(sliceRuns[slice][i], request)) {
+                            sliceQueues[slice].push(std::make_pair(request, i));
                         }
-                        batchKeys.push_back(next.first.first);
-                        batchBytes += keyBytes;
                     }
-                    batchItems.push_back(std::make_pair(batchKeys.size() - 1, next.first.second));
                 }
-                if (batchKeys.empty() == false) {
-                    serveBatch();
+                // the next batch is read while a batch is packed and written
+                bool hasBatch = mergeBatch(batches[0]);
+                for (size_t batch = 0; hasBatch; batch++) {
+                    seqDbr.loadData(batches[batch % 2].loadKeys);
+                    hasBatch = mergeBatch(batches[(batch + 1) % 2]);
+                    seqDbr.prefetchData(batches[(batch + 1) % 2].loadKeys);
+                    serveBatch(batches[batch % 2]);
                 }
                 for (size_t i = 0; i < requestFds.size(); i++) {
                     close(requestFds[i]);
@@ -2243,11 +2356,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 requestFds.clear();
                 requestFiles.clear();
                 requestFilesBytes.clear();
-                runs.clear();
-                for (size_t range = 0; range < extentBuffers.size(); range++) {
-                    if (extentBuffers[range].empty() == false) {
-                        writeExtent(range);
-                    }
+                for (size_t slice = 0; slice < SERVE_SLICES; slice++) {
+                    sliceRuns[slice].clear();
                 }
                 std::sort(extents.begin(), extents.end(), SequenceExtent::compareByRange);
                 const size_t extentOffset = servedFileBytes;
@@ -3581,14 +3691,12 @@ int align2clustLinfinity(Parameters &par) {
     }
     MMseqsNode::addPhaseTime(phaseValues, "scanning the prefilter", phaseValueTimer);
 
-    // an epoch: the group ranges of a pass whose targets are about the entry bytes of the database, so a home reads its share about once per epoch, with at most the extent memory over MIN_EXTENT_BYTES ranges
+    // an epoch: the group ranges of a pass whose targets are about the entry bytes of the database, so a home reads its share about once per epoch
     const uint128 dbBytes = seqDbr.getDataSize();
     uint128 totalClassBytes = 0;
     for (size_t sizeClass = 0; sizeClass < prefSizeBits; sizeClass++) {
         totalClassBytes += classBytes[sizeClass];
     }
-    const size_t extentMemory = std::max<size_t>(1, smallestMemoryLimit / EXTENT_MEMORY_DIVISOR);
-    const size_t maxEpochRanges = std::max<size_t>(1, extentMemory / MIN_EXTENT_BYTES);
     for (size_t sizeClass = prefSizeBits; sizeClass-- > 0;) {
         if (classBytes[sizeClass] == 0) {
             continue;
@@ -3598,16 +3706,13 @@ int align2clustLinfinity(Parameters &par) {
         const size_t firstPassEpoch = epochs.size();
         uint128 targetBytes = 0;
         for (size_t groupRange = 0; groupRange < groupRangeCount; groupRange++) {
-            if (groupRange == 0 || targetBytes * passEpochs > totalTargetBytes * (epochs.size() - firstPassEpoch) || epochs.back().rangeEnd - epochs.back().rangeBegin == maxEpochRanges) {
-                const SequenceEpoch epoch = { (prefSizeBits - 1 - sizeClass) * paddedDbSize + groupRangeKeyOffsets[groupRange], sizeClass, groupRange, groupRange, 0 };
+            if (groupRange == 0 || targetBytes * passEpochs > totalTargetBytes * (epochs.size() - firstPassEpoch)) {
+                const SequenceEpoch epoch = { (prefSizeBits - 1 - sizeClass) * paddedDbSize + groupRangeKeyOffsets[groupRange], sizeClass, groupRange, groupRange };
                 epochs.push_back(epoch);
             }
             epochs.back().rangeEnd = groupRange + 1;
             targetBytes += groupRangeTargetBytes[groupRange];
         }
-    }
-    for (size_t epoch = 0; epoch < epochs.size(); epoch++) {
-        epochs[epoch].extentBytes = std::max(MIN_EXTENT_BYTES, extentMemory / (epochs[epoch].rangeEnd - epochs[epoch].rangeBegin));
     }
     RepTargetsReader requestReader(par, seqDbr, partitions, groupRangePartitionOffsets, groupRangeKeyOffsets, epochs, groupRangeQueue, maxRecordBytes, memoryLimit, paddedDbSize, prefSizeBits);
 
