@@ -73,6 +73,18 @@ int lin8clust(int argc, const char **argv, const Command& command) {
                                        : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
     }
 
+    // punchHole warns here, before the run, if the exchange files cannot be freed while they are read
+    const std::string punchFile = tmpDir + "/punch_hole_check";
+    FILE *punchHandle = FileUtil::openAndDelete(punchFile.c_str(), "w");
+    const std::vector<char> page(Util::getPageSize(), 0);
+    if (fwrite(page.data(), 1, page.size(), punchHandle) != page.size() || fflush(punchHandle) != 0) {
+        Debug(Debug::ERROR) << "Cannot write " << punchFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    FileUtil::punchHole(fileno(punchHandle), 0, page.size());
+    fclose(punchHandle);
+    FileUtil::remove(punchFile.c_str());
+
     CommandCaller cmd;
     cmd.addVariable("REMOVE_TMP", par.removeTmpFiles ? "TRUE" : NULL);
     cmd.addVariable("RUNNER", par.nodeRunner.c_str());

@@ -141,7 +141,7 @@ void FileUtil::punchHole(int fd, size_t offset, size_t size) {
     static int warned = 0;
     if (size > 0 && fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size) != 0 && errno == EOPNOTSUPP
         && __sync_bool_compare_and_swap(&warned, 0, 1)) {
-        Debug(Debug::WARNING) << "Exchange files are not freed while read on this file system\n";
+        Debug(Debug::WARNING) << "Exchange files are not freed while read on this file system, so they need more temporary disk space\n";
     }
 #else
     (void) fd; (void) offset; (void) size;

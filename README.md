@@ -173,6 +173,8 @@ A file on ext4 and a Lustre object are limited to 16 TiB. At about 1 trillion se
 
     lfs setstripe -c -1 /shared/tmp
 
+Pass `--remove-tmp-files 1` for large runs, the temporary files are kept by default. The nodes free the exchange files while they read them by punching holes. `lin8clust` warns at the start if the temporary folder does not support this, then the exchange files stay whole until each step ends and need more space.
+
 The memory limits default to 90 % of the physical memory of the machine and do not see the SLURM `--mem` limit. If several tasks share a machine, set `--split-memory-limit` per task. `clusthashfast`, `kmermatcher`, `align2clust`, `mergeclusters`, `createtsv` and `result2flat` follow it, `createdb --createdb-mode 3` always sizes its buffers from the physical memory.
 
 The first node (rank 0) needs more memory than the others, about 480 GB or more at 1 trillion sequences. The largest prefilter entry at 1 billion sequences was 3.19 MB, and at 1 trillion the prefilter entries it holds can take up to about 335 GB on top of its other work.
