@@ -127,7 +127,7 @@ public:
     // a barrier that returns the smallest memoryLimit of all nodes, so they all cut the same splits; with threads all nodes must run with as many
     static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0);
 
-    // an exchange file <prefix>.<node> holds flushes sorted by receiving node, then P + 1 columns of one offset per flush: column c is where the part of node c starts, the last column where the flush ends; a block is a part
+    // a range of an exchange file <prefix>.<node> that this node reads through a buffer, freeing its bytes once read
     struct ExchangeBlock {
         FILE *file;
         size_t pos;
@@ -147,16 +147,19 @@ public:
     static void addExchangeFlush(std::string &indexData, size_t &writtenBytes, const std::vector<size_t> &nodeOffsets);
     // openExchange reads records, from malloc, as the records that this node sends to itself through exchange in its last flush
     static void keepOwnExchangeRecords(const std::string &exchange, char *records, size_t bytes);
+    // counts bytes that this node sent through an exchange, otherNodeBytes of them for other nodes
+    static void addSentExchangeBytes(size_t bytes, size_t otherNodeBytes);
     // appends the offsets of indexData to the file of this node, closes it and returns a line of every node, its record bytes and flush count, once every node has closed its file
     static std::string closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData);
+    // an exchange file <prefix>.<node> of closeExchange holds flushes sorted by receiving node, then P + 1 columns of one offset per flush: column c is where the part of node c starts, the last column where the flush ends; a block is a part
     static void openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeBlock> &blocks, std::vector<FILE *> &files);
     // moves the buffered records up to last of every block to records, recordOffsets their starts then the end; returns their count, 0 once none is left; recordSize NULL: ClusterPair records
     static size_t readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t (*recordSize)(const char *, size_t),
                                     bool (*compare)(const ClusterPair &, const ClusterPair &), const ClusterPair &last,
                                     std::vector<char> &records, std::vector<size_t> *recordOffsets, const std::string &prefix);
-    // copies each segment { fileType, offset, size, stored size } then bytes (zstd if stored size < size) of fileType that starts before windowEnd to window + offset - windowBegin and adds { offset, size } to segments; returns the offset of the next one, SIZE_MAX if none is left
-    static size_t readExchangeSegments(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t maxSegmentSize, uint64_t fileType, size_t windowBegin, size_t windowEnd,
-                                       char *window, std::vector<std::pair<size_t, size_t> > &segments, const std::string &prefix);
+    // copies each segment { length, offset in its length bin, size, stored size } then bytes (zstd if stored size < size) that starts before windowEnd to window + offset - windowBegin, where offset adds its bin offset from blockBins ({ length, offset }, longer first), and adds { offset, size } to segments; returns the offset of the next one, SIZE_MAX if none is left
+    static size_t readExchangeSegments(std::vector<ExchangeBlock> &blocks, const std::vector<std::vector<std::pair<size_t, size_t> > > &blockBins, size_t bufferMemory, size_t maxSegmentSize,
+                                       size_t windowBegin, size_t windowEnd, char *window, std::vector<std::pair<size_t, size_t> > &segments, const std::string &prefix);
     static void closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix);
 
     // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered, those for this node kept in memory; nodeKeyOffsets: keys of every node;
