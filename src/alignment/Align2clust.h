@@ -8,6 +8,7 @@
 #include "BlockAligner.h"
 #include "SwipeAligner.h"
 #include "MMseqsNode.h"
+#include "Util.h"
 #include <atomic>
 #include <string>
 #include <vector>
@@ -167,6 +168,8 @@ struct SwipeTargets {
     std::vector<s_align> aligns;
     std::vector<std::string> backtraces;
     std::vector<DBKeyType> targetKeys;
+    // the letters of the targets at offsets, as a reader may return them in a buffer of the thread
+    std::vector<char> seqData;
     std::vector<const char *> targetSequences;
     std::vector<int> seedQueries;
     std::vector<int> seedTargets;
@@ -212,7 +215,7 @@ struct SwipeTargets {
         sequences.insert(sequences.end(), target.numSequence, target.numSequence + target.L);
         lengths.push_back(target.L);
         targetKeys.push_back(targetKey);
-        targetSequences.push_back(target.getSeqData());
+        seqData.insert(seqData.end(), target.getSeqData(), target.getSeqData() + target.L);
         seedQueries.push_back(seedQuery);
         seedTargets.push_back(seedTarget);
     }
@@ -228,7 +231,7 @@ struct SwipeTargets {
         offsets.clear();
         lengths.clear();
         targetKeys.clear();
-        targetSequences.clear();
+        seqData.clear();
         seedQueries.clear();
         seedTargets.clear();
     }
@@ -297,6 +300,137 @@ void alignClusterMembers(const Parameters &par, BlockAligner &blockAligner, Matc
 bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockAlignerInitialized, Sequence &query, Sequence &target,
                  float scorePerColThreshold, unsigned short &diagonal, const ClusterAssignment *assignedCluster, size_t targetId, Matcher::result_t *result,
                  SwipeTargets *swipe);
+bool swipeExtensionsPass(const Parameters &par, SwipeTargets &swipe, size_t i);
 int align2clustLinfinity(Parameters &par);
+
+// the SWIPE extensions of the queued targets (--align2clust-aligner-mode 1), skipping the ones assigned since
+template <typename Assigned>
+void alignTargetsSwipe(const Parameters &par, SwipeTargets &swipe, const Assigned &isAssigned, std::vector<ClusterPair> &pairs) {
+    const int32_t xDrop = (MIN_SIZE * par.gapExtend.values.aminoacid() + par.gapOpen.values.aminoacid());
+    // twice one past the longest gap within the X-drop, which is MIN_SIZE + 1 long
+    const int bandSide = 2 * (MIN_SIZE + 2);
+    size_t count = 0;
+    for (size_t i = 0; i < swipe.targetKeys.size(); i++) {
+        if (isAssigned(swipe.repKeys[swipe.queryIds[i]]) || isAssigned(swipe.targetKeys[i])) {
+            continue;
+        }
+        swipe.queryIds[count] = swipe.queryIds[i];
+        swipe.offsets[count] = swipe.offsets[i];
+        swipe.lengths[count] = swipe.lengths[i];
+        swipe.seedQueries[count] = swipe.seedQueries[i];
+        swipe.seedTargets[count] = swipe.seedTargets[i];
+        swipe.targetKeys[count] = swipe.targetKeys[i];
+        count++;
+    }
+    if (count == 0) {
+        return;
+    }
+    swipe.targets.resize(count);
+    swipe.targetSequences.resize(count);
+    swipe.aligns.resize(count);
+    swipe.backtraces.resize(count);
+    for (size_t i = 0; i < count; i++) {
+        swipe.targets[i] = swipe.sequences.data() + swipe.offsets[i];
+        swipe.targetSequences[i] = swipe.seqData.data() + swipe.offsets[i];
+    }
+    swipe.extender.extendBanded(count, swipe.queryIds.data(), swipe.targets.data(), swipe.lengths.data(), swipe.seedQueries.data(), swipe.seedTargets.data(), false, xDrop,
+                               bandSide, swipe.aligns.data(), swipe.backtraces.data());
+    // the targets whose forward extension covers enough move to the front
+    size_t passed = 0;
+    for (size_t i = 0; i < count; i++) {
+        const s_align &forward = swipe.aligns[i];
+        if (forward.score1 == 0 || Util::hasCoverage(par.covThr, par.covMode, SmithWaterman::computeCov(0, forward.qEndPos1, swipe.repLengths[swipe.queryIds[i]]),
+                                                     SmithWaterman::computeCov(0, forward.dbEndPos1, swipe.lengths[i])) == false) {
+            continue;
+        }
+        swipe.queryIds[passed] = swipe.queryIds[i];
+        swipe.targets[passed] = swipe.targets[i];
+        swipe.lengths[passed] = swipe.lengths[i];
+        swipe.seedQueries[passed] = swipe.seedQueries[i];
+        swipe.seedTargets[passed] = swipe.seedTargets[i];
+        swipe.targetKeys[passed] = swipe.targetKeys[i];
+        swipe.targetSequences[passed] = swipe.targetSequences[i];
+        swipe.aligns[passed] = swipe.aligns[i];
+        swipe.backtraces[passed].swap(swipe.backtraces[i]);
+        passed++;
+    }
+    swipe.targetPairs += count;
+    count = passed;
+    swipe.backAligns.resize(count);
+    swipe.backBacktraces.resize(count);
+    swipe.extender.extendBanded(count, swipe.queryIds.data(), swipe.targets.data(), swipe.lengths.data(), swipe.seedQueries.data(), swipe.seedTargets.data(), true, xDrop,
+                               bandSide, swipe.backAligns.data(), swipe.backBacktraces.data());
+    for (size_t i = 0; i < count; i++) {
+        if (swipe.backAligns[i].score1 > 0 && swipeExtensionsPass(par, swipe, i)) {
+            const ClusterPair pair = { swipe.repKeys[swipe.queryIds[i]], swipe.targetKeys[i] };
+            pairs.push_back(pair);
+        }
+    }
+}
+
+// the member gates of a batch of reps in shared rounds: the gapped members of all reps share the extension lanes, the ones no extension accepted go through alignMembersSwipe per rep
+template <typename MapRep>
+void alignMemberGatesSwipe(const Parameters &par, BlockAligner &blockAligner, Matcher &matcher, Sequence &query, Sequence &element, DBReader<DBKeyType> *cluSeqDbr,
+                           unsigned int swMode, unsigned int threadIdx, ClusterMembers &members, const std::vector<size_t> &repGateOffsets,
+                           const std::vector<DBKeyType> &repKeys, const MapRep &mapRep) {
+    SwipeTargets &targets = *members.targets;
+    SwipeBatch &swipe = *members.swipe;
+    bool matcherInitialized = false;
+    for (size_t batchSize = 1; ; batchSize *= 2) {
+        bool open = false;
+        members.gappedGates.clear();
+        members.gappedMembers.clear();
+        for (size_t rep = 0; rep < repKeys.size(); rep++) {
+            bool repOpen = (batchSize == 1);
+            for (size_t g = repGateOffsets[rep]; g < repGateOffsets[rep + 1]; g++) {
+                repOpen = repOpen || (members.gates[g].live && members.gates[g].next < members.gates[g].memberKeys.size());
+            }
+            if (repOpen == false) {
+                continue;
+            }
+            mapRep(query, blockAligner, repKeys[rep]);
+            if (batchSize == 1) {
+                prepareMemberGates(par, query, cluSeqDbr, false, members, repGateOffsets[rep], repGateOffsets[rep + 1]);
+            }
+            targets.startRep(repKeys[rep]);
+            open = alignMemberRound(par, blockAligner, matcher, matcherInitialized, query, element, cluSeqDbr, swMode, threadIdx, false, NULL, members,
+                                    repGateOffsets[rep], repGateOffsets[rep + 1], batchSize) || open;
+        }
+        if (open == false) {
+            break;
+        }
+        members.extendedPairs.clear();
+        alignTargetsSwipe(par, targets, [](DBKeyType) { return false; }, members.extendedPairs);
+        targets.clearTargets();
+        for (size_t i = 0; i < members.extendedPairs.size(); i++) {
+            members.gappedMembers[members.extendedPairs[i].memberKey] = SIZE_MAX;
+        }
+        size_t gapped = 0;
+        for (size_t rep = 0; rep < repKeys.size(); rep++) {
+            swipe.clear();
+            members.poolGates.clear();
+            for (; gapped < members.gappedGates.size() && members.gappedGates[gapped] < repGateOffsets[rep + 1]; gapped++) {
+                const size_t i = members.gappedMembers[gapped];
+                if (i == SIZE_MAX) {
+                    continue;
+                }
+                const size_t g = members.gappedGates[gapped];
+                const DBKeyType elementKey = members.gates[g].memberKeys[i];
+                const size_t elementId = cluSeqDbr->getId(elementKey);
+                element.mapSequence(elementId, elementKey, cluSeqDbr->getData(elementId, threadIdx), cluSeqDbr->getSeqLen(elementId));
+                swipe.add(element);
+                swipe.gapped.push_back(i);
+                members.poolGates.push_back(g);
+            }
+            if (swipe.gapped.empty()) {
+                continue;
+            }
+            mapRep(query, blockAligner, repKeys[rep]);
+            swipe.startRep();
+            matcherInitialized = false;
+            alignMembersSwipe(par, matcher, matcherInitialized, members, query, element, cluSeqDbr, swMode, threadIdx, false, NULL);
+        }
+    }
+}
 
 #endif

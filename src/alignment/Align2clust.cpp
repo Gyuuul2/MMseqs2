@@ -314,6 +314,11 @@ static void printSwipeLanes() {
                            << swipeTargetLaneRows.load() * 100 / std::max<size_t>(1, swipeTargetSlotRows.load()) << "% lane fill), "
                            << swipeTargetLongPairs.load() << " extensions longer than the lane trace\n";
     }
+    if (swipeMemberSlotRows.load() + swipeTargetSlotRows.load() > 0) {
+        Debug(Debug::INFO) << "SWIPE extensions in 8 bit lanes: " << swipeByteSlotRows.load() * 100 / (swipeMemberSlotRows.load() + swipeTargetSlotRows.load())
+                           << "% of the lane rows (" << swipeByteLaneRows.load() * 100 / std::max<size_t>(1, swipeByteSlotRows.load()) << "% active), "
+                           << swipeRerunPairs.load() << " again in 16 bit lanes\n";
+    }
 }
 
 // the result of a SWIPE alignment with start, end, identities and backtrace
@@ -335,6 +340,33 @@ static bool swipeForwardPasses(const Parameters &par, EvalueComputation &evaluer
     const float qCov = SmithWaterman::computeCov(0, alignment.qEndPos1, queryLength);
     const float tCov = SmithWaterman::computeCov(0, alignment.dbEndPos1, targetLength);
     return Util::hasCoverage(par.covThr, par.covMode, qCov, tCov) && evaluer.computeEvalue(alignment.score1, queryLength) <= par.evalThr;
+}
+
+// whether the forward and backward extension of target i of alignTargetsSwipe, joined at their seed cell, meet the clustering criteria
+bool swipeExtensionsPass(const Parameters &par, SwipeTargets &swipe, size_t i) {
+    const s_align &forward = swipe.aligns[i];
+    const s_align &backward = swipe.backAligns[i];
+    // the seed cell is in both extensions
+    const int rawScore = static_cast<int>(forward.score1) + static_cast<int>(backward.score1)
+                         - swipe.extender.cellScore(swipe.queryIds[i], swipe.seedQueries[i], swipe.targets[i][swipe.seedTargets[i]]);
+    std::string &gappedBacktrace = swipe.backBacktraces[i];
+    gappedBacktrace.pop_back();
+    gappedBacktrace += swipe.backtraces[i];
+    s_align joined = forward;
+    joined.qStartPos1 = backward.qStartPos1;
+    joined.dbStartPos1 = backward.dbStartPos1;
+    const char *querySequence = swipe.repSequences[swipe.queryIds[i]];
+    const char *targetSequence = swipe.targetSequences[i];
+    joined.identicalAACnt = 0;
+    for (size_t b = 0, q = joined.qStartPos1, t = joined.dbStartPos1; b < gappedBacktrace.size(); b++) {
+        const char op = gappedBacktrace[b];
+        joined.identicalAACnt += (op == 'M' && querySequence[q] == targetSequence[t]);
+        q += (op != 'D');
+        t += (op != 'I');
+    }
+    Matcher::result_t result = swipeResult(par, swipe.evaluer, swipe.targetKeys[i], rawScore, joined, swipe.repLengths[swipe.queryIds[i]], swipe.lengths[i],
+                                           gappedBacktrace);
+    return Alignment::checkCriteria(result, false, par.evalThr, par.seqIdThr, par.alnLenThr, par.covMode, par.covThr);
 }
 
 // the cell after the first 3 matches in a row of an ungapped alignment, which seeds its gapped alignment
@@ -975,8 +1007,14 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         targetsWithDiagonal.reserve(1000);
         const bool swipeLanes = (par.align2clustAlignerMode != Parameters::ALIGNER_MODE_DEFAULT && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid());
         SwipeBatch swipe(par, scoring.subMat, scoring.evaluer, db_maxseqlen);
-        // the member gates of a rep wait for its last target and go in rounds that share the lanes, unless the alignments are written in target order
-        ClusterMembers members(swipeLanes ? &swipe : NULL, swipeLanes && cluDbr != NULL && alnWriter == nullptr);
+        // the gapped targets and the member gates of a rep wait for its last target and share the SWIPE lanes, unless the alignments are written in target order
+        const bool targetLanes = swipeLanes && alnWriter == nullptr;
+        SwipeTargets swipeTargets(par, scoring.subMat, scoring.evaluer, db_maxseqlen);
+        SwipeTargets memberTargets(par, scoring.subMat, scoring.evaluer, db_maxseqlen, true);
+        ClusterMembers members(swipeLanes ? &swipe : NULL, targetLanes && cluDbr != NULL, targetLanes ? &memberTargets : NULL);
+        std::vector<ClusterPair> swipePairs;
+        std::vector<size_t> repGateOffsets(2, 0);
+        std::vector<DBKeyType> repKeys(1);
         std::string querySeqBuffer;
         querySeqBuffer.reserve(db_maxseqlen + 1);
 
@@ -1045,6 +1083,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             bool blockAlignerInitialized = false;
             bool matcherInitialized = false;
             swipe.startRep();
+            swipeTargets.startRep(queryKey);
 
             for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
                 if (loadAssignedCluster(assignedCluster, representativeId) != DB_LOCAL_ID_INVALID) {
@@ -1075,7 +1114,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 target.mapSequence(targetId, targetKey, targetSequence, targetLength);
                 unsigned short diagonal = targetsWithDiagonal[targetIdx].second;
                 bool isAccepted = alignTarget(par, blockAligner, blockAlignerInitialized, query, target, scoring.scorePerColThreshold, diagonal, assignedCluster, targetId,
-                                              includeAlignFiles ? &targetResult : NULL, NULL);
+                                              includeAlignFiles ? &targetResult : NULL, targetLanes ? &swipeTargets : NULL);
                 if (isAccepted && cluDbr != NULL) {
                     isAccepted = alignTargetMembers(par, blockAligner, matcher, matcherInitialized, query, element, cluDbr, cluSeqDbr, targetKey, targetId,
                                                     diagonal, swMode, threadIdx, includeAlignFiles ? &pendingMemberAln : NULL, alnLineBuffer.data(), members);
@@ -1088,8 +1127,22 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     clusterResult.memberIds.push_back(targetId);
                 }
             }
+            swipePairs.clear();
+            alignTargetsSwipe(par, swipeTargets, [&](DBKeyType key) { return loadAssignedCluster(assignedCluster, seqDbr->getId(key)) != DB_LOCAL_ID_INVALID; }, swipePairs);
+            swipeTargets.clearTargets();
+            for (size_t p = 0; p < swipePairs.size(); p++) {
+                const DBKeyType targetKey = swipePairs[p].memberKey;
+                const size_t targetId = seqDbr->getId(targetKey);
+                if (cluDbr == NULL || alignTargetMembers(par, blockAligner, matcher, matcherInitialized, query, element, cluDbr, cluSeqDbr, targetKey, targetId,
+                                                         0, swMode, threadIdx, NULL, NULL, members)) {
+                    clusterResult.memberIds.push_back(targetId);
+                }
+            }
             if (members.deferGates && members.gateCount > 0) {
-                alignClusterMembers(par, blockAligner, matcher, matcherInitialized, query, element, cluSeqDbr, swMode, threadIdx, false, NULL, members);
+                repGateOffsets[1] = members.gateCount;
+                repKeys[0] = queryKey;
+                alignMemberGatesSwipe(par, blockAligner, matcher, query, element, cluSeqDbr, swMode, threadIdx, members, repGateOffsets, repKeys,
+                                      [](Sequence &, BlockAligner &, DBKeyType) {});
                 for (size_t g = 0; g < members.gateCount; g++) {
                     if (members.gates[g].live == false) {
                         clusterResult.memberIds.erase(std::find(clusterResult.memberIds.begin(), clusterResult.memberIds.end(), members.gates[g].targetId));
