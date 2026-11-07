@@ -255,31 +255,28 @@ std::string MMseqsNode::gatherRunFiles(const std::string &prefix) {
     return content;
 }
 
-void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t bytes, size_t orderedClaims) {
+void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t bytes) {
     if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
         Debug(Debug::ERROR) << "Cannot flush " << log << "\n";
         EXIT(EXIT_FAILURE);
     }
-    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(bytes) + "\t" + SSTR(orderedClaims) + "\n");
+    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(bytes) + "\n");
 }
 
-bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &bytes, size_t *orderedClaims) {
+bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &bytes) {
     const std::string file = log + ".progress";
     // NFS may fail to read a progress file that was just replaced; the next poll reads it again
     const std::string content = readPolledFile(file);
     if (content.compare(0, runId.size(), runId) != 0) {
         return false;
     }
-    const char *columns[3];
-    if (Util::getWordsOfLine((char *) content.c_str() + runId.size(), columns, 3) < 3) {
+    const char *columns[2];
+    if (Util::getWordsOfLine((char *) content.c_str() + runId.size(), columns, 2) < 2) {
         Debug(Debug::ERROR) << "Cannot read " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
     key = Util::fast_atoi<size_t>(columns[0]);
     bytes = Util::fast_atoi<size_t>(columns[1]);
-    if (orderedClaims != NULL) {
-        *orderedClaims = Util::fast_atoi<size_t>(columns[2]);
-    }
     return true;
 }
 
@@ -404,6 +401,14 @@ size_t MMseqsNode::readExchangeFlushes(const std::string &indexFile, size_t flus
     return lineCount;
 }
 
+void MMseqsNode::waitForExchangeFlush(const std::string &indexFile, size_t flush, std::vector<uint64_t> &line) {
+    WaitWarning warning;
+    for (unsigned int polls = 0; readExchangeFlushes(indexFile, flush, line.size(), line) == 0; polls++) {
+        sleepBeforePoll(polls);
+        warning.check(indexFile);
+    }
+}
+
 void MMseqsNode::writeExchangeSliceHeader(FILE *file, const std::string &fileName, uint64_t generation) {
     const ExchangeSliceHeader header = { exchangeSliceMagic(), generation };
     if (fwrite(&header, sizeof(header), 1, file) != 1 || fflush(file) != 0) {
@@ -412,67 +417,66 @@ void MMseqsNode::writeExchangeSliceHeader(FILE *file, const std::string &fileNam
     }
 }
 
-void MMseqsNode::writeExchangeFlush(const std::string &fileName, uint64_t generation, const char *data, size_t bytes, const std::string &indexFile,
-                                    const std::vector<uint64_t> &line, int threads) {
-    FILE *file = FileUtil::openAndDelete(fileName.c_str(), "w");
-    writeExchangeSliceHeader(file, fileName, generation);
-#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (size_t offset = 0; offset < bytes; offset += EXCHANGE_WRITE_BYTES) {
-        FileUtil::pwriteAll(fileno(file), fileName.c_str(), data + offset, std::min(EXCHANGE_WRITE_BYTES, bytes - offset), EXCHANGE_SLICE_HEADER_BYTES + offset);
-    }
-    publishExchangeFlush(file, fileName, EXCHANGE_SLICE_HEADER_BYTES + bytes, indexFile, line);
-}
-
-int MMseqsNode::tryOpenExchangeSlice(const std::string &file, size_t expectedBytes, uint64_t expectedGeneration, time_t &lastDirectoryRefresh,
-                                     size_t &observedBytes, uint64_t &observedGeneration, int &lastError) {
-    observedBytes = SIZE_MAX;
-    observedGeneration = UINT64_MAX;
-    lastError = 0;
-    int fd = openFile(file, O_RDONLY | O_CLOEXEC);
-    int openError = (fd < 0) ? errno : 0;
-    if (openError == ENOENT) {
-        const time_t now = time(NULL);
-        if (now != lastDirectoryRefresh) {
-            lastDirectoryRefresh = now;
-            if (isListed(file)) {
-                fd = openFile(file, O_RDONLY | O_CLOEXEC);
-                openError = (fd < 0) ? errno : 0;
+int MMseqsNode::openExchangeSlice(const std::string &file, size_t expectedBytes, uint64_t expectedGeneration) {
+    time_t lastDirectoryRefresh = 0;
+    const time_t start = time(NULL);
+    for (unsigned int polls = 0; ; polls++) {
+        size_t observedBytes = SIZE_MAX;
+        uint64_t observedGeneration = UINT64_MAX;
+        int fd = openFile(file, O_RDONLY | O_CLOEXEC);
+        int lastError = (fd < 0) ? errno : 0;
+        // a listing refreshes an NFS negative lookup once a second
+        if (lastError == ENOENT) {
+            const time_t now = time(NULL);
+            if (now != lastDirectoryRefresh) {
+                lastDirectoryRefresh = now;
+                if (isListed(file)) {
+                    fd = openFile(file, O_RDONLY | O_CLOEXEC);
+                    lastError = (fd < 0) ? errno : 0;
+                }
             }
         }
-    }
-    if (fd < 0) {
-        lastError = openError;
-        return -1;
-    }
-    struct stat fileStat;
-    int statResult;
-    do {
-        statResult = fstat(fd, &fileStat);
-    } while (statResult < 0 && errno == EINTR);
-    if (statResult == 0) {
-        observedBytes = static_cast<size_t>(fileStat.st_size);
-        if (observedBytes == expectedBytes) {
-            ExchangeSliceHeader header;
-            ssize_t headerBytes;
+        if (fd >= 0) {
+            struct stat fileStat;
+            int statResult;
             do {
-                headerBytes = pread(fd, &header, sizeof(header), 0);
-            } while (headerBytes < 0 && errno == EINTR);
-            if (headerBytes == static_cast<ssize_t>(sizeof(header))) {
-                observedGeneration = header.generation;
-            }
-            if (headerBytes == static_cast<ssize_t>(sizeof(header)) && header.magic == exchangeSliceMagic()
-                && header.generation == expectedGeneration) {
-                return fd;
-            }
-            if (headerBytes < 0) {
+                statResult = fstat(fd, &fileStat);
+            } while (statResult < 0 && errno == EINTR);
+            if (statResult == 0) {
+                observedBytes = static_cast<size_t>(fileStat.st_size);
+                if (observedBytes == expectedBytes) {
+                    ExchangeSliceHeader header;
+                    ssize_t headerBytes;
+                    do {
+                        headerBytes = pread(fd, &header, sizeof(header), 0);
+                    } while (headerBytes < 0 && errno == EINTR);
+                    if (headerBytes == static_cast<ssize_t>(sizeof(header))) {
+                        observedGeneration = header.generation;
+                        if (header.magic == exchangeSliceMagic() && header.generation == expectedGeneration) {
+                            return fd;
+                        }
+                    } else if (headerBytes < 0) {
+                        lastError = errno;
+                    }
+                }
+            } else {
                 lastError = errno;
             }
+            close(fd);
         }
-    } else {
-        lastError = errno;
+        if (lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
+            Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(lastError) << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        // a published file stays missing or short for a while on NFS only; the time alone would include a stall of this node
+        if (polls >= 100 && time(NULL) - start >= DIRECTORY_WAIT_SECONDS) {
+            Debug(Debug::ERROR) << "Cannot open complete " << file << " (expected " << expectedBytes << " bytes, observed "
+                                << (observedBytes == SIZE_MAX ? std::string("unavailable") : SSTR(observedBytes)) << " bytes; expected generation " << expectedGeneration
+                                << ", observed " << (observedGeneration == UINT64_MAX ? std::string("unavailable") : SSTR(observedGeneration)) << "; error " << lastError << ")\n";
+            EXIT(EXIT_FAILURE);
+        }
+        sleepBeforePoll(polls);
     }
-    close(fd);
-    return -1;
 }
 
 bool MMseqsNode::tryReadExchangeSlice(int fd, char *data, size_t bytes, size_t offset, int &readError) {
@@ -490,6 +494,30 @@ bool MMseqsNode::tryReadExchangeSlice(int fd, char *data, size_t bytes, size_t o
     }
     readError = 0;
     return true;
+}
+
+void MMseqsNode::readExchangeSlice(int fd, const std::string &file, size_t expectedBytes, uint64_t expectedGeneration, char *data, size_t bytes, size_t offset) {
+    const time_t start = time(NULL);
+    for (unsigned int polls = 0; ; polls++) {
+        const int readFd = (polls == 0) ? fd : openExchangeSlice(file, expectedBytes, expectedGeneration);
+        int readError;
+        const bool isRead = tryReadExchangeSlice(readFd, data, bytes, offset, readError);
+        if (readFd != fd) {
+            close(readFd);
+        }
+        if (isRead) {
+            return;
+        }
+        if (readError != 0 && readError != ESTALE && readError != EINTR) {
+            Debug(Debug::ERROR) << "Cannot read " << file << ": " << strerror(readError) << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (polls >= 100 && time(NULL) - start >= DIRECTORY_WAIT_SECONDS) {
+            Debug(Debug::ERROR) << "Cannot read complete " << file << " bytes " << offset << " to " << offset + bytes << " (error " << readError << ")\n";
+            EXIT(EXIT_FAILURE);
+        }
+        sleepBeforePoll(polls);
+    }
 }
 
 void MMseqsNode::removeOnceRead(const std::string &file) {
@@ -596,28 +624,8 @@ size_t MMseqsNode::WorkQueue::claimInOrder() {
     while (item < itemCount && claim(item) == false) {
         item++;
     }
-    __atomic_store_n(&nextOrderedItem, std::min(item + 1, itemCount), __ATOMIC_RELAXED);
+    nextOrderedItem = std::min(item + 1, itemCount);
     return item;
-}
-
-size_t MMseqsNode::WorkQueue::getOrderedClaims() const {
-    return __atomic_load_n(&nextOrderedItem, __ATOMIC_RELAXED);
-}
-
-unsigned int MMseqsNode::WorkQueue::getNode(size_t item) const {
-    unsigned int node = count;
-    const std::string file = name + "." + SSTR(item);
-    int fd = openFile(file);
-    if (fd < 0 && errno == ENOENT && isListed(file)) {
-        fd = openFile(file);
-    }
-    if (fd >= 0) {
-        if (pread(fd, &node, sizeof(node), 0) != static_cast<ssize_t>(sizeof(node))) {
-            node = count;
-        }
-        close(fd);
-    }
-    return node;
 }
 
 void MMseqsNode::WorkQueue::removeClaims() {

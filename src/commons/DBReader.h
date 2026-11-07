@@ -7,7 +7,6 @@
 //
 #include "MemoryTracker.h"
 #include <cstddef>
-#include <map>
 #include <utility>
 #include <vector>
 #include <string>
@@ -294,14 +293,13 @@ public:
     size_t getBufferSizeToPrefetch(size_t keyBegin, size_t keyEnd);
     // --createdb-mode 3 sequences: reads the ascending keys, entries less than a page apart in one request, through the buffered fds
     void loadData(const std::vector<DBKeyType> &keys);
-    // --createdb-mode 3 sequences without a block cache: loadData of the same keys takes this read
+    // --createdb-mode 3 sequences: loadData of the same keys takes this read
     void prefetchData(const std::vector<DBKeyType> &keys);
-    // --createdb-mode 3 sequences: loads by keys read the whole block of a key while the blocks fit cacheBytes; blocks below the loaded and the requested keys are freed when new blocks need their room
-    void setBlockCacheBytes(size_t cacheBytes);
-    // the block of setBlockCacheBytes that holds key
+    // --createdb-mode 3 sequences: cuts the keys into blocks whose entries start in the same MAX_READ_REQUEST_SIZE bytes of a data file
+    void buildBlockKeyOffsets();
+    // the block of buildBlockKeyOffsets that holds key
     size_t getKeyBlock(size_t key) const;
     const std::vector<size_t> &getBlockKeyOffsets() const { return blockKeyOffsets; }
-    size_t getBlockReadBytes() { return blockReadBytes; }
     size_t getKeyReadBytes() { return keyReadBytes; }
     size_t getBufferSizeToLoad(size_t keyBegin, size_t keyEnd);
     // --createdb-mode 3 headers: the size of the names of keys [keyBegin, keyEnd)
@@ -666,8 +664,6 @@ private:
         bool isKeyLoad;
         // read by prefetchData and not yet taken by loadData
         bool isPrefetched;
-        // the blocks of the last blocks.size() read requests, which join the cache once read
-        std::vector<size_t> blocks;
     };
     BufferInfo loadedBuffer, prefetchBuffer;
     // the keys of prefetchBuffer if it is a load of keys
@@ -675,15 +671,8 @@ private:
     // startLoadData: the keys below partKeyEnd are read or in flight, the parts are of about partBytes
     size_t partKeyEnd;
     size_t partBytes;
-    void cacheBlocks(BufferInfo &buffer);
-    void freeBlocks(size_t keyEnd, size_t neededBytes);
     // --createdb-mode 3 sequences: block b holds the keys [blockKeyOffsets[b], blockKeyOffsets[b + 1]) whose entries start in the same MAX_READ_REQUEST_SIZE bytes of a data file
     std::vector<size_t> blockKeyOffsets;
-    std::map<size_t, BatchReader::ReadRequest> cachedBlocks;
-    size_t blockCacheBytes;
-    // the bytes of the cached blocks and of those being read
-    size_t cachedBlockBytes;
-    size_t blockReadBytes;
     size_t keyReadBytes;
     bool prepareBufferToLoad(BufferInfo &bufferToLoadInto, size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
 

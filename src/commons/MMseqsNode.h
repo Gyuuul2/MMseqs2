@@ -66,9 +66,8 @@ public:
     // waits for prefix + node of every node and returns their content in node order; the files are removed
     static std::string gatherRunFiles(const std::string &prefix);
     // a log that one node appends to while another reads it: its synced byte count and a key are published as <log>.progress, read from a new open
-    // orderedClaims: the first items of an ordered work queue that are taken, so the reader opens only their files
-    static void publishLog(FILE *file, const std::string &log, size_t key, size_t bytes, size_t orderedClaims = 0);
-    static bool readLogProgress(const std::string &log, size_t &key, size_t &bytes, size_t *orderedClaims = NULL);
+    static void publishLog(FILE *file, const std::string &log, size_t key, size_t bytes);
+    static bool readLogProgress(const std::string &log, size_t &key, size_t &bytes);
     static void waitForLog(const std::string &log, size_t &key, size_t &bytes);
     // without wait, returns false at once instead of polling until the bytes are readable
     static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true);
@@ -79,14 +78,15 @@ public:
     static size_t readExchangeFlushes(const std::string &indexFile, size_t flush, size_t lineWords, std::vector<uint64_t> &lines);
     static const size_t EXCHANGE_SLICE_HEADER_BYTES = 2 * sizeof(uint64_t);
     static void writeExchangeSliceHeader(FILE *file, const std::string &fileName, uint64_t generation);
+    // waits for line flush of indexFile, line.size() words, as readExchangeFlushes reads it
+    static void waitForExchangeFlush(const std::string &indexFile, size_t flush, std::vector<uint64_t> &line);
     // the bytes of a flush that a thread writes at once
     static const size_t EXCHANGE_WRITE_BYTES = 16 * 1024 * 1024;
-    // writes bytes of data as flush generation of fileName from threads threads, then publishes it with line to indexFile
-    static void writeExchangeFlush(const std::string &fileName, uint64_t generation, const char *data, size_t bytes, const std::string &indexFile,
-                                   const std::vector<uint64_t> &line, int threads);
-    static int tryOpenExchangeSlice(const std::string &file, size_t expectedBytes, uint64_t expectedGeneration, time_t &lastDirectoryRefresh,
-                                    size_t &observedBytes, uint64_t &observedGeneration, int &lastError);
+    // opens a file that an index line published with its bytes and generation, again while NFS shows an older state of it, until that lasts too long
+    static int openExchangeSlice(const std::string &file, size_t expectedBytes, uint64_t expectedGeneration);
     static bool tryReadExchangeSlice(int fd, char *data, size_t bytes, size_t offset, int &readError);
+    // reads bytes at offset of a file of openExchangeSlice through fd, and through new opens while NFS reads it short or stale, until that lasts too long
+    static void readExchangeSlice(int fd, const std::string &file, size_t expectedBytes, uint64_t expectedGeneration, char *data, size_t bytes, size_t offset);
     // every node publishes content as file + "." + node; returns all contents in node order, gathered by the master into file
     static std::string barrier(const std::string &file, const std::string &content = "");
     // this node has read file; the master removes it once every node has, the others do not wait
@@ -106,10 +106,6 @@ public:
         size_t claimNext();
         // the first item that no node has taken, for a queue that all nodes take in order, so its taken items are always the first ones
         size_t claimInOrder();
-        // the number of first items that some node has taken; any thread of this node may read it while claimInOrder runs
-        size_t getOrderedClaims() const;
-        // the node that took item, count while that is not readable
-        unsigned int getNode(size_t item) const;
         // removes <name>.<item> of the own items of this node, while no node takes items of the queue
         void removeClaims();
 
