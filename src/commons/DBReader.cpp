@@ -256,7 +256,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
         incrementMemory(sizeof(Index) * indexSize);
 
         if (isLinfinity) {
-            // the headers are opened with <db>.nodeinfo as index, one line "firstKey count" per file
+            // the headers are opened with <db>.file_keys as index, one line "firstKey count" per file
             const bool isHeader = Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_GENERIC_DB);
             if (isCompressed(dbtype) == COMPRESSED && isHeader == false) {
                 Debug(Debug::ERROR) << "Database " << dataFileName << " is a linfinity database (--createdb-mode 3) and cannot be compressed\n";
@@ -1406,7 +1406,7 @@ template <typename T> void DBReader<T>::decompressLoadedBuffer() {
     if (frameOffsets.empty() || loadedBuffer.readRequests.empty()) {
         return;
     }
-    // header read requests are one per <db>.nodeinfo range
+    // header read requests are one per <db>.file_keys range
     const size_t firstRange = findIdRange(loadedBuffer.keyBegin);
     std::vector<std::pair<size_t, size_t> > requestFrames;
     for (size_t i = 0; i < loadedBuffer.readRequests.size(); i++) {
@@ -1817,8 +1817,8 @@ void DBReader<T>::moveDb(const std::string &srcDbName, const std::string &dstDbN
     if (FileUtil::fileExists((srcDbName + ".lookup").c_str())) {
         FileUtil::move((srcDbName + ".lookup").c_str(), (dstDbName + ".lookup").c_str());
     }
-    if (FileUtil::fileExists((srcDbName + ".nodeinfo").c_str())) {
-        FileUtil::move((srcDbName + ".nodeinfo").c_str(), (dstDbName + ".nodeinfo").c_str());
+    if (FileUtil::fileExists((srcDbName + ".file_keys").c_str())) {
+        FileUtil::move((srcDbName + ".file_keys").c_str(), (dstDbName + ".file_keys").c_str());
     }
     if (FileUtil::fileExists((srcDbName + ".partitions").c_str())) {
         FileUtil::move((srcDbName + ".partitions").c_str(), (dstDbName + ".partitions").c_str());
@@ -1858,9 +1858,9 @@ void DBReader<T>::removeDb(const std::string &databaseName){
     if (FileUtil::fileExists(partitionsFile.c_str())) {
         FileUtil::remove(partitionsFile.c_str());
     }
-    std::string nodeInfoFile = databaseName + ".nodeinfo";
-    if (FileUtil::fileExists(nodeInfoFile.c_str())) {
-        FileUtil::remove(nodeInfoFile.c_str());
+    std::string fileKeysFile = databaseName + ".file_keys";
+    if (FileUtil::fileExists(fileKeysFile.c_str())) {
+        FileUtil::remove(fileKeysFile.c_str());
     }
     std::string mergedFile = databaseName + ".merged";
     if (FileUtil::fileExists(mergedFile.c_str())) {
@@ -1901,7 +1901,7 @@ void copyLinkDb(const std::string &databaseName, const std::string &outDb, DBFil
         { DBFiles::DATA_DBTYPE,   ".dbtype"           },
         { DBFiles::HEADER,        "_h"                },
         { DBFiles::HEADER_INDEX,  "_h.index"          },
-        { DBFiles::HEADER_INDEX,  ".nodeinfo"         },
+        { DBFiles::HEADER_INDEX,  ".file_keys"        },
         { DBFiles::HEADER_DBTYPE, "_h.dbtype"         },
         { DBFiles::LOOKUP,        ".lookup"           },
         { DBFiles::SOURCE,        ".source"           },

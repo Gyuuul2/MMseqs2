@@ -369,7 +369,7 @@ int createtsv(int argc, const char **argv, const Command &command) {
             Debug(Debug::ERROR) << par.db3 << " is not a linfinity clustering (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
             EXIT(EXIT_FAILURE);
         }
-        DBReader<DBKeyType> headers(par.hdr1.c_str(), (par.db1 + ".nodeinfo").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
+        DBReader<DBKeyType> headers(par.hdr1.c_str(), (par.db1 + ".file_keys").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
         headers.open(DBReader<DBKeyType>::NOSORT);
         const std::vector<size_t> nodeKeyOffsets = headers.getEvenNodeKeyOffsets(MMseqsNode::count);
         std::string phaseValues;

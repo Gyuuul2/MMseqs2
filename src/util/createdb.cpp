@@ -847,11 +847,11 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
     }
     if (MMseqsNode::isMaster()) {
-        std::string nodeInfoData;
+        std::string fileKeysText;
         size_t fileFirstKey = 0;
         for (size_t i = HEADER_OFFSETS * MMseqsNode::count; i < dataFileBytes.size(); i++) {
             const size_t fileKeyCount = dataFileBytes[i] / sizeof(uint64_t);
-            nodeInfoData += SSTR(fileFirstKey) + "\t" + SSTR(fileKeyCount) + "\n";
+            fileKeysText += SSTR(fileFirstKey) + "\t" + SSTR(fileKeyCount) + "\n";
             fileFirstKey += fileKeyCount;
         }
         // the data files take dataSize bytes besides the exchange files, which are mostly freed only once each data file type is written
@@ -861,7 +861,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             EXIT(EXIT_FAILURE);
         }
         MMseqsNode::publishFile(dataFile + ".index", indexData);
-        MMseqsNode::publishFile(dataFile + ".nodeinfo", nodeInfoData);
+        MMseqsNode::publishFile(dataFile + ".file_keys", fileKeysText);
     }
 
     // the files of this node get their final sizes, so a file size limit fails before they are written

@@ -18,7 +18,7 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
     par.parseParameters(argc, argv, command, true, true, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
-        DBReader<DBKeyType> dbr(par.hdr1.c_str(), (par.db1 + ".nodeinfo").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
+        DBReader<DBKeyType> dbr(par.hdr1.c_str(), (par.db1 + ".file_keys").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
         dbr.open(DBReader<DBKeyType>::NOSORT);
         const std::vector<size_t> nodeKeyOffsets = dbr.getEvenNodeKeyOffsets(MMseqsNode::count);
         const bool hasSecondClustering = par.filenames.size() > 3;

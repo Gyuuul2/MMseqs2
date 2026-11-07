@@ -21,7 +21,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
     // linfinity: every node writes the representatives of its cluster database <clu>.<node> with their sequences to <out>.<node>
     const std::string nodeSuffix = isLinfinity ? "." + SSTR(MMseqsNode::rank) : "";
 
-    DBReader<DBKeyType> querydb_header(par.hdr1.c_str(), isLinfinity ? (par.db1 + ".nodeinfo").c_str() : par.hdr1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
+    DBReader<DBKeyType> querydb_header(par.hdr1.c_str(), isLinfinity ? (par.db1 + ".file_keys").c_str() : par.hdr1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
     querydb_header.open(DBReader<DBKeyType>::NOSORT);
     querydb_header.readMmapedDataInMemory();
 
