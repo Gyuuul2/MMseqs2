@@ -169,7 +169,7 @@ The workflow can also be run step by step. `createdb --createdb-mode 3` writes o
 
 The input can be FASTA files, also compressed with `.gz`, `.bz2` or `.zst`. Large files are split over the threads and nodes only if they are uncompressed or compressed with `pzstd`. `.gz`, `.bz2` and other `.zst` files are each read by one thread on one node, and `createdb` warns about such large files.
 
-A file on ext4 and a Lustre object are limited to 16 TiB. At about 1 trillion sequences the k-mer, pair and prefilter files that each node writes to the temporary folder can pass this, and `kmermatcher` stops right at its start if the file system refuses the expected size of the k-mer file. On Lustre, stripe the temporary folder over all OSTs before the run, or run on more nodes, which makes the files of each node smaller:
+A file on ext4 and a Lustre object are limited to 16 TiB. At about 1 trillion sequences the k-mer, pair and prefilter files that each node writes to the temporary folder can pass this. On Lustre, stripe the temporary folder over all OSTs before the run, or run on more nodes, which makes the files of each node smaller:
 
     lfs setstripe -c -1 /shared/tmp
 
