@@ -313,7 +313,7 @@ std::vector<Command> baseCommands = {
                                                            {"clusterDB", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::clusterDb },
                                                            {"tmpDir", DbType::ACCESS_MODE_OUTPUT, DbType::NEED_DATA, &DbValidator::directory }}},
         {"lin8clust",         lin8clust,         &par.lin8clustworkflow,          COMMAND_MAIN,
-                "Fast linear time clustering of a --createdb-mode 3 database on one or many nodes",
+                "Fast linear time clustering of a linfinity database (--createdb-mode 3) on one or many nodes",
                 "# Linear-time clustering of FASTA file\n"
                 "mmseqs createdb examples/DB.fasta sequenceDB --createdb-mode 3\n"
                 "mmseqs lin8clust sequenceDB clusterDB tmp\n\n"

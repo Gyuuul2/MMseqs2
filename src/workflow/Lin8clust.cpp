@@ -38,13 +38,13 @@ int lin8clust(int argc, const char **argv, const Command& command) {
 
     const int dbType = FileUtil::parseDbType(par.db1.c_str());
     if ((DBReader<DBKeyType>::getExtendedDbtype(dbType) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {
-        Debug(Debug::ERROR) << "lin8clust clusters --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases only. "
+        Debug(Debug::ERROR) << "lin8clust clusters linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ") only. "
                             << "Use createdb --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " or easy-lin8clust.\n";
         EXIT(EXIT_FAILURE);
     }
     // align2clust leaves out the singletons of a subset with representative bits, so lin8clust takes whole databases only
     if (FileUtil::fileExists((par.db1 + ".bits.0").c_str())) {
-        Debug(Debug::ERROR) << "lin8clust clusters whole --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases, not subsets such as clusthashfast or createsubdb output\n";
+        Debug(Debug::ERROR) << "lin8clust clusters whole linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << "), not subsets such as clusthashfast or createsubdb output\n";
         EXIT(EXIT_FAILURE);
     }
 
@@ -60,7 +60,7 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     }
     if (par.clusteringMode != Parameters::SET_COVER && par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
         Debug(Debug::ERROR) << "align2clust supports only --cluster-mode " << Parameters::SET_COVER << ", " << Parameters::GREEDY << " and " << Parameters::GREEDY_MEM
-                            << " for --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
+                            << " for linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
         EXIT(EXIT_FAILURE);
     }
     if (par.PARAM_ALPH_SIZE.wasSet == false) {

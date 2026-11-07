@@ -283,20 +283,20 @@ public:
 
     void remapData();
 
-    // --createdb-mode 3: reads keys [keyBegin, keyEnd) into memory for getData
+    // linfinity: reads keys [keyBegin, keyEnd) into memory for getData
     void loadData(size_t keyBegin, size_t keyEnd);
     void prefetchData(size_t keyBegin, size_t keyEnd);
-    // --createdb-mode 3 sequences: loadData that returns at once and reads about readBytes at a time;
+    // linfinity sequences: loadData that returns at once and reads about readBytes at a time;
     // waitForLoadedData waits for the read in flight, starts the next one and returns the end of the keys read so far
     void startLoadData(size_t keyBegin, size_t keyEnd, size_t readBytes);
     size_t waitForLoadedData();
     // the bytes of the loaded and the prefetch buffer once keys [keyBegin, keyEnd) are prefetched
     size_t getBufferSizeToPrefetch(size_t keyBegin, size_t keyEnd);
-    // --createdb-mode 3 sequences: reads the ascending keys, entries less than a page apart in one request, through the buffered fds
+    // linfinity sequences: reads the ascending keys, entries less than a page apart in one request, through the buffered fds
     void loadData(const std::vector<DBKeyType> &keys);
-    // --createdb-mode 3 sequences without a block cache: loadData of the same keys takes this read
+    // linfinity sequences without a block cache: loadData of the same keys takes this read
     void prefetchData(const std::vector<DBKeyType> &keys);
-    // --createdb-mode 3 sequences: loads by keys read the whole block of a key while the blocks fit cacheBytes; blocks below the loaded and the requested keys are freed when new blocks need their room
+    // linfinity sequences: loads by keys read the whole block of a key while the blocks fit cacheBytes; blocks below the loaded and the requested keys are freed when new blocks need their room
     void setBlockCacheBytes(size_t cacheBytes);
     // the block of setBlockCacheBytes that holds key
     size_t getKeyBlock(size_t key) const;
@@ -304,9 +304,9 @@ public:
     size_t getBlockReadBytes() { return blockReadBytes; }
     size_t getKeyReadBytes() { return keyReadBytes; }
     size_t getBufferSizeToLoad(size_t keyBegin, size_t keyEnd);
-    // --createdb-mode 3 headers: the size of the names of keys [keyBegin, keyEnd)
+    // linfinity headers: the size of the names of keys [keyBegin, keyEnd)
     size_t getNamesSize(size_t keyBegin, size_t keyEnd);
-    // --createdb-mode 3 cluster databases: the first entry that starts at offset or later, the entry count after the last
+    // linfinity cluster databases: the first entry that starts at offset or later, the entry count after the last
     size_t findEntryByOffset(size_t offset) {
         return findEntryByCell(1, offset);
     }
@@ -314,11 +314,11 @@ public:
     size_t findEntryByKey(size_t key, size_t first = 0, size_t last = SIZE_MAX) {
         return findEntryByCell(0, key, first, last);
     }
-    // --createdb-mode 3 cluster databases: the key, offset and length of entry id, read from the index
+    // linfinity cluster databases: the key, offset and length of entry id, read from the index
     Index getIndexEntry(size_t id);
-    // --createdb-mode 3 cluster databases: reads bytes at offset of the data file to destination
+    // linfinity cluster databases: reads bytes at offset of the data file to destination
     void readData(size_t offset, size_t bytes, char *destination);
-    // --createdb-mode 3 cluster databases: the data file fd without O_DIRECT, for preads of any thread
+    // linfinity cluster databases: the data file fd without O_DIRECT, for preads of any thread
     int getBufferedFd() const { return bufferedFds[0]; }
     char *getDataFromLoadedBuffer(size_t key);
 
@@ -431,7 +431,7 @@ public:
 
     Index* getIndex() {
         if (entryOffsetsFileNames.empty() == false) {
-            Debug(Debug::ERROR) << "Call of getIndex is not allowed for the headers or clusters of a --createdb-mode 3 database " << dataFileName << "\n";
+            Debug(Debug::ERROR) << "Call of getIndex is not allowed for the headers or clusters of a linfinity database " << dataFileName << "\n";
             EXIT(EXIT_FAILURE);
         }
         return index;
@@ -563,16 +563,16 @@ public:
     void releaseDataPages();
     void decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize, size_t *startEntry, size_t *numEntries);
 
-    // --createdb-mode 3: data file f holds the keys [offsets[f], offsets[f + 1]), the data files follow in key order
+    // linfinity: data file f holds the keys [offsets[f], offsets[f + 1]), the data files follow in key order
     std::vector<size_t> getFileKeyOffsets(size_t fileCount);
-    // --createdb-mode 3: node n holds the keys [offsets[n], offsets[n + 1]), as many for every node, the entries of node n of a cluster database are those of its representatives
+    // linfinity: node n holds the keys [offsets[n], offsets[n + 1]), as many for every node, the entries of node n of a cluster database are those of its representatives
     std::vector<size_t> getNodeKeyOffsets(size_t nodeCount);
-    // --createdb-mode 3: split s holds the keys [offsets[s], offsets[s + 1]) of [keyBegin, keyEnd) whose entries, keyBytes more per key, fit splitBytes, at least one key
+    // linfinity: split s holds the keys [offsets[s], offsets[s + 1]) of [keyBegin, keyEnd) whose entries, keyBytes more per key, fit splitBytes, at least one key
     std::vector<size_t> getSplitKeyOffsets(size_t keyBegin, size_t keyEnd, size_t splitBytes, size_t keyBytes);
     size_t findIdRange(size_t id);
-    // --createdb-mode 3: the sequence length of id, whose range is searched from range on, or from the start if range is SIZE_MAX; ids in key order walk the ranges once
+    // linfinity: the sequence length of id, whose range is searched from range on, or from the start if range is SIZE_MAX; ids in key order walk the ranges once
     size_t getSeqLenFromRange(size_t &range, size_t id);
-    // --createdb-mode 3: the representatives of a range, the sixth column of the index of a clusthashfast subset, otherwise all its keys
+    // linfinity: the representatives of a range, the sixth column of the index of a clusthashfast subset, otherwise all its keys
     size_t getRangeRepresentativeCount(size_t range) const {
         return rangeRepresentativeCounts[range];
     }
@@ -637,7 +637,7 @@ private:
     DBLocalId * id2local;
     DBLocalId * local2id;
 
-    // --createdb-mode 3: range i holds keys index[i].id .. index[i + 1].id - 1 of one length, from index[i].offset in <db>.<index2dbfile[i]>
+    // linfinity: range i holds keys index[i].id .. index[i + 1].id - 1 of one length, from index[i].offset in <db>.<index2dbfile[i]>
     unsigned int * index2dbfile;
     // headers: <db>_h.index.<file> holds uint64 name starts in <db>_h.<file> and its size, clusters: the index of clusterIndex; their fds follow the data fds
     std::vector<std::string> entryOffsetsFileNames;
@@ -677,7 +677,7 @@ private:
     size_t partBytes;
     void cacheBlocks(BufferInfo &buffer);
     void freeBlocks(size_t keyEnd, size_t neededBytes);
-    // --createdb-mode 3 sequences: block b holds the keys [blockKeyOffsets[b], blockKeyOffsets[b + 1]) whose entries start in the same MAX_READ_REQUEST_SIZE bytes of a data file
+    // linfinity sequences: block b holds the keys [blockKeyOffsets[b], blockKeyOffsets[b + 1]) whose entries start in the same MAX_READ_REQUEST_SIZE bytes of a data file
     std::vector<size_t> blockKeyOffsets;
     std::map<size_t, BatchReader::ReadRequest> cachedBlocks;
     size_t blockCacheBytes;

@@ -160,7 +160,7 @@ Inside a SLURM allocation, pass the command that starts one task per node with `
 
 Without `--node-runner` everything runs on one node. Each node writes its own part of the result: `result_cluster.tsv.<node>` holds the clusters whose representative the node holds and `result_rep_seq.fasta.<node>` these representatives.
 
-The workflow can also be run step by step. `createdb --createdb-mode 3` writes one data file per node, so every later step has to run on the same number of nodes (`lin8clust` stops with an error otherwise):
+The workflow can also be run step by step. `createdb --createdb-mode 3` writes a linfinity database with one data file per node, so every later step has to run on the same number of nodes (`lin8clust` stops with an error otherwise):
 
     NODE_RUNNER="srun --kill-on-bad-exit=1 -N 4 --ntasks-per-node=1 -c 64"
     $NODE_RUNNER mmseqs createdb *.fasta sequenceDB --createdb-mode 3

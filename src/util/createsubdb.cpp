@@ -13,7 +13,7 @@ int createsubdb(int argc, const char **argv, const Command& command) {
     Parameters& par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
-    // --createdb-mode 3: the entry keys of the cluster database <subset>.<node> become the representative bits of the data file of a node and the sixth index column
+    // linfinity: the entry keys of the cluster database <subset>.<node> become the representative bits of the data file of a node and the sixth index column
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db2.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
         DBReader<DBKeyType> reader(par.db2.c_str(), par.db2Index.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
@@ -34,7 +34,7 @@ int createsubdb(int argc, const char **argv, const Command& command) {
         }
         MMseqsNode::writeRepresentativeBits(par.db3, reader, bits.data(), firstKey, keyCount);
         if (MMseqsNode::isMaster()) {
-            // a mode 3 subset only feeds the next pipeline steps, which read no headers, lookup or source
+            // a linfinity subset only feeds the next pipeline steps, which read no headers, lookup or source
             DBReader<DBKeyType>::softlinkDb(par.db2, par.db3, DBFiles::DATA);
             DBWriter::writeDbtypeFile(par.db3.c_str(), reader.getDbtype(), reader.isCompressed());
         }

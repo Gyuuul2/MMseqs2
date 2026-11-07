@@ -331,14 +331,14 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     const size_t localKeySize = nodeSeqRange.back().startKey - localFirstKey;
 
     if (isLinfinity && par.compressed) {
-        Debug(Debug::WARNING) << "Compressed output cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
+        Debug(Debug::WARNING) << "Compressed output cannot be combined with linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
         Debug(Debug::WARNING) << "We recompute with --compressed 0\n";
         par.compressed = 0;
     }
     const std::string resultDb = isLinfinity ? par.db2 + "." + SSTR(MMseqsNode::rank) : par.db2;
     DBWriter resultWriter(resultDb.c_str(), (resultDb + ".index").c_str(), 1, par.compressed, Parameters::DBTYPE_CLUSTER_RES);
     const std::string resultIndex = par.db2 + ".index." + SSTR(MMseqsNode::rank);
-    // a mode 3 node writes its data and index file on all threads at prefix-summed offsets
+    // a linfinity node writes its data and index file on all threads at prefix-summed offsets
     FILE *resultDataFile = NULL;
     FILE *resultIndexFile = NULL;
     size_t resultDataBytes = 0;
@@ -355,7 +355,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         representativeWriter.open();
     }
     const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
-    // a mode 3 node keeps its representatives as one bit per key
+    // a linfinity node keeps its representatives as one bit per key
     const size_t representativeBitsSize = isLinfinity ? (localKeySize + 63) / 64 : 0;
     uint64_t *representativeBits = new(std::nothrow) uint64_t[representativeBitsSize]();
     Util::checkAllocation(representativeBits, "Can not allocate representative bit memory");
@@ -369,7 +369,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     const size_t splitMemoryLimit = static_cast<size_t>(static_cast<double>(memoryLimit - representativeBitsSize * sizeof(uint64_t) - writeBufferBytes) * 0.95);
 
     // consecutive lengths that fit together are loaded at once;
-    // a length that does not fit is loaded alone: a mode 3 length is read one read chunk at a time to hash it and once per block of candidates, a standard DB length once per hash range that fits, after 2 bits per key
+    // a length that does not fit is loaded alone: a linfinity length is read one read chunk at a time to hash it and once per block of candidates, a standard DB length once per hash range that fits, after 2 bits per key
     const size_t readChunkBytes = std::min(MAX_INFLIGHT_READ_SIZE, splitMemoryLimit / 4);
     const size_t seqBufferLimit = isLinfinity ? splitMemoryLimit / 3 : 0;
     const size_t hashIdPairsLimit = splitMemoryLimit - 2 * seqBufferLimit;
@@ -383,14 +383,14 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             const size_t readChunkBufferBytes = 2 * reader.getBufferSizeToLoad(nodeSeqRange[i].startKey, nodeSeqRange[i].startKey + readChunkSeqCount);
             const size_t keptBytes = isLinfinity ? (lengthSeqCount / 64 + 1) * sizeof(MemberBits) : lengthSeqCount / 4;
             const size_t hashBytes = sizeof(HashEntry) + (isLinfinity ? nodeSeqRange[i].entryLength - 2 : 0);
-            // a split mode 3 length keeps a pair for every member to write its clusters in key order
+            // a split linfinity length keeps a pair for every member to write its clusters in key order
             const size_t pairBytes = isLinfinity ? lengthSeqCount * sizeof(ClusterPair) : 0;
             if ((isLinfinity && readChunkSeqCount == 0) || splitMemoryLimit <= keptBytes + readChunkBufferBytes + pairBytes + hashBytes) {
                 Debug(Debug::ERROR) << "Not enough memory to hash " << lengthSeqCount << " sequences\n"
                                     << "Raise RAM size or --split-memory-limit.\n";
                 EXIT(EXIT_FAILURE);
             }
-            // a split mode 3 length keeps its hashIdPairs and, after its candidates, the sequences of a block in hashIdPairs
+            // a split linfinity length keeps its hashIdPairs and, after its candidates, the sequences of a block in hashIdPairs
             hashIdPairsCapacity[i] = (splitMemoryLimit - keptBytes - readChunkBufferBytes - pairBytes) / sizeof(HashEntry);
         }
         if (loadOffsets.empty()
@@ -407,7 +407,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     // a large hash bin keeps one thread busy, so the cluster step cuts more parts than threads, like clusthash does with its bins
     std::vector<size_t> partOffsets(par.threads * 16 + 1);
     std::vector<std::string> threadData(par.threads);
-    // (representative id, offset) of the entries of the part of a thread; mode 3: (key, offset), the offset in the data file once written
+    // (representative id, offset) of the entries of the part of a thread; linfinity: (key, offset), the offset in the data file once written
     std::vector<std::vector<uint64_t> > threadEntries(par.threads);
     ClusterPair *loadPairs = NULL;
     size_t loadPairCount = 0;
@@ -445,7 +445,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
 
         // [first, second) of hash buckets of a split length
         std::vector<std::pair<size_t, size_t>> hashRanges(1, std::make_pair(0, USHRT_MAX + 1));
-        // block b holds hashIdPairs [blockOffsets[b], blockOffsets[b + 1]) of a split mode 3 length whose hashIdPairs fit
+        // block b holds hashIdPairs [blockOffsets[b], blockOffsets[b + 1]) of a split linfinity length whose hashIdPairs fit
         std::vector<size_t> blockOffsets(1, 0);
         MemberBits *memberBits = NULL;
         char *blockSeqs = NULL;
@@ -483,7 +483,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             blockSeqs = reinterpret_cast<char *>(hashIdPairs + candidateCount);
         }
         if (isSplitLength && hashIdPairsFit == false) {
-            // the sequences of a hash range of a mode 3 length are copied after its hashIdPairs
+            // the sequences of a hash range of a linfinity length are copied after its hashIdPairs
             const size_t maxRangeSeqCount = hashedSeqCapacity * sizeof(HashEntry) / (sizeof(HashEntry) + length);
             hashRanges = setupHashRanges(reader, &subMat, par.maxSeqLen, loadFirstKey, loadSeqCount, readChunkSeqCount, maxRangeSeqCount);
             blockSeqs = copiesSeqs ? reinterpret_cast<char *>(hashIdPairs + maxRangeSeqCount) : NULL;
@@ -519,7 +519,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                                ? fillHashRange(reader, &subMat, par.maxSeqLen, loadFirstKey, loadSeqCount, readChunkSeqCount, hashRanges[range], hashIdPairs, memberBits)
                                : loadSeqCount;
                 SORT_PARALLEL(hashIdPairs, hashIdPairs + hashedSeqCount, HashEntry::compareByHashAndId);
-                // a mode 3 singleton only sets its bit, so it is neither clustered, sorted again nor written
+                // a linfinity singleton only sets its bit, so it is neither clustered, sorted again nor written
                 if (isLinfinity) {
                     hashedSeqCount = removeSingletons(hashIdPairs, hashedSeqCount, representativeBits, localFirstKey, partOffsets);
                 }
@@ -595,14 +595,14 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                         if (isLinfinity) {
                             __sync_fetch_and_or(&representativeBits[(repId - localFirstKey) / 64], 1ull << ((repId - localFirstKey) % 64));
                         }
-                        // the clusters of a split mode 3 length are written in key order after its last hash range, the representative first
+                        // the clusters of a split linfinity length are written in key order after its last hash range, the representative first
                         if (copiesSeqs) {
                             for (size_t i = clusterBegin; i < clusterEnd; i++) {
                                 const ClusterPair pair = { repId, rangeHashIdPairs[i].id };
                                 loadPairs[loadPairCount + i] = pair;
                             }
                         } else if (isLinfinity == false || clusterEnd - clusterBegin > 1) {
-                            // a mode 3 representative without members has its bit and no entry
+                            // a linfinity representative without members has its bit and no entry
                             entries.push_back(repId);
                             entries.push_back(data.size());
                             for (size_t i = clusterBegin; i < clusterEnd; i++) {
@@ -654,7 +654,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     const size_t endPair = findRepKey(writeBegin + writeKeys * (thread + 1) / par.threads);
                     while (pair < endPair) {
                         const DBKeyType repKey = loadPairs[pair].repKey;
-                        // a mode 3 representative without members has its bit and no entry
+                        // a linfinity representative without members has its bit and no entry
                         if (pair + 1 == endPair || loadPairs[pair + 1].repKey != repKey) {
                             pair++;
                             continue;
@@ -710,7 +710,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             }
             representativeReader.close();
             MMseqsNode::gatherRunFiles(par.db2 + ".phases.");
-            // a mode 3 subset only feeds the next pipeline steps, which read no headers, lookup or source
+            // a linfinity subset only feeds the next pipeline steps, which read no headers, lookup or source
             DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_CLUSTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
         } else {
             DBReader<DBKeyType>::softlinkDb(par.db1, representativeDb, DBFiles::SEQUENCE_ANCILLARY);

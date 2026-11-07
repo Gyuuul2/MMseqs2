@@ -104,7 +104,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
     this->accessType = accessType;
     bool isLinfinity = false;
     if (dataFileName != NULL) {
-        // the data file <clu>.<node> of a --createdb-mode 3 cluster database has the dbtype of <clu>
+        // the data file <clu>.<node> of a linfinity cluster database has the dbtype of <clu>
         std::string dbtypeName(dataFileName);
         const size_t nodePos = dbtypeName.find_last_of('.');
         if ((dataMode & USE_LINFINITY) && nodePos != std::string::npos && Util::isNumber(dbtypeName.substr(nodePos + 1))
@@ -115,11 +115,11 @@ template <typename T> bool DBReader<T>::open(int accessType){
         isLinfinity = getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_LINFINITY;
         clusterIndex = isLinfinity && (Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_CLUSTER_RES) || Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_PREFILTER_RES));
         if (isLinfinity && (dataMode & USE_LINFINITY) == 0) {
-            Debug(Debug::ERROR) << "Database " << dataFileName << " was created with --createdb-mode 3, which this command does not support\n";
+            Debug(Debug::ERROR) << "Database " << dataFileName << " is a linfinity database (--createdb-mode 3), which this command does not support\n";
             EXIT(EXIT_FAILURE);
         }
         if (isLinfinity && accessType != NOSORT && accessType != HARDNOSORT && accessType != LINEAR_ACCCESS) {
-            Debug(Debug::ERROR) << "Database " << dataFileName << " was created with --createdb-mode 3 and is read in key order only\n";
+            Debug(Debug::ERROR) << "Database " << dataFileName << " is a linfinity database (--createdb-mode 3) and is read in key order only\n";
             EXIT(EXIT_FAILURE);
         }
     }
@@ -259,7 +259,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
             // the headers are opened with <db>.nodeinfo as index, one line "firstKey count" per file
             const bool isHeader = Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_GENERIC_DB);
             if (isCompressed(dbtype) == COMPRESSED && isHeader == false) {
-                Debug(Debug::ERROR) << "Database " << dataFileName << " was created with --createdb-mode 3 and cannot be compressed\n";
+                Debug(Debug::ERROR) << "Database " << dataFileName << " is a linfinity database (--createdb-mode 3) and cannot be compressed\n";
                 EXIT(EXIT_FAILURE);
             }
             index2dbfile = new(std::nothrow) unsigned int[indexSize];
@@ -591,7 +591,7 @@ template <typename T> char* DBReader<T>::getDataCompressed(size_t id, int thrIdx
 template <typename T> size_t DBReader<T>::getAminoAcidDBSize() {
     checkClosed();
     if (entryOffsetsFileNames.empty() == false) {
-        Debug(Debug::ERROR) << "Call of getAminoAcidDBSize is not allowed for the headers or clusters of a --createdb-mode 3 database " << dataFileName << "\n";
+        Debug(Debug::ERROR) << "Call of getAminoAcidDBSize is not allowed for the headers or clusters of a linfinity database " << dataFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
     if (Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_HMM_PROFILE)){
@@ -826,7 +826,7 @@ template <typename T> void DBReader<T>::sortSourceByFileName(){
 
 template <typename T> size_t DBReader<T>::getId (T dbKey){
     if (entryOffsetsFileNames.empty() == false) {
-        Debug(Debug::ERROR) << "Call of getId is not allowed for the headers or clusters of a --createdb-mode 3 database " << dataFileName << "\n";
+        Debug(Debug::ERROR) << "Call of getId is not allowed for the headers or clusters of a linfinity database " << dataFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
     if (index2dbfile != NULL) {
@@ -913,7 +913,7 @@ template <typename T> size_t DBReader<T>::getSeqLenFromRange(size_t &range, size
 
 template <typename T> size_t DBReader<T>::findEntryByCell(size_t column, size_t value, size_t first, size_t last) {
     if (clusterIndex == false || (column == 1 && value > dataSize)) {
-        Debug(Debug::ERROR) << ((column == 0) ? "Key " : "Offset ") << value << " is not in the --createdb-mode 3 cluster or prefilter database " << dataFileName << "\n";
+        Debug(Debug::ERROR) << ((column == 0) ? "Key " : "Offset ") << value << " is not in the linfinity cluster or prefilter database " << dataFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
     const int fd = bufferedFds[dataFileNames.size()];
@@ -947,7 +947,7 @@ template <typename T> void DBReader<T>::readData(size_t offset, size_t bytes, ch
 
 template <typename T> size_t DBReader<T>::getNamesSize(size_t keyBegin, size_t keyEnd) {
     if (clusterIndex || entryOffsetsFileNames.empty() || bufferedFds.empty()) {
-        Debug(Debug::ERROR) << "Call of getNamesSize is only allowed for the headers of a --createdb-mode 3 database opened with data " << dataFileName << "\n";
+        Debug(Debug::ERROR) << "Call of getNamesSize is only allowed for the headers of a linfinity database opened with data " << dataFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
     // the names of the keys of a file run from the header offset of the first key to the one after the last
@@ -1100,7 +1100,7 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
 
 template <typename T> size_t DBReader<T>::getBufferSizeToLoad(size_t keyBegin, size_t keyEnd) {
     if (entryOffsetsFileNames.empty() == false) {
-        Debug(Debug::ERROR) << "Call of getBufferSizeToLoad is not allowed for the headers or clusters of a --createdb-mode 3 database " << dataFileName << "\n";
+        Debug(Debug::ERROR) << "Call of getBufferSizeToLoad is not allowed for the headers or clusters of a linfinity database " << dataFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
     std::vector<BatchReader::ReadRequest> readRequests;
@@ -1115,7 +1115,7 @@ template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<
     readRequests.clear();
     requestFirstKeys.clear();
     if (entryOffsetsFileNames.empty() == false || clusterIndex) {
-        Debug(Debug::ERROR) << "Call of loadData with keys is not allowed for the headers or clusters of a --createdb-mode 3 database " << dataFileName << "\n";
+        Debug(Debug::ERROR) << "Call of loadData with keys is not allowed for the headers or clusters of a linfinity database " << dataFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
     if (batchReader == NULL) {
@@ -1274,7 +1274,7 @@ template <typename T> void DBReader<T>::prefetchData(size_t keyBegin, size_t key
 
 template <typename T> void DBReader<T>::startLoadData(size_t keyBegin, size_t keyEnd, size_t readBytes) {
     if (entryOffsetsFileNames.empty() == false) {
-        Debug(Debug::ERROR) << "Call of startLoadData is not allowed for the headers or clusters of a --createdb-mode 3 database " << dataFileName << "\n";
+        Debug(Debug::ERROR) << "Call of startLoadData is not allowed for the headers or clusters of a linfinity database " << dataFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
     partKeyEnd = keyEnd;
@@ -1805,7 +1805,7 @@ void DBReader<T>::moveDb(const std::string &srcDbName, const std::string &dstDbN
     std::vector<std::string> files = FileUtil::findDatafiles(srcDbName.c_str());
     moveDatafiles(files, dstDbName);
 
-    // --createdb-mode 3 keeps one header index per data file and the clusthashfast representative bits per node
+    // a linfinity database keeps one header index per data file and the clusthashfast representative bits per node
     moveDatafiles(FileUtil::findDatafiles((srcDbName + ".index").c_str()), dstDbName + ".index");
     if (FileUtil::fileExists((srcDbName + ".index").c_str())) {
         FileUtil::move((srcDbName + ".index").c_str(), (dstDbName + ".index").c_str());
@@ -1918,7 +1918,7 @@ void copyLinkDb(const std::string &databaseName, const std::string &outDb, DBFil
         { DBFiles::CA3M_HDR_IDX,  "_header.ffindex"   },
     };
 
-    // a --createdb-mode 3 database keeps the file numbers of its headers and header index files
+    // a linfinity database keeps the file numbers of its headers and header index files
     for (size_t i = 0; i < ARRAY_SIZE(suffices); ++i) {
         if (dbFilesFlags & suffices[i].flag) {
             std::vector<std::string> names = FileUtil::findDatafiles((databaseName + suffices[i].suffix).c_str());
@@ -1974,7 +1974,7 @@ std::vector<size_t> DBReader<T>::getNodeKeyOffsets(size_t nodeCount) {
 template<typename T>
 std::vector<size_t> DBReader<T>::getSplitKeyOffsets(size_t keyBegin, size_t keyEnd, size_t splitBytes, size_t keyBytes) {
     if (entryOffsetsFileNames.empty() == false) {
-        Debug(Debug::ERROR) << "Call of getSplitKeyOffsets is not allowed for the headers or clusters of a --createdb-mode 3 database " << dataFileName << "\n";
+        Debug(Debug::ERROR) << "Call of getSplitKeyOffsets is not allowed for the headers or clusters of a linfinity database " << dataFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
     std::vector<size_t> offsets(1, keyBegin);

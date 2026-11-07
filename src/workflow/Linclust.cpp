@@ -141,7 +141,7 @@ int linclust(int argc, const char **argv, const Command& command) {
     }
 
     if (DBReader<DBKeyType>::getExtendedDbtype(dbType) & Parameters::DBTYPE_EXTENDED_LINFINITY) {
-        Debug(Debug::ERROR) << "--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases are clustered with lin8clust.\n";
+        Debug(Debug::ERROR) << "Linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ") are clustered with lin8clust.\n";
         EXIT(EXIT_FAILURE);
     }
 

@@ -635,7 +635,7 @@ private:
 
 __extension__ typedef unsigned __int128 uint128;
 
-// --createdb-mode 3: a row of <pref>.partitions, the entries from firstKey on in <pref>.<node>
+// linfinity: a row of <pref>.partitions, the entries from firstKey on in <pref>.<node>
 struct PrefPartition {
     size_t firstKey;
     size_t prefOffset;
@@ -644,7 +644,7 @@ struct PrefPartition {
     size_t node;
 };
 
-// --createdb-mode 3: a rep with the first of its targets next to each other and their count
+// linfinity: a rep with the first of its targets next to each other and their count
 struct RepTargetsRecord {
     ClusterPair repFirstTarget;
     unsigned int targetCount;
@@ -675,7 +675,7 @@ static size_t getKeyNode(const DBReader<DBKeyType> &seqDbr, size_t key) {
     return getBlockNode(seqDbr.getKeyBlock(key));
 }
 
-// --createdb-mode 3: the records [begin, end) of a chunk aligned at once, with their keys and entries: the keys to fetch by home, then the keys kept from the window before as the last home
+// linfinity: the records [begin, end) of a chunk aligned at once, with their keys and entries: the keys to fetch by home, then the keys kept from the window before as the last home
 struct RepWindow {
     RepWindow() : chunk(0), begin(0), end(0), data(NULL), allocatedBytes(0) {}
     size_t chunk;
@@ -956,7 +956,7 @@ private:
     std::vector<DBKeyType> anchors;
 };
 
-// --createdb-mode 3: a part of a pref file, read at once
+// linfinity: a part of a pref file, read at once
 struct PrefSplit {
     size_t prefNode;
     size_t firstEntry;
@@ -966,7 +966,7 @@ struct PrefSplit {
     uint64_t sizeClasses;
 };
 
-// --createdb-mode 3: reads the records of the group ranges that this node claims, in order key order
+// linfinity: reads the records of the group ranges that this node claims, in order key order
 struct RepTargetsReader {
     RepTargetsReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &partitions, const std::vector<size_t> &groupRangePartitionOffsets,
                      MMseqsNode::WorkQueue &groupRangeQueue, size_t maxRecordBytes, size_t memoryLimit, size_t paddedDbSize, size_t prefSizeBits)
@@ -1268,7 +1268,7 @@ struct MemberAligners {
           memberBuffers(swipeLanes ? &swipe : NULL, true, swipeLanes ? &memberTargets : NULL) {}
 };
 
-// --createdb-mode 3: aligns the records window by window and logs the accepted pairs
+// linfinity: aligns the records window by window and logs the accepted pairs
 static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTargetsReader &repTargetsReader,
                             size_t memoryLimit, size_t masterMemoryLimit, size_t flushEntryBytes, size_t representativeResidues,
                             size_t paddedDbSize, size_t prefSizeBits, ClusterMemberLookup *members, DBReader<DBKeyType> *memberDbr, std::string &phaseValues) {
@@ -2747,7 +2747,7 @@ struct TakenLog {
     char *buffer;
 };
 
-// --createdb-mode 3: the master clusters the accepted pairs in order key order; returns the member count
+// linfinity: the master clusters the accepted pairs in order key order; returns the member count
 static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimit, const std::vector<size_t> &groupRangeKeyOffsets, const MMseqsNode::WorkQueue &groupRangeQueue, const DBReader<DBKeyType> &seqDbr,
                                    const std::vector<unsigned int> &pageNodes, int mode, size_t paddedDbSize, size_t prefSizeBits,
                                    const std::string &accepted, const std::string &assignedChanges, const std::string &taken, const std::string &assignedBits, std::string &phaseValues) {
@@ -3448,7 +3448,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     return memberCount;
 }
 
-// --createdb-mode 3: the nodes align the reps of their targets while the master clusters
+// linfinity: the nodes align the reps of their targets while the master clusters
 int align2clustLinfinity(Parameters &par) {
     Timer timer;
     std::string phaseValues;

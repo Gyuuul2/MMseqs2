@@ -128,7 +128,7 @@ public:
 
     static size_t countSetBits(const uint64_t *bits, size_t from, size_t to);
 
-    // a key of a --createdb-mode 3 prefilter result: 7 bits a byte, the high bit set on all bytes but the last; returns its bytes
+    // a key of a linfinity prefilter result: 7 bits a byte, the high bit set on all bytes but the last; returns its bytes
     static inline size_t putPrefKey(char *buffer, uint64_t key) {
         size_t bytes = 0;
         for (; key >= 0x80; key >>= 7) {

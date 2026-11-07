@@ -18,7 +18,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
-    // --createdb-mode 3: every node writes the representatives of its cluster database <clu>.<node> with their sequences to <out>.<node>
+    // linfinity: every node writes the representatives of its cluster database <clu>.<node> with their sequences to <out>.<node>
     const std::string nodeSuffix = isLinfinity ? "." + SSTR(MMseqsNode::rank) : "";
 
     DBReader<DBKeyType> querydb_header(par.hdr1.c_str(), isLinfinity ? (par.db1 + ".nodeinfo").c_str() : par.hdr1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
@@ -42,7 +42,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
     const std::string fastaFile = par.db4 + nodeSuffix;
     FILE *fastaFP = FileUtil::openAndDelete(fastaFile.c_str(), "w");
 
-    // one split of all entries; --createdb-mode 3: splits of the keys of the data file of this node, cut by sequence bytes as the written sequences are, whose sequences and names fit the memory, loaded and prefetched
+    // one split of all entries; linfinity: splits of the keys of the data file of this node, cut by sequence bytes as the written sequences are, whose sequences and names fit the memory, loaded and prefetched
     std::vector<size_t> splitKeyOffsets;
     std::vector<size_t> cluKeyOffsets;
     if (isLinfinity) {
@@ -130,7 +130,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
                         buffer.append(headerStr);
                         buffer.push_back('\n');
 
-                        // --createdb-mode 3: the sequence of the representative with its newline, without its null byte
+                        // linfinity: the sequence of the representative with its newline, without its null byte
                         if (isLinfinity) {
                             buffer.append(seqDbr.getData(key, thread_idx), seqDbr.getSeqLen(key) + 1);
                             continue;

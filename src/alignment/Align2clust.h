@@ -150,7 +150,7 @@ struct SwipeBatch {
     }
 };
 
-// per thread queue of the rep targets for the SWIPE extensions (--align2clust-aligner-mode 1 on mode 3 DBs)
+// per thread queue of the rep targets for the SWIPE extensions (--align2clust-aligner-mode 1)
 struct SwipeTargets {
     SwipeExtender extender;
     EvalueComputation &evaluer;

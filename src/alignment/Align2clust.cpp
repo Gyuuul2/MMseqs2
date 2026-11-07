@@ -286,12 +286,12 @@ std::atomic<size_t> swipeLanePairs(0);
 std::atomic<size_t> swipeLaneSlots(0);
 std::atomic<size_t> swipeSinglePairs(0);
 
-// mode 3 member extensions in SWIPE lanes, their lane rows and all lane rows
+// member extensions in SWIPE lanes, their lane rows and all lane rows
 std::atomic<size_t> swipeMemberExtensions(0);
 std::atomic<size_t> swipeMemberLaneRows(0);
 std::atomic<size_t> swipeMemberSlotRows(0);
 
-// mode 3 target gapped alignments in SWIPE lanes, their lane rows and all lane rows, and the extensions longer than the trace of the last lane rows
+// target gapped alignments in SWIPE lanes, their lane rows and all lane rows, and the extensions longer than the trace of the last lane rows
 std::atomic<size_t> swipeTargetPairs(0);
 std::atomic<size_t> swipeTargetLaneRows(0);
 std::atomic<size_t> swipeTargetSlotRows(0);
@@ -1242,22 +1242,22 @@ int align2clust(int argc, const char **argv, const Command &command) {
     if (isLinfinity) {
         if (par.clusteringMode != Parameters::SET_COVER && par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
             Debug(Debug::ERROR) << "align2clust supports only --cluster-mode " << Parameters::SET_COVER << ", " << Parameters::GREEDY << " and " << Parameters::GREEDY_MEM
-                                << " for --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
+                                << " for linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
             EXIT(EXIT_FAILURE);
         }
         const int prefDbtype = FileUtil::parseDbType(par.db2.c_str());
         if (Parameters::isEqualDbtype(prefDbtype, Parameters::DBTYPE_PREFILTER_RES) == false
             || (DBReader<DBKeyType>::getExtendedDbtype(prefDbtype) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {
-            Debug(Debug::ERROR) << par.db2 << " is not a --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " prefilter result\n";
+            Debug(Debug::ERROR) << par.db2 << " is not a linfinity prefilter result (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
             EXIT(EXIT_FAILURE);
         }
         if (par.compressed) {
-            Debug(Debug::WARNING) << "--compressed cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
+            Debug(Debug::WARNING) << "--compressed cannot be combined with linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
             Debug(Debug::WARNING) << "We recompute with --compressed 0\n";
             par.compressed = 0;
         }
         if (par.includeAlignFiles) {
-            Debug(Debug::WARNING) << "--include-align-files cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
+            Debug(Debug::WARNING) << "--include-align-files cannot be combined with linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
             Debug(Debug::WARNING) << "We recompute with --include-align-files 0\n";
             par.includeAlignFiles = false;
         }

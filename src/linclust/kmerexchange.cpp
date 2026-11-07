@@ -585,7 +585,7 @@ static size_t getPassLimit(size_t memory) {
     return memory / 3 / sizeof(size_t) * sizeof(size_t);
 }
 
-// --createdb-mode 3: the send ranges, hash ranges and partitions that every node cuts the same, and the limits of this node
+// linfinity: the send ranges, hash ranges and partitions that every node cuts the same, and the limits of this node
 struct KmerExchange {
     // the keys of every send range, whose k-mers the node that takes it sends; the merge splits are key ranges of its partitions
     std::vector<size_t> sendRangeKeyOffsets;
@@ -1351,7 +1351,7 @@ struct OwnKmers {
     std::vector<size_t> hashRanges;
 };
 
-// --createdb-mode 3 sending: the nodes take the send ranges one at a time, the k-mers of a send range in loads, written to <pref>.kmers.<node>
+// linfinity sending: the nodes take the send ranges one at a time, the k-mers of a send range in loads, written to <pref>.kmers.<node>
 template <typename T, bool includeAdjacency, typename L>
 static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, MMseqsNode::WorkQueue &sendQueue,
                         size_t representativeBitsMemory, std::vector<size_t> &sendRanges, std::string &sendValues, OwnKmers &ownKmers) {
@@ -1705,7 +1705,7 @@ struct ReceivedHashRange {
 // a chunk of a receiving pass is done, or stops at a group whose records do not fit the output that is full, or that do not fit the empty output either
 enum { CHUNK_DONE, CHUNK_OUTPUT_FULL, CHUNK_GROUP_TOO_BIG };
 
-// --createdb-mode 3 receiving: the nodes take the hash ranges one at a time, in passes, and write the pairs of the chosen reps to <pref>.pairs.<node> or to ownPairs
+// linfinity receiving: the nodes take the hash ranges one at a time, in passes, and write the pairs of the chosen reps to <pref>.pairs.<node> or to ownPairs
 static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange, MMseqsNode::WorkQueue &hashQueue, std::vector<size_t> &hashRanges,
                            std::string &receiveValues, size_t &pairBytes, OwnKmers &ownKmers, OwnPairs &ownPairs) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
@@ -2301,7 +2301,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     return receivedBytes;
 }
 
-// --createdb-mode 3 rep node: merges the own merge send ranges, then takes merge splits one at a time and merges their partitions from every pair file and ownPairs into <pref>.<node>; returns its partition rows
+// linfinity rep node: merges the own merge send ranges, then takes merge splits one at a time and merges their partitions from every pair file and ownPairs into <pref>.<node>; returns its partition rows
 static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange, MMseqsNode::WorkQueue &mergeQueue, std::vector<size_t> &mergeSplits,
                                       std::string &mergeValues, OwnPairs &ownPairs) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
