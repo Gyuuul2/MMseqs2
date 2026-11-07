@@ -79,13 +79,14 @@ public:
     static size_t readExchangeFlushes(const std::string &indexFile, size_t flush, size_t lineWords, std::vector<uint64_t> &lines);
     static const size_t EXCHANGE_SLICE_HEADER_BYTES = 2 * sizeof(uint64_t);
     static void writeExchangeSliceHeader(FILE *file, const std::string &fileName, uint64_t generation);
+    // waits for line flush of indexFile, line.size() words, as readExchangeFlushes reads it
+    static void waitForExchangeFlush(const std::string &indexFile, size_t flush, std::vector<uint64_t> &line);
     // the bytes of a flush that a thread writes at once
     static const size_t EXCHANGE_WRITE_BYTES = 16 * 1024 * 1024;
-    // writes bytes of data as flush generation of fileName from threads threads, then publishes it with line to indexFile
-    static void writeExchangeFlush(const std::string &fileName, uint64_t generation, const char *data, size_t bytes, const std::string &indexFile,
-                                   const std::vector<uint64_t> &line, int threads);
     static int tryOpenExchangeSlice(const std::string &file, size_t expectedBytes, uint64_t expectedGeneration, time_t &lastDirectoryRefresh,
                                     size_t &observedBytes, uint64_t &observedGeneration, int &lastError);
+    // opens a file that an index line published with its bytes and generation, again while NFS shows an older state of it, until that lasts too long
+    static int openExchangeSlice(const std::string &file, size_t expectedBytes, uint64_t expectedGeneration);
     static bool tryReadExchangeSlice(int fd, char *data, size_t bytes, size_t offset, int &readError);
     // every node publishes content as file + "." + node; returns all contents in node order, gathered by the master into file
     static std::string barrier(const std::string &file, const std::string &content = "");
@@ -108,8 +109,6 @@ public:
         size_t claimInOrder();
         // the number of first items that some node has taken; any thread of this node may read it while claimInOrder runs
         size_t getOrderedClaims() const;
-        // the node that took item, count while that is not readable
-        unsigned int getNode(size_t item) const;
         // removes <name>.<item> of the own items of this node, while no node takes items of the queue
         void removeClaims();
 

@@ -404,23 +404,20 @@ size_t MMseqsNode::readExchangeFlushes(const std::string &indexFile, size_t flus
     return lineCount;
 }
 
+void MMseqsNode::waitForExchangeFlush(const std::string &indexFile, size_t flush, std::vector<uint64_t> &line) {
+    WaitWarning warning;
+    for (unsigned int polls = 0; readExchangeFlushes(indexFile, flush, line.size(), line) == 0; polls++) {
+        sleepBeforePoll(polls);
+        warning.check(indexFile);
+    }
+}
+
 void MMseqsNode::writeExchangeSliceHeader(FILE *file, const std::string &fileName, uint64_t generation) {
     const ExchangeSliceHeader header = { exchangeSliceMagic(), generation };
     if (fwrite(&header, sizeof(header), 1, file) != 1 || fflush(file) != 0) {
         Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
-}
-
-void MMseqsNode::writeExchangeFlush(const std::string &fileName, uint64_t generation, const char *data, size_t bytes, const std::string &indexFile,
-                                    const std::vector<uint64_t> &line, int threads) {
-    FILE *file = FileUtil::openAndDelete(fileName.c_str(), "w");
-    writeExchangeSliceHeader(file, fileName, generation);
-#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (size_t offset = 0; offset < bytes; offset += EXCHANGE_WRITE_BYTES) {
-        FileUtil::pwriteAll(fileno(file), fileName.c_str(), data + offset, std::min(EXCHANGE_WRITE_BYTES, bytes - offset), EXCHANGE_SLICE_HEADER_BYTES + offset);
-    }
-    publishExchangeFlush(file, fileName, EXCHANGE_SLICE_HEADER_BYTES + bytes, indexFile, line);
 }
 
 int MMseqsNode::tryOpenExchangeSlice(const std::string &file, size_t expectedBytes, uint64_t expectedGeneration, time_t &lastDirectoryRefresh,
@@ -473,6 +470,32 @@ int MMseqsNode::tryOpenExchangeSlice(const std::string &file, size_t expectedByt
     }
     close(fd);
     return -1;
+}
+
+int MMseqsNode::openExchangeSlice(const std::string &file, size_t expectedBytes, uint64_t expectedGeneration) {
+    time_t lastDirectoryRefresh = 0;
+    const time_t start = time(NULL);
+    for (unsigned int polls = 0; ; polls++) {
+        size_t observedBytes;
+        uint64_t observedGeneration;
+        int lastError;
+        const int fd = tryOpenExchangeSlice(file, expectedBytes, expectedGeneration, lastDirectoryRefresh, observedBytes, observedGeneration, lastError);
+        if (fd >= 0) {
+            return fd;
+        }
+        if (lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
+            Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(lastError) << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        // a published file stays missing or short for a while on NFS only; the time alone would include a stall of this node
+        if (polls >= 100 && time(NULL) - start >= DIRECTORY_WAIT_SECONDS) {
+            Debug(Debug::ERROR) << "Cannot open complete " << file << " (expected " << expectedBytes << " bytes, observed "
+                                << (observedBytes == SIZE_MAX ? std::string("unavailable") : SSTR(observedBytes)) << " bytes; expected generation " << expectedGeneration
+                                << ", observed " << (observedGeneration == UINT64_MAX ? std::string("unavailable") : SSTR(observedGeneration)) << "; error " << lastError << ")\n";
+            EXIT(EXIT_FAILURE);
+        }
+        sleepBeforePoll(polls);
+    }
 }
 
 bool MMseqsNode::tryReadExchangeSlice(int fd, char *data, size_t bytes, size_t offset, int &readError) {
@@ -602,22 +625,6 @@ size_t MMseqsNode::WorkQueue::claimInOrder() {
 
 size_t MMseqsNode::WorkQueue::getOrderedClaims() const {
     return __atomic_load_n(&nextOrderedItem, __ATOMIC_RELAXED);
-}
-
-unsigned int MMseqsNode::WorkQueue::getNode(size_t item) const {
-    unsigned int node = count;
-    const std::string file = name + "." + SSTR(item);
-    int fd = openFile(file);
-    if (fd < 0 && errno == ENOENT && isListed(file)) {
-        fd = openFile(file);
-    }
-    if (fd >= 0) {
-        if (pread(fd, &node, sizeof(node), 0) != static_cast<ssize_t>(sizeof(node))) {
-            node = count;
-        }
-        close(fd);
-    }
-    return node;
 }
 
 void MMseqsNode::WorkQueue::removeClaims() {
