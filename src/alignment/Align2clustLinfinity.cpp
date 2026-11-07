@@ -1452,9 +1452,21 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     const auto publishAccepted = [&](size_t repKey, size_t bytes) {
         MMseqsNode::publishLog(acceptedHandle, acceptedFile, repKey, bytes, repTargetsReader.getOrderedClaims());
     };
+
+    // the assigned bits of the keys that this node serves or that are in its group ranges, a page of bits from the first change of a key in it on; other keys read as not assigned
+    std::vector<uint64_t *> assignedPages(hasService ? (dbSize + ASSIGNED_PAGE_KEYS - 1) / ASSIGNED_PAGE_KEYS : 0, NULL);
+    const auto isAssigned = [&](size_t orderKey) {
+        const size_t key = orderKey % paddedDbSize;
+        const uint64_t *page = __atomic_load_n(&assignedPages[key / ASSIGNED_PAGE_KEYS], __ATOMIC_ACQUIRE);
+        return page != NULL && ((__atomic_load_n(&page[key % ASSIGNED_PAGE_KEYS / 64], __ATOMIC_RELAXED) >> (key % 64)) & 1) != 0;
+    };
+    // a pair with an assigned rep or member stays out of the log; the master drops it anyway, as it set the bit before and never clears it
     const auto logAcceptedPairs = [&](const ClusterPair *pairs, size_t pairCount) {
         acceptedWords.clear();
         for (size_t i = 0; i < pairCount; i++) {
+            if (isAssigned(pairs[i].repKey) || isAssigned(pairs[i].memberKey)) {
+                continue;
+            }
             if (pairs[i].repKey != loggedRepKey) {
                 loggedRepKey = pairs[i].repKey;
                 acceptedWords.push_back(loggedRepKey | ACCEPTED_REP_BIT);
@@ -1467,16 +1479,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
         acceptedBytes += acceptedWords.size() * sizeof(uint64_t);
     };
-
-    // the assigned bits of the keys that this node serves or that are in its group ranges, a page of bits from the first change of a key in it on; other keys read as not assigned
-    std::vector<uint64_t *> assignedPages(hasService ? (dbSize + ASSIGNED_PAGE_KEYS - 1) / ASSIGNED_PAGE_KEYS : 0, NULL);
     size_t clusteredKey = 0;
     size_t clusteredAcceptedBytes = 0;
-    const auto isAssigned = [&](size_t orderKey) {
-        const size_t key = orderKey % paddedDbSize;
-        const uint64_t *page = __atomic_load_n(&assignedPages[key / ASSIGNED_PAGE_KEYS], __ATOMIC_ACQUIRE);
-        return page != NULL && ((__atomic_load_n(&page[key % ASSIGNED_PAGE_KEYS / 64], __ATOMIC_RELAXED) >> (key % 64)) & 1) != 0;
-    };
     const size_t headerWords = getChangeHeaderWords();
     const size_t changeReadWords = 1024 * 1024;
     size_t changesBytes = 0;
@@ -2581,6 +2585,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
         repBatchWallSeconds += repBatchTimer.getTimediff();
         if (memberDbr != NULL) {
+            // the pairs assigned by now skip their member reads
+            {
+                std::unique_lock<std::mutex> changesLock(assignedChangesMutex, std::try_to_lock);
+                if (changesLock.owns_lock()) {
+                    readAssignedChanges(false);
+                }
+            }
             Timer memberScanTimer;
             windowPairs.clear();
             for (size_t batch = 0; batch < batchCount; batch++) {
