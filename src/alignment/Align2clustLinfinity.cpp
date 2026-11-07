@@ -1740,8 +1740,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     RepWindow window;
     RepWindow nextWindow;
     nextWindow.homeKeyOffsets.assign(nodes + 2, 0);
-    // the service thread and the chunk loader take a quarter of the threads for their parallel parts
-    const int serviceThreads = std::max(1, par.threads / 4);
+    // the service thread and the chunk loader take half of the threads for their parallel parts
+    const int serviceThreads = std::max(1, par.threads / 2);
     // the alignment cells, as the cost of a partition, that this node aligns per second
     std::atomic<double> alignedCostPerSecond(0);
     repTargetsReader.loadChunk(chunkRecords[0], chunkTargets[0], maxWindowBytes, 0);
