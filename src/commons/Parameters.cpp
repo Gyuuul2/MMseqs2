@@ -2373,8 +2373,8 @@ void Parameters::checkIfDatabaseIsValid(const Command& command, int argc, const 
                     return filenames[fileIdx] != "stdin" && FileUtil::fileExists((filenames[fileIdx]).c_str()) == false && FileUtil::fileExists((filenames[fileIdx] + ".dbtype").c_str()) == false;
                 };
                 // a step on another machine may have written the input; like --latency-wait of Snakemake and exitReadTimeout of Nextflow
-                const char *stepTasks = getenv("SLURM_STEP_NUM_TASKS");
-                for (int second = 0; stepTasks != NULL && atoi(stepTasks) > 1 && second < INPUT_LATENCY_SECONDS && isMissing(); second++) {
+                const char *stepTaskCount = getenv("SLURM_STEP_NUM_TASKS");
+                for (int second = 0; stepTaskCount != NULL && atoi(stepTaskCount) > 1 && second < INPUT_LATENCY_SECONDS && isMissing(); second++) {
                     sleep(1);
                 }
                 if (isMissing()) {

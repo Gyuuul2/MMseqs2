@@ -31,15 +31,15 @@ if [ -n "$CLUSTHASH" ] || [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
 else
     CLUDB="$2"
 fi
-ITER2_PRODUCTS=""
+SECOND_ITERATION_OUTPUTS=""
 if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
-    ITER2_PRODUCTS="${TMP_PATH}/clu_merged.dbtype ${TMP_PATH}/input_rep.dbtype ${TMP_PATH}/pref_rep.dbtype ${TMP_PATH}/clu_rep.dbtype"
+    SECOND_ITERATION_OUTPUTS="${TMP_PATH}/clu_merged.dbtype ${TMP_PATH}/input_rep.dbtype ${TMP_PATH}/pref_rep.dbtype ${TMP_PATH}/clu_rep.dbtype"
 fi
 
 # 0. clusthash
 if [ -n "$CLUSTHASH" ]; then
     # shellcheck disable=SC2086
-    if notExists "${TMP_PATH}/input_clusthash_clust.dbtype" ${ITER2_PRODUCTS}; then
+    if notExists "${TMP_PATH}/input_clusthash_clust.dbtype" ${SECOND_ITERATION_OUTPUTS}; then
         # shellcheck disable=SC2086
         $RUNNER "$MMSEQS" clusthashfast "$INPUT" "${TMP_PATH}/input_clusthash_clust" ${CLUSTHASHFAST_PAR} \
             || fail "clusthashfast died"
@@ -50,14 +50,14 @@ fi
 
 # 1. k-mer matching
 # shellcheck disable=SC2086
-if notExists "${TMP_PATH}/pref.dbtype" "${CLUDB}.dbtype" ${ITER2_PRODUCTS}; then
+if notExists "${TMP_PATH}/pref.dbtype" "${CLUDB}.dbtype" ${SECOND_ITERATION_OUTPUTS}; then
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" kmermatcher "$INPUT" "${TMP_PATH}/pref" ${KMERMATCHER_PAR} \
         || fail "kmermatcher died"
 fi
 
 # shellcheck disable=SC2086
-if notExists "${CLUDB}.dbtype" ${ITER2_PRODUCTS}; then
+if notExists "${CLUDB}.dbtype" ${SECOND_ITERATION_OUTPUTS}; then
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" align2clust "$INPUT" "${TMP_PATH}/pref" "$CLUDB" ${ALIGN2CLUST_PAR} \
         || fail "align2clust died"
@@ -76,7 +76,7 @@ if [ -n "$CLUSTHASH" ]; then
         MERGED="$2"
     fi
     # shellcheck disable=SC2086
-    if notExists "${MERGED}.dbtype" ${ITER2_PRODUCTS}; then
+    if notExists "${MERGED}.dbtype" ${SECOND_ITERATION_OUTPUTS}; then
         # shellcheck disable=SC2086
         $RUNNER "$MMSEQS" mergeclusters "$SOURCE" "$MERGED" \
             "${TMP_PATH}/input_clusthash_clust" "$CLUDB" ${MERGECLU_PAR} \

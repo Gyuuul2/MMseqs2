@@ -46,7 +46,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
     std::vector<size_t> splitKeyOffsets;
     std::vector<size_t> cluKeyOffsets;
     if (isLinfinity) {
-        cluKeyOffsets = MMseqsNode::getClusterKeyOffsets(par.db4 + ".keys", par.db3, seqDbr.getSize());
+        cluKeyOffsets = MMseqsNode::getClusterKeyOffsets(par.db4 + ".cluster_key_offsets", par.db3, seqDbr.getSize());
         const std::vector<size_t> fileKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
         const size_t fileFirstKey = fileKeyOffsets[MMseqsNode::rank];
         const size_t fileEndKey = fileKeyOffsets[MMseqsNode::rank + 1];
@@ -69,12 +69,12 @@ int result2flat(int argc, const char **argv, const Command &command) {
     }
     const size_t splitCount = isLinfinity ? splitKeyOffsets.size() - 1 : 1;
 
-    const size_t chunkEntries = isLinfinity ? 4096 : 1024;
-    // the chunks that the threads format at once before they are written at their prefix-summed offsets
-    const size_t batchChunks = (isLinfinity ? 4 : 16) * static_cast<size_t>(par.threads);
-    std::vector<std::string> chunkData(batchChunks);
-    std::vector<size_t> chunkOffsets(batchChunks + 1);
-    size_t fastaSize = 0;
+    const size_t entriesPerTask = isLinfinity ? 4096 : 1024;
+    // the tasks that the threads format at once before they are written at their prefix-summed offsets
+    const size_t tasksPerBatch = (isLinfinity ? 4 : 16) * static_cast<size_t>(par.threads);
+    std::vector<std::string> taskFastaText(tasksPerBatch);
+    std::vector<size_t> taskOffsets(tasksPerBatch + 1);
+    size_t fastaBytes = 0;
     std::vector<DBKeyType> repKeys;
     Timer timer;
     double loadSeconds = 0;
@@ -94,9 +94,9 @@ int result2flat(int argc, const char **argv, const Command &command) {
         }
         loadSeconds += timer.getTimediff();
         timer.reset();
-        const size_t chunkCount = (splitEnd + chunkEntries - 1) / chunkEntries;
-        for (size_t batchBegin = 0; batchBegin < chunkCount; batchBegin += batchChunks) {
-            const size_t batchEnd = std::min(chunkCount, batchBegin + batchChunks);
+        const size_t taskCount = (splitEnd + entriesPerTask - 1) / entriesPerTask;
+        for (size_t batchBegin = 0; batchBegin < taskCount; batchBegin += tasksPerBatch) {
+            const size_t batchEnd = std::min(taskCount, batchBegin + tasksPerBatch);
 #pragma omp parallel
             {
                 int thread_idx = 0;
@@ -104,10 +104,10 @@ int result2flat(int argc, const char **argv, const Command &command) {
                 thread_idx = omp_get_thread_num();
 #endif
 #pragma omp for schedule(dynamic, 1)
-                for (size_t chunk = batchBegin; chunk < batchEnd; chunk++) {
-                    std::string &buffer = chunkData[chunk - batchBegin];
+                for (size_t task = batchBegin; task < batchEnd; task++) {
+                    std::string &buffer = taskFastaText[task - batchBegin];
                     buffer.clear();
-                    for (size_t i = chunk * chunkEntries; i < std::min(splitEnd, (chunk + 1) * chunkEntries); i++) {
+                    for (size_t i = task * entriesPerTask; i < std::min(splitEnd, (task + 1) * entriesPerTask); i++) {
 
                         // Write the header, taken from the original queryDB
                         buffer.push_back('>');
@@ -186,16 +186,16 @@ int result2flat(int argc, const char **argv, const Command &command) {
             }
             formatSeconds += timer.getTimediff();
             timer.reset();
-            chunkOffsets[0] = fastaSize;
-            for (size_t chunk = batchBegin; chunk < batchEnd; chunk++) {
-                chunkOffsets[chunk - batchBegin + 1] = chunkOffsets[chunk - batchBegin] + chunkData[chunk - batchBegin].size();
+            taskOffsets[0] = fastaBytes;
+            for (size_t task = batchBegin; task < batchEnd; task++) {
+                taskOffsets[task - batchBegin + 1] = taskOffsets[task - batchBegin] + taskFastaText[task - batchBegin].size();
             }
 #pragma omp parallel for schedule(dynamic, 1)
-            for (size_t chunk = batchBegin; chunk < batchEnd; chunk++) {
-                const std::string &buffer = chunkData[chunk - batchBegin];
-                FileUtil::pwriteAll(fileno(fastaFP), fastaFile.c_str(), buffer.data(), buffer.size(), chunkOffsets[chunk - batchBegin]);
+            for (size_t task = batchBegin; task < batchEnd; task++) {
+                const std::string &buffer = taskFastaText[task - batchBegin];
+                FileUtil::pwriteAll(fileno(fastaFP), fastaFile.c_str(), buffer.data(), buffer.size(), taskOffsets[task - batchBegin]);
             }
-            fastaSize = chunkOffsets[batchEnd - batchBegin];
+            fastaBytes = taskOffsets[batchEnd - batchBegin];
             writeSeconds += timer.getTimediff();
             timer.reset();
         }

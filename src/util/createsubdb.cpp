@@ -19,7 +19,7 @@ int createsubdb(int argc, const char **argv, const Command& command) {
         DBReader<DBKeyType> reader(par.db2.c_str(), par.db2Index.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
         reader.open(DBReader<DBKeyType>::NOSORT);
         const std::vector<size_t> fileKeyOffsets = reader.getFileKeyOffsets(MMseqsNode::count);
-        const std::vector<size_t> cluKeyOffsets = MMseqsNode::getClusterKeyOffsets(par.db3 + ".keys", par.db1, reader.getSize());
+        const std::vector<size_t> cluKeyOffsets = MMseqsNode::getClusterKeyOffsets(par.db3 + ".cluster_key_offsets", par.db1, reader.getSize());
         const size_t firstKey = fileKeyOffsets[MMseqsNode::rank];
         const size_t keyCount = fileKeyOffsets[MMseqsNode::rank + 1] - firstKey;
         std::vector<uint64_t> bits((keyCount + 63) / 64, 0);
