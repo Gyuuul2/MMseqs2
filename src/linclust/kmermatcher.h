@@ -131,6 +131,59 @@ private:
     }
 };
 
+// [ 0 | k-mer | maxSeqLen - seqLen | id | pos | adjKey | used as rep ] in integer order, the order of KmerPosition::compareRepSequenceAndIdAndPos;
+// a key above the k-mer field, a whole sequence hash, is [ 1 | key | maxSeqLen - seqLen | id | used as rep ] with pos 0 and all adjacent residues X
+struct KmerPositionDiagonalBit {
+    static const unsigned int WHOLE_SEQUENCE_SHIFT = 127;
+    static const unsigned int ADJ_KEY_SHIFT = 1;
+    static unsigned int posShift;
+    static unsigned int idShift;
+    static unsigned int seqLenShift;
+    static unsigned int kmerShift;
+    static size_t maxSeqLen;
+    static unsigned char xIndex;
+    __extension__ typedef unsigned __int128 uint128;
+    uint128 value;
+
+    void set(size_t kmer, unsigned int adjKey, size_t seqLen, DBKeyType id, size_t pos, bool) {
+        const bool isWholeSequence = (static_cast<uint128>(kmer) >> (WHOLE_SEQUENCE_SHIFT - kmerShift)) != 0;
+        const unsigned int shift = isWholeSequence ? idShift - 1 : 0;
+        value = (static_cast<uint128>(isWholeSequence) << WHOLE_SEQUENCE_SHIFT)
+                | (static_cast<uint128>(kmer) << (kmerShift - shift))
+                | (static_cast<uint128>(maxSeqLen - seqLen) << (seqLenShift - shift))
+                | (static_cast<uint128>(id) << (idShift - shift));
+        if (isWholeSequence == false) {
+            value |= (static_cast<uint128>(pos) << posShift) | (static_cast<uint128>(adjKey) << ADJ_KEY_SHIFT);
+        }
+    }
+
+    bool isWholeSequence() const { return (value >> WHOLE_SEQUENCE_SHIFT) != 0; }
+    size_t getKmer() const { return getBits(kmerShift - getWholeSequenceShift(), WHOLE_SEQUENCE_SHIFT); }
+    size_t getSeqLen() const { return maxSeqLen - getBits(seqLenShift - getWholeSequenceShift(), kmerShift - getWholeSequenceShift()); }
+    DBKeyType getId() const { return getBits(idShift - getWholeSequenceShift(), seqLenShift - getWholeSequenceShift()); }
+    size_t getPos() const { return isWholeSequence() ? 0 : getBits(posShift, idShift); }
+    unsigned char getAdjacentSeq(int index) const {
+        if (index == 0 && (value & 1)) {
+            return UCHAR_MAX;
+        }
+        return isWholeSequence() ? xIndex : getBits(ADJ_KEY_SHIFT + KmerPositionBit::RESIDUE_BITS * index, ADJ_KEY_SHIFT + KmerPositionBit::RESIDUE_BITS * (index + 1));
+    }
+    // assignGroup only marks a used rep, setAdjacentSeq(0, UCHAR_MAX)
+    void setAdjacentSeq(int, unsigned char) { value |= 1; }
+
+    bool operator<(const KmerPositionDiagonalBit &other) const {
+        const uint64_t upper = static_cast<uint64_t>(value >> 64);
+        const uint64_t otherUpper = static_cast<uint64_t>(other.value >> 64);
+        return (upper != otherUpper) ? upper < otherUpper : static_cast<uint64_t>(value) < static_cast<uint64_t>(other.value);
+    }
+
+private:
+    unsigned int getWholeSequenceShift() const { return isWholeSequence() ? idShift - 1 : 0; }
+    size_t getBits(unsigned int shift, unsigned int nextShift) const {
+        return (value >> shift) & ((static_cast<uint128>(1) << (nextShift - shift)) - 1);
+    }
+};
+
 template <typename T, bool includeAdjacency = false, typename L = T>
 struct __attribute__((__packed__)) KmerPosition {
     size_t kmer;
