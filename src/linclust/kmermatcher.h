@@ -421,7 +421,8 @@ KmerPosition<T, includeAdjacency, L> *initKmerPositionMemory(size_t size);
 template <int TYPE, typename T, bool includeAdjacency = false, typename L = T, typename KmerPositionType>
 std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, size_t kmerArraySize, DBReader<DBKeyType> &seqDbr,
                                                  Parameters & par, BaseMatrix * subMat, bool hashWholeSequence,
-                                                 size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution);
+                                                 size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution,
+                                                 KmerPositionType *countTableKmerArray = NULL, size_t countTableKmers = 0, size_t countTableEndRange = 0);
 
 
 void maskSequence(int maskMode, int maskLowerCase,
@@ -514,7 +515,8 @@ template <int TYPE, typename T, bool includeAdjacency, typename L, typename Kmer
 std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, size_t kmerArraySize, DBReader<DBKeyType> &seqDbr,
                                                 Parameters & par, BaseMatrix * subMat, bool hashWholeSequence,
                                                 size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution,
-                                                const std::vector<size_t> &readChunkOffsets);
+                                                const std::vector<size_t> &readChunkOffsets,
+                                                KmerPositionType *countTableKmerArray = NULL, size_t countTableKmers = 0, size_t countTableEndRange = 0);
 
 template <typename T, bool includeAdjacency, typename L>
 void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, size_t memoryLimit);

@@ -135,8 +135,10 @@ template <int TYPE, typename T, bool includeAdjacency, typename L, typename Kmer
 std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, size_t kmerArraySize, DBReader<DBKeyType> &seqDbr,
                                                 Parameters & par, BaseMatrix * subMat, bool hashWholeSequence,
                                                 size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution,
-                                                const std::vector<size_t> &readChunkOffsets){
+                                                const std::vector<size_t> &readChunkOffsets,
+                                                KmerPositionType *countTableKmerArray, size_t countTableKmers, size_t countTableEndRange){
     size_t offset = 0;
+    size_t countTableOffset = 0;
     int querySeqType  =  seqDbr.getDbtype();
     size_t longestKmer = par.kmerSize;
     const unsigned char xIndex = includeAdjacency ? adjSubMat->aa2num[static_cast<int>('X')] : 0;
@@ -209,6 +211,21 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
             threadKmerBuffer = new(std::nothrow) KmerPosition<T, includeAdjacency, L>[BUFFER_SIZE];
             Util::checkAllocation(threadKmerBuffer, "Can not allocate threadKmerBuffer memory in fillKmerPositionArray");
         }
+        size_t countTableBufferPos = 0;
+        KmerPosition<T, includeAdjacency, L> *countTableKmerBuffer = NULL;
+        if (countTableKmerArray != NULL) {
+            countTableKmerBuffer = new(std::nothrow) KmerPosition<T, includeAdjacency, L>[BUFFER_SIZE];
+            Util::checkAllocation(countTableKmerBuffer, "Can not allocate countTableKmerBuffer memory in fillKmerPositionArray");
+        }
+        auto addCountTableKmer = [&]() {
+            memcpy(reinterpret_cast<char *>(countTableKmerBuffer) + countTableBufferPos * sizeof(KmerPositionType),
+                   reinterpret_cast<char *>(threadKmerBuffer) + bufferPos * sizeof(KmerPositionType), sizeof(KmerPositionType));
+            countTableBufferPos++;
+            if (countTableBufferPos >= BUFFER_SIZE) {
+                flushKmerBuffer(countTableKmerArray, countTableKmers, countTableKmerBuffer, countTableBufferPos, &countTableOffset);
+                countTableBufferPos = 0;
+            }
+        };
         SequencePosition * kmers = (SequencePosition *) malloc((par.pickNbest * (par.maxSeqLen + 1) + 1) * sizeof(SequencePosition) * 2);
         Util::checkAllocation(kmers, "Can not allocate kmers memory in fillKmerPositionArray");
         size_t kmersArraySize = par.maxSeqLen;
@@ -405,7 +422,9 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                 int tooMuchElemInLastBin = (kmerInBins - kmerConsidered);
 
                 // add k-mer to represent the identity
-                if (static_cast<unsigned short>(seqHash) >= hashStartRange && static_cast<unsigned short>(seqHash) <= hashEndRange) {
+                const bool seqHashInRange = static_cast<unsigned short>(seqHash) >= hashStartRange && static_cast<unsigned short>(seqHash) <= hashEndRange;
+                const bool seqHashInCountTable = countTableKmerArray != NULL && static_cast<unsigned short>(seqHash) <= countTableEndRange;
+                if (seqHashInRange || seqHashInCountTable) {
                     if(hashDistribution != NULL){
                         __sync_fetch_and_add(&hashDistribution[static_cast<unsigned short>(seqHash)], 1);
                     }
@@ -420,10 +439,15 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                             }
                         }
                         encodeKmerPosition(kmerArray, threadKmerBuffer, bufferPos, true, loadFirstKey);
-                        bufferPos++;
-                        if (bufferPos >= BUFFER_SIZE) {
-                            flushKmerBuffer(kmerArray, kmerArraySize, threadKmerBuffer, bufferPos, &offset);
-                            bufferPos = 0;
+                        if (seqHashInCountTable) {
+                            addCountTableKmer();
+                        }
+                        if (seqHashInRange) {
+                            bufferPos++;
+                            if (bufferPos >= BUFFER_SIZE) {
+                                flushKmerBuffer(kmerArray, kmerArraySize, threadKmerBuffer, bufferPos, &offset);
+                                bufferPos = 0;
+                            }
                         }
                     }
                 }
@@ -472,7 +496,9 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                         }
 
                         selectedKmer++;
-                        if ((kmers + kmerIdx)->score >= hashStartRange && (kmers + kmerIdx)->score <= hashEndRange)
+                        const bool kmerInRange = (kmers + kmerIdx)->score >= hashStartRange && (kmers + kmerIdx)->score <= hashEndRange;
+                        const bool kmerInCountTable = countTableKmerArray != NULL && (kmers + kmerIdx)->score <= countTableEndRange;
+                        if (kmerInRange || kmerInCountTable)
                         {
                             if(hashDistribution != NULL){
                                 __sync_fetch_and_add(&hashDistribution[(kmers + kmerIdx)->score], 1);
@@ -502,6 +528,12 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                                 }
                             }
                             encodeKmerPosition(kmerArray, threadKmerBuffer, bufferPos, false, loadFirstKey);
+                            if (kmerInCountTable) {
+                                addCountTableKmer();
+                            }
+                            if (kmerInRange == false) {
+                                continue;
+                            }
                             bufferPos++;
 
                             if (bufferPos >= BUFFER_SIZE) {
@@ -532,8 +564,12 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
         if(threadKmerBuffer != NULL && bufferPos > 0){
             flushKmerBuffer(kmerArray, kmerArraySize, threadKmerBuffer, bufferPos, &offset);
         }
+        if (countTableBufferPos > 0) {
+            flushKmerBuffer(countTableKmerArray, countTableKmers, countTableKmerBuffer, countTableBufferPos, &countTableOffset);
+        }
         free(kmers);
         delete[] threadKmerBuffer;
+        delete[] countTableKmerBuffer;
         delete[] hierarchicalScoreDist;
         delete[] scoreDist;
         if (TYPE == Parameters::DBTYPE_HMM_PROFILE) {
@@ -556,7 +592,8 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
 template <int TYPE, typename T, bool includeAdjacency, typename L, typename KmerPositionType>
 std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, size_t kmerArraySize, DBReader<DBKeyType> &seqDbr,
                                                 Parameters & par, BaseMatrix * subMat, bool hashWholeSequence,
-                                                size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution){
+                                                size_t hashStartRange, size_t hashEndRange, size_t * hashDistribution,
+                                                KmerPositionType *countTableKmerArray, size_t countTableKmers, size_t countTableEndRange){
     const size_t flushSize = 100000000;
     std::vector<size_t> readChunkOffsets;
     for (size_t start = 0; start < seqDbr.getSize(); start += flushSize) {
@@ -564,7 +601,8 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
     }
     readChunkOffsets.push_back(seqDbr.getSize());
     return fillKmerPositionArray<TYPE, T, includeAdjacency, L>(kmerArray, kmerArraySize, seqDbr, par, subMat, hashWholeSequence,
-                                                               hashStartRange, hashEndRange, hashDistribution, readChunkOffsets);
+                                                               hashStartRange, hashEndRange, hashDistribution, readChunkOffsets,
+                                                               countTableKmerArray, countTableKmers, countTableEndRange);
 }
 
 template <int TYPE, typename T, bool includeAdjacency, typename L, typename KmerPositionType>
@@ -1051,31 +1089,40 @@ SeqPairType *doComputation(
     size_t totalKmers, size_t hashStartRange, size_t hashEndRange,
     const std::string &splitFile, AssignGroupMask assignGroupMask,
     ComputationPhase phase, DBReader<DBKeyType> &seqDbr,
-    Parameters &par, BaseMatrix *subMat, unsigned char *countTable) {
+    Parameters &par, BaseMatrix *subMat, unsigned char *countTable,
+    KmerPositionType *countTableKmerArray = NULL, size_t countTableKmers = 0, size_t countTableEndRange = 0) {
 
-    KmerPositionType *hashSeqPair = initKmerPositionArray<KmerPositionType>(totalKmers);
+    // SetupCountTable sorts and assigns the count table k-mers that the Main fill collected, if any
+    KmerPositionType *hashSeqPair = countTableKmerArray;
 
     SeqPairType *writeSeqPair = NULL;
 
-    size_t elementsToSort;
-    if (Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)) {
-        std::pair<size_t, size_t> ret =
-            fillKmerPositionArray<Parameters::DBTYPE_NUCLEOTIDES, T, includeAdjacency, L>(
-                hashSeqPair, totalKmers, seqDbr, par,
-                subMat, true, hashStartRange, hashEndRange, NULL);
-        elementsToSort = ret.first;
-        par.kmerSize = ret.second;
-        Debug(Debug::INFO) << "\nAdjusted k-mer length " << par.kmerSize << "\n";
-    } else {
-        std::pair<size_t, size_t> ret =
-            fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, L>(
-                hashSeqPair, totalKmers, seqDbr, par,
-                subMat, true, hashStartRange, hashEndRange, NULL);
-        elementsToSort = ret.first;
-    }
+    size_t elementsToSort = totalKmers;
+    if (phase == ComputationPhase::Main || countTableKmerArray == NULL) {
+        hashSeqPair = initKmerPositionArray<KmerPositionType>(totalKmers);
+        if (Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)) {
+            std::pair<size_t, size_t> ret =
+                fillKmerPositionArray<Parameters::DBTYPE_NUCLEOTIDES, T, includeAdjacency, L>(
+                    hashSeqPair, totalKmers, seqDbr, par,
+                    subMat, true, hashStartRange, hashEndRange, NULL, countTableKmerArray, countTableKmers, countTableEndRange);
+            elementsToSort = ret.first;
+            par.kmerSize = ret.second;
+            Debug(Debug::INFO) << "\nAdjusted k-mer length " << par.kmerSize << "\n";
+        } else {
+            std::pair<size_t, size_t> ret =
+                fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, L>(
+                    hashSeqPair, totalKmers, seqDbr, par,
+                    subMat, true, hashStartRange, hashEndRange, NULL, countTableKmerArray, countTableKmers, countTableEndRange);
+            elementsToSort = ret.first;
+        }
 
-    if (hashEndRange == SIZE_T_MAX) {
-        seqDbr.unmapData();
+        if (hashEndRange == SIZE_T_MAX) {
+            seqDbr.unmapData();
+        }
+        if (countTableKmerArray != NULL) {
+            doComputation<KmerPositionType, T, includeAdjacency, L>(countTableKmers, 0, 0, splitFile, AssignGroupFeature::Default, ComputationPhase::SetupCountTable,
+                                                                    seqDbr, par, subMat, countTable, countTableKmerArray);
+        }
     }
 
     Debug(Debug::INFO) << "Sort kmer ";
@@ -1780,6 +1827,9 @@ static void kmermatcherWithDiagonalInner(Parameters &par, DBReader<DBKeyType> &s
                                 );
 
     std::vector<unsigned char> countTable;
+    KmerPositionType *countTableKmerArray = NULL;
+    size_t countTableKmers = 0;
+    size_t countTableEndRange = 0;
     if (par.includeCountTable) {
         countTable.assign(dbKeySize, 0);
         size_t countTableTotalKmers = static_cast<size_t>(totalKmers * par.countTableScale);
@@ -1803,7 +1853,15 @@ static void kmermatcherWithDiagonalInner(Parameters &par, DBReader<DBKeyType> &s
             countTableSplits, countTableKmersPerSplit,
             static_cast<size_t>(totalKmers * par.countTableScale)
         );
-        for (size_t split = 0; split < countTableHashRanges.size(); split++) {
+        // the count table hash ranges are consecutive from 0, so the first Main fill can collect their k-mers
+        // in the memory that the write buffer of the first split takes only after its fill
+        if (countTableHashRanges.empty() == false && countTableSplits == 1
+            && countTableKmersPerSplit * sizeof(KmerPositionType) <= totalKmersPerSplit * sizeof(SeqPairType)) {
+            countTableKmers = countTableKmersPerSplit;
+            countTableEndRange = countTableHashRanges.back().second;
+            countTableKmerArray = initKmerPositionArray<KmerPositionType>(countTableKmers);
+        }
+        for (size_t split = 0; countTableKmerArray == NULL && split < countTableHashRanges.size(); split++) {
             Debug(Debug::INFO) << "Fill count table for " << (split + 1) << " split\n";
 
             doComputation<KmerPosition<T, false, L>, T, false, L>(
@@ -1854,7 +1912,9 @@ static void kmermatcherWithDiagonalInner(Parameters &par, DBReader<DBKeyType> &s
         hashSeqPair = doComputation<KmerPositionType, T, includeAdjacency, L, SeqPairType>(
                         totalKmers, hashRanges[split].first, hashRanges[split].second, splitFileName,
                         assignGroupMask, ComputationPhase::Main,
-                        seqDbr, par, subMat, countTable.empty() ? NULL : countTable.data());
+                        seqDbr, par, subMat, countTable.empty() ? NULL : countTable.data(),
+                        countTableKmerArray, countTableKmers, countTableEndRange);
+        countTableKmerArray = NULL;
     }
 
     MPI_Barrier(MPI_COMM_WORLD);
@@ -1874,12 +1934,15 @@ static void kmermatcherWithDiagonalInner(Parameters &par, DBReader<DBKeyType> &s
             hashSeqPair = doComputation<KmerPositionType, T, includeAdjacency, L, SeqPairType>(
                         totalKmersPerSplit, hashRanges[split].first, hashRanges[split].second, splitFileName,
                         assignGroupMask, ComputationPhase::Main,
-                        seqDbr, par, subMat, countTable.empty() ? NULL : countTable.data());
+                        seqDbr, par, subMat, countTable.empty() ? NULL : countTable.data(),
+                        countTableKmerArray, countTableKmers, countTableEndRange);
+            countTableKmerArray = NULL;
         }
 
         splitFiles.push_back(splitFileName);
     }
 #endif
+    delete[] countTableKmerArray;
     if(mpiRank == 0){
         int maxIter = 1;
         if (par.includeAdjacency) {
@@ -2777,25 +2840,25 @@ void setKmerLengthAndAlphabet(Parameters &parameters, size_t aaDbSize, int seqTy
     }
 }
 
-template std::pair<size_t, size_t>  fillKmerPositionArray<0, short, true, short>(KmerPosition<short, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<0, short, false, short>(KmerPosition<short, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<1, short, true, short>(KmerPosition<short, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<1, short, false, short>(KmerPosition<short, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<2, short, true, short>(KmerPosition<short, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<2, short, false, short>(KmerPosition<short, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<0, int, true, int>(KmerPosition<int, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<0, int, false, int>(KmerPosition<int, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<1, int, true, int>(KmerPosition<int, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<1, int, false, int>(KmerPosition<int, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<2, int, true, int>(KmerPosition<int, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
-template std::pair<size_t, size_t>  fillKmerPositionArray<2, int, false, int>(KmerPosition<int, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *);
+template std::pair<size_t, size_t>  fillKmerPositionArray<0, short, true, short>(KmerPosition<short, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<short, true> *, size_t, size_t);
+template std::pair<size_t, size_t>  fillKmerPositionArray<0, short, false, short>(KmerPosition<short, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<short, false> *, size_t, size_t);
+template std::pair<size_t, size_t>  fillKmerPositionArray<1, short, true, short>(KmerPosition<short, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<short, true> *, size_t, size_t);
+template std::pair<size_t, size_t>  fillKmerPositionArray<1, short, false, short>(KmerPosition<short, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<short, false> *, size_t, size_t);
+template std::pair<size_t, size_t>  fillKmerPositionArray<2, short, true, short>(KmerPosition<short, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<short, true> *, size_t, size_t);
+template std::pair<size_t, size_t>  fillKmerPositionArray<2, short, false, short>(KmerPosition<short, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<short, false> *, size_t, size_t);
+template std::pair<size_t, size_t>  fillKmerPositionArray<0, int, true, int>(KmerPosition<int, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<int, true> *, size_t, size_t);
+template std::pair<size_t, size_t>  fillKmerPositionArray<0, int, false, int>(KmerPosition<int, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<int, false> *, size_t, size_t);
+template std::pair<size_t, size_t>  fillKmerPositionArray<1, int, true, int>(KmerPosition<int, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<int, true> *, size_t, size_t);
+template std::pair<size_t, size_t>  fillKmerPositionArray<1, int, false, int>(KmerPosition<int, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<int, false> *, size_t, size_t);
+template std::pair<size_t, size_t>  fillKmerPositionArray<2, int, true, int>(KmerPosition<int, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<int, true> *, size_t, size_t);
+template std::pair<size_t, size_t>  fillKmerPositionArray<2, int, false, int>(KmerPosition<int, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<int, false> *, size_t, size_t);
 
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, short, true, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, short, false, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, true, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, false, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, true, int, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, false, int, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, short, true, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, KmerPositionBit *, size_t, size_t);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, short, false, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, KmerPositionBit *, size_t, size_t);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, true, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, KmerPositionBit *, size_t, size_t);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, false, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, KmerPositionBit *, size_t, size_t);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, true, int, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, KmerPositionBit *, size_t, size_t);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, false, int, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, KmerPositionBit *, size_t, size_t);
 
 template KmerPosition<short, true> *initKmerPositionMemory(size_t size);
 template KmerPosition<short, false> *initKmerPositionMemory(size_t size);
