@@ -667,6 +667,11 @@ void MMseqsNode::keepOwnExchangeRecords(const std::string &exchange, char *recor
     __sync_fetch_and_add(&sentExchangeBytes, bytes);
 }
 
+void MMseqsNode::addSentExchangeBytes(size_t bytes, size_t otherNodeBytes) {
+    __sync_fetch_and_add(&sentExchangeBytes, bytes);
+    __sync_fetch_and_add(&sentOtherNodeExchangeBytes, otherNodeBytes);
+}
+
 std::string MMseqsNode::closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData) {
     const size_t flushCount = indexData.size() / ((count + 1) * sizeof(uint64_t));
     // the offsets of a node in all flushes follow each other, so a node reads its starts and ends at once
@@ -938,8 +943,12 @@ size_t MMseqsNode::readExchangeRange(std::vector<ExchangeBlock> &blocks, size_t 
     return blockRecordOffsets.back();
 }
 
-size_t MMseqsNode::readExchangeSegments(std::vector<ExchangeBlock> &blocks, size_t bufferMemory, size_t maxSegmentSize, uint64_t fileType, size_t windowBegin, size_t windowEnd,
-                                        char *window, std::vector<std::pair<size_t, size_t> > &segments, const std::string &prefix) {
+static bool isLongerLength(const std::pair<size_t, size_t> &bin, size_t length) {
+    return bin.first > length;
+}
+
+size_t MMseqsNode::readExchangeSegments(std::vector<ExchangeBlock> &blocks, const std::vector<std::vector<std::pair<size_t, size_t> > > &blockBins, size_t bufferMemory, size_t maxSegmentSize,
+                                        size_t windowBegin, size_t windowEnd, char *window, std::vector<std::pair<size_t, size_t> > &segments, const std::string &prefix) {
     const size_t bufferSize = std::max(4 * sizeof(uint64_t) + maxSegmentSize, bufferMemory / std::max<size_t>(1, blocks.size()));
     size_t nextOffset = SIZE_MAX;
 #pragma omp parallel reduction(min:nextOffset)
@@ -960,10 +969,9 @@ size_t MMseqsNode::readExchangeSegments(std::vector<ExchangeBlock> &blocks, size
                     break;
                 }
                 memcpy(segment, getBlockData(block) + block.bufferPos, sizeof(segment));
-                if (segment[0] != fileType || segment[1] >= windowEnd) {
-                    if (segment[0] == fileType) {
-                        nextOffset = std::min<size_t>(nextOffset, segment[1]);
-                    }
+                const size_t offset = std::lower_bound(blockBins[i].begin(), blockBins[i].end(), segment[0], isLongerLength)->second + segment[1];
+                if (offset >= windowEnd) {
+                    nextOffset = std::min(nextOffset, offset);
                     break;
                 }
                 bufferExchangeBlock(block, sizeof(segment) + segment[3], bufferSize, prefix);
@@ -973,12 +981,12 @@ size_t MMseqsNode::readExchangeSegments(std::vector<ExchangeBlock> &blocks, size
                 }
                 const char *data = getBlockData(block) + block.bufferPos + sizeof(segment);
                 if (segment[3] == segment[2]) {
-                    memcpy(window + (segment[1] - windowBegin), data, segment[2]);
-                } else if (ZSTD_decompressDCtx(dctx, window + (segment[1] - windowBegin), segment[2], data, segment[3]) != segment[2]) {
+                    memcpy(window + (offset - windowBegin), data, segment[2]);
+                } else if (ZSTD_decompressDCtx(dctx, window + (offset - windowBegin), segment[2], data, segment[3]) != segment[2]) {
                     Debug(Debug::ERROR) << "Cannot decompress a record of " << prefix << "\n";
                     EXIT(EXIT_FAILURE);
                 }
-                threadSegments.push_back(std::make_pair(segment[1], segment[2]));
+                threadSegments.push_back(std::make_pair(offset, segment[2]));
                 block.bufferPos += sizeof(segment) + segment[3];
             }
             releaseReadBlock(block);
