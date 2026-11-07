@@ -3817,9 +3817,10 @@ int align2clustLinfinity(Parameters &par) {
     MMseqsNode::addPhaseTime(phaseValues, "waiting for the clustering", phaseValueTimer);
     const size_t nodeFirstKey = nodeKeyOffsets[MMseqsNode::rank];
     const size_t nodeKeys = nodeKeyOffsets[MMseqsNode::rank + 1] - nodeFirstKey;
-    const size_t nodeWords = (nodeKeys + 63) / 64;
     const std::string clusterPairs = par.db3 + "_cluster_pairs";
-    MMseqsNode::ClusterPairWriter clusterPairWriter(clusterPairs, std::max<size_t>(64, memoryLimit / CLUSTER_PAIRS_MEMORY_DIVISOR / sizeof(ClusterPair)), ClusterPair::compareByRep, nodeKeyOffsets);
+    std::vector<size_t> balancedKeyOffsets;
+    MMseqsNode::ClusterPairWriter clusterPairWriter(clusterPairs, std::max<size_t>(64, memoryLimit / CLUSTER_PAIRS_MEMORY_DIVISOR / sizeof(ClusterPair)), ClusterPair::compareByRep, nodeKeyOffsets,
+                                                    &balancedKeyOffsets);
     const std::string acceptedFile = accepted + "." + SSTR(MMseqsNode::rank);
     if (par.clusteringMode == Parameters::SET_COVER) {
         for (size_t from = 0; from < takenBytes;) {
@@ -3893,7 +3894,28 @@ int align2clustLinfinity(Parameters &par) {
     }
     MMseqsNode::removeLog(takenFile);
     MMseqsNode::removeLog(acceptedFile);
-    const std::string clusterPairsIndex = clusterPairWriter.close();
+    // every node writes its clusters, and its singletons unless the subset has bits, as mergeclusters takes those from the lower clustering; readKeyBits fills a word past the keys
+    uint64_t *singletonBits = NULL;
+    FILE *assignedHandle = NULL;
+    const auto readSingletonBits = [&](size_t firstKey, size_t keyCount) {
+        const size_t words = (keyCount + 63) / 64;
+        std::vector<uint64_t> assignedWords(words + 1, 0);
+        MMseqsNode::readKeyBits(fileno(assignedHandle), assignedBits, 0, 0, firstKey, firstKey + keyCount, firstKey, assignedWords.data());
+        uint64_t *bits = new(std::nothrow) uint64_t[words];
+        Util::checkAllocation(bits, "Can not allocate singletonBits memory in align2clust");
+        for (size_t word = 0; word < words; word++) {
+            bits[word] = ~assignedWords[word];
+        }
+        return bits;
+    };
+    if (assignedBits.empty() == false) {
+        size_t assignedKey;
+        size_t assignedBytes;
+        MMseqsNode::waitForLog(assignedBits, assignedKey, assignedBytes);
+        assignedHandle = FileUtil::openFileOrDie(assignedBits.c_str(), "r", true);
+        singletonBits = readSingletonBits(nodeFirstKey, nodeKeys);
+    }
+    const std::string clusterPairsIndex = clusterPairWriter.close(singletonBits, nodeFirstKey, nodeKeys);
     // every node has read the sequences that this node requested and served
     for (size_t i = 0; i < sequenceIndexes.size(); i++) {
         FileUtil::remove(sequenceIndexes[i].c_str());
@@ -3911,26 +3933,18 @@ int align2clustLinfinity(Parameters &par) {
         delete memberDbr;
     }
 
-    // every node writes its clusters, and its singletons unless the subset has bits, as mergeclusters takes those from the lower clustering; readKeyBits fills a word past the keys
-    uint64_t *singletonBits = NULL;
-    if (assignedBits.empty() == false) {
-        size_t assignedKey;
-        size_t assignedBytes;
-        MMseqsNode::waitForLog(assignedBits, assignedKey, assignedBytes);
-        FILE *assignedHandle = FileUtil::openFileOrDie(assignedBits.c_str(), "r", true);
-        std::vector<uint64_t> nodeAssignedBits(nodeWords + 1, 0);
-        MMseqsNode::readKeyBits(fileno(assignedHandle), assignedBits, 0, 0, nodeFirstKey, nodeFirstKey + nodeKeys, nodeFirstKey, nodeAssignedBits.data());
+    // a node writes the representatives of its balanced keys, so the parts stay in key order without overlap, and their singletons
+    const size_t repFirstKey = balancedKeyOffsets[MMseqsNode::rank];
+    const size_t repKeyCount = balancedKeyOffsets[MMseqsNode::rank + 1] - repFirstKey;
+    if (assignedHandle != NULL) {
+        delete[] singletonBits;
+        singletonBits = readSingletonBits(repFirstKey, repKeyCount);
         if (fclose(assignedHandle) != 0) {
             Debug(Debug::ERROR) << "Cannot close " << assignedBits << "\n";
             EXIT(EXIT_FAILURE);
         }
-        singletonBits = new(std::nothrow) uint64_t[nodeWords];
-        Util::checkAllocation(singletonBits, "Can not allocate singletonBits memory in align2clust");
-        for (size_t word = 0; word < nodeWords; word++) {
-            singletonBits[word] = ~nodeAssignedBits[word];
-        }
     }
-    MMseqsNode::writeClusterPairs(clusterPairsIndex, clusterPairs, par.db3, singletonBits, nodeFirstKey, nodeKeys);
+    MMseqsNode::writeClusterPairs(clusterPairsIndex, clusterPairs, par.db3, singletonBits, repFirstKey, repKeyCount);
     delete[] singletonBits;
     MMseqsNode::addPhaseTime(phaseValues, "writing the clusters", phaseValueTimer);
     MMseqsNode::removeExchanges(par.db3, clusterPairs, std::vector<std::string>(1, clusterPairs), phaseValues);
