@@ -101,11 +101,11 @@ public:
         FILE* file;
         ZSTD_DStream* dstream;
         ZSTD_inBuffer input;
-        size_t toRead;
-        size_t position;
-        size_t end;
-        size_t outputPosition;
-        size_t outputEnd;
+        size_t readHintBytes;
+        size_t compressedOffset;
+        size_t compressedEndOffset;
+        size_t decompressedOffset;
+        size_t decompressedEndOffset;
     };
 private:
     ZstdFile file;

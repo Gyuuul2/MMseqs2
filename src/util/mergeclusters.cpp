@@ -20,7 +20,7 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
     if (isLinfinity) {
         DBReader<DBKeyType> dbr(par.hdr1.c_str(), (par.db1 + ".nodeinfo").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
         dbr.open(DBReader<DBKeyType>::NOSORT);
-        const std::vector<size_t> nodeKeyOffsets = dbr.getNodeKeyOffsets(MMseqsNode::count);
+        const std::vector<size_t> nodeKeyOffsets = dbr.getEvenNodeKeyOffsets(MMseqsNode::count);
         const bool hasSecondClustering = par.filenames.size() > 3;
         // clusthashfast writes no entries for clusters of one key, its representative bits hold them
         const std::string representativeDb = par.filenames[2] + "_redundancy";

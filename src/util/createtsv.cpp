@@ -145,21 +145,21 @@ static size_t writeMemberAccessions(MemberAccession *memberAccessions, size_t ac
 
 static std::string readMemberAccessions(const std::string &sortedByMemberIndex, const std::string &sortedByMember, DBReader<DBKeyType> &headers, const std::vector<size_t> &nodeKeyOffsets,
                                         const std::vector<size_t> &tsvKeyOffsets, size_t memoryLimit, const std::string &sortedByRep) {
-    std::vector<MMseqsNode::ExchangeBlock> memberBlocks;
+    std::vector<MMseqsNode::ExchangeReader> memberBlocks;
     std::vector<FILE *> memberFiles;
     MMseqsNode::openExchange(sortedByMemberIndex, sortedByMember, memberBlocks, memberFiles);
 
     const size_t localFirstKey = nodeKeyOffsets[MMseqsNode::rank];
     const size_t localEndKey = nodeKeyOffsets[MMseqsNode::rank + 1];
     // a key also holds its name offset in the read buffer and in the split
-    const size_t keyBytes = headers.getNamesSize(localFirstKey, localEndKey) / std::max<size_t>(1, localEndKey - localFirstKey) + sizeof(uint64_t) + sizeof(size_t);
+    const size_t keyBytes = headers.getNamesBytes(localFirstKey, localEndKey) / std::max<size_t>(1, localEndKey - localFirstKey) + sizeof(uint64_t) + sizeof(size_t);
     const size_t splitKeys = std::max<size_t>(1, memoryLimit / 8 / keyBytes);
     // the average sizes the first candidate; uneven names must still fit the split
     std::vector<size_t> splitKeyOffsets(1, localFirstKey);
     while (splitKeyOffsets.back() < localEndKey) {
         const size_t keyBegin = splitKeyOffsets.back();
         size_t keyEnd = keyBegin + std::min(splitKeys, localEndKey - keyBegin);
-        while (keyEnd - keyBegin > 1 && headers.getNamesSize(keyBegin, keyEnd) + (keyEnd - keyBegin) * (sizeof(uint64_t) + sizeof(size_t)) > memoryLimit / 8) {
+        while (keyEnd - keyBegin > 1 && headers.getNamesBytes(keyBegin, keyEnd) + (keyEnd - keyBegin) * (sizeof(uint64_t) + sizeof(size_t)) > memoryLimit / 8) {
             keyEnd = keyBegin + (keyEnd - keyBegin) / 2;
         }
         splitKeyOffsets.push_back(keyEnd);
@@ -190,7 +190,7 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
         }
         const ClusterPair splitLast = { static_cast<DBKeyType>(keyEnd - 1), static_cast<DBKeyType>(keyEnd - 1) };
         size_t pairCount;
-        while ((pairCount = MMseqsNode::readExchangeRange(memberBlocks, memoryLimit / 64, NULL, ClusterPair::compareByMember, splitLast, received, NULL, sortedByMember)) > 0) {
+        while ((pairCount = MMseqsNode::readExchangeRecordsUpTo(memberBlocks, memoryLimit / 64, NULL, ClusterPair::compareByMember, splitLast, received, NULL, sortedByMember)) > 0) {
             ClusterPair *pairs = reinterpret_cast<ClusterPair *>(received.data());
             SORT_PARALLEL(pairs, pairs + pairCount, ClusterPair::compareByMember);
             const size_t firstAccession = accessionCount;
@@ -237,7 +237,7 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
         }
     }
     const ClusterPair lastPair = { DB_KEY_INVALID, DB_KEY_INVALID };
-    if (MMseqsNode::readExchangeRange(memberBlocks, memoryLimit / 64, NULL, ClusterPair::compareByMember, lastPair, received, NULL, sortedByMember) > 0) {
+    if (MMseqsNode::readExchangeRecordsUpTo(memberBlocks, memoryLimit / 64, NULL, ClusterPair::compareByMember, lastPair, received, NULL, sortedByMember) > 0) {
         Debug(Debug::ERROR) << "Key " << reinterpret_cast<ClusterPair *>(received.data())->memberKey << " of the clustering is not in the sequence database\n";
         EXIT(EXIT_FAILURE);
     }
@@ -252,7 +252,7 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
 
 // returns the line count of the tsv
 static size_t writeRepresentativeEntries(const std::string &sortedByRepIndex, const std::string &sortedByRep, const std::string &tsv, const Parameters &par) {
-    std::vector<MMseqsNode::ExchangeBlock> repBlocks;
+    std::vector<MMseqsNode::ExchangeReader> repBlocks;
     std::vector<FILE *> repFiles;
     MMseqsNode::openExchange(sortedByRepIndex, sortedByRep, repBlocks, repFiles);
     const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
@@ -266,13 +266,13 @@ static size_t writeRepresentativeEntries(const std::string &sortedByRepIndex, co
     size_t memberAccessionCapacity = 0;
     std::vector<std::string> threadLines(par.threads);
     std::vector<size_t> threadLineOffsets(par.threads + 1);
-    const size_t writeBufferSize = std::min(MAX_READ_REQUEST_SIZE, std::max<size_t>(1, memoryLimit / 8 / par.threads));
+    const size_t writeBufferSize = std::min(MAX_READ_REQUEST_BYTES, std::max<size_t>(1, memoryLimit / 8 / par.threads));
     // the accession of the representative whose cluster the previous range ended in
     std::string repAccession;
     DBKeyType previousRepKey = DB_KEY_INVALID;
     size_t lineCount = 0;
     size_t recordCount;
-    while ((recordCount = MMseqsNode::readExchangeRange(repBlocks, memoryLimit / 8, memberAccessionSize, ClusterPair::compareByRep, lastPair, records, &recordOffsets, sortedByRep)) > 0) {
+    while ((recordCount = MMseqsNode::readExchangeRecordsUpTo(repBlocks, memoryLimit / 8, memberAccessionSize, ClusterPair::compareByRep, lastPair, records, &recordOffsets, sortedByRep)) > 0) {
         growBuffer(memberAccessions, memberAccessionCapacity, recordCount);
 #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < recordCount; i++) {
@@ -371,7 +371,7 @@ int createtsv(int argc, const char **argv, const Command &command) {
         }
         DBReader<DBKeyType> headers(par.hdr1.c_str(), (par.db1 + ".nodeinfo").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
         headers.open(DBReader<DBKeyType>::NOSORT);
-        const std::vector<size_t> nodeKeyOffsets = headers.getNodeKeyOffsets(MMseqsNode::count);
+        const std::vector<size_t> nodeKeyOffsets = headers.getEvenNodeKeyOffsets(MMseqsNode::count);
         std::string phaseValues;
         Timer timer;
         const std::string sortedByMember = par.db4 + "_by_member";

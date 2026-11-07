@@ -907,7 +907,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
         // a block per flush and data file type with the offsets of its bins in the data files, given in key order: by node, flush, then longer first
         std::vector<LengthBin> lengthToStart = getLengthToBin(localNodeStarts);
-        std::vector<std::vector<MMseqsNode::ExchangeBlock> > blocks(DATA_FILE_TYPES);
+        std::vector<std::vector<MMseqsNode::ExchangeReader> > blocks(DATA_FILE_TYPES);
         std::vector<std::vector<std::vector<std::pair<size_t, size_t> > > > blockBins(DATA_FILE_TYPES);
         // where the header offsets of a bin start in their data file, with where its headers start
         std::vector<std::pair<size_t, size_t> > headerOffsetBins;
@@ -920,7 +920,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 const bool isFlushStart = i == 0 || bins[i - 1].flush != bins[i].flush;
                 for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
                     if (isFlushStart) {
-                        const MMseqsNode::ExchangeBlock block = { exchangeFiles[node], bins[i].starts[fileType], bins[i].ends[fileType], std::vector<char>(), 0, 0, 0, 0, NULL, bins[i].starts[fileType] };
+                        const MMseqsNode::ExchangeReader block = { exchangeFiles[node], bins[i].starts[fileType], bins[i].ends[fileType], std::vector<char>(), 0, 0, 0, 0, NULL, bins[i].starts[fileType] };
                         blocks[fileType].push_back(block);
                         blockBins[fileType].push_back(std::vector<std::pair<size_t, size_t> >());
                     }
@@ -968,7 +968,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
             for (size_t windowBegin = 0; windowBegin != SIZE_MAX; ) {
                 segments.clear();
-                const size_t nextOffset = MMseqsNode::readExchangeSegments(blocks[fileType], blockBins[fileType], blockMemory, MAX_SEGMENT_SIZE, windowBegin, windowBegin + windowSize, window, segments, exchange);
+                const size_t nextOffset = MMseqsNode::readExchangeCompressionUnits(blocks[fileType], blockBins[fileType], blockMemory, MAX_SEGMENT_SIZE, windowBegin, windowBegin + windowSize, window, segments, exchange);
                 SORT_SERIAL(segments.begin(), segments.end());
                 if (fileType == HEADER_OFFSETS) {
 #pragma omp parallel for schedule(dynamic, 1)

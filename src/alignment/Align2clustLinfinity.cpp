@@ -986,7 +986,7 @@ struct RepTargetsReader {
         const size_t groupRangeCount = groupRangePartitionOffsets.size() - 1;
         const size_t splitCount = prefSplits.size();
         while (prefSplits.size() == splitCount) {
-            const size_t groupRange = (MMseqsNode::rank >= getFirstAlignNode()) ? groupRangeQueue.claimInOrder() : groupRangeCount;
+            const size_t groupRange = (MMseqsNode::rank >= getFirstAlignNode()) ? groupRangeQueue.takeNextItemInOrder() : groupRangeCount;
             if (groupRange == groupRangeCount) {
                 break;
             }
@@ -1088,8 +1088,8 @@ struct RepTargetsReader {
         MMseqsNode::addPhaseValue(phaseValues, "Claimed group ranges", SSTR(claimedGroupRanges) + " of " + SSTR(groupRangePartitionOffsets.size() - 1));
     }
 
-    size_t getOrderedClaims() const {
-        return groupRangeQueue.getOrderedClaims();
+    size_t getTakenItemCount() const {
+        return groupRangeQueue.getTakenItemCount();
     }
 
     const size_t maxRecordBytes;
@@ -1294,7 +1294,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<uint64_t> acceptedWords;
     DBKeyType loggedRepKey = DB_KEY_INVALID;
     const auto publishAccepted = [&](size_t repKey, size_t bytes) {
-        MMseqsNode::publishLog(acceptedHandle, acceptedFile, repKey, bytes, repTargetsReader.getOrderedClaims());
+        MMseqsNode::publishLog(acceptedHandle, acceptedFile, repKey, bytes, repTargetsReader.getTakenItemCount());
     };
 
     // the assigned bits of the keys that this node serves or that are in its group ranges, a page of bits from the first change of a key in it on; other keys read as not assigned
@@ -1873,8 +1873,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     if (isAhead == false) {
                         if (alignNodes > 1) {
                             FILE *requestHandle = FileUtil::openAndDelete(requestFiles[rank].c_str(), "w");
-                            MMseqsNode::writeExchangeSliceHeader(requestHandle, requestFiles[rank], requestFlushCount);
-                            size_t requestBytes = MMseqsNode::EXCHANGE_SLICE_HEADER_BYTES;
+                            MMseqsNode::writeExchangeFileHeader(requestHandle, requestFiles[rank], requestFlushCount);
+                            size_t requestBytes = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
                             for (unsigned int node = 0; node < nodes; node++) {
                                 requestLine[2 + node] = requestBytes;
                                 const size_t keyBegin = nextRequest->homeKeyOffsets[node];
@@ -1895,7 +1895,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             requestLine[0] = requestFlushCount++;
                             requestLine[1] = isLast;
                             requestLine[2 + nodes] = requestBytes;
-                            MMseqsNode::publishExchangeFlush(requestHandle, requestFiles[rank], requestBytes, requestIndexes[rank], requestLine);
+                            MMseqsNode::publishExchangeFile(requestHandle, requestFiles[rank], requestBytes, requestIndexes[rank], requestLine);
                         }
                         const size_t ownKey = nextRequest->homeKeyOffsets[rank];
                         copyEntries(nextRequest->keys.data() + ownKey, nextRequest->homeKeyOffsets[rank + 1] - ownKey, nextRequest->entryOffsets.data() + ownKey, nextRequest->data, NULL);
@@ -1926,7 +1926,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 continue;
                             }
                             Timer pollTimer;
-                            const size_t lineCount = MMseqsNode::readExchangeFlushes(servedIndexes[home], nodeServedFlushes[home], servedLineWords, servedLines);
+                            const size_t lineCount = MMseqsNode::readExchangeIndexLines(servedIndexes[home], nodeServedFlushes[home], servedLineWords, servedLines);
                             pollingSeconds += pollTimer.getTimediff();
                             if (lineCount == 0) {
                                 nextServedIndexPolls[home] = serviceClock.getTimediff() + pollMicroseconds / 1e6;
@@ -1956,7 +1956,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         uint64_t observedGeneration;
                         int lastError;
                         Timer openTimer;
-                        const int fd = MMseqsNode::tryOpenExchangeSlice(flushFile, flushFileBytes[home], sliceFlushes[home], lastDirectoryRefresh[home], observedBytes, observedGeneration, lastError);
+                        const int fd = MMseqsNode::tryOpenExchangeFile(flushFile, flushFileBytes[home], sliceFlushes[home], lastDirectoryRefresh[home], observedBytes, observedGeneration, lastError);
                         readingSeconds += openTimer.getTimediff();
                         if (fd < 0) {
                             if (lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
@@ -1991,8 +1991,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 const SliceRead &request = sliceReads[chunks[i].first];
                                 const size_t offset = chunks[i].second;
                                 int readError;
-                                if (MMseqsNode::tryReadExchangeSlice(request.fd, receivedSlices.data() + request.receivedOffset + offset, std::min(MMseqsNode::EXCHANGE_WRITE_BYTES, request.bytes - offset),
-                                                                     sliceBegins[request.home] + offset, readError) == false) {
+                                if (MMseqsNode::tryPreadAll(request.fd, receivedSlices.data() + request.receivedOffset + offset, std::min(MMseqsNode::EXCHANGE_WRITE_BYTES, request.bytes - offset),
+                                                            sliceBegins[request.home] + offset, readError) == false) {
                                     chunkErrors[i] = (readError != 0) ? readError : -1;
                                 }
                             }
@@ -2050,7 +2050,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     const unsigned int node = (rank + 1 + (i + pollTurn) % (nodes - 1)) % nodes;
                     while (servedRequests.size() < SERVICE_POLL_NODES && isRequesting[node] && isServing[node] == 0 && serviceClock.getTimediff() >= nextRequestIndexPolls[node]) {
                         Timer pollTimer;
-                        const bool hasLine = MMseqsNode::readExchangeFlushes(requestIndexes[node], nodeRequests[node], requestLine.size(), requestLine) == 1;
+                        const bool hasLine = MMseqsNode::readExchangeIndexLines(requestIndexes[node], nodeRequests[node], requestLine.size(), requestLine) == 1;
                         pollingSeconds += pollTimer.getTimediff();
                         if (hasLine == false) {
                             nextRequestIndexPolls[node] = serviceClock.getTimediff() + pollMicroseconds / 1e6;
@@ -2082,7 +2082,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 std::sort(servedRequests.begin(), servedRequests.end(), [](const ServedRequest &first, const ServedRequest &second) { return first.node < second.node; });
                 const size_t share = flushEntryBytes / std::max<size_t>(1, servedRequests.size());
                 for (size_t request = 0, node = 0; node < nodes && servedRequests.empty() == false; node++) {
-                    servedLine[1 + node] = MMseqsNode::EXCHANGE_SLICE_HEADER_BYTES + sliceBytes;
+                    servedLine[1 + node] = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + sliceBytes;
                     servedLine[nodes + 2 + node] = 0;
                     if (request == servedRequests.size() || servedRequests[request].node != node) {
                         continue;
@@ -2097,7 +2097,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     uint64_t observedGeneration;
                     int lastError;
                     Timer requestTimer;
-                    const int requestFd = MMseqsNode::tryOpenExchangeSlice(requestFiles[node], servedRequest.requestBytes, servedRequest.flush,
+                    const int requestFd = MMseqsNode::tryOpenExchangeFile(requestFiles[node], servedRequest.requestBytes, servedRequest.flush,
                                                                             lastRequestDirectoryRefresh[node], observedBytes, observedGeneration, lastError);
                     if (requestFd < 0 && lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
                         Debug(Debug::ERROR) << "Cannot open sequence request " << requestFiles[node] << ": " << strerror(lastError) << "\n";
@@ -2105,7 +2105,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                     bool readRequest = requestFd >= 0;
                     if (readRequest) {
-                        readRequest = MMseqsNode::tryReadExchangeSlice(requestFd, requestCodes.data(), codeBytes, servedRequest.codeOffset, lastError);
+                        readRequest = MMseqsNode::tryPreadAll(requestFd, requestCodes.data(), codeBytes, servedRequest.codeOffset, lastError);
                         if (close(requestFd) != 0 && readRequest) {
                             lastError = errno;
                             readRequest = false;
@@ -2199,7 +2199,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 }
                 if (flushSlices > 0) {
                     servedLine[0] = servedFlushCount;
-                    servedLine[1 + nodes] = MMseqsNode::EXCHANGE_SLICE_HEADER_BYTES + sliceBytes;
+                    servedLine[1 + nodes] = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + sliceBytes;
                     flushUnreadSlices[servedFlushCount] = flushSlices;
                     // one flush is written at a time, so the index lines stay in flush order
                     Timer waitTimer;
@@ -2211,8 +2211,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     const size_t writtenFlush = servedFlushCount;
                     flushWriter = std::thread([&, sliceBytes, servedLine, writtenFlush]() {
                         Timer writeTimer;
-                        MMseqsNode::writeExchangeFlush(served + "." + SSTR(rank) + "." + SSTR(writtenFlush), writtenFlush, writtenSlice.data(), sliceBytes,
-                                                       servedIndexes[rank], servedLine, serviceThreads);
+                        MMseqsNode::writeExchangeFile(served + "." + SSTR(rank) + "." + SSTR(writtenFlush), writtenFlush, writtenSlice.data(), sliceBytes,
+                                                      servedIndexes[rank], servedLine, serviceThreads);
                         writingSeconds += writeTimer.getTimediff();
                     });
                     servedFlushCount++;
@@ -3463,7 +3463,7 @@ int align2clustLinfinity(Parameters &par) {
     }
     DBReader<DBKeyType> seqDbr(seqDb.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
     seqDbr.open(DBReader<DBKeyType>::NOSORT);
-    const std::vector<size_t> nodeKeyOffsets = seqDbr.getNodeKeyOffsets(MMseqsNode::count);
+    const std::vector<size_t> nodeKeyOffsets = seqDbr.getEvenNodeKeyOffsets(MMseqsNode::count);
     const size_t dbSize = seqDbr.getSize();
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     // a copy on tmpfs holds the sequences in memory
@@ -3560,7 +3560,7 @@ int align2clustLinfinity(Parameters &par) {
     }
 
     // every node removes the claims of the group ranges rank, rank + count, ... that a killed run left before the barrier of the memory limits
-    groupRangeQueue.removeClaims();
+    groupRangeQueue.removeTakenItemFiles();
     // all nodes use the smallest memory limit besides the assigned bits, so they agree on the splits and fail together
     const size_t smallestMemoryLimit = MMseqsNode::getSmallestMemoryLimit(par.db3 + ".memory", nodeMemoryLimit - std::min(nodeMemoryLimit, assignedMemory));
     const size_t paddedDbSize = (dbSize + 63) / 64 * 64;
@@ -3643,7 +3643,7 @@ int align2clustLinfinity(Parameters &par) {
     size_t takenBytes;
     MMseqsNode::waitForLog(takenFile, takenKey, takenBytes);
     // every node has claimed its last group range before the master published the taken logs
-    groupRangeQueue.removeClaims();
+    groupRangeQueue.removeTakenItemFiles();
     if (MMseqsNode::isMaster()) {
         clusterThread.join();
         Debug(Debug::INFO) << "Number of clusters: " << representatives - memberCount << "\n";

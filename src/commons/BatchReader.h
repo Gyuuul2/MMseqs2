@@ -8,10 +8,10 @@
 #include <thread>
 #include <vector>
 
-// a read is split into requests of at most MAX_READ_REQUEST_SIZE at its multiples in the file
-static const size_t MAX_READ_REQUEST_SIZE = 16 * 1024 * 1024;
+// a read is split into requests of at most MAX_READ_REQUEST_BYTES at its multiples in the file
+static const size_t MAX_READ_REQUEST_BYTES = 16 * 1024 * 1024;
 // the largest read that is in flight at once: starting unaligned, it splits into 64 requests, the smallest io_uring queue (MIN_RING_DEPTH)
-static const size_t MAX_INFLIGHT_READ_SIZE = 63 * MAX_READ_REQUEST_SIZE;
+static const size_t MAX_INFLIGHT_READ_BYTES = 63 * MAX_READ_REQUEST_BYTES;
 
 #ifdef HAVE_IO_URING
 struct io_uring_sqe;
@@ -48,8 +48,8 @@ public:
     StorageKind getStorage() const {
         return storage;
     }
-    int getConcurrency() const {
-        return concurrencyRequests;
+    int getMaxInflightRequests() const {
+        return maxInflightRequests;
     }
 
 private:
@@ -57,7 +57,7 @@ private:
     void readWithPread();
 
     StorageKind storage;
-    int concurrencyRequests;
+    int maxInflightRequests;
     std::vector<ReadRequest> splitReadRequests;
     size_t nextSplitReadRequest;
     // errno of the first failed read, -1 for an unexpected end of file
@@ -69,13 +69,13 @@ private:
 
     std::thread ringThread;
     int ringFd;
-    bool ringWorkersLimited;
-    unsigned int inflightReadRequests;
+    bool isRingWorkerCountLimited;
+    unsigned int inflightReadRequestCount;
     unsigned int inflightReadLimit;
     char *ring;
-    size_t ringSize;
+    size_t ringBytes;
     io_uring_sqe *sqes;
-    size_t sqesSize;
+    size_t sqeBytes;
     unsigned int *sqHead;
     unsigned int *sqTail;
     unsigned int sqMask;
@@ -89,7 +89,7 @@ private:
 // write copies its bytes to a buffer and threads write the full buffers, sorted by file position, so the callers go on computing until all buffers wait for the storage
 class BatchWriter {
 public:
-    // memoryBytes: the buffers of BUFFER_SIZE, at least two, and one per write thread
+    // memoryBytes: the buffers of BUFFER_BYTES, at least two, and one per write thread
     BatchWriter(size_t memoryBytes, int maxIoThreads, int fdToDetectStorage);
     ~BatchWriter();
 
@@ -102,15 +102,15 @@ public:
     }
 
 private:
-    static const size_t BUFFER_SIZE = 64 * 1024 * 1024;
-    struct Piece {
+    static const size_t BUFFER_BYTES = 64 * 1024 * 1024;
+    struct WriteRequest {
         int fd;
         const char *fileName;
         size_t bufferOffset;
         size_t bytes;
         size_t fileOffset;
 
-        static bool compareByFile(const Piece &first, const Piece &second) {
+        static bool compareByFile(const WriteRequest &first, const WriteRequest &second) {
             return first.fd < second.fd || (first.fd == second.fd && first.fileOffset < second.fileOffset);
         }
     };
@@ -118,11 +118,11 @@ private:
         char *data;
         size_t bytes;
         // the callers that still copy to it
-        size_t copies;
-        std::vector<Piece> pieces;
+        size_t activeCopyCount;
+        std::vector<WriteRequest> writeRequests;
     };
     void queueCopiedBuffer(Buffer *buffer);
-    void writeBuffers(char *joinedPieces);
+    void writeBuffers(char *joinedWrites);
 
     char *memory;
     std::vector<Buffer> buffers;
@@ -130,7 +130,7 @@ private:
     std::deque<Buffer *> fullBuffers;
     Buffer *currentBuffer;
     // the buffers that are not free
-    size_t busyBuffers;
+    size_t busyBufferCount;
     bool isClosing;
     double waitSeconds;
     std::mutex bufferMutex;

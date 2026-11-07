@@ -88,7 +88,7 @@ IoMode getIoMode() {
 }
 
 // a read from Lustre or GPFS waits milliseconds on its server, so many are in flight; the servers of NFS take fewer
-static int storageConcurrency(StorageKind storage, int maxIoThreads) {
+static int getStorageMaxInflightRequests(StorageKind storage, int maxIoThreads) {
     const char *concurrency = getenv("MMSEQS_IO_CONCURRENCY");
     if (concurrency != NULL) {
         const int value = atoi(concurrency);
@@ -109,11 +109,11 @@ static int storageConcurrency(StorageKind storage, int maxIoThreads) {
 
 BatchReader::BatchReader(int maxIoThreads, int fdToDetectStorage) : nextSplitReadRequest(0), readError(0), readErrorFileName(NULL) {
     storage = getStorageKind(fdToDetectStorage);
-    concurrencyRequests = std::max(1, std::min(storageConcurrency(storage, maxIoThreads), maxIoThreads));
+    maxInflightRequests = std::max(1, std::min(getStorageMaxInflightRequests(storage, maxIoThreads), maxIoThreads));
 #ifdef HAVE_IO_URING
     ringFd = -1;
-    ringWorkersLimited = false;
-    inflightReadRequests = 0;
+    isRingWorkerCountLimited = false;
+    inflightReadRequestCount = 0;
     inflightReadLimit = MIN_RING_DEPTH;
     io_uring_params params;
     memset(&params, 0, sizeof(params));
@@ -135,16 +135,16 @@ BatchReader::BatchReader(int maxIoThreads, int fdToDetectStorage) : nextSplitRea
         close(fd);
         return;
     }
-    ringSize = std::max(params.sq_off.array + params.sq_entries * sizeof(unsigned int), params.cq_off.cqes + params.cq_entries * sizeof(io_uring_cqe));
-    ring = static_cast<char *>(mmap(NULL, ringSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING));
+    ringBytes = std::max(params.sq_off.array + params.sq_entries * sizeof(unsigned int), params.cq_off.cqes + params.cq_entries * sizeof(io_uring_cqe));
+    ring = static_cast<char *>(mmap(NULL, ringBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING));
     if (ring == MAP_FAILED) {
         close(fd);
         return;
     }
-    sqesSize = params.sq_entries * sizeof(io_uring_sqe);
-    sqes = static_cast<io_uring_sqe *>(mmap(NULL, sqesSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES));
+    sqeBytes = params.sq_entries * sizeof(io_uring_sqe);
+    sqes = static_cast<io_uring_sqe *>(mmap(NULL, sqeBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES));
     if (sqes == MAP_FAILED) {
-        munmap(ring, ringSize);
+        munmap(ring, ringBytes);
         close(fd);
         return;
     }
@@ -167,8 +167,8 @@ BatchReader::~BatchReader() {
     waitAsyncRead();
 #ifdef HAVE_IO_URING
     if (ringFd >= 0) {
-        munmap(sqes, sqesSize);
-        munmap(ring, ringSize);
+        munmap(sqes, sqeBytes);
+        munmap(ring, ringBytes);
         close(ringFd);
     }
 #endif
@@ -212,7 +212,7 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
         const size_t end = request.fileOffset + request.bytesToRead;
         const size_t minEnd = request.fileOffset + request.minBytesToRead;
         for (size_t at = request.fileOffset; at < minEnd;) {
-            const size_t next = std::min((at / MAX_READ_REQUEST_SIZE + 1) * MAX_READ_REQUEST_SIZE, end);
+            const size_t next = std::min((at / MAX_READ_REQUEST_BYTES + 1) * MAX_READ_REQUEST_BYTES, end);
             ReadRequest splitReadRequest = request;
             splitReadRequest.destination += at - request.fileOffset;
             splitReadRequest.fileOffset = at;
@@ -224,12 +224,12 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
     }
 #ifdef HAVE_IO_URING
     if (ringFd >= 0) {
-        if (ringWorkersLimited == false) {
-            unsigned int maxWorkers[2] = { static_cast<unsigned int>(concurrencyRequests), static_cast<unsigned int>(concurrencyRequests) };
+        if (isRingWorkerCountLimited == false) {
+            unsigned int maxWorkers[2] = { static_cast<unsigned int>(maxInflightRequests), static_cast<unsigned int>(maxInflightRequests) };
             // without a worker cap (Linux < 5.15) io-wq can start 4 workers per CPU
-            ringWorkersLimited = syscall(__NR_io_uring_register, ringFd, IORING_REGISTER_IOWQ_MAX_WORKERS, maxWorkers, 2) >= 0;
+            isRingWorkerCountLimited = syscall(__NR_io_uring_register, ringFd, IORING_REGISTER_IOWQ_MAX_WORKERS, maxWorkers, 2) >= 0;
         }
-        inflightReadLimit = ringWorkersLimited ? sqMask + 1 : MIN_RING_DEPTH;
+        inflightReadLimit = isRingWorkerCountLimited ? sqMask + 1 : MIN_RING_DEPTH;
         for (size_t i = 0; i < requests.size(); i++) {
             if (callingThreadReads && (fcntl(requests[i].fileToRead, F_GETFL) & O_DIRECT) == 0) {
                 inflightReadLimit = MIN_RING_DEPTH;
@@ -245,7 +245,7 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
         return;
     }
 #endif
-    const size_t preadThreadCount = std::min(static_cast<size_t>(concurrencyRequests), splitReadRequests.size());
+    const size_t preadThreadCount = std::min(static_cast<size_t>(maxInflightRequests), splitReadRequests.size());
     for (size_t i = callingThreadReads ? 1 : 0; i < preadThreadCount; i++) {
         preadThreads.emplace_back(&BatchReader::readWithPread, this);
     }
@@ -282,7 +282,7 @@ void BatchReader::readWithRing(bool waitForAll) {
     const size_t pageSize = Util::getPageSize();
     do {
         unsigned int tail = *sqTail;
-        for (; readError == 0 && nextSplitReadRequest < splitReadRequests.size() && inflightReadRequests < inflightReadLimit; nextSplitReadRequest++, inflightReadRequests++, tail++) {
+        for (; readError == 0 && nextSplitReadRequest < splitReadRequests.size() && inflightReadRequestCount < inflightReadLimit; nextSplitReadRequest++, inflightReadRequestCount++, tail++) {
             io_uring_sqe &sqe = sqes[tail & sqMask];
             memset(&sqe, 0, sizeof(sqe));
             sqe.opcode = IORING_OP_READ;
@@ -290,18 +290,18 @@ void BatchReader::readWithRing(bool waitForAll) {
             sqe.off = splitReadRequests[nextSplitReadRequest].fileOffset;
             sqe.addr = reinterpret_cast<unsigned long>(splitReadRequests[nextSplitReadRequest].destination);
             sqe.len = splitReadRequests[nextSplitReadRequest].bytesToRead;
-            sqe.flags = (splitReadRequests[nextSplitReadRequest].bytesToRead == MAX_READ_REQUEST_SIZE) ? IOSQE_ASYNC : 0;
+            sqe.flags = (splitReadRequests[nextSplitReadRequest].bytesToRead == MAX_READ_REQUEST_BYTES) ? IOSQE_ASYNC : 0;
             sqe.user_data = nextSplitReadRequest;
         }
         __atomic_store_n(sqTail, tail, __ATOMIC_RELEASE);
         const unsigned int toSubmit = tail - __atomic_load_n(sqHead, __ATOMIC_RELAXED);
-        const unsigned int toWait = (waitForAll && inflightReadRequests > 0) ? 1 : 0;
+        const unsigned int toWait = (waitForAll && inflightReadRequestCount > 0) ? 1 : 0;
         if (syscall(__NR_io_uring_enter, ringFd, toSubmit, toWait, IORING_ENTER_GETEVENTS, NULL, 0) < 0 && errno != EAGAIN && errno != EINTR) {
             Debug(Debug::ERROR) << "Cannot read with io_uring: " << strerror(errno) << "\n";
             EXIT(EXIT_FAILURE);
         }
         unsigned int head = *cqHead;
-        for (const unsigned int end = __atomic_load_n(cqTail, __ATOMIC_ACQUIRE); head != end; head++, inflightReadRequests--) {
+        for (const unsigned int end = __atomic_load_n(cqTail, __ATOMIC_ACQUIRE); head != end; head++, inflightReadRequestCount--) {
             const io_uring_cqe &cqe = cqes[head & cqMask];
             ReadRequest rest = splitReadRequests[cqe.user_data];
             if (cqe.res == -EAGAIN || cqe.res == -EINTR) {
@@ -325,27 +325,27 @@ void BatchReader::readWithRing(bool waitForAll) {
             }
         }
         __atomic_store_n(cqHead, head, __ATOMIC_RELEASE);
-    } while (waitForAll && (inflightReadRequests > 0 || (readError == 0 && nextSplitReadRequest < splitReadRequests.size())));
+    } while (waitForAll && (inflightReadRequestCount > 0 || (readError == 0 && nextSplitReadRequest < splitReadRequests.size())));
 }
 #endif
 
-const size_t BatchWriter::BUFFER_SIZE;
+const size_t BatchWriter::BUFFER_BYTES;
 
-BatchWriter::BatchWriter(size_t memoryBytes, int maxIoThreads, int fdToDetectStorage) : currentBuffer(NULL), busyBuffers(0), isClosing(false), waitSeconds(0) {
-    // a thread also has a buffer for the pieces that it joins, so the threads take half of the memory at most
-    const size_t threads = std::max<size_t>(1, std::min<size_t>(std::min(storageConcurrency(getStorageKind(fdToDetectStorage), maxIoThreads), maxIoThreads), memoryBytes / BUFFER_SIZE / 2));
-    const size_t bufferCount = std::max<size_t>(2, memoryBytes / BUFFER_SIZE - std::min(memoryBytes / BUFFER_SIZE, threads));
-    memory = new(std::nothrow) char[(bufferCount + threads) * BUFFER_SIZE];
+BatchWriter::BatchWriter(size_t memoryBytes, int maxIoThreads, int fdToDetectStorage) : currentBuffer(NULL), busyBufferCount(0), isClosing(false), waitSeconds(0) {
+    // a thread also has a buffer for the write requests that it joins, so the threads take half of the memory at most
+    const size_t threads = std::max<size_t>(1, std::min<size_t>(std::min(getStorageMaxInflightRequests(getStorageKind(fdToDetectStorage), maxIoThreads), maxIoThreads), memoryBytes / BUFFER_BYTES / 2));
+    const size_t bufferCount = std::max<size_t>(2, memoryBytes / BUFFER_BYTES - std::min(memoryBytes / BUFFER_BYTES, threads));
+    memory = new(std::nothrow) char[(bufferCount + threads) * BUFFER_BYTES];
     Util::checkAllocation(memory, "Can not allocate memory in BatchWriter");
     buffers.resize(bufferCount);
     for (size_t i = 0; i < bufferCount; i++) {
-        buffers[i].data = memory + i * BUFFER_SIZE;
+        buffers[i].data = memory + i * BUFFER_BYTES;
         buffers[i].bytes = 0;
-        buffers[i].copies = 0;
+        buffers[i].activeCopyCount = 0;
         freeBuffers.push_back(&buffers[i]);
     }
     for (size_t i = 0; i < threads; i++) {
-        writeThreads.emplace_back(&BatchWriter::writeBuffers, this, memory + (bufferCount + i) * BUFFER_SIZE);
+        writeThreads.emplace_back(&BatchWriter::writeBuffers, this, memory + (bufferCount + i) * BUFFER_BYTES);
     }
 }
 
@@ -359,13 +359,13 @@ BatchWriter::~BatchWriter() {
     for (size_t i = 0; i < writeThreads.size(); i++) {
         writeThreads[i].join();
     }
-    Util::releasePages(memory, (buffers.size() + writeThreads.size()) * BUFFER_SIZE);
+    Util::releasePages(memory, (buffers.size() + writeThreads.size()) * BUFFER_BYTES);
     delete[] memory;
 }
 
 // a buffer that takes no more bytes is written once all copies to it are done
 void BatchWriter::queueCopiedBuffer(Buffer *buffer) {
-    if (buffer != currentBuffer && buffer->copies == 0) {
+    if (buffer != currentBuffer && buffer->activeCopyCount == 0) {
         fullBuffers.push_back(buffer);
         fullCondition.notify_one();
     }
@@ -382,22 +382,22 @@ void BatchWriter::write(int fd, const char *fileName, const char *data, size_t b
         if (currentBuffer == NULL) {
             currentBuffer = freeBuffers.back();
             freeBuffers.pop_back();
-            busyBuffers++;
+            busyBufferCount++;
         }
         Buffer *buffer = currentBuffer;
         const size_t bufferOffset = buffer->bytes;
-        const size_t copyBytes = std::min(bytes - done, BUFFER_SIZE - bufferOffset);
-        const Piece piece = { fd, fileName, bufferOffset, copyBytes, fileOffset + done };
-        buffer->pieces.push_back(piece);
+        const size_t copyBytes = std::min(bytes - done, BUFFER_BYTES - bufferOffset);
+        const WriteRequest writeRequest = { fd, fileName, bufferOffset, copyBytes, fileOffset + done };
+        buffer->writeRequests.push_back(writeRequest);
         buffer->bytes += copyBytes;
-        buffer->copies++;
-        if (buffer->bytes == BUFFER_SIZE) {
+        buffer->activeCopyCount++;
+        if (buffer->bytes == BUFFER_BYTES) {
             currentBuffer = NULL;
         }
         lock.unlock();
         memcpy(buffer->data + bufferOffset, data + done, copyBytes);
         lock.lock();
-        buffer->copies--;
+        buffer->activeCopyCount--;
         queueCopiedBuffer(buffer);
         done += copyBytes;
     }
@@ -410,10 +410,10 @@ void BatchWriter::waitWrites() {
         currentBuffer = NULL;
         queueCopiedBuffer(buffer);
     }
-    freeCondition.wait(lock, [&]() { return busyBuffers == 0; });
+    freeCondition.wait(lock, [&]() { return busyBufferCount == 0; });
 }
 
-void BatchWriter::writeBuffers(char *joinedPieces) {
+void BatchWriter::writeBuffers(char *joinedWrites) {
     std::unique_lock<std::mutex> lock(bufferMutex);
     while (true) {
         fullCondition.wait(lock, [&]() { return fullBuffers.empty() == false || isClosing; });
@@ -423,28 +423,28 @@ void BatchWriter::writeBuffers(char *joinedPieces) {
         Buffer *buffer = fullBuffers.front();
         fullBuffers.pop_front();
         lock.unlock();
-        std::vector<Piece> &pieces = buffer->pieces;
-        SORT_SERIAL(pieces.begin(), pieces.end(), Piece::compareByFile);
-        // the pieces that follow each other in their file are one write
-        for (size_t first = 0, last = 0; first < pieces.size(); first = last) {
+        std::vector<WriteRequest> &writeRequests = buffer->writeRequests;
+        SORT_SERIAL(writeRequests.begin(), writeRequests.end(), WriteRequest::compareByFile);
+        // the write requests that follow each other in their file are one write
+        for (size_t first = 0, last = 0; first < writeRequests.size(); first = last) {
             size_t joinedBytes = 0;
-            for (last = first; last < pieces.size() && pieces[last].fd == pieces[first].fd && pieces[last].fileOffset == pieces[first].fileOffset + joinedBytes; last++) {
-                joinedBytes += pieces[last].bytes;
+            for (last = first; last < writeRequests.size() && writeRequests[last].fd == writeRequests[first].fd && writeRequests[last].fileOffset == writeRequests[first].fileOffset + joinedBytes; last++) {
+                joinedBytes += writeRequests[last].bytes;
             }
-            const char *writeData = buffer->data + pieces[first].bufferOffset;
+            const char *writeData = buffer->data + writeRequests[first].bufferOffset;
             if (last > first + 1) {
-                writeData = joinedPieces;
-                for (size_t piece = first, joinedPos = 0; piece < last; joinedPos += pieces[piece].bytes, piece++) {
-                    memcpy(joinedPieces + joinedPos, buffer->data + pieces[piece].bufferOffset, pieces[piece].bytes);
+                writeData = joinedWrites;
+                for (size_t request = first, joinedPos = 0; request < last; joinedPos += writeRequests[request].bytes, request++) {
+                    memcpy(joinedWrites + joinedPos, buffer->data + writeRequests[request].bufferOffset, writeRequests[request].bytes);
                 }
             }
-            FileUtil::pwriteAll(pieces[first].fd, pieces[first].fileName, writeData, joinedBytes, pieces[first].fileOffset);
+            FileUtil::pwriteAll(writeRequests[first].fd, writeRequests[first].fileName, writeData, joinedBytes, writeRequests[first].fileOffset);
         }
-        pieces.clear();
+        writeRequests.clear();
         buffer->bytes = 0;
         lock.lock();
         freeBuffers.push_back(buffer);
-        busyBuffers--;
+        busyBufferCount--;
         freeCondition.notify_all();
     }
 }

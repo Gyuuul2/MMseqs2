@@ -1357,7 +1357,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                         size_t representativeBitsMemory, std::vector<size_t> &sendRanges, std::string &sendValues, OwnKmers &ownKmers) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     const float kmersPerSequenceScale = par.kmersPerSequenceScale.values.aminoacid();
-    const size_t readChunkBytes = std::min(MAX_INFLIGHT_READ_SIZE, exchange.loadMemoryLimit / 4);
+    const size_t readChunkBytes = std::min(MAX_INFLIGHT_READ_BYTES, exchange.loadMemoryLimit / 4);
     // a load spans so few keys that their ids fit next to the whole sequence bit, the hash and the adjKey
     const size_t loadKeyLimit = (1ULL << (128 - 1 - 64 - exchange.adjKeyBits)) - 1;
     const std::string kmerFile = par.db2 + ".kmers." + SSTR(MMseqsNode::rank);
@@ -1376,7 +1376,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
     KmerPositionBit *hashSeqPair = NULL;
     size_t hashSeqPairCapacity = 0;
     std::vector<char> isOwnLoadHashRange(exchange.hashRangeCount);
-    for (size_t sendRange = sendQueue.claimNext(); sendRange < exchange.sendRangeCount; sendRange = sendQueue.claimNext()) {
+    for (size_t sendRange = sendQueue.takeNextItem(); sendRange < exchange.sendRangeCount; sendRange = sendQueue.takeNextItem()) {
         sendRanges.push_back(sendRange);
         setSendRange(par, exchange, sendRange);
         const size_t dbFrom = exchange.sendRangeKeyOffsets[sendRange];
@@ -1838,7 +1838,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     // the hash ranges of the own rows first, which this node took while sending
     size_t ownHashRanges = 0;
     const auto takeHashRange = [&]() {
-        return (ownHashRanges < ownKmers.hashRanges.size()) ? ownKmers.hashRanges[ownHashRanges++] : hashQueue.claimNext();
+        return (ownHashRanges < ownKmers.hashRanges.size()) ? ownKmers.hashRanges[ownHashRanges++] : hashQueue.takeNextItem();
     };
     ReceivedHashRange receivedHashRanges[2];
     size_t hashRange = takeHashRange();
@@ -2416,7 +2416,7 @@ static std::string mergeAssignedPairs(Parameters &par, DBReader<DBKeyType> &seqD
                 ownPairs.bytes = 0;
                 receivedPairFiles[MMseqsNode::count].data = NULL;
             }
-            const size_t item = mergeQueue.claimNext();
+            const size_t item = mergeQueue.takeNextItem();
             if (item == mergeSplitCount) {
                 break;
             }
@@ -2820,9 +2820,9 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     MMseqsNode::WorkQueue sendQueue(par.db2 + ".send_ranges", exchange.sendRangeCount);
     MMseqsNode::WorkQueue hashQueue(par.db2 + ".hash_ranges", exchange.hashRangeCount);
     MMseqsNode::WorkQueue mergeQueue(par.db2 + ".merge_splits", exchange.sendRangeCount);
-    sendQueue.removeClaims();
-    hashQueue.removeClaims();
-    mergeQueue.removeClaims();
+    sendQueue.removeTakenItemFiles();
+    hashQueue.removeTakenItemFiles();
+    mergeQueue.removeTakenItemFiles();
     const size_t minPassLimit = std::max<size_t>(1, getPassLimit(MMseqsNode::getSmallestMemoryLimit(par.db2 + ".memory", memoryLimit, par.threads)));
     const size_t passes = std::max<size_t>(1, (globalKmers * receiverKmerBytes + minPassLimit - 1) / minPassLimit);
     // a pass holds about CHUNKS_PER_THREAD hash sub ranges per thread, so the threads take whole hash sub ranges without decoding a row to cut it
@@ -2858,9 +2858,9 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         Debug(Debug::INFO) << "Send k-mers in " << exchange.sendRangeCount << " ranges\n";
     }
     const size_t sentBytes = sendKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, sendQueue, representativeBitsMemory, sendRanges, sendValues, ownKmers);
-    // no node takes hash ranges before the barrier, so claimNext takes the first own hash ranges in order
+    // no node takes hash ranges before the barrier, so takeNextItem takes the first own hash ranges in order
     for (size_t i = 0; i < ownKmers.hashRanges.size(); i++) {
-        hashQueue.claimNext();
+        hashQueue.takeNextItem();
     }
     MMseqsNode::addPhaseTime(sendValues, "sending k-mers", phaseTimer);
     MMseqsNode::addPhaseValue(sendValues, "K-mer bytes sent", SSTR(sentBytes + ownKmers.bytes));
@@ -2870,7 +2870,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     MMseqsNode::barrier(par.db2 + ".kmers.done");
     const double sendWaitSeconds = phaseTimer.getTimediff();
     // every node has passed the send ranges
-    sendQueue.removeClaims();
+    sendQueue.removeTakenItemFiles();
     // every node has read the memory limits
     if (MMseqsNode::isMaster()) {
         FileUtil::remove((par.db2 + ".memory").c_str());
@@ -2895,7 +2895,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     std::string mergeValues;
     MMseqsNode::addPhaseTime(mergeValues, "waiting for the other nodes to receive k-mers", phaseTimer);
     // every node has passed the hash ranges and read the k-mer file of this node
-    hashQueue.removeClaims();
+    hashQueue.removeTakenItemFiles();
     // freeing the blocks and cached pages of a large k-mer file takes long, so it is removed while the pairs are merged
     const std::string kmerFile = par.db2 + ".kmers." + SSTR(MMseqsNode::rank);
     std::thread kmerFileRemoval([&kmerFile]() { FileUtil::remove(kmerFile.c_str()); });
@@ -2923,7 +2923,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         MMseqsNode::publishRunFile(par.db2 + ".merged", "");
         std::thread pairFileRemoval([&pairFile]() { FileUtil::remove(pairFile.c_str()); });
         MMseqsNode::printPhaseValues(mergeWaitValues);
-        mergeQueue.removeClaims();
+        mergeQueue.removeTakenItemFiles();
         FileUtil::remove((par.db2 + ".pairs.done").c_str());
         // the partition rows of all nodes are sorted by key
         std::vector<std::pair<size_t, char *> > partitionRows;
@@ -2943,7 +2943,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         // the master publishes this once every node has merged, so no node takes merge ranges or reads the pair file of this node any more
         MMseqsNode::waitForRunFile(par.db2 + ".merged");
         MMseqsNode::removeOnceRead(par.db2 + ".merged");
-        mergeQueue.removeClaims();
+        mergeQueue.removeTakenItemFiles();
         FileUtil::remove(pairFile.c_str());
     }
 }

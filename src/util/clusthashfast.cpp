@@ -317,7 +317,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         const DBReader<DBKeyType>::Index *index = reader.getIndex();
         size_t endOffset = 0;
         for (size_t range = 0; range < reader.getIndexSize(); range++) {
-            if (reader.getIndexFile(range) == MMseqsNode::rank) {
+            if (reader.getRangeDataFile(range) == MMseqsNode::rank) {
                 nodeSeqRange.push_back({index[range].id, index[range].offset, index[range].length});
                 endOffset = index[range].offset + (endKey - index[range].id) * index[range].length;
             }
@@ -370,7 +370,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
 
     // consecutive lengths that fit together are loaded at once;
     // a length that does not fit is loaded alone: a linfinity length is read one read chunk at a time to hash it and once per block of candidates, a standard DB length once per hash range that fits, after 2 bits per key
-    const size_t readChunkBytes = std::min(MAX_INFLIGHT_READ_SIZE, splitMemoryLimit / 4);
+    const size_t readChunkBytes = std::min(MAX_INFLIGHT_READ_BYTES, splitMemoryLimit / 4);
     const size_t seqBufferLimit = isLinfinity ? splitMemoryLimit / 3 : 0;
     const size_t hashIdPairsLimit = splitMemoryLimit - 2 * seqBufferLimit;
     std::vector<size_t> hashIdPairsCapacity(nodeSeqRange.size() - 1, 0);
@@ -380,7 +380,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         const size_t lengthBytes = (isLinfinity ? nodeSeqRange[i + 1].offset - nodeSeqRange[i].offset : 0) + lengthSeqCount * sizeof(HashEntry);
         if (lengthBytes > splitMemoryLimit) {
             const size_t readChunkSeqCount = isLinfinity ? std::min(readChunkBytes / nodeSeqRange[i].entryLength / 64 * 64, lengthSeqCount) : 0;
-            const size_t readChunkBufferBytes = 2 * reader.getBufferSizeToLoad(nodeSeqRange[i].startKey, nodeSeqRange[i].startKey + readChunkSeqCount);
+            const size_t readChunkBufferBytes = 2 * reader.getLoadBufferBytes(nodeSeqRange[i].startKey, nodeSeqRange[i].startKey + readChunkSeqCount);
             const size_t keptBytes = isLinfinity ? (lengthSeqCount / 64 + 1) * sizeof(MemberBits) : lengthSeqCount / 4;
             const size_t hashBytes = sizeof(HashEntry) + (isLinfinity ? nodeSeqRange[i].entryLength - 2 : 0);
             // a split linfinity length keeps a pair for every member to write its clusters in key order
@@ -496,7 +496,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                 if (readChunkEnd == loadFirstKey + loadSeqCount && isLinfinity && load + 2 < loadOffsets.size() && hashIdPairsCapacity[loadOffsets[load + 1]] == 0) {
                     const size_t nextLoadFirstKey = nodeSeqRange[loadOffsets[load + 1]].startKey;
                     const size_t nextLoadEndKey = nodeSeqRange[loadOffsets[load + 2]].startKey;
-                    prefetchesNextLoad = reader.getBufferSizeToPrefetch(nextLoadFirstKey, nextLoadEndKey) + std::max(hashIdPairsSize, nextLoadEndKey - nextLoadFirstKey) * sizeof(HashEntry) <= splitMemoryLimit;
+                    prefetchesNextLoad = reader.getPrefetchBufferBytes(nextLoadFirstKey, nextLoadEndKey) + std::max(hashIdPairsSize, nextLoadEndKey - nextLoadFirstKey) * sizeof(HashEntry) <= splitMemoryLimit;
                     if (prefetchesNextLoad) {
                         reader.prefetchData(nextLoadFirstKey, nextLoadEndKey);
                     }
@@ -616,7 +616,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     }
                 }
                 if (isLinfinity) {
-                    MMseqsNode::writeClusterThreadParts(resultDataFile, resultDb, resultIndexFile, resultIndex, threadData, threadEntries, resultDataBytes, resultIndexBytes);
+                    MMseqsNode::writeClusterThreadEntries(resultDataFile, resultDb, resultIndexFile, resultIndex, threadData, threadEntries, resultDataBytes, resultIndexBytes);
                     continue;
                 }
                 for (int thread = 0; thread < par.threads; thread++) {
@@ -669,7 +669,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                         data.push_back('\0');
                     }
                 }
-                MMseqsNode::writeClusterThreadParts(resultDataFile, resultDb, resultIndexFile, resultIndex, threadData, threadEntries, resultDataBytes, resultIndexBytes);
+                MMseqsNode::writeClusterThreadEntries(resultDataFile, resultDb, resultIndexFile, resultIndex, threadData, threadEntries, resultDataBytes, resultIndexBytes);
             }
             Util::releasePages(loadPairs, loadSeqCount * sizeof(ClusterPair));
             delete[] loadPairs;

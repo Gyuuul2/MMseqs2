@@ -574,7 +574,7 @@ std::string FileUtil::sanitizeFilename(std::string name){
 }
 
 // the bytes copied at once by a thread
-static const size_t LOCAL_COPY_CHUNK = 64 * 1024 * 1024;
+static const size_t LOCAL_COPY_IO_BYTES = 64 * 1024 * 1024;
 // shared storage serves this many large reads of a copy at once
 static const int LOCAL_COPY_THREADS = 64;
 
@@ -594,7 +594,7 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
     size_t totalBytes = 0;
     for (size_t i = 0; i < dataFiles.size(); i++) {
         fileBytes[i] = getFileSize(dataFiles[i]);
-        for (size_t offset = 0; offset < fileBytes[i]; offset += LOCAL_COPY_CHUNK) {
+        for (size_t offset = 0; offset < fileBytes[i]; offset += LOCAL_COPY_IO_BYTES) {
             chunks.emplace_back(i, offset);
         }
         totalBytes += fileBytes[i];
@@ -620,11 +620,11 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
     memoryBytes = (getStorageKind(copyFds[0]) == STORAGE_MEMORY) ? totalBytes : 0;
 #pragma omp parallel num_threads(std::max(1, std::min(threads, LOCAL_COPY_THREADS)))
     {
-        std::vector<char> buffer(LOCAL_COPY_CHUNK);
+        std::vector<char> buffer(LOCAL_COPY_IO_BYTES);
 #pragma omp for schedule(dynamic, 1)
         for (size_t i = 0; i < chunks.size(); i++) {
             const size_t file = chunks[i].first;
-            const size_t bytes = std::min(LOCAL_COPY_CHUNK, fileBytes[file] - chunks[i].second);
+            const size_t bytes = std::min(LOCAL_COPY_IO_BYTES, fileBytes[file] - chunks[i].second);
             preadAll(sourceFds[file], dataFiles[file].c_str(), buffer.data(), bytes, chunks[i].second);
             pwriteAll(copyFds[file], copies[file].c_str(), buffer.data(), bytes, chunks[i].second);
         }

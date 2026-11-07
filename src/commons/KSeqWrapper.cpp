@@ -169,32 +169,32 @@ namespace KSEQZSTD {
         while (output.pos == 0) {
             if (file->input.pos == file->input.size) {
                 size_t readSize = ZSTD_DStreamInSize();
-                if (file->position < file->end) {
-                    readSize = std::min(readSize, file->end - file->position);
-                } else if (file->outputEnd == SIZE_MAX) {
+                if (file->compressedOffset < file->compressedEndOffset) {
+                    readSize = std::min(readSize, file->compressedEndOffset - file->compressedOffset);
+                } else if (file->decompressedEndOffset == SIZE_MAX) {
                     readSize = 0;
                 }
                 file->input.size = fread((void*) file->input.src, sizeof(char), readSize, file->file);
                 file->input.pos = 0;
-                file->position += file->input.size;
-                if (file->input.size == 0 && file->toRead == 0 && ferror(file->file) == 0) {
+                file->compressedOffset += file->input.size;
+                if (file->input.size == 0 && file->readHintBytes == 0 && ferror(file->file) == 0) {
                     break;
                 }
             }
-            file->toRead = ZSTD_decompressStream(file->dstream, &output, &file->input);
-            if (ZSTD_isError(file->toRead)) {
-                Debug(Debug::ERROR) << "ZSTD_decompressStream " << ZSTD_getErrorName(file->toRead) << "\n";
+            file->readHintBytes = ZSTD_decompressStream(file->dstream, &output, &file->input);
+            if (ZSTD_isError(file->readHintBytes)) {
+                Debug(Debug::ERROR) << "ZSTD_decompressStream " << ZSTD_getErrorName(file->readHintBytes) << "\n";
                 EXIT(EXIT_FAILURE);
             }
             if (file->input.size == 0 && output.pos == 0) {
                 Debug(Debug::ERROR) << "Cannot read truncated zstd input\n";
                 EXIT(EXIT_FAILURE);
             }
-            if (file->outputEnd == SIZE_MAX && file->position >= file->end && file->input.pos == file->input.size && file->toRead == 0) {
-                file->outputEnd = file->outputPosition + output.pos;
+            if (file->decompressedEndOffset == SIZE_MAX && file->compressedOffset >= file->compressedEndOffset && file->input.pos == file->input.size && file->readHintBytes == 0) {
+                file->decompressedEndOffset = file->decompressedOffset + output.pos;
             }
         }
-        file->outputPosition += output.pos;
+        file->decompressedOffset += output.pos;
         return output.pos;
     }
 
@@ -202,14 +202,14 @@ namespace KSEQZSTD {
 
     // the first pzstd frame that starts from pos to limit, a skippable frame { ZSTD_MAGIC_SKIPPABLE_START, 4, size } then a zstd frame of size bytes, followed by the next such frame or the file end; limit if none
     static size_t findFrame(FILE *file, const char *fileName, size_t pos, size_t limit) {
-        const size_t fileSize = FileUtil::getFileSize(fileName);
-        limit = std::min(limit, fileSize);
-        const size_t scanSize = 1024 * 1024;
-        std::vector<char> buffer(scanSize + 4 * sizeof(uint32_t));
-        for (; pos < limit; pos += scanSize) {
-            const size_t bytes = std::min(buffer.size(), fileSize - pos);
+        const size_t fileBytes = FileUtil::getFileSize(fileName);
+        limit = std::min(limit, fileBytes);
+        const size_t scanBytes = 1024 * 1024;
+        std::vector<char> buffer(scanBytes + 4 * sizeof(uint32_t));
+        for (; pos < limit; pos += scanBytes) {
+            const size_t bytes = std::min(buffer.size(), fileBytes - pos);
             FileUtil::preadAll(fileno(file), fileName, buffer.data(), bytes, pos);
-            for (size_t i = 0; i < scanSize && pos + i < limit && i + 4 * sizeof(uint32_t) <= bytes; i++) {
+            for (size_t i = 0; i < scanBytes && pos + i < limit && i + 4 * sizeof(uint32_t) <= bytes; i++) {
                 uint32_t header[4];
                 memcpy(header, buffer.data() + i, sizeof(header));
                 if (header[0] != ZSTD_MAGIC_SKIPPABLE_START || header[1] != 4 || header[3] != ZSTD_MAGICNUMBER) {
@@ -217,10 +217,10 @@ namespace KSEQZSTD {
                 }
                 const size_t next = pos + i + 3 * sizeof(uint32_t) + header[2];
                 uint32_t nextHeader[2] = {0, 0};
-                if (next + sizeof(nextHeader) <= fileSize) {
+                if (next + sizeof(nextHeader) <= fileBytes) {
                     FileUtil::preadAll(fileno(file), fileName, reinterpret_cast<char *>(nextHeader), sizeof(nextHeader), next);
                 }
-                if (next == fileSize || (nextHeader[0] == ZSTD_MAGIC_SKIPPABLE_START && nextHeader[1] == 4)) {
+                if (next == fileBytes || (nextHeader[0] == ZSTD_MAGIC_SKIPPABLE_START && nextHeader[1] == 4)) {
                     return pos + i;
                 }
             }
@@ -231,7 +231,7 @@ namespace KSEQZSTD {
 
 KSeqZstd::KSeqZstd(const char* fileName, size_t start, size_t end) {
     file.file = FileUtil::openFileOrDie(fileName, "r", true);
-    // a piece of a pzstd file holds the frames that start from its start to its end, so a piece without one is empty and its scan stops at its end
+    // an input split of a pzstd file holds the frames that start from its start to its end, so a split without one is empty and its scan stops at its end
     if (start > 0) {
         start = KSEQZSTD::findFrame(file.file, fileName, start, end);
     }
@@ -250,11 +250,11 @@ KSeqZstd::KSeqZstd(const char* fileName, size_t start, size_t end) {
     file.input.src = malloc(ZSTD_DStreamInSize());
     file.input.size = 0;
     file.input.pos = 0;
-    file.toRead = 0;
-    file.position = start;
-    file.end = end;
-    file.outputPosition = 0;
-    file.outputEnd = SIZE_MAX;
+    file.readHintBytes = 0;
+    file.compressedOffset = start;
+    file.compressedEndOffset = end;
+    file.decompressedOffset = 0;
+    file.decompressedEndOffset = SIZE_MAX;
     seq = (void*) KSEQZSTD::kseq_init(&file);
     type = KSEQ_ZSTD;
     if (start > 0) {
@@ -266,7 +266,7 @@ KSeqZstd::KSeqZstd(const char* fileName, size_t start, size_t end) {
 
 bool KSeqZstd::ReadEntry() {
     KSEQZSTD::kseq_t* s = (KSEQZSTD::kseq_t*) seq;
-    if (KSEQZSTD::kseq_read(s) < 0 || s->headerOffset - 1 > file.outputEnd)
+    if (KSEQZSTD::kseq_read(s) < 0 || s->headerOffset - 1 > file.decompressedEndOffset)
         return false;
 
     entry.name = s->name;
