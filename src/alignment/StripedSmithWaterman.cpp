@@ -867,16 +867,16 @@ s_align SmithWaterman::ssw_align (
         const double  evalueThr,
         EvalueComputation * evaluer,
         const int covMode, const float covThr, const float correlationScoreWeight,
-        const int32_t maskLen, const s_align *forward, bool wordFirst) {
+        const int32_t maskLen, const s_align *forward, bool isWordFirst) {
     resizeTarget(db_length);
     s_align alignment;
     // check if both query and target are profiles
 	if (profile->isProfile) {
         alignment = ssw_align_private<SmithWaterman::PROFILE_SEQ>(db_num_sequence, db_length, backtrace, gap_open,
-                                                                  gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen, forward, wordFirst);
+                                                                  gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen, forward, isWordFirst);
     } else {
         alignment = ssw_align_private<SmithWaterman::SEQ_SEQ>(db_num_sequence, db_length, backtrace, gap_open,
-                                                              gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen, forward, wordFirst);
+                                                              gap_extend, alignmentMode, evalueThr, evaluer, covMode, covThr, correlationScoreWeight, maskLen, forward, isWordFirst);
     }
     return alignment;
 }
@@ -893,12 +893,12 @@ s_align SmithWaterman::ssw_align_private (
 	const double  evalueThr,
 	EvalueComputation * evaluer,
 	const int covMode, const float covThr, const float correlationScoreWeight,
-	const int32_t maskLen, const s_align *forward, bool wordFirst) {
+	const int32_t maskLen, const s_align *forward, bool isWordFirst) {
 
 	int32_t query_length = profile->query_length;
 
 	// find the alignment position, unless the forward pass of several targets at once (SWIPE) found it
-	s_align align = (forward != NULL) ? *forward : alignScoreEndPos<type>(db_sequence, db_length, gap_open, gap_extend, maskLen, wordFirst);
+	s_align align = (forward != NULL) ? *forward : alignScoreEndPos<type>(db_sequence, db_length, gap_open, gap_extend, maskLen, isWordFirst);
 	// SWIPE starts 16 bit lanes where the byte pass would not have overflowed
 	if (forward != NULL && align.word == 1 && align.score1 + profile->bias < UCHAR_MAX) {
 		align.word = 0;
@@ -953,7 +953,7 @@ s_align SmithWaterman::alignScoreEndPos (
 		const uint8_t gap_open,
 		const uint8_t gap_extend,
 		const int32_t maskLen,
-		bool wordFirst) {
+		bool isWordFirst) {
 	int32_t query_length = profile->query_length;
 
 	s_align r;
@@ -968,12 +968,12 @@ s_align SmithWaterman::alignScoreEndPos (
 	}
 	// 1. byte, unless the caller expects it to overflow
 	r.word = 0;
-	if (wordFirst == false) {
+	if (isWordFirst == false) {
 		bests = sw_sse2_byte<type>(db_sequence, 0, db_length, query_length, gap_open, gap_extend,
 					profile->profile_byte, UCHAR_MAX, profile->bias, maskLen, simdData);
 	}
 	// 2. word, with the byte result if the byte pass would not have overflowed
-	if (wordFirst || bests.first.score == 255) {
+	if (isWordFirst || bests.first.score == 255) {
 		bests = sw_sse2_word<type>(db_sequence, 0, db_length, query_length, gap_open, gap_extend,
                     profile->profile_word, INT16_MAX, maskLen, simdData);
         r.word = 1;

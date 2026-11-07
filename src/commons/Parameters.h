@@ -311,7 +311,7 @@ public:
     static const int DIAGONAL_MODE_UNGAPPED = 1;
 
     // aligner mode
-    static const int ALIGNER_MODE_DEFAULT = 0;
+    static const int ALIGNER_MODE_FARRAR = 0;
     static const int ALIGNER_MODE_SWIPE = 1;
 
     // rescorediagonal

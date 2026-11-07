@@ -2859,7 +2859,7 @@ void Parameters::setDefaults() {
     adjacencyAlphabetSize = 21;
     diagonalMode = DIAGONAL_MODE_KMER;
     align2clustAlignerMode = ALIGNER_MODE_SWIPE;
-    alignerMode = ALIGNER_MODE_DEFAULT;
+    alignerMode = ALIGNER_MODE_FARRAR;
     kmerPosFilter = true;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;

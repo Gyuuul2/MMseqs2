@@ -12,7 +12,7 @@
 
 #include <algorithm>
 
-// bestDiagonal: one lane per diagonal, 8-bit first, a group reruns in 16 bits if a lane may have saturated; the group width is the same on every ISA
+// computeBestDiagonal: one lane per diagonal, 8-bit first, a group reruns in 16 bits if a lane may have saturated; the group width is the same on every ISA
 static const int DIAG_GROUP = 6 * 2 * SSE_VECSIZE_INT;
 static const int DIAG_MAX_STEP = 8;
 static const int DIAG_MIN_SCORE = -2;
@@ -77,8 +77,8 @@ BlockAligner::BlockAligner(
             diagSubMatrix[a * subMat->alphabetSize + b] = static_cast<int8_t>(std::max(subMat->subMatrix[a][b], (short) DIAG_MIN_SCORE));
         }
     }
-    diagProfileStale = true;
-    diagProfileWordStale = true;
+    isDiagProfileStale = true;
+    isDiagWordProfileStale = true;
 }
 
 BlockAligner::~BlockAligner() {
@@ -108,7 +108,7 @@ void BlockAligner::initQuery(Sequence* query){
     querySeq = query->getSeqData();
     queryNumSeq = query->numSequence;
     queryLength = query->L;
-    diagProfileStale = true;
+    isDiagProfileStale = true;
     // the alignments only read the first queryLength positions of these buffers
     std::reverse_copy(queryNumSeq, queryNumSeq + queryLength, queryRevNumSeq);
     if (Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_AMINO_ACIDS)&& compBiasCorrection){
@@ -128,7 +128,7 @@ void BlockAligner::setQuery(Sequence* query){
     querySeq = query->getSeqData();
     queryNumSeq = query->numSequence;
     queryLength = query->L;
-    diagProfileStale = true;
+    isDiagProfileStale = true;
 }
 
 // note: traceback cigar string will be reversed, but UngappedAln_res will contain correct start and end positions
@@ -259,7 +259,7 @@ BlockAligner::UngappedAln_res BlockAligner::hammingDistance(
 
 
 template <typename T, int VectorCount = (DIAG_GROUP + VECSIZE_INT * 4 / sizeof(T) - 1) / (VECSIZE_INT * 4 / sizeof(T))>
-static void diagonalMaxScores(const T* queryProfile, const unsigned char* dbSequence, size_t profileStride, int j, int dbEnd, T* maxScores) {
+static void computeDiagonalMaxScores(const T* queryProfile, const unsigned char* dbSequence, size_t profileStride, int j, int dbEnd, T* maxScores) {
     const int vectorSize = VECSIZE_INT * 4 / sizeof(T);
     const int vectorCount = VectorCount;
     simd_int vScore[vectorCount], vMaxScore[vectorCount];
@@ -291,8 +291,8 @@ static void diagonalMaxScores(const T* queryProfile, const unsigned char* dbSequ
     }
 }
 
-// diagonalMaxScores<int8_t> of two adjacent groups in one pass
-static void diagonalMaxScoresTwoGroups(const int8_t* queryProfile, const unsigned char* dbSequence, size_t profileStride, int j, int dbEndSecond, int dbEnd, int8_t* maxScores) {
+// computeDiagonalMaxScores<int8_t> of two adjacent groups in one pass
+static void computeDiagonalMaxScoresTwoGroups(const int8_t* queryProfile, const unsigned char* dbSequence, size_t profileStride, int j, int dbEndSecond, int dbEnd, int8_t* maxScores) {
     const int vectorSize = VECSIZE_INT * 4;
     const int vectorCount = (2 * DIAG_GROUP + vectorSize - 1) / vectorSize;
     simd_int vScore[vectorCount], vMaxScore[vectorCount];
@@ -349,8 +349,8 @@ static void diagonalMaxScoresTwoGroups(const int8_t* queryProfile, const unsigne
     }
 }
 
-unsigned short BlockAligner::bestDiagonal(Sequence* currentTarget, int minDiag, int maxDiag) {
-    if (diagProfileStale) {
+unsigned short BlockAligner::computeBestDiagonal(Sequence* currentTarget, int minDiag, int maxDiag) {
+    if (isDiagProfileStale) {
         // locals, since the int8_t stores may alias the members
         const unsigned char* querySeq = queryNumSeq;
         const int queryLen = queryLength;
@@ -364,8 +364,8 @@ unsigned short BlockAligner::bestDiagonal(Sequence* currentTarget, int minDiag, 
             }
             std::fill(profileRow + 2 * DIAG_GROUP + queryLen, profileRow + diagProfileStride, DIAG_MIN_SCORE);
         }
-        diagProfileStale = false;
-        diagProfileWordStale = true;
+        isDiagProfileStale = false;
+        isDiagWordProfileStale = true;
     }
     const unsigned char* dbSequence = currentTarget->numSequence;
     const int dbLength = currentTarget->L;
@@ -382,9 +382,9 @@ unsigned short BlockAligner::bestDiagonal(Sequence* currentTarget, int minDiag, 
         const bool twoGroups = (d0 + DIAG_GROUP < endDiag) && ((dbStart - dbStartSecond) % DIAG_MAX_STEP == 0);
         if (twoGroups) {
             const int dbEndSecond = std::min(dbLength, queryLength - d0 - DIAG_GROUP);
-            diagonalMaxScoresTwoGroups(diagProfileByte + 2 * DIAG_GROUP + d0, dbSequence, diagProfileStride, dbStartSecond, dbEndSecond, dbEnd, maxScoresByte);
+            computeDiagonalMaxScoresTwoGroups(diagProfileByte + 2 * DIAG_GROUP + d0, dbSequence, diagProfileStride, dbStartSecond, dbEndSecond, dbEnd, maxScoresByte);
         } else {
-            diagonalMaxScores<int8_t>(diagProfileByte + 2 * DIAG_GROUP + d0, dbSequence, diagProfileStride, dbStart, dbEnd, maxScoresByte);
+            computeDiagonalMaxScores<int8_t>(diagProfileByte + 2 * DIAG_GROUP + d0, dbSequence, diagProfileStride, dbStart, dbEnd, maxScoresByte);
         }
         for (int group = 0; group < (twoGroups ? 2 : 1); group++, d0 += DIAG_GROUP) {
             const int8_t* groupMaxScores = maxScoresByte + group * DIAG_GROUP;
@@ -402,13 +402,13 @@ unsigned short BlockAligner::bestDiagonal(Sequence* currentTarget, int minDiag, 
             }
             const bool saturated = (saturatedVectors != 0);
             if (saturated) {
-                if (diagProfileWordStale) {
+                if (isDiagWordProfileStale) {
                     std::copy(diagProfileByte, diagProfileByte + subMat->alphabetSize * diagProfileStride, diagProfileWord);
-                    diagProfileWordStale = false;
+                    isDiagWordProfileStale = false;
                 }
                 for (int c = 0; (saturatedVectors >> c) != 0; c++) {
                     if ((saturatedVectors >> c) & 1) {
-                        diagonalMaxScores<int16_t, 1>(diagProfileWord + 2 * DIAG_GROUP + d0 + c * wordLanes, dbSequence, diagProfileStride,
+                        computeDiagonalMaxScores<int16_t, 1>(diagProfileWord + 2 * DIAG_GROUP + d0 + c * wordLanes, dbSequence, diagProfileStride,
                                                   groupDbBegin, groupDbEnd, maxScoresWord + c * wordLanes);
                     }
                 }

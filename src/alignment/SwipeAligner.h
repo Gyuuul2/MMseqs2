@@ -53,7 +53,7 @@ private:
     int queryLength;
     std::vector<unsigned char> query;
     std::vector<int8_t> bias;
-    float *tmpBias;
+    float *queryBiasBuffer;
 
     // minus the lowest score, and the bias that makes the 8 bit scores non-negative with the composition bias, as SSW profile->bias
     int matrixBias;
@@ -107,18 +107,18 @@ public:
     void extendBanded(size_t count, const size_t *queryIds, const unsigned char *const *targets, const int *targetLengths, const int *seedQueries,
                       const int *seedTargets, bool backward, int xDrop, int bandSide, s_align *aligns, std::string *backtraces);
 
-    int cellScore(size_t queryId, int queryPos, unsigned char targetLetter) const {
+    int getCellScore(size_t queryId, int queryPos, unsigned char targetLetter) const {
         const size_t position = queryOffsets[queryId] + queryPos;
         return subMat->subMatrix[queries[position]][targetLetter] + biases[position];
     }
 
     // the lane rows that extended a target and all lane rows, the same in 8 bit lanes, the extensions longer than the lane trace and the ones redone in 16 bit lanes
-    size_t extendLaneRows;
-    size_t extendSlotRows;
-    size_t extendByteLaneRows;
-    size_t extendByteSlotRows;
-    size_t extendLongJobs;
-    size_t extendRerunJobs;
+    size_t extensionActiveLaneRowCount;
+    size_t extensionTotalLaneRowCount;
+    size_t byteExtensionActiveLaneRowCount;
+    size_t byteExtensionTotalLaneRowCount;
+    size_t longExtensionCount;
+    size_t rerunExtensionCount;
 
 private:
     struct ExtendJob {
@@ -129,7 +129,7 @@ private:
         int left;
         int right;
         // in 16 bit lanes
-        bool wide;
+        bool isWordAlignment;
     };
 
     template <typename T>
@@ -150,7 +150,7 @@ private:
     std::vector<size_t> queryOffsets;
     std::vector<int> queryLengths;
     std::vector<int8_t> bias;
-    float *tmpBias;
+    float *queryBiasBuffer;
 
     // per query letter, the scores of the target letters 0-31
     int8_t *scoreRows;
