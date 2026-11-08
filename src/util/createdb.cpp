@@ -1253,9 +1253,11 @@ int createdb(int argc, const char **argv, const Command& command) {
         par.compressed = 0;
     }
 
-    if (par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH && par.compressHeaders) {
-        Debug(Debug::WARNING) << "Header compression can only be used with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << "\n";
-        Debug(Debug::WARNING) << "We recompute with --compress-headers 0\n";
+    if (par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) {
+        if (par.PARAM_COMPRESS_HEADERS.wasSet && par.compressHeaders) {
+            Debug(Debug::WARNING) << "Header compression can only be used with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << "\n";
+            Debug(Debug::WARNING) << "We recompute with --compress-headers 0\n";
+        }
         par.compressHeaders = 0;
     }
 

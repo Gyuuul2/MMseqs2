@@ -2676,7 +2676,7 @@ void Parameters::setDefaults() {
     createdbMode = SEQUENCE_SPLIT_MODE_HARD;
     shuffleDatabase = true;
     writeLookup = true;
-    compressHeaders = 0;
+    compressHeaders = 1;
 
     // format alignment
     formatAlignmentMode = FORMAT_ALIGNMENT_BLAST_TAB;
