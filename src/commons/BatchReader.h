@@ -96,10 +96,6 @@ public:
     void write(int fd, const char *fileName, const char *data, size_t bytes, size_t fileOffset);
     // no caller is in write; afterwards all bytes are written
     void waitWrites();
-    // the seconds that the callers of write waited for a buffer, summed over them
-    double getWaitSeconds() const {
-        return waitSeconds;
-    }
 
 private:
     static const size_t BUFFER_BYTES = 64 * 1024 * 1024;
@@ -132,7 +128,6 @@ private:
     // the buffers that are not free
     size_t busyBufferCount;
     bool isClosing;
-    double waitSeconds;
     std::mutex bufferMutex;
     std::condition_variable freeCondition;
     std::condition_variable fullCondition;

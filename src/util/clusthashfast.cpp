@@ -689,7 +689,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     if (isLinfinity) {
         std::string phaseValues;
         MMseqsNode::addPhaseTime(phaseValues, "hashing the sequences", timer);
-        MMseqsNode::addPhaseValue(phaseValues, "Sequences hashed", SSTR(localKeyCount));
         MMseqsNode::printPhaseValues(phaseValues);
         MMseqsNode::publishRunFile(par.db2 + ".phases." + SSTR(MMseqsNode::rank), "");
         MMseqsNode::closeClusterFiles(resultDataFile, resultDb, resultIndexFile, resultIndex, resultDataBytes, resultIndexBytes);

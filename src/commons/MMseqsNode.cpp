@@ -1606,7 +1606,7 @@ static size_t findMergedPairCount(const ClusterPair *pairs, size_t pairCount, co
     return low;
 }
 
-size_t MMseqsNode::writeClusterPairs(const std::string &index, const std::string &prefix, const std::string &clu, const uint64_t *singletonBits, size_t firstKey, size_t keyCount) {
+void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &prefix, const std::string &clu, const uint64_t *singletonBits, size_t firstKey, size_t keyCount) {
     const Parameters &par = Parameters::getInstance();
     std::vector<ExchangeReader> repReaders;
     std::vector<FILE *> repFiles;
@@ -1625,7 +1625,6 @@ size_t MMseqsNode::writeClusterPairs(const std::string &index, const std::string
     // (key, offset) of the entries that start in the part of a thread
     std::vector<std::vector<uint64_t> > threadEntries(par.threads);
     DBKeyType previousRepKey = DB_KEY_INVALID;
-    size_t lineCount = 0;
     // the keys go in splits, so the pairs of their singletons fit into memory
     const size_t splitKeys = std::max<size_t>(1, memoryLimit / 16 / sizeof(ClusterPair));
     const size_t keyEnd = firstKey + keyCount;
@@ -1718,7 +1717,6 @@ size_t MMseqsNode::writeClusterPairs(const std::string &index, const std::string
                 }
             }
             writeClusterThreadEntries(resultDataFile, resultDb, resultIndexFile, resultIndex, threadData, threadEntries, resultDataBytes, resultIndexBytes);
-            lineCount += writeCount;
             previousRepKey = getLastRepKey(pairCount, singletonCount);
         } while (pairCount > 0);
     }
@@ -1728,7 +1726,6 @@ size_t MMseqsNode::writeClusterPairs(const std::string &index, const std::string
     }
     closeClusterFiles(resultDataFile, resultDb, resultIndexFile, resultIndex, resultDataBytes, resultIndexBytes);
     closeExchangeFiles(repFiles, prefix);
-    return lineCount;
 }
 
 void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues) {

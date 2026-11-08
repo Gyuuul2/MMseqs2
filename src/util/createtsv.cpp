@@ -250,8 +250,7 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
     return MMseqsNode::closeExchange(sortedByRepHandle, sortedByRepFile, sortedByRep + ".index", sortedByRepIndexData);
 }
 
-// returns the line count of the tsv
-static size_t writeClusterTsvLines(const std::string &sortedByRepIndex, const std::string &sortedByRep, const std::string &tsv, const Parameters &par) {
+static void writeClusterTsvLines(const std::string &sortedByRepIndex, const std::string &sortedByRep, const std::string &tsv, const Parameters &par) {
     std::vector<MMseqsNode::ExchangeReader> repReaders;
     std::vector<FILE *> repFiles;
     MMseqsNode::openExchange(sortedByRepIndex, sortedByRep, repReaders, repFiles);
@@ -270,7 +269,6 @@ static size_t writeClusterTsvLines(const std::string &sortedByRepIndex, const st
     // the accession of the representative whose cluster the previous range ended in
     std::string repAccession;
     DBKeyType previousRepKey = DB_KEY_INVALID;
-    size_t lineCount = 0;
     size_t recordCount;
     while ((recordCount = MMseqsNode::readExchangeRecordsUpTo(repReaders, memoryLimit / 8, getMemberAccessionBytes, ClusterPair::compareByRep, lastPair, records, &recordOffsets, sortedByRep)) > 0) {
         growBuffer(memberAccessions, memberAccessionCapacity, recordCount);
@@ -339,7 +337,6 @@ static size_t writeClusterTsvLines(const std::string &sortedByRepIndex, const st
             }
         }
         tsvBytes = threadLineOffsets[par.threads];
-        lineCount += recordCount;
         previousRepKey = memberAccessions[recordCount - 1].repKey;
         const MemberAccession repLine = { previousRepKey, previousRepKey, 0, 0 };
         const size_t repLinePos = std::lower_bound(memberAccessions, memberAccessions + recordCount, repLine, MemberAccession::compareByRep) - memberAccessions;
@@ -354,7 +351,6 @@ static size_t writeClusterTsvLines(const std::string &sortedByRepIndex, const st
         EXIT(EXIT_FAILURE);
     }
     MMseqsNode::closeExchangeFiles(repFiles, sortedByRep);
-    return lineCount;
 }
 
 int createtsv(int argc, const char **argv, const Command &command) {
@@ -383,9 +379,8 @@ int createtsv(int argc, const char **argv, const Command &command) {
         headers.close();
         MMseqsNode::addPhaseTime(phaseValues, "sending the member accessions", timer);
         FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
-        const size_t tsvLineCount = writeClusterTsvLines(sortedByRepIndex, sortedByRep, par.db4, par);
+        writeClusterTsvLines(sortedByRepIndex, sortedByRep, par.db4, par);
         MMseqsNode::addPhaseTime(phaseValues, "writing the tsv", timer);
-        MMseqsNode::addPhaseValue(phaseValues, "Cluster lines written", SSTR(tsvLineCount));
         std::vector<std::string> exchanges;
         exchanges.push_back(sortedByMember);
         exchanges.push_back(sortedByRep);

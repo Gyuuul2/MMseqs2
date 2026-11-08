@@ -1072,7 +1072,6 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         MMseqsNode::addPhaseSeconds(phaseValues, "compressing the headers", compressSeconds);
     }
     MMseqsNode::addPhaseSeconds(phaseValues, "writing the sequences", timer.getTimediff() - compressSeconds);
-    MMseqsNode::addPhaseValue(phaseValues, "Bytes written", SSTR(dataFileBytes[SEQUENCE_DATA * MMseqsNode::count + MMseqsNode::rank] + headerDataBytes + dataFileBytes[HEADER_OFFSETS * MMseqsNode::count + MMseqsNode::rank] + sizeof(uint64_t)));
     MMseqsNode::removeExchanges(dataFile, exchange, std::vector<std::string>(1, exchange), phaseValues);
     if (MMseqsNode::isMaster()) {
         std::string sourceData;

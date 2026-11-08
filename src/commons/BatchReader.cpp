@@ -331,7 +331,7 @@ void BatchReader::readWithRing(bool waitForAll) {
 
 const size_t BatchWriter::BUFFER_BYTES;
 
-BatchWriter::BatchWriter(size_t memoryBytes, int maxIoThreads, int fdToDetectStorage) : currentBuffer(NULL), busyBufferCount(0), isClosing(false), waitSeconds(0) {
+BatchWriter::BatchWriter(size_t memoryBytes, int maxIoThreads, int fdToDetectStorage) : currentBuffer(NULL), busyBufferCount(0), isClosing(false) {
     // a thread also has a buffer for the write requests that it joins, so the threads take half of the memory at most
     const size_t threads = std::max<size_t>(1, std::min<size_t>(std::min(getStorageMaxInflightRequests(getStorageKind(fdToDetectStorage), maxIoThreads), maxIoThreads), memoryBytes / BUFFER_BYTES / 2));
     const size_t bufferCount = std::max<size_t>(2, memoryBytes / BUFFER_BYTES - std::min(memoryBytes / BUFFER_BYTES, threads));
@@ -374,11 +374,7 @@ void BatchWriter::queueCopiedBuffer(Buffer *buffer) {
 void BatchWriter::write(int fd, const char *fileName, const char *data, size_t bytes, size_t fileOffset) {
     for (size_t done = 0; done < bytes;) {
         std::unique_lock<std::mutex> lock(bufferMutex);
-        if (currentBuffer == NULL && freeBuffers.empty()) {
-            Timer waitTimer;
-            freeCondition.wait(lock, [&]() { return currentBuffer != NULL || freeBuffers.empty() == false; });
-            waitSeconds += waitTimer.getTimediff();
-        }
+        freeCondition.wait(lock, [&]() { return currentBuffer != NULL || freeBuffers.empty() == false; });
         if (currentBuffer == NULL) {
             currentBuffer = freeBuffers.back();
             freeBuffers.pop_back();

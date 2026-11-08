@@ -54,10 +54,9 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         const size_t repFirstKey = repKeyOffsets[MMseqsNode::rank];
         const size_t repKeyCount = repKeyOffsets[MMseqsNode::rank + 1] - repFirstKey;
         uint64_t *singletonBits = hasRepresentativeBits ? MMseqsNode::readRepresentativeBits(sortedByRep, nodeKeyOffsets, repFirstKey, repKeyCount) : NULL;
-        const size_t clusterLineCount = MMseqsNode::writeClusterPairs(sortedByRepIndex, sortedByRep, par.db2, singletonBits, repFirstKey, repKeyCount);
+        MMseqsNode::writeClusterPairs(sortedByRepIndex, sortedByRep, par.db2, singletonBits, repFirstKey, repKeyCount);
         delete[] singletonBits;
         MMseqsNode::addPhaseTime(phaseValues, "writing the clusters", timer);
-        MMseqsNode::addPhaseValue(phaseValues, "Cluster lines written", SSTR(clusterLineCount));
         std::vector<std::string> exchanges;
         exchanges.push_back(sortedByRep);
         if (hasSecondClustering) {
