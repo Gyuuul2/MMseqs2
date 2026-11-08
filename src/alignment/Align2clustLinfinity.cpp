@@ -1746,8 +1746,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                     if (isAhead == false) {
                         if (alignNodeCount > 1) {
-                            FILE *requestHandle = FileUtil::openAndDelete(requestFiles[rank].c_str(), "w");
-                            MMseqsNode::writeExchangeFileHeader(requestHandle, requestFiles[rank], requestCount);
+                            FILE *requestHandle = MMseqsNode::createExchangeFile(requestFiles[rank], requestCount);
                             size_t requestSize = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
                             for (unsigned int node = 0; node < nodes; node++) {
                                 requestLine[2 + node] = requestSize;

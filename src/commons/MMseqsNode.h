@@ -3,6 +3,7 @@
 
 #include "IndexTypes.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <ctime>
 #include <string>
@@ -72,7 +73,7 @@ public:
     static size_t readExchangeIndexLines(const std::string &indexFile, size_t firstLine, size_t lineWords, std::vector<uint64_t> &lines);
     static size_t waitForExchangeIndexLines(const std::string &indexFile, size_t &nextLine, size_t lineWords, std::vector<uint64_t> &lines, bool wait);
     static const size_t EXCHANGE_FILE_HEADER_BYTES = 2 * sizeof(uint64_t);
-    static void writeExchangeFileHeader(FILE *file, const std::string &fileName, uint64_t exchangeFileNumber);
+    static FILE *createExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *mode = "w");
     static void writeExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *data, size_t size, const std::string &indexFile,
                                   const std::vector<uint64_t> &line, int threads);
     static int tryOpenExchangeFile(const std::string &file, size_t expectedSize, uint64_t expectedNumber,
@@ -123,10 +124,15 @@ public:
         size_t punchEnd;
     };
 
-    static void addExchangeFlush(std::string &indexData, size_t &writtenSize, const std::vector<size_t> &nodeOffsets);
+    static size_t writeExchangeTable(int fd, const std::string &fileName, const std::vector<size_t> &flushOffsets, size_t columns, const std::vector<size_t> &tail, size_t tableOffset);
+    static void readExchangeTableColumns(int fd, const std::string &fileName, size_t tableOffset, size_t flushCount, size_t column, std::vector<size_t> &offsets);
+    static size_t getExchangeFileOffset(size_t offset, size_t ownBegin, size_t ownEnd) {
+        return offset - (std::min(offset, ownEnd) - std::min(offset, ownBegin));
+    }
+    static void addExchangeFlush(std::vector<size_t> &indexData, size_t &writtenSize, const std::vector<size_t> &nodeOffsets, size_t ownBegin, size_t ownEnd, size_t lineBegin, size_t lineEnd);
     static void keepOwnExchangeRecords(const std::string &exchange, char *records, size_t size);
     static void addSentExchangeBytes(size_t size, size_t otherNodeSize);
-    static std::string closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData);
+    static std::string closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::vector<size_t> &indexData);
     static void openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeReader> &readers, std::vector<FILE *> &files);
     static size_t readExchangeRecordsUpTo(std::vector<ExchangeReader> &readers, size_t bufferMemory, size_t (*recordSize)(const char *, size_t),
                                           bool (*compare)(const ClusterPair &, const ClusterPair &), const ClusterPair &last,
@@ -170,7 +176,7 @@ public:
         const std::vector<size_t> &nodeKeyOffsets;
         std::vector<size_t> *balancedKeyOffsets;
         std::vector<size_t> binOffsets;
-        std::string indexData;
+        std::vector<size_t> indexData;
         size_t writtenSize;
         size_t keptPairCount;
     };

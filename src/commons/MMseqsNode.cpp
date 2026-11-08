@@ -412,18 +412,19 @@ size_t MMseqsNode::waitForExchangeIndexLines(const std::string &indexFile, size_
     }
 }
 
-void MMseqsNode::writeExchangeFileHeader(FILE *file, const std::string &fileName, uint64_t exchangeFileNumber) {
+FILE *MMseqsNode::createExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *mode) {
+    FILE *file = FileUtil::openAndDelete(fileName.c_str(), mode);
     ExchangeFileHeader header = { getExchangeFileMagic(), exchangeFileNumber };
     if (fwrite(&header, sizeof(header), 1, file) != 1 || fflush(file) != 0) {
         Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
+    return file;
 }
 
 void MMseqsNode::writeExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *data, size_t size, const std::string &indexFile,
                                    const std::vector<uint64_t> &line, int threads) {
-    FILE *file = FileUtil::openAndDelete(fileName.c_str(), "w");
-    writeExchangeFileHeader(file, fileName, exchangeFileNumber);
+    FILE *file = createExchangeFile(fileName, exchangeFileNumber);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
     for (size_t offset = 0; offset < size; offset += BatchReader::MAX_READ_REQUEST_SIZE) {
         FileUtil::pwriteAll(fileno(file), fileName.c_str(), data + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, size - offset), EXCHANGE_FILE_HEADER_BYTES + offset);
@@ -668,14 +669,37 @@ size_t MMseqsNode::getSmallestMemoryLimit(const std::string &file, size_t memory
     return smallestMemoryLimit;
 }
 
-void MMseqsNode::addExchangeFlush(std::string &indexData, size_t &writtenSize, const std::vector<size_t> &nodeOffsets) {
-    for (size_t node = 0; node < nodeOffsets.size(); node++) {
-        uint64_t offset = writtenSize + nodeOffsets[node];
-        indexData.append((const char *) &offset, sizeof(offset));
+// column-major, a reader takes its two columns in one read
+size_t MMseqsNode::writeExchangeTable(int fd, const std::string &fileName, const std::vector<size_t> &flushOffsets, size_t columns, const std::vector<size_t> &tail, size_t tableOffset) {
+    size_t flushCount = flushOffsets.size() / columns;
+    std::vector<size_t> table(flushOffsets.size());
+    for (size_t flush = 0; flush < flushCount; flush++) {
+        for (size_t column = 0; column < columns; column++) {
+            table[column * flushCount + flush] = flushOffsets[flush * columns + column];
+        }
     }
-    writtenSize += nodeOffsets.back();
-    __sync_fetch_and_add(&sentExchangeSize, nodeOffsets.back());
-    __sync_fetch_and_add(&sentOtherNodeExchangeSize, nodeOffsets.back() - (nodeOffsets[rank + 1] - nodeOffsets[rank]));
+    table.insert(table.end(), tail.begin(), tail.end());
+    FileUtil::pwriteAll(fd, fileName.c_str(), (const char *) table.data(), table.size() * sizeof(size_t), tableOffset);
+    return tableOffset + table.size() * sizeof(size_t);
+}
+
+void MMseqsNode::readExchangeTableColumns(int fd, const std::string &fileName, size_t tableOffset, size_t flushCount, size_t column, std::vector<size_t> &offsets) {
+    offsets.resize(2 * flushCount);
+    FileUtil::preadAll(fd, fileName.c_str(), (char *) offsets.data(), offsets.size() * sizeof(size_t), tableOffset + column * flushCount * sizeof(size_t));
+}
+
+// buffer offsets; the own records [ownBegin, ownEnd) are not in the file
+void MMseqsNode::addExchangeFlush(std::vector<size_t> &indexData, size_t &writtenSize, const std::vector<size_t> &nodeOffsets, size_t ownBegin, size_t ownEnd, size_t lineBegin, size_t lineEnd) {
+    lineBegin = getExchangeFileOffset(lineBegin, ownBegin, ownEnd);
+    lineEnd = getExchangeFileOffset(lineEnd, ownBegin, ownEnd);
+    std::vector<size_t> offsets(count + 1);
+    for (size_t node = 0; node <= count; node++) {
+        offsets[node] = std::min(std::max(getExchangeFileOffset(nodeOffsets[node], ownBegin, ownEnd), lineBegin), lineEnd) - lineBegin;
+        indexData.push_back(writtenSize + offsets[node]);
+    }
+    writtenSize += offsets[count];
+    __sync_fetch_and_add(&sentExchangeSize, offsets[count]);
+    __sync_fetch_and_add(&sentOtherNodeExchangeSize, offsets[count] - (offsets[rank + 1] - offsets[rank]));
 }
 
 void MMseqsNode::keepOwnExchangeRecords(const std::string &exchange, char *records, size_t size) {
@@ -688,19 +712,10 @@ void MMseqsNode::addSentExchangeBytes(size_t size, size_t otherNodeSize) {
     __sync_fetch_and_add(&sentOtherNodeExchangeSize, otherNodeSize);
 }
 
-std::string MMseqsNode::closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData) {
-    size_t flushCount = indexData.size() / ((count + 1) * sizeof(uint64_t));
-    std::vector<uint64_t> nodeFlushOffsets(indexData.size() / sizeof(uint64_t));
-    for (size_t flush = 0; flush < flushCount; flush++) {
-        for (size_t node = 0; node <= count; node++) {
-            memcpy(&nodeFlushOffsets[node * flushCount + flush], indexData.data() + (flush * (count + 1) + node) * sizeof(uint64_t), sizeof(uint64_t));
-        }
-    }
-    size_t writtenSize = (flushCount > 0) ? nodeFlushOffsets.back() : 0;
-    if (fseeko(file, writtenSize, SEEK_SET) != 0 || fwrite(nodeFlushOffsets.data(), sizeof(uint64_t), nodeFlushOffsets.size(), file) != nodeFlushOffsets.size()) {
-        Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
+std::string MMseqsNode::closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::vector<size_t> &indexData) {
+    size_t flushCount = indexData.size() / (count + 1);
+    size_t writtenSize = (flushCount > 0) ? indexData.back() : 0;
+    writeExchangeTable(fileno(file), fileName, indexData, count + 1, std::vector<size_t>(), writtenSize);
     if (fclose(file) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
         EXIT(EXIT_FAILURE);
@@ -719,7 +734,7 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
         writtenSizes[node] = Util::fast_atoi<size_t>(columns[0]);
         flushCounts[node] = Util::fast_atoi<size_t>(columns[1]);
     }
-    std::vector<std::vector<uint64_t> > flushOffsets(count);
+    std::vector<std::vector<size_t> > flushOffsets(count);
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t node = 0; node < count; node++) {
         if (flushCounts[node] == 0) {
@@ -728,9 +743,7 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
         std::string file = prefix + "." + SSTR(node);
         // writable to punch holes
         files[node] = FileUtil::openFileOrDie(file.c_str(), "r+", true);
-        flushOffsets[node].resize(2 * flushCounts[node]);
-        FileUtil::preadAll(fileno(files[node]), file.c_str(), (char *) flushOffsets[node].data(), flushOffsets[node].size() * sizeof(uint64_t),
-                           writtenSizes[node] + rank * flushCounts[node] * sizeof(uint64_t));
+        readExchangeTableColumns(fileno(files[node]), file, writtenSizes[node], flushCounts[node], rank, flushOffsets[node]);
     }
     for (size_t node = 0; node < count; node++) {
         size_t nodeReaders = readers.size();
@@ -1033,7 +1046,7 @@ static void addBinOffsets(const ClusterPair *pairs, size_t pairCount, bool (*com
 }
 
 static size_t writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
-                         FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenSize, size_t ownPairLimit) {
+                         FILE *file, const std::string &fileName, std::vector<size_t> &indexData, size_t &writtenSize, size_t ownPairLimit) {
     std::vector<size_t> nodeOffsets(MMseqsNode::count + 1, pairCount * sizeof(ClusterPair));
     for (size_t node = 0; node < MMseqsNode::count; node++) {
         ClusterPair nodeFirstPair = { static_cast<DBKeyType>(nodeKeyOffsets[node]), static_cast<DBKeyType>(nodeKeyOffsets[node]) };
@@ -1048,10 +1061,7 @@ static size_t writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare)(c
     if (ownBegin > 0) {
         memmove(pairs, pairs + ownBegin, (ownEnd - ownBegin) * sizeof(ClusterPair));
     }
-    for (size_t node = MMseqsNode::rank + 1; node <= MMseqsNode::count; node++) {
-        nodeOffsets[node] -= (ownEnd - ownBegin) * sizeof(ClusterPair);
-    }
-    MMseqsNode::addExchangeFlush(indexData, writtenSize, nodeOffsets);
+    MMseqsNode::addExchangeFlush(indexData, writtenSize, nodeOffsets, ownBegin * sizeof(ClusterPair), ownEnd * sizeof(ClusterPair), 0, pairCount * sizeof(ClusterPair));
     return ownEnd - ownBegin;
 }
 
@@ -1150,7 +1160,7 @@ std::string MMseqsNode::ClusterPairWriter::close(const uint64_t *singletonBits, 
             for (size_t node = 0; node <= count; node++) {
                 nodeOffsets[node] = binOffsets[flushBegin + nodeBinOffsets[node]] * sizeof(ClusterPair);
             }
-            addExchangeFlush(indexData, writtenSize, nodeOffsets);
+            addExchangeFlush(indexData, writtenSize, nodeOffsets, 0, 0, 0, nodeOffsets[count]);
         }
         std::vector<size_t>().swap(binOffsets);
     }

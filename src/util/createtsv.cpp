@@ -52,13 +52,8 @@ static void growBuffer(T *&buffer, size_t &capacity, size_t size) {
     }
 }
 
-// file offset, own records are not written
-static size_t getFileOffset(size_t offset, size_t ownBegin, size_t ownEnd) {
-    return offset - (std::min(offset, ownEnd) - std::min(offset, ownBegin));
-}
-
 static size_t writeMemberAccessions(MemberAccession *memberAccessions, size_t accessionCount, const char *accessions, const std::vector<size_t> &repKeyOffsets,
-                                    FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes, const std::string &ownExchange, size_t ownBytesLimit) {
+                                    FILE *file, const std::string &fileName, std::vector<size_t> &indexData, size_t &writtenBytes, const std::string &ownExchange, size_t ownBytesLimit) {
     SORT_PARALLEL(memberAccessions, memberAccessions + accessionCount, MemberAccession::compareByRep);
     std::vector<size_t> nodeAccessionOffsets(MMseqsNode::count + 1, accessionCount);
     for (size_t node = 0; node < MMseqsNode::count; node++) {
@@ -109,7 +104,7 @@ static size_t writeMemberAccessions(MemberAccession *memberAccessions, size_t ac
         size_t beforeOwn = std::max(begin, std::min(end, ownBegin));
         size_t afterOwn = std::min(end, std::max(begin, ownEnd));
         FileUtil::pwriteAll(fileno(file), fileName.c_str(), writeBuffer + begin, beforeOwn - begin, writtenBytes + begin);
-        FileUtil::pwriteAll(fileno(file), fileName.c_str(), writeBuffer + afterOwn, end - afterOwn, writtenBytes + getFileOffset(afterOwn, ownBegin, ownEnd));
+        FileUtil::pwriteAll(fileno(file), fileName.c_str(), writeBuffer + afterOwn, end - afterOwn, writtenBytes + MMseqsNode::getExchangeFileOffset(afterOwn, ownBegin, ownEnd));
     }
 
     // index lines per thread group, so receivers scan on all threads
@@ -135,14 +130,8 @@ static size_t writeMemberAccessions(MemberAccession *memberAccessions, size_t ac
 
     Util::releasePages(writeBuffer, writeBufferBytes);
     free(writeBuffer);
-    std::vector<size_t> threadNodeOffsets(MMseqsNode::count + 1);
     for (int indexLine = 0; indexLine < indexLines; indexLine++) {
-        size_t indexLineBegin = getFileOffset(threadOffsets[threads * indexLine / indexLines], ownBegin, ownEnd);
-        size_t indexLineEnd = getFileOffset(threadOffsets[threads * (indexLine + 1) / indexLines], ownBegin, ownEnd);
-        for (size_t node = 0; node <= MMseqsNode::count; node++) {
-            threadNodeOffsets[node] = std::min(std::max(getFileOffset(nodeOffsets[node], ownBegin, ownEnd), indexLineBegin), indexLineEnd) - indexLineBegin;
-        }
-        MMseqsNode::addExchangeFlush(indexData, writtenBytes, threadNodeOffsets);
+        MMseqsNode::addExchangeFlush(indexData, writtenBytes, nodeOffsets, ownBegin, ownEnd, threadOffsets[threads * indexLine / indexLines], threadOffsets[threads * (indexLine + 1) / indexLines]);
     }
     return ownEnd - ownBegin;
 }
@@ -171,7 +160,7 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
 
     std::string repFile = sortedByRep + "." + SSTR(MMseqsNode::rank);
     FILE *repHandle = FileUtil::openAndDelete(repFile.c_str(), "w");
-    std::string repIndexData;
+    std::vector<size_t> repIndexData;
     size_t writtenBytes = 0;
     MemberAccession *memberAccessions = NULL;
     size_t accessionCount = 0;

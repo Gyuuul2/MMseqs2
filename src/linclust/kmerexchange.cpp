@@ -359,27 +359,11 @@ static size_t getRowEnd(const Row &row) {
     return row.offsets[sizeof(row.offsets) / sizeof(size_t) - 1];
 }
 
-static size_t writeRowTable(FILE *file, const std::string &fileName, size_t itemCount, const std::vector<size_t> &flushRowOffsets, const std::vector<size_t> &itemSizes, size_t rowTableOffset) {
-    size_t flushCount = flushRowOffsets.size() / (itemCount + 1);
-    std::vector<size_t> table(flushRowOffsets.size());
-    for (size_t flush = 0; flush < flushCount; flush++) {
-        for (size_t item = 0; item <= itemCount; item++) {
-            table[item * flushCount + flush] = flushRowOffsets[flush * (itemCount + 1) + item];
-        }
-    }
-    table.insert(table.end(), itemSizes.begin(), itemSizes.end());
-    table.push_back(flushCount);
-    table.push_back(rowTableOffset);
-    FileUtil::pwriteAll(fileno(file), fileName.c_str(), (const char *) table.data(), table.size() * sizeof(size_t), rowTableOffset);
-    return rowTableOffset + table.size() * sizeof(size_t);
-}
-
 template <typename Row>
 static void readItemRows(const ReceivedFile &receivedFile, size_t item, std::vector<Row> &rows, std::vector<BatchReader::ReadRequest> *readRequests = NULL) {
     size_t flushCount = receivedFile.flushCount;
-    std::vector<size_t> rowStarts(2 * flushCount);
-    FileUtil::preadAll(fileno(receivedFile.file), receivedFile.fileName.c_str(), (char *) rowStarts.data(), rowStarts.size() * sizeof(size_t),
-                       receivedFile.rowTableOffset + item * flushCount * sizeof(size_t));
+    std::vector<size_t> rowStarts;
+    MMseqsNode::readExchangeTableColumns(fileno(receivedFile.file), receivedFile.fileName, receivedFile.rowTableOffset, flushCount, item, rowStarts);
     size_t rowCount = 0;
     for (size_t flush = 0; flush < flushCount; flush++) {
         rowCount += (rowStarts[flushCount + flush] - rowStarts[flush]) / sizeof(Row);
@@ -503,8 +487,7 @@ static void createFileGroups(ExchangeFileGroups &groups) {
     groups.flushRowOffsets.assign(groups.count, std::vector<size_t>());
     for (size_t i = 0; i < groups.count; i++) {
         groups.names[i] = isLocalFileGroup(groups, i) ? getLocalFileGroupName(groups, i) : getFileGroupName(groups, MMseqsNode::rank, i);
-        groups.files[i] = FileUtil::openAndDelete(groups.names[i].c_str(), "w+");
-        MMseqsNode::writeExchangeFileHeader(groups.files[i], groups.names[i], i);
+        groups.files[i] = MMseqsNode::createExchangeFile(groups.names[i], i, "w+");
     }
 }
 
@@ -513,17 +496,19 @@ static size_t closeFileGroups(ExchangeFileGroups &groups, const std::vector<size
     for (size_t i = 0; i < groups.count; i++) {
         size_t begin = i * groups.itemsPerGroup;
         size_t end = getFileGroupItemEnd(groups, i);
-        std::vector<size_t> groupItemSizes;
+        std::vector<size_t> tail;
         if (itemSizes.empty() == false) {
-            groupItemSizes.assign(itemSizes.begin() + begin, itemSizes.begin() + end);
+            tail.assign(itemSizes.begin() + begin, itemSizes.begin() + end);
         }
-        size_t tableItems = (groups.flushCount > 0) ? groups.flushRowOffsets[i].size() / groups.flushCount - 1 : 0;
-        size_t fileSize = writeRowTable(groups.files[i], groups.names[i], tableItems, groups.flushRowOffsets[i], groupItemSizes, groups.sizes[i]);
         std::vector<uint64_t> line(groups.lineWords, 0);
+        std::copy(tail.begin(), tail.end(), line.begin() + 3);
+        tail.push_back(groups.flushCount);
+        tail.push_back(groups.sizes[i]);
+        size_t columns = (groups.flushCount > 0) ? groups.flushRowOffsets[i].size() / groups.flushCount : 1;
+        size_t fileSize = MMseqsNode::writeExchangeTable(fileno(groups.files[i]), groups.names[i], groups.flushRowOffsets[i], columns, tail, groups.sizes[i]);
         line[0] = groups.publishedLineCount++;
         line[1] = i;
         line[2] = isLocalFileGroup(groups, i) ? 0 : fileSize;
-        std::copy(groupItemSizes.begin(), groupItemSizes.end(), line.begin() + 3);
         if (isLocalFileGroup(groups, i)) {
             groups.localLines.push_back(line);
         }
