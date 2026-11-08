@@ -247,7 +247,9 @@ KSeqZstd::KSeqZstd(const char* fileName, size_t start, size_t end) {
         Debug(Debug::ERROR) << "ZSTD_createDStream() error\n";
         EXIT(EXIT_FAILURE);
     }
-    file.input.src = malloc(ZSTD_DStreamInSize());
+    void *input = malloc(ZSTD_DStreamInSize());
+    Util::checkAllocation(input, "Can not allocate input memory in KSeqZstd");
+    file.input.src = input;
     file.input.size = 0;
     file.input.pos = 0;
     file.readHintBytes = 0;

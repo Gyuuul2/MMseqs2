@@ -12,6 +12,13 @@ notExists() {
     return 0
 }
 
+# true if none of the files exists, nor with two iterations an output of the refinement pass
+notExistsBeforeRefinement() {
+    notExists "$@" || return 1
+    [ "$LINCLUST_ITERATIONS" -ge 2 ] || return 0
+    notExists "${TMP_PATH}/clu_merged.dbtype" "${TMP_PATH}/input_rep.dbtype" "${TMP_PATH}/pref_rep.dbtype" "${TMP_PATH}/clu_rep.dbtype"
+}
+
 # srun ends the other tasks of a step when one fails, they would wait for it forever
 export SLURM_KILL_BAD_EXIT=1
 
@@ -31,15 +38,9 @@ if [ -n "$CLUSTHASH" ] || [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
 else
     CLUDB="$2"
 fi
-SECOND_ITERATION_OUTPUTS=""
-if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
-    SECOND_ITERATION_OUTPUTS="${TMP_PATH}/clu_merged.dbtype ${TMP_PATH}/input_rep.dbtype ${TMP_PATH}/pref_rep.dbtype ${TMP_PATH}/clu_rep.dbtype"
-fi
-
 # 0. clusthash
 if [ -n "$CLUSTHASH" ]; then
-    # shellcheck disable=SC2086
-    if notExists "${TMP_PATH}/input_clusthash_clust.dbtype" ${SECOND_ITERATION_OUTPUTS}; then
+    if notExistsBeforeRefinement "${TMP_PATH}/input_clusthash_clust.dbtype"; then
         # shellcheck disable=SC2086
         $RUNNER "$MMSEQS" clusthashfast "$INPUT" "${TMP_PATH}/input_clusthash_clust" ${CLUSTHASHFAST_PAR} \
             || fail "clusthashfast died"
@@ -49,15 +50,13 @@ if [ -n "$CLUSTHASH" ]; then
 fi
 
 # 1. k-mer matching
-# shellcheck disable=SC2086
-if notExists "${TMP_PATH}/pref.dbtype" "${CLUDB}.dbtype" ${SECOND_ITERATION_OUTPUTS}; then
+if notExistsBeforeRefinement "${TMP_PATH}/pref.dbtype" "${CLUDB}.dbtype"; then
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" kmermatcher "$INPUT" "${TMP_PATH}/pref" ${KMERMATCHER_PAR} \
         || fail "kmermatcher died"
 fi
 
-# shellcheck disable=SC2086
-if notExists "${CLUDB}.dbtype" ${SECOND_ITERATION_OUTPUTS}; then
+if notExistsBeforeRefinement "${CLUDB}.dbtype"; then
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" align2clust "$INPUT" "${TMP_PATH}/pref" "$CLUDB" ${ALIGN2CLUST_PAR} \
         || fail "align2clust died"
@@ -75,8 +74,7 @@ if [ -n "$CLUSTHASH" ]; then
     else
         MERGED="$2"
     fi
-    # shellcheck disable=SC2086
-    if notExists "${MERGED}.dbtype" ${SECOND_ITERATION_OUTPUTS}; then
+    if notExistsBeforeRefinement "${MERGED}.dbtype"; then
         # shellcheck disable=SC2086
         $RUNNER "$MMSEQS" mergeclusters "$SOURCE" "$MERGED" \
             "${TMP_PATH}/input_clusthash_clust" "$CLUDB" ${MERGECLU_PAR} \
