@@ -234,6 +234,26 @@ void MMseqsNode::publishRunFile(const std::string &file, const std::string &cont
     publishFile(file, runId + content);
 }
 
+void MMseqsNode::waitForRunFilesChange(const std::string &prefix, std::string &content) {
+    WaitWarning warning;
+    // poll at least 160 ms apart, so that many nodes do not load the metadata server
+    for (unsigned int polls = 4;; polls++) {
+        std::string nodeContents;
+        for (unsigned int node = 0; node < count; node++) {
+            std::string nodeContent = readPolledFile(prefix + SSTR(node));
+            if (nodeContent.compare(0, runId.size(), runId) == 0) {
+                nodeContents.append(nodeContent, runId.size(), std::string::npos);
+            }
+        }
+        if (nodeContents != content) {
+            content.swap(nodeContents);
+            return;
+        }
+        sleepBeforePoll(polls, 7);
+        warning.check(prefix);
+    }
+}
+
 std::string MMseqsNode::gatherRunFiles(const std::string &prefix) {
     std::vector<std::string> nodeContents(count);
     // the threads wait for the files at once, so their reads do not add up node after node
@@ -391,6 +411,19 @@ size_t MMseqsNode::readExchangeIndexLines(const std::string &indexFile, size_t f
     return lineCount;
 }
 
+size_t MMseqsNode::waitForExchangeIndexLines(const std::string &indexFile, size_t &nextLine, size_t lineWords, std::vector<uint64_t> &lines, bool wait) {
+    WaitWarning warning;
+    for (unsigned int polls = 0;; polls++) {
+        size_t lineCount = readExchangeIndexLines(indexFile, nextLine, lineWords, lines);
+        if (lineCount > 0 || wait == false) {
+            nextLine += lineCount;
+            return lineCount;
+        }
+        sleepInWait(polls);
+        warning.check(indexFile);
+    }
+}
+
 void MMseqsNode::writeExchangeFileHeader(FILE *file, const std::string &fileName, uint64_t exchangeFileNumber) {
     const ExchangeFileHeader header = { getExchangeFileMagic(), exchangeFileNumber };
     if (fwrite(&header, sizeof(header), 1, file) != 1 || fflush(file) != 0) {
@@ -411,11 +444,11 @@ void MMseqsNode::writeExchangeFile(const std::string &fileName, uint64_t exchang
 }
 
 int MMseqsNode::tryOpenExchangeFile(const std::string &file, size_t expectedBytes, uint64_t expectedExchangeFileNumber,
-                                    size_t &observedBytes, uint64_t &observedExchangeFileNumber, int &lastError) {
+                                    size_t &observedBytes, uint64_t &observedExchangeFileNumber, int &lastError, int openFlags) {
     observedBytes = SIZE_MAX;
     observedExchangeFileNumber = UINT64_MAX;
     lastError = 0;
-    const int fd = openListedFile(file, O_RDONLY | O_CLOEXEC);
+    const int fd = openListedFile(file, O_RDONLY | O_CLOEXEC | openFlags);
     if (fd < 0) {
         lastError = errno;
         return -1;
@@ -449,6 +482,25 @@ int MMseqsNode::tryOpenExchangeFile(const std::string &file, size_t expectedByte
     }
     close(fd);
     return -1;
+}
+
+int MMseqsNode::waitForExchangeFile(const std::string &file, size_t bytes, uint64_t exchangeFileNumber) {
+    WaitWarning warning;
+    for (unsigned int polls = 0;; polls++) {
+        size_t observedBytes;
+        uint64_t observedExchangeFileNumber;
+        int lastError;
+        int fd = tryOpenExchangeFile(file, bytes, exchangeFileNumber, observedBytes, observedExchangeFileNumber, lastError, O_RDWR);
+        if (fd >= 0) {
+            return fd;
+        }
+        if (lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
+            Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(lastError) << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        sleepInWait(polls);
+        warning.check(file);
+    }
 }
 
 bool MMseqsNode::tryPreadAll(int fd, char *data, size_t bytes, size_t offset, int &readError) {

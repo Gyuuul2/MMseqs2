@@ -63,6 +63,8 @@ public:
     // publishFile and waiting for a file of this run, so a file that a killed run left is not read
     static void publishRunFile(const std::string &file, const std::string &content);
     static std::string waitForRunFile(const std::string &file);
+    // wait until the run files prefix + node of all nodes differ from content, which becomes theirs
+    static void waitForRunFilesChange(const std::string &prefix, std::string &content);
     // waits for prefix + node of every node and returns their content in node order; the files are removed
     static std::string gatherRunFiles(const std::string &prefix);
     // a log appended by one node while another reads it: its synced bytes, a key and takenItemCount (the taken items of an ordered work queue) go to <log>.progress
@@ -76,13 +78,17 @@ public:
     static void publishExchangeFile(FILE *file, const std::string &fileName, size_t bytes, const std::string &indexFile, const std::vector<uint64_t> &line);
     // reads the lines firstLine, firstLine + 1, ... of lineWords words of indexFile that fit lines from a new open; the number of this run's lines there in a row
     static size_t readExchangeIndexLines(const std::string &indexFile, size_t firstLine, size_t lineWords, std::vector<uint64_t> &lines);
+    // readExchangeIndexLines from nextLine on, waiting for one if wait; advances nextLine
+    static size_t waitForExchangeIndexLines(const std::string &indexFile, size_t &nextLine, size_t lineWords, std::vector<uint64_t> &lines, bool wait);
     static const size_t EXCHANGE_FILE_HEADER_BYTES = 2 * sizeof(uint64_t);
     static void writeExchangeFileHeader(FILE *file, const std::string &fileName, uint64_t exchangeFileNumber);
     // writes bytes of data to fileName as exchange file exchangeFileNumber from threads threads, then publishes it with line to indexFile
     static void writeExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *data, size_t bytes, const std::string &indexFile,
                                   const std::vector<uint64_t> &line, int threads);
     static int tryOpenExchangeFile(const std::string &file, size_t expectedBytes, uint64_t expectedExchangeFileNumber,
-                                   size_t &observedBytes, uint64_t &observedExchangeFileNumber, int &lastError);
+                                   size_t &observedBytes, uint64_t &observedExchangeFileNumber, int &lastError, int openFlags = 0);
+    // wait until tryOpenExchangeFile opens file for reading and writing
+    static int waitForExchangeFile(const std::string &file, size_t bytes, uint64_t exchangeFileNumber);
     static bool tryPreadAll(int fd, char *data, size_t bytes, size_t offset, int &readError);
     // every node publishes content as file + "." + node; returns all contents in node order, gathered by the master into file
     static std::string barrier(const std::string &file, const std::string &content = "");
