@@ -1073,14 +1073,23 @@ std::string MMseqsNode::ClusterPairWriter::close(const uint64_t *singletonBits, 
         publishRunFile(binFile + "." + SSTR(rank), std::string(reinterpret_cast<const char *>(binLines.data()), bins * sizeof(uint64_t)));
         std::vector<uint64_t> nodeBinOffsets(count + 1, bins);
         if (isMaster()) {
-            const std::string nodeBinLines = gatherRunFiles(binFile + ".");
-            std::vector<uint64_t> nodeLines(count * bins);
-            memcpy(nodeLines.data(), nodeBinLines.data(), nodeLines.size() * sizeof(uint64_t));
+            // the lines of a node are added once its file is read, so the master holds one file per thread
             std::fill(binLines.begin(), binLines.end(), 0);
+#pragma omp parallel for schedule(dynamic, 1)
+            for (unsigned int node = 0; node < count; node++) {
+                const std::string file = binFile + "." + SSTR(node);
+                const std::string nodeBinLines = waitForRunFile(file);
+                FileUtil::remove(file.c_str());
+#pragma omp critical
+                for (size_t bin = 0; bin < bins; bin++) {
+                    uint64_t lines;
+                    memcpy(&lines, nodeBinLines.data() + bin * sizeof(uint64_t), sizeof(uint64_t));
+                    binLines[bin] += lines;
+                }
+            }
             uint64_t totalLines = 0;
-            for (size_t i = 0; i < nodeLines.size(); i++) {
-                binLines[i % bins] += nodeLines[i];
-                totalLines += nodeLines[i];
+            for (size_t bin = 0; bin < bins; bin++) {
+                totalLines += binLines[bin];
             }
             nodeBinOffsets[0] = 0;
             size_t bin = 0;

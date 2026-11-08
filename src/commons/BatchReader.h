@@ -89,7 +89,7 @@ private:
 // write copies its bytes to a buffer and threads write the full buffers, sorted by file position, so the callers go on computing until all buffers wait for the storage
 class BatchWriter {
 public:
-    // memoryBytes: the buffers of BUFFER_BYTES, at least two, and one per write thread
+    // memoryBytes: buffers of BUFFER_BYTES, a third of memoryBytes if less, at least two and one per write thread
     BatchWriter(size_t memoryBytes, int maxIoThreads, int fdToDetectStorage);
     ~BatchWriter();
 
@@ -120,6 +120,7 @@ private:
     void queueCopiedBuffer(Buffer *buffer);
     void writeBuffers(char *joinedWrites);
 
+    const size_t bufferBytes;
     char *memory;
     std::vector<Buffer> buffers;
     std::vector<Buffer *> freeBuffers;

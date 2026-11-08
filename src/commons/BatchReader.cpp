@@ -331,21 +331,22 @@ void BatchReader::readWithRing(bool waitForAll) {
 
 const size_t BatchWriter::BUFFER_BYTES;
 
-BatchWriter::BatchWriter(size_t memoryBytes, int maxIoThreads, int fdToDetectStorage) : currentBuffer(NULL), busyBufferCount(0), isClosing(false) {
+BatchWriter::BatchWriter(size_t memoryBytes, int maxIoThreads, int fdToDetectStorage)
+    : bufferBytes(std::min(BUFFER_BYTES, std::max<size_t>(1, memoryBytes / 3))), currentBuffer(NULL), busyBufferCount(0), isClosing(false) {
     // a thread also has a buffer for the write requests that it joins, so the threads take half of the memory at most
-    const size_t threads = std::max<size_t>(1, std::min<size_t>(std::min(getStorageMaxInflightRequests(getStorageKind(fdToDetectStorage), maxIoThreads), maxIoThreads), memoryBytes / BUFFER_BYTES / 2));
-    const size_t bufferCount = std::max<size_t>(2, memoryBytes / BUFFER_BYTES - std::min(memoryBytes / BUFFER_BYTES, threads));
-    memory = new(std::nothrow) char[(bufferCount + threads) * BUFFER_BYTES];
+    const size_t threads = std::max<size_t>(1, std::min<size_t>(std::min(getStorageMaxInflightRequests(getStorageKind(fdToDetectStorage), maxIoThreads), maxIoThreads), memoryBytes / bufferBytes / 2));
+    const size_t bufferCount = std::max<size_t>(2, memoryBytes / bufferBytes - std::min(memoryBytes / bufferBytes, threads));
+    memory = new(std::nothrow) char[(bufferCount + threads) * bufferBytes];
     Util::checkAllocation(memory, "Can not allocate memory in BatchWriter");
     buffers.resize(bufferCount);
     for (size_t i = 0; i < bufferCount; i++) {
-        buffers[i].data = memory + i * BUFFER_BYTES;
+        buffers[i].data = memory + i * bufferBytes;
         buffers[i].bytes = 0;
         buffers[i].activeCopyCount = 0;
         freeBuffers.push_back(&buffers[i]);
     }
     for (size_t i = 0; i < threads; i++) {
-        writeThreads.emplace_back(&BatchWriter::writeBuffers, this, memory + (bufferCount + i) * BUFFER_BYTES);
+        writeThreads.emplace_back(&BatchWriter::writeBuffers, this, memory + (bufferCount + i) * bufferBytes);
     }
 }
 
@@ -359,7 +360,7 @@ BatchWriter::~BatchWriter() {
     for (size_t i = 0; i < writeThreads.size(); i++) {
         writeThreads[i].join();
     }
-    Util::releasePages(memory, (buffers.size() + writeThreads.size()) * BUFFER_BYTES);
+    Util::releasePages(memory, (buffers.size() + writeThreads.size()) * bufferBytes);
     delete[] memory;
 }
 
@@ -382,12 +383,12 @@ void BatchWriter::write(int fd, const char *fileName, const char *data, size_t b
         }
         Buffer *buffer = currentBuffer;
         const size_t bufferOffset = buffer->bytes;
-        const size_t copyBytes = std::min(bytes - done, BUFFER_BYTES - bufferOffset);
+        const size_t copyBytes = std::min(bytes - done, bufferBytes - bufferOffset);
         const WriteRequest writeRequest = { fd, fileName, bufferOffset, copyBytes, fileOffset + done };
         buffer->writeRequests.push_back(writeRequest);
         buffer->bytes += copyBytes;
         buffer->activeCopyCount++;
-        if (buffer->bytes == BUFFER_BYTES) {
+        if (buffer->bytes == bufferBytes) {
             currentBuffer = NULL;
         }
         lock.unlock();
