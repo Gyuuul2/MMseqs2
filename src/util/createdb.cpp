@@ -946,6 +946,10 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
 
         // half for reader buffers, an eighth for writes
         size_t rowSize = sizeof(SentLengthRow) + (DATA_FILE_TYPE_COUNT + 1) * sizeof(std::pair<size_t, size_t>);
+        if (receivedRowCount * rowSize >= static_cast<size_t>(memoryLimit * 0.95)) {
+            Debug(Debug::ERROR) << "createdb needs more than " << receivedRowCount * rowSize << " bytes of memory for the " << receivedRowCount << " received length rows, but has " << static_cast<size_t>(memoryLimit * 0.95) << ". Run on more nodes or with more memory\n";
+            EXIT(EXIT_FAILURE);
+        }
         size_t receiveMemory = static_cast<size_t>(memoryLimit * 0.95) - receivedRowCount * rowSize;
         size_t readerBufferSize = receiveMemory / 2;
         size_t writeBufferSize = receiveMemory / 8;
