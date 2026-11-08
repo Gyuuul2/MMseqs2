@@ -11,7 +11,6 @@
 class Timer;
 template <typename T> class DBReader;
 
-// a member of a cluster with its representative, the record of most exchanges between nodes
 struct ClusterPair {
     DBKeyType repKey;
     DBKeyType memberKey;
@@ -20,7 +19,6 @@ struct ClusterPair {
         return first.memberKey < second.memberKey;
     }
 
-    // the representative itself first, so it is the first line of its entry
     static bool compareByRep(const ClusterPair &first, const ClusterPair &second) {
         if (first.repKey != second.repKey) {
             return first.repKey < second.repKey;
@@ -44,9 +42,8 @@ public:
         return rank == MASTER;
     }
 
-    // sleeps before poll number polls of a file that another node publishes: ten milliseconds, twice as long each poll, up to 10 << maxShift milliseconds
     static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
-    // every node tells of a wait for what that takes 600 s, then twice as long each time, as Debug::ERROR so that every node prints it
+
     class WaitWarning {
     public:
         WaitWarning();
@@ -57,63 +54,47 @@ public:
         time_t start;
         size_t nextSeconds;
     };
+
     static void publishFile(const std::string &file, const std::string &content);
-    // reads a file that an earlier step wrote
     static std::string readFile(const std::string &file);
-    // publishFile and waiting for a file of this run, so a file that a killed run left is not read
     static void publishRunFile(const std::string &file, const std::string &content);
     static std::string waitForRunFile(const std::string &file);
-    // wait until the run files prefix + node of all nodes differ from content, which becomes theirs
     static void waitForRunFilesChange(const std::string &prefix, std::string &content);
-    // waits for prefix + node of every node and returns their content in node order; the files are removed
     static std::string gatherRunFiles(const std::string &prefix);
-    // a log appended by one node while another reads it: its synced bytes, a key and takenItemCount (the taken items of an ordered work queue) go to <log>.progress
-    static void publishLog(FILE *file, const std::string &log, size_t key, size_t bytes, size_t takenItemCount = 0);
-    static bool readLogProgress(const std::string &log, size_t &key, size_t &bytes, size_t *takenItemCount = NULL);
-    static void waitForLog(const std::string &log, size_t &key, size_t &bytes);
-    // without wait, returns false at once instead of polling until the bytes are readable
+
+    static void publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t takenItemCount = 0);
+    static bool readLogProgress(const std::string &log, size_t &key, size_t &size, size_t *takenItemCount = NULL);
+    static void waitForLog(const std::string &log, size_t &key, size_t &size);
     static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true);
     static void removeLog(const std::string &log);
-    // closes file, an exchange file of bytes that only this node writes, then appends line with its last word set to this run's magic to indexFile
-    static void publishExchangeFile(FILE *file, const std::string &fileName, size_t bytes, const std::string &indexFile, const std::vector<uint64_t> &line);
-    // reads the lines firstLine, firstLine + 1, ... of lineWords words of indexFile that fit lines from a new open; the number of this run's lines there in a row
+
+    static void publishExchangeFile(FILE *file, const std::string &fileName, size_t size, const std::string &indexFile, const std::vector<uint64_t> &line);
     static size_t readExchangeIndexLines(const std::string &indexFile, size_t firstLine, size_t lineWords, std::vector<uint64_t> &lines);
-    // readExchangeIndexLines from nextLine on, waiting for one if wait; advances nextLine
     static size_t waitForExchangeIndexLines(const std::string &indexFile, size_t &nextLine, size_t lineWords, std::vector<uint64_t> &lines, bool wait);
     static const size_t EXCHANGE_FILE_HEADER_BYTES = 2 * sizeof(uint64_t);
     static void writeExchangeFileHeader(FILE *file, const std::string &fileName, uint64_t exchangeFileNumber);
-    // writes bytes of data to fileName as exchange file exchangeFileNumber from threads threads, then publishes it with line to indexFile
-    static void writeExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *data, size_t bytes, const std::string &indexFile,
+    static void writeExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *data, size_t size, const std::string &indexFile,
                                   const std::vector<uint64_t> &line, int threads);
-    static int tryOpenExchangeFile(const std::string &file, size_t expectedBytes, uint64_t expectedExchangeFileNumber,
-                                   size_t &observedBytes, uint64_t &observedExchangeFileNumber, int &lastError, int openFlags = 0);
-    // wait until tryOpenExchangeFile opens file for reading and writing
-    static int waitForExchangeFile(const std::string &file, size_t bytes, uint64_t exchangeFileNumber);
-    static bool tryPreadAll(int fd, char *data, size_t bytes, size_t offset, int &readError);
-    // every node publishes content as file + "." + node; returns all contents in node order, gathered by the master into file
+    static int tryOpenExchangeFile(const std::string &file, size_t expectedSize, uint64_t expectedNumber,
+                                   size_t &observedSize, uint64_t &observedNumber, int &lastError, int openFlags = 0);
+    static int waitForExchangeFile(const std::string &file, size_t size, uint64_t exchangeFileNumber);
+    static bool tryPreadAll(int fd, char *data, size_t size, size_t offset, int &readError);
+
     static std::string barrier(const std::string &file, const std::string &content = "");
-    // this node has read file; the master removes it once every node has, the others do not wait
     static void removeOnceRead(const std::string &file);
-    // local phase values as lines name<TAB>node<TAB>value
+
     static void addPhaseValue(std::string &content, const std::string &name, const std::string &value);
-    // the seconds since timer started, which then starts again
     static void addPhaseTime(std::string &content, const std::string &phase, Timer &timer);
     static void addPhaseSeconds(std::string &content, const std::string &phase, double seconds);
-    // prints this node's phase values through Debug::INFO, prefixed with its rank on multiple nodes
     static void printPhaseValues(const std::string &values);
-    // the items of a work queue that this node takes: its own items rank, rank + count, ... from the front, then those of the others from the back, round-robin from rank + 1
+
     class WorkQueue {
     public:
         WorkQueue(const std::string &name, size_t itemCount);
-        // the next item that this node has taken by creating <name>.<item> exclusively with its rank, itemCount once none is left
         size_t takeNextItem();
-        // the first item that no node has taken, for a queue that all nodes take in order, so its taken items are always the first ones
         size_t takeNextItemInOrder();
-        // the number of first items that some node has taken; any thread of this node may read it while takeNextItemInOrder runs
         size_t getTakenItemCount() const;
-        // the node that took item, count while that is not readable
         unsigned int getNode(size_t item) const;
-        // removes <name>.<item> of the own items of this node, while no node takes items of the queue
         void removeTakenItemFiles();
 
     private:
@@ -123,15 +104,12 @@ public:
         const size_t itemCount;
         size_t nextItem;
         size_t nextOrderedItem;
-        // the items of every other node not tried yet from the back, and the node to try next
         std::vector<size_t> itemsLeft;
         size_t nextNode;
     };
-    // a barrier that returns the smallest memoryLimit of all nodes, so they all cut the same splits; with threads all nodes must run with as many
-    // localNodes: the nodes with localDirectory on the same local flash device as this one, 0 if it is not local flash
+
     static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0, const std::string &localDirectory = "", size_t *localNodes = NULL);
 
-    // a range of an exchange file <prefix>.<node> that this node reads through a buffer, freeing its bytes once read
     struct ExchangeReader {
         FILE *file;
         size_t pos;
@@ -139,34 +117,24 @@ public:
         std::vector<char> buffer;
         size_t bufferPos;
         size_t bufferEnd;
-        // end of the records that the buffer holds in full and start of the last of them
         size_t recordEnd;
         size_t lastRecord;
-        // the records that this node sent to itself, read from memory instead of file and freed once read
         char *ownRecords;
-        // where the bytes of the reader in its file that are not freed yet start
         size_t punchEnd;
     };
-    // appends the offsets of a flush to indexData; nodeOffsets: where the bytes of every node start in the flush, then the flush size
-    static void addExchangeFlush(std::string &indexData, size_t &writtenBytes, const std::vector<size_t> &nodeOffsets);
-    // openExchange reads records, from malloc, as the records that this node sends to itself through exchange in its last flush
-    static void keepOwnExchangeRecords(const std::string &exchange, char *records, size_t bytes);
-    // counts bytes that this node sent through an exchange, otherNodeBytes of them for other nodes
-    static void addSentExchangeBytes(size_t bytes, size_t otherNodeBytes);
-    // appends the offsets of indexData to the file of this node, closes it and returns a line of every node, its record bytes and flush count, once every node has closed its file
+
+    static void addExchangeFlush(std::string &indexData, size_t &writtenSize, const std::vector<size_t> &nodeOffsets);
+    static void keepOwnExchangeRecords(const std::string &exchange, char *records, size_t size);
+    static void addSentExchangeBytes(size_t size, size_t otherNodeSize);
     static std::string closeExchange(FILE *file, const std::string &fileName, const std::string &indexFile, const std::string &indexData);
-    // an exchange file <prefix>.<node> of closeExchange holds flushes sorted by receiving node, then P + 1 columns of one offset per flush: column c is where the part of node c starts, the last column where the flush ends; a reader reads one part
     static void openExchange(const std::string &index, const std::string &prefix, std::vector<ExchangeReader> &readers, std::vector<FILE *> &files);
-    // moves the buffered records up to last of every reader to records, recordOffsets their starts then the end; returns their count, 0 once none is left; recordSize NULL: ClusterPair records
     static size_t readExchangeRecordsUpTo(std::vector<ExchangeReader> &readers, size_t bufferMemory, size_t (*recordSize)(const char *, size_t),
                                           bool (*compare)(const ClusterPair &, const ClusterPair &), const ClusterPair &last,
                                           std::vector<char> &records, std::vector<size_t> *recordOffsets, const std::string &prefix);
-    // copies each compression unit { length, offset in its length bin, size, stored size } then bytes (zstd if stored size < size) that starts before bufferEnd to buffer + offset - bufferBegin, where offset adds its bin offset from readerLengthOffsets ({ length, offset }, longer first), and adds { offset, size } to compressionUnits; returns the offset of the next one, SIZE_MAX if none is left
-    static size_t readExchangeCompressionUnits(std::vector<ExchangeReader> &readers, const std::vector<std::vector<std::pair<size_t, size_t> > > &readerLengthOffsets, size_t bufferMemory, size_t maxCompressionUnitBytes,
+    static size_t readExchangeCompressionUnits(std::vector<ExchangeReader> &readers, const std::vector<std::vector<std::pair<size_t, size_t> > > &readerLengthOffsets, size_t bufferMemory, size_t maxCompressionUnitSize,
                                                size_t bufferBegin, size_t bufferEnd, char *buffer, std::vector<std::pair<size_t, size_t> > &compressionUnits, const std::string &prefix);
     static void closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix);
 
-    // pairs sent through <exchange>.<node>, sorted and written per pairCapacity, those for this node kept; balancedKeyOffsets: close cuts the nodes to about equal lines
     struct ClusterPairWriter {
         ClusterPairWriter(const std::string &exchange, size_t pairCapacity, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                           std::vector<size_t> *balancedKeyOffsets = NULL);
@@ -179,7 +147,7 @@ public:
             pairs[pairCount].memberKey = memberKey;
             pairCount++;
         }
-        // makes room for count more pairs, at most pairCapacity, and returns where they go
+
         ClusterPair *reservePairs(size_t count) {
             if (pairCount + count > pairCapacity) {
                 flush();
@@ -188,8 +156,8 @@ public:
             pairCount += count;
             return reserved;
         }
+
         void flush();
-        // writes the buffered pairs, keeping those for this node in memory; with balancedKeyOffsets, bit k of singletonBits counts as a line of key firstKey + k; returns the line of every node from closeExchange
         std::string close(const uint64_t *singletonBits = NULL, size_t firstKey = 0, size_t keyCount = 0);
 
         const std::string exchange;
@@ -201,37 +169,28 @@ public:
         bool (*compare)(const ClusterPair &, const ClusterPair &);
         const std::vector<size_t> &nodeKeyOffsets;
         std::vector<size_t> *balancedKeyOffsets;
-        // where the pairs of every bin start in each flush, then its pair count
         std::vector<size_t> binOffsets;
         std::string indexData;
-        size_t writtenBytes;
+        size_t writtenSize;
         size_t keptPairCount;
     };
-    // the representative of entry p becomes the one received for p in receivedIndex if given; representativeBits: keys [firstKey, firstKey + keyCount) of clu, which has no entries of one key, left set for keys neither entries nor received; cluKeyOffsets: where the node files of clu start, without them <clu>.<node>; balancedKeyOffsets: set to where the keys of every node start, cut so that the nodes get about equal lines; the representative bits left are written to <exchange>.bits.<node>
+
     static std::string sendClusterPairs(const std::string &clu, bool withRepresentative, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                                         const std::string &exchange, const std::string &receivedIndex = "", const std::string &receivedPrefix = "",
                                         uint64_t *representativeBits = NULL, const std::vector<size_t> &cluKeyOffsets = std::vector<size_t>(), size_t firstKey = 0, size_t keyCount = 0,
                                         std::vector<size_t> *balancedKeyOffsets = NULL);
-    // once every node has read lastExchange, a node removes its file of it; the master removes the indexes of exchanges and prints phaseValues
     static void removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues = "");
-    // ORs the bits of keys [from, to) of a file, bit k at fileOffset = key fileFirstKey + k, into bit key - firstKey of bits, a word longer than its keys
+
     static void readKeyBits(int fd, const std::string &fileName, size_t fileOffset, size_t fileFirstKey, size_t from, size_t to, size_t firstKey, uint64_t *bits);
-    // the representative bits of keys [firstKey, firstKey + keyCount) from the files <db>.bits.<node>, each {firstKey, keyCount} then its bits
     static uint64_t *readRepresentativeBits(const std::string &db, const std::vector<size_t> &fileKeyOffsets, size_t firstKey, size_t keyCount);
-    // writes the representative bits of this node as <db>.bits.<node> and its ranges with their representative counts as <db>.index.<node>, gathered by the master
     static void writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount);
-    // a barrier that returns where the keys of every <clu>.<node> start, then keyCount, from their first entries, for node files in key order; only keys that are entries of the clustering are routed
+
     static std::vector<size_t> getClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount, const std::string &firstKeyFile = "");
-    // a barrier that returns where the keys of every node start, then keyCount, cut so that the nodes get about equal entry bytes of the node files <clu>.<node>, for node files in key order
     static std::vector<size_t> getBalancedClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount);
-    // the entry keys in [keyBegin, keyEnd) of the node files <clu>.<node>, whose keys start at cluKeyOffsets, in key order
     static void readClusterKeys(const std::string &clu, const std::vector<size_t> &cluKeyOffsets, size_t keyBegin, size_t keyEnd, std::vector<DBKeyType> &keys);
-    // appends the data and (key, offset) entries of every thread to dataFile and indexFile of a cluster database, uint64 (key, offset) per entry in key order then (DB_KEY_INVALID, data size)
     static void writeClusterThreadEntries(FILE *dataFile, const std::string &dataFileName, FILE *indexFile, const std::string &indexFileName,
-                                          std::vector<std::string> &threadData, std::vector<std::vector<uint64_t> > &threadEntries, size_t &dataBytes, size_t &indexBytes);
-    // writes the end entry (DB_KEY_INVALID, dataBytes) at indexBytes and closes dataFile and indexFile
-    static void closeClusterFiles(FILE *dataFile, const std::string &dataFileName, FILE *indexFile, const std::string &indexFileName, size_t dataBytes, size_t indexBytes);
-    // writes the pairs of an exchange in rep order as the cluster database <clu>.<node>; singletonBits: bit k makes key firstKey + k a singleton
+                                          std::vector<std::string> &threadData, std::vector<std::vector<uint64_t> > &threadEntries, size_t &dataSize, size_t &indexSize);
+    static void closeClusterFiles(FILE *dataFile, const std::string &dataFileName, FILE *indexFile, const std::string &indexFileName, size_t dataSize, size_t indexSize);
     static void writeClusterPairs(const std::string &index, const std::string &prefix, const std::string &clu, const uint64_t *singletonBits, size_t firstKey, size_t keyCount);
 };
 
