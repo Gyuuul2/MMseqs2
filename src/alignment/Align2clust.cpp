@@ -360,7 +360,7 @@ bool doSwipeExtensionsPass(const Parameters &par, SwipeTargets &swipeTargets, si
     joined.identicalAACnt = 0;
     for (size_t b = 0, q = joined.qStartPos1, t = joined.dbStartPos1; b < gappedBacktrace.size(); b++) {
         const char op = gappedBacktrace[b];
-        joined.identicalAACnt += (op == 'M' && querySequence[q] == targetSequence[t]);
+        joined.identicalAACnt += (op == 'M' && (querySequence[q] & static_cast<unsigned char>(~0x20)) == (targetSequence[t] & static_cast<unsigned char>(~0x20)));
         q += (op != 'D');
         t += (op != 'I');
     }

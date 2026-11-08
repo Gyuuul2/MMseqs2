@@ -546,16 +546,20 @@ void SwipeAligner::alignBand(const BandJob *jobs, size_t jobCount, const unsigne
             }
             traceRow[width / codesPerLane] = codes;
         }
-        if (simd_any(V::gt(vRowMax, vBest))) {
+        // as Farrar: the best score ends at its smallest target position, then smallest query position
+        if (simd_any(simdi_andnot(V::gt(vBest, vRowMax), V::gt(vRowMax, vZero)))) {
             simdi_storeu(reinterpret_cast<simd_int *>(rowMax), vRowMax);
             for (size_t l = 0; l < jobCount; l++) {
-                if (rowMax[l] > bests[l]) {
+                if (rowMax[l] < bests[l] || rowMax[l] == 0) {
+                    continue;
+                }
+                int k = 0;
+                while (getLaneValue<T>(hRow + k, l) != rowMax[l]) {
+                    k++;
+                }
+                if (rowMax[l] > bests[l] || r + k < rows[l] + columns[l]) {
                     bests[l] = rowMax[l];
                     rows[l] = r;
-                    int k = 0;
-                    while (getLaneValue<T>(hRow + k, l) != rowMax[l]) {
-                        k++;
-                    }
                     columns[l] = k;
                 }
             }
@@ -1307,8 +1311,8 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
         simd_int vE = vZero;
         simd_int vRowMax = vZero;
         int kb = columnBegin / block * block;
-        simd_int vPos = vZero;
         simd_int vK = V::set(kb + V::COLUMN_BIAS);
+        simd_int vPos = vK;
         simd_int hDiag = hRow[kb];
         const auto cell = [&](int k, simd_int score, bool masked, bool first) {
             const simd_int hAbove = hRow[k + 1];
@@ -1337,7 +1341,7 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
             hDiag = hAbove;
             vHl = hp;
             const simd_int cellMax = V::max(vRowMax, h);
-            vPos = laneSelect(V::eq(cellMax, h), vK, vPos);
+            vPos = laneSelect(V::eq(cellMax, vRowMax), vPos, vK);
             vRowMax = cellMax;
             vK = V::add(vK, vOne);
         };
@@ -1367,13 +1371,13 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
                 traceRow[width / codesPerLane] = codes;
             }
         }
-        // ties go to the larger target position, then the later row, so an extension ends at the farthest cell of its best score; BlockAligner does so only within the step that raised it
+        // as Farrar: ties end at the cell nearest the seed, by target position, then query position
         if (simd_any(simdi_andnot(V::gt(vBest, vRowMax), vActive))) {
             simdi_storeu(reinterpret_cast<simd_int *>(rowMax), vRowMax);
             simdi_storeu(reinterpret_cast<simd_int *>(rowPos), vPos);
             for (int l = 0; l < lanes; l++) {
                 const int pos = static_cast<T>(rowPos[l] - V::COLUMN_BIAS);
-                const bool better = active[l] && (rowMax[l] > laneBests[l] || (rowMax[l] == laneBests[l] && laneRows[l] + pos >= bestRows[l] + bestColumns[l]));
+                const bool better = active[l] && (rowMax[l] > laneBests[l] || (rowMax[l] == laneBests[l] && laneRows[l] + pos < bestRows[l] + bestColumns[l]));
                 bestRows[l] = better ? laneRows[l] : bestRows[l];
                 bestColumns[l] = better ? pos : bestColumns[l];
             }
