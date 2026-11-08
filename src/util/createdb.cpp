@@ -426,6 +426,14 @@ static bool isLongerRange(const LengthRangeLayout &range, size_t length) {
     return range.length > length;
 }
 
+// prints every 10 % of a node's bytes, also on the nodes besides the master
+static void printProgress(const char *step, size_t before, size_t after, size_t total, Timer &timer) {
+    if (total > 0 && after * 10 / total > before * 10 / total) {
+        Debug(Debug::INFO) << ((MMseqsNode::count > 1) ? "[node " + SSTR(MMseqsNode::rank) + "] " : "") << after * 100 / total << "% of " << step << " after "
+                           << static_cast<size_t>(timer.getTimediff()) << " s\n";
+    }
+}
+
 static void flushBufferToExchange(char *buffer, size_t bufferPos, char *sortedBuffer, ZSTD_CCtx *cctx, size_t lengthCount, size_t inputSplit, size_t inputSplitFlush,
                                   FILE *exchangeFile, const std::string &exchangeFileName, std::vector<SentFlush> &sentFlushes, size_t &exchangeBytes) {
     std::vector<size_t> lengthBytes(DATA_FILE_TYPE_COUNT * lengthCount, 0);
@@ -623,6 +631,11 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     size_t exchangeBytes = 0;
     size_t emptySequenceCount = 0;
     size_t threadCnt = std::max((size_t) 1, std::min((size_t) par.threads, nodeInputSplits.size()));
+    size_t inputBytes = 0;
+    for (size_t i = 0; i < nodeInputSplits.size(); i++) {
+        inputBytes += nodeInputSplits[i].end - nodeInputSplits[i].start;
+    }
+    size_t readBytes = 0;
     size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
     size_t entryBufferBytes = static_cast<size_t>(memoryLimit * 0.95) / (2 * threadCnt);
 #pragma omp parallel num_threads(threadCnt) reduction(+:emptySequenceCount)
@@ -684,6 +697,11 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                                       exchangeHandle, exchangeFile, sentFlushes, exchangeBytes);
             }
             delete kseq;
+            size_t splitBytes = nodeInputSplits[i].end - nodeInputSplits[i].start;
+            size_t readEnd;
+#pragma omp atomic capture
+            readEnd = readBytes += splitBytes;
+            printProgress("the input read", readEnd - splitBytes, readEnd, inputBytes, timer);
         }
         Util::releasePages(buffer, entryBufferBytes);
         Util::releasePages(sortedBuffer, entryBufferBytes);
@@ -977,7 +995,14 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
 
         std::vector<std::pair<size_t, size_t> > compressionUnits;
         std::vector<std::pair<size_t, size_t> > writes;
+        size_t outputBytes = 0;
         for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
+            outputBytes += dataFileBytes[fileType * MMseqsNode::count + MMseqsNode::rank];
+        }
+        size_t writtenBytes = 0;
+        for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
+            size_t fileTypeBegin = writtenBytes;
+            size_t fileTypeBytes = dataFileBytes[fileType * MMseqsNode::count + MMseqsNode::rank];
             for (size_t writeBufferBegin = 0; writeBufferBegin != SIZE_MAX; ) {
                 compressionUnits.clear();
                 size_t nextOffset = MMseqsNode::readExchangeCompressionUnits(readers[fileType], readerLengthOffsets[fileType], readerBufferSize, MAX_UNIT_SIZE,
@@ -1049,6 +1074,9 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     }
                     writeBufferBegin = nextOffset;
                 }
+                size_t writtenEnd = fileTypeBegin + std::min(writeBufferBegin, fileTypeBytes);
+                printProgress("the database written", writtenBytes, writtenEnd, outputBytes, timer);
+                writtenBytes = writtenEnd;
             }
         }
 
