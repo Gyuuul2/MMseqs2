@@ -45,10 +45,6 @@ struct LengthRange {
     size_t entryLength;
 };
 
-static size_t hashWithLength(size_t hash, size_t length) {
-    return hash ^ (length + static_cast<size_t>(0x9e3779b97f4a7c15ULL) + (hash << 6) + (hash >> 2));
-}
-
 // positions 64 * i .. 64 * i + 63 of a split length: which are members of the current hash range or copy batch, and how many members come before them
 struct MemberBits {
     uint64_t memberMask;
@@ -81,7 +77,8 @@ static void cutThreadOffsets(const HashEntry *hashIdPairs, size_t begin, size_t 
 
 static size_t seqHash(Sequence &seq, size_t id, const char *data, size_t length) {
     seq.mapSequence(id, 0, data, length);
-    return hashWithLength(Util::hash(seq.numSequence, seq.L), length);
+    const size_t hash = Util::hash(seq.numSequence, seq.L);
+    return hash ^ (length + static_cast<size_t>(0x9e3779b97f4a7c15ULL) + (hash << 6) + (hash >> 2));
 }
 
 // hashes the loaded keys [keyBegin, keyEnd) of ranges [0, rangeCount), ended by ranges[rangeCount].startKey, into hashIdPairs
@@ -156,8 +153,7 @@ static size_t loadReadChunk(DBReader<DBKeyType> &reader, size_t firstKey, size_t
     return readChunkEnd;
 }
 
-// counts the sequences of each 16 bit hash value of keys [firstKey, firstKey + seqCount), read readChunkSeqCount at a time,
-// and cuts the hash values into hash ranges of at most maxRangeSeqCount sequences, like kmermatcher setupKmerSplits
+// counts the sequences of each 16 bit hash value of keys [firstKey, firstKey + seqCount) and cuts them into hash ranges of at most maxRangeSeqCount, like setupKmerSplits
 static std::vector<std::pair<size_t, size_t>> setupHashRanges(DBReader<DBKeyType> &reader, const BaseMatrix *subMat, size_t maxSeqLen,
                                                               size_t firstKey, size_t seqCount, size_t readChunkSeqCount, size_t maxRangeSeqCount) {
     size_t *hashDist = new(std::nothrow) size_t[USHRT_MAX + 1];
@@ -374,8 +370,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     }
     const size_t splitMemoryLimit = static_cast<size_t>(static_cast<double>(memoryLimit - representativeBitsWordCount * sizeof(uint64_t) - writeBufferBytes) * 0.95);
 
-    // consecutive lengths that fit together are a split;
-    // a length that does not fit is a split alone: a linfinity length is read one read chunk at a time to hash it and once per copy batch of candidates, a standard DB length once per hash range that fits, after 2 bits per key
+    // lengths that fit are a split together, a larger length a split alone (linfinity: per read chunk and copy batch, standard: per hash range)
     const size_t readChunkBytes = std::min(MAX_INFLIGHT_READ_BYTES, splitMemoryLimit / 4);
     const size_t seqBufferLimit = isLinfinity ? splitMemoryLimit / 3 : 0;
     const size_t hashIdPairsLimit = splitMemoryLimit - 2 * seqBufferLimit;

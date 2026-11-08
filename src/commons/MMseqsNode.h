@@ -65,8 +65,7 @@ public:
     static std::string waitForRunFile(const std::string &file);
     // waits for prefix + node of every node and returns their content in node order; the files are removed
     static std::string gatherRunFiles(const std::string &prefix);
-    // a log that one node appends to while another reads it: its synced byte count and a key are published as <log>.progress, read from a new open
-    // takenItemCount: the first items of an ordered work queue that are taken, so the reader opens only their files
+    // a log appended by one node while another reads it: its synced bytes, a key and takenItemCount (the taken items of an ordered work queue) go to <log>.progress
     static void publishLog(FILE *file, const std::string &log, size_t key, size_t bytes, size_t takenItemCount = 0);
     static bool readLogProgress(const std::string &log, size_t &key, size_t &bytes, size_t *takenItemCount = NULL);
     static void waitForLog(const std::string &log, size_t &key, size_t &bytes);
@@ -79,12 +78,10 @@ public:
     static size_t readExchangeIndexLines(const std::string &indexFile, size_t firstLine, size_t lineWords, std::vector<uint64_t> &lines);
     static const size_t EXCHANGE_FILE_HEADER_BYTES = 2 * sizeof(uint64_t);
     static void writeExchangeFileHeader(FILE *file, const std::string &fileName, uint64_t exchangeFileNumber);
-    // the bytes of a flush that a thread writes at once
-    static const size_t EXCHANGE_WRITE_BYTES = 16 * 1024 * 1024;
     // writes bytes of data to fileName as exchange file exchangeFileNumber from threads threads, then publishes it with line to indexFile
     static void writeExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *data, size_t bytes, const std::string &indexFile,
                                   const std::vector<uint64_t> &line, int threads);
-    static int tryOpenExchangeFile(const std::string &file, size_t expectedBytes, uint64_t expectedExchangeFileNumber, time_t &lastDirectoryRefresh,
+    static int tryOpenExchangeFile(const std::string &file, size_t expectedBytes, uint64_t expectedExchangeFileNumber,
                                    size_t &observedBytes, uint64_t &observedExchangeFileNumber, int &lastError);
     static bool tryPreadAll(int fd, char *data, size_t bytes, size_t offset, int &readError);
     // every node publishes content as file + "." + node; returns all contents in node order, gathered by the master into file
@@ -162,8 +159,7 @@ public:
                                                size_t bufferBegin, size_t bufferEnd, char *buffer, std::vector<std::pair<size_t, size_t> > &compressionUnits, const std::string &prefix);
     static void closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix);
 
-    // the pairs that this node sends through the exchange file <exchange>.<node>, sorted and written once pairCapacity are buffered, those for this node kept in memory; nodeKeyOffsets: keys of every node;
-    // balancedKeyOffsets: full flushes are written whole and close sets it to keys of every node cut so that the nodes get about equal lines, then cuts the last flush at it
+    // pairs sent through <exchange>.<node>, sorted and written per pairCapacity, those for this node kept; balancedKeyOffsets: close cuts the nodes to about equal lines
     struct ClusterPairWriter {
         ClusterPairWriter(const std::string &exchange, size_t pairCapacity, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                           std::vector<size_t> *balancedKeyOffsets = NULL);

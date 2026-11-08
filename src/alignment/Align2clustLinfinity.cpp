@@ -25,6 +25,11 @@
 
 static const size_t PREFETCH_DISTANCE = 16;
 
+// the memory of a set-cover file: the read buffers of a merge, or the pending sets of the large sets
+static size_t getSetCoverFileBytes(size_t memoryLimit) {
+    return std::min<size_t>(memoryLimit / 64, 4ULL * 1024 * 1024 * 1024);
+}
+
 // the sorted runs of a file of records of recordElementCount elements; merge takes the records largest first by less, with a read buffer per run
 template <typename T>
 class SetCoverMergeReader {
@@ -142,7 +147,7 @@ public:
             EXIT(EXIT_FAILURE);
         }
         file = NULL;
-        runs.merge(fileName, 1, std::min<size_t>(memoryLimit / 64, 4ULL * 1024 * 1024 * 1024),
+        runs.merge(fileName, 1, getSetCoverFileBytes(memoryLimit),
                    [](const ClusterPair *first, const ClusterPair *second) { return ClusterPair::compareByRep(*first, *second); },
                    [&](const ClusterPair *pair) { prefetchPair(*pair); },
                    [&](const ClusterPair *pair) { addClusterPair(*pair); });
@@ -214,8 +219,6 @@ public:
         }
     }
 
-    size_t mergeReadBudgetBytes() const { return std::min<size_t>(memoryLimit / 64, 4ULL * 1024 * 1024 * 1024); }
-
 private:
     struct SetSizeFile {
         std::vector<DBKeyType> memberKeys;
@@ -278,7 +281,7 @@ private:
             EXIT(EXIT_FAILURE);
         }
         setSizeFile.writer = NULL;
-        setSizeFile.runs.merge(path, count, mergeReadBudgetBytes(),
+        setSizeFile.runs.merge(path, count, getSetCoverFileBytes(memoryLimit),
                                             [](const DBKeyType *first, const DBKeyType *second) { return first[0] < second[0]; },
                                             [&](const DBKeyType *ahead) {
                                            for (size_t member = 0; member < count; member++) {
@@ -298,7 +301,7 @@ private:
 class SetCoverLargeSetFiles {
 public:
     SetCoverLargeSetFiles(const std::string &prefix, size_t memoryLimit)
-        : prefix(prefix), memoryBudget(std::max<size_t>(65 * sizeof(DBKeyType), std::min<size_t>(memoryLimit / 64, 4ULL * 1024 * 1024 * 1024))),
+        : prefix(prefix), memoryBudget(std::max<size_t>(65 * sizeof(DBKeyType), getSetCoverFileBytes(memoryLimit))),
           nextFile(0), writtenBytes(0) {}
 
     template <typename Reps, typename Counts, typename IsFree, typename Word>
@@ -659,7 +662,7 @@ static const size_t FETCHED_KEY_BYTES = 4 * sizeof(DBKeyType) + sizeof(unsigned 
 static const size_t ASSIGNED_PAGE_KEYS = 32768;
 // the first fetch is small so aligning starts soon; every next one doubles
 static const size_t FIRST_FETCH_BYTES = 64 * 1024 * 1024;
-// a served file is cut once its served entries reach the memory limit divided by this, at least MMseqsNode::EXCHANGE_WRITE_BYTES
+// a served file is cut once its served entries reach the memory limit divided by this, at least MAX_READ_REQUEST_BYTES
 static const size_t SERVED_FILE_MEMORY_DIVISOR = 512;
 // the served entries of a request: a bit per key, set when it is assigned and not served, then a packed entry per served entry of 5 bits per byte, or PACKED_RAW_CODE and its bytes after the packed entries
 static const char PACKED_ENTRY_ALPHABET[] = "\0\nABCDEFGHIJKLMNOPQRSTUVWXYZ*-";
@@ -1629,9 +1632,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 requestFiles[node] = requests + "." + SSTR(node);
                 servedIndexes[node] = served + ".index." + SSTR(node);
             }
-            // a request index line: the request, whether it is the last, where the keys of every node start, then the end
+            // a request index line: the request, whether it is the last, where the keys of every node start, the end, then the magic
             std::vector<uint64_t> requestLine(nodes + 4);
-            // a served index line: the served file, where the served entries of every node start in it, the end, then where the served entries of every node end in the keys of its request for this serving node
+            // a served index line: the served file, where the served entries of every node start in it, the end, then where the served entries of every node end in the keys of its request for this serving node, then the magic
             const size_t servedLineWords = 2 * nodes + 3;
             std::vector<uint64_t> servedLine(servedLineWords);
             // the lines of a serving node read at once
@@ -1657,10 +1660,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             std::vector<double> nextRequestIndexPolls(nodes, 0);
             std::vector<time_t> missingServedFileSince(nodes, 0);
             std::vector<unsigned int> missingServedFileAttempts(nodes, 0);
-            std::vector<time_t> lastDirectoryRefresh(nodes, 0);
             std::vector<time_t> missingRequestSince(nodes, 0);
             std::vector<unsigned int> missingRequestAttempts(nodes, 0);
-            std::vector<time_t> lastRequestDirectoryRefresh(nodes, 0);
             // a request this node serves in parts: its node, its request number, where its key codes for this node start, where the next one is and where they end in the request file, the request file bytes, the keys served so far and the last of them
             struct ServedRequest {
                 unsigned int node;
@@ -1838,7 +1839,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         uint64_t observedExchangeFileNumber;
                         int lastError;
                         Timer openTimer;
-                        const int fd = MMseqsNode::tryOpenExchangeFile(servedFile, polledServedFileBytes[servingNode], servedFileNumbers[servingNode], lastDirectoryRefresh[servingNode], observedBytes, observedExchangeFileNumber, lastError);
+                        const int fd = MMseqsNode::tryOpenExchangeFile(servedFile, polledServedFileBytes[servingNode], servedFileNumbers[servingNode], observedBytes, observedExchangeFileNumber, lastError);
                         readingSeconds += openTimer.getTimediff();
                         if (fd < 0) {
                             if (lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
@@ -1863,7 +1864,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             // the served entries are read in parts of the bytes a served file writes at once, by served entries and offset; a failed part keeps its error, -1 without errno, 0 when it did not fail
                             std::vector<std::pair<size_t, size_t> > readRequests;
                             for (size_t i = 0; i < servedEntriesReads.size(); i++) {
-                                for (size_t offset = 0; offset < servedEntriesReads[i].bytes; offset += MMseqsNode::EXCHANGE_WRITE_BYTES) {
+                                for (size_t offset = 0; offset < servedEntriesReads[i].bytes; offset += MAX_READ_REQUEST_BYTES) {
                                     readRequests.push_back(std::make_pair(i, offset));
                                 }
                             }
@@ -1873,7 +1874,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 const ServedEntriesRead &request = servedEntriesReads[readRequests[i].first];
                                 const size_t offset = readRequests[i].second;
                                 int readError;
-                                if (MMseqsNode::tryPreadAll(request.fd, receivedEntries.data() + request.receivedOffset + offset, std::min(MMseqsNode::EXCHANGE_WRITE_BYTES, request.bytes - offset),
+                                if (MMseqsNode::tryPreadAll(request.fd, receivedEntries.data() + request.receivedOffset + offset, std::min(MAX_READ_REQUEST_BYTES, request.bytes - offset),
                                                             servedEntriesBegins[request.servingNode] + offset, readError) == false) {
                                     readErrors[i] = (readError != 0) ? readError : -1;
                                 }
@@ -1977,7 +1978,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     int lastError;
                     Timer requestTimer;
                     const int requestFd = MMseqsNode::tryOpenExchangeFile(requestFiles[node], servedRequest.requestBytes, servedRequest.requestFileNumber,
-                                                                            lastRequestDirectoryRefresh[node], observedBytes, observedExchangeFileNumber, lastError);
+                                                                            observedBytes, observedExchangeFileNumber, lastError);
                     if (requestFd < 0 && lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
                         Debug(Debug::ERROR) << "Cannot open sequence request " << requestFiles[node] << ": " << strerror(lastError) << "\n";
                         EXIT(EXIT_FAILURE);
@@ -2094,7 +2095,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     hasWorked = true;
                 }
                 pollTurn += polledNodes;
-                // idle: poll again after up to 160 ms while this or another aligning node may wait, else up to 1.28 s
+                // idle: poll again after pollMicroseconds and up to 160 ms more while this or another aligning node may wait, else up to 1.28 s more
                 if (hasWorked) {
                     polls = 0;
                 } else {
@@ -2613,7 +2614,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     std::vector<size_t> nodeClusteredWordCounts(MMseqsNode::count, 0);
     for (size_t node = 0; node < MMseqsNode::count; node++) {
         const ClusteredLog clusteredLog = { FileUtil::openAndDelete((clusteredLogPrefix + "." + SSTR(node)).c_str(), "w"), 0, 0, 0, new(std::nothrow) char[CLUSTERED_LOG_BUFFER_BYTES] };
-        Util::checkAllocation(clusteredLog.buffer, "Cannot allocate the buffer of " + clusteredLogPrefix);
+        Util::checkAllocation(clusteredLog.buffer, "Can not allocate clustered log buffer memory in align2clust");
         setvbuf(clusteredLog.file, clusteredLog.buffer, _IOFBF, CLUSTERED_LOG_BUFFER_BYTES);
         nodeClusteredLogs[node] = clusteredLog;
     }
@@ -2883,13 +2884,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             }
             repKeyOffsets[rep + 1] = (freeCount > 0) ? freeCount + 1 : 0;
         }
-        if (repCount > 16384 && threads > 1) {
-            sumOffsets(repKeyOffsets.data(), repCount, threads);
-        } else {
-            for (size_t rep = 0; rep < repCount; rep++) {
-                repKeyOffsets[rep + 1] += repKeyOffsets[rep];
-            }
-        }
+        sumOffsets(repKeyOffsets.data(), repCount, threads);
         if (mode == Parameters::SET_COVER) {
             // a set waits until no later rep can have a larger one, the sets of two as pairs
             size_t setPairs = 0;
@@ -3324,7 +3319,7 @@ int align2clustLinfinity(Parameters &par) {
     const size_t sizeClassCount = (par.clusteringMode == Parameters::SET_COVER) ? 64 - __builtin_clzll(dbSize | 1) : 1;
     const size_t maxRecordBytes = std::max<size_t>(1, smallestMemoryLimit / RECORD_MEMORY_DIVISOR);
     // every node cuts its served files at the same bytes, so received served entries fit the reservation of any node
-    const size_t servedFileEntryBytes = std::max(MMseqsNode::EXCHANGE_WRITE_BYTES, smallestMemoryLimit / SERVED_FILE_MEMORY_DIVISOR);
+    const size_t servedFileEntryBytes = std::max(MAX_READ_REQUEST_BYTES, smallestMemoryLimit / SERVED_FILE_MEMORY_DIVISOR);
 
     RepTargetsReader repTargetsReader(par, seqDbr, partitions, alignmentSplitPartitionOffsets, alignmentSplitQueue, maxRecordBytes, memoryLimit, paddedDbSize, sizeClassCount);
     if (sizeClassCount > 1) {

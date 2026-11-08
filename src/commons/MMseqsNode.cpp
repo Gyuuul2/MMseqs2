@@ -27,7 +27,6 @@
 unsigned int MMseqsNode::rank = 0;
 unsigned int MMseqsNode::count = 1;
 const size_t MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
-const size_t MMseqsNode::EXCHANGE_WRITE_BYTES;
 // the first line of every barrier file, so a file that a killed run left is told apart from one of this run
 static std::string runId;
 // the exchange bytes that this node sent, all of them and those for other nodes, reported by removeExchanges
@@ -89,9 +88,7 @@ void MMseqsNode::sleepBeforePoll(unsigned int polls, unsigned int maxShift) {
     usleep(10000u << std::min(polls, maxShift));
 }
 
-// whether the directory of file lists it: reading the directory asks the server, while a lookup of a name that NFS once
-// saw missing is answered from its cache for up to 60 s (Nextflow lists the work directory before it reads .exitcode, too); a listing refreshes
-// the directory for all threads, so a process lists at most once a second and treats a file as not listed in between
+// whether a listing of its directory finds file, at most once a second per process, as NFS caches a missing name for up to 60 s
 static bool isListed(const std::string &file) {
     if (FileUtil::needsDirectoryRefresh(file) == false) {
         return false;
@@ -125,9 +122,18 @@ static int openFile(const std::string &file, int flags = O_RDONLY) {
     return fd;
 }
 
-// the content of file, or an empty string while it is not published; NFS only promises that open sees the latest state of a file that
-// exists, a name it found missing can stay missing, so a poll creates the empty file that the rename of the publish replaces; a file
-// that a later publish replaces while it is read fails with ESTALE and is read again by the next poll; other file systems see the rename at once
+// on NFS a name once seen missing is opened again after a listing of its directory finds it
+static int openListedFile(const std::string &file, int flags = O_RDONLY) {
+    const int fd = openFile(file, flags);
+    const int openError = errno;
+    if (fd < 0 && openError == ENOENT && isListed(file)) {
+        return openFile(file, flags);
+    }
+    errno = openError;
+    return fd;
+}
+
+// the content of file, or empty until it is published; on NFS a poll creates the empty file that the publish replaces, as a name seen missing can stay missing
 static std::string readPolledFile(const std::string &file) {
     const int flags = FileUtil::needsDirectoryRefresh(file) ? (O_RDONLY | O_CREAT) : O_RDONLY;
     int fd = openFile(file, flags);
@@ -287,12 +293,8 @@ bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
     }
     // NFS can expose the progress file before the flushed log is visible
     for (unsigned int polls = 0; polls < MAX_READ_POLLS; polls++) {
-        int fd = openFile(log);
-        int openError = (fd < 0) ? errno : 0;
-        if (openError == ENOENT && isListed(log)) {
-            fd = openFile(log);
-            openError = (fd < 0) ? errno : 0;
-        }
+        const int fd = openListedFile(log);
+        const int openError = (fd < 0) ? errno : 0;
         if (fd < 0) {
             if (openError != ENOENT && openError != ESTALE) {
                 Debug(Debug::ERROR) << "Cannot open " << log << ": " << strerror(openError) << "\n";
@@ -358,14 +360,9 @@ void MMseqsNode::publishExchangeFile(FILE *file, const std::string &fileName, si
 
 size_t MMseqsNode::readExchangeIndexLines(const std::string &indexFile, size_t firstLine, size_t lineWords, std::vector<uint64_t> &lines) {
     const size_t lineBytes = lineWords * sizeof(uint64_t);
-    int fd = openFile(indexFile);
+    const int fd = openListedFile(indexFile);
     __sync_fetch_and_add(&exchangeIndexOpenCount, 1);
-    int openError = (fd < 0) ? errno : 0;
-    // a listing refreshes an NFS negative lookup before the index is opened again
-    if (openError == ENOENT && isListed(indexFile)) {
-        fd = openFile(indexFile);
-        openError = (fd < 0) ? errno : 0;
-    }
+    const int openError = (fd < 0) ? errno : 0;
     if (fd < 0) {
         if (openError == ENOENT || openError == ESTALE) {
             return 0;
@@ -407,31 +404,20 @@ void MMseqsNode::writeExchangeFile(const std::string &fileName, uint64_t exchang
     FILE *file = FileUtil::openAndDelete(fileName.c_str(), "w");
     writeExchangeFileHeader(file, fileName, exchangeFileNumber);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (size_t offset = 0; offset < bytes; offset += EXCHANGE_WRITE_BYTES) {
-        FileUtil::pwriteAll(fileno(file), fileName.c_str(), data + offset, std::min(EXCHANGE_WRITE_BYTES, bytes - offset), EXCHANGE_FILE_HEADER_BYTES + offset);
+    for (size_t offset = 0; offset < bytes; offset += MAX_READ_REQUEST_BYTES) {
+        FileUtil::pwriteAll(fileno(file), fileName.c_str(), data + offset, std::min(MAX_READ_REQUEST_BYTES, bytes - offset), EXCHANGE_FILE_HEADER_BYTES + offset);
     }
     publishExchangeFile(file, fileName, EXCHANGE_FILE_HEADER_BYTES + bytes, indexFile, line);
 }
 
-int MMseqsNode::tryOpenExchangeFile(const std::string &file, size_t expectedBytes, uint64_t expectedExchangeFileNumber, time_t &lastDirectoryRefresh,
+int MMseqsNode::tryOpenExchangeFile(const std::string &file, size_t expectedBytes, uint64_t expectedExchangeFileNumber,
                                     size_t &observedBytes, uint64_t &observedExchangeFileNumber, int &lastError) {
     observedBytes = SIZE_MAX;
     observedExchangeFileNumber = UINT64_MAX;
     lastError = 0;
-    int fd = openFile(file, O_RDONLY | O_CLOEXEC);
-    int openError = (fd < 0) ? errno : 0;
-    if (openError == ENOENT) {
-        const time_t now = time(NULL);
-        if (now != lastDirectoryRefresh) {
-            lastDirectoryRefresh = now;
-            if (isListed(file)) {
-                fd = openFile(file, O_RDONLY | O_CLOEXEC);
-                openError = (fd < 0) ? errno : 0;
-            }
-        }
-    }
+    const int fd = openListedFile(file, O_RDONLY | O_CLOEXEC);
     if (fd < 0) {
-        lastError = openError;
+        lastError = errno;
         return -1;
     }
     struct stat fileStat;
@@ -594,10 +580,7 @@ size_t MMseqsNode::WorkQueue::getTakenItemCount() const {
 unsigned int MMseqsNode::WorkQueue::getNode(size_t item) const {
     unsigned int node = count;
     const std::string file = name + "." + SSTR(item);
-    int fd = openFile(file);
-    if (fd < 0 && errno == ENOENT && isListed(file)) {
-        fd = openFile(file);
-    }
+    const int fd = openListedFile(file);
     if (fd >= 0) {
         if (pread(fd, &node, sizeof(node), 0) != static_cast<ssize_t>(sizeof(node))) {
             node = count;
@@ -733,8 +716,7 @@ static const char *getReaderData(const MMseqsNode::ExchangeReader &reader) {
     return (reader.ownRecords != NULL) ? reader.ownRecords : reader.buffer.data();
 }
 
-// a reader frees the bytes that it has read in steps of at least PUNCH_HOLE_STEP that end at whole PUNCH_HOLE_ALIGNMENT, then its rest once read,
-// so a few punches free a reader of any size while the other nodes read their parts of the same file
+// a reader frees the bytes it has read in steps of PUNCH_HOLE_STEP at whole PUNCH_HOLE_ALIGNMENT, then its rest once read
 static const size_t PUNCH_HOLE_STEP = 1024 * 1024 * 1024;
 static const size_t PUNCH_HOLE_ALIGNMENT = 1024 * 1024;
 // the smallest buffer of a reader in readExchangeRecordsUpTo

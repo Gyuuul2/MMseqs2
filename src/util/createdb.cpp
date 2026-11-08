@@ -377,43 +377,6 @@ static size_t getCompressionUnitHeaderBytes(size_t entryCount, size_t lengthCoun
     return (DATA_FILE_TYPE_COUNT * (std::min(entryCount, lengthCount) + 1) + dataSize / MAX_COMPRESSION_UNIT_BYTES) * COMPRESSION_UNIT_HEADER_BYTES;
 }
 
-static std::vector<LengthRangeLayout> makeLengthRanges(const std::vector<size_t> &sequenceCount, const std::vector<size_t> &headerBytes) {
-    std::vector<LengthRangeLayout> histogram;
-    for (size_t length = sequenceCount.size(); length-- > 0; ) {
-        if (sequenceCount[length] > 0) {
-            LengthRangeLayout range = {length, sequenceCount[length], headerBytes[length], 0, {}, 0};
-            histogram.push_back(range);
-        }
-    }
-    return histogram;
-}
-
-static std::vector<LengthRangeLayout> mergeLengthHistograms(const std::vector<std::vector<LengthRangeLayout>> &histograms) {
-    size_t maxLength = 0;
-    for (size_t i = 0; i < histograms.size(); i++) {
-        if (histograms[i].empty() == false) {
-            maxLength = std::max(maxLength, histograms[i][0].length);
-        }
-    }
-    std::vector<size_t> sequenceCount(maxLength + 1, 0);
-    std::vector<size_t> headerBytes(maxLength + 1, 0);
-    for (size_t i = 0; i < histograms.size(); i++) {
-        for (size_t j = 0; j < histograms[i].size(); j++) {
-            sequenceCount[histograms[i][j].length] += histograms[i][j].sequenceCount;
-            headerBytes[histograms[i][j].length] += histograms[i][j].headerBytes;
-        }
-    }
-    return makeLengthRanges(sequenceCount, headerBytes);
-}
-
-static std::vector<LengthRangeLayout> getLengthToRange(const std::vector<LengthRangeLayout> &histogram) {
-    std::vector<LengthRangeLayout> lengthToRange(histogram.empty() ? 0 : histogram[0].length + 1);
-    for (size_t i = 0; i < histogram.size(); i++) {
-        lengthToRange[histogram[i].length] = histogram[i];
-    }
-    return lengthToRange;
-}
-
 // copies data behind the written bytes of a length, leaving room for the headers of its compression units
 static void copyToCompressionUnits(char *buffer, size_t &written, const char *data, size_t size) {
     while (size > 0) {
@@ -761,6 +724,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     // every node has the length histograms of all nodes and makes the same layout
     std::vector<size_t> tableOffsets(MMseqsNode::count);
     std::vector<std::vector<LengthRangeLayout>> nodeHistograms(MMseqsNode::count);
+    std::vector<size_t> sequenceCount;
+    std::vector<size_t> headerBytes;
     // where the table rows of each length of a node start, then their count
     std::vector<std::vector<size_t>> nodeTableOffsets(MMseqsNode::count, std::vector<size_t>(1, 0));
     size_t globalEmptySequenceCount = 0;
@@ -774,6 +739,12 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             range.sequenceCount = strtoull(nodeLinesChar, &nodeLinesChar, 10);
             range.headerBytes = strtoull(nodeLinesChar, &nodeLinesChar, 10);
             nodeHistograms[node].push_back(range);
+            if (range.length >= sequenceCount.size()) {
+                sequenceCount.resize(range.length + 1, 0);
+                headerBytes.resize(range.length + 1, 0);
+            }
+            sequenceCount[range.length] += range.sequenceCount;
+            headerBytes[range.length] += range.headerBytes;
             nodeTableOffsets[node].push_back(nodeTableOffsets[node].back() + strtoull(nodeLinesChar, &nodeLinesChar, 10));
         }
         nodeLinesChar++;
@@ -781,7 +752,14 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     if (globalEmptySequenceCount > 0 && MMseqsNode::isMaster()) {
         Debug(Debug::WARNING) << globalEmptySequenceCount << " sequences without residues are skipped\n";
     }
-    std::vector<LengthRangeLayout> globalHistogram = mergeLengthHistograms(nodeHistograms);
+    // the lengths of all nodes, longer first
+    std::vector<LengthRangeLayout> globalHistogram;
+    for (size_t length = sequenceCount.size(); length-- > 0;) {
+        if (sequenceCount[length] > 0) {
+            const LengthRangeLayout range = {length, sequenceCount[length], headerBytes[length], 0, {}, 0};
+            globalHistogram.push_back(range);
+        }
+    }
     if (globalHistogram.empty()) {
         if (MMseqsNode::isMaster()) {
             Debug(Debug::ERROR) << "The input files have no entry: ";
@@ -884,6 +862,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
 
     // the compression units of the data files of this node from all nodes, written write buffer by write buffer
     double compressSeconds = 0;
+    const std::string compressedHeaderFileName = dataFileNames[HEADER_DATA] + ".tmp";
     {
         // the table rows of the lengths of this node from the table of every node, which follow each other there, in flush order
         std::vector<FILE *> exchangeFiles(MMseqsNode::count, NULL);
@@ -906,7 +885,10 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             }
         }
         // a reader per flush and data file type with the offsets of its rows in the data files, given in key order: by node, flush, then longer first
-        std::vector<LengthRangeLayout> lengthToWriteOffsets = getLengthToRange(nodeLengthRanges);
+        std::vector<LengthRangeLayout> lengthToWriteOffsets(nodeLengthRanges.empty() ? 0 : nodeLengthRanges[0].length + 1);
+        for (size_t i = 0; i < nodeLengthRanges.size(); i++) {
+            lengthToWriteOffsets[nodeLengthRanges[i].length] = nodeLengthRanges[i];
+        }
         std::vector<std::vector<MMseqsNode::ExchangeReader> > readers(DATA_FILE_TYPE_COUNT);
         std::vector<std::vector<std::vector<std::pair<size_t, size_t> > > > readerLengthOffsets(DATA_FILE_TYPE_COUNT);
         // where the header offsets of a row start in their data file, with where its headers start
@@ -953,7 +935,6 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         // --compress-headers: the headers are compressed in frames of uncompressedFrameBytes as they are received, the frames of a write buffer by tasks of frames on all threads
         const size_t uncompressedFrameBytes = 1024 * 1024;
         const size_t maxCompressedFrameBytes = ZSTD_compressBound(uncompressedFrameBytes);
-        const std::string compressedHeaderFileName = dataFileNames[HEADER_DATA] + ".tmp";
         FILE *compressedHeaderFile = NULL;
         char *compressedFrames = NULL;
         std::vector<uint32_t> seekTable;
@@ -1068,7 +1049,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
     }
     if (par.compressHeaders) {
-        FileUtil::move((dataFileNames[HEADER_DATA] + ".tmp").c_str(), dataFileNames[HEADER_DATA].c_str());
+        FileUtil::move(compressedHeaderFileName.c_str(), dataFileNames[HEADER_DATA].c_str());
         MMseqsNode::addPhaseSeconds(phaseValues, "compressing the headers", compressSeconds);
     }
     MMseqsNode::addPhaseSeconds(phaseValues, "writing the sequences", timer.getTimediff() - compressSeconds);
