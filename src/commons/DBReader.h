@@ -291,7 +291,6 @@ public:
     size_t waitForLoadedData();
     size_t getPrefetchBufferBytes(size_t keyBegin, size_t keyEnd);
     void loadData(const std::vector<DBKeyType> &keys);
-    void prefetchData(const std::vector<DBKeyType> &keys);
     void setBlockCacheBytes(size_t cacheBytes);
     size_t getKeyBlock(size_t key) const;
     const std::vector<size_t> &getBlockKeyOffsets() const { return blockKeyOffsets; }
@@ -657,7 +656,6 @@ private:
         std::vector<size_t> blocks;
     };
     EntryReadBuffer loadedBuffer, prefetchBuffer;
-    std::vector<DBKeyType> prefetchedKeys;
 
     // startLoadData
     size_t readStepKeyEnd;

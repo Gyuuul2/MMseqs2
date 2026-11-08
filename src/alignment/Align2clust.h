@@ -248,6 +248,8 @@ struct MemberCheck {
     size_t targetId;
     short startDiagonal;
     std::vector<DBKeyType> memberKeys;
+    // linfinity: fetched entries of memberKeys
+    std::vector<const char *> memberData;
     std::vector<size_t> order;
     std::vector<int> lengths;
     std::vector<std::string> records;
@@ -281,6 +283,7 @@ struct MemberChecks {
         check.targetId = targetId;
         check.startDiagonal = startDiagonal;
         check.memberKeys.clear();
+        check.memberData.clear();
         return check;
     }
 };
@@ -415,9 +418,10 @@ void alignMemberChecksSwipe(const Parameters &par, BlockAligner &blockAligner, M
                     continue;
                 }
                 const size_t g = memberChecks.extendedMemberChecks[gapped];
-                const DBKeyType elementKey = memberChecks.checks[g].memberKeys[i];
+                const MemberCheck &check = memberChecks.checks[g];
+                const DBKeyType elementKey = check.memberKeys[i];
                 const size_t elementId = cluSeqDbr->getId(elementKey);
-                element.mapSequence(elementId, elementKey, cluSeqDbr->getData(elementId, threadIdx), cluSeqDbr->getSeqLen(elementId));
+                element.mapSequence(elementId, elementKey, check.memberData.empty() ? cluSeqDbr->getData(elementId, threadIdx) : check.memberData[i], cluSeqDbr->getSeqLen(elementId));
                 swipeMembers.add(element);
                 swipeMembers.gapped.push_back(i);
                 memberChecks.gappedMemberChecks.push_back(g);

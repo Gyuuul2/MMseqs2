@@ -444,7 +444,7 @@ void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherIni
         const size_t i = swipeMembers.gapped[g];
         const DBKeyType elementKey = check.memberKeys[i];
         const size_t elementId = cluSeqDbr->getId(elementKey);
-        element.mapSequence(elementId, elementKey, cluSeqDbr->getData(elementId, threadIdx), cluSeqDbr->getSeqLen(elementId));
+        element.mapSequence(elementId, elementKey, check.memberData.empty() ? cluSeqDbr->getData(elementId, threadIdx) : check.memberData[i], cluSeqDbr->getSeqLen(elementId));
         const size_t l = gappedMemberBatchIndices[g];
         Matcher::result_t res_element;
         if (l == SIZE_MAX || swipeMembers.aligns[l].word >= 2) {
@@ -519,7 +519,7 @@ bool alignNextMembers(const Parameters &par, BlockAligner &blockAligner, Matcher
             const size_t i = check.order[o];
             const DBKeyType elementKey = check.memberKeys[i];
             const size_t elementId = cluSeqDbr->getId(elementKey);
-            char *elementSequence = cluSeqDbr->getData(elementId, threadIdx);
+            const char *elementSequence = check.memberData.empty() ? cluSeqDbr->getData(elementId, threadIdx) : check.memberData[i];
             size_t elementLength = cluSeqDbr->getSeqLen(elementId);
             short elementDiagonal = check.startDiagonal;
 

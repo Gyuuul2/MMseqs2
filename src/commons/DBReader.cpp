@@ -1278,8 +1278,7 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &buf
 }
 
 template <typename T> void DBReader<T>::loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys) {
-    if (prefetchBuffer.isPrefetched && prefetchBuffer.keyBegin == keyBegin && prefetchBuffer.keyEnd == keyEnd
-        && prefetchBuffer.isKeyLoad == (keys != NULL) && (keys == NULL || *keys == prefetchedKeys)) {
+    if (keys == NULL && prefetchBuffer.isPrefetched && prefetchBuffer.keyBegin == keyBegin && prefetchBuffer.keyEnd == keyEnd) {
         batchReader->waitAsyncRead();
         prefetchBuffer.isPrefetched = false;
         std::swap(loadedBuffer, prefetchBuffer);
@@ -1374,14 +1373,6 @@ template <typename T> size_t DBReader<T>::getPrefetchBufferBytes(size_t keyBegin
 template <typename T> void DBReader<T>::loadData(const std::vector<DBKeyType> &keys) {
     if (keys.empty() == false) {
         loadKeys(keys.front(), keys.back() + 1, &keys);
-    }
-}
-
-template <typename T> void DBReader<T>::prefetchData(const std::vector<DBKeyType> &keys) {
-    if (keys.empty() == false && prepareBufferToLoad(prefetchBuffer, keys.front(), keys.back() + 1, &keys)) {
-        batchReader->readAsync(frameOffsets.empty() ? prefetchBuffer.readRequests : prefetchBuffer.compressedReadRequests);
-        prefetchBuffer.isPrefetched = true;
-        prefetchedKeys = keys;
     }
 }
 

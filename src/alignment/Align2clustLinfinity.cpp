@@ -609,10 +609,14 @@ static size_t getKeyServingNode(const DBReader<DBKeyType> &seqDbr, size_t key) {
 
 // linfinity: the records [begin, end) of a prefilter buffer aligned at once, with their keys and entries: the keys to fetch by serving node, then the keys kept from the fetch before as the last fetch source
 struct FetchedSequences {
-    FetchedSequences() : prefilterBuffer(0), begin(0), end(0), entries(NULL), allocatedBytes(0) {}
+    FetchedSequences() : prefilterBuffer(0), begin(0), end(0), pendingPairCount(0), firstPendingRepKey(0), isLast(false), entries(NULL), allocatedBytes(0) {}
     size_t prefilterBuffer;
     size_t begin;
     size_t end;
+    // pending pairs whose reps and members it brings
+    size_t pendingPairCount;
+    size_t firstPendingRepKey;
+    bool isLast;
     std::vector<DBKeyType> keys;
     std::vector<size_t> fetchSourceKeyOffsets;
     char *entries;
@@ -1200,6 +1204,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     const size_t orderKeyEnd = (sizeClassCount - 1) * paddedDbSize + dbSize;
     const size_t maxSeqLen = seqDbr.getMaxSeqLen();
     const size_t maxMemberSeqLen = (memberDbr != NULL) ? std::max(maxSeqLen, memberDbr->getMaxSeqLen()) : maxSeqLen;
+    const size_t memberSplitBytes = memoryLimit / MEMBER_SPLIT_MEMORY_DIVISOR;
     const size_t pageSize = Util::getPageSize();
     AlignmentScoring scoring(par, representativeResidues);
     const unsigned int swMode = Alignment::initSWMode(par.alignmentMode, par.covThr, par.seqIdThr);
@@ -1302,6 +1307,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<DBKeyType> uniqueKeys;
     std::vector<unsigned int> keyFetchSources;
     std::vector<size_t> threadFetchSourceKeyOffsets;
+    // accepted pairs waiting for their member checks, in log order; a pair over maxPendingPairBytes keeps no member keys
+    std::vector<ClusterPair> pendingPairs;
+    std::vector<size_t> pendingPairBytes;
+    std::vector<size_t> pendingMemberOffsets(1, 0);
+    std::vector<DBKeyType> pendingMembers;
     // the bytes a rep can cover, averaged over the keys, of the blocks of a serving node
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     const size_t rangeCount = seqDbr.getIndexSize();
@@ -1335,7 +1345,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     // besides the block cache: members, prefilter buffers, member splits, two fetches, a copyEntries load and, with other aligning nodes, three served files and the key lists of a request
     const auto getReservedMemory = [&](size_t fetchBytes) {
         return ((memberLookup != NULL) ? memberLookup->memoryBytes() + (par.threads + 1) * MEMBER_READ_BYTES : 0) + 3 * 2 * (memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)
-               + ((memberDbr != NULL) ? 2 * (memoryLimit / MEMBER_SPLIT_MEMORY_DIVISOR) : 0)
+               + ((memberDbr != NULL) ? 2 * memberSplitBytes : 0)
                + 2 * std::max(fetchBytes, repTargetsReader.maxRecordBytes) + fetchBytes
                + ((isAligningNode && alignNodeCount > 1) ? 3 * maxServedFileBytes + 6 * maxServedKeys * sizeof(size_t) : 0);
     };
@@ -1349,6 +1359,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     }
     const size_t blockCacheBytes = memoryLimit - std::min(memoryLimit, getReservedMemory(maxFetchBytes));
     seqDbr.setBlockCacheBytes(blockCacheBytes);
+    const size_t maxPendingPairBytes = std::min(memberSplitBytes, maxFetchBytes);
     // the copy on --local-tmp holds only the served blocks
     const bool isReadingDirectly = hasLocalServedBlocks == false && isCacheTooSmall(blockCacheBytes);
     if (isAligningNode) {
@@ -1372,7 +1383,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     };
     // a fetch takes records while their reps and targets fit, at least one; previous is complete and unchanged while it is read
     const auto selectRecordKeys = [&](FetchedSequences &sequences, const FetchedSequences &previous) {
-        if (prefilterRecordPos[prefilterBuffer] == prefilterRecords[prefilterBuffer].size()) {
+        // an empty prefilter buffer is the last one
+        if (prefilterRecordPos[prefilterBuffer] == prefilterRecords[prefilterBuffer].size() && prefilterRecords[prefilterBuffer].empty() == false) {
             Timer waitTimer;
             std::unique_lock<std::mutex> lock(prefilterBufferMutex);
             prefilterBufferCondition.wait(lock, [&]() { return filledPrefilterBufferCount > usedPrefilterBufferCount; });
@@ -1385,13 +1397,23 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         sequences.prefilterBuffer = prefilterBuffer;
         sequences.begin = prefilterRecordPos[prefilterBuffer];
         sequences.end = sequences.begin;
-        for (size_t fetchBytes = 0; sequences.end < prefilterRecords[prefilterBuffer].size(); sequences.end++) {
+        // pending pairs first, at least one
+        size_t fetchBytes = 0;
+        sequences.pendingPairCount = 0;
+        for (size_t i = previous.pendingPairCount; i < pendingPairs.size() && (sequences.pendingPairCount == 0 || fetchBytes + pendingPairBytes[i] <= fetchBytesLimit); i++) {
+            fetchBytes += pendingPairBytes[i];
+            sequences.pendingPairCount++;
+        }
+        sequences.firstPendingRepKey = (sequences.pendingPairCount > 0) ? static_cast<size_t>(pendingPairs[previous.pendingPairCount].repKey) : orderKeyEnd;
+        for (; sequences.end < prefilterRecords[prefilterBuffer].size(); sequences.end++) {
             fetchBytes += prefilterRecords[prefilterBuffer][sequences.end].readBytes;
             if (sequences.end > sequences.begin && fetchBytes > fetchBytesLimit) {
                 break;
             }
         }
         prefilterRecordPos[prefilterBuffer] = sequences.end;
+        // previous may still add pending pairs
+        sequences.isLast = sequences.end == sequences.begin && sequences.pendingPairCount == 0 && (memberDbr == NULL || previous.end == previous.begin);
         fetchBytesLimit = std::min(2 * fetchBytesLimit, maxFetchBytes);
 #pragma omp parallel
         {
@@ -1418,6 +1440,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 // a rep without a target left is not aligned, so its entry is not fetched
                 if (threadKeys[thread_idx].size() > targetsBegin) {
                     threadKeys[thread_idx].push_back(repKey);
+                }
+            }
+            // members share the keys and data files of the sequence database
+#pragma omp for schedule(dynamic, 100)
+            for (size_t i = previous.pendingPairCount; i < previous.pendingPairCount + sequences.pendingPairCount; i++) {
+                if (isAssigned(pendingPairs[i].repKey) == false && isAssigned(pendingPairs[i].memberKey) == false) {
+                    threadKeys[thread_idx].push_back(pendingPairs[i].repKey % paddedDbSize);
+                    threadKeys[thread_idx].insert(threadKeys[thread_idx].end(), pendingMembers.begin() + pendingMemberOffsets[i], pendingMembers.begin() + pendingMemberOffsets[i + 1]);
                 }
             }
         }
@@ -1536,16 +1566,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<unsigned char> batchDone;
     std::vector<std::vector<ClusterPair> > batchPairs;
     std::vector<ClusterPair> acceptedPairs;
-    std::vector<size_t> memberOffsets;
+    std::vector<size_t> memberCounts;
     std::vector<size_t> memberBytes;
-    std::vector<size_t> memberSplitOffsets;
     std::vector<unsigned char> membersPassed;
     std::vector<unsigned char> needsMemberCheck;
-    std::vector<ClusterMemberLookup::Entry> memberEntries;
     std::vector<DBKeyType> memberSplitKeys;
     std::vector<DBKeyType> memberSplitMembers;
-    std::vector<DBKeyType> nextMemberSplitKeys;
-    std::vector<DBKeyType> nextMemberSplitMembers;
     std::vector<size_t> repPairOffsets;
     std::vector<size_t> batchRepOffsets;
     double waitSeconds = 0;
@@ -1739,11 +1765,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     nextAcceptedBytes = requestAcceptedBytes;
                 }
                 if (nextRequest != NULL) {
-                    const bool isLast = nextRequest->end == nextRequest->begin;
+                    const bool isLast = nextRequest->isLast;
                     bool isAhead;
                     {
                         std::lock_guard<std::mutex> assignedKeysLock(assignedKeysMutex);
-                        const size_t repKey = getFirstRepKey(*nextRequest);
+                        const size_t repKey = std::min(nextRequest->firstPendingRepKey, getFirstRepKey(*nextRequest));
                         if (isLast == false && repKey > clusteredOrderKey && nextAcceptedBytes >= clusteredAcceptedBytes + maxUnclusteredAcceptedBytes) {
                             readAssignedKeys(true);
                         }
@@ -2142,7 +2168,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         requestSequences(currentSequences);
         waitForSequences(currentSequences, getFirstRepKey(currentSequences));
     }
-    while (currentSequences.end > currentSequences.begin) {
+    while (currentSequences.isLast == false) {
         selectRecordKeys(nextSequences, currentSequences);
         requestSequences(nextSequences);
         Timer alignTimer;
@@ -2292,68 +2318,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             }
         }
         if (memberDbr != NULL) {
-            // the pairs assigned by now skip their member reads
+            // the pairs assigned by now skip their member checks
             {
                 std::unique_lock<std::mutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
                 if (assignedKeysLock.owns_lock()) {
                     readAssignedKeys(false);
                 }
             }
-            acceptedPairs.clear();
-            for (size_t batch = 0; batch < batchCount; batch++) {
-                acceptedPairs.insert(acceptedPairs.end(), batchPairs[batch].begin(), batchPairs[batch].end());
-            }
-            memberOffsets.resize(acceptedPairs.size() + 1);
-            memberBytes.resize(acceptedPairs.size());
-            const size_t memberSplitBytes = memoryLimit / MEMBER_SPLIT_MEMORY_DIVISOR;
-            needsMemberCheck.resize(acceptedPairs.size());
-            memberEntries.resize(acceptedPairs.size());
-#pragma omp parallel
-            {
-                ClusterMemberLookup::EntryReader entryReader;
-#pragma omp for schedule(dynamic, 1024)
-                for (size_t i = 0; i < acceptedPairs.size(); i++) {
-                    memberBytes[i] = 0;
-                    memberOffsets[i + 1] = 0;
-                    // the members of an assigned pair or of a check that fails on a length are not read
-                    needsMemberCheck[i] = isAssigned(acceptedPairs[i].repKey) == false && isAssigned(acceptedPairs[i].memberKey) == false;
-                    const int repLength = static_cast<int>(seqDbr.getSeqLen(acceptedPairs[i].repKey % paddedDbSize));
-                    if (needsMemberCheck[i]) {
-                        memberEntries[i] = memberLookup->find(acceptedPairs[i].memberKey);
-                        entryReader.start(memberEntries[i]);
-                    }
-                    DBKeyType memberKey;
-                    while (needsMemberCheck[i] && memberLookup->next(entryReader, memberKey)) {
-                        needsMemberCheck[i] = canCoverMember(par, repLength, static_cast<int>(memberDbr->getSeqLen(memberKey)));
-                        const size_t entryBytes = std::max(memberDbr->getEntryLen(memberKey), pageSize);
-                        if (entryBytes > memberSplitBytes - memberBytes[i]) {
-                            memberBytes[i] = memberSplitBytes + 1;
-                            break;
-                        }
-                        memberBytes[i] += entryBytes;
-                        memberOffsets[i + 1]++;
-                    }
-                    if (needsMemberCheck[i] == false) {
-                        memberBytes[i] = 0;
-                        memberOffsets[i + 1] = 0;
-                    }
-                }
-            }
-            memberSplitOffsets.assign(1, 0);
-            for (size_t i = 0, splitBytes = 0; i < acceptedPairs.size(); i++) {
-                if (i > memberSplitOffsets.back() && (splitBytes > memberSplitBytes || memberBytes[i] > memberSplitBytes - splitBytes)) {
-                    memberSplitOffsets.push_back(i);
-                    splitBytes = 0;
-                }
-                splitBytes += memberBytes[i];
-            }
-            memberSplitOffsets.push_back(acceptedPairs.size());
-            memberOffsets[0] = 0;
-            sumOffsets(memberOffsets.data(), acceptedPairs.size(), par.threads);
-            membersPassed.assign(acceptedPairs.size(), 0);
-            const auto isLargeMemberSplit = [&](size_t split) {
-                return memberSplitOffsets[split + 1] == memberSplitOffsets[split] + 1 && memberBytes[memberSplitOffsets[split]] > memberSplitBytes;
-            };
             // without the extensions a batch holds the checks of one rep
             const auto alignMemberChecks = [&](MemberAligners &aligners, unsigned int threadIdx, const std::vector<size_t> &repMemberCheckOffsets, const std::vector<DBKeyType> &repKeys) {
                 if (isSwipeEnabled) {
@@ -2364,152 +2335,172 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     alignClusterMembers(par, aligners.blockAligner, aligners.matcher, matcherInitialized, aligners.query, aligners.element, memberDbr, swMode, threadIdx, false, NULL, aligners.memberChecks);
                 }
             };
-            // looks up the members of a member split, the first at memberOffsets of its first pair, and starts reading them
-            const auto prefetchMemberSplit = [&](size_t split) {
-                const size_t first = memberSplitOffsets[split];
-                nextMemberSplitMembers.resize(memberOffsets[memberSplitOffsets[split + 1]] - memberOffsets[first]);
-#pragma omp parallel
-                {
-                    ClusterMemberLookup::EntryReader entryReader;
-#pragma omp for schedule(dynamic, 1024)
-                    for (size_t i = first; i < memberSplitOffsets[split + 1]; i++) {
-                        if (needsMemberCheck[i] == false) {
-                            continue;
-                        }
-                        entryReader.start(memberEntries[i]);
-                        size_t member = memberOffsets[i] - memberOffsets[first];
-                        DBKeyType memberKey;
-                        while (memberLookup->next(entryReader, memberKey)) {
-                            nextMemberSplitMembers[member++] = memberKey;
-                        }
-                    }
-                }
-                nextMemberSplitKeys = nextMemberSplitMembers;
-                SORT_PARALLEL(nextMemberSplitKeys.begin(), nextMemberSplitKeys.end());
-                nextMemberSplitKeys.erase(std::unique(nextMemberSplitKeys.begin(), nextMemberSplitKeys.end()), nextMemberSplitKeys.end());
-                memberDbr->prefetchData(nextMemberSplitKeys);
-            };
+            // check the pending pairs of this fetch; an unserved rep is assigned
+            const size_t pairCount = currentSequences.pendingPairCount;
+            membersPassed.assign(pairCount, 0);
             ClusterMemberLookup::EntryReader entryReader;
-            size_t prefetchedMemberSplit = SIZE_MAX;
-            for (size_t split = 0; split + 1 < memberSplitOffsets.size(); split++) {
-                const size_t first = memberSplitOffsets[split];
-                const size_t last = memberSplitOffsets[split + 1];
-                if (isLargeMemberSplit(split)) {
-                    const ClusterPair &pair = acceptedPairs[first];
-                    if (isAssigned(pair.repKey) || isAssigned(pair.memberKey)) {
-                        continue;
-                    }
-                    const size_t repKey = pair.repKey % paddedDbSize;
-                    MemberAligners aligners(par, scoring, maxMemberSeqLen, isSwipeEnabled);
-                    const std::vector<size_t> repMemberCheckOffsets = {0, 1};
-                    const std::vector<DBKeyType> repKeys(1, repKey);
-                    entryReader.start(memberEntries[first]);
-                    DBKeyType memberKey;
-                    bool hasMember = memberLookup->next(entryReader, memberKey);
-                    bool passed = true;
-                    while (passed && hasMember) {
-                        memberSplitMembers.clear();
-                        for (size_t splitBytes = 0; hasMember; hasMember = memberLookup->next(entryReader, memberKey)) {
-                            const size_t entryBytes = std::max(memberDbr->getEntryLen(memberKey), pageSize);
-                            if (entryBytes > memberSplitBytes) {
-                                Debug(Debug::ERROR) << "Cluster member sequence " << memberKey << " exceeds the " << memberSplitBytes << " byte member split\n";
-                                EXIT(EXIT_FAILURE);
-                            }
-                            if (memberSplitMembers.empty() == false && entryBytes > memberSplitBytes - splitBytes) {
-                                break;
-                            }
-                            memberSplitMembers.push_back(memberKey);
-                            splitBytes += entryBytes;
-                        }
-                        memberSplitKeys = memberSplitMembers;
-                        SORT_PARALLEL(memberSplitKeys.begin(), memberSplitKeys.end());
-                        memberSplitKeys.erase(std::unique(memberSplitKeys.begin(), memberSplitKeys.end()), memberSplitKeys.end());
-                        memberDbr->loadData(memberSplitKeys);
-                        aligners.memberChecks.checkCount = 0;
-                        MemberCheck &check = aligners.memberChecks.addCheck(first, 0);
-                        check.memberKeys = memberSplitMembers;
-                        alignMemberChecks(aligners, 0, repMemberCheckOffsets, repKeys);
-                        passed = check.isPassing;
-                    }
-                    membersPassed[first] = passed;
+            for (size_t i = 0; i < pairCount; i++) {
+                const ClusterPair &pair = pendingPairs[i];
+                if (pendingPairBytes[i] <= maxPendingPairBytes || isAssigned(pair.repKey) || isAssigned(pair.memberKey) || getFetchedSequence(currentSequences, pair.repKey % paddedDbSize) == NULL) {
                     continue;
                 }
-                if (prefetchedMemberSplit != split) {
-                    prefetchMemberSplit(split);
-                }
-                memberSplitMembers.swap(nextMemberSplitMembers);
-                memberSplitKeys.swap(nextMemberSplitKeys);
-                memberDbr->loadData(memberSplitKeys);
-                // the next member split is read while the checks of this one run
-                if (split + 2 < memberSplitOffsets.size() && isLargeMemberSplit(split + 1) == false) {
-                    prefetchMemberSplit(split + 1);
-                    prefetchedMemberSplit = split + 1;
-                }
-                // the pairs of a rep are next to each other, they share the query and the rounds of their member checks
-                repPairOffsets.clear();
-                for (size_t i = first; i < last; i++) {
-                    if (i == first || acceptedPairs[i].repKey != acceptedPairs[i - 1].repKey) {
-                        repPairOffsets.push_back(i);
+                // read the members in member splits
+                const size_t repKey = pair.repKey % paddedDbSize;
+                MemberAligners aligners(par, scoring, maxMemberSeqLen, isSwipeEnabled);
+                const std::vector<size_t> repMemberCheckOffsets = {0, 1};
+                const std::vector<DBKeyType> repKeys(1, repKey);
+                entryReader.start(memberLookup->find(pair.memberKey));
+                DBKeyType memberKey;
+                bool hasMember = memberLookup->next(entryReader, memberKey);
+                bool passed = true;
+                while (passed && hasMember) {
+                    memberSplitMembers.clear();
+                    for (size_t splitBytes = 0; hasMember; hasMember = memberLookup->next(entryReader, memberKey)) {
+                        const size_t entryBytes = std::max(memberDbr->getEntryLen(memberKey), pageSize);
+                        if (entryBytes > memberSplitBytes) {
+                            Debug(Debug::ERROR) << "Cluster member sequence " << memberKey << " exceeds the " << memberSplitBytes << " byte member split\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        if (memberSplitMembers.empty() == false && entryBytes > memberSplitBytes - splitBytes) {
+                            break;
+                        }
+                        memberSplitMembers.push_back(memberKey);
+                        splitBytes += entryBytes;
                     }
+                    memberSplitKeys = memberSplitMembers;
+                    SORT_PARALLEL(memberSplitKeys.begin(), memberSplitKeys.end());
+                    memberSplitKeys.erase(std::unique(memberSplitKeys.begin(), memberSplitKeys.end()), memberSplitKeys.end());
+                    memberDbr->loadData(memberSplitKeys);
+                    aligners.memberChecks.checkCount = 0;
+                    MemberCheck &check = aligners.memberChecks.addCheck(i, 0);
+                    check.memberKeys = memberSplitMembers;
+                    alignMemberChecks(aligners, 0, repMemberCheckOffsets, repKeys);
+                    passed = check.isPassing;
                 }
-                repPairOffsets.push_back(last);
-                const size_t repCount = repPairOffsets.size() - 1;
-                // with the extensions reps go in batches that fill the lanes and give a thread 4 of them
-                const size_t batchMemberLimit = std::min(MEMBER_BATCH_SIZE, std::max(memberSplitMembers.size() / (par.threads * 4), MEMBER_BATCH_SIZE / 16));
-                batchRepOffsets.assign(1, 0);
-                for (size_t rep = 0, batchMembers = 0; rep < repCount; rep++) {
-                    batchMembers += memberOffsets[repPairOffsets[rep + 1]] - memberOffsets[repPairOffsets[rep]];
-                    if (isSwipeEnabled == false || batchMembers >= batchMemberLimit || rep + 1 == repCount) {
-                        batchRepOffsets.push_back(rep + 1);
-                        batchMembers = 0;
-                    }
+                membersPassed[i] = passed;
+            }
+            // the pairs of a rep are next to each other, they share the query and the rounds of their member checks
+            repPairOffsets.clear();
+            for (size_t i = 0; i < pairCount; i++) {
+                if (i == 0 || pendingPairs[i].repKey != pendingPairs[i - 1].repKey) {
+                    repPairOffsets.push_back(i);
                 }
-                const size_t memberBatchCount = batchRepOffsets.size() - 1;
+            }
+            repPairOffsets.push_back(pairCount);
+            const size_t repCount = repPairOffsets.size() - 1;
+            // with the extensions reps go in batches that fill the lanes and give a thread 4 of them
+            const size_t batchMemberLimit = std::min(MEMBER_BATCH_SIZE, std::max(pendingMemberOffsets[pairCount] / (par.threads * 4), MEMBER_BATCH_SIZE / 16));
+            batchRepOffsets.assign(1, 0);
+            for (size_t rep = 0, batchMembers = 0; rep < repCount; rep++) {
+                batchMembers += pendingMemberOffsets[repPairOffsets[rep + 1]] - pendingMemberOffsets[repPairOffsets[rep]];
+                if (isSwipeEnabled == false || batchMembers >= batchMemberLimit || rep + 1 == repCount) {
+                    batchRepOffsets.push_back(rep + 1);
+                    batchMembers = 0;
+                }
+            }
+            const size_t memberBatchCount = batchRepOffsets.size() - 1;
 #pragma omp parallel
-                {
-                    unsigned int thread_idx = 0;
+            {
+                unsigned int thread_idx = 0;
 #ifdef OPENMP
-                    thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+                thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-                    MemberAligners aligners(par, scoring, maxMemberSeqLen, isSwipeEnabled);
-                    std::vector<size_t> repMemberCheckOffsets;
-                    std::vector<DBKeyType> repKeys;
+                MemberAligners aligners(par, scoring, maxMemberSeqLen, isSwipeEnabled);
+                std::vector<size_t> repMemberCheckOffsets;
+                std::vector<DBKeyType> repKeys;
 #pragma omp for schedule(dynamic, 1)
-                    for (size_t batch = 0; batch < memberBatchCount; batch++) {
-                        aligners.memberChecks.checkCount = 0;
-                        repMemberCheckOffsets.assign(1, 0);
-                        repKeys.clear();
-                        for (size_t rep = batchRepOffsets[batch]; rep < batchRepOffsets[batch + 1]; rep++) {
-                            for (size_t i = repPairOffsets[rep]; i < repPairOffsets[rep + 1]; i++) {
-                                const ClusterPair &pair = acceptedPairs[i];
-                                if (needsMemberCheck[i] == false || isAssigned(pair.repKey) || isAssigned(pair.memberKey)) {
-                                    continue;
-                                }
-                                MemberCheck &check = aligners.memberChecks.addCheck(i, 0);
-                                for (size_t member = memberOffsets[i]; member < memberOffsets[i + 1]; member++) {
-                                    check.memberKeys.push_back(memberSplitMembers[member - memberOffsets[first]]);
-                                }
+                for (size_t batch = 0; batch < memberBatchCount; batch++) {
+                    aligners.memberChecks.checkCount = 0;
+                    repMemberCheckOffsets.assign(1, 0);
+                    repKeys.clear();
+                    for (size_t rep = batchRepOffsets[batch]; rep < batchRepOffsets[batch + 1]; rep++) {
+                        for (size_t i = repPairOffsets[rep]; i < repPairOffsets[rep + 1]; i++) {
+                            const ClusterPair &pair = pendingPairs[i];
+                            if (pendingPairBytes[i] > maxPendingPairBytes || isAssigned(pair.repKey) || isAssigned(pair.memberKey) || getFetchedSequence(currentSequences, pair.repKey % paddedDbSize) == NULL) {
+                                continue;
                             }
-                            if (aligners.memberChecks.checkCount > repMemberCheckOffsets.back()) {
-                                repMemberCheckOffsets.push_back(aligners.memberChecks.checkCount);
-                                repKeys.push_back(acceptedPairs[repPairOffsets[rep]].repKey % paddedDbSize);
+                            MemberCheck &check = aligners.memberChecks.addCheck(i, 0);
+                            for (size_t member = pendingMemberOffsets[i]; member < pendingMemberOffsets[i + 1]; member++) {
+                                check.memberKeys.push_back(pendingMembers[member]);
+                                check.memberData.push_back(getFetchedEntry(currentSequences, pendingMembers[member]));
                             }
                         }
-                        alignMemberChecks(aligners, thread_idx, repMemberCheckOffsets, repKeys);
-                        for (size_t g = 0; g < aligners.memberChecks.checkCount; g++) {
-                            membersPassed[aligners.memberChecks.checks[g].targetId] = aligners.memberChecks.checks[g].isPassing;
+                        if (aligners.memberChecks.checkCount > repMemberCheckOffsets.back()) {
+                            repMemberCheckOffsets.push_back(aligners.memberChecks.checkCount);
+                            repKeys.push_back(pendingPairs[repPairOffsets[rep]].repKey % paddedDbSize);
                         }
+                    }
+                    alignMemberChecks(aligners, thread_idx, repMemberCheckOffsets, repKeys);
+                    for (size_t g = 0; g < aligners.memberChecks.checkCount; g++) {
+                        membersPassed[aligners.memberChecks.checks[g].targetId] = aligners.memberChecks.checks[g].isPassing;
                     }
                 }
             }
             size_t acceptedCount = 0;
-            for (size_t i = 0; i < acceptedPairs.size(); i++) {
+            for (size_t i = 0; i < pairCount; i++) {
                 if (membersPassed[i]) {
-                    acceptedPairs[acceptedCount++] = acceptedPairs[i];
+                    pendingPairs[acceptedCount++] = pendingPairs[i];
                 }
             }
-            logAcceptedPairs(acceptedPairs.data(), acceptedCount);
-            publishAccepted(nextRepKey, acceptedBytes);
+            logAcceptedPairs(pendingPairs.data(), acceptedCount);
+            size_t checkedMembers = pendingMemberOffsets[pairCount];
+            pendingPairs.erase(pendingPairs.begin(), pendingPairs.begin() + pairCount);
+            pendingPairBytes.erase(pendingPairBytes.begin(), pendingPairBytes.begin() + pairCount);
+            pendingMemberOffsets.erase(pendingMemberOffsets.begin(), pendingMemberOffsets.begin() + pairCount);
+            pendingMembers.erase(pendingMembers.begin(), pendingMembers.begin() + checkedMembers);
+            for (size_t i = 0; i < pendingMemberOffsets.size(); i++) {
+                pendingMemberOffsets[i] -= checkedMembers;
+            }
+
+            // the accepted pairs wait for a later fetch
+            acceptedPairs.clear();
+            for (size_t batch = 0; batch < batchCount; batch++) {
+                acceptedPairs.insert(acceptedPairs.end(), batchPairs[batch].begin(), batchPairs[batch].end());
+            }
+            memberCounts.resize(acceptedPairs.size());
+            memberBytes.resize(acceptedPairs.size());
+            needsMemberCheck.resize(acceptedPairs.size());
+#pragma omp parallel
+            {
+                unsigned int thread_idx = 0;
+#ifdef OPENMP
+                thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+                ClusterMemberLookup::EntryReader entryReader;
+                threadKeys[thread_idx].clear();
+#pragma omp for schedule(static)
+                for (size_t i = 0; i < acceptedPairs.size(); i++) {
+                    size_t memberBegin = threadKeys[thread_idx].size();
+                    size_t repKey = acceptedPairs[i].repKey % paddedDbSize;
+                    // an assigned key or an uncoverable member fails without a check
+                    needsMemberCheck[i] = isAssigned(acceptedPairs[i].repKey) == false && isAssigned(acceptedPairs[i].memberKey) == false;
+                    memberBytes[i] = seqDbr.getEntryLen(repKey) + FETCHED_KEY_BYTES;
+                    if (needsMemberCheck[i]) {
+                        entryReader.start(memberLookup->find(acceptedPairs[i].memberKey));
+                    }
+                    DBKeyType memberKey;
+                    while (needsMemberCheck[i] && memberBytes[i] <= maxPendingPairBytes && memberLookup->next(entryReader, memberKey)) {
+                        needsMemberCheck[i] = canCoverMember(par, static_cast<int>(seqDbr.getSeqLen(repKey)), static_cast<int>(seqDbr.getSeqLen(memberKey)));
+                        memberBytes[i] += seqDbr.getEntryLen(memberKey) + FETCHED_KEY_BYTES;
+                        threadKeys[thread_idx].push_back(memberKey);
+                    }
+                    if (needsMemberCheck[i] == false || memberBytes[i] > maxPendingPairBytes) {
+                        threadKeys[thread_idx].resize(memberBegin);
+                    }
+                    memberCounts[i] = threadKeys[thread_idx].size() - memberBegin;
+                }
+            }
+            for (size_t thread = 0; thread < threadKeys.size(); thread++) {
+                pendingMembers.insert(pendingMembers.end(), threadKeys[thread].begin(), threadKeys[thread].end());
+            }
+            for (size_t i = 0; i < acceptedPairs.size(); i++) {
+                if (needsMemberCheck[i]) {
+                    pendingPairs.push_back(acceptedPairs[i]);
+                    pendingPairBytes.push_back(memberBytes[i]);
+                    pendingMemberOffsets.push_back(pendingMemberOffsets.back() + memberCounts[i]);
+                }
+            }
+            publishAccepted(pendingPairs.empty() ? nextRepKey : static_cast<size_t>(pendingPairs[0].repKey), acceptedBytes);
             publishedBytes = acceptedBytes;
             publishTime = time(NULL);
             if (nextRepKey < orderKeyEnd) {
@@ -2520,7 +2511,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         alignedCells += static_cast<double>(fetchAlignmentCells);
         alignSeconds += alignTimer.getTimediff();
         alignedCellsPerSecond.store(alignedCells / std::max(alignSeconds, 1e-3));
-        waitForSequences(nextSequences, nextRepKey);
+        // the reps of pending pairs are not done
+        waitForSequences(nextSequences, pendingPairs.empty() ? nextRepKey : static_cast<size_t>(pendingPairs[0].repKey));
         std::swap(currentSequences, nextSequences);
     }
     prefilterLoader.join();
