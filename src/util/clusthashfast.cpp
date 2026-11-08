@@ -11,6 +11,12 @@
 #include "itoa.h"
 #include "FileUtil.h"
 #include "Timer.h"
+#include <algorithm>
+#include <climits>
+#include <cstring>
+#include <limits>
+#include <string>
+#include <vector>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -690,7 +696,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         std::string phaseValues;
         MMseqsNode::addPhaseTime(phaseValues, "hashing the sequences", timer);
         MMseqsNode::printPhaseValues(phaseValues);
-        MMseqsNode::publishRunFile(par.db2 + ".phases." + SSTR(MMseqsNode::rank), "");
         MMseqsNode::closeClusterFiles(resultDataFile, resultDb, resultIndexFile, resultIndex, resultDataBytes, resultIndexBytes);
         MMseqsNode::writeRepresentativeBits(representativeDb, reader, representativeBits, localFirstKey, localKeyCount);
     } else {
@@ -708,7 +713,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                 clusters += representativeReader.getRangeRepresentativeCount(range);
             }
             representativeReader.close();
-            MMseqsNode::gatherRunFiles(par.db2 + ".phases.");
             // a linfinity subset only feeds the next pipeline steps, which read no headers, lookup or source
             DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_CLUSTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
         } else {

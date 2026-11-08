@@ -195,18 +195,6 @@ static void sleepInWait(unsigned int polls) {
     MMseqsNode::sleepBeforePoll(polls, std::min(8u, 4 + polls / 32));
 }
 
-// the content of file once it is published; a published file is never empty
-static std::string waitForFile(const std::string &file) {
-    std::string content = readPolledFile(file);
-    MMseqsNode::WaitWarning warning;
-    for (unsigned int polls = 0; content.empty(); polls++) {
-        sleepInWait(polls);
-        warning.check(file);
-        content = readPolledFile(file);
-    }
-    return content;
-}
-
 std::string MMseqsNode::readFile(const std::string &file) {
     FILE *handle = FileUtil::openFileOrDie(file.c_str(), "r", true);
     struct stat sb;
@@ -224,14 +212,14 @@ std::string MMseqsNode::readFile(const std::string &file) {
     return content;
 }
 
-// a file of another run is read again until this run replaces it
+// a file not published yet or of another run is read again until this run publishes it
 std::string MMseqsNode::waitForRunFile(const std::string &file) {
-    std::string content = waitForFile(file);
+    std::string content = readPolledFile(file);
     WaitWarning warning;
     for (unsigned int polls = 0; content.compare(0, runId.size(), runId) != 0; polls++) {
         sleepInWait(polls);
         warning.check(file);
-        content = waitForFile(file);
+        content = readPolledFile(file);
     }
     return content.substr(runId.size());
 }
@@ -533,10 +521,7 @@ void MMseqsNode::printPhaseValues(const std::string &values) {
     std::string output;
     for (char *line = (char *) values.c_str(); *line != '\0'; line = Util::skipLine(line)) {
         const char *columns[3];
-        if (Util::getFieldsOfLine(line, columns, 3) < 3) {
-            Debug(Debug::ERROR) << "Cannot read the phase values\n";
-            EXIT(EXIT_FAILURE);
-        }
+        Util::getFieldsOfLine(line, columns, 3);
         output += prefix;
         output.append(columns[0], columns[1] - 1);
         output += ": ";

@@ -1215,7 +1215,6 @@ int createdb(int argc, const char **argv, const Command& command) {
     if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH && par.dbType == 2) {
         Debug(Debug::WARNING) << "Nucleotide database cannot be combined with --createdb-mode " << par.createdbMode << "\n";
         Debug(Debug::WARNING) << "We recompute with --dbtype 1\n";
-        par.dbType = 1;
     }
 
     if(par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) {

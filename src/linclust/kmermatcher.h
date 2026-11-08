@@ -411,11 +411,6 @@ void writeKmerMatcherResult(DBWriter & dbw, KmerPositionType *hashSeqPair, size_
 
 
 template <typename T, bool includeAdjacency = false, typename L = T>
-KmerPosition<T, includeAdjacency, L> * doComputation(size_t totalKmers, size_t split, size_t splits, std::string splitFile,
-                                DBReader<DBKeyType> & seqDbr, Parameters & par, BaseMatrix  * subMat,
-                                size_t KMER_SIZE, size_t chooseTopKmer, float chooseTopKmerScale = 0.0);
-
-template <typename T, bool includeAdjacency = false, typename L = T>
 KmerPosition<T, includeAdjacency, L> *initKmerPositionMemory(size_t size);
 
 template <int TYPE, typename T, bool includeAdjacency = false, typename L = T, typename KmerPositionType>
