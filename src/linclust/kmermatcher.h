@@ -82,7 +82,7 @@ struct __attribute__((__packed__)) AdjacentData<false> {
     unsigned char get(int) const { return '\0'; }
 };
 
-// [ isWholeSequence | k-mer | adjKey | maxSeqLen - seqLen | id | pos ] in integer order; a whole sequence holds its hash from adjKeyShift up
+// [ isWholeSequence | k-mer | adjKey | maxSeqLen - seqLen | id | pos ], whole sequence hash from adjKeyShift
 struct PackedKmerPosition {
     static const unsigned int WHOLE_SEQUENCE_SHIFT = 127;
     static const unsigned int RESIDUE_BITS = 5;
@@ -121,8 +121,8 @@ struct PackedKmerPosition {
     size_t getPos() const { return getBits(0, idShift); }
 
     bool operator<(const PackedKmerPosition &other) const {
-        const uint64_t upper = static_cast<uint64_t>(value >> 64);
-        const uint64_t otherUpper = static_cast<uint64_t>(other.value >> 64);
+        uint64_t upper = static_cast<uint64_t>(value >> 64);
+        uint64_t otherUpper = static_cast<uint64_t>(other.value >> 64);
         return (upper != otherUpper) ? upper < otherUpper : static_cast<uint64_t>(value) < static_cast<uint64_t>(other.value);
     }
 
@@ -132,8 +132,8 @@ private:
     }
 };
 
-// [ 0 | k-mer | maxSeqLen - seqLen | id | pos | adjKey | used as rep ] in integer order, the order of KmerPosition::compareRepSequenceAndIdAndPos;
-// a key above the k-mer field, a whole sequence hash, is [ 1 | key | maxSeqLen - seqLen | id | used as rep ] with pos 0 and all adjacent residues X
+// [ 0 | k-mer | maxSeqLen - seqLen | id | pos | adjKey | used as rep ]
+// whole sequence: [ 1 | key | maxSeqLen - seqLen | id | used as rep ]
 struct PackedDiagonalKmerPosition {
     static const unsigned int WHOLE_SEQUENCE_SHIFT = 127;
     static const unsigned int ADJ_KEY_SHIFT = 1;
@@ -147,8 +147,8 @@ struct PackedDiagonalKmerPosition {
     uint128 value;
 
     void set(size_t kmer, unsigned int adjKey, size_t seqLen, DBKeyType id, size_t pos, bool) {
-        const bool isWholeSequence = (static_cast<uint128>(kmer) >> (WHOLE_SEQUENCE_SHIFT - kmerShift)) != 0;
-        const unsigned int shift = isWholeSequence ? idShift - 1 : 0;
+        bool isWholeSequence = (static_cast<uint128>(kmer) >> (WHOLE_SEQUENCE_SHIFT - kmerShift)) != 0;
+        unsigned int shift = isWholeSequence ? idShift - 1 : 0;
         value = (static_cast<uint128>(isWholeSequence) << WHOLE_SEQUENCE_SHIFT)
                 | (static_cast<uint128>(kmer) << (kmerShift - shift))
                 | (static_cast<uint128>(maxSeqLen - seqLen) << (seqLenShift - shift))
@@ -169,12 +169,12 @@ struct PackedDiagonalKmerPosition {
         }
         return isWholeSequence() ? xIndex : getBits(ADJ_KEY_SHIFT + PackedKmerPosition::RESIDUE_BITS * index, ADJ_KEY_SHIFT + PackedKmerPosition::RESIDUE_BITS * (index + 1));
     }
-    // assignGroup only marks a used rep, setAdjacentSeq(0, UCHAR_MAX)
+    // only marks a used rep
     void setAdjacentSeq(int, unsigned char) { value |= 1; }
 
     bool operator<(const PackedDiagonalKmerPosition &other) const {
-        const uint64_t upper = static_cast<uint64_t>(value >> 64);
-        const uint64_t otherUpper = static_cast<uint64_t>(other.value >> 64);
+        uint64_t upper = static_cast<uint64_t>(value >> 64);
+        uint64_t otherUpper = static_cast<uint64_t>(other.value >> 64);
         return (upper != otherUpper) ? upper < otherUpper : static_cast<uint64_t>(value) < static_cast<uint64_t>(other.value);
     }
 
@@ -185,8 +185,8 @@ private:
     }
 };
 
-// [ rep id | id | diagonal + 2^(bits of T - 1) ] in integer order, the order of KmerPosition::compareRepSequenceAndIdAndDiag;
-// the rep id field is wider than the id and read sign-extended, so the 0xFF end marker that assignGroup writes after the last pair reads as SIZE_T_MAX
+// [ rep id | id | diagonal + 2^(bits of T - 1) ]
+// rep id is sign-extended, so the 0xFF end marker reads as SIZE_T_MAX
 template <typename T, typename Upper>
 struct __attribute__((__packed__)) PackedSeqPair {
     typedef typename std::make_unsigned<T>::type UnsignedT;
@@ -437,7 +437,7 @@ void setLinearFilterDefault(Parameters *p);
 size_t computeMemoryNeededLinearfilter(size_t totalKmer);
 
 extern BaseMatrix *adjSubMat;
-// linfinity: the first key of the send split that this node sends or merges, only the keys set in representativeBits unless NULL
+// linfinity send split
 extern size_t sendSplitFirstKey;
 extern uint64_t *representativeBits;
 
@@ -458,7 +458,7 @@ static inline size_t computeSeqKmerCount(int seqLen, size_t kmerSize, size_t cho
     return std::min(kmerAdjustedSeqLen, static_cast<int>(chooseTopKmer + (chooseTopKmerScale * seqLen)));
 }
 
-// the next rep of a k-mer group: the adjKey candidate scoring lowest against the previous one, at a tie the first by isBefore
+// pick the adjKey scoring lowest against the previous rep
 template <typename Candidate, typename ForEachRepCandidate, typename IsBefore>
 static inline void selectGroupRepSeqs(std::vector<Candidate> &reps, size_t maxRepSeqCount, ForEachRepCandidate forEachRepCandidate, IsBefore isBefore) {
     short *subMatPos[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
@@ -476,7 +476,7 @@ static inline void selectGroupRepSeqs(std::vector<Candidate> &reps, size_t maxRe
         bool isFirst = true;
         unsigned int prevAdjKey = 0;
         forEachRepCandidate([&](unsigned int adjKey, const Candidate &candidate) {
-            const bool isOtherAdjKey = isFirst || adjKey != prevAdjKey;
+            bool isOtherAdjKey = isFirst || adjKey != prevAdjKey;
             isFirst = false;
             prevAdjKey = adjKey;
             if (isOtherAdjKey == false) {

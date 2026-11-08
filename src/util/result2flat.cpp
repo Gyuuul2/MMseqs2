@@ -51,7 +51,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
         size_t fileFirstKey = fileKeyOffsets[MMseqsNode::rank];
         size_t fileEndKey = fileKeyOffsets[MMseqsNode::rank + 1];
         // name, offset and representative key
-        size_t keyBytes = querydb_header.getNamesBytes(fileFirstKey, fileEndKey) / std::max((size_t) 1, fileEndKey - fileFirstKey) + 2 * sizeof(uint64_t);
+        size_t keyBytes = querydb_header.getNamesSize(fileFirstKey, fileEndKey) / std::max((size_t) 1, fileEndKey - fileFirstKey) + 2 * sizeof(uint64_t);
         size_t splitBytes = std::max((size_t) 1, Util::computeMemory(par.splitMemoryLimit) / 8);
         std::vector<size_t> sequenceKeyOffsets = seqDbr.getSplitKeyOffsets(fileFirstKey, fileEndKey, splitBytes, keyBytes);
         // halve splits whose names do not fit
@@ -60,7 +60,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
             while (splitKeyOffsets.back() < sequenceKeyOffsets[split]) {
                 size_t keyBegin = splitKeyOffsets.back();
                 size_t keyEnd = sequenceKeyOffsets[split];
-                while (keyEnd - keyBegin > 1 && querydb_header.getNamesBytes(keyBegin, keyEnd) + (keyEnd - keyBegin) * 2 * sizeof(uint64_t) > splitBytes) {
+                while (keyEnd - keyBegin > 1 && querydb_header.getNamesSize(keyBegin, keyEnd) + (keyEnd - keyBegin) * 2 * sizeof(uint64_t) > splitBytes) {
                     keyEnd = keyBegin + (keyEnd - keyBegin) / 2;
                 }
                 splitKeyOffsets.push_back(keyEnd);

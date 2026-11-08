@@ -1346,7 +1346,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         maxFetchSize /= 2;
     }
     const size_t blockCacheSize = memoryLimit - std::min(memoryLimit, getReservedMemory(maxFetchSize));
-    seqDbr.setBlockCacheBytes(blockCacheSize);
+    seqDbr.setBlockCacheSize(blockCacheSize);
     const size_t maxPendingPairSize = std::min(memberSplitSize, maxFetchSize);
     // the copy on --local-tmp holds only the served blocks
     const bool isReadingDirectly = hasLocalServedBlocks == false && isCacheTooSmall(blockCacheSize);
@@ -1855,7 +1855,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             // read in parts; a failed part keeps its error
                             std::vector<std::pair<size_t, size_t> > readRequests;
                             for (size_t i = 0; i < servedEntriesReads.size(); i++) {
-                                for (size_t offset = 0; offset < servedEntriesReads[i].bytes; offset += MAX_READ_REQUEST_BYTES) {
+                                for (size_t offset = 0; offset < servedEntriesReads[i].bytes; offset += BatchReader::MAX_READ_REQUEST_SIZE) {
                                     readRequests.push_back(std::make_pair(i, offset));
                                 }
                             }
@@ -1865,7 +1865,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 const ServedEntriesRead &request = servedEntriesReads[readRequests[i].first];
                                 const size_t offset = readRequests[i].second;
                                 int readError;
-                                if (MMseqsNode::tryPreadAll(request.fd, receivedEntries.data() + request.receivedOffset + offset, std::min(MAX_READ_REQUEST_BYTES, request.bytes - offset),
+                                if (MMseqsNode::tryPreadAll(request.fd, receivedEntries.data() + request.receivedOffset + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, request.bytes - offset),
                                                             servedEntriesBegins[request.servingNode] + offset, readError) == false) {
                                     readErrors[i] = (readError != 0) ? readError : -1;
                                 }
@@ -2500,8 +2500,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     for (size_t page = 0; page < assignedPages.size(); page++) {
         delete[] assignedPages[page];
     }
-    MMseqsNode::addPhaseValue(phaseValues, "Block read bytes", SSTR(seqDbr.getBlockReadBytes()));
-    MMseqsNode::addPhaseValue(phaseValues, "Key read bytes", SSTR(seqDbr.getKeyReadBytes()));
+    MMseqsNode::addPhaseValue(phaseValues, "Block read bytes", SSTR(seqDbr.getBlockReadSize()));
+    MMseqsNode::addPhaseValue(phaseValues, "Key read bytes", SSTR(seqDbr.getKeyReadSize()));
     // the master still finds the nodes of keys in the blocks of seqDbr
     seqDbr.releaseDataPages();
     if (isAligningNode) {
@@ -3188,7 +3188,7 @@ int align2clustLinfinity(Parameters &par) {
             // copy only the served blocks
             DBReader<DBKeyType> blockDbr(par.db1.c_str(), par.db1Index.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
             blockDbr.open(DBReader<DBKeyType>::NOSORT);
-            blockDbr.setBlockCacheBytes(0);
+            blockDbr.setBlockCacheSize(0);
             const std::vector<size_t> &blockKeyOffsets = blockDbr.getBlockKeyOffsets();
             const DBReader<DBKeyType>::Index *blockIndex = blockDbr.getIndex();
             const std::vector<std::string> dataFiles = FileUtil::findDatafiles(par.db1.c_str());
@@ -3269,7 +3269,7 @@ int align2clustLinfinity(Parameters &par) {
     MMseqsNode::WorkQueue alignmentSplitQueue(par.db3 + "_alignment_splits", alignmentSplitPartitionOffsets.size() - 1);
 
     // builds the block table of getKeyBlock
-    seqDbr.setBlockCacheBytes(0);
+    seqDbr.setBlockCacheSize(0);
     const std::vector<size_t> &blockKeyOffsets = seqDbr.getBlockKeyOffsets();
     // the master keeps the serving node of every page of assigned bits
     const size_t pageCount = (dbSize + ASSIGNED_PAGE_KEYS - 1) / ASSIGNED_PAGE_KEYS;
@@ -3328,7 +3328,7 @@ int align2clustLinfinity(Parameters &par) {
     const size_t sizeClassCount = (par.clusteringMode == Parameters::SET_COVER) ? 64 - __builtin_clzll(dbSize | 1) : 1;
     const size_t maxRecordSize = std::max<size_t>(1, smallestMemoryLimit / RECORD_MEMORY_DIVISOR);
     // all nodes cut served files at the same size
-    const size_t servedFileEntrySize = std::max(MAX_READ_REQUEST_BYTES, smallestMemoryLimit / SERVED_FILE_MEMORY_DIVISOR);
+    const size_t servedFileEntrySize = std::max(BatchReader::MAX_READ_REQUEST_SIZE, smallestMemoryLimit / SERVED_FILE_MEMORY_DIVISOR);
 
     RepTargetsReader repTargetsReader(par, seqDbr, partitions, alignmentSplitPartitionOffsets, alignmentSplitQueue, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount);
     if (sizeClassCount > 1) {
@@ -3521,8 +3521,8 @@ int align2clustLinfinity(Parameters &par) {
     }
     MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", phaseValueTimer);
     if (memberDbr != NULL) {
-        MMseqsNode::addPhaseValue(phaseValues, "Member block read bytes", SSTR(memberDbr->getBlockReadBytes()));
-        MMseqsNode::addPhaseValue(phaseValues, "Member key read bytes", SSTR(memberDbr->getKeyReadBytes()));
+        MMseqsNode::addPhaseValue(phaseValues, "Member block read bytes", SSTR(memberDbr->getBlockReadSize()));
+        MMseqsNode::addPhaseValue(phaseValues, "Member key read bytes", SSTR(memberDbr->getKeyReadSize()));
         memberDbr->close();
         delete memberDbr;
     }

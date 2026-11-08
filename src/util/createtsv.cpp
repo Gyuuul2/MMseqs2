@@ -156,14 +156,14 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
     size_t localFirstKey = nodeKeyOffsets[MMseqsNode::rank];
     size_t localEndKey = nodeKeyOffsets[MMseqsNode::rank + 1];
     // name, buffer offset and split offset
-    size_t keyBytes = headers.getNamesBytes(localFirstKey, localEndKey) / std::max((size_t) 1, localEndKey - localFirstKey) + sizeof(uint64_t) + sizeof(size_t);
+    size_t keyBytes = headers.getNamesSize(localFirstKey, localEndKey) / std::max((size_t) 1, localEndKey - localFirstKey) + sizeof(uint64_t) + sizeof(size_t);
     size_t splitKeys = std::max((size_t) 1, memoryLimit / 8 / keyBytes);
     // halve splits whose names do not fit
     std::vector<size_t> splitKeyOffsets(1, localFirstKey);
     while (splitKeyOffsets.back() < localEndKey) {
         size_t keyBegin = splitKeyOffsets.back();
         size_t keyEnd = keyBegin + std::min(splitKeys, localEndKey - keyBegin);
-        while (keyEnd - keyBegin > 1 && headers.getNamesBytes(keyBegin, keyEnd) + (keyEnd - keyBegin) * (sizeof(uint64_t) + sizeof(size_t)) > memoryLimit / 8) {
+        while (keyEnd - keyBegin > 1 && headers.getNamesSize(keyBegin, keyEnd) + (keyEnd - keyBegin) * (sizeof(uint64_t) + sizeof(size_t)) > memoryLimit / 8) {
             keyEnd = keyBegin + (keyEnd - keyBegin) / 2;
         }
         splitKeyOffsets.push_back(keyEnd);
@@ -272,7 +272,7 @@ static void writeClusterTsvLines(const std::string &sortedByRepIndex, const std:
     size_t memberAccessionCapacity = 0;
     std::vector<std::string> threadLines(par.threads);
     std::vector<size_t> threadLineOffsets(par.threads + 1);
-    size_t writeBufferBytes = std::min(MAX_READ_REQUEST_BYTES, std::max((size_t) 1, memoryLimit / 8 / par.threads));
+    size_t writeBufferBytes = std::min(BatchReader::MAX_READ_REQUEST_SIZE, std::max((size_t) 1, memoryLimit / 8 / par.threads));
 
     // representative of the cluster the previous range ended in
     std::string repAccession;

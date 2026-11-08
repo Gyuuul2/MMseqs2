@@ -286,20 +286,20 @@ public:
     // linfinity sequences
     void loadData(size_t keyBegin, size_t keyEnd);
     void prefetchData(size_t keyBegin, size_t keyEnd);
-    void startLoadData(size_t keyBegin, size_t keyEnd, size_t readBytes);
+    void startLoadData(size_t keyBegin, size_t keyEnd, size_t readSize);
     // returns the end of the keys read so far
     size_t waitForLoadedData();
-    size_t getPrefetchBufferBytes(size_t keyBegin, size_t keyEnd);
+    size_t getPrefetchBufferSize(size_t keyBegin, size_t keyEnd);
     void loadData(const std::vector<DBKeyType> &keys);
-    void setBlockCacheBytes(size_t cacheBytes);
+    void setBlockCacheSize(size_t cacheSize);
     size_t getKeyBlock(size_t key) const;
     const std::vector<size_t> &getBlockKeyOffsets() const { return blockKeyOffsets; }
-    size_t getBlockReadBytes() { return blockReadBytes; }
-    size_t getKeyReadBytes() { return keyReadBytes; }
-    size_t getLoadBufferBytes(size_t keyBegin, size_t keyEnd);
+    size_t getBlockReadSize() { return blockReadSize; }
+    size_t getKeyReadSize() { return keyReadSize; }
+    size_t getLoadBufferSize(size_t keyBegin, size_t keyEnd);
 
     // linfinity headers
-    size_t getNamesBytes(size_t keyBegin, size_t keyEnd);
+    size_t getNamesSize(size_t keyBegin, size_t keyEnd);
 
     // linfinity cluster databases
     size_t findEntryByOffset(size_t offset) {
@@ -557,7 +557,7 @@ public:
     // linfinity
     std::vector<size_t> getFileKeyOffsets(size_t fileCount);
     std::vector<size_t> getEvenNodeKeyOffsets(size_t nodeCount);
-    std::vector<size_t> getSplitKeyOffsets(size_t keyBegin, size_t keyEnd, size_t splitBytes, size_t keyBytes);
+    std::vector<size_t> getSplitKeyOffsets(size_t keyBegin, size_t keyEnd, size_t splitSize, size_t keySize);
     size_t findIdRange(size_t id);
     // range SIZE_MAX searches from the start
     size_t getSeqLenFromRange(size_t &range, size_t id);
@@ -635,14 +635,14 @@ private:
     bool hasBinaryIndex;
     // zstd seekable headers
     std::vector<std::vector<size_t> > frameOffsets;
-    std::vector<size_t> uncompressedFrameBytes;
+    std::vector<size_t> uncompressedFrameSizes;
     std::vector<int> dataFds;
     // without O_DIRECT for key loads and index searches
     std::vector<int> bufferedFds;
     BatchReader * batchReader;
     struct EntryReadBuffer {
         char *buffer;
-        size_t allocatedBytes;
+        size_t allocatedSize;
         size_t keyBegin;
         size_t keyEnd;
         std::vector<BatchReader::ReadRequest> readRequests;
@@ -659,17 +659,17 @@ private:
 
     // startLoadData
     size_t readStepKeyEnd;
-    size_t readStepBytes;
+    size_t readStepSize;
 
     // block cache
     void cacheBlocks(EntryReadBuffer &buffer);
-    void freeBlocks(size_t keyEnd, size_t neededBytes);
+    void freeBlocks(size_t keyEnd, size_t neededSize);
     std::vector<size_t> blockKeyOffsets;
     std::map<size_t, BatchReader::ReadRequest> cachedBlocks;
-    size_t blockCacheBytes;
-    size_t cachedBlockBytes;
-    size_t blockReadBytes;
-    size_t keyReadBytes;
+    size_t blockCacheSize;
+    size_t cachedBlockSize;
+    size_t blockReadSize;
+    size_t keyReadSize;
     bool prepareBufferToLoad(EntryReadBuffer &bufferToLoadInto, size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
 
     bool dataMapped;

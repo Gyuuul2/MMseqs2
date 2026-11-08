@@ -51,7 +51,7 @@ StorageKind getStorageKind(int fd) {
             snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/%s/rotational", major(st.st_dev), minor(st.st_dev), queues[i]);
             FILE *file = fopen(path, "r");
             if (file != NULL) {
-                const int rotational = fgetc(file);
+                int rotational = fgetc(file);
                 fclose(file);
                 return (rotational == '1') ? STORAGE_LOCAL_DISK : STORAGE_LOCAL_FLASH;
             }
@@ -87,11 +87,10 @@ IoMode getIoMode() {
     EXIT(EXIT_FAILURE);
 }
 
-// a read from Lustre or GPFS waits milliseconds on its server, so many are in flight; the servers of NFS take fewer
 static int getStorageMaxInflightRequests(StorageKind storage, int maxIoThreads) {
     const char *concurrency = getenv("MMSEQS_IO_CONCURRENCY");
     if (concurrency != NULL) {
-        const int value = atoi(concurrency);
+        int value = atoi(concurrency);
         if (value < 1) {
             Debug(Debug::ERROR) << "MMSEQS_IO_CONCURRENCY must be a positive number, not " << concurrency << "\n";
             EXIT(EXIT_FAILURE);
@@ -118,7 +117,7 @@ BatchReader::BatchReader(int maxIoThreads, int fdToDetectStorage) : nextSplitRea
     io_uring_params params;
     memset(&params, 0, sizeof(params));
     int fd = syscall(__NR_io_uring_setup, MAX_RING_DEPTH, &params);
-    // kernels before 5.12 charge the ring to RLIMIT_MEMLOCK, which may only fit MIN_RING_DEPTH
+    // RLIMIT_MEMLOCK before Linux 5.12
     if (fd < 0) {
         memset(&params, 0, sizeof(params));
         fd = syscall(__NR_io_uring_setup, MIN_RING_DEPTH, &params);
@@ -126,36 +125,36 @@ BatchReader::BatchReader(int maxIoThreads, int fdToDetectStorage) : nextSplitRea
     if (fd < 0) {
         return;
     }
-    const unsigned int probeOps = IORING_OP_READ + 1;
-    io_uring_probe *probe = static_cast<io_uring_probe *>(calloc(1, sizeof(io_uring_probe) + probeOps * sizeof(io_uring_probe_op)));
-    const bool canRead = probe != NULL && syscall(__NR_io_uring_register, fd, IORING_REGISTER_PROBE, probe, probeOps) >= 0
+    unsigned int probeOps = IORING_OP_READ + 1;
+    io_uring_probe *probe = (io_uring_probe *) calloc(1, sizeof(io_uring_probe) + probeOps * sizeof(io_uring_probe_op));
+    bool canRead = probe != NULL && syscall(__NR_io_uring_register, fd, IORING_REGISTER_PROBE, probe, probeOps) >= 0
                          && probe->ops_len > IORING_OP_READ && (probe->ops[IORING_OP_READ].flags & IO_URING_OP_SUPPORTED);
     free(probe);
     if (canRead == false || (params.features & IORING_FEAT_SINGLE_MMAP) == 0) {
         close(fd);
         return;
     }
-    ringBytes = std::max(params.sq_off.array + params.sq_entries * sizeof(unsigned int), params.cq_off.cqes + params.cq_entries * sizeof(io_uring_cqe));
-    ring = static_cast<char *>(mmap(NULL, ringBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING));
+    ringSize = std::max(params.sq_off.array + params.sq_entries * sizeof(unsigned int), params.cq_off.cqes + params.cq_entries * sizeof(io_uring_cqe));
+    ring = (char *) mmap(NULL, ringSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQ_RING);
     if (ring == MAP_FAILED) {
         close(fd);
         return;
     }
-    sqeBytes = params.sq_entries * sizeof(io_uring_sqe);
-    sqes = static_cast<io_uring_sqe *>(mmap(NULL, sqeBytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES));
+    sqeSize = params.sq_entries * sizeof(io_uring_sqe);
+    sqes = (io_uring_sqe *) mmap(NULL, sqeSize, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_POPULATE, fd, IORING_OFF_SQES);
     if (sqes == MAP_FAILED) {
-        munmap(ring, ringBytes);
+        munmap(ring, ringSize);
         close(fd);
         return;
     }
-    sqHead = reinterpret_cast<unsigned int *>(ring + params.sq_off.head);
-    sqTail = reinterpret_cast<unsigned int *>(ring + params.sq_off.tail);
-    sqMask = *reinterpret_cast<unsigned int *>(ring + params.sq_off.ring_mask);
-    cqHead = reinterpret_cast<unsigned int *>(ring + params.cq_off.head);
-    cqTail = reinterpret_cast<unsigned int *>(ring + params.cq_off.tail);
-    cqMask = *reinterpret_cast<unsigned int *>(ring + params.cq_off.ring_mask);
-    cqes = reinterpret_cast<io_uring_cqe *>(ring + params.cq_off.cqes);
-    unsigned int *sqArray = reinterpret_cast<unsigned int *>(ring + params.sq_off.array);
+    sqHead = (unsigned int *) (ring + params.sq_off.head);
+    sqTail = (unsigned int *) (ring + params.sq_off.tail);
+    sqMask = *(unsigned int *) (ring + params.sq_off.ring_mask);
+    cqHead = (unsigned int *) (ring + params.cq_off.head);
+    cqTail = (unsigned int *) (ring + params.cq_off.tail);
+    cqMask = *(unsigned int *) (ring + params.cq_off.ring_mask);
+    cqes = (io_uring_cqe *) (ring + params.cq_off.cqes);
+    unsigned int *sqArray = (unsigned int *) (ring + params.sq_off.array);
     for (unsigned int i = 0; i < params.sq_entries; i++) {
         sqArray[i] = i;
     }
@@ -167,8 +166,8 @@ BatchReader::~BatchReader() {
     waitAsyncRead();
 #ifdef HAVE_IO_URING
     if (ringFd >= 0) {
-        munmap(sqes, sqeBytes);
-        munmap(ring, ringBytes);
+        munmap(sqes, sqeSize);
+        munmap(ring, ringSize);
         close(ringFd);
     }
 #endif
@@ -209,16 +208,16 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
     nextSplitReadRequest = 0;
     for (size_t i = 0; i < requests.size(); i++) {
         const ReadRequest &request = requests[i];
-        const size_t end = request.fileOffset + request.bytesToRead;
-        const size_t minEnd = request.fileOffset + request.minBytesToRead;
+        size_t end = request.fileOffset + request.bytesToRead;
+        size_t minEnd = request.fileOffset + request.minBytesToRead;
         for (size_t at = request.fileOffset; at < minEnd;) {
-            const size_t next = std::min((at / MAX_READ_REQUEST_BYTES + 1) * MAX_READ_REQUEST_BYTES, end);
-            ReadRequest splitReadRequest = request;
-            splitReadRequest.destination += at - request.fileOffset;
-            splitReadRequest.fileOffset = at;
-            splitReadRequest.bytesToRead = next - at;
-            splitReadRequest.minBytesToRead = std::min(next, minEnd) - at;
-            splitReadRequests.push_back(splitReadRequest);
+            size_t next = std::min((at / MAX_READ_REQUEST_SIZE + 1) * MAX_READ_REQUEST_SIZE, end);
+            ReadRequest split = request;
+            split.destination += at - request.fileOffset;
+            split.fileOffset = at;
+            split.bytesToRead = next - at;
+            split.minBytesToRead = std::min(next, minEnd) - at;
+            splitReadRequests.push_back(split);
             at = next;
         }
     }
@@ -226,11 +225,11 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
     if (ringFd >= 0) {
         if (isRingWorkerCountLimited == false) {
             unsigned int maxWorkers[2] = { static_cast<unsigned int>(maxInflightRequests), static_cast<unsigned int>(maxInflightRequests) };
-            // without a worker cap (Linux < 5.15) io-wq can start 4 workers per CPU
+            // no cap before Linux 5.15
             isRingWorkerCountLimited = syscall(__NR_io_uring_register, ringFd, IORING_REGISTER_IOWQ_MAX_WORKERS, maxWorkers, 2) >= 0;
         }
         inflightReadLimit = isRingWorkerCountLimited ? sqMask + 1 : MIN_RING_DEPTH;
-        // the ring holds the requests of most reads; for more, a thread refills it while the caller works
+        // refill a full ring from a thread
         if (callingThreadReads == false && splitReadRequests.size() > inflightReadLimit) {
             ringThread = std::thread(&BatchReader::readWithRing, this, true);
         } else {
@@ -239,33 +238,34 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
         return;
     }
 #endif
-    const size_t preadThreadCount = std::min(static_cast<size_t>(maxInflightRequests), splitReadRequests.size());
-    for (size_t i = callingThreadReads ? 1 : 0; i < preadThreadCount; i++) {
+    size_t threads = std::min(static_cast<size_t>(maxInflightRequests), splitReadRequests.size());
+    for (size_t i = callingThreadReads ? 1 : 0; i < threads; i++) {
         preadThreads.emplace_back(&BatchReader::readWithPread, this);
     }
 }
 
 void BatchReader::readWithPread() {
-    const size_t pageSize = Util::getPageSize();
+    size_t pageSize = Util::getPageSize();
     while (__atomic_load_n(&readError, __ATOMIC_RELAXED) == 0) {
-        const size_t i = __sync_fetch_and_add(&nextSplitReadRequest, 1);
+        size_t i = __sync_fetch_and_add(&nextSplitReadRequest, 1);
         if (i >= splitReadRequests.size()) {
             return;
         }
-        for (size_t bytesRead = 0; bytesRead < splitReadRequests[i].minBytesToRead;) {
-            const ssize_t count = pread(splitReadRequests[i].fileToRead, splitReadRequests[i].destination + bytesRead, splitReadRequests[i].bytesToRead - bytesRead, splitReadRequests[i].fileOffset + bytesRead);
+        const ReadRequest &request = splitReadRequests[i];
+        for (size_t done = 0; done < request.minBytesToRead;) {
+            ssize_t count = pread(request.fileToRead, request.destination + done, request.bytesToRead - done, request.fileOffset + done);
             if (count < 0 && errno == EINTR) {
                 continue;
             }
-            if (count < static_cast<ssize_t>(std::min(pageSize, splitReadRequests[i].minBytesToRead - bytesRead))) {
+            if (count < static_cast<ssize_t>(std::min(pageSize, request.minBytesToRead - done))) {
                 if (__sync_bool_compare_and_swap(&readError, 0, count < 0 ? errno : -1)) {
-                    readErrorFileName = splitReadRequests[i].fileName;
+                    readErrorFileName = request.fileName;
                 }
                 return;
             }
-            bytesRead += count;
-            if (bytesRead < splitReadRequests[i].minBytesToRead) {
-                bytesRead -= bytesRead % pageSize;
+            done += count;
+            if (done < request.minBytesToRead) {
+                done -= done % pageSize;
             }
         }
     }
@@ -273,7 +273,7 @@ void BatchReader::readWithPread() {
 
 #ifdef HAVE_IO_URING
 void BatchReader::readWithRing(bool waitForAll) {
-    const size_t pageSize = Util::getPageSize();
+    size_t pageSize = Util::getPageSize();
     do {
         unsigned int tail = *sqTail;
         for (; readError == 0 && nextSplitReadRequest < splitReadRequests.size() && inflightReadRequestCount < inflightReadLimit; nextSplitReadRequest++, inflightReadRequestCount++, tail++) {
@@ -284,12 +284,12 @@ void BatchReader::readWithRing(bool waitForAll) {
             sqe.off = splitReadRequests[nextSplitReadRequest].fileOffset;
             sqe.addr = reinterpret_cast<unsigned long>(splitReadRequests[nextSplitReadRequest].destination);
             sqe.len = splitReadRequests[nextSplitReadRequest].bytesToRead;
-            sqe.flags = (splitReadRequests[nextSplitReadRequest].bytesToRead == MAX_READ_REQUEST_BYTES) ? IOSQE_ASYNC : 0;
+            sqe.flags = (splitReadRequests[nextSplitReadRequest].bytesToRead == MAX_READ_REQUEST_SIZE) ? IOSQE_ASYNC : 0;
             sqe.user_data = nextSplitReadRequest;
         }
         __atomic_store_n(sqTail, tail, __ATOMIC_RELEASE);
-        const unsigned int toSubmit = tail - __atomic_load_n(sqHead, __ATOMIC_RELAXED);
-        const unsigned int toWait = (waitForAll && inflightReadRequestCount > 0) ? 1 : 0;
+        unsigned int toSubmit = tail - __atomic_load_n(sqHead, __ATOMIC_RELAXED);
+        unsigned int toWait = (waitForAll && inflightReadRequestCount > 0) ? 1 : 0;
         if (syscall(__NR_io_uring_enter, ringFd, toSubmit, toWait, IORING_ENTER_GETEVENTS, NULL, 0) < 0 && errno != EAGAIN && errno != EINTR) {
             Debug(Debug::ERROR) << "Cannot read with io_uring: " << strerror(errno) << "\n";
             EXIT(EXIT_FAILURE);
@@ -310,11 +310,11 @@ void BatchReader::readWithRing(bool waitForAll) {
                 continue;
             }
             if (static_cast<size_t>(cqe.res) < rest.minBytesToRead) {
-                const size_t alignedBytesRead = cqe.res - cqe.res % pageSize;
-                rest.destination += alignedBytesRead;
-                rest.fileOffset += alignedBytesRead;
-                rest.bytesToRead -= alignedBytesRead;
-                rest.minBytesToRead -= alignedBytesRead;
+                size_t done = cqe.res - cqe.res % pageSize;
+                rest.destination += done;
+                rest.fileOffset += done;
+                rest.bytesToRead -= done;
+                rest.minBytesToRead -= done;
                 splitReadRequests.push_back(rest);
             }
         }
@@ -323,24 +323,26 @@ void BatchReader::readWithRing(bool waitForAll) {
 }
 #endif
 
-const size_t BatchWriter::BUFFER_BYTES;
+const size_t BatchReader::MAX_READ_REQUEST_SIZE;
+const size_t BatchReader::MAX_INFLIGHT_READ_SIZE;
+const size_t BatchWriter::BUFFER_SIZE;
 
-BatchWriter::BatchWriter(size_t memoryBytes, int maxIoThreads, int fdToDetectStorage)
-    : bufferBytes(std::min(BUFFER_BYTES, std::max<size_t>(1, memoryBytes / 3))), currentBuffer(NULL), busyBufferCount(0), isClosing(false) {
-    // a thread also has a buffer for the write requests that it joins, so the threads take half of the memory at most
-    const size_t threads = std::max<size_t>(1, std::min<size_t>(std::min(getStorageMaxInflightRequests(getStorageKind(fdToDetectStorage), maxIoThreads), maxIoThreads), memoryBytes / bufferBytes / 2));
-    const size_t bufferCount = std::max<size_t>(2, memoryBytes / bufferBytes - std::min(memoryBytes / bufferBytes, threads));
-    memory = new(std::nothrow) char[(bufferCount + threads) * bufferBytes];
+BatchWriter::BatchWriter(size_t memorySize, int maxIoThreads, int fdToDetectStorage)
+    : bufferSize(std::min(BUFFER_SIZE, std::max((size_t) 1, memorySize / 3))), currentBuffer(NULL), busyBufferCount(0), isClosing(false) {
+    // each thread has a buffer to join writes, so threads take at most half
+    size_t threads = std::max((size_t) 1, std::min((size_t) std::min(getStorageMaxInflightRequests(getStorageKind(fdToDetectStorage), maxIoThreads), maxIoThreads), memorySize / bufferSize / 2));
+    size_t bufferCount = std::max((size_t) 2, memorySize / bufferSize - std::min(memorySize / bufferSize, threads));
+    memory = new(std::nothrow) char[(bufferCount + threads) * bufferSize];
     Util::checkAllocation(memory, "Can not allocate memory in BatchWriter");
     buffers.resize(bufferCount);
     for (size_t i = 0; i < bufferCount; i++) {
-        buffers[i].data = memory + i * bufferBytes;
-        buffers[i].bytes = 0;
+        buffers[i].data = memory + i * bufferSize;
+        buffers[i].size = 0;
         buffers[i].activeCopyCount = 0;
         freeBuffers.push_back(&buffers[i]);
     }
     for (size_t i = 0; i < threads; i++) {
-        writeThreads.emplace_back(&BatchWriter::writeBuffers, this, memory + (bufferCount + i) * bufferBytes);
+        writeThreads.emplace_back(&BatchWriter::writeBuffers, this, memory + (bufferCount + i) * bufferSize);
     }
 }
 
@@ -354,11 +356,10 @@ BatchWriter::~BatchWriter() {
     for (size_t i = 0; i < writeThreads.size(); i++) {
         writeThreads[i].join();
     }
-    Util::releasePages(memory, (buffers.size() + writeThreads.size()) * bufferBytes);
+    Util::releasePages(memory, (buffers.size() + writeThreads.size()) * bufferSize);
     delete[] memory;
 }
 
-// a buffer that takes no more bytes is written once all copies to it are done
 void BatchWriter::queueCopiedBuffer(Buffer *buffer) {
     if (buffer != currentBuffer && buffer->activeCopyCount == 0) {
         fullBuffers.push_back(buffer);
@@ -366,31 +367,33 @@ void BatchWriter::queueCopiedBuffer(Buffer *buffer) {
     }
 }
 
-void BatchWriter::write(int fd, const char *fileName, const char *data, size_t bytes, size_t fileOffset) {
-    for (size_t done = 0; done < bytes;) {
+void BatchWriter::write(int fd, const char *fileName, const char *data, size_t size, size_t fileOffset) {
+    for (size_t done = 0; done < size;) {
         std::unique_lock<std::mutex> lock(bufferMutex);
-        freeCondition.wait(lock, [&]() { return currentBuffer != NULL || freeBuffers.empty() == false; });
+        while (currentBuffer == NULL && freeBuffers.empty()) {
+            freeCondition.wait(lock);
+        }
         if (currentBuffer == NULL) {
             currentBuffer = freeBuffers.back();
             freeBuffers.pop_back();
             busyBufferCount++;
         }
         Buffer *buffer = currentBuffer;
-        const size_t bufferOffset = buffer->bytes;
-        const size_t copyBytes = std::min(bytes - done, bufferBytes - bufferOffset);
-        const WriteRequest writeRequest = { fd, fileName, bufferOffset, copyBytes, fileOffset + done };
-        buffer->writeRequests.push_back(writeRequest);
-        buffer->bytes += copyBytes;
+        size_t bufferOffset = buffer->size;
+        size_t copySize = std::min(size - done, bufferSize - bufferOffset);
+        WriteRequest request = { fd, fileName, bufferOffset, copySize, fileOffset + done };
+        buffer->writeRequests.push_back(request);
+        buffer->size += copySize;
         buffer->activeCopyCount++;
-        if (buffer->bytes == bufferBytes) {
+        if (buffer->size == bufferSize) {
             currentBuffer = NULL;
         }
         lock.unlock();
-        memcpy(buffer->data + bufferOffset, data + done, copyBytes);
+        memcpy(buffer->data + bufferOffset, data + done, copySize);
         lock.lock();
         buffer->activeCopyCount--;
         queueCopiedBuffer(buffer);
-        done += copyBytes;
+        done += copySize;
     }
 }
 
@@ -401,13 +404,17 @@ void BatchWriter::waitWrites() {
         currentBuffer = NULL;
         queueCopiedBuffer(buffer);
     }
-    freeCondition.wait(lock, [&]() { return busyBufferCount == 0; });
+    while (busyBufferCount != 0) {
+        freeCondition.wait(lock);
+    }
 }
 
 void BatchWriter::writeBuffers(char *joinedWrites) {
     std::unique_lock<std::mutex> lock(bufferMutex);
     while (true) {
-        fullCondition.wait(lock, [&]() { return fullBuffers.empty() == false || isClosing; });
+        while (fullBuffers.empty() && isClosing == false) {
+            fullCondition.wait(lock);
+        }
         if (fullBuffers.empty()) {
             return;
         }
@@ -416,23 +423,23 @@ void BatchWriter::writeBuffers(char *joinedWrites) {
         lock.unlock();
         std::vector<WriteRequest> &writeRequests = buffer->writeRequests;
         SORT_SERIAL(writeRequests.begin(), writeRequests.end(), WriteRequest::compareByFile);
-        // the write requests that follow each other in their file are one write
+        // join consecutive writes
         for (size_t first = 0, last = 0; first < writeRequests.size(); first = last) {
-            size_t joinedBytes = 0;
-            for (last = first; last < writeRequests.size() && writeRequests[last].fd == writeRequests[first].fd && writeRequests[last].fileOffset == writeRequests[first].fileOffset + joinedBytes; last++) {
-                joinedBytes += writeRequests[last].bytes;
+            size_t joinedSize = 0;
+            for (last = first; last < writeRequests.size() && writeRequests[last].fd == writeRequests[first].fd && writeRequests[last].fileOffset == writeRequests[first].fileOffset + joinedSize; last++) {
+                joinedSize += writeRequests[last].size;
             }
             const char *writeData = buffer->data + writeRequests[first].bufferOffset;
             if (last > first + 1) {
                 writeData = joinedWrites;
-                for (size_t request = first, joinedPos = 0; request < last; joinedPos += writeRequests[request].bytes, request++) {
-                    memcpy(joinedWrites + joinedPos, buffer->data + writeRequests[request].bufferOffset, writeRequests[request].bytes);
+                for (size_t request = first, joinedPos = 0; request < last; joinedPos += writeRequests[request].size, request++) {
+                    memcpy(joinedWrites + joinedPos, buffer->data + writeRequests[request].bufferOffset, writeRequests[request].size);
                 }
             }
-            FileUtil::pwriteAll(writeRequests[first].fd, writeRequests[first].fileName, writeData, joinedBytes, writeRequests[first].fileOffset);
+            FileUtil::pwriteAll(writeRequests[first].fd, writeRequests[first].fileName, writeData, joinedSize, writeRequests[first].fileOffset);
         }
         writeRequests.clear();
-        buffer->bytes = 0;
+        buffer->size = 0;
         lock.lock();
         freeBuffers.push_back(buffer);
         busyBufferCount--;

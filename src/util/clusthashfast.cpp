@@ -371,7 +371,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     size_t splitMemoryLimit = static_cast<size_t>(static_cast<double>(memoryLimit - bitWords * sizeof(uint64_t) - writeBufferBytes) * 0.95);
 
     // group lengths that fit into splits
-    size_t readChunkBytes = std::min(MAX_INFLIGHT_READ_BYTES, splitMemoryLimit / 4);
+    size_t readChunkBytes = std::min(BatchReader::MAX_INFLIGHT_READ_SIZE, splitMemoryLimit / 4);
     size_t seqBufferLimit = isLinfinity ? splitMemoryLimit / 3 : 0;
     size_t hashIdPairsLimit = splitMemoryLimit - 2 * seqBufferLimit;
     std::vector<size_t> hashIdPairsCapacity(nodeLengthRanges.size() - 1, 0);
@@ -381,7 +381,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         size_t lengthBytes = (isLinfinity ? nodeLengthRanges[i + 1].offset - nodeLengthRanges[i].offset : 0) + lengthSeqCount * sizeof(HashEntry);
         if (lengthBytes > splitMemoryLimit) {
             size_t readChunkSeqCount = isLinfinity ? std::min(readChunkBytes / nodeLengthRanges[i].entryLength / 64 * 64, lengthSeqCount) : 0;
-            size_t chunkBufferBytes = 2 * reader.getLoadBufferBytes(nodeLengthRanges[i].startKey, nodeLengthRanges[i].startKey + readChunkSeqCount);
+            size_t chunkBufferBytes = 2 * reader.getLoadBufferSize(nodeLengthRanges[i].startKey, nodeLengthRanges[i].startKey + readChunkSeqCount);
             size_t keptBytes = isLinfinity ? (lengthSeqCount / 64 + 1) * sizeof(MemberBits) : lengthSeqCount / 4;
             size_t hashBytes = sizeof(HashEntry) + (isLinfinity ? nodeLengthRanges[i].entryLength - 2 : 0);
             // pairs to write a split length in key order
@@ -502,7 +502,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     size_t nextFirstKey = nodeLengthRanges[splitRangeOffsets[split + 1]].startKey;
                     size_t nextEndKey = nodeLengthRanges[splitRangeOffsets[split + 2]].startKey;
                     size_t nextHashBytes = std::max(allocatedHashEntryCount, nextEndKey - nextFirstKey) * sizeof(HashEntry);
-                    isNextPrefetched = reader.getPrefetchBufferBytes(nextFirstKey, nextEndKey) + nextHashBytes <= splitMemoryLimit;
+                    isNextPrefetched = reader.getPrefetchBufferSize(nextFirstKey, nextEndKey) + nextHashBytes <= splitMemoryLimit;
                     if (isNextPrefetched) {
                         reader.prefetchData(nextFirstKey, nextEndKey);
                     }

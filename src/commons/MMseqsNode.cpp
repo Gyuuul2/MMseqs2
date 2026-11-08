@@ -438,8 +438,8 @@ void MMseqsNode::writeExchangeFile(const std::string &fileName, uint64_t exchang
     FILE *file = FileUtil::openAndDelete(fileName.c_str(), "w");
     writeExchangeFileHeader(file, fileName, exchangeFileNumber);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (size_t offset = 0; offset < bytes; offset += MAX_READ_REQUEST_BYTES) {
-        FileUtil::pwriteAll(fileno(file), fileName.c_str(), data + offset, std::min(MAX_READ_REQUEST_BYTES, bytes - offset), EXCHANGE_FILE_HEADER_BYTES + offset);
+    for (size_t offset = 0; offset < bytes; offset += BatchReader::MAX_READ_REQUEST_SIZE) {
+        FileUtil::pwriteAll(fileno(file), fileName.c_str(), data + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, bytes - offset), EXCHANGE_FILE_HEADER_BYTES + offset);
     }
     publishExchangeFile(file, fileName, EXCHANGE_FILE_HEADER_BYTES + bytes, indexFile, line);
 }
@@ -823,7 +823,7 @@ static void fillExchangeReader(MMseqsNode::ExchangeReader &reader, size_t bytes,
     // outside a parallel region the threads share the reads of the reader
     std::vector<std::pair<size_t, size_t> > reads;
     while (reader.bufferEnd < reader.buffer.size() && getUnreadBytes(reader) > 0) {
-        const size_t readBytes = std::min(std::min(reader.buffer.size() - reader.bufferEnd, reader.end - reader.pos), MAX_READ_REQUEST_BYTES);
+        const size_t readBytes = std::min(std::min(reader.buffer.size() - reader.bufferEnd, reader.end - reader.pos), BatchReader::MAX_READ_REQUEST_SIZE);
         reads.push_back(std::make_pair(reader.pos, reader.bufferEnd));
         reader.pos += readBytes;
         reader.bufferEnd += readBytes;
@@ -1225,7 +1225,7 @@ static void writeKeyBits(const std::string &bitsFile, const uint64_t *bits, size
 
 // reads the next keys of entry that fit a split and moves entry past them, false once all are read; a key cut off by the read is read again with the next
 static bool readEntryKeys(DBReader<DBKeyType> &cluDb, DBReader<DBKeyType>::Index &entry, size_t memoryLimit, std::vector<char> &buffer, std::vector<DBKeyType> &keys) {
-    buffer.resize(std::min(memoryLimit / CLUSTER_SPLIT_MEMORY_DIVISOR, MAX_INFLIGHT_READ_BYTES));
+    buffer.resize(std::min(memoryLimit / CLUSTER_SPLIT_MEMORY_DIVISOR, BatchReader::MAX_INFLIGHT_READ_SIZE));
     // the entry ends with '\0' after its last newline
     const size_t bytes = std::min(buffer.size() - 1, entry.length - 1);
     if (bytes == 0) {

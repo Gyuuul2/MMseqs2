@@ -1603,7 +1603,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                         size_t representativeBitsMemory, std::vector<size_t> &sendSplits, OwnKmers &ownKmers, ExchangeFileGroups &kmerGroups) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     const float kmersPerSequenceScale = par.kmersPerSequenceScale.values.aminoacid();
-    const size_t readChunkBytes = std::min(MAX_INFLIGHT_READ_BYTES, exchange.keySplitMemoryLimit / 4);
+    const size_t readChunkBytes = std::min(BatchReader::MAX_INFLIGHT_READ_SIZE, exchange.keySplitMemoryLimit / 4);
     // a key split spans so few keys that their ids fit next to the whole sequence bit, the hash and the adjKey
     const size_t keySplitKeyLimit = (1ULL << (128 - 1 - 64 - exchange.adjKeyBits)) - 1;
     createFileGroups(kmerGroups);
