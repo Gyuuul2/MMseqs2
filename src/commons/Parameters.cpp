@@ -488,6 +488,7 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_FILTER_CLUDB_FILE);
     align2clust.push_back(&PARAM_FILTER_SEQDB_FILE);
     align2clust.push_back(&PARAM_LOCAL_DB_DIR);
+    align2clust.push_back(&PARAM_LOCAL_TMP);
     align2clust.push_back(&PARAM_INCLUDE_ALIGN_FILES);
     align2clust.push_back(&PARAM_DIAGONAL_MODE);
     align2clust.push_back(&PARAM_ALIGN2CLUST_ALIGNER_MODE);

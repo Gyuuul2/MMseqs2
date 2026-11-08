@@ -179,7 +179,7 @@ The memory limits default to 90 % of the physical memory of the machine and do n
 
 The first node (rank 0) needs more memory than the others, about 480 GB or more at 1 trillion sequences. The largest prefilter entry at 1 billion sequences was 3.19 MB, and at 1 trillion the prefilter entries it holds can take up to about 335 GB on top of its other work.
 
-`align2clust` with the default `--cov-mode 1` is fast when every aligning node holds its share of the sequence database in memory, that is the sequence bytes divided by the aligning nodes. Otherwise it reads the sequences key by key. With two or more nodes the first node does not align, so choose the number of nodes such that (nodes - 1) x 0.6 x node memory is at least the size of the sequence database, which is about 190 bytes per sequence for MGnify-like data.
+`align2clust` with the default `--cov-mode 1` is fast when every aligning node holds its share of the sequence database in memory, that is the sequence bytes divided by the aligning nodes. Otherwise it reads the sequences key by key. With `--local-tmp` on node-local flash, each aligning node first copies the sequence blocks it serves there and reads them from there. With two or more nodes the first node does not align, so choose the number of nodes such that (nodes - 1) x 0.6 x node memory is at least the size of the sequence database, which is about 190 bytes per sequence for MGnify-like data.
 
 ## Contributors
 

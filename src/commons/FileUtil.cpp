@@ -578,7 +578,8 @@ static const size_t LOCAL_COPY_IO_BYTES = 64 * 1024 * 1024;
 // shared storage serves this many large reads of a copy at once
 static const int LOCAL_COPY_THREADS = 64;
 
-std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &memoryBytes) {
+std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &memoryBytes,
+                                     const std::vector<std::vector<std::pair<size_t, size_t> > > *fileRanges) {
     const std::vector<std::string> dataFiles = findDatafiles(db.c_str());
     if (dataFiles.empty()) {
         Debug(Debug::ERROR) << "No datafile could be found for " << db << "\n";
@@ -591,13 +592,19 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
     const std::string localDb = localDir + "/" + baseName(db);
     std::vector<size_t> fileBytes(dataFiles.size());
     std::vector<std::pair<size_t, size_t> > chunks;
+    std::vector<size_t> chunkBytes;
     size_t totalBytes = 0;
     for (size_t i = 0; i < dataFiles.size(); i++) {
         fileBytes[i] = getFileSize(dataFiles[i]);
-        for (size_t offset = 0; offset < fileBytes[i]; offset += LOCAL_COPY_IO_BYTES) {
-            chunks.emplace_back(i, offset);
+        const std::vector<std::pair<size_t, size_t> > wholeFile(1, std::make_pair(0, fileBytes[i]));
+        const std::vector<std::pair<size_t, size_t> > &ranges = (fileRanges == NULL) ? wholeFile : (*fileRanges)[i];
+        for (size_t range = 0; range < ranges.size(); range++) {
+            for (size_t offset = ranges[range].first; offset < ranges[range].second; offset += LOCAL_COPY_IO_BYTES) {
+                chunks.emplace_back(i, offset);
+                chunkBytes.push_back(std::min(LOCAL_COPY_IO_BYTES, ranges[range].second - offset));
+                totalBytes += chunkBytes.back();
+            }
         }
-        totalBytes += fileBytes[i];
     }
     std::vector<int> sourceFds(dataFiles.size());
     std::vector<int> copyFds(dataFiles.size());
@@ -624,9 +631,8 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
 #pragma omp for schedule(dynamic, 1)
         for (size_t i = 0; i < chunks.size(); i++) {
             const size_t file = chunks[i].first;
-            const size_t bytes = std::min(LOCAL_COPY_IO_BYTES, fileBytes[file] - chunks[i].second);
-            preadAll(sourceFds[file], dataFiles[file].c_str(), buffer.data(), bytes, chunks[i].second);
-            pwriteAll(copyFds[file], copies[file].c_str(), buffer.data(), bytes, chunks[i].second);
+            preadAll(sourceFds[file], dataFiles[file].c_str(), buffer.data(), chunkBytes[i], chunks[i].second);
+            pwriteAll(copyFds[file], copies[file].c_str(), buffer.data(), chunkBytes[i], chunks[i].second);
         }
     }
     for (size_t i = 0; i < dataFiles.size(); i++) {

@@ -64,7 +64,9 @@ public:
     static void copyFile(const std::string& src, const std::string& dst);
 
     // copies the data files of db into the directory localDir and returns the name of the copy; memoryBytes: its bytes if it is on tmpfs
-    static std::string copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &memoryBytes);
+    // fileRanges: only these byte ranges of each data file, into sparse copies
+    static std::string copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &memoryBytes,
+                                      const std::vector<std::vector<std::pair<size_t, size_t> > > *fileRanges = NULL);
 
     static FILE *openAndDelete(const char *fileName, const char *mode);
 
