@@ -83,7 +83,7 @@ struct __attribute__((__packed__)) AdjacentData<false> {
 };
 
 // [ isWholeSequence | k-mer | adjKey | maxSeqLen - seqLen | id | pos ] in integer order; a whole sequence holds its hash from adjKeyShift up
-struct KmerPositionBit {
+struct PackedKmerPosition {
     static const unsigned int WHOLE_SEQUENCE_SHIFT = 127;
     static const unsigned int RESIDUE_BITS = 5;
     static unsigned int kmerShift;
@@ -97,7 +97,7 @@ struct KmerPositionBit {
     void set(size_t kmer, unsigned int adjKey, size_t seqLen, DBKeyType id, size_t pos, bool isWholeSequence) {
         value = (static_cast<uint128>(isWholeSequence) << WHOLE_SEQUENCE_SHIFT)
                 | (static_cast<uint128>(id) << idShift);
-        // --createdb-mode 3 records have no length and no position field
+        // linfinity records have no length and no position field
         if (adjKeyShift > seqLenShift) {
             value |= static_cast<uint128>(maxSeqLen - seqLen) << seqLenShift;
         }
@@ -120,7 +120,7 @@ struct KmerPositionBit {
     DBKeyType getId() const { return getBits(idShift, seqLenShift); }
     size_t getPos() const { return getBits(0, idShift); }
 
-    bool operator<(const KmerPositionBit &other) const {
+    bool operator<(const PackedKmerPosition &other) const {
         const uint64_t upper = static_cast<uint64_t>(value >> 64);
         const uint64_t otherUpper = static_cast<uint64_t>(other.value >> 64);
         return (upper != otherUpper) ? upper < otherUpper : static_cast<uint64_t>(value) < static_cast<uint64_t>(other.value);
@@ -134,7 +134,7 @@ private:
 
 // [ 0 | k-mer | maxSeqLen - seqLen | id | pos | adjKey | used as rep ] in integer order, the order of KmerPosition::compareRepSequenceAndIdAndPos;
 // a key above the k-mer field, a whole sequence hash, is [ 1 | key | maxSeqLen - seqLen | id | used as rep ] with pos 0 and all adjacent residues X
-struct KmerPositionDiagonalBit {
+struct PackedDiagonalKmerPosition {
     static const unsigned int WHOLE_SEQUENCE_SHIFT = 127;
     static const unsigned int ADJ_KEY_SHIFT = 1;
     static unsigned int posShift;
@@ -167,12 +167,12 @@ struct KmerPositionDiagonalBit {
         if (index == 0 && (value & 1)) {
             return UCHAR_MAX;
         }
-        return isWholeSequence() ? xIndex : getBits(ADJ_KEY_SHIFT + KmerPositionBit::RESIDUE_BITS * index, ADJ_KEY_SHIFT + KmerPositionBit::RESIDUE_BITS * (index + 1));
+        return isWholeSequence() ? xIndex : getBits(ADJ_KEY_SHIFT + PackedKmerPosition::RESIDUE_BITS * index, ADJ_KEY_SHIFT + PackedKmerPosition::RESIDUE_BITS * (index + 1));
     }
     // assignGroup only marks a used rep, setAdjacentSeq(0, UCHAR_MAX)
     void setAdjacentSeq(int, unsigned char) { value |= 1; }
 
-    bool operator<(const KmerPositionDiagonalBit &other) const {
+    bool operator<(const PackedDiagonalKmerPosition &other) const {
         const uint64_t upper = static_cast<uint64_t>(value >> 64);
         const uint64_t otherUpper = static_cast<uint64_t>(other.value >> 64);
         return (upper != otherUpper) ? upper < otherUpper : static_cast<uint64_t>(value) < static_cast<uint64_t>(other.value);
@@ -186,9 +186,9 @@ private:
 };
 
 // [ rep id | id | diagonal + 2^(bits of T - 1) ] in integer order, the order of KmerPosition::compareRepSequenceAndIdAndDiag;
-// the rep id field is wider than the id and read sign-extended, so the 0xFF fill of initKmerPositionArray reads as SIZE_T_MAX
+// the rep id field is wider than the id and read sign-extended, so the 0xFF end marker that assignGroup writes after the last pair reads as SIZE_T_MAX
 template <typename T, typename Upper>
-struct __attribute__((__packed__)) KmerPositionPairBit {
+struct __attribute__((__packed__)) PackedSeqPair {
     typedef typename std::make_unsigned<T>::type UnsignedT;
     static const unsigned int ID_SHIFT = 8 * sizeof(T);
     static const unsigned int BITS = 64 + 8 * sizeof(Upper);
@@ -210,7 +210,7 @@ struct __attribute__((__packed__)) KmerPositionPairBit {
     DBKeyType getId() const { return (getValue() >> ID_SHIFT) & ((static_cast<uint128>(1) << (repShift - ID_SHIFT)) - 1); }
     size_t getPos() const { return static_cast<T>(static_cast<UnsignedT>(lower) ^ DIAGONAL_OFFSET); }
 
-    bool operator<(const KmerPositionPairBit &other) const {
+    bool operator<(const PackedSeqPair &other) const {
         return (upper != other.upper) ? upper < other.upper : lower < other.lower;
     }
 
@@ -219,7 +219,7 @@ private:
 };
 
 template <typename T, typename Upper>
-unsigned int KmerPositionPairBit<T, Upper>::repShift = 0;
+unsigned int PackedSeqPair<T, Upper>::repShift = 0;
 
 template <typename T, bool includeAdjacency = false, typename L = T>
 struct __attribute__((__packed__)) KmerPosition {
@@ -241,7 +241,7 @@ struct __attribute__((__packed__)) KmerPosition {
     size_t getAdjKey() const {
         size_t adjKey = 0;
         for (int i = 5; i >= 0; i--) {
-            adjKey = (adjKey << KmerPositionBit::RESIDUE_BITS) | adj.get(i);
+            adjKey = (adjKey << PackedKmerPosition::RESIDUE_BITS) | adj.get(i);
         }
         return adjKey;
     }
@@ -442,12 +442,12 @@ void setLinearFilterDefault(Parameters *p);
 size_t computeMemoryNeededLinearfilter(size_t totalKmer);
 
 extern BaseMatrix *adjSubMat;
-// --createdb-mode 3: the first key of the send range that this node sends or merges, only the keys set in representativeBits unless NULL
-extern size_t localFirstKey;
+// linfinity: the first key of the send split that this node sends or merges, only the keys set in representativeBits unless NULL
+extern size_t sendSplitFirstKey;
 extern uint64_t *representativeBits;
 
 static inline bool isRepresentative(size_t id) {
-    return representativeBits == NULL || ((representativeBits[(id - localFirstKey) / 64] >> ((id - localFirstKey) % 64)) & 1);
+    return representativeBits == NULL || ((representativeBits[(id - sendSplitFirstKey) / 64] >> ((id - sendSplitFirstKey) % 64)) & 1);
 }
 
 static inline unsigned int getBitWidth(uint64_t value) {
@@ -465,13 +465,13 @@ static inline size_t computeSeqKmerCount(int seqLen, size_t kmerSize, size_t cho
 
 // the next rep of a k-mer group: the adjKey candidate scoring lowest against the previous one, at a tie the first by isBefore
 template <typename Candidate, typename ForEachRepCandidate, typename IsBefore>
-static inline void selectGroupRepSeqs(std::vector<Candidate> &reps, size_t maxRepSeqs, ForEachRepCandidate forEachRepCandidate, IsBefore isBefore) {
+static inline void selectGroupRepSeqs(std::vector<Candidate> &reps, size_t maxRepSeqCount, ForEachRepCandidate forEachRepCandidate, IsBefore isBefore) {
     short *subMatPos[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
     unsigned int repAdjKey = 0;
-    while (reps.size() < maxRepSeqs) {
+    while (reps.size() < maxRepSeqCount) {
         if (reps.empty() == false) {
             for (int j = 0; j < 6; j++) {
-                subMatPos[j] = adjSubMat->subMatrix[KmerPositionBit::getAdjacentSeq(repAdjKey, j)];
+                subMatPos[j] = adjSubMat->subMatrix[PackedKmerPosition::getAdjacentSeq(repAdjKey, j)];
             }
         }
         bool hasBest = false;
@@ -494,7 +494,7 @@ static inline void selectGroupRepSeqs(std::vector<Candidate> &reps, size_t maxRe
             }
             int score = 0;
             for (int j = 0; reps.empty() == false && j < 6; j++) {
-                score += subMatPos[j][KmerPositionBit::getAdjacentSeq(adjKey, j)];
+                score += subMatPos[j][PackedKmerPosition::getAdjacentSeq(adjKey, j)];
             }
             if (hasBest == false || score < bestScore || (score == bestScore && isBefore(candidate, bestCandidate))) {
                 hasBest = true;

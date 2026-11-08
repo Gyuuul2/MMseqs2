@@ -38,19 +38,19 @@ static float diagCovScale = 0.0f;
 
 BaseMatrix *adjSubMat = NULL;
 
-unsigned int KmerPositionBit::kmerShift = 0;
-unsigned int KmerPositionBit::adjKeyShift = 0;
-unsigned int KmerPositionBit::seqLenShift = 0;
-unsigned int KmerPositionBit::idShift = 0;
-size_t KmerPositionBit::maxSeqLen = 0;
-unsigned int KmerPositionDiagonalBit::posShift = 0;
-unsigned int KmerPositionDiagonalBit::idShift = 0;
-unsigned int KmerPositionDiagonalBit::seqLenShift = 0;
-unsigned int KmerPositionDiagonalBit::kmerShift = 0;
-size_t KmerPositionDiagonalBit::maxSeqLen = 0;
-unsigned char KmerPositionDiagonalBit::xIndex = 0;
+unsigned int PackedKmerPosition::kmerShift = 0;
+unsigned int PackedKmerPosition::adjKeyShift = 0;
+unsigned int PackedKmerPosition::seqLenShift = 0;
+unsigned int PackedKmerPosition::idShift = 0;
+size_t PackedKmerPosition::maxSeqLen = 0;
+unsigned int PackedDiagonalKmerPosition::posShift = 0;
+unsigned int PackedDiagonalKmerPosition::idShift = 0;
+unsigned int PackedDiagonalKmerPosition::seqLenShift = 0;
+unsigned int PackedDiagonalKmerPosition::kmerShift = 0;
+size_t PackedDiagonalKmerPosition::maxSeqLen = 0;
+unsigned char PackedDiagonalKmerPosition::xIndex = 0;
 
-size_t localFirstKey = 0;
+size_t sendSplitFirstKey = 0;
 uint64_t *representativeBits = NULL;
 
 static inline unsigned char adjacentResidue(const Sequence &seq, const char *seqData, size_t pos,
@@ -120,14 +120,14 @@ static void encodeKmerPosition(KmerPosition<T, includeAdjacency, L> *, KmerPosit
 }
 
 template <typename KmerPositionType, typename T, bool includeAdjacency, typename L>
-static void encodeKmerPosition(KmerPositionType *, KmerPosition<T, includeAdjacency, L> *threadKmerBuffer, size_t bufferPos, bool isWholeSequence, size_t loadFirstKey) {
+static void encodeKmerPosition(KmerPositionType *, KmerPosition<T, includeAdjacency, L> *threadKmerBuffer, size_t bufferPos, bool isWholeSequence, size_t keySplitFirstKey) {
     KmerPosition<T, includeAdjacency, L> &kmer = threadKmerBuffer[bufferPos];
     unsigned int adjKey = 0;
     for (int j = 5; j >= 0; j--) {
-        adjKey = (adjKey << KmerPositionBit::RESIDUE_BITS) | kmer.getAdjacentSeq(j);
+        adjKey = (adjKey << PackedKmerPosition::RESIDUE_BITS) | kmer.getAdjacentSeq(j);
     }
     KmerPositionType entry;
-    entry.set(kmer.kmer, adjKey, static_cast<size_t>(kmer.seqLen), kmer.id - loadFirstKey, static_cast<size_t>(kmer.pos), isWholeSequence);
+    entry.set(kmer.kmer, adjKey, static_cast<size_t>(kmer.seqLen), kmer.id - keySplitFirstKey, static_cast<size_t>(kmer.pos), isWholeSequence);
     memcpy(reinterpret_cast<char *>(threadKmerBuffer) + bufferPos * sizeof(entry), &entry, sizeof(entry));
 }
 
@@ -143,10 +143,10 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
     size_t longestKmer = par.kmerSize;
     const unsigned char xIndex = includeAdjacency ? adjSubMat->aa2num[static_cast<int>('X')] : 0;
     const unsigned char maskedIndex = subMat->aa2num[static_cast<int>('X')];
-    // --createdb-mode 3: a k-mer record holds a mix of the k-mer index in its top bits instead of the index and the key minus the first key of the load
+    // linfinity: a k-mer record holds a mix of the k-mer index in its top bits instead of the index and the key minus the first key of the key split
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(querySeqType) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     const unsigned int kmerBits = isLinfinity ? getKmerBits(subMat, par.kmerSize) : 0;
-    const size_t loadFirstKey = readChunkOffsets.front();
+    const size_t keySplitFirstKey = readChunkOffsets.front();
 
     ScoreMatrix two;
     ScoreMatrix three;
@@ -438,7 +438,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                                 threadKmerBuffer[bufferPos].setAdjacentSeq(i, xIndex);
                             }
                         }
-                        encodeKmerPosition(kmerArray, threadKmerBuffer, bufferPos, true, loadFirstKey);
+                        encodeKmerPosition(kmerArray, threadKmerBuffer, bufferPos, true, keySplitFirstKey);
                         if (seqHashInCountTable) {
                             addCountTableKmer();
                         }
@@ -527,7 +527,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                                     }
                                 }
                             }
-                            encodeKmerPosition(kmerArray, threadKmerBuffer, bufferPos, false, loadFirstKey);
+                            encodeKmerPosition(kmerArray, threadKmerBuffer, bufferPos, false, keySplitFirstKey);
                             if (kmerInCountTable) {
                                 addCountTableKmer();
                             }
@@ -983,7 +983,7 @@ static void sortSeqPairsByRepSequence(KmerPosition<T, false, L> *writeSeqPair, s
 }
 
 template <typename T, typename Upper>
-static void sortSeqPairsByRepSequence(KmerPositionPairBit<T, Upper> *writeSeqPair, size_t pairCount, bool) {
+static void sortSeqPairsByRepSequence(PackedSeqPair<T, Upper> *writeSeqPair, size_t pairCount, bool) {
     SORT_PARALLEL(writeSeqPair, writeSeqPair + pairCount);
 }
 
@@ -1056,7 +1056,7 @@ static void runIteration(
     iteration++;
 }
 
-static void sortKmersByRepSequence(KmerPositionDiagonalBit *hashSeqPair, size_t kmerCount, bool) {
+static void sortKmersByRepSequence(PackedDiagonalKmerPosition *hashSeqPair, size_t kmerCount, bool) {
     SORT_PARALLEL(hashSeqPair, hashSeqPair + kmerCount);
 }
 
@@ -1262,7 +1262,7 @@ SeqPairType *doComputation(
     return writeSeqPair;
 }
 
-static void sortKmers(KmerPositionBit *hashSeqPair, size_t kmerCount) {
+static void sortKmers(PackedKmerPosition *hashSeqPair, size_t kmerCount) {
     SORT_PARALLEL(hashSeqPair, hashSeqPair + kmerCount);
 }
 
@@ -1271,7 +1271,7 @@ static void sortKmers(KmerPosition<T, includeAdjacency, L> *hashSeqPair, size_t 
     SORT_PARALLEL(hashSeqPair, hashSeqPair + kmerCount, KmerPosition<T, includeAdjacency, L>::compareKmer);
 }
 
-static void sortKmerGroup(KmerPositionBit *, KmerPositionBit *) {
+static void sortKmerGroup(PackedKmerPosition *, PackedKmerPosition *) {
 }
 
 template <typename T, bool includeAdjacency, typename L>
@@ -1289,7 +1289,7 @@ struct KmerGroupRepSeq {
 };
 
 template <typename KmerPositionType>
-static size_t assignGroupWithoutDiagonal(KmerPositionType *hashSeqPair, int maxRepSeqs, int threads, std::vector<size_t> &threadOffsets,
+static size_t assignGroupWithoutDiagonal(KmerPositionType *hashSeqPair, int maxRepSeqCount, int threads, std::vector<size_t> &threadOffsets,
                                          KmerGroupRepSeq *groupRepSeqs) {
     std::vector<size_t> localWritePos(threads);
 
@@ -1311,9 +1311,9 @@ static size_t assignGroupWithoutDiagonal(KmerPositionType *hashSeqPair, int maxR
 
             repPositions.clear();
             // a whole sequence record holds hash bits instead of adjacent residues
-            const int groupMaxRepSeqs = hashSeqPair[groupStart].isWholeSequence() ? 1 : maxRepSeqs;
+            const int groupMaxRepSeqCount = hashSeqPair[groupStart].isWholeSequence() ? 1 : maxRepSeqCount;
             // the records are sorted by (adjKey, longer, smaller id)
-            selectGroupRepSeqs(repPositions, groupMaxRepSeqs,
+            selectGroupRepSeqs(repPositions, groupMaxRepSeqCount,
                                [&](const auto &visit) {
                                    for (size_t i = groupStart; i < groupEnd; i++) {
                                        visit(hashSeqPair[i].getAdjKey(), i);
@@ -1546,10 +1546,10 @@ static KmerPositionType *doComputationWithoutDiagonal(size_t totalKmers, size_t 
     }
 
     timer.reset();
-    const int maxRepSeqs = 1 + (includeAdjacency ? par.adjIteration : 0);
+    const int maxRepSeqCount = 1 + (includeAdjacency ? par.adjIteration : 0);
     groupRepSeqs = new(std::nothrow) KmerGroupRepSeq[elementsToSort];
     Util::checkAllocation(groupRepSeqs, "Can not allocate groupRepSeqs memory in doComputationWithoutDiagonal");
-    groupRepSeqCount = assignGroupWithoutDiagonal(hashSeqPair, maxRepSeqs, par.threads, threadOffsets, groupRepSeqs);
+    groupRepSeqCount = assignGroupWithoutDiagonal(hashSeqPair, maxRepSeqCount, par.threads, threadOffsets, groupRepSeqs);
     Debug(Debug::INFO) << "Time for assign: " << timer.lap() << "\n";
 
     Debug(Debug::INFO) << "Sort by rep. sequence ";
@@ -1780,17 +1780,17 @@ static void runKmermatcherWithoutDiagonal(Parameters &par, DBReader<DBKeyType> &
     const unsigned int seqLenBits = getBitWidth(maxSeqLen);
     const unsigned int idBits = getBitWidth(seqDbr.getLastKey());
     const unsigned int kmerBits = getKmerBits(subMat, par.kmerSize);
-    const unsigned int adjKeyBits = (includeAdjacency ? 6 : 0) * KmerPositionBit::RESIDUE_BITS;
+    const unsigned int adjKeyBits = (includeAdjacency ? 6 : 0) * PackedKmerPosition::RESIDUE_BITS;
     const unsigned int posBits = par.kmerPosFilter ? seqLenBits : 0;
     const unsigned int kmerPositionBits = 1 + kmerBits + adjKeyBits + seqLenBits + idBits + posBits;
     const unsigned int wholeSequencePositionBits = 1 + 64 + seqLenBits + idBits + posBits;
-    KmerPositionBit::idShift = posBits;
-    KmerPositionBit::seqLenShift = KmerPositionBit::idShift + idBits;
-    KmerPositionBit::adjKeyShift = KmerPositionBit::seqLenShift + seqLenBits;
-    KmerPositionBit::kmerShift = KmerPositionBit::adjKeyShift + adjKeyBits;
-    KmerPositionBit::maxSeqLen = maxSeqLen;
+    PackedKmerPosition::idShift = posBits;
+    PackedKmerPosition::seqLenShift = PackedKmerPosition::idShift + idBits;
+    PackedKmerPosition::adjKeyShift = PackedKmerPosition::seqLenShift + seqLenBits;
+    PackedKmerPosition::kmerShift = PackedKmerPosition::adjKeyShift + adjKeyBits;
+    PackedKmerPosition::maxSeqLen = maxSeqLen;
     if (std::max(kmerPositionBits, wholeSequencePositionBits) <= 128) {
-        kmermatcherWithoutDiagonalInner<KmerPositionBit, T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit, totalKmers);
+        kmermatcherWithoutDiagonalInner<PackedKmerPosition, T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit, totalKmers);
         return;
     }
     kmermatcherWithoutDiagonalInner<KmerPosition<T, includeAdjacency, L>, T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit, totalKmers);
@@ -1970,28 +1970,28 @@ static void runKmermatcherWithDiagonal(Parameters &par, DBReader<DBKeyType> &seq
     const unsigned int seqLenBits = getBitWidth(maxSeqLen);
     const unsigned int idBits = getBitWidth(seqDbr.getLastKey());
     const unsigned int kmerBits = getKmerBits(subMat, par.kmerSize);
-    const unsigned int adjKeyBits = (includeAdjacency ? 6 : 0) * KmerPositionBit::RESIDUE_BITS;
+    const unsigned int adjKeyBits = (includeAdjacency ? 6 : 0) * PackedKmerPosition::RESIDUE_BITS;
     const unsigned int posBits = seqLenBits;
     const unsigned int kmerPositionBits = 1 + kmerBits + seqLenBits + idBits + posBits + adjKeyBits + 1;
     const unsigned int wholeSequencePositionBits = 1 + 64 + seqLenBits + idBits + 1;
-    KmerPositionDiagonalBit::posShift = KmerPositionDiagonalBit::ADJ_KEY_SHIFT + adjKeyBits;
-    KmerPositionDiagonalBit::idShift = KmerPositionDiagonalBit::posShift + posBits;
-    KmerPositionDiagonalBit::seqLenShift = KmerPositionDiagonalBit::idShift + idBits;
-    KmerPositionDiagonalBit::kmerShift = KmerPositionDiagonalBit::seqLenShift + seqLenBits;
-    KmerPositionDiagonalBit::maxSeqLen = maxSeqLen;
-    KmerPositionDiagonalBit::xIndex = includeAdjacency ? adjSubMat->aa2num[static_cast<int>('X')] : 0;
+    PackedDiagonalKmerPosition::posShift = PackedDiagonalKmerPosition::ADJ_KEY_SHIFT + adjKeyBits;
+    PackedDiagonalKmerPosition::idShift = PackedDiagonalKmerPosition::posShift + posBits;
+    PackedDiagonalKmerPosition::seqLenShift = PackedDiagonalKmerPosition::idShift + idBits;
+    PackedDiagonalKmerPosition::kmerShift = PackedDiagonalKmerPosition::seqLenShift + seqLenBits;
+    PackedDiagonalKmerPosition::maxSeqLen = maxSeqLen;
+    PackedDiagonalKmerPosition::xIndex = includeAdjacency ? adjSubMat->aa2num[static_cast<int>('X')] : 0;
     // the pairs need the write buffer and a nucleotide k-mer keeps its strand outside the order
     if (par.needWriteBuffer && Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES) == false
         && std::max(kmerPositionBits, wholeSequencePositionBits) <= 128) {
-        const unsigned int seqPairBits = KmerPositionPairBit<T, uint32_t>::ID_SHIFT + idBits + idBits + 1;
-        KmerPositionPairBit<T, uint32_t>::repShift = KmerPositionPairBit<T, uint32_t>::ID_SHIFT + idBits;
-        KmerPositionPairBit<T, uint64_t>::repShift = KmerPositionPairBit<T, uint64_t>::ID_SHIFT + idBits;
-        if (seqPairBits <= KmerPositionPairBit<T, uint32_t>::BITS) {
-            kmermatcherWithDiagonalInner<KmerPositionDiagonalBit, KmerPositionPairBit<T, uint32_t>, T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit, totalKmers);
-        } else if (seqPairBits <= KmerPositionPairBit<T, uint64_t>::BITS) {
-            kmermatcherWithDiagonalInner<KmerPositionDiagonalBit, KmerPositionPairBit<T, uint64_t>, T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit, totalKmers);
+        const unsigned int seqPairBits = PackedSeqPair<T, uint32_t>::ID_SHIFT + idBits + idBits + 1;
+        PackedSeqPair<T, uint32_t>::repShift = PackedSeqPair<T, uint32_t>::ID_SHIFT + idBits;
+        PackedSeqPair<T, uint64_t>::repShift = PackedSeqPair<T, uint64_t>::ID_SHIFT + idBits;
+        if (seqPairBits <= PackedSeqPair<T, uint32_t>::BITS) {
+            kmermatcherWithDiagonalInner<PackedDiagonalKmerPosition, PackedSeqPair<T, uint32_t>, T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit, totalKmers);
+        } else if (seqPairBits <= PackedSeqPair<T, uint64_t>::BITS) {
+            kmermatcherWithDiagonalInner<PackedDiagonalKmerPosition, PackedSeqPair<T, uint64_t>, T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit, totalKmers);
         } else {
-            kmermatcherWithDiagonalInner<KmerPositionDiagonalBit, KmerPosition<T, false, L>, T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit, totalKmers);
+            kmermatcherWithDiagonalInner<PackedDiagonalKmerPosition, KmerPosition<T, false, L>, T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit, totalKmers);
         }
         return;
     }
@@ -2256,7 +2256,7 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     
     if (isLinfinity) {
         if (par.diagonalMode != Parameters::DIAGONAL_MODE_UNGAPPED && par.PARAM_DIAGONAL_MODE.wasSet) {
-            Debug(Debug::WARNING) << "--diagonal-mode 0 cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases\n";
+            Debug(Debug::WARNING) << "--diagonal-mode 0 cannot be combined with linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
             Debug(Debug::WARNING) << "We recompute with --diagonal-mode 1\n";
         }
         par.diagonalMode = Parameters::DIAGONAL_MODE_UNGAPPED;
@@ -2853,12 +2853,12 @@ template std::pair<size_t, size_t>  fillKmerPositionArray<1, int, false, int>(Km
 template std::pair<size_t, size_t>  fillKmerPositionArray<2, int, true, int>(KmerPosition<int, true> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<int, true> *, size_t, size_t);
 template std::pair<size_t, size_t>  fillKmerPositionArray<2, int, false, int>(KmerPosition<int, false> *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, KmerPosition<int, false> *, size_t, size_t);
 
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, short, true, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, KmerPositionBit *, size_t, size_t);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, short, false, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, KmerPositionBit *, size_t, size_t);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, true, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, KmerPositionBit *, size_t, size_t);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, false, unsigned short, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, KmerPositionBit *, size_t, size_t);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, true, int, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, KmerPositionBit *, size_t, size_t);
-template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, false, int, KmerPositionBit>(KmerPositionBit *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, KmerPositionBit *, size_t, size_t);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, short, true, unsigned short, PackedKmerPosition>(PackedKmerPosition *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, PackedKmerPosition *, size_t, size_t);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, short, false, unsigned short, PackedKmerPosition>(PackedKmerPosition *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, PackedKmerPosition *, size_t, size_t);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, true, unsigned short, PackedKmerPosition>(PackedKmerPosition *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, PackedKmerPosition *, size_t, size_t);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, false, unsigned short, PackedKmerPosition>(PackedKmerPosition *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, PackedKmerPosition *, size_t, size_t);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, true, int, PackedKmerPosition>(PackedKmerPosition *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, PackedKmerPosition *, size_t, size_t);
+template std::pair<size_t, size_t> fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, int, false, int, PackedKmerPosition>(PackedKmerPosition *, size_t, DBReader<DBKeyType> &, Parameters &, BaseMatrix *, bool, size_t, size_t, size_t *, const std::vector<size_t> &, PackedKmerPosition *, size_t, size_t);
 
 template KmerPosition<short, true> *initKmerPositionMemory(size_t size);
 template KmerPosition<short, false> *initKmerPositionMemory(size_t size);

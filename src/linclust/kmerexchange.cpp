@@ -249,15 +249,15 @@ static inline uint64_t getRice(KmerCodeReader &kmerCodeRead, unsigned int bits) 
 }
 
 // hash sub range i of hashSubRangeCount starts at i * 2^64 / hashSubRangeCount rounded down, here in units of 2^shift rounded up
-static KmerPositionBit::uint128 getHashSubRangeStart(size_t hashSubRange, size_t hashSubRangeCount, unsigned int shift) {
-    const KmerPositionBit::uint128 start = (static_cast<KmerPositionBit::uint128>(hashSubRange) << 64) / hashSubRangeCount;
-    return (start + (static_cast<KmerPositionBit::uint128>(1) << shift) - 1) >> shift;
+static PackedKmerPosition::uint128 getHashSubRangeStart(size_t hashSubRange, size_t hashSubRangeCount, unsigned int shift) {
+    const PackedKmerPosition::uint128 start = (static_cast<PackedKmerPosition::uint128>(hashSubRange) << 64) / hashSubRangeCount;
+    return (start + (static_cast<PackedKmerPosition::uint128>(1) << shift) - 1) >> shift;
 }
 
 // Rice parameter: the expected difference between the hashes of groupCount groups in the hash sub ranges [hashSubRange, hashSubRangeEnd), rounded down to a power of two
 static unsigned int getHashDiffLowBits(size_t hashSubRange, size_t hashSubRangeEnd, size_t hashSubRangeCount, unsigned int shift, size_t groupCount) {
-    const KmerPositionBit::uint128 width = getHashSubRangeStart(hashSubRangeEnd, hashSubRangeCount, shift) - getHashSubRangeStart(hashSubRange, hashSubRangeCount, shift);
-    const KmerPositionBit::uint128 diff = width / std::max<size_t>(1, groupCount);
+    const PackedKmerPosition::uint128 width = getHashSubRangeStart(hashSubRangeEnd, hashSubRangeCount, shift) - getHashSubRangeStart(hashSubRange, hashSubRangeCount, shift);
+    const PackedKmerPosition::uint128 diff = width / std::max<size_t>(1, groupCount);
     return getBitWidth((diff > UINT64_MAX) ? UINT64_MAX : std::max<uint64_t>(1, static_cast<uint64_t>(diff))) - 1;
 }
 
@@ -604,7 +604,7 @@ struct KmerExchange {
     unsigned int adjKeyCodeBits;
     unsigned int kmerHashShift;
     unsigned int globalIdBits;
-    size_t maxRepSeqs;
+    size_t maxRepSeqCount;
     // every node merges its first own send splits, rank + i * count for i below this, itself and before the merge splits that the nodes take
     size_t selfMergedSendSplitCount;
     size_t hashRangeCount;
@@ -625,7 +625,7 @@ static bool getRowHashSubRanges(const KmerExchange &exchange, size_t hashRange, 
 static inline void putAdjKeyCode(KmerCodeWriter &kmerCodeWrite, const KmerExchange &exchange, unsigned int adjKey) {
     unsigned int adjKeyCode = 0;
     for (int j = 5; j >= 0; j--) {
-        adjKeyCode = adjKeyCode * exchange.adjKeyBase + KmerPositionBit::getAdjacentSeq(adjKey, j);
+        adjKeyCode = adjKeyCode * exchange.adjKeyBase + PackedKmerPosition::getAdjacentSeq(adjKey, j);
     }
     putBits(kmerCodeWrite, adjKeyCode, exchange.adjKeyCodeBits);
 }
@@ -634,7 +634,7 @@ static inline unsigned int getAdjKeyCode(KmerCodeReader &kmerCodeRead, const Kme
     unsigned int adjKeyCode = getBits(kmerCodeRead, exchange.adjKeyCodeBits);
     unsigned int adjKey = 0;
     for (int j = 0; j < 6; j++) {
-        adjKey |= (adjKeyCode % exchange.adjKeyBase) << (KmerPositionBit::RESIDUE_BITS * j);
+        adjKey |= (adjKeyCode % exchange.adjKeyBase) << (PackedKmerPosition::RESIDUE_BITS * j);
         adjKeyCode /= exchange.adjKeyBase;
     }
     return adjKey;
@@ -647,16 +647,16 @@ static size_t getPartitionFirstKey(const KmerExchange &exchange, size_t sendSpli
 
 // a node sends and merges a send split with the representative bits of its keys
 static void setSendSplit(const Parameters &par, const KmerExchange &exchange, size_t sendSplit) {
-    localFirstKey = exchange.sendSplitKeyOffsets[sendSplit];
+    sendSplitFirstKey = exchange.sendSplitKeyOffsets[sendSplit];
     delete[] representativeBits;
     representativeBits = NULL;
     if (exchange.hasRepresentativeBits) {
-        representativeBits = MMseqsNode::readRepresentativeBits(par.db1, exchange.fileKeyOffsets, localFirstKey, exchange.sendSplitKeyOffsets[sendSplit + 1] - localFirstKey);
+        representativeBits = MMseqsNode::readRepresentativeBits(par.db1, exchange.fileKeyOffsets, sendSplitFirstKey, exchange.sendSplitKeyOffsets[sendSplit + 1] - sendSplitFirstKey);
     }
 }
 
 // the distinct ids of [groupStart, groupEnd), sorted in groupBuffer or, if they do not fit, set as bits of the key split counted per 512; returns their count
-static size_t getGroupIds(const KmerPositionBit *hashSeqPair, size_t groupStart, size_t groupEnd, uint64_t *groupBuffer, size_t groupBufferWords, uint64_t *setBitCounts, size_t keySplitWords) {
+static size_t getGroupIds(const PackedKmerPosition *hashSeqPair, size_t groupStart, size_t groupEnd, uint64_t *groupBuffer, size_t groupBufferWords, uint64_t *setBitCounts, size_t keySplitWords) {
     if (groupEnd - groupStart <= groupBufferWords) {
         for (size_t pos = groupStart; pos < groupEnd; pos++) {
             groupBuffer[pos - groupStart] = hashSeqPair[pos].getId();
@@ -1373,7 +1373,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
     Util::checkAllocation(kmerWriteBuffer, "Can not allocate kmerWriteBuffer memory in sendKmers");
     BatchWriter batchWriter(exchange.writeBehindBytes, par.threads, fileno(kmerFileHandle));
     // the k-mers of the largest send split so far, kept for the next ones so their pages are not mapped again, while they fit with the group buffers
-    KmerPositionBit *hashSeqPair = NULL;
+    PackedKmerPosition *hashSeqPair = NULL;
     size_t hashSeqPairCapacity = 0;
     std::vector<char> isOwnKeySplitHashRange(exchange.hashRangeCount);
     for (size_t sendSplit = sendQueue.takeNextItem(); sendSplit < exchange.sendSplitCount; sendSplit = sendQueue.takeNextItem()) {
@@ -1387,7 +1387,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
         };
         // the k-mers of a key split and a group buffer per thread fit the memory beside the own rows, with fewer k-mers per key split if needed
         const size_t keySplitMemoryLimit = exchange.keySplitMemoryLimit - ownKmers.bytes;
-        size_t kmerCapacity = keySplitMemoryLimit / sizeof(KmerPositionBit);
+        size_t kmerCapacity = keySplitMemoryLimit / sizeof(PackedKmerPosition);
         std::vector<size_t> keySplitOffsets;
         size_t maxKeySplitKmers = 0;
         size_t maxKeySplitKeys = 0;
@@ -1448,7 +1448,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
             // a group buffer holds the ids of a group, or for a bigger group a bit per key of the key split and the count of set bits before every 512 of them
             groupBufferWords = (maxKeySplitKeys + 63) / 64 + (maxKeySplitKeys + 511) / 512;
             fixedBytes = par.threads * groupBufferWords * sizeof(uint64_t);
-            if (fixedBytes + maxKeySplitKmers * sizeof(KmerPositionBit) <= keySplitMemoryLimit) {
+            if (fixedBytes + maxKeySplitKmers * sizeof(PackedKmerPosition) <= keySplitMemoryLimit) {
                 break;
             }
             if (maxKeySplitKmers == 0) {
@@ -1458,22 +1458,22 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                 EXIT(EXIT_FAILURE);
             }
             // fewer k-mers per key split take fewer keys per group buffer
-            kmerCapacity = std::min(maxKeySplitKmers - 1, (fixedBytes < keySplitMemoryLimit) ? (keySplitMemoryLimit - fixedBytes) / sizeof(KmerPositionBit) : maxKeySplitKmers / 2);
+            kmerCapacity = std::min(maxKeySplitKmers - 1, (fixedBytes < keySplitMemoryLimit) ? (keySplitMemoryLimit - fixedBytes) / sizeof(PackedKmerPosition) : maxKeySplitKmers / 2);
         }
         const size_t keySplitCount = keySplitOffsets.size() - 1;
 
         const unsigned int idBits = getBitWidth(maxKeySplitKeys);
-        KmerPositionBit::idShift = 0;
-        KmerPositionBit::seqLenShift = idBits;
-        KmerPositionBit::adjKeyShift = idBits;
-        KmerPositionBit::kmerShift = idBits + exchange.adjKeyBits;
-        KmerPositionBit::maxSeqLen = 0;
+        PackedKmerPosition::idShift = 0;
+        PackedKmerPosition::seqLenShift = idBits;
+        PackedKmerPosition::adjKeyShift = idBits;
+        PackedKmerPosition::kmerShift = idBits + exchange.adjKeyBits;
+        PackedKmerPosition::maxSeqLen = 0;
 
-        if (maxKeySplitKmers > hashSeqPairCapacity || fixedBytes + hashSeqPairCapacity * sizeof(KmerPositionBit) > keySplitMemoryLimit) {
-            Util::releasePages(hashSeqPair, hashSeqPairCapacity * sizeof(KmerPositionBit));
+        if (maxKeySplitKmers > hashSeqPairCapacity || fixedBytes + hashSeqPairCapacity * sizeof(PackedKmerPosition) > keySplitMemoryLimit) {
+            Util::releasePages(hashSeqPair, hashSeqPairCapacity * sizeof(PackedKmerPosition));
             delete[] hashSeqPair;
             hashSeqPairCapacity = maxKeySplitKmers;
-            hashSeqPair = new(std::nothrow) KmerPositionBit[hashSeqPairCapacity];
+            hashSeqPair = new(std::nothrow) PackedKmerPosition[hashSeqPairCapacity];
             Util::checkAllocation(hashSeqPair, "Can not allocate hashSeqPair memory in sendKmers");
         }
         uint64_t *groupBuffers = new(std::nothrow) uint64_t[par.threads * groupBufferWords];
@@ -1503,8 +1503,8 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
 
             // the whole sequence records follow the k-mer records, both in hash order
             const size_t wholeSequenceStart = std::partition_point(hashSeqPair, hashSeqPair + kmerCount,
-                                                                   [](const KmerPositionBit &kmer) { return kmer.isWholeSequence() == false; }) - hashSeqPair;
-            const auto compareHash = [](const KmerPositionBit &kmer, uint64_t hash) { return static_cast<uint64_t>(kmer.getKmer()) < hash; };
+                                                                   [](const PackedKmerPosition &kmer) { return kmer.isWholeSequence() == false; }) - hashSeqPair;
+            const auto compareHash = [](const PackedKmerPosition &kmer, uint64_t hash) { return static_cast<uint64_t>(kmer.getKmer()) < hash; };
 #pragma omp parallel for schedule(static) num_threads(par.threads)
             for (size_t hashSubRange = 0; hashSubRange < exchange.hashSubRangeCount; hashSubRange++) {
                 const uint64_t hashSubRangeStart = static_cast<uint64_t>(getHashSubRangeStart(hashSubRange, exchange.hashSubRangeCount, 0));
@@ -1559,7 +1559,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                 }
             }
             // the own hash ranges keep their rows of the key split in memory up to the first that does not fit beside the key split
-            const size_t ownKeySplitLimit = std::min(exchange.keySplitMemoryLimit - ownKmers.bytes - fixedBytes - hashSeqPairCapacity * sizeof(KmerPositionBit),
+            const size_t ownKeySplitLimit = std::min(exchange.keySplitMemoryLimit - ownKmers.bytes - fixedBytes - hashSeqPairCapacity * sizeof(PackedKmerPosition),
                                                      ownKmers.limit - std::min(ownKmers.limit, ownKmers.bytes));
             size_t ownKeySplitBytes = 0;
             isOwnKeySplitHashRange.assign(exchange.hashRangeCount, false);
@@ -1683,7 +1683,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
     batchWriter.waitWrites();
     MMseqsNode::addPhaseSeconds(sendValues, "waiting to write k-mers", batchWriter.getWaitSeconds() / par.threads);
     delete[] kmerWriteBuffer;
-    Util::releasePages(hashSeqPair, hashSeqPairCapacity * sizeof(KmerPositionBit));
+    Util::releasePages(hashSeqPair, hashSeqPairCapacity * sizeof(PackedKmerPosition));
     delete[] hashSeqPair;
     writeRowTable(kmerFileHandle, kmerFile, exchange.hashRangeCount, flushRowOffsets, std::vector<size_t>(), kmerFileBytes);
     return kmerFileBytes;
@@ -1750,7 +1750,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     // a thread that is alone with a group too big for the output takes half of it for records, at least one per representative, and half for targets
     const size_t halfRecords = outputBytes / 2 / sizeof(PairRecord);
     const size_t halfTargets = (outputBytes - halfRecords * sizeof(PairRecord)) / sizeof(DBKeyType);
-    if (halfRecords < exchange.maxRepSeqs || halfTargets == 0) {
+    if (halfRecords < exchange.maxRepSeqCount || halfTargets == 0) {
         Debug(Debug::ERROR) << "Not enough memory to receive the k-mers. Raise --split-memory-limit.\n";
         EXIT(EXIT_FAILURE);
     }
@@ -1936,8 +1936,8 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                 size_t hashSubRangeEnd = 0;
                 const bool isWholeSequence = getRowHashSubRanges(exchange, received.hashRange, passFirstHashSubRange + passHashSubRange, hashSubRange, hashSubRangeEnd);
                 const unsigned int hashShift = isWholeSequence ? 0 : exchange.kmerHashShift;
-                const KmerPositionBit::uint128 hashStart = getHashSubRangeStart(hashSubRange, exchange.hashSubRangeCount, hashShift);
-                const KmerPositionBit::uint128 hashWidth = getHashSubRangeStart(hashSubRangeEnd, exchange.hashSubRangeCount, hashShift) - hashStart;
+                const PackedKmerPosition::uint128 hashStart = getHashSubRangeStart(hashSubRange, exchange.hashSubRangeCount, hashShift);
+                const PackedKmerPosition::uint128 hashWidth = getHashSubRangeStart(hashSubRangeEnd, exchange.hashSubRangeCount, hashShift) - hashStart;
                 KmerThreadTaskStart start = {0, static_cast<uint64_t>(hashStart), {0, 0, 0}};
                 rowStarts[0] = start;
                 if (taskCount > 1) {
@@ -2036,7 +2036,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                         size_t hashSubRangeEnd = 0;
                         const bool isWholeSequence = getRowHashSubRanges(exchange, received.hashRange, passFirstHashSubRange + passHashSubRange, hashSubRange, hashSubRangeEnd);
                         const unsigned int hashShift = isWholeSequence ? 0 : exchange.kmerHashShift;
-                        const size_t groupMaxRepSeqs = isWholeSequence ? 1 : exchange.maxRepSeqs;
+                        const size_t groupMaxRepSeqCount = isWholeSequence ? 1 : exchange.maxRepSeqCount;
                         const size_t rowCount = hashSubRangeRowOffsets[passHashSubRange + 1] - hashSubRangeRowOffsets[passHashSubRange];
                         const KmerThreadTaskStart *rowStarts = taskStarts.data() + taskStartOffsets[passHashSubRange] + (task - hashSubRangeTaskOffsets[passHashSubRange]) * rowCount;
                         const KmerThreadTaskStart *rowResumes = taskResumes[task].empty() ? rowStarts : taskResumes[task].data();
@@ -2095,13 +2095,13 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                 seekKmerCodeBits(repCandidateRead, getKmerCodeBitPos(repCandidateRead) + repCandidateBits);
                             } else {
                                 // the records and targets of the group at most: a record per representative and every member once
-                                if (takePairOutput(output, region, groupMaxRepSeqs, memberCount) == false) {
+                                if (takePairOutput(output, region, groupMaxRepSeqCount, memberCount) == false) {
                                     if (isAlone == false) {
-                                        taskStops[task] = (groupMaxRepSeqs * sizeof(PairRecord) + memberCount * sizeof(DBKeyType) > output.bytes) ? TASK_GROUP_TOO_BIG : TASK_OUTPUT_FULL;
+                                        taskStops[task] = (groupMaxRepSeqCount * sizeof(PairRecord) + memberCount * sizeof(DBKeyType) > output.bytes) ? TASK_GROUP_TOO_BIG : TASK_OUTPUT_FULL;
                                         break;
                                     }
                                     flushPairOutput(exchange, pairFile, output, outputRegions, pairWriteBuffer, 1);
-                                    takePairOutput(output, region, std::min(groupMaxRepSeqs, halfRecords), std::min(memberCount, halfTargets));
+                                    takePairOutput(output, region, std::min(groupMaxRepSeqCount, halfRecords), std::min(memberCount, halfTargets));
                                 }
                                 threadGroups++;
                                 groupRepCandidateStarts.clear();
@@ -2132,13 +2132,13 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                             }
                                         }
                                         SORT_SERIAL(repCandidates.begin(), repCandidates.end());
-                                        selectGroupRepSeqs(repMembers, groupMaxRepSeqs, [&](const auto &visit) {
+                                        selectGroupRepSeqs(repMembers, groupMaxRepSeqCount, [&](const auto &visit) {
                                             for (size_t repCandidate = 0; repCandidate < repCandidates.size(); repCandidate++) {
                                                 visit(repCandidates[repCandidate].first, repCandidates[repCandidate].second);
                                             }
                                         }, std::less<std::pair<size_t, size_t> >());
                                     } else {
-                                        selectGroupRepSeqs(repMembers, groupMaxRepSeqs, [&](const auto &visit) {
+                                        selectGroupRepSeqs(repMembers, groupMaxRepSeqCount, [&](const auto &visit) {
                                             rewindGroupReads(KMER_REP_CANDIDATE_CODES, groupRepCandidateStarts);
                                             if (groupRows.size() == 1) {
                                                 KmerHashSubRangeRead &read = reads[groupRows[0]];
@@ -2319,7 +2319,7 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     // a partition is its start, the starts and cuts of its key tasks and its end, with the pref bytes before them in the pref file and the alignment cells before them in the partition
     std::vector<PartitionCut> partitionCuts;
     std::vector<size_t> partitionCutOffsets(1, 0);
-    KmerPositionBit::uint128 mergedCost = 0;
+    PackedKmerPosition::uint128 mergedCost = 0;
     const auto addKeyTaskCuts = [&](size_t partitionFirstKey, size_t taskFirstKey, size_t taskPrefOffset, size_t taskCost, const KeyTaskCuts &taskCuts) {
         const PartitionCut taskStart = { partitionFirstKey + taskFirstKey, taskPrefOffset, taskCost };
         partitionCuts.push_back(taskStart);
@@ -2774,7 +2774,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         const size_t rangeCost = rangeKmers * SEND_KMER_BYTES + rangeKeys * index[range].length;
         for (; sendSplit < exchange.sendSplitCount && costBefore + rangeCost >= sendSplit * sendSplitCost; sendSplit++) {
             const size_t cutCost = sendSplit * sendSplitCost - costBefore;
-            sendSplitKeyOffsets[sendSplit] = index[range].id + static_cast<size_t>((static_cast<KmerPositionBit::uint128>(cutCost) * rangeKeys + rangeCost - 1) / rangeCost);
+            sendSplitKeyOffsets[sendSplit] = index[range].id + static_cast<size_t>((static_cast<PackedKmerPosition::uint128>(cutCost) * rangeKeys + rangeCost - 1) / rangeCost);
         }
         costBefore += rangeCost;
     }
@@ -2800,7 +2800,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     }
 
     // keys are in length descending order, so a record needs no length, and no position as the diagonal comes later
-    exchange.adjKeyBits = (includeAdjacency ? 6 : 0) * KmerPositionBit::RESIDUE_BITS;
+    exchange.adjKeyBits = (includeAdjacency ? 6 : 0) * PackedKmerPosition::RESIDUE_BITS;
     exchange.adjKeyBase = includeAdjacency ? adjSubMat->alphabetSize : 1;
     exchange.adjKeyCodeBits = includeAdjacency ? getBitWidth(MathUtil::ipow<size_t>(exchange.adjKeyBase, 6) - 1) : 0;
     // a k-mer record holds its hash in the top kmerBits bits, the hash of a whole sequence takes all 64
@@ -2809,7 +2809,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     // hash ranges are equal parts of the 64 bit hash, RANGES_PER_NODE a node and enough for the threads that write the k-mer file of a key split
     exchange.hashRangeCount = std::max(RANGES_PER_NODE * MMseqsNode::count, TASKS_PER_THREAD * par.threads);
     exchange.globalIdBits = getBitWidth(seqDbr.getSize() - 1);
-    exchange.maxRepSeqs = 1 + (includeAdjacency ? par.adjIteration : 0);
+    exchange.maxRepSeqCount = 1 + (includeAdjacency ? par.adjIteration : 0);
     // as many as a node half as fast as the others merges, like the own hash ranges
     exchange.selfMergedSendSplitCount = exchange.sendSplitCount / MMseqsNode::count * MMseqsNode::count / (2 * MMseqsNode::count - 1);
     // a receiving node reads about a member id, a rep candidate and its index codes per record
@@ -2835,7 +2835,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     const size_t fixedMemory = representativeBitsMemory + 2 * par.threads * KMER_FILE_BUFFER_BYTES + exchange.writeBehindBytes
                                + exchange.hashRangeCount * exchange.rowsPerHashRange * sizeof(KmerFileRow);
     exchange.keySplitMemoryLimit = (fixedMemory < memoryLimit) ? static_cast<size_t>(static_cast<double>(memoryLimit - fixedMemory) * 0.95) : 0;
-    const size_t rangePairPasses = std::max<size_t>(1, (totalKmerCount / exchange.sendSplitCount * exchange.maxRepSeqs * pairTargetBytes + minPassLimit - 1) / minPassLimit);
+    const size_t rangePairPasses = std::max<size_t>(1, (totalKmerCount / exchange.sendSplitCount * exchange.maxRepSeqCount * pairTargetBytes + minPassLimit - 1) / minPassLimit);
     // all threads merge a partition, which is about half a pass or smaller, so only a few are too big for a pass
     exchange.partitionsPerRange = std::max(PARTITIONS_PER_THREAD * par.threads, 2 * rangePairPasses);
     exchange.pairRowBytes = exchange.sendSplitCount * exchange.partitionsPerRange * sizeof(PairFileRow);
@@ -2846,7 +2846,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     // the own rows of the first own hash ranges that fit and that a node half as fast as the others takes itself
     OwnKmers ownKmers = {NULL, 0, getPassLimit(exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, exchange.pairRowBytes)),
                          std::vector<std::vector<KmerFileRow> >(exchange.hashRangeCount), std::vector<size_t>()};
-    const size_t sendSplitKmerBytes = totalKmerCount / exchange.sendSplitCount * sizeof(KmerPositionBit);
+    const size_t sendSplitKmerBytes = totalKmerCount / exchange.sendSplitCount * sizeof(PackedKmerPosition);
     const size_t ownMemory = std::min(ownKmers.limit, exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, sendSplitKmerBytes));
     const size_t ownHashRangeBytes = std::max<size_t>(1, totalKmerCount * receiverKmerBytes / (MMseqsNode::count * exchange.hashRangeCount));
     const size_t ownItems = (exchange.hashRangeCount - MMseqsNode::rank + MMseqsNode::count - 1) / MMseqsNode::count;
