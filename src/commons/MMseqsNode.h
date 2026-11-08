@@ -128,7 +128,8 @@ public:
         size_t nextNode;
     };
     // a barrier that returns the smallest memoryLimit of all nodes, so they all cut the same splits; with threads all nodes must run with as many
-    static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0);
+    // localNodes: the nodes with localDirectory on the same local flash device as this one, 0 if it is not local flash
+    static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0, const std::string &localDirectory = "", size_t *localNodes = NULL);
 
     // a range of an exchange file <prefix>.<node> that this node reads through a buffer, freeing its bytes once read
     struct ExchangeReader {

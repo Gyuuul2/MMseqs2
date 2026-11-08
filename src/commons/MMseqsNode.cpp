@@ -7,6 +7,7 @@
 #include "DBReader.h"
 #include "itoa.h"
 #include "Timer.h"
+#include "BatchReader.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -651,9 +652,22 @@ void MMseqsNode::WorkQueue::removeTakenItemFiles() {
     }
 }
 
-size_t MMseqsNode::getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads) {
-    const std::string nodeLimits = barrier(file, SSTR(memoryLimit) + ((threads > 0) ? "\t" + SSTR(threads) : "") + "\n");
+size_t MMseqsNode::getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads, const std::string &localDirectory, size_t *localNodes) {
+    // host and device of a local flash directory
+    std::string localDevice;
+    int fd = localDirectory.empty() ? -1 : open(localDirectory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    struct stat sb;
+    if (fd >= 0 && getStorageKind(fd) == STORAGE_LOCAL_FLASH && fstat(fd, &sb) == 0) {
+        char host[256] = "";
+        gethostname(host, sizeof(host) - 1);
+        localDevice = "\t" + std::string(host) + "\t" + SSTR(sb.st_dev) + "\n";
+    }
+    if (fd >= 0) {
+        close(fd);
+    }
+    const std::string nodeLimits = barrier(file, SSTR(memoryLimit) + ((threads > 0) ? "\t" + SSTR(threads) : "") + (localDevice.empty() ? "\n" : localDevice));
     size_t smallestMemoryLimit = memoryLimit;
+    size_t sameDevice = 0;
     for (char *line = (char *) nodeLimits.c_str(); *line != '\0'; line = Util::skipLine(line)) {
         const char *columns[2];
         Util::getWordsOfLine(line, columns, 2);
@@ -662,6 +676,11 @@ size_t MMseqsNode::getSmallestMemoryLimit(const std::string &file, size_t memory
             EXIT(EXIT_FAILURE);
         }
         smallestMemoryLimit = std::min(smallestMemoryLimit, Util::fast_atoi<size_t>(columns[0]));
+        char *end = Util::skipLine(line);
+        sameDevice += localDevice.empty() == false && static_cast<size_t>(end - line) >= localDevice.size() && localDevice.compare(0, std::string::npos, end - localDevice.size(), localDevice.size()) == 0;
+    }
+    if (localNodes != NULL) {
+        *localNodes = sameDevice;
     }
     return smallestMemoryLimit;
 }

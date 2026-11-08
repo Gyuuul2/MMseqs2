@@ -443,14 +443,20 @@ static void closeReceivedFiles(std::vector<ReceivedFile> &receivedFiles) {
     }
 }
 
-// linfinity: a node writes its k-mer and pair files as groups of itemsPerGroup items, each removed by its node once all nodes passed its items
+// linfinity: a node writes its k-mer and pair files as groups of itemsPerGroup items, each removed by its node once all nodes passed its items;
+// its last localCount groups go to local flash and are copied to the shared file system once an earlier group is released
 struct ExchangeFileGroups {
-    // files <prefix>.<node>.<group>, index <prefix>.index.<node>
+    // files <prefix>.<node>.<group>, index <prefix>.index.<node>, the same names in localTmp
     std::string prefix;
+    std::string localTmp;
     size_t itemCount;
     size_t itemsPerGroup;
     size_t count;
-    // index line: number, group, file size, code bytes of the partitions of a pair file group, magic
+    size_t localCount;
+    // nodes on the local flash device of this node
+    size_t localNodes;
+    std::vector<std::vector<uint64_t> > localLines;
+    // index line: number, group, file size or 0 on local flash, code bytes of the partitions of a pair file group, magic
     size_t lineWords;
     // read index lines and file size of every group per node, SIZE_MAX before its line
     std::vector<size_t> nextIndexLines;
@@ -467,6 +473,8 @@ struct ExchangeFileGroups {
 
 static void initFileGroups(ExchangeFileGroups &groups, const std::string &prefix, size_t itemCount, size_t itemsPerGroup, size_t lineWords) {
     groups.prefix = prefix;
+    groups.localCount = 0;
+    groups.localNodes = 0;
     groups.itemCount = itemCount;
     groups.itemsPerGroup = itemsPerGroup;
     groups.count = (itemCount + itemsPerGroup - 1) / itemsPerGroup;
@@ -486,6 +494,52 @@ static std::string getFileGroupName(const ExchangeFileGroups &groups, size_t nod
     return groups.prefix + "." + SSTR(node) + "." + SSTR(group);
 }
 
+static bool isLocalFileGroup(const ExchangeFileGroups &groups, size_t group) {
+    return group + groups.localCount >= groups.count;
+}
+
+static std::string getLocalFileGroupName(const ExchangeFileGroups &groups, size_t group) {
+    return groups.localTmp + "/" + FileUtil::baseName(getFileGroupName(groups, MMseqsNode::rank, group));
+}
+
+// copy the bytes of a local file to a new shared file group of this node, then remove the local one
+static FILE *copyLocalFileGroup(const ExchangeFileGroups &groups, size_t group, FILE *local, size_t bytes) {
+    std::string name = getFileGroupName(groups, MMseqsNode::rank, group);
+    FILE *shared = FileUtil::openAndDelete(name.c_str(), "w");
+    char *buffer = new(std::nothrow) char[KMER_FILE_BUFFER_BYTES];
+    Util::checkAllocation(buffer, "Can not allocate buffer memory in copyLocalFileGroup");
+    for (size_t offset = 0; offset < bytes; offset += KMER_FILE_BUFFER_BYTES) {
+        size_t copyBytes = std::min(KMER_FILE_BUFFER_BYTES, bytes - offset);
+        FileUtil::preadAll(fileno(local), "local file group", buffer, copyBytes, offset);
+        FileUtil::pwriteAll(fileno(shared), name.c_str(), buffer, copyBytes, offset);
+    }
+    delete[] buffer;
+    if (fclose(local) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << getLocalFileGroupName(groups, group) << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    FileUtil::remove(getLocalFileGroupName(groups, group).c_str());
+    return shared;
+}
+
+// move the first local groups to the shared file system while the growth of a flush from flushStarts to flushEnds does not fit half the local share
+static void fitLocalFileGroups(ExchangeFileGroups &groups, const std::vector<size_t> &flushStarts, const std::vector<size_t> &flushEnds, BatchWriter &batchWriter) {
+    while (groups.localCount > 0) {
+        size_t growth = 0;
+        for (size_t i = groups.count - groups.localCount; i < groups.count; i++) {
+            growth += flushEnds[i] - flushStarts[i];
+        }
+        if (2 * growth * groups.localNodes <= FileUtil::getFreeSpace(groups.localTmp.c_str())) {
+            return;
+        }
+        batchWriter.waitWrites();
+        size_t first = groups.count - groups.localCount;
+        groups.files[first] = copyLocalFileGroup(groups, first, groups.files[first], flushStarts[first]);
+        groups.names[first] = getFileGroupName(groups, MMseqsNode::rank, first);
+        groups.localCount--;
+    }
+}
+
 // create the files of this node with their headers
 static void createFileGroups(ExchangeFileGroups &groups) {
     groups.names.resize(groups.count);
@@ -493,8 +547,8 @@ static void createFileGroups(ExchangeFileGroups &groups) {
     groups.bytes.assign(groups.count, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES);
     groups.flushRowOffsets.assign(groups.count, std::vector<size_t>());
     for (size_t i = 0; i < groups.count; i++) {
-        groups.names[i] = getFileGroupName(groups, MMseqsNode::rank, i);
-        groups.files[i] = FileUtil::openAndDelete(groups.names[i].c_str(), "w");
+        groups.names[i] = isLocalFileGroup(groups, i) ? getLocalFileGroupName(groups, i) : getFileGroupName(groups, MMseqsNode::rank, i);
+        groups.files[i] = FileUtil::openAndDelete(groups.names[i].c_str(), "w+");
         MMseqsNode::writeExchangeFileHeader(groups.files[i], groups.names[i], i);
     }
 }
@@ -514,9 +568,12 @@ static size_t closeFileGroups(ExchangeFileGroups &groups, const std::vector<size
         std::vector<uint64_t> line(groups.lineWords, 0);
         line[0] = groups.publishedLineCount++;
         line[1] = i;
-        line[2] = fileSize;
+        line[2] = isLocalFileGroup(groups, i) ? 0 : fileSize;
         std::copy(groupItemBytes.begin(), groupItemBytes.end(), line.begin() + 3);
-        MMseqsNode::publishExchangeFile(groups.files[i], groups.names[i], fileSize, groups.prefix + ".index." + SSTR(MMseqsNode::rank), line);
+        if (isLocalFileGroup(groups, i)) {
+            groups.localLines.push_back(line);
+        }
+        MMseqsNode::publishExchangeFile(groups.files[i], groups.names[i], line[2], groups.prefix + ".index." + SSTR(MMseqsNode::rank), line);
         sent += groups.bytes[i] - MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
     }
     return sent;
@@ -532,7 +589,9 @@ static size_t readFileGroupIndex(ExchangeFileGroups &groups, unsigned int node, 
         for (size_t item = line[1] * groups.itemsPerGroup; fileBytes == SIZE_MAX && itemBytes != NULL && item < getFileGroupItemEnd(groups, line[1]); item++) {
             (*itemBytes)[item] += line[3 + item - line[1] * groups.itemsPerGroup];
         }
-        fileBytes = line[2];
+        if (fileBytes == SIZE_MAX || line[2] > 0) {
+            fileBytes = line[2];
+        }
     }
     return lineCount;
 }
@@ -541,7 +600,7 @@ static size_t readFileGroupIndex(ExchangeFileGroups &groups, unsigned int node, 
 static bool waitForFileGroup(ExchangeFileGroups &groups, size_t group, bool wait) {
     Timer timer;
     for (unsigned int node = 0; node < MMseqsNode::count; node++) {
-        while (groups.nodeFileBytes[node][group] == SIZE_MAX) {
+        while (groups.nodeFileBytes[node][group] == 0 || groups.nodeFileBytes[node][group] == SIZE_MAX) {
             if (readFileGroupIndex(groups, node, wait) == 0) {
                 return false;
             }
@@ -570,9 +629,27 @@ static void openFileGroups(const ExchangeFileGroups &groups, size_t group, std::
     }
 }
 
-// remove the files of this node once the master released them
+// remove the files of this node once the master released them; copy its j-th local group once group min(j, group - 2) is released
 static void followFileGroups(ExchangeFileGroups &groups) {
-    for (size_t i = 0; i < groups.count; i++) {
+    size_t served = 0;
+    for (size_t i = 0; i <= groups.count; i++) {
+        for (; served < groups.localLines.size() && std::min(served + 2, groups.localLines[served][1]) <= i + 1; served++) {
+            std::vector<uint64_t> &line = groups.localLines[served];
+            std::string localName = getLocalFileGroupName(groups, line[1]);
+            FILE *local = FileUtil::openFileOrDie(localName.c_str(), "r", true);
+            struct stat sb;
+            if (fstat(fileno(local), &sb) != 0) {
+                Debug(Debug::ERROR) << "Cannot read " << localName << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            line[0] = groups.publishedLineCount++;
+            line[2] = sb.st_size;
+            FILE *shared = copyLocalFileGroup(groups, line[1], local, line[2]);
+            MMseqsNode::publishExchangeFile(shared, getFileGroupName(groups, MMseqsNode::rank, line[1]), line[2], groups.prefix + ".index." + SSTR(MMseqsNode::rank), line);
+        }
+        if (i == groups.count) {
+            break;
+        }
         MMseqsNode::waitForRunFile(groups.prefix + ".released." + SSTR(i));
         FileUtil::remove(getFileGroupName(groups, MMseqsNode::rank, i).c_str());
     }
@@ -1036,6 +1113,9 @@ static void writePairFileRows(const KmerExchange &exchange, PairFile &pairFile, 
     OwnPairs &ownPairs = *pairFile.ownPairs;
     const size_t ownBytesBefore = ownPairs.bytes;
     std::vector<char> isOwnSendSplit(exchange.sendSplitCount, false);
+    ExchangeFileGroups &groups = *pairFile.groups;
+    std::vector<size_t> flushStarts(groups.bytes);
+    std::vector<size_t> flushEnds(groups.bytes);
     for (size_t sendSplit = 0; sendSplit < exchange.sendSplitCount; sendSplit++) {
         size_t sendSplitBytes = 0;
         for (size_t row = sendSplitRows[sendSplit]; row < sendSplitRows[sendSplit + 1]; row++) {
@@ -1054,9 +1134,11 @@ static void writePairFileRows(const KmerExchange &exchange, PairFile &pairFile, 
             bytes = rows[row].offsets[PAIR_CODE_COUNT];
             if (isOwnSendSplit[sendSplit] == false) {
                 pairFile.partitionBytes[sendSplit * exchange.partitionsPerRange + rows[row].partition] += bytes - rows[row].offsets[0];
+                flushEnds[(sendSplit * exchange.partitionsPerRange + rows[row].partition) / groups.itemsPerGroup] += bytes - rows[row].offsets[0] + sizeof(PairFileRow);
             }
         }
     }
+    fitLocalFileGroups(groups, flushStarts, flushEnds, *pairFile.batchWriter);
     if (ownPairs.bytes > ownBytesBefore) {
         ownPairs.data = static_cast<char *>(realloc(ownPairs.data, ownPairs.bytes));
         Util::checkAllocation(ownPairs.data, "Can not allocate ownPairs memory in writePairFileRows");
@@ -1133,7 +1215,6 @@ static void writePairFileRows(const KmerExchange &exchange, PairFile &pairFile, 
             ownPairs.sendSplitRows[sendSplit].insert(ownPairs.sendSplitRows[sendSplit].end(), rows.data() + sendSplitRows[sendSplit], rows.data() + sendSplitRows[sendSplit + 1]);
         }
     }
-    ExchangeFileGroups &groups = *pairFile.groups;
     for (size_t i = 0; i < groups.count; i++) {
         size_t groupBegin = i * groups.itemsPerGroup;
         size_t groupEnd = getFileGroupItemEnd(groups, i);
@@ -1737,6 +1818,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                 ownKeySplitBytes += hashRangeBytes;
             }
             // the rows of the hash ranges follow each other in the k-mer file or in memory
+            std::vector<size_t> flushStarts(kmerGroups.bytes);
             for (size_t row = 0; row < keySplitRows.size(); row++) {
                 size_t &bytes = isOwnKeySplitHashRange[row / exchange.rowsPerHashRange] ? ownKmers.bytes : kmerGroups.bytes[row / exchange.rowsPerHashRange / MMseqsNode::count];
                 for (size_t code = 0; code <= KMER_CODE_COUNT; code++) {
@@ -1744,6 +1826,11 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                 }
                 bytes = keySplitRows[row].offsets[KMER_CODE_COUNT];
             }
+            std::vector<size_t> flushEnds(kmerGroups.bytes);
+            for (size_t hashRange = 0; hashRange < exchange.hashRangeCount; hashRange++) {
+                flushEnds[hashRange / MMseqsNode::count] += isOwnKeySplitHashRange[hashRange] ? 0 : exchange.rowsPerHashRange * sizeof(KmerFileRow);
+            }
+            fitLocalFileGroups(kmerGroups, flushStarts, flushEnds, batchWriter);
             if (ownKeySplitBytes > 0) {
                 ownKmers.data = static_cast<char *>(realloc(ownKmers.data, ownKmers.bytes));
                 Util::checkAllocation(ownKmers.data, "Can not allocate ownKmers memory in sendKmers");
@@ -2968,7 +3055,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
             EXIT(EXIT_FAILURE);
         }
     }
-    const size_t minPassLimit = std::max<size_t>(1, getPassLimit(MMseqsNode::getSmallestMemoryLimit(par.db2 + ".memory", memoryLimit, par.threads)));
+    size_t localNodes = 0;
+    const size_t minPassLimit = std::max<size_t>(1, getPassLimit(MMseqsNode::getSmallestMemoryLimit(par.db2 + ".memory", memoryLimit, par.threads, par.localTmp, &localNodes)));
     const size_t passes = std::max<size_t>(1, (totalKmerCount * receiverKmerBytes + minPassLimit - 1) / minPassLimit);
     // a pass holds about TASKS_PER_THREAD hash sub ranges per thread, so the threads take whole hash sub ranges without decoding a row to cut it
     exchange.hashSubRangesPerRange = (std::max(passes, exchange.hashRangeCount) * TASKS_PER_THREAD * par.threads + exchange.hashRangeCount - 1) / exchange.hashRangeCount;
@@ -2988,6 +3076,18 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     size_t partitionCount = exchange.sendSplitCount * exchange.partitionsPerRange;
     size_t partitionsPerGroup = (partitionCount + kmerGroups.count - 1) / kmerGroups.count;
     initFileGroups(pairGroups, par.db2 + ".pairs", partitionCount, partitionsPerGroup, 4 + partitionsPerGroup);
+    // the last groups go to local flash, k-mer and pair file groups half of the share each with half again
+    if (localNodes > 0) {
+        size_t share = FileUtil::getFreeSpace(par.localTmp.c_str()) / localNodes;
+        size_t kmerGroupBytes = std::max<size_t>(1, totalKmerCount * receiverKmerBytes / (MMseqsNode::count * kmerGroups.count));
+        size_t pairGroupBytes = std::max<size_t>(1, totalKmerCount * ((exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT) / (MMseqsNode::count * pairGroups.count));
+        kmerGroups.localCount = std::min(kmerGroups.count, share / (3 * kmerGroupBytes));
+        pairGroups.localCount = std::min(pairGroups.count, share / (3 * pairGroupBytes));
+    }
+    kmerGroups.localTmp = par.localTmp;
+    pairGroups.localTmp = par.localTmp;
+    kmerGroups.localNodes = localNodes;
+    pairGroups.localNodes = localNodes;
     std::string progress;
 
     Timer phaseTimer;
