@@ -623,7 +623,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     size_t exchangeBytes = 0;
     size_t emptySequenceCount = 0;
     size_t threadCnt = std::max((size_t) 1, std::min((size_t) par.threads, nodeInputSplits.size()));
-    size_t memoryLimit = Util::computeMemory(0);
+    size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
     size_t entryBufferBytes = static_cast<size_t>(memoryLimit * 0.95) / (2 * threadCnt);
 #pragma omp parallel num_threads(threadCnt) reduction(+:emptySequenceCount)
     {

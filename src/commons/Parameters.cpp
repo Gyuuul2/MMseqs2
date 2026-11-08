@@ -928,6 +928,7 @@ Parameters::Parameters():
     createdb.push_back(&PARAM_WRITE_LOOKUP);
     createdb.push_back(&PARAM_COMPRESS_HEADERS);
     createdb.push_back(&PARAM_ID_OFFSET);
+    createdb.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     createdb.push_back(&PARAM_THREADS);
     createdb.push_back(&PARAM_COMPRESSED);
     createdb.push_back(&PARAM_MASK_RESIDUES);
