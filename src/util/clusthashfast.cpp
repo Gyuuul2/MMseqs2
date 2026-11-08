@@ -120,6 +120,8 @@ static size_t removeSingletons(HashEntry *hashIdPairs, size_t seqCount, uint64_t
             if (hashGroupEnd - hashGroupBegin == 1) {
                 size_t bit = hashIdPairs[hashGroupBegin].id - localFirstKey;
                 __sync_fetch_and_or(&representativeBits[bit / 64], 1ull << (bit % 64));
+            } else if (writePos == hashGroupBegin) {
+                writePos = hashGroupEnd;
             } else {
                 for (size_t i = hashGroupBegin; i < hashGroupEnd; i++) {
                     hashIdPairs[writePos++] = hashIdPairs[i];
@@ -132,7 +134,9 @@ static size_t removeSingletons(HashEntry *hashIdPairs, size_t seqCount, uint64_t
     // move tasks in order so none is overwritten
     size_t candidateCount = 0;
     for (size_t task = 0; task < taskCount; task++) {
-        memmove(hashIdPairs + candidateCount, hashIdPairs + taskOffsets[task], taskCandidateCounts[task] * sizeof(HashEntry));
+        if (taskCandidateCounts[task] > 0 && candidateCount != taskOffsets[task]) {
+            memmove(hashIdPairs + candidateCount, hashIdPairs + taskOffsets[task], taskCandidateCounts[task] * sizeof(HashEntry));
+        }
         candidateCount += taskCandidateCounts[task];
     }
     return candidateCount;
@@ -237,6 +241,10 @@ static size_t fillHashRange(DBReader<DBKeyType> &reader, const BaseMatrix *subMa
 
 static void copyBatchSeqs(DBReader<DBKeyType> &reader, size_t firstKey, size_t seqCount, size_t readChunkSeqCount, const HashEntry *batchHashIdPairs, size_t batchSeqCount,
                           MemberBits *memberBits, char *batchSeqs) {
+    if (batchSeqCount == 0) {
+        reader.releaseDataPages();
+        return;
+    }
     size_t length = reader.getSeqLen(firstKey);
     memset(memberBits, 0, sizeof(MemberBits) * (seqCount / 64 + 1));
 #pragma omp parallel for
@@ -552,15 +560,17 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     while (hashGroupEnd < taskEnd && rangeHashIdPairs[hashGroupEnd].hash == rangeHashIdPairs[hashGroupBegin].hash) {
                         hashGroupEnd++;
                     }
-                    // the smallest unassigned id is the next representative
+                    // the first id is already smallest; find the smallest unassigned id after swaps
                     for (size_t i = hashGroupBegin; i < hashGroupEnd;) {
-                        std::iter_swap(rangeHashIdPairs + i, std::min_element(rangeHashIdPairs + i, rangeHashIdPairs + hashGroupEnd, HashEntry::compareById));
+                        if (i > hashGroupBegin) {
+                            std::iter_swap(rangeHashIdPairs + i, std::min_element(rangeHashIdPairs + i, rangeHashIdPairs + hashGroupEnd, HashEntry::compareById));
+                        }
                         DBLocalId repId = rangeHashIdPairs[i].id;
                         rangeHashIdPairs[i++].hash = repId;
                         if (i == hashGroupEnd) {
                             break;
                         }
-                        unsigned int repLength = reader.getSeqLen(repId);
+                        unsigned int repLength = isCopyingSeqs ? length : reader.getSeqLen(repId);
                         const char *repSeq = (batchSeqs == NULL) ? reader.getData(repId, thread) : batchSeqs + getMemberIndex(memberBits, repId - splitFirstKey) * length;
                         if (isCopyingRepSeq) {
                             repSeqCopy.assign(repSeq, repLength);
@@ -568,7 +578,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                         }
                         for (size_t j = i; j < hashGroupEnd; j++) {
                             DBLocalId memberId = rangeHashIdPairs[j].id;
-                            if (reader.getSeqLen(memberId) != repLength) {
+                            if (isCopyingSeqs == false && reader.getSeqLen(memberId) != repLength) {
                                 continue;
                             }
                             const char *memberSeq = (batchSeqs == NULL) ? reader.getData(memberId, thread) : batchSeqs + getMemberIndex(memberBits, memberId - splitFirstKey) * length;

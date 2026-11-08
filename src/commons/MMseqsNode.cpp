@@ -962,6 +962,8 @@ size_t MMseqsNode::readExchangeCompressionUnits(std::vector<ExchangeReader> &rea
 #pragma omp for schedule(dynamic, 1) nowait
         for (size_t i = 0; i < readers.size(); i++) {
             ExchangeReader &reader = readers[i];
+            // consecutive units mostly share their length
+            std::vector<std::pair<size_t, size_t> >::const_iterator lengthOffset = readerLengthOffsets[i].end();
             uint64_t compressionUnit[4];
             for (;;) {
                 fillExchangeReader(reader, sizeof(compressionUnit), bufferSize, prefix);
@@ -969,7 +971,10 @@ size_t MMseqsNode::readExchangeCompressionUnits(std::vector<ExchangeReader> &rea
                     break;
                 }
                 memcpy(compressionUnit, getReaderData(reader) + reader.bufferPos, sizeof(compressionUnit));
-                size_t offset = std::lower_bound(readerLengthOffsets[i].begin(), readerLengthOffsets[i].end(), compressionUnit[0], isLongerLength)->second + compressionUnit[1];
+                if (lengthOffset == readerLengthOffsets[i].end() || lengthOffset->first != compressionUnit[0]) {
+                    lengthOffset = std::lower_bound(readerLengthOffsets[i].begin(), readerLengthOffsets[i].end(), compressionUnit[0], isLongerLength);
+                }
+                size_t offset = lengthOffset->second + compressionUnit[1];
                 if (offset >= bufferEnd) {
                     nextOffset = std::min(nextOffset, offset);
                     break;

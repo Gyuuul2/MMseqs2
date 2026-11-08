@@ -511,13 +511,14 @@ static void flushBufferToExchange(char *buffer, size_t bufferPos, char *sortedBu
         }
     }
 
+    size_t offset;
 #pragma omp critical
     {
-        flush.offset = exchangeBytes;
+        offset = flush.offset = exchangeBytes;
         exchangeBytes += compressedPos;
-        sentFlushes.push_back(flush);
+        sentFlushes.push_back(std::move(flush));
     }
-    FileUtil::pwriteAll(fileno(exchangeFile), exchangeFileName.c_str(), buffer, compressedPos, flush.offset);
+    FileUtil::pwriteAll(fileno(exchangeFile), exchangeFileName.c_str(), buffer, compressedPos, offset);
 }
 
 static int createdbLinfinity(Parameters &par, const std::vector<std::string> &filenames, const std::string &dataFile) {

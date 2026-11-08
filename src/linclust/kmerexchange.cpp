@@ -2297,7 +2297,10 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                                 repCandidates.push_back(GroupRepCandidate(adjKey, std::pair<size_t, size_t>(row, getBits(read.codeReads[KMER_REP_CANDIDATE_CODES], memberIndexBits))));
                                             }
                                         }
-                                        SORT_SERIAL(repCandidates.begin(), repCandidates.end());
+                                        // one row lists its candidates in adjKey order
+                                        if (groupRows.size() > 1) {
+                                            SORT_SERIAL(repCandidates.begin(), repCandidates.end());
+                                        }
                                         selectGroupRepSeqs(repMembers, groupMaxRepSeqCount, [&](const auto &visit) {
                                             for (size_t repCandidate = 0; repCandidate < repCandidates.size(); repCandidate++) {
                                                 visit(repCandidates[repCandidate].first, repCandidates[repCandidate].second);
@@ -2374,7 +2377,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                                     for (size_t rep = 0; rep < repSeqIds.size(); rep++) {
                                         const DBKeyType *covered = std::lower_bound(members, membersEnd, repCoveredKeys[rep].first);
                                         const DBKeyType *coveredEnd = std::lower_bound(covered, membersEnd, repCoveredKeys[rep].second);
-                                        if (coveredEnd - covered > (std::binary_search(covered, coveredEnd, repSeqIds[rep]) ? 1 : 0)) {
+                                        if (coveredEnd - covered > 1 || (coveredEnd - covered == 1 && *covered != repSeqIds[rep])) {
                                             PairRecord record = {repSeqIds[rep], static_cast<size_t>(covered - output.targets), static_cast<size_t>(coveredEnd - covered)};
                                             output.records[region.recordPos++] = record;
                                         }
