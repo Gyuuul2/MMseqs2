@@ -48,7 +48,7 @@ typedef std::atomic<DBLocalId> ClusterAssignment;
 struct AlignmentScoring {
     BaseMatrix *subMat;
     SubstitutionMatrix::FastMatrix fastMatrix;
-    // the minimum ungapped score per column of a pair that is aligned with gaps
+    // min ungapped score per column for a gapped alignment
     float scorePerColThreshold;
     EvalueComputation evaluer;
 
@@ -75,7 +75,7 @@ extern std::atomic<size_t> swipeByteActiveLaneRowCount;
 extern std::atomic<size_t> swipeByteTotalLaneRowCount;
 extern std::atomic<size_t> swipeRerunPairCount;
 
-// per thread buffers of --align2clust-aligner-mode 1: the cluster members of a rep that go through the SWIPE lanes
+// member alignments in SWIPE lanes, per thread
 struct SwipeBatch {
     SwipeAligner aligner;
     EvalueComputation &evaluer;
@@ -108,7 +108,7 @@ struct SwipeBatch {
     }
 
     void addLanePairs(size_t count) {
-        const size_t lanes = VECSIZE_INT * 2;
+        size_t lanes = VECSIZE_INT * 2;
         lanePairCount += count;
         laneCapacity += (count + lanes - 1) / lanes * lanes;
     }
@@ -131,7 +131,7 @@ struct SwipeBatch {
         return offsets.size() - 1;
     }
 
-    // the entries in order in 16 bit lanes, as most members of a cluster are similar enough to saturate 8 bit
+    // start in 16 bit lanes, most members saturate 8 bit
     void select(size_t count) {
         targets.resize(count);
         diagonals.resize(count);
@@ -150,7 +150,7 @@ struct SwipeBatch {
     }
 };
 
-// per thread queue of the rep targets for the SWIPE extensions (--align2clust-aligner-mode 1)
+// targets for the SWIPE extensions, per thread
 struct SwipeTargets {
     SwipeExtender extender;
     EvalueComputation &evaluer;
@@ -168,7 +168,6 @@ struct SwipeTargets {
     std::vector<s_align> aligns;
     std::vector<std::string> backtraces;
     std::vector<DBKeyType> targetKeys;
-    // the letters of the targets at offsets, as a reader may return them in a buffer of the thread
     std::vector<char> seqData;
     std::vector<const char *> targetSequences;
     std::vector<int> seedQueries;
@@ -176,7 +175,6 @@ struct SwipeTargets {
     std::vector<s_align> backAligns;
     std::vector<std::string> backBacktraces;
     size_t targetPairs;
-    // the extensions of the member checks, which count apart from the targets
     bool isForMembers;
 
     SwipeTargets(const Parameters &par, BaseMatrix *subMat, EvalueComputation &evaluer, size_t maxSeqLen, bool isForMembers = false)
@@ -242,8 +240,6 @@ struct SwipeTargets {
     }
 };
 
-// a member check of a target: its members in the order they are checked, the next of them, its member alignments in member order
-// and whether no member failed so far
 struct MemberCheck {
     size_t targetId;
     short startDiagonal;
@@ -258,8 +254,6 @@ struct MemberCheck {
     bool isPassing;
 };
 
-// per thread buffers of the member checks; with SWIPE (--align2clust-aligner-mode 1) the checks of all targets of a rep can wait and go in rounds
-// that share the lanes (isMemberCheckDeferred)
 struct MemberChecks {
     std::vector<MemberCheck> checks;
     size_t checkCount;
@@ -267,7 +261,6 @@ struct MemberChecks {
     std::vector<size_t> gappedMemberBatchIndices;
     SwipeBatch *swipeMembers;
     bool isMemberCheckDeferred;
-    // the gapped members of a round of alignMemberChecksSwipe and the ones its extensions accepted
     SwipeTargets *swipeTargets;
     std::vector<size_t> extendedMemberChecks;
     std::vector<size_t> gappedMembers;
@@ -306,12 +299,12 @@ bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockA
 bool doSwipeExtensionsPass(const Parameters &par, SwipeTargets &swipeTargets, size_t i);
 int align2clustLinfinity(Parameters &par);
 
-// the SWIPE extensions of the queued targets (--align2clust-aligner-mode 1), skipping the ones assigned since
+// skip the targets assigned since they were queued
 template <typename Assigned>
 void alignTargetsSwipe(const Parameters &par, SwipeTargets &swipeTargets, const Assigned &isAssigned, std::vector<ClusterPair> &pairs) {
-    const int32_t xDrop = (MIN_SIZE * par.gapExtend.values.aminoacid() + par.gapOpen.values.aminoacid());
-    // twice one past the longest gap within the X-drop, which is MIN_SIZE + 1 long
-    const int bandSide = 2 * (MIN_SIZE + 2);
+    int32_t xDrop = (MIN_SIZE * par.gapExtend.values.aminoacid() + par.gapOpen.values.aminoacid());
+    // twice one past the longest gap within the X-drop
+    int bandSide = 2 * (MIN_SIZE + 2);
     size_t count = 0;
     for (size_t i = 0; i < swipeTargets.targetKeys.size(); i++) {
         if (isAssigned(swipeTargets.repKeys[swipeTargets.queryIds[i]]) || isAssigned(swipeTargets.targetKeys[i])) {
@@ -338,7 +331,7 @@ void alignTargetsSwipe(const Parameters &par, SwipeTargets &swipeTargets, const 
     }
     swipeTargets.extender.extendBanded(count, swipeTargets.queryIds.data(), swipeTargets.targets.data(), swipeTargets.lengths.data(), swipeTargets.seedQueries.data(), swipeTargets.seedTargets.data(), false, xDrop,
                                bandSide, swipeTargets.aligns.data(), swipeTargets.backtraces.data());
-    // the targets whose forward extension covers enough move to the front
+    // keep the targets whose forward extension covers enough
     size_t passed = 0;
     for (size_t i = 0; i < count; i++) {
         const s_align &forward = swipeTargets.aligns[i];
@@ -365,13 +358,13 @@ void alignTargetsSwipe(const Parameters &par, SwipeTargets &swipeTargets, const 
                                bandSide, swipeTargets.backAligns.data(), swipeTargets.backBacktraces.data());
     for (size_t i = 0; i < count; i++) {
         if (swipeTargets.backAligns[i].score1 > 0 && doSwipeExtensionsPass(par, swipeTargets, i)) {
-            const ClusterPair pair = { swipeTargets.repKeys[swipeTargets.queryIds[i]], swipeTargets.targetKeys[i] };
+            ClusterPair pair = { swipeTargets.repKeys[swipeTargets.queryIds[i]], swipeTargets.targetKeys[i] };
             pairs.push_back(pair);
         }
     }
 }
 
-// the member checks of a batch of reps in shared rounds: the gapped members of all reps share the extension lanes, the ones no extension accepted go through alignMembersSwipe per rep
+// the gapped members of all reps share the extension lanes
 template <typename MapRep>
 void alignMemberChecksSwipe(const Parameters &par, BlockAligner &blockAligner, Matcher &matcher, Sequence &query, Sequence &element, DBReader<DBKeyType> *cluSeqDbr,
                             unsigned int swMode, unsigned int threadIdx, MemberChecks &memberChecks, const std::vector<size_t> &repMemberCheckOffsets,
@@ -413,14 +406,14 @@ void alignMemberChecksSwipe(const Parameters &par, BlockAligner &blockAligner, M
             swipeMembers.clear();
             memberChecks.gappedMemberChecks.clear();
             for (; gapped < memberChecks.extendedMemberChecks.size() && memberChecks.extendedMemberChecks[gapped] < repMemberCheckOffsets[rep + 1]; gapped++) {
-                const size_t i = memberChecks.gappedMembers[gapped];
+                size_t i = memberChecks.gappedMembers[gapped];
                 if (i == SIZE_MAX) {
                     continue;
                 }
-                const size_t g = memberChecks.extendedMemberChecks[gapped];
+                size_t g = memberChecks.extendedMemberChecks[gapped];
                 const MemberCheck &check = memberChecks.checks[g];
-                const DBKeyType elementKey = check.memberKeys[i];
-                const size_t elementId = cluSeqDbr->getId(elementKey);
+                DBKeyType elementKey = check.memberKeys[i];
+                size_t elementId = cluSeqDbr->getId(elementKey);
                 element.mapSequence(elementId, elementKey, check.memberData.empty() ? cluSeqDbr->getData(elementId, threadIdx) : check.memberData[i], cluSeqDbr->getSeqLen(elementId));
                 swipeMembers.add(element);
                 swipeMembers.gapped.push_back(i);
