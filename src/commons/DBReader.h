@@ -229,8 +229,8 @@ public:
 
     size_t getMaxSeqLen(){
             return (Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_HMM_PROFILE ) ) ?
-                    (std::max<size_t>(maxSeqLen, 1)) / Sequence::PROFILE_READIN_SIZE :
-                    (std::max<size_t>(maxSeqLen, 2));
+                    (std::max(maxSeqLen, (size_t) 1)) / Sequence::PROFILE_READIN_SIZE :
+                    (std::max(maxSeqLen, (size_t) 2));
     }
 
     T getDbKey(size_t id);
@@ -253,10 +253,10 @@ public:
 
         if(Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_HMM_PROFILE ) ){
             // -1 null byte
-            return (std::max<size_t>(length, 1) - 1) / Sequence::PROFILE_READIN_SIZE;
+            return (std::max(length, (size_t) 1) - 1) / Sequence::PROFILE_READIN_SIZE;
         }else{
             // -2 newline and null byte
-            return (std::max<size_t>(length, 2) - 2);
+            return (std::max(length, (size_t) 2) - 2);
         }
     }
 
@@ -270,8 +270,8 @@ public:
             return index[local2id[id]].length;
         }else if (index2dbfile != NULL) {
             if (entryOffsetsFileNames.empty() == false) {
-                const size_t entryOffsetsPos = findLoadedEntryOffsetsPos(id);
-                return loadedBuffer.entryOffsets[entryOffsetsPos + 1] - loadedBuffer.entryOffsets[entryOffsetsPos];
+                size_t pos = findLoadedEntryOffsetsPos(id);
+                return loadedBuffer.entryOffsets[pos + 1] - loadedBuffer.entryOffsets[pos];
             }
             return index[findIdRange(id)].length;
         }else{
@@ -283,42 +283,34 @@ public:
 
     void remapData();
 
-    // linfinity: reads keys [keyBegin, keyEnd) into memory for getData
+    // linfinity sequences
     void loadData(size_t keyBegin, size_t keyEnd);
     void prefetchData(size_t keyBegin, size_t keyEnd);
-    // linfinity sequences: loadData that returns at once and reads about readBytes at a time;
-    // waitForLoadedData waits for the read in flight, starts the next one and returns the end of the keys read so far
     void startLoadData(size_t keyBegin, size_t keyEnd, size_t readBytes);
+    // returns the end of the keys read so far
     size_t waitForLoadedData();
-    // the bytes of the loaded and the prefetch buffer once keys [keyBegin, keyEnd) are prefetched
     size_t getPrefetchBufferBytes(size_t keyBegin, size_t keyEnd);
-    // linfinity sequences: reads the ascending keys, entries less than a page apart in one request, through the buffered fds
     void loadData(const std::vector<DBKeyType> &keys);
-    // linfinity sequences without a block cache: loadData of the same keys takes this read
     void prefetchData(const std::vector<DBKeyType> &keys);
-    // linfinity sequences: loads by keys read the whole block of a key while the blocks fit cacheBytes; blocks below the loaded and the requested keys are freed when new blocks need their room
     void setBlockCacheBytes(size_t cacheBytes);
-    // the block of setBlockCacheBytes that holds key
     size_t getKeyBlock(size_t key) const;
     const std::vector<size_t> &getBlockKeyOffsets() const { return blockKeyOffsets; }
     size_t getBlockReadBytes() { return blockReadBytes; }
     size_t getKeyReadBytes() { return keyReadBytes; }
     size_t getLoadBufferBytes(size_t keyBegin, size_t keyEnd);
-    // linfinity headers: the size of the names of keys [keyBegin, keyEnd)
+
+    // linfinity headers
     size_t getNamesBytes(size_t keyBegin, size_t keyEnd);
-    // linfinity cluster databases: the first entry that starts at offset or later, the entry count after the last
+
+    // linfinity cluster databases
     size_t findEntryByOffset(size_t offset) {
         return findEntryByIndexColumn(1, offset);
     }
-    // the first entry of [first, last) whose key is key or larger, otherwise last; by default the entry count after the last
     size_t findEntryByKey(size_t key, size_t first = 0, size_t last = SIZE_MAX) {
         return findEntryByIndexColumn(0, key, first, last);
     }
-    // linfinity cluster databases: the key, offset and length of entry id, read from the index
     Index getIndexEntry(size_t id);
-    // linfinity cluster databases: reads bytes at offset of the data file to destination
     void readData(size_t offset, size_t bytes, char *destination);
-    // linfinity cluster databases: the data file fd without O_DIRECT, for preads of any thread
     int getBufferedFd() const { return bufferedFds[0]; }
     char *getDataFromLoadedBuffer(size_t key);
 
@@ -563,16 +555,14 @@ public:
     void releaseDataPages();
     void decomposeDomainByAminoAcid(size_t worldRank, size_t worldSize, size_t *startEntry, size_t *numEntries);
 
-    // linfinity: data file f holds the keys [offsets[f], offsets[f + 1]), the data files follow in key order
+    // linfinity
     std::vector<size_t> getFileKeyOffsets(size_t fileCount);
-    // linfinity: node n holds the keys [offsets[n], offsets[n + 1]), as many for every node, the entries of node n of a cluster database are those of its representatives
     std::vector<size_t> getEvenNodeKeyOffsets(size_t nodeCount);
-    // linfinity: split s holds the keys [offsets[s], offsets[s + 1]) of [keyBegin, keyEnd) whose entries, keyBytes more per key, fit splitBytes, at least one key
     std::vector<size_t> getSplitKeyOffsets(size_t keyBegin, size_t keyEnd, size_t splitBytes, size_t keyBytes);
     size_t findIdRange(size_t id);
-    // linfinity: the sequence length of id, whose range is searched from range on, or from the start if range is SIZE_MAX; ids in key order walk the ranges once
+    // range SIZE_MAX searches from the start
     size_t getSeqLenFromRange(size_t &range, size_t id);
-    // linfinity: the representatives of a range, the sixth column of the index of a clusthashfast subset, otherwise all its keys
+    // sixth index column of a clusthashfast subset
     size_t getRangeRepresentativeCount(size_t range) const {
         return rangeRepresentativeCounts[range];
     }
@@ -580,11 +570,11 @@ public:
 private:
     void checkClosed() const;
     size_t findLoadedEntryOffsetsPos(size_t id);
-    // the first (key, offset) pair in [first, last) of the entries and the end pair whose pair[column] is value or larger, otherwise last
     size_t findEntryByIndexColumn(size_t column, size_t value, size_t first = 0, size_t last = SIZE_MAX);
-    size_t planReadRequests(size_t keyBegin, size_t keyEnd, bool isReadingOffsets, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &entryOffsets, std::vector<size_t> &keys, std::vector<BatchReader::ReadRequest> &compressedReadRequests, std::vector<size_t> &requestFirstKeys);
+    size_t planReadRequests(size_t keyBegin, size_t keyEnd, bool isReadingOffsets, std::vector<BatchReader::ReadRequest> &readRequests,
+                            std::vector<size_t> &entryOffsets, std::vector<size_t> &keys,
+                            std::vector<BatchReader::ReadRequest> &compressedReadRequests, std::vector<size_t> &requestFirstKeys);
     size_t planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys);
-    // a load of keys [keyBegin, keyEnd), only the given keys of them if keys is not NULL
     void loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
     void decompressLoadedBuffer();
 
@@ -637,18 +627,18 @@ private:
     DBLocalId * id2local;
     DBLocalId * local2id;
 
-    // linfinity: range i holds keys index[i].id .. index[i + 1].id - 1 of one length, from index[i].offset in <db>.<index2dbfile[i]>
+    // linfinity: data file of each length range
     unsigned int * index2dbfile;
-    // headers: <db>_h.index.<file> holds uint64 name starts in <db>_h.<file> and its size, clusters: the binary index of hasBinaryIndex; their fds follow the data fds
+    // header offsets or binary cluster index, their fds follow the data fds
     std::vector<std::string> entryOffsetsFileNames;
     std::vector<size_t> rangeRepresentativeCounts;
-    // cluster or prefilter database of a node: <clu>.index.<node> holds uint64 (key, offset) per entry, then (DB_KEY_INVALID, data size); it is read like the header offsets
+    // uint64 (key, offset) pairs in <clu>.index.<node>
     bool hasBinaryIndex;
-    // zstd seekable headers: compressed start of each frame of <db>_h.<file> and its end, frames of uncompressedFrameBytes[file] decompressed bytes
+    // zstd seekable headers
     std::vector<std::vector<size_t> > frameOffsets;
     std::vector<size_t> uncompressedFrameBytes;
     std::vector<int> dataFds;
-    // the same files without O_DIRECT for the scattered reads of a load by keys and of findEntryByIndexColumn, which the page cache keeps for later windows
+    // without O_DIRECT for key loads and index searches
     std::vector<int> bufferedFds;
     BatchReader * batchReader;
     struct EntryReadBuffer {
@@ -660,28 +650,25 @@ private:
         std::vector<size_t> entryOffsets;
         std::vector<size_t> keys;
         std::vector<BatchReader::ReadRequest> compressedReadRequests;
-        // the first key of every read request, they follow in key order
         std::vector<size_t> requestFirstKeys;
-        // a load of a key list, read through bufferedFds
         bool isKeyLoad;
-        // read by prefetchData and not yet taken by loadData
         bool isPrefetched;
-        // the blocks of the last blocks.size() read requests, which join the cache once read
+        // blocks of the last read requests
         std::vector<size_t> blocks;
     };
     EntryReadBuffer loadedBuffer, prefetchBuffer;
-    // the keys of prefetchBuffer if it is a load of keys
     std::vector<DBKeyType> prefetchedKeys;
-    // startLoadData: the keys below readStepKeyEnd are read or in flight, the read steps are of about readStepBytes
+
+    // startLoadData
     size_t readStepKeyEnd;
     size_t readStepBytes;
+
+    // block cache
     void cacheBlocks(EntryReadBuffer &buffer);
     void freeBlocks(size_t keyEnd, size_t neededBytes);
-    // linfinity sequences: block b holds the keys [blockKeyOffsets[b], blockKeyOffsets[b + 1]) whose entries start in the same MAX_READ_REQUEST_BYTES bytes of a data file
     std::vector<size_t> blockKeyOffsets;
     std::map<size_t, BatchReader::ReadRequest> cachedBlocks;
     size_t blockCacheBytes;
-    // the bytes of the cached blocks and of those being read
     size_t cachedBlockBytes;
     size_t blockReadBytes;
     size_t keyReadBytes;

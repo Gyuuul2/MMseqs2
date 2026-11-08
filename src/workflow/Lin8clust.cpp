@@ -36,19 +36,19 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     par.filenames.pop_back();
     par.filenames.push_back(tmpDir);
 
-    const int dbType = FileUtil::parseDbType(par.db1.c_str());
+    int dbType = FileUtil::parseDbType(par.db1.c_str());
     if ((DBReader<DBKeyType>::getExtendedDbtype(dbType) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {
         Debug(Debug::ERROR) << "lin8clust clusters linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ") only. "
                             << "Use createdb --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " or easy-lin8clust.\n";
         EXIT(EXIT_FAILURE);
     }
-    // align2clust leaves out the singletons of a subset with representative bits, so lin8clust takes whole databases only
+    // align2clust leaves out the singletons of subsets
     if (FileUtil::fileExists((par.db1 + ".bits.0").c_str())) {
         Debug(Debug::ERROR) << "lin8clust clusters whole linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << "), not subsets such as clusthashfast or createsubdb output\n";
         EXIT(EXIT_FAILURE);
     }
 
-    const bool nonSymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
+    bool nonSymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
     if (par.PARAM_CLUSTER_MODE.wasSet == false) {
         if (nonSymetric) {
             par.clusteringMode = Parameters::GREEDY_MEM;
@@ -69,14 +69,17 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     par.includeCountTable = false;
     par.countTableIteration = 0;
     if (par.PARAM_INCLUDE_ADJACENCY.wasSet == false && par.PARAM_NUM_ADJACENCY.wasSet == false) {
-        par.adjIteration = nonSymetric ? Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY
-                                       : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
+        if (nonSymetric) {
+            par.adjIteration = Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY;
+        } else {
+            par.adjIteration = Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
+        }
     }
 
-    // punchHole warns here, before the run, if the exchange files cannot be freed while they are read
-    const std::string punchFile = tmpDir + "/punch_hole_check";
+    // let punchHole warn before the run if it is not supported
+    std::string punchFile = tmpDir + "/punch_hole_check";
     FILE *punchHandle = FileUtil::openAndDelete(punchFile.c_str(), "w");
-    const std::vector<char> page(Util::getPageSize(), 0);
+    std::vector<char> page(Util::getPageSize(), 0);
     if (fwrite(page.data(), 1, page.size(), punchHandle) != page.size() || fflush(punchHandle) != 0) {
         Debug(Debug::ERROR) << "Cannot write " << punchFile << "\n";
         EXIT(EXIT_FAILURE);
@@ -94,7 +97,7 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     cmd.addVariable("MERGECLU_PAR", par.createParameterString(par.mergeclusters).c_str());
     cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
     cmd.addVariable("LINCLUST_ITERATIONS", SSTR(par.linclustIterations).c_str());
-    // the second iteration matches the representatives with spaced k-mers, a tenth as many per sequence (see linclust)
+    // second iteration: spaced k-mers, a tenth per sequence (see linclust)
     if (par.linclustIterations > 1) {
         par.spacedKmer = true;
         par.kmersPerSequenceScale = 0.1;

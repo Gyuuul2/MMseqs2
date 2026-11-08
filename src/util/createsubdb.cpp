@@ -13,19 +13,18 @@ int createsubdb(int argc, const char **argv, const Command& command) {
     Parameters& par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
-    // linfinity: the entry keys of the cluster database <subset>.<node> become the representative bits of the data file of a node and the sixth index column
+    // linfinity: entry keys become representative bits
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db2.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
         DBReader<DBKeyType> reader(par.db2.c_str(), par.db2Index.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
         reader.open(DBReader<DBKeyType>::NOSORT);
-        const std::vector<size_t> fileKeyOffsets = reader.getFileKeyOffsets(MMseqsNode::count);
-        const std::vector<size_t> cluKeyOffsets = MMseqsNode::getClusterKeyOffsets(par.db3 + ".cluster_key_offsets", par.db1, reader.getSize());
-        const size_t firstKey = fileKeyOffsets[MMseqsNode::rank];
-        const size_t keyCount = fileKeyOffsets[MMseqsNode::rank + 1] - firstKey;
+        std::vector<size_t> fileKeyOffsets = reader.getFileKeyOffsets(MMseqsNode::count);
+        std::vector<size_t> cluKeyOffsets = MMseqsNode::getClusterKeyOffsets(par.db3 + ".cluster_key_offsets", par.db1, reader.getSize());
+        size_t firstKey = fileKeyOffsets[MMseqsNode::rank];
+        size_t keyCount = fileKeyOffsets[MMseqsNode::rank + 1] - firstKey;
         std::vector<uint64_t> bits((keyCount + 63) / 64, 0);
         std::vector<DBKeyType> repKeys;
-        // the keys go in splits whose representative keys fit into memory
-        const size_t splitKeys = std::max<size_t>(1, Util::computeMemory(par.splitMemoryLimit) / 16 / sizeof(DBKeyType));
+        size_t splitKeys = std::max((size_t) 1, Util::computeMemory(par.splitMemoryLimit) / 16 / sizeof(DBKeyType));
         for (size_t splitBegin = firstKey; splitBegin < firstKey + keyCount; splitBegin += splitKeys) {
             MMseqsNode::readClusterKeys(par.db1, cluKeyOffsets, splitBegin, std::min(firstKey + keyCount, splitBegin + splitKeys), repKeys);
             for (size_t i = 0; i < repKeys.size(); i++) {
@@ -33,8 +32,9 @@ int createsubdb(int argc, const char **argv, const Command& command) {
             }
         }
         MMseqsNode::writeRepresentativeBits(par.db3, reader, bits.data(), firstKey, keyCount);
+
         if (MMseqsNode::isMaster()) {
-            // a linfinity subset only feeds the next pipeline steps, which read no headers, lookup or source
+            // the next steps read no headers, lookup or source
             DBReader<DBKeyType>::softlinkDb(par.db2, par.db3, DBFiles::DATA);
             DBWriter::writeDbtypeFile(par.db3.c_str(), reader.getDbtype(), reader.isCompressed());
         }

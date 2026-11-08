@@ -190,7 +190,8 @@ namespace KSEQZSTD {
                 Debug(Debug::ERROR) << "Cannot read truncated zstd input\n";
                 EXIT(EXIT_FAILURE);
             }
-            if (file->decompressedEndOffset == SIZE_MAX && file->compressedOffset >= file->compressedEndOffset && file->input.pos == file->input.size && file->readHintBytes == 0) {
+            if (file->decompressedEndOffset == SIZE_MAX && file->compressedOffset >= file->compressedEndOffset
+                && file->input.pos == file->input.size && file->readHintBytes == 0) {
                 file->decompressedEndOffset = file->decompressedOffset + output.pos;
             }
         }
@@ -200,14 +201,14 @@ namespace KSEQZSTD {
 
     KSEQ_INIT(KSeqZstd::ZstdFile*, zstdread)
 
-    // the first pzstd frame that starts from pos to limit, a skippable frame { ZSTD_MAGIC_SKIPPABLE_START, 4, size } then a zstd frame of size bytes, followed by the next such frame or the file end; limit if none
+    // find the first pzstd frame in [pos, limit)
     static size_t findFrame(FILE *file, const char *fileName, size_t pos, size_t limit) {
-        const size_t fileBytes = FileUtil::getFileSize(fileName);
+        size_t fileBytes = FileUtil::getFileSize(fileName);
         limit = std::min(limit, fileBytes);
-        const size_t scanBytes = 1024 * 1024;
+        size_t scanBytes = 1024 * 1024;
         std::vector<char> buffer(scanBytes + 4 * sizeof(uint32_t));
         for (; pos < limit; pos += scanBytes) {
-            const size_t bytes = std::min(buffer.size(), fileBytes - pos);
+            size_t bytes = std::min(buffer.size(), fileBytes - pos);
             FileUtil::preadAll(fileno(file), fileName, buffer.data(), bytes, pos);
             for (size_t i = 0; i < scanBytes && pos + i < limit && i + 4 * sizeof(uint32_t) <= bytes; i++) {
                 uint32_t header[4];
@@ -215,10 +216,10 @@ namespace KSEQZSTD {
                 if (header[0] != ZSTD_MAGIC_SKIPPABLE_START || header[1] != 4 || header[3] != ZSTD_MAGICNUMBER) {
                     continue;
                 }
-                const size_t next = pos + i + 3 * sizeof(uint32_t) + header[2];
+                size_t next = pos + i + 3 * sizeof(uint32_t) + header[2];
                 uint32_t nextHeader[2] = {0, 0};
                 if (next + sizeof(nextHeader) <= fileBytes) {
-                    FileUtil::preadAll(fileno(file), fileName, reinterpret_cast<char *>(nextHeader), sizeof(nextHeader), next);
+                    FileUtil::preadAll(fileno(file), fileName, (char *) nextHeader, sizeof(nextHeader), next);
                 }
                 if (next == fileBytes || (nextHeader[0] == ZSTD_MAGIC_SKIPPABLE_START && nextHeader[1] == 4)) {
                     return pos + i;
@@ -231,7 +232,7 @@ namespace KSEQZSTD {
 
 KSeqZstd::KSeqZstd(const char* fileName, size_t start, size_t end) {
     file.file = FileUtil::openFileOrDie(fileName, "r", true);
-    // an input split of a pzstd file holds the frames that start from its start to its end, so a split without one is empty and its scan stops at its end
+    // a split holds the pzstd frames that start in it
     if (start > 0) {
         start = KSEQZSTD::findFrame(file.file, fileName, start, end);
     }
@@ -299,7 +300,8 @@ KSeqWrapper* KSeqFactory(const char* file, size_t start, size_t end) {
         return kseq;
     }
 
-    if(Util::endsWith(".gz", file) == false && Util::endsWith(".bz2", file) == false && Util::endsWith(".zst", file) == false) {
+    if(Util::endsWith(".gz", file) == false && Util::endsWith(".bz2", file) == false
+       && Util::endsWith(".zst", file) == false) {
         kseq = new KSeqFile(file, start, end);
         return kseq;
     }

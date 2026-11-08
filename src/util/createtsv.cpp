@@ -24,15 +24,15 @@ struct MemberAccession {
     unsigned int accessionLength;
 
     static bool compareByRep(const MemberAccession &first, const MemberAccession &second) {
-        const ClusterPair firstPair = { first.repKey, first.memberKey };
-        const ClusterPair secondPair = { second.repKey, second.memberKey };
+        ClusterPair firstPair = { first.repKey, first.memberKey };
+        ClusterPair secondPair = { second.repKey, second.memberKey };
         return ClusterPair::compareByRep(firstPair, secondPair);
     }
 };
 
 static const size_t MEMBER_ACCESSION_HEADER_BYTES = 2 * sizeof(DBKeyType) + sizeof(unsigned int);
 
-// the size of the exchanged member accession at record, 0 if bytes do not hold all of it
+// 0 if the record is incomplete
 static size_t getMemberAccessionBytes(const char *record, size_t bytes) {
     if (bytes < MEMBER_ACCESSION_HEADER_BYTES) {
         return 0;
@@ -42,7 +42,7 @@ static size_t getMemberAccessionBytes(const char *record, size_t bytes) {
     return (bytes >= MEMBER_ACCESSION_HEADER_BYTES + accessionLength) ? MEMBER_ACCESSION_HEADER_BYTES + accessionLength : 0;
 }
 
-// grows like std::vector::resize without zero-filling, so the threads touch the new elements first
+// no zero-fill, the threads touch new elements first
 template <typename T>
 static void growBuffer(T *&buffer, size_t &capacity, size_t size) {
     if (size > capacity) {
@@ -52,17 +52,21 @@ static void growBuffer(T *&buffer, size_t &capacity, size_t size) {
     }
 }
 
-// sorts a flush, appends it to file and adds its offsets; keeps the records for this node in memory for ownExchange if they fit ownBytesLimit and returns their bytes
+// file offset, own records are not written
+static size_t getFileOffset(size_t offset, size_t ownBegin, size_t ownEnd) {
+    return offset - (std::min(offset, ownEnd) - std::min(offset, ownBegin));
+}
+
 static size_t writeMemberAccessions(MemberAccession *memberAccessions, size_t accessionCount, const char *accessions, const std::vector<size_t> &repKeyOffsets,
                                     FILE *file, const std::string &fileName, std::string &indexData, size_t &writtenBytes, const std::string &ownExchange, size_t ownBytesLimit) {
     SORT_PARALLEL(memberAccessions, memberAccessions + accessionCount, MemberAccession::compareByRep);
-    // the first member accession of every node, then the end
     std::vector<size_t> nodeAccessionOffsets(MMseqsNode::count + 1, accessionCount);
     for (size_t node = 0; node < MMseqsNode::count; node++) {
-        const MemberAccession nodeFirst = { static_cast<DBKeyType>(repKeyOffsets[node]), static_cast<DBKeyType>(repKeyOffsets[node]), 0, 0 };
+        MemberAccession nodeFirst = { static_cast<DBKeyType>(repKeyOffsets[node]), static_cast<DBKeyType>(repKeyOffsets[node]), 0, 0 };
         nodeAccessionOffsets[node] = std::lower_bound(memberAccessions, memberAccessions + accessionCount, nodeFirst, MemberAccession::compareByRep) - memberAccessions;
     }
-    const int threads = Parameters::getInstance().threads;
+
+    int threads = Parameters::getInstance().threads;
     std::vector<size_t> threadOffsets(threads + 1, 0);
 #pragma omp parallel for schedule(static)
     for (int thread = 0; thread < threads; thread++) {
@@ -73,13 +77,14 @@ static size_t writeMemberAccessions(MemberAccession *memberAccessions, size_t ac
     for (int thread = 0; thread < threads; thread++) {
         threadOffsets[thread + 1] += threadOffsets[thread];
     }
-    const size_t writeBufferBytes = threadOffsets[threads];
+
+    size_t writeBufferBytes = threadOffsets[threads];
     char *writeBuffer = static_cast<char *>(malloc(writeBufferBytes));
     Util::checkAllocation(writeBuffer, "Can not allocate writeBuffer memory in createtsv");
     std::vector<size_t> nodeOffsets(MMseqsNode::count + 1, writeBufferBytes);
 #pragma omp parallel for schedule(static)
     for (int thread = 0; thread < threads; thread++) {
-        const size_t begin = accessionCount * thread / threads;
+        size_t begin = accessionCount * thread / threads;
         size_t node = std::lower_bound(nodeAccessionOffsets.begin(), nodeAccessionOffsets.end(), begin) - nodeAccessionOffsets.begin();
         size_t bufferPos = threadOffsets[thread];
         for (size_t i = begin; i < accessionCount * (thread + 1) / threads; i++) {
@@ -94,29 +99,27 @@ static size_t writeMemberAccessions(MemberAccession *memberAccessions, size_t ac
             bufferPos += MEMBER_ACCESSION_HEADER_BYTES + memberAccession.accessionLength;
         }
     }
-    const size_t ownBegin = nodeOffsets[MMseqsNode::rank];
-    const size_t ownEnd = (nodeOffsets[MMseqsNode::rank + 1] - ownBegin <= ownBytesLimit) ? nodeOffsets[MMseqsNode::rank + 1] : ownBegin;
-    // the position in the file of a position in the write buffer, whose records for this node stay in memory
-    const auto getFileOffset = [&](size_t offset) {
-        return offset - (std::min(offset, ownEnd) - std::min(offset, ownBegin));
-    };
+
+    size_t ownBegin = nodeOffsets[MMseqsNode::rank];
+    size_t ownEnd = (nodeOffsets[MMseqsNode::rank + 1] - ownBegin <= ownBytesLimit) ? nodeOffsets[MMseqsNode::rank + 1] : ownBegin;
 #pragma omp parallel for schedule(static)
     for (int thread = 0; thread < threads; thread++) {
-        const size_t begin = threadOffsets[thread];
-        const size_t end = threadOffsets[thread + 1];
-        const size_t beforeOwn = std::max(begin, std::min(end, ownBegin));
-        const size_t afterOwn = std::min(end, std::max(begin, ownEnd));
+        size_t begin = threadOffsets[thread];
+        size_t end = threadOffsets[thread + 1];
+        size_t beforeOwn = std::max(begin, std::min(end, ownBegin));
+        size_t afterOwn = std::min(end, std::max(begin, ownEnd));
         FileUtil::pwriteAll(fileno(file), fileName.c_str(), writeBuffer + begin, beforeOwn - begin, writtenBytes + begin);
-        FileUtil::pwriteAll(fileno(file), fileName.c_str(), writeBuffer + afterOwn, end - afterOwn, writtenBytes + getFileOffset(afterOwn));
+        FileUtil::pwriteAll(fileno(file), fileName.c_str(), writeBuffer + afterOwn, end - afterOwn, writtenBytes + getFileOffset(afterOwn, ownBegin, ownEnd));
     }
-    // with fewer nodes than threads the flush is indexed in an index line per group of threads, so the receiving node scans the records on all threads
-    const int flushIndexLineCount = std::max(1, threads / static_cast<int>(MMseqsNode::count));
-    std::vector<char *> ownRecords(flushIndexLineCount, NULL);
-    std::vector<size_t> ownRecordBytes(flushIndexLineCount, 0);
+
+    // index lines per thread group, so receivers scan on all threads
+    int indexLines = std::max(1, threads / static_cast<int>(MMseqsNode::count));
+    std::vector<char *> ownRecords(indexLines, NULL);
+    std::vector<size_t> ownRecordBytes(indexLines, 0);
 #pragma omp parallel for schedule(dynamic, 1)
-    for (int indexLine = 0; indexLine < flushIndexLineCount; indexLine++) {
-        const size_t indexLineBegin = std::max(ownBegin, threadOffsets[threads * indexLine / flushIndexLineCount]);
-        const size_t indexLineEnd = std::min(ownEnd, threadOffsets[threads * (indexLine + 1) / flushIndexLineCount]);
+    for (int indexLine = 0; indexLine < indexLines; indexLine++) {
+        size_t indexLineBegin = std::max(ownBegin, threadOffsets[threads * indexLine / indexLines]);
+        size_t indexLineEnd = std::min(ownEnd, threadOffsets[threads * (indexLine + 1) / indexLines]);
         if (indexLineBegin < indexLineEnd) {
             ownRecordBytes[indexLine] = indexLineEnd - indexLineBegin;
             ownRecords[indexLine] = static_cast<char *>(malloc(ownRecordBytes[indexLine]));
@@ -124,19 +127,20 @@ static size_t writeMemberAccessions(MemberAccession *memberAccessions, size_t ac
             memcpy(ownRecords[indexLine], writeBuffer + indexLineBegin, ownRecordBytes[indexLine]);
         }
     }
-    for (int indexLine = 0; indexLine < flushIndexLineCount; indexLine++) {
+    for (int indexLine = 0; indexLine < indexLines; indexLine++) {
         if (ownRecordBytes[indexLine] > 0) {
             MMseqsNode::keepOwnExchangeRecords(ownExchange, ownRecords[indexLine], ownRecordBytes[indexLine]);
         }
     }
+
     Util::releasePages(writeBuffer, writeBufferBytes);
     free(writeBuffer);
     std::vector<size_t> threadNodeOffsets(MMseqsNode::count + 1);
-    for (int indexLine = 0; indexLine < flushIndexLineCount; indexLine++) {
-        const size_t indexLineBegin = getFileOffset(threadOffsets[threads * indexLine / flushIndexLineCount]);
-        const size_t indexLineEnd = getFileOffset(threadOffsets[threads * (indexLine + 1) / flushIndexLineCount]);
+    for (int indexLine = 0; indexLine < indexLines; indexLine++) {
+        size_t indexLineBegin = getFileOffset(threadOffsets[threads * indexLine / indexLines], ownBegin, ownEnd);
+        size_t indexLineEnd = getFileOffset(threadOffsets[threads * (indexLine + 1) / indexLines], ownBegin, ownEnd);
         for (size_t node = 0; node <= MMseqsNode::count; node++) {
-            threadNodeOffsets[node] = std::min(std::max(getFileOffset(nodeOffsets[node]), indexLineBegin), indexLineEnd) - indexLineBegin;
+            threadNodeOffsets[node] = std::min(std::max(getFileOffset(nodeOffsets[node], ownBegin, ownEnd), indexLineBegin), indexLineEnd) - indexLineBegin;
         }
         MMseqsNode::addExchangeFlush(indexData, writtenBytes, threadNodeOffsets);
     }
@@ -149,15 +153,15 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
     std::vector<FILE *> memberFiles;
     MMseqsNode::openExchange(sortedByMemberIndex, sortedByMember, memberReaders, memberFiles);
 
-    const size_t localFirstKey = nodeKeyOffsets[MMseqsNode::rank];
-    const size_t localEndKey = nodeKeyOffsets[MMseqsNode::rank + 1];
-    // a key also holds its name offset in the read buffer and in the split
-    const size_t keyBytes = headers.getNamesBytes(localFirstKey, localEndKey) / std::max<size_t>(1, localEndKey - localFirstKey) + sizeof(uint64_t) + sizeof(size_t);
-    const size_t splitKeys = std::max<size_t>(1, memoryLimit / 8 / keyBytes);
-    // the average sizes the first candidate; uneven names must still fit the split
+    size_t localFirstKey = nodeKeyOffsets[MMseqsNode::rank];
+    size_t localEndKey = nodeKeyOffsets[MMseqsNode::rank + 1];
+    // name, buffer offset and split offset
+    size_t keyBytes = headers.getNamesBytes(localFirstKey, localEndKey) / std::max((size_t) 1, localEndKey - localFirstKey) + sizeof(uint64_t) + sizeof(size_t);
+    size_t splitKeys = std::max((size_t) 1, memoryLimit / 8 / keyBytes);
+    // halve splits whose names do not fit
     std::vector<size_t> splitKeyOffsets(1, localFirstKey);
     while (splitKeyOffsets.back() < localEndKey) {
-        const size_t keyBegin = splitKeyOffsets.back();
+        size_t keyBegin = splitKeyOffsets.back();
         size_t keyEnd = keyBegin + std::min(splitKeys, localEndKey - keyBegin);
         while (keyEnd - keyBegin > 1 && headers.getNamesBytes(keyBegin, keyEnd) + (keyEnd - keyBegin) * (sizeof(uint64_t) + sizeof(size_t)) > memoryLimit / 8) {
             keyEnd = keyBegin + (keyEnd - keyBegin) / 2;
@@ -165,9 +169,9 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
         splitKeyOffsets.push_back(keyEnd);
     }
 
-    const std::string sortedByRepFile = sortedByRep + "." + SSTR(MMseqsNode::rank);
-    FILE *sortedByRepHandle = FileUtil::openAndDelete(sortedByRepFile.c_str(), "w");
-    std::string sortedByRepIndexData;
+    std::string repFile = sortedByRep + "." + SSTR(MMseqsNode::rank);
+    FILE *repHandle = FileUtil::openAndDelete(repFile.c_str(), "w");
+    std::string repIndexData;
     size_t writtenBytes = 0;
     MemberAccession *memberAccessions = NULL;
     size_t accessionCount = 0;
@@ -175,25 +179,26 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
     char *accessions = NULL;
     size_t accessionsBytes = 0;
     size_t accessionsCapacity = 0;
-    const int threads = Parameters::getInstance().threads;
+    int threads = Parameters::getInstance().threads;
     std::vector<std::string> threadAccessions(threads);
     std::vector<size_t> threadAccessionOffsets(threads + 1);
     std::vector<char> receivedPairs;
-    // the records for this node of the flushes before the last stay in memory up to a quarter of it, the last flush keeps all of them as its buffers are freed
+    // keep own records in memory, up to a quarter of it
     size_t keptOwnBytes = 0;
     for (size_t split = 0; split + 1 < splitKeyOffsets.size(); split++) {
-        const size_t keyBegin = splitKeyOffsets[split];
-        const size_t keyEnd = splitKeyOffsets[split + 1];
+        size_t keyBegin = splitKeyOffsets[split];
+        size_t keyEnd = splitKeyOffsets[split + 1];
         headers.loadData(keyBegin, keyEnd);
         if (split + 2 < splitKeyOffsets.size()) {
             headers.prefetchData(keyEnd, splitKeyOffsets[split + 2]);
         }
-        const ClusterPair splitLastPair = { static_cast<DBKeyType>(keyEnd - 1), static_cast<DBKeyType>(keyEnd - 1) };
+        ClusterPair splitLastPair = { static_cast<DBKeyType>(keyEnd - 1), static_cast<DBKeyType>(keyEnd - 1) };
         size_t pairCount;
-        while ((pairCount = MMseqsNode::readExchangeRecordsUpTo(memberReaders, memoryLimit / 64, NULL, ClusterPair::compareByMember, splitLastPair, receivedPairs, NULL, sortedByMember)) > 0) {
+        while ((pairCount = MMseqsNode::readExchangeRecordsUpTo(memberReaders, memoryLimit / 64, NULL, ClusterPair::compareByMember, splitLastPair,
+                                                                receivedPairs, NULL, sortedByMember)) > 0) {
             ClusterPair *pairs = reinterpret_cast<ClusterPair *>(receivedPairs.data());
             SORT_PARALLEL(pairs, pairs + pairCount, ClusterPair::compareByMember);
-            const size_t firstAccession = accessionCount;
+            size_t firstAccession = accessionCount;
             accessionCount += pairCount;
             growBuffer(memberAccessions, memberAccessionCapacity, accessionCount);
 #pragma omp parallel
@@ -206,9 +211,9 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
                 for (int thread = 0; thread < threads; thread++) {
                     threadAccessions[thread].clear();
                     for (size_t i = pairCount * thread / threads; i < pairCount * (thread + 1) / threads; i++) {
-                        const DBKeyType memberKey = pairs[i].memberKey;
-                        const std::string accession = Util::parseFastaHeader(headers.getData(memberKey, thread_idx));
-                        const MemberAccession memberAccession = { pairs[i].repKey, memberKey, threadAccessions[thread].size(), static_cast<unsigned int>(accession.size()) };
+                        DBKeyType memberKey = pairs[i].memberKey;
+                        std::string accession = Util::parseFastaHeader(headers.getData(memberKey, thread_idx));
+                        MemberAccession memberAccession = { pairs[i].repKey, memberKey, threadAccessions[thread].size(), static_cast<unsigned int>(accession.size()) };
                         memberAccessions[firstAccession + i] = memberAccession;
                         threadAccessions[thread].append(accession);
                     }
@@ -227,50 +232,54 @@ static std::string readMemberAccessions(const std::string &sortedByMemberIndex, 
                     memberAccessions[firstAccession + i].accessionOffset += threadAccessionOffsets[thread];
                 }
             }
-            // the flush is copied once more into the write buffer
             if (accessionsBytes + accessionCount * sizeof(MemberAccession) >= memoryLimit / 8) {
-                keptOwnBytes += writeMemberAccessions(memberAccessions, accessionCount, accessions, tsvKeyOffsets, sortedByRepHandle, sortedByRepFile, sortedByRepIndexData, writtenBytes,
+                keptOwnBytes += writeMemberAccessions(memberAccessions, accessionCount, accessions, tsvKeyOffsets, repHandle, repFile, repIndexData, writtenBytes,
                                                       sortedByRep, memoryLimit / 4 - keptOwnBytes);
                 accessionCount = 0;
                 accessionsBytes = 0;
             }
         }
     }
-    const ClusterPair lastPair = { DB_KEY_INVALID, DB_KEY_INVALID };
+
+    ClusterPair lastPair = { DB_KEY_INVALID, DB_KEY_INVALID };
     if (MMseqsNode::readExchangeRecordsUpTo(memberReaders, memoryLimit / 64, NULL, ClusterPair::compareByMember, lastPair, receivedPairs, NULL, sortedByMember) > 0) {
         Debug(Debug::ERROR) << "Key " << reinterpret_cast<ClusterPair *>(receivedPairs.data())->memberKey << " of the clustering is not in the sequence database\n";
         EXIT(EXIT_FAILURE);
     }
-    writeMemberAccessions(memberAccessions, accessionCount, accessions, tsvKeyOffsets, sortedByRepHandle, sortedByRepFile, sortedByRepIndexData, writtenBytes, sortedByRep, SIZE_MAX);
+    writeMemberAccessions(memberAccessions, accessionCount, accessions, tsvKeyOffsets, repHandle, repFile, repIndexData, writtenBytes,
+                          sortedByRep, SIZE_MAX);
     Util::releasePages(memberAccessions, memberAccessionCapacity * sizeof(MemberAccession));
     free(memberAccessions);
     Util::releasePages(accessions, accessionsCapacity);
     free(accessions);
     MMseqsNode::closeExchangeFiles(memberFiles, sortedByMember);
-    return MMseqsNode::closeExchange(sortedByRepHandle, sortedByRepFile, sortedByRep + ".index", sortedByRepIndexData);
+    return MMseqsNode::closeExchange(repHandle, repFile, sortedByRep + ".index", repIndexData);
 }
 
 static void writeClusterTsvLines(const std::string &sortedByRepIndex, const std::string &sortedByRep, const std::string &tsv, const Parameters &par) {
     std::vector<MMseqsNode::ExchangeReader> repReaders;
     std::vector<FILE *> repFiles;
     MMseqsNode::openExchange(sortedByRepIndex, sortedByRep, repReaders, repFiles);
-    const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
-    const std::string tsvFile = tsv + "." + SSTR(MMseqsNode::rank);
+
+    size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
+    std::string tsvFile = tsv + "." + SSTR(MMseqsNode::rank);
     FILE *tsvHandle = FileUtil::openAndDelete(tsvFile.c_str(), "w");
     size_t tsvBytes = 0;
-    const ClusterPair lastPair = { DB_KEY_INVALID, DB_KEY_INVALID };
+    ClusterPair lastPair = { DB_KEY_INVALID, DB_KEY_INVALID };
     std::vector<char> records;
     std::vector<size_t> recordOffsets;
     MemberAccession *memberAccessions = NULL;
     size_t memberAccessionCapacity = 0;
     std::vector<std::string> threadLines(par.threads);
     std::vector<size_t> threadLineOffsets(par.threads + 1);
-    const size_t writeBufferBytes = std::min(MAX_READ_REQUEST_BYTES, std::max<size_t>(1, memoryLimit / 8 / par.threads));
-    // the accession of the representative whose cluster the previous range ended in
+    size_t writeBufferBytes = std::min(MAX_READ_REQUEST_BYTES, std::max((size_t) 1, memoryLimit / 8 / par.threads));
+
+    // representative of the cluster the previous range ended in
     std::string repAccession;
     DBKeyType previousRepKey = DB_KEY_INVALID;
     size_t recordCount;
-    while ((recordCount = MMseqsNode::readExchangeRecordsUpTo(repReaders, memoryLimit / 8, getMemberAccessionBytes, ClusterPair::compareByRep, lastPair, records, &recordOffsets, sortedByRep)) > 0) {
+    while ((recordCount = MMseqsNode::readExchangeRecordsUpTo(repReaders, memoryLimit / 8, getMemberAccessionBytes, ClusterPair::compareByRep, lastPair,
+                                                              records, &recordOffsets, sortedByRep)) > 0) {
         growBuffer(memberAccessions, memberAccessionCapacity, recordCount);
 #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < recordCount; i++) {
@@ -282,20 +291,20 @@ static void writeClusterTsvLines(const std::string &sortedByRepIndex, const std:
             memberAccession.accessionOffset = recordOffsets[i] + MEMBER_ACCESSION_HEADER_BYTES;
         }
         SORT_PARALLEL(memberAccessions, memberAccessions + recordCount, MemberAccession::compareByRep);
-        // count the bytes first: a long representative name can make the TSV much larger than the received records
+        // count bytes first, long representative names grow the TSV
         for (int pass = 0; pass < 2; pass++) {
 #pragma omp parallel for schedule(dynamic, 1)
             for (int thread = 0; thread < par.threads; thread++) {
                 std::string &lines = threadLines[thread];
                 lines.clear();
-                const size_t begin = recordCount * thread / par.threads;
-                const size_t end = recordCount * (thread + 1) / par.threads;
+                size_t begin = recordCount * thread / par.threads;
+                size_t end = recordCount * (thread + 1) / par.threads;
                 DBKeyType repKey = (begin > 0) ? memberAccessions[begin - 1].repKey : previousRepKey;
                 const char *repName = repAccession.data();
                 size_t repLength = repAccession.size();
-                // a cluster that continues from the part before has its representative line earlier in this range or in a previous range
-                const MemberAccession repLine = { repKey, repKey, 0, 0 };
-                const size_t repLinePos = std::lower_bound(memberAccessions, memberAccessions + begin, repLine, MemberAccession::compareByRep) - memberAccessions;
+                // find the representative line of a continued cluster
+                MemberAccession repLine = { repKey, repKey, 0, 0 };
+                size_t repLinePos = std::lower_bound(memberAccessions, memberAccessions + begin, repLine, MemberAccession::compareByRep) - memberAccessions;
                 if (repLinePos < begin && memberAccessions[repLinePos].memberKey == repKey) {
                     repName = records.data() + memberAccessions[repLinePos].accessionOffset;
                     repLength = memberAccessions[repLinePos].accessionLength;
@@ -304,7 +313,6 @@ static void writeClusterTsvLines(const std::string &sortedByRepIndex, const std:
                 for (size_t i = begin; i < end; i++) {
                     const MemberAccession &memberAccession = memberAccessions[i];
                     if (memberAccession.repKey != repKey) {
-                        // the representative itself comes first
                         repKey = memberAccession.repKey;
                         repName = records.data() + memberAccession.accessionOffset;
                         repLength = memberAccession.accessionLength;
@@ -338,12 +346,13 @@ static void writeClusterTsvLines(const std::string &sortedByRepIndex, const std:
         }
         tsvBytes = threadLineOffsets[par.threads];
         previousRepKey = memberAccessions[recordCount - 1].repKey;
-        const MemberAccession repLine = { previousRepKey, previousRepKey, 0, 0 };
-        const size_t repLinePos = std::lower_bound(memberAccessions, memberAccessions + recordCount, repLine, MemberAccession::compareByRep) - memberAccessions;
+        MemberAccession repLine = { previousRepKey, previousRepKey, 0, 0 };
+        size_t repLinePos = std::lower_bound(memberAccessions, memberAccessions + recordCount, repLine, MemberAccession::compareByRep) - memberAccessions;
         if (memberAccessions[repLinePos].memberKey == previousRepKey) {
             repAccession.assign(records.data() + memberAccessions[repLinePos].accessionOffset, memberAccessions[repLinePos].accessionLength);
         }
     }
+
     Util::releasePages(memberAccessions, memberAccessionCapacity * sizeof(MemberAccession));
     free(memberAccessions);
     if (fclose(tsvHandle) != 0) {
@@ -359,28 +368,34 @@ int createtsv(int argc, const char **argv, const Command &command) {
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_VARIADIC, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
-        const int clusterDbtype = FileUtil::parseDbType(par.db3.c_str());
+        int clusterDbtype = FileUtil::parseDbType(par.db3.c_str());
         if (Parameters::isEqualDbtype(clusterDbtype, Parameters::DBTYPE_CLUSTER_RES) == false
             || (DBReader<DBKeyType>::getExtendedDbtype(clusterDbtype) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {
             Debug(Debug::ERROR) << par.db3 << " is not a linfinity clustering (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
             EXIT(EXIT_FAILURE);
         }
+
         DBReader<DBKeyType> headers(par.hdr1.c_str(), (par.db1 + ".file_keys").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
         headers.open(DBReader<DBKeyType>::NOSORT);
-        const std::vector<size_t> nodeKeyOffsets = headers.getEvenNodeKeyOffsets(MMseqsNode::count);
+        std::vector<size_t> nodeKeyOffsets = headers.getEvenNodeKeyOffsets(MMseqsNode::count);
         std::string phaseValues;
         Timer timer;
-        const std::string sortedByMember = par.db4 + "_by_member";
-        const std::string sortedByMemberIndex = MMseqsNode::sendClusterPairs(par.db3, true, ClusterPair::compareByMember, nodeKeyOffsets, sortedByMember);
-        MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", timer);
-        const std::string sortedByRep = par.db4 + "_by_rep";
-        const std::vector<size_t> tsvKeyOffsets = MMseqsNode::getBalancedClusterKeyOffsets(par.db4 + ".cluster_key_offsets", par.db3, headers.getSize());
-        const std::string sortedByRepIndex = readMemberAccessions(sortedByMemberIndex, sortedByMember, headers, nodeKeyOffsets, tsvKeyOffsets, Util::computeMemory(par.splitMemoryLimit), sortedByRep);
+
+        std::string sortedByMember = par.db4 + "_by_member";
+        std::string sortedByMemberIndex = MMseqsNode::sendClusterPairs(par.db3, true, ClusterPair::compareByMember, nodeKeyOffsets, sortedByMember);
+        MMseqsNode::addPhaseTime(phaseValues, "sending cluster pairs", timer);
+
+        std::string sortedByRep = par.db4 + "_by_rep";
+        std::vector<size_t> tsvKeyOffsets = MMseqsNode::getBalancedClusterKeyOffsets(par.db4 + ".cluster_key_offsets", par.db3, headers.getSize());
+        std::string sortedByRepIndex = readMemberAccessions(sortedByMemberIndex, sortedByMember, headers, nodeKeyOffsets, tsvKeyOffsets,
+                                                            Util::computeMemory(par.splitMemoryLimit), sortedByRep);
         headers.close();
-        MMseqsNode::addPhaseTime(phaseValues, "sending the member accessions", timer);
+        MMseqsNode::addPhaseTime(phaseValues, "sending member accessions", timer);
         FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
+
         writeClusterTsvLines(sortedByRepIndex, sortedByRep, par.db4, par);
-        MMseqsNode::addPhaseTime(phaseValues, "writing the tsv", timer);
+        MMseqsNode::addPhaseTime(phaseValues, "writing TSV", timer);
+
         std::vector<std::string> exchanges;
         exchanges.push_back(sortedByMember);
         exchanges.push_back(sortedByRep);

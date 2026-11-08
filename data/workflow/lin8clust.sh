@@ -4,7 +4,7 @@ fail() {
     exit 1
 }
 
-# true if none of the files exists; an output removed once a later step consumed it counts as present, so the later step's outputs are checked too
+# true if none of the files exists, pass later outputs too
 notExists() {
     for FILE in "$@"; do
         [ -f "$FILE" ] && return 1
@@ -12,14 +12,14 @@ notExists() {
     return 0
 }
 
-# true if none of the files exists, nor with two iterations an output of the refinement pass
+# also check the refinement outputs with two iterations
 notExistsBeforeRefinement() {
     notExists "$@" || return 1
     [ "$LINCLUST_ITERATIONS" -ge 2 ] || return 0
     notExists "${TMP_PATH}/clu_merged.dbtype" "${TMP_PATH}/input_rep.dbtype" "${TMP_PATH}/pref_rep.dbtype" "${TMP_PATH}/clu_rep.dbtype"
 }
 
-# srun ends the other tasks of a step when one fails, they would wait for it forever
+# end all tasks of a srun step if one fails
 export SLURM_KILL_BAD_EXIT=1
 
 [ "$#" -ne 3 ] && echo "Please provide <sequenceDB> <outDB> <tmp>" && exit 1;
@@ -141,7 +141,7 @@ if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
     fi
 fi
 
-# the databases that the next steps do not read are removed in the background, a failed removal still fails the workflow
+# wait for the background rmdb
 for PID in $PIDS; do
     wait "$PID"
 done

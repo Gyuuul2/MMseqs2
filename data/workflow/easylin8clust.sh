@@ -8,7 +8,7 @@ notExists() {
    [ ! -f "$1" ]
 }
 
-# srun ends the other tasks of a step when one fails, they would wait for it forever
+# end all tasks of a srun step if one fails
 export SLURM_KILL_BAD_EXIT=1
 
 if notExists "${TMP_PATH}/input.dbtype"; then
@@ -23,7 +23,7 @@ if notExists "${TMP_PATH}/clu.dbtype"; then
         || fail "lin8clust died"
 fi
 
-# the outputs are one file per node and a killed step can leave some of them, so a .done marker tells that a step finished
+# a killed step can leave some node files, mark finished steps
 if notExists "${TMP_PATH}/createtsv.done"; then
     rm -f "${RESULTS}_cluster.tsv".*
     # shellcheck disable=SC2086

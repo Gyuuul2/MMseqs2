@@ -99,7 +99,7 @@ public:
 
     static char touchMemory(const char* memory, size_t size);
 
-    // returns the pages of memory to the system on all threads, so freeing a large buffer afterwards does not unmap them on one thread
+    // release pages on all threads before freeing a large buffer
     static void releasePages(void *memory, size_t size);
 
     // Wrap posix_madvise with errno-aware logging. Returns posix_madvise's
@@ -128,7 +128,7 @@ public:
 
     static size_t countSetBits(const uint64_t *bits, size_t from, size_t to);
 
-    // a key of a linfinity prefilter result: 7 bits a byte, the high bit set on all bytes but the last; returns its bytes
+    // varint key of a linfinity prefilter result
     static inline size_t putPrefKey(char *buffer, uint64_t key) {
         size_t bytes = 0;
         for (; key >= 0x80; key >>= 7) {
@@ -141,7 +141,7 @@ public:
     static inline uint64_t getPrefKey(const char *&data) {
         uint64_t key = 0;
         for (unsigned int shift = 0;; shift += 7) {
-            const unsigned char byte = static_cast<unsigned char>(*data++);
+            unsigned char byte = static_cast<unsigned char>(*data++);
             key |= static_cast<uint64_t>(byte & 0x7F) << shift;
             if (byte < 0x80) {
                 return key;
@@ -400,7 +400,7 @@ public:
         const size_t A3 = A2 * A;
         const size_t A4 = A3 * A;
 
-        const size_t unrolledLength = length - length % 4;
+        size_t unrolledLength = length - length % 4;
         size_t h = 0;
         for (size_t i = 0; i < unrolledLength; i += 4) {
             h = h * A4 + x[i] * A3 + x[i + 1] * A2

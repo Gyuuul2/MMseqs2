@@ -18,8 +18,8 @@ int result2flat(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
-    // linfinity: every node writes the representatives of its cluster database <clu>.<node> with their sequences to <out>.<node>
-    const std::string nodeSuffix = isLinfinity ? "." + SSTR(MMseqsNode::rank) : "";
+    // linfinity: every node writes <out>.<node>
+    std::string nodeSuffix = isLinfinity ? "." + SSTR(MMseqsNode::rank) : "";
 
     DBReader<DBKeyType> querydb_header(par.hdr1.c_str(), isLinfinity ? (par.db1 + ".file_keys").c_str() : par.hdr1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
     querydb_header.open(DBReader<DBKeyType>::NOSORT);
@@ -39,26 +39,26 @@ int result2flat(int argc, const char **argv, const Command &command) {
         dbr_data.open(DBReader<DBKeyType>::LINEAR_ACCCESS);
     }
 
-    const std::string fastaFile = par.db4 + nodeSuffix;
+    std::string fastaFile = par.db4 + nodeSuffix;
     FILE *fastaFP = FileUtil::openAndDelete(fastaFile.c_str(), "w");
 
-    // one split of all entries; linfinity: splits of the keys of the data file of this node, cut by sequence bytes as the written sequences are, whose sequences and names fit the memory, loaded and prefetched
+    // linfinity: splits of the node file keys whose sequences and names fit
     std::vector<size_t> splitKeyOffsets;
     std::vector<size_t> cluKeyOffsets;
     if (isLinfinity) {
         cluKeyOffsets = MMseqsNode::getClusterKeyOffsets(par.db4 + ".cluster_key_offsets", par.db3, seqDbr.getSize());
-        const std::vector<size_t> fileKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
-        const size_t fileFirstKey = fileKeyOffsets[MMseqsNode::rank];
-        const size_t fileEndKey = fileKeyOffsets[MMseqsNode::rank + 1];
-        // a key also holds its name with its offset and its representative key
-        const size_t keyBytes = querydb_header.getNamesBytes(fileFirstKey, fileEndKey) / std::max<size_t>(1, fileEndKey - fileFirstKey) + 2 * sizeof(uint64_t);
-        const size_t splitBytes = std::max<size_t>(1, Util::computeMemory(par.splitMemoryLimit) / 8);
-        // the average sizes the sequence splits; uneven names must still fit the split
-        const std::vector<size_t> sequenceKeyOffsets = seqDbr.getSplitKeyOffsets(fileFirstKey, fileEndKey, splitBytes, keyBytes);
+        std::vector<size_t> fileKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
+        size_t fileFirstKey = fileKeyOffsets[MMseqsNode::rank];
+        size_t fileEndKey = fileKeyOffsets[MMseqsNode::rank + 1];
+        // name, offset and representative key
+        size_t keyBytes = querydb_header.getNamesBytes(fileFirstKey, fileEndKey) / std::max((size_t) 1, fileEndKey - fileFirstKey) + 2 * sizeof(uint64_t);
+        size_t splitBytes = std::max((size_t) 1, Util::computeMemory(par.splitMemoryLimit) / 8);
+        std::vector<size_t> sequenceKeyOffsets = seqDbr.getSplitKeyOffsets(fileFirstKey, fileEndKey, splitBytes, keyBytes);
+        // halve splits whose names do not fit
         splitKeyOffsets.push_back(fileFirstKey);
         for (size_t split = 1; split < sequenceKeyOffsets.size(); split++) {
             while (splitKeyOffsets.back() < sequenceKeyOffsets[split]) {
-                const size_t keyBegin = splitKeyOffsets.back();
+                size_t keyBegin = splitKeyOffsets.back();
                 size_t keyEnd = sequenceKeyOffsets[split];
                 while (keyEnd - keyBegin > 1 && querydb_header.getNamesBytes(keyBegin, keyEnd) + (keyEnd - keyBegin) * 2 * sizeof(uint64_t) > splitBytes) {
                     keyEnd = keyBegin + (keyEnd - keyBegin) / 2;
@@ -67,11 +67,10 @@ int result2flat(int argc, const char **argv, const Command &command) {
             }
         }
     }
-    const size_t splitCount = isLinfinity ? splitKeyOffsets.size() - 1 : 1;
+    size_t splitCount = isLinfinity ? splitKeyOffsets.size() - 1 : 1;
 
-    const size_t entriesPerTask = isLinfinity ? 4096 : 1024;
-    // the tasks that the threads format at once before they are written at their prefix-summed offsets
-    const size_t tasksPerBatch = (isLinfinity ? 4 : 16) * static_cast<size_t>(par.threads);
+    size_t entriesPerTask = isLinfinity ? 4096 : 1024;
+    size_t tasksPerBatch = (isLinfinity ? 4 : 16) * static_cast<size_t>(par.threads);
     std::vector<std::string> taskFastaText(tasksPerBatch);
     std::vector<size_t> taskOffsets(tasksPerBatch + 1);
     size_t fastaBytes = 0;
@@ -94,9 +93,9 @@ int result2flat(int argc, const char **argv, const Command &command) {
         }
         loadSeconds += timer.getTimediff();
         timer.reset();
-        const size_t taskCount = (splitEnd + entriesPerTask - 1) / entriesPerTask;
+        size_t taskCount = (splitEnd + entriesPerTask - 1) / entriesPerTask;
         for (size_t batchBegin = 0; batchBegin < taskCount; batchBegin += tasksPerBatch) {
-            const size_t batchEnd = std::min(taskCount, batchBegin + tasksPerBatch);
+            size_t batchEnd = std::min(taskCount, batchBegin + tasksPerBatch);
 #pragma omp parallel
             {
                 int thread_idx = 0;
@@ -130,7 +129,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
                         buffer.append(headerStr);
                         buffer.push_back('\n');
 
-                        // linfinity: the sequence of the representative with its newline, without its null byte
+                        // linfinity: sequence with newline, without null byte
                         if (isLinfinity) {
                             buffer.append(seqDbr.getData(key, thread_idx), seqDbr.getSeqLen(key) + 1);
                             continue;
@@ -208,9 +207,9 @@ int result2flat(int argc, const char **argv, const Command &command) {
     if (isLinfinity) {
         writeSeconds += timer.getTimediff();
         std::string phaseValues;
-        MMseqsNode::addPhaseSeconds(phaseValues, "loading the sequences", loadSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "formatting the sequences", formatSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "writing the sequences", writeSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "loading sequences", loadSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "formatting sequences", formatSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "writing sequences", writeSeconds);
         MMseqsNode::printPhaseValues(phaseValues);
         seqDbr.close();
     } else {

@@ -89,8 +89,8 @@ int Util::readMappingDBKey(std::string mappingFilename, std::vector<std::pair<DB
 size_t Util::countSetBits(const uint64_t *bits, size_t from, size_t to) {
     size_t count = 0;
     for (size_t bit = from; bit < to; bit = bit / 64 * 64 + 64) {
-        const size_t wordBits = std::min<size_t>(64 - bit % 64, to - bit);
-        const uint64_t word = bits[bit / 64] >> (bit % 64);
+        size_t wordBits = std::min(64 - bit % 64, to - bit);
+        uint64_t word = bits[bit / 64] >> (bit % 64);
         count += __builtin_popcountll((wordBits == 64) ? word : word & ((1ULL << wordBits) - 1));
     }
     return count;
@@ -408,20 +408,20 @@ void Util::releasePages(void *memory, size_t size) {
     if (memory == NULL) {
         return;
     }
-    const size_t pageSize = getPageSize();
-    const size_t begin = (reinterpret_cast<size_t>(memory) + pageSize - 1) / pageSize;
-    const size_t end = (reinterpret_cast<size_t>(memory) + size) / pageSize;
-    const size_t pages = (end > begin) ? end - begin : 0;
+    size_t pageSize = getPageSize();
+    size_t begin = ((size_t) memory + pageSize - 1) / pageSize;
+    size_t end = ((size_t) memory + size) / pageSize;
+    size_t pages = (end > begin) ? end - begin : 0;
     int threads = 1;
 #ifdef OPENMP
     threads = (omp_in_parallel() == 0) ? omp_get_max_threads() : 1;
 #endif
 #pragma omp parallel for schedule(static) num_threads(threads)
     for (int thread = 0; thread < threads; thread++) {
-        const size_t from = begin + pages * thread / threads;
-        const size_t to = begin + pages * (thread + 1) / threads;
+        size_t from = begin + pages * thread / threads;
+        size_t to = begin + pages * (thread + 1) / threads;
         if (from < to) {
-            madvise(reinterpret_cast<void *>(from * pageSize), (to - from) * pageSize, MADV_DONTNEED);
+            madvise((void *) (from * pageSize), (to - from) * pageSize, MADV_DONTNEED);
         }
     }
 #else
