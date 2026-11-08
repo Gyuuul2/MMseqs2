@@ -230,12 +230,6 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
             isRingWorkerCountLimited = syscall(__NR_io_uring_register, ringFd, IORING_REGISTER_IOWQ_MAX_WORKERS, maxWorkers, 2) >= 0;
         }
         inflightReadLimit = isRingWorkerCountLimited ? sqMask + 1 : MIN_RING_DEPTH;
-        for (size_t i = 0; i < requests.size(); i++) {
-            if (callingThreadReads && (fcntl(requests[i].fileToRead, F_GETFL) & O_DIRECT) == 0) {
-                inflightReadLimit = MIN_RING_DEPTH;
-                break;
-            }
-        }
         // the ring holds the requests of most reads; for more, a thread refills it while the caller works
         if (callingThreadReads == false && splitReadRequests.size() > inflightReadLimit) {
             ringThread = std::thread(&BatchReader::readWithRing, this, true);
