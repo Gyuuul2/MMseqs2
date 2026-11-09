@@ -948,7 +948,10 @@ static bool isLongerLength(const std::pair<size_t, size_t> &bin, size_t length) 
 }
 
 size_t MMseqsNode::readExchangeCompressionUnits(std::vector<ExchangeReader> &readers, const std::vector<std::vector<std::pair<size_t, size_t> > > &readerLengthOffsets, size_t bufferMemory, size_t maxCompressionUnitSize,
-                                                size_t bufferBegin, size_t bufferEnd, char *buffer, std::vector<std::pair<size_t, size_t> > &compressionUnits, const std::string &prefix) {
+                                                size_t bufferBegin, size_t bufferEnd, char *buffer, std::vector<std::pair<size_t, size_t> > *compressionUnits, const std::string &prefix) {
+    if (readers.empty()) {
+        return SIZE_MAX;
+    }
     size_t bufferSize = std::max(4 * sizeof(uint64_t) + maxCompressionUnitSize, bufferMemory / std::max((size_t) 1, readers.size()));
     size_t nextOffset = SIZE_MAX;
 #pragma omp parallel reduction(min:nextOffset)
@@ -991,14 +994,18 @@ size_t MMseqsNode::readExchangeCompressionUnits(std::vector<ExchangeReader> &rea
                     Debug(Debug::ERROR) << "Cannot decompress a record of " << prefix << "\n";
                     EXIT(EXIT_FAILURE);
                 }
-                threadCompressionUnits.push_back(std::make_pair(offset, compressionUnit[2]));
+                if (compressionUnits != NULL) {
+                    threadCompressionUnits.push_back(std::make_pair(offset, compressionUnit[2]));
+                }
                 reader.bufferPos += sizeof(compressionUnit) + compressionUnit[3];
             }
             releaseExchangeReader(reader);
         }
         ZSTD_freeDCtx(dctx);
+        if (compressionUnits != NULL) {
 #pragma omp critical
-        compressionUnits.insert(compressionUnits.end(), threadCompressionUnits.begin(), threadCompressionUnits.end());
+            compressionUnits->insert(compressionUnits->end(), threadCompressionUnits.begin(), threadCompressionUnits.end());
+        }
     }
     return nextOffset;
 }

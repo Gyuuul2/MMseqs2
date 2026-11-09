@@ -973,8 +973,10 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         dataFileBytes[SEQUENCE_DATA * MMseqsNode::count + file] += range.sequenceCount * (range.length + 2);
         dataFileBytes[HEADER_DATA * MMseqsNode::count + file] += range.headerBytes;
         dataFileBytes[HEADER_OFFSETS * MMseqsNode::count + file] += range.sequenceCount * sizeof(uint64_t);
-        indexData += SSTR(range.startKey) + "\t" + SSTR(range.offsets[SEQUENCE_DATA]) + "\t" + SSTR(range.length + 2) + "\t"
-                     + SSTR(range.sequenceCount) + "\t" + SSTR(range.file) + "\n";
+        if (MMseqsNode::isMaster()) {
+            indexData += SSTR(range.startKey) + "\t" + SSTR(range.offsets[SEQUENCE_DATA]) + "\t" + SSTR(range.length + 2) + "\t"
+                         + SSTR(range.sequenceCount) + "\t" + SSTR(range.file) + "\n";
+        }
         if (range.file == MMseqsNode::rank) {
             nodeLengthRanges.push_back(range);
         }
@@ -1158,6 +1160,12 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         size_t receiveMemory = static_cast<size_t>(memoryLimit * 0.95) - receivedRowCount * rowSize;
         size_t readerBufferSize = receiveMemory / 2;
         size_t writeBufferSize = receiveMemory / 8;
+        size_t frameSize = 1024 * 1024;
+        if (par.compressHeaders && writeBufferSize < std::min(frameSize, headerDataBytes)) {
+            Debug(Debug::ERROR) << "Not enough memory to compress the headers. The write buffer needs " << std::min(frameSize, headerDataBytes)
+                                << " bytes, it has " << writeBufferSize << ". Raise --split-memory-limit.\n";
+            EXIT(EXIT_FAILURE);
+        }
         size_t threadWriteSize = std::max((size_t) 1, writeBufferSize / par.threads);
         BatchWriter batchWriter(writeBufferSize, par.threads, fileno(dataFiles[SEQUENCE_DATA]));
 
@@ -1168,7 +1176,6 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
 
         // --compress-headers
-        size_t frameSize = 1024 * 1024;
         size_t maxCompressedSize = ZSTD_compressBound(frameSize);
         FILE *tmpHeaderFile = NULL;
         char *compressedFrames = NULL;
@@ -1208,11 +1215,11 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
             size_t fileTypeBegin = writtenBytes;
             size_t fileTypeBytes = (isSpooled && fileType == SEQUENCE_DATA) ? sentSequenceSize : dataFileBytes[fileType * MMseqsNode::count + MMseqsNode::rank];
+            bool isCompressedHeader = par.compressHeaders && fileType == HEADER_DATA;
             for (size_t writeBufferBegin = 0; writeBufferBegin != SIZE_MAX; ) {
                 compressionUnits.clear();
                 size_t nextOffset = MMseqsNode::readExchangeCompressionUnits(readers[fileType], readerLengthOffsets[fileType], readerBufferSize, MAX_UNIT_SIZE,
-                                                                             writeBufferBegin, writeBufferBegin + writeBufferSize, writeBuffer, compressionUnits, exchange);
-                SORT_SERIAL(compressionUnits.begin(), compressionUnits.end());
+                                                                             writeBufferBegin, writeBufferBegin + writeBufferSize, writeBuffer, isCompressedHeader ? NULL : &compressionUnits, exchange);
                 if (fileType == HEADER_OFFSETS) {
 #pragma omp parallel for schedule(dynamic, 1)
                     for (size_t i = 0; i < compressionUnits.size(); i++) {
@@ -1225,7 +1232,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     }
                 }
                 writes.clear();
-                if (par.compressHeaders && fileType == HEADER_DATA) {
+                if (isCompressedHeader) {
                     Timer compressTimer;
                     size_t writeBufferEnd = std::min(nextOffset, headerDataBytes);
                     // carry the last partial frame to the next write buffer
@@ -1236,20 +1243,29 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     size_t firstFrame = seekTable.size() / 2;
                     seekTable.resize(seekTable.size() + 2 * frameCount);
                     std::vector<size_t> frameTaskOffsets(taskCount + 1, 0);
-#pragma omp parallel for schedule(dynamic, 1)
-                    for (size_t task = 0; task < taskCount; task++) {
-                        for (size_t frame = task * framesPerTask; frame < std::min(frameCount, (task + 1) * framesPerTask); frame++) {
-                            size_t size = std::min(frameSize, frameEnd - writeBufferBegin - frame * frameSize);
-                            char *compressedFrame = compressedFrames + task * framesPerTask * maxCompressedSize + frameTaskOffsets[task + 1];
-                            size_t compressedSize = ZSTD_compress(compressedFrame, maxCompressedSize, writeBuffer + frame * frameSize, size, 3);
-                            if (ZSTD_isError(compressedSize)) {
-                                Debug(Debug::ERROR) << "ZSTD_compress " << ZSTD_getErrorName(compressedSize) << "\n";
-                                EXIT(EXIT_FAILURE);
-                            }
-                            seekTable[2 * (firstFrame + frame)] = compressedSize;
-                            seekTable[2 * (firstFrame + frame) + 1] = size;
-                            frameTaskOffsets[task + 1] += compressedSize;
+#pragma omp parallel
+                    {
+                        ZSTD_CCtx *cctx = ZSTD_createCCtx();
+                        if (cctx == NULL) {
+                            Debug(Debug::ERROR) << "ZSTD_createCCtx() error\n";
+                            EXIT(EXIT_FAILURE);
                         }
+#pragma omp for schedule(dynamic, 1)
+                        for (size_t task = 0; task < taskCount; task++) {
+                            for (size_t frame = task * framesPerTask; frame < std::min(frameCount, (task + 1) * framesPerTask); frame++) {
+                                size_t size = std::min(frameSize, frameEnd - writeBufferBegin - frame * frameSize);
+                                char *compressedFrame = compressedFrames + task * framesPerTask * maxCompressedSize + frameTaskOffsets[task + 1];
+                                size_t compressedSize = ZSTD_compressCCtx(cctx, compressedFrame, maxCompressedSize, writeBuffer + frame * frameSize, size, 3);
+                                if (ZSTD_isError(compressedSize)) {
+                                    Debug(Debug::ERROR) << "ZSTD_compress " << ZSTD_getErrorName(compressedSize) << "\n";
+                                    EXIT(EXIT_FAILURE);
+                                }
+                                seekTable[2 * (firstFrame + frame)] = compressedSize;
+                                seekTable[2 * (firstFrame + frame) + 1] = size;
+                                frameTaskOffsets[task + 1] += compressedSize;
+                            }
+                        }
+                        ZSTD_freeCCtx(cctx);
                     }
                     for (size_t task = 0; task < taskCount; task++) {
                         frameTaskOffsets[task + 1] += frameTaskOffsets[task];
@@ -1264,6 +1280,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     writeBufferBegin = (frameEnd == headerDataBytes) ? SIZE_MAX : frameEnd;
                     compressSeconds += compressTimer.getTimediff();
                 } else {
+                    SORT_SERIAL(compressionUnits.begin(), compressionUnits.end());
                     // merge adjacent compression units
                     for (size_t i = 0; i < compressionUnits.size(); i++) {
                         if (writes.empty() == false && writes.back().first + writes.back().second == compressionUnits[i].first
@@ -1310,10 +1327,13 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             }
         }
 
+        Timer writeCompletionTimer;
         batchWriter.waitWrites();
+        MMseqsNode::addPhaseTime(phaseValues, "writing sequences: waiting for writes", writeCompletionTimer);
         Util::releasePages(writeBuffer, writeBufferSize + MAX_UNIT_SIZE);
         delete[] writeBuffer;
         MMseqsNode::closeExchangeFiles(exchangeFiles, exchange);
+        MMseqsNode::addPhaseTime(phaseValues, "writing sequences: releasing exchange files", writeCompletionTimer);
 
         if (isSpooled) {
             for (unsigned int file = 0; file < MMseqsNode::count; file++) {
@@ -1326,8 +1346,10 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 Debug(Debug::ERROR) << "Cannot close " << edgeFile << " or " << spoolFile << "\n";
                 EXIT(EXIT_FAILURE);
             }
+            MMseqsNode::addPhaseTime(phaseValues, "writing sequences: closing sequence files", writeCompletionTimer);
             MMseqsNode::addSentExchangeBytes(edgeSize, edgeSize);
             MMseqsNode::barrier(edges + ".index");
+            MMseqsNode::addPhaseTime(phaseValues, "writing sequences: waiting for sequence edges", writeCompletionTimer);
             FileUtil::remove(exchangeFile.c_str());
 
             // write the edges of the runs of other nodes, one read per node and chunk
@@ -1363,6 +1385,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 }
             }
             MMseqsNode::closeExchangeFiles(edgeFiles, edges);
+            MMseqsNode::addPhaseTime(phaseValues, "writing sequences: writing sequence edges", writeCompletionTimer);
         }
 
         if (par.compressHeaders) {
@@ -1384,9 +1407,11 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 Debug(Debug::ERROR) << "Cannot close data file " << tmpHeaderName << "\n";
                 EXIT(EXIT_FAILURE);
             }
+            MMseqsNode::addPhaseTime(phaseValues, "writing sequences: closing headers", writeCompletionTimer);
         }
     }
 
+    Timer closeTimer;
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < DATA_FILE_TYPE_COUNT; i++) {
         if (fclose(dataFiles[i]) != 0) {
@@ -1394,6 +1419,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             EXIT(EXIT_FAILURE);
         }
     }
+    MMseqsNode::addPhaseTime(phaseValues, "writing sequences: closing database files", closeTimer);
 
     if (par.compressHeaders) {
         FileUtil::move(tmpHeaderName.c_str(), dataFileNames[HEADER_DATA].c_str());
@@ -1468,10 +1494,13 @@ int createdb(int argc, const char **argv, const Command& command) {
         return FileUtil::baseName(a) < FileUtil::baseName(b);
     });
     
-    for (size_t i = 0; i < filenames.size(); i++) {
-        if (FileUtil::directoryExists(filenames[i].c_str()) == true) {
-            Debug(Debug::ERROR) << "File " << filenames[i] << " is a directory\n";
-            EXIT(EXIT_FAILURE);
+    // one rank checks the input files
+    if (par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH || MMseqsNode::isMaster()) {
+        for (size_t i = 0; i < filenames.size(); i++) {
+            if (FileUtil::directoryExists(filenames[i].c_str()) == true) {
+                Debug(Debug::ERROR) << "File " << filenames[i] << " is a directory\n";
+                EXIT(EXIT_FAILURE);
+            }
         }
     }
 

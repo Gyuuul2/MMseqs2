@@ -141,7 +141,7 @@ public:
                                           bool (*compare)(const ClusterPair &, const ClusterPair &), const ClusterPair &last,
                                           std::vector<char> &records, std::vector<size_t> *recordOffsets, const std::string &prefix);
     static size_t readExchangeCompressionUnits(std::vector<ExchangeReader> &readers, const std::vector<std::vector<std::pair<size_t, size_t> > > &readerLengthOffsets, size_t bufferMemory, size_t maxCompressionUnitSize,
-                                               size_t bufferBegin, size_t bufferEnd, char *buffer, std::vector<std::pair<size_t, size_t> > &compressionUnits, const std::string &prefix);
+                                               size_t bufferBegin, size_t bufferEnd, char *buffer, std::vector<std::pair<size_t, size_t> > *compressionUnits, const std::string &prefix);
     static void closeExchangeFiles(std::vector<FILE *> &files, const std::string &prefix);
 
     struct ClusterPairWriter {
