@@ -62,24 +62,7 @@ void MMseqsNode::init() {
 }
 
 void MMseqsNode::publishFile(const std::string &file, const std::string &content) {
-    std::string tmpFile = file + ".tmp";
-    FILE *handle = FileUtil::openAndDelete(tmpFile.c_str(), "w");
-    if (fwrite(content.c_str(), sizeof(char), content.size(), handle) != content.size()) {
-        Debug(Debug::ERROR) << "Cannot write " << tmpFile << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    if (fflush(handle) != 0 || fsync(fileno(handle)) != 0) {
-        Debug(Debug::ERROR) << "Cannot flush " << tmpFile << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    if (fclose(handle) != 0) {
-        Debug(Debug::ERROR) << "Cannot close " << tmpFile << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    if (rename(tmpFile.c_str(), file.c_str()) != 0) {
-        Debug(Debug::ERROR) << "Cannot rename " << tmpFile << " to " << file << "\n";
-        EXIT(EXIT_FAILURE);
-    }
+    FileUtil::publishFile(file, content);
 }
 
 void MMseqsNode::sleepBeforePoll(unsigned int polls, unsigned int maxShift) {
@@ -195,20 +178,7 @@ static void sleepInWait(unsigned int polls) {
 }
 
 std::string MMseqsNode::readFile(const std::string &file) {
-    FILE *handle = FileUtil::openFileOrDie(file.c_str(), "r", true);
-    struct stat sb;
-    if (fstat(fileno(handle), &sb) != 0) {
-        Debug(Debug::ERROR) << "Cannot read " << file << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    std::string content(sb.st_size, '\0');
-    size_t readSize = content.empty() ? 0 : fread(&content[0], sizeof(char), content.size(), handle);
-    int closeResult = fclose(handle);
-    if (readSize != content.size() || closeResult != 0) {
-        Debug(Debug::ERROR) << "Cannot read " << file << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    return content;
+    return FileUtil::readFile(file);
 }
 
 std::string MMseqsNode::waitForRunFile(const std::string &file) {
@@ -635,6 +605,23 @@ void MMseqsNode::WorkQueue::removeTakenItemFiles() {
             FileUtil::remove(file.c_str());
         }
     }
+}
+
+size_t MMseqsNode::getMemoryLimit(const Parameters &par, size_t localCopyBytes) {
+    const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
+    if (par.localDbName.empty() == false) {
+        if (par.localDbDir.empty() || FileUtil::isDbName(par.localDbName) == false) {
+            Debug(Debug::ERROR) << "--local-db-name requires --local-db-dir and a database name without a directory\n";
+            EXIT(EXIT_FAILURE);
+        }
+        const std::string localDb = FileUtil::getLocalDbPath(par.localDbDir + "/" + par.localDbName, rank);
+        localCopyBytes = FileUtil::getLocalDbMemoryBytes(localDb);
+    }
+    if (localCopyBytes > 0 && localCopyBytes >= memoryLimit) {
+        Debug(Debug::ERROR) << "The sequence copy on tmpfs needs " << localCopyBytes << " bytes, the available memory is " << memoryLimit << " bytes\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return memoryLimit - localCopyBytes;
 }
 
 size_t MMseqsNode::getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads, const std::string &localDirectory, size_t *localNodes) {
@@ -1245,7 +1232,7 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
     if (receivedPrefix.empty() == false) {
         openExchange(receivedIndex, receivedPrefix, receivedReaders, receivedFiles);
     }
-    size_t memoryLimit = Util::computeMemory(Parameters::getInstance().splitMemoryLimit);
+    size_t memoryLimit = getMemoryLimit(Parameters::getInstance());
     ClusterPairWriter pairWriter(exchange, memoryLimit / 4 / sizeof(ClusterPair), compare, nodeKeyOffsets, balancedKeyOffsets);
 
     std::vector<DBKeyType> repKeys;
@@ -1628,7 +1615,7 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
     std::vector<ExchangeReader> repReaders;
     std::vector<FILE *> repFiles;
     openExchange(index, prefix, repReaders, repFiles);
-    size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
+    size_t memoryLimit = getMemoryLimit(par);
     std::string resultDb = clu + "." + SSTR(rank);
     std::string resultIndex = clu + ".index." + SSTR(rank);
     FILE *resultDataFile = FileUtil::openAndDelete(resultDb.c_str(), "w");

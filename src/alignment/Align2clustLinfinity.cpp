@@ -3187,24 +3187,8 @@ int align2clustLinfinity(Parameters &par) {
     bool hasLocalServedBlocks = false;
     // a master that only clusters reads no sequences
     if (par.localDbDir.empty() == false && MMseqsNode::rank >= getFirstAlignNode()) {
-        // ranks on one machine may create it at once
-        if (FileUtil::makeDir(par.localDbDir.c_str()) == false && FileUtil::directoryExists(par.localDbDir.c_str()) == false) {
-            Debug(Debug::ERROR) << "Cannot create local database dir " << par.localDbDir << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        const int localDbFd = open(par.localDbDir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        const StorageKind localDbStorage = getStorageKind(localDbFd);
-        struct stat localDbStat, dbStat;
-        const bool isDbDevice = fstat(localDbFd, &localDbStat) == 0 && stat(par.db1Index.c_str(), &dbStat) == 0 && localDbStat.st_dev == dbStat.st_dev;
-        close(localDbFd);
-        if (localDbStorage != STORAGE_LOCAL_FLASH && localDbStorage != STORAGE_MEMORY) {
-            Debug(Debug::WARNING) << par.localDbDir << " is on " << getStorageName(localDbStorage) << ", not local flash\n";
-        }
-        if (isDbDevice) {
-            Debug(Debug::WARNING) << par.localDbDir << " is on the device of the database\n";
-        }
-        seqDb = FileUtil::copyToLocalDir(par.db1, par.localDbDir + "/" + FileUtil::baseName(par.db3) + "." + SSTR(MMseqsNode::rank), par.threads, localCopies, localCopySize);
-        MMseqsNode::addPhaseTime(phaseValues, "copying the sequences to --local-db-dir", phaseValueTimer);
+        seqDb = FileUtil::getLocalDb(par.db1, par.localDbDir, par.localDbName, par.db3, par.threads, MMseqsNode::rank, localCopies, localCopySize);
+        MMseqsNode::addPhaseTime(phaseValues, "preparing the sequences on --local-db-dir", phaseValueTimer);
     } else if (par.localTmp.empty() == false && MMseqsNode::rank >= getFirstAlignNode()) {
         // ranks on one machine may create it at once
         if (FileUtil::makeDir(par.localTmp.c_str()) == false && FileUtil::directoryExists(par.localTmp.c_str()) == false) {
@@ -3252,7 +3236,7 @@ int align2clustLinfinity(Parameters &par) {
             if (freeSize < servedSize) {
                 Debug(Debug::WARNING) << "Not copying the served blocks to " << par.localTmp << ": it has " << freeSize << " free bytes, the served blocks need " << servedSize << "\n";
             } else {
-                seqDb = FileUtil::copyToLocalDir(par.db1, par.localTmp + "/" + FileUtil::baseName(par.db3) + "." + SSTR(MMseqsNode::rank), par.threads, localCopies, localCopySize, &servedFileRanges);
+                seqDb = FileUtil::copyToLocalDir(par.db1, par.localTmp + "/" + FileUtil::baseName(par.db3) + ".served." + SSTR(MMseqsNode::rank), par.threads, localCopies, localCopySize, &servedFileRanges);
                 hasLocalServedBlocks = true;
                 MMseqsNode::addPhaseTime(phaseValues, "copying the served blocks to --local-tmp", phaseValueTimer);
             }
@@ -3264,7 +3248,7 @@ int align2clustLinfinity(Parameters &par) {
     const size_t dbSize = seqDbr.getSize();
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     // a copy on tmpfs holds the sequences in memory
-    const size_t nodeMemoryLimit = std::max(Util::computeMemory(par.splitMemoryLimit), localCopySize) - localCopySize;
+    const size_t nodeMemoryLimit = MMseqsNode::getMemoryLimit(par, localCopySize);
     const bool isMasterAligning = getFirstAlignNode() == 0;
     const size_t masterMemoryLimit = nodeMemoryLimit / (isMasterAligning ? MASTER_MEMORY_DIVISOR : 1);
     // the master holds the assigned bits and a log buffer per node in both clustering modes
@@ -3401,18 +3385,8 @@ int align2clustLinfinity(Parameters &par) {
         }
         // --local-db-dir copied the data files the members share with the sequence database
         std::string memberSeqDb = par.filterSeqDBFile;
-        if (par.localDbDir.empty() == false && MMseqsNode::rank >= getFirstAlignNode()) {
-            const std::vector<std::string> memberFiles = FileUtil::findDatafiles(par.filterSeqDBFile.c_str());
-            const std::vector<std::string> seqFiles = FileUtil::findDatafiles(par.db1.c_str());
-            bool isSameData = memberFiles.size() == seqFiles.size();
-            for (size_t i = 0; isSameData && i < seqFiles.size(); i++) {
-                struct stat memberStat, seqStat;
-                isSameData = stat(memberFiles[i].c_str(), &memberStat) == 0 && stat(seqFiles[i].c_str(), &seqStat) == 0
-                             && memberStat.st_dev == seqStat.st_dev && memberStat.st_ino == seqStat.st_ino;
-            }
-            if (isSameData) {
-                memberSeqDb = seqDb;
-            }
+        if (par.localDbDir.empty() == false && MMseqsNode::rank >= getFirstAlignNode() && FileUtil::isSameDbData(par.filterSeqDBFile, par.db1)) {
+            memberSeqDb = seqDb;
         }
         memberDbr = new DBReader<DBKeyType>(memberSeqDb.c_str(), (par.filterSeqDBFile + ".index").c_str(), par.threads,
                                             DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);

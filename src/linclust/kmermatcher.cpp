@@ -23,6 +23,7 @@
 #include <sys/stat.h>
 #include <sys/mman.h>
 #include <fcntl.h>
+#include <unistd.h>
 
 #include <limits>
 #include <algorithm>
@@ -2010,7 +2011,7 @@ static void runKmermatcherWithDiagonal(Parameters &par, DBReader<DBKeyType> &seq
 }
 
 template <typename T, bool includeAdjacency, typename L>
-int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
+int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr, size_t localCopyBytes) {
     int querySeqType = seqDbr.getDbtype();
     BaseMatrix *subMat;
     if (Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES)) {
@@ -2039,12 +2040,13 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
     diagCovScale = (par.linclustVersion == Parameters::LINCLUST_VERSION2 && par.kmerPosFilter)
                    ? Parameters::CLUST_LINEAR_DIAG_COV_SCALE : 0.0f;
 
-    size_t memoryLimit=Util::computeMemory(par.splitMemoryLimit);
+    const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(querySeqType) & Parameters::DBTYPE_EXTENDED_LINFINITY;
+    size_t memoryLimit = isLinfinity ? MMseqsNode::getMemoryLimit(par, localCopyBytes) : Util::computeMemory(par.splitMemoryLimit);
 
     Debug(Debug::INFO) << "\n";
     float kmersPerSequenceScale = (Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES)) ?
                                         par.kmersPerSequenceScale.values.nucleotide() : par.kmersPerSequenceScale.values.aminoacid();
-    if (DBReader<DBKeyType>::getExtendedDbtype(querySeqType) & Parameters::DBTYPE_EXTENDED_LINFINITY) {
+    if (isLinfinity) {
         kmermatcherLinfinity<T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit);
     } else {
         size_t totalKmers = computeKmerCount(seqDbr, par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
@@ -2105,11 +2107,11 @@ std::vector<std::pair<size_t, size_t>> setupKmerSplits(Parameters &par, BaseMatr
 }
 
 template <typename T, typename L>
-int kmermatcherByAdjacency(Parameters &par, DBReader<DBKeyType> &seqDbr) {
+int kmermatcherByAdjacency(Parameters &par, DBReader<DBKeyType> &seqDbr, size_t localCopyBytes) {
     if (par.includeAdjacency) {
-        return kmermatcherInner<T, true, L>(par, seqDbr);
+        return kmermatcherInner<T, true, L>(par, seqDbr, localCopyBytes);
     }
-    return kmermatcherInner<T, false, L>(par, seqDbr);
+    return kmermatcherInner<T, false, L>(par, seqDbr, localCopyBytes);
 }
 
 
@@ -2202,11 +2204,19 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     MemoryMapped indexMap;
     bool sortedByOffset = false;
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
+    std::vector<std::string> localCopies;
+    size_t localCopyBytes = 0;
+    std::string seqDb = par.db1;
     DBReader<DBKeyType> *seqDbrPtr;
     if (isLinfinity) {
-        seqDbrPtr = new DBReader<DBKeyType>(par.db1.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
+        seqDb = FileUtil::getLocalDb(par.db1, par.localDbDir, par.localDbName, par.db2, par.threads, MMseqsNode::rank, localCopies, localCopyBytes);
+        seqDbrPtr = new DBReader<DBKeyType>(seqDb.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
         seqDbrPtr->open(DBReader<DBKeyType>::NOSORT);
     } else {
+        if (par.localDbDir.empty() == false) {
+            Debug(Debug::ERROR) << "--local-db-dir supports only linfinity databases (--createdb-mode 3)\n";
+            EXIT(EXIT_FAILURE);
+        }
         seqDbrPtr = openReaderWithMappedIndex(par, indexMap,
                                               par.db2 + "_index_" + SSTR(MMseqsMPI::rank), sortedByOffset);
     }
@@ -2302,19 +2312,26 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     }
 
     if (seqDbr.getMaxSeqLen() < SHRT_MAX) {
-        kmermatcherByAdjacency<short, unsigned short>(par, seqDbr);
+        kmermatcherByAdjacency<short, unsigned short>(par, seqDbr, localCopyBytes);
     }
     else if (seqDbr.getMaxSeqLen() < USHRT_MAX) {
-        kmermatcherByAdjacency<int, unsigned short>(par, seqDbr);
+        kmermatcherByAdjacency<int, unsigned short>(par, seqDbr, localCopyBytes);
     }
     else {
-        kmermatcherByAdjacency<int, int>(par, seqDbr);
+        kmermatcherByAdjacency<int, int>(par, seqDbr, localCopyBytes);
     }
 
     delete[] representativeBits;
     seqDbr.close();
     delete seqDbrPtr;
     indexMap.close();
+
+    for (size_t i = 0; i < localCopies.size(); i++) {
+        FileUtil::remove(localCopies[i].c_str());
+    }
+    if (localCopies.empty() == false) {
+        rmdir(FileUtil::dirName(seqDb).c_str());
+    }
 
     return EXIT_SUCCESS;
 }

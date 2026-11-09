@@ -181,6 +181,10 @@ The first node (rank 0) needs more memory than the others, about 480 GB or more 
 
 `align2clust` with the default `--cov-mode 1` is fast when every aligning node holds its share of the sequence database in memory, that is the sequence bytes divided by the aligning nodes. Otherwise it reads the sequences key by key. With `--local-tmp` on node-local flash, each aligning node first copies the sequence blocks it serves there and reads them from there. With two or more nodes the first node does not align, so choose the number of nodes such that (nodes - 1) x 0.6 x node memory is at least the size of the sequence database, which is about 190 bytes per sequence for MGnify-like data.
 
+With `--local-db-dir /local/ssd`, `lin8clust` copies the whole sequence data once per rank, reuses it in `clusthashfast`, both `kmermatcher` passes and both `align2clust` passes, and removes it after the last alignment pass. Each rank needs room for the whole sequence database, including when several ranks share a machine. Indexes and representative bits stay on shared storage and are read from the database of the current pass. Copies on `/dev/shm` count against the memory limit in every step while they exist. The node runner must keep ranks on the same machines across steps. A standalone module creates and removes its own copy.
+
+`cpdb sourceDB copyName --local-db-dir /local/ssd` copies only the linfinity sequence data and its dbtype to `/local/ssd/copyName.full.<rank>/copyName`; `copyName` must have no directory component. The dbtype is published atomically after all data files have been copied. `rmdb copyName --local-db-dir /local/ssd` removes that rank's copy. The workflow runs both commands through the node runner and cleans up after the last consumer on success. A failed run may leave its copy behind; restarting the workflow recreates it at the same path. Completed copies are reused only within that workflow invocation. Standalone modules also use a fixed path derived from the source name, output path and rank, so a restart replaces their previous copy.
+
 ## Contributors
 
 MMseqs2 exists thanks to all the people who contribute. 

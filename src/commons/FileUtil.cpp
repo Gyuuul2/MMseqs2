@@ -167,6 +167,44 @@ void FileUtil::writeFile(const std::string &pathToFile, const unsigned char *dat
     }
 }
 
+std::string FileUtil::readFile(const std::string &file) {
+    FILE *handle = openFileOrDie(file.c_str(), "r", true);
+    struct stat sb;
+    if (fstat(fileno(handle), &sb) != 0) {
+        Debug(Debug::ERROR) << "Cannot read " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    std::string content(sb.st_size, '\0');
+    size_t readSize = content.empty() ? 0 : fread(&content[0], sizeof(char), content.size(), handle);
+    int closeResult = fclose(handle);
+    if (readSize != content.size() || closeResult != 0) {
+        Debug(Debug::ERROR) << "Cannot read " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return content;
+}
+
+void FileUtil::publishFile(const std::string &file, const std::string &content) {
+    std::string tmpFile = file + ".tmp";
+    FILE *handle = openAndDelete(tmpFile.c_str(), "w");
+    if (fwrite(content.c_str(), sizeof(char), content.size(), handle) != content.size()) {
+        Debug(Debug::ERROR) << "Cannot write " << tmpFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fflush(handle) != 0 || fsync(fileno(handle)) != 0) {
+        Debug(Debug::ERROR) << "Cannot flush " << tmpFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fclose(handle) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << tmpFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (rename(tmpFile.c_str(), file.c_str()) != 0) {
+        Debug(Debug::ERROR) << "Cannot rename " << tmpFile << " to " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
 // NFS caches that a name is missing; Lustre, GPFS and local file systems are coherent across machines, unknown storage counts as NFS
 bool FileUtil::needsDirectoryRefresh(const std::string &file) {
     static std::mutex directoriesMutex;
@@ -573,13 +611,98 @@ std::string FileUtil::sanitizeFilename(std::string name){
     return name;
 }
 
+bool FileUtil::isDbName(const std::string &name) {
+    return name.empty() == false && name != "." && name != ".." && baseName(name) == name;
+}
+
+bool FileUtil::isSameDbData(const std::string &firstDb, const std::string &secondDb) {
+    const std::vector<std::string> firstFiles = findDatafiles(firstDb.c_str());
+    const std::vector<std::string> secondFiles = findDatafiles(secondDb.c_str());
+    if (firstFiles.empty() || firstFiles.size() != secondFiles.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < firstFiles.size(); i++) {
+        struct stat firstStat, secondStat;
+        if (stat(firstFiles[i].c_str(), &firstStat) != 0 || stat(secondFiles[i].c_str(), &secondStat) != 0
+            || firstStat.st_dev != secondStat.st_dev || firstStat.st_ino != secondStat.st_ino) {
+            return false;
+        }
+    }
+    return true;
+}
+
+std::string FileUtil::getLocalDbPath(const std::string &prefix, unsigned int rank) {
+    return prefix + ".full." + SSTR(rank) + "/" + baseName(prefix);
+}
+
+size_t FileUtil::getLocalDbMemoryBytes(const std::string &db) {
+    const std::vector<std::string> files = findDatafiles(db.c_str());
+    if (files.empty()) {
+        Debug(Debug::ERROR) << "No datafile could be found for " << db << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    FILE *handle = openFileOrDie(files[0].c_str(), "r", true);
+    const bool isInMemory = getStorageKind(fileno(handle)) == STORAGE_MEMORY;
+    if (fclose(handle) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << files[0] << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    size_t memoryBytes = 0;
+    if (isInMemory) {
+        for (size_t i = 0; i < files.size(); i++) {
+            const size_t fileBytes = getFileSize(files[i]);
+            if (fileBytes == static_cast<size_t>(-1)) {
+                Debug(Debug::ERROR) << "Cannot count the sequence bytes of " << db << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            memoryBytes += fileBytes;
+        }
+    }
+    return memoryBytes;
+}
+
+std::string FileUtil::getLocalDb(const std::string &db, const std::string &localDir, const std::string &localName, const std::string &outputDb, int threads, unsigned int rank,
+                                std::vector<std::string> &copies, size_t &memoryBytes) {
+    memoryBytes = 0;
+    if (localDir.empty()) {
+        if (localName.empty() == false) {
+            Debug(Debug::ERROR) << "--local-db-name requires --local-db-dir\n";
+            EXIT(EXIT_FAILURE);
+        }
+        return db;
+    }
+    if (localName.empty() == false) {
+        if (isDbName(localName) == false) {
+            Debug(Debug::ERROR) << "--local-db-name requires a database name without a directory\n";
+            EXIT(EXIT_FAILURE);
+        }
+        const std::string localDb = getLocalDbPath(localDir + "/" + localName, rank);
+        if (fileExists((localDb + ".dbtype").c_str()) == false || parseDbType(localDb.c_str()) != parseDbType(db.c_str())) {
+            Debug(Debug::ERROR) << "The workflow sequence copy is incomplete: " << localDb << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        // The workflow copied SOURCE before starting its consumers. Only .dbtype marks completion.
+        // Leave copies empty: the workflow owns the files; linfinity memory budgets reserve their tmpfs bytes.
+        return localDb;
+    }
+    if (directoryExists(localDir.c_str()) == false && makeDir(localDir.c_str()) == false && directoryExists(localDir.c_str()) == false) {
+        Debug(Debug::ERROR) << "Cannot create local database dir " << localDir << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    // A restart of this output replaces its copy; different outputs use different names.
+    const std::string outputPath = getRealPathFromSymLink(dirName(outputDb)) + "/" + baseName(outputDb);
+    const std::string copyName = baseName(db) + "_" + SSTR(Util::hash(outputPath.c_str(), outputPath.size()));
+    const std::string localDb = getLocalDbPath(localDir + "/" + copyName, rank);
+    return copyToLocalDir(db, dirName(localDb), threads, copies, memoryBytes, NULL, copyName);
+}
+
 // the bytes copied at once by a thread
 static const size_t LOCAL_COPY_IO_BYTES = 64 * 1024 * 1024;
 // shared storage serves this many large reads of a copy at once
 static const int LOCAL_COPY_THREADS = 64;
 
 std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &memoryBytes,
-                                     const std::vector<std::vector<std::pair<size_t, size_t> > > *fileRanges) {
+                                     const std::vector<std::vector<std::pair<size_t, size_t> > > *fileRanges, const std::string &copyName) {
     const std::vector<std::string> dataFiles = findDatafiles(db.c_str());
     if (dataFiles.empty()) {
         Debug(Debug::ERROR) << "No datafile could be found for " << db << "\n";
@@ -589,7 +712,36 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
         Debug(Debug::ERROR) << "Cannot create " << localDir << "\n";
         EXIT(EXIT_FAILURE);
     }
-    const std::string localDb = localDir + "/" + baseName(db);
+    const int localFd = open(localDir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (localFd < 0) {
+        Debug(Debug::ERROR) << "Cannot open local database dir " << localDir << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    const StorageKind localStorage = getStorageKind(localFd);
+    struct stat localStat, dbStat;
+    const bool isDbDevice = fstat(localFd, &localStat) == 0 && stat((db + ".index").c_str(), &dbStat) == 0 && localStat.st_dev == dbStat.st_dev;
+    close(localFd);
+    if (localStorage != STORAGE_LOCAL_FLASH && localStorage != STORAGE_MEMORY) {
+        Debug(Debug::WARNING) << localDir << " is on " << getStorageName(localStorage) << ", not local flash\n";
+    }
+    if (isDbDevice) {
+        Debug(Debug::WARNING) << localDir << " is on the device of the database\n";
+    }
+    const std::string localDb = localDir + "/" + (copyName.empty() ? baseName(db) : copyName);
+    if (isSameDbData(db, localDb)) {
+        Debug(Debug::ERROR) << "Cannot copy a database onto its own data: " << localDb << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fileExists((localDb + ".dbtype").c_str())) {
+        remove((localDb + ".dbtype").c_str());
+    }
+    if (fileRanges == NULL) {
+        // Recreate whole copies on restart, including any old data file suffixes.
+        const std::vector<std::string> previousFiles = findDatafiles(localDb.c_str());
+        for (size_t i = 0; i < previousFiles.size(); i++) {
+            remove(previousFiles[i].c_str());
+        }
+    }
     std::vector<size_t> fileBytes(dataFiles.size());
     std::vector<std::pair<size_t, size_t> > chunks;
     std::vector<size_t> chunkBytes;
@@ -624,7 +776,6 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
         Debug(Debug::ERROR) << localDir << " needs " << totalBytes << " free bytes for the sequences of " << db << "\n";
         EXIT(EXIT_FAILURE);
     }
-    memoryBytes = (getStorageKind(copyFds[0]) == STORAGE_MEMORY) ? totalBytes : 0;
     const int copyThreads = std::max(1, std::min(std::min(threads, LOCAL_COPY_THREADS), (int) chunks.size()));
 #pragma omp parallel num_threads(copyThreads)
     {
@@ -642,7 +793,13 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
             EXIT(EXIT_FAILURE);
         }
     }
-    copyFile(db + ".dbtype", localDb + ".dbtype");
+    memoryBytes = (fileRanges == NULL) ? getLocalDbMemoryBytes(localDb) : ((localStorage == STORAGE_MEMORY) ? totalBytes : 0);
+    const std::string dbtype = readFile(db + ".dbtype");
+    if (dbtype.size() != sizeof(int)) {
+        Debug(Debug::ERROR) << "Invalid database type file: " << db << ".dbtype\n";
+        EXIT(EXIT_FAILURE);
+    }
+    publishFile(localDb + ".dbtype", dbtype);
     copies.push_back(localDb + ".dbtype");
     Debug(Debug::INFO) << "Copied " << totalBytes << " bytes of " << db << " to " << localDb << "\n";
     return localDb;

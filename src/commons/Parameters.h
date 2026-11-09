@@ -683,6 +683,7 @@ public:
     std::string filterCluDBFile;
     std::string filterSeqDBFile;
     std::string localDbDir;
+    std::string localDbName;
 
     // besthitperset
     bool simpleBestHit;
@@ -1093,6 +1094,7 @@ public:
     PARAMETER(PARAM_FILTER_CLUDB_FILE)
     PARAMETER(PARAM_FILTER_SEQDB_FILE)
     PARAMETER(PARAM_LOCAL_DB_DIR)
+    PARAMETER(PARAM_LOCAL_DB_NAME)
 
     //besthitperset
     PARAMETER(PARAM_SIMPLE_BEST_HIT)
@@ -1237,6 +1239,8 @@ public:
     std::vector<MMseqsParameter*> verbandcompression;
     std::vector<MMseqsParameter*> onlythreads;
     std::vector<MMseqsParameter*> threadsandcompression;
+    std::vector<MMseqsParameter*> cpdb;
+    std::vector<MMseqsParameter*> rmdb;
 
     std::vector<MMseqsParameter*> alignall;
     std::vector<MMseqsParameter*> align;

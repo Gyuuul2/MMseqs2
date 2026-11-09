@@ -17,6 +17,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include <unistd.h>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -316,7 +317,17 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     par.seqIdThr = (float)Parameters::CLUST_HASH_DEFAULT_MIN_SEQ_ID / 100.0f;
     par.parseParameters(argc, argv, command, true, 0, 0);
 
-    DBReader<DBKeyType> reader(par.db1.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
+    std::vector<std::string> localCopies;
+    size_t localCopyBytes = 0;
+    std::string seqDb = par.db1;
+    if (par.localDbDir.empty() == false) {
+        if ((DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {
+            Debug(Debug::ERROR) << "--local-db-dir supports only linfinity databases (--createdb-mode 3)\n";
+            EXIT(EXIT_FAILURE);
+        }
+        seqDb = FileUtil::getLocalDb(par.db1, par.localDbDir, par.localDbName, par.db2, par.threads, MMseqsNode::rank, localCopies, localCopyBytes);
+    }
+    DBReader<DBKeyType> reader(seqDb.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
     reader.open(DBReader<DBKeyType>::NOSORT);
     if (Parameters::isEqualDbtype(reader.getDbtype(), Parameters::DBTYPE_AMINO_ACIDS) == false) {
         Debug(Debug::ERROR) << "clusthashfast only supports amino acid databases\n";
@@ -375,7 +386,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         representativeWriter.open();
     }
 
-    size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
+    size_t memoryLimit = isLinfinity ? MMseqsNode::getMemoryLimit(par, localCopyBytes) : Util::computeMemory(par.splitMemoryLimit);
     // linfinity: one representative bit per key
     size_t bitWords = isLinfinity ? (localKeyCount + 63) / 64 : 0;
     uint64_t *representativeBits = new(std::nothrow) uint64_t[bitWords]();
@@ -822,5 +833,11 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     Util::releasePages(hashIdPairs, allocatedHashEntryCount * sizeof(HashEntry));
     delete[] hashIdPairs;
     reader.close();
+    for (size_t i = 0; i < localCopies.size(); i++) {
+        FileUtil::remove(localCopies[i].c_str());
+    }
+    if (localCopies.empty() == false) {
+        rmdir(FileUtil::dirName(seqDb).c_str());
+    }
     return EXIT_SUCCESS;
 }

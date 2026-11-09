@@ -10,6 +10,7 @@
 #include <vector>
 
 class Timer;
+class Parameters;
 template <typename T> class DBReader;
 
 struct ClusterPair {
@@ -110,6 +111,8 @@ public:
     };
 
     static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0, const std::string &localDirectory = "", size_t *localNodes = NULL);
+    // Reserve tmpfs sequence copies only in linfinity paths; localCopyBytes is for a module-owned copy.
+    static size_t getMemoryLimit(const Parameters &par, size_t localCopyBytes = 0);
 
     struct ExchangeReader {
         FILE *file;

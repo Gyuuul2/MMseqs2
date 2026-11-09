@@ -24,7 +24,7 @@ int createsubdb(int argc, const char **argv, const Command& command) {
         size_t keyCount = fileKeyOffsets[MMseqsNode::rank + 1] - firstKey;
         std::vector<uint64_t> bits((keyCount + 63) / 64, 0);
         std::vector<DBKeyType> repKeys;
-        size_t splitKeys = std::max((size_t) 1, Util::computeMemory(par.splitMemoryLimit) / 16 / sizeof(DBKeyType));
+        size_t splitKeys = std::max((size_t) 1, MMseqsNode::getMemoryLimit(par) / 16 / sizeof(DBKeyType));
         for (size_t splitBegin = firstKey; splitBegin < firstKey + keyCount; splitBegin += splitKeys) {
             MMseqsNode::readClusterKeys(par.db1, cluKeyOffsets, splitBegin, std::min(firstKey + keyCount, splitBegin + splitKeys), repKeys);
             for (size_t i = 0; i < repKeys.size(); i++) {

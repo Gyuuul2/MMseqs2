@@ -32,6 +32,21 @@ INPUT="$1"
 TMP_PATH="$3"
 SOURCE="$INPUT"
 PIDS=""
+LOCAL_DB_ACTIVE=""
+
+cleanupLocalDb() {
+    [ -n "$LOCAL_DB_ACTIVE" ] || return 0
+    LOCAL_DB_ACTIVE=""
+    # shellcheck disable=SC2086
+    $RUNNER "$MMSEQS" rmdb "$LOCAL_DB_NAME" ${LOCAL_DB_REMOVE_PAR}
+}
+
+if [ -n "$LOCAL_DB_NAME" ]; then
+    LOCAL_DB_ACTIVE=1
+    # shellcheck disable=SC2086
+    $RUNNER "$MMSEQS" cpdb "$SOURCE" "$LOCAL_DB_NAME" ${LOCAL_DB_COPY_PAR} \
+        || fail "copying the sequence database to --local-db-dir died"
+fi
 
 if [ -n "$CLUSTHASH" ] || [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
     CLUDB="${TMP_PATH}/clu"
@@ -68,6 +83,13 @@ if notExistsBeforeRefinement "${CLUDB}.dbtype"; then
 fi
 
 # 2. Merge clusthash pre-clusters with alignment clusters
+MERGECLU_PAR1="$MERGECLU_PAR"
+if [ "$LINCLUST_ITERATIONS" -lt 2 ]; then
+    cleanupLocalDb || fail "removing the local sequence database died"
+else
+    # The sequence copy stays on tmpfs until the refinement alignment ends.
+    MERGECLU_PAR1="$MERGECLU_LOCAL_PAR"
+fi
 if [ -n "$CLUSTHASH" ]; then
     if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
         MERGED="${TMP_PATH}/clu_merged"
@@ -77,7 +99,7 @@ if [ -n "$CLUSTHASH" ]; then
     if notExistsBeforeRefinement "${MERGED}.dbtype"; then
         # shellcheck disable=SC2086
         $RUNNER "$MMSEQS" mergeclusters "$SOURCE" "$MERGED" \
-            "${TMP_PATH}/input_clusthash_clust" "$CLUDB" ${MERGECLU_PAR} \
+            "${TMP_PATH}/input_clusthash_clust" "$CLUDB" ${MERGECLU_PAR1} \
             || fail "mergeclusters died"
         if [ -n "$REMOVE_TMP" ]; then
             # shellcheck disable=SC2086
@@ -98,7 +120,7 @@ fi
 if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
     if notExists "${TMP_PATH}/input_rep.dbtype" "${TMP_PATH}/pref_rep.dbtype" "${TMP_PATH}/clu_rep.dbtype"; then
         # shellcheck disable=SC2086
-        $RUNNER "$MMSEQS" createsubdb "$CLUDB" "$SOURCE" "${TMP_PATH}/input_rep" ${VERBOSITY} --subdb-mode 1 \
+        $RUNNER "$MMSEQS" createsubdb "$CLUDB" "$SOURCE" "${TMP_PATH}/input_rep" ${CREATESUBDB_PAR} \
             || fail "createsubdb (representatives) died"
     fi
 
@@ -124,6 +146,8 @@ if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
             PIDS="$PIDS $!"
         fi
     fi
+
+    cleanupLocalDb || fail "removing the local sequence database died"
 
     if notExists "$2.dbtype"; then
         # shellcheck disable=SC2086
