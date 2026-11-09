@@ -1349,7 +1349,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     const size_t blockCacheSize = memoryLimit - std::min(memoryLimit, getReservedMemory(maxFetchSize));
     seqDbr.setBlockCacheSize(blockCacheSize);
     const size_t maxPendingPairSize = std::min(memberSplitSize, maxFetchSize);
-    // the copy on --local-tmp holds only the served blocks
+    // a --local-tmp copy holds only the blocks this rank serves, the keys of other nodes come from them
     const bool isReadingDirectly = hasLocalServedBlocks == false && isCacheTooSmall(blockCacheSize);
     if (isAligningNode) {
         MMseqsNode::addPhaseValue(phaseValues, "Block cache", SSTR(blockCacheSize) + " bytes for " + SSTR(static_cast<size_t>(servingNodeCoverableSize)) + " coverable bytes and " + SSTR(servedSequenceSize) + " sequence bytes of the serving node"
@@ -3187,6 +3187,22 @@ int align2clustLinfinity(Parameters &par) {
     bool hasLocalServedBlocks = false;
     // a master that only clusters reads no sequences
     if (par.localDbDir.empty() == false && MMseqsNode::rank >= getFirstAlignNode()) {
+        // ranks on one machine may create it at once
+        if (FileUtil::makeDir(par.localDbDir.c_str()) == false && FileUtil::directoryExists(par.localDbDir.c_str()) == false) {
+            Debug(Debug::ERROR) << "Cannot create local database dir " << par.localDbDir << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        const int localDbFd = open(par.localDbDir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        const StorageKind localDbStorage = getStorageKind(localDbFd);
+        struct stat localDbStat, dbStat;
+        const bool isDbDevice = fstat(localDbFd, &localDbStat) == 0 && stat(par.db1Index.c_str(), &dbStat) == 0 && localDbStat.st_dev == dbStat.st_dev;
+        close(localDbFd);
+        if (localDbStorage != STORAGE_LOCAL_FLASH && localDbStorage != STORAGE_MEMORY) {
+            Debug(Debug::WARNING) << par.localDbDir << " is on " << getStorageName(localDbStorage) << ", not local flash\n";
+        }
+        if (isDbDevice) {
+            Debug(Debug::WARNING) << par.localDbDir << " is on the device of the database\n";
+        }
         seqDb = FileUtil::copyToLocalDir(par.db1, par.localDbDir + "/" + FileUtil::baseName(par.db3) + "." + SSTR(MMseqsNode::rank), par.threads, localCopies, localCopySize);
         MMseqsNode::addPhaseTime(phaseValues, "copying the sequences to --local-db-dir", phaseValueTimer);
     } else if (par.localTmp.empty() == false && MMseqsNode::rank >= getFirstAlignNode()) {
@@ -3383,7 +3399,22 @@ int align2clustLinfinity(Parameters &par) {
         if (MMseqsNode::rank >= getFirstAlignNode()) {
             memberLookup = new ClusterMemberLookup(par.filterCluDBFile, sampledKeyData, entriesPerSampledKey);
         }
-        memberDbr = new DBReader<DBKeyType>(par.filterSeqDBFile.c_str(), (par.filterSeqDBFile + ".index").c_str(), par.threads,
+        // --local-db-dir copied the data files the members share with the sequence database
+        std::string memberSeqDb = par.filterSeqDBFile;
+        if (par.localDbDir.empty() == false && MMseqsNode::rank >= getFirstAlignNode()) {
+            const std::vector<std::string> memberFiles = FileUtil::findDatafiles(par.filterSeqDBFile.c_str());
+            const std::vector<std::string> seqFiles = FileUtil::findDatafiles(par.db1.c_str());
+            bool isSameData = memberFiles.size() == seqFiles.size();
+            for (size_t i = 0; isSameData && i < seqFiles.size(); i++) {
+                struct stat memberStat, seqStat;
+                isSameData = stat(memberFiles[i].c_str(), &memberStat) == 0 && stat(seqFiles[i].c_str(), &seqStat) == 0
+                             && memberStat.st_dev == seqStat.st_dev && memberStat.st_ino == seqStat.st_ino;
+            }
+            if (isSameData) {
+                memberSeqDb = seqDb;
+            }
+        }
+        memberDbr = new DBReader<DBKeyType>(memberSeqDb.c_str(), (par.filterSeqDBFile + ".index").c_str(), par.threads,
                                             DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
         memberDbr->open(DBReader<DBKeyType>::NOSORT);
         MMseqsNode::addPhaseTime(phaseValues, "sampling the cluster index keys", phaseValueTimer);
