@@ -148,6 +148,14 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(querySeqType) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     unsigned int kmerBits = isLinfinity ? getKmerBits(subMat, par.kmerSize) : 0;
     size_t keySplitFirstKey = readChunkOffsets.front();
+    // a chunk without a representative has no k-mers
+    std::vector<size_t> readChunks;
+    for (size_t i = 0; i + 1 < readChunkOffsets.size(); i++) {
+        if (representativeBits == NULL
+            || Util::countSetBits(representativeBits, readChunkOffsets[i] - sendSplitFirstKey, readChunkOffsets[i + 1] - sendSplitFirstKey) > 0) {
+            readChunks.push_back(i);
+        }
+    }
 
     ScoreMatrix two;
     ScoreMatrix three;
@@ -221,13 +229,14 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
         SequencePosition * kmers = (SequencePosition *) malloc((par.pickNbest * (par.maxSeqLen + 1) + 1) * sizeof(SequencePosition) * 2);
         Util::checkAllocation(kmers, "Can not allocate kmers memory in fillKmerPositionArray");
         size_t kmersArraySize = par.maxSeqLen;
-        for (size_t i = 0; i + 1 < readChunkOffsets.size(); i++) {
-            size_t start = readChunkOffsets[i];
-            size_t bucketSize = readChunkOffsets[i + 1] - start;
+        for (size_t readChunk = 0; readChunk < readChunks.size(); readChunk++) {
+            size_t start = readChunkOffsets[readChunks[readChunk]];
+            size_t bucketSize = readChunkOffsets[readChunks[readChunk] + 1] - start;
             if (thread_idx == 0) {
                 seqDbr.loadData(start, start + bucketSize);
-                if (isLinfinity && i + 2 < readChunkOffsets.size()) {
-                    seqDbr.prefetchData(readChunkOffsets[i + 1], readChunkOffsets[i + 2]);
+                if (isLinfinity && readChunk + 1 < readChunks.size()) {
+                    size_t nextChunk = readChunks[readChunk + 1];
+                    seqDbr.prefetchData(readChunkOffsets[nextChunk], readChunkOffsets[nextChunk + 1]);
                 }
             }
 #pragma omp barrier

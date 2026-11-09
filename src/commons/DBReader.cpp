@@ -917,10 +917,9 @@ template <typename T> size_t DBReader<T>::findIdRange(size_t id) {
 }
 
 template <typename T> size_t DBReader<T>::getSeqLenFromRange(size_t &range, size_t id) {
-    if (range == SIZE_MAX) {
+    if (range == SIZE_MAX || (range + 1 < indexSize && indexIdToNum(&index[range + 1].id) <= id)) {
         range = findIdRange(id);
     }
-    for (; range + 1 < indexSize && indexIdToNum(&index[range + 1].id) <= id; range++) {}
     return index[range].length - 2;
 }
 

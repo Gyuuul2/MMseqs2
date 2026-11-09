@@ -641,10 +641,17 @@ struct FetchedSequences {
     std::vector<size_t> entryOffsets;
 };
 
-static const char *findFetchedKey(const FetchedSequences &sequences, size_t fetchSource, DBKeyType key) {
+static const char *findFetchedKey(const FetchedSequences &sequences, size_t fetchSource, DBKeyType key, size_t *seqLen = NULL) {
     const DBKeyType *keys = sequences.keys.data();
     const DBKeyType *found = std::lower_bound(keys + sequences.fetchSourceKeyOffsets[fetchSource], keys + sequences.fetchSourceKeyOffsets[fetchSource + 1], key);
-    return (found != keys + sequences.fetchSourceKeyOffsets[fetchSource + 1] && *found == key) ? sequences.entries + sequences.entryOffsets[found - keys] : NULL;
+    if (found == keys + sequences.fetchSourceKeyOffsets[fetchSource + 1] || *found != key) {
+        return NULL;
+    }
+    const size_t entry = found - keys;
+    if (seqLen != NULL) {
+        *seqLen = sequences.entryOffsets[entry + 1] - sequences.entryOffsets[entry] - 2;
+    }
+    return sequences.entries + sequences.entryOffsets[entry];
 }
 
 static const size_t PUBLISH_SIZE = 4 * 1024 * 1024;
@@ -1141,6 +1148,7 @@ private:
                 entryTargets[j] = ((j > 0) ? entryTargets[j - 1] : 0) + Util::getPrefKey(data);
             }
             size_t j = firstRecord + entryRecordOffsets[entry];
+            size_t targetRange = SIZE_MAX;
             for (size_t first = 0; first < targetCount; first += maxRecordTargetCount, j++) {
                 RepTargetsRecord &record = records[j];
                 record.repOrderKeyFirstTarget.repKey = (sizeClassCount - 1 - getSizeClass(targetCount, sizeClassCount)) * paddedDbSize + repKey;
@@ -1149,7 +1157,7 @@ private:
                 record.targetOffset = entryTargets + first - targets.data();
                 record.readSize = repSize;
                 for (unsigned int i = 0; i < record.targetCount; i++) {
-                    record.readSize += seqDbr.getEntryLen(entryTargets[first + i]) + FETCHED_KEY_SIZE;
+                    record.readSize += seqDbr.getSeqLenFromRange(targetRange, entryTargets[first + i]) + 2 + FETCHED_KEY_SIZE;
                 }
                 prefReadFetchSize += record.readSize;
             }
@@ -1356,12 +1364,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                  + (isReadingDirectly ? ", the sequences are read directly" : ""));
     }
     size_t fetchBytesLimit = std::min(maxFetchSize / 64, FIRST_FETCH_SIZE);
-    const auto getFetchedEntry = [&](const FetchedSequences &sequences, size_t key) -> const char * {
-        const char *data = findFetchedKey(sequences, nodes, key);
-        return (data != NULL) ? data : findFetchedKey(sequences, isReadingDirectly ? rank : getKeyServingNode(seqDbr, key), key);
+    const auto getFetchedEntry = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL) -> const char * {
+        const char *data = findFetchedKey(sequences, nodes, key, seqLen);
+        return (data != NULL) ? data : findFetchedKey(sequences, isReadingDirectly ? rank : getKeyServingNode(seqDbr, key), key, seqLen);
     };
-    const auto getFetchedSequence = [&](const FetchedSequences &sequences, size_t key) -> const char * {
-        const char *data = getFetchedEntry(sequences, key);
+    const auto getFetchedSequence = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL) -> const char * {
+        const char *data = getFetchedEntry(sequences, key, seqLen);
         // assigned keys are served as zeros
         return (data != NULL && data[0] != '\0') ? data : NULL;
     };
@@ -1562,7 +1570,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     double alignedCells = 0;
     double alignSeconds = 0;
     const auto mapRep = [&](Sequence &query, BlockAligner &blockAligner, size_t repKey) {
-        query.mapSequence(repKey, repKey, getFetchedSequence(currentSequences, repKey), seqDbr.getSeqLen(repKey));
+        size_t repLength = 0;
+        const char *repData = getFetchedSequence(currentSequences, repKey, &repLength);
+        query.mapSequence(repKey, repKey, repData, repLength);
         blockAligner.setQuery(&query);
     };
     const bool isSwipeEnabled = par.align2clustAlignerMode != Parameters::ALIGNER_MODE_FARRAR && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid();
@@ -1591,11 +1601,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     double unpackSeconds = 0;
     // copy, or pack with rawKeys, the entries of keys; assigned keys get zeros
     const auto copyEntries = [&](const DBKeyType *keys, size_t keyCount, const size_t *offsets, char *data, std::vector<DBKeyType> *rawKeys) {
+        size_t loadRange = SIZE_MAX;
         for (size_t first = 0; first < keyCount;) {
             const size_t loadFirst = first;
             // a load fits maxFetchSize
-            for (size_t loadSize = 0; first < keyCount && (first == loadFirst || loadSize + seqDbr.getEntryLen(keys[first]) + 2 * pageSize <= maxFetchSize); first++) {
-                loadSize += seqDbr.getEntryLen(keys[first]) + 2 * pageSize;
+            for (size_t loadSize = 0; first < keyCount; first++) {
+                const size_t entrySize = seqDbr.getSeqLenFromRange(loadRange, keys[first]) + 2 + 2 * pageSize;
+                if (first > loadFirst && loadSize + entrySize > maxFetchSize) {
+                    break;
+                }
+                loadSize += entrySize;
             }
             loadKeys.clear();
             for (size_t i = loadFirst; i < first; i++) {
@@ -1616,6 +1631,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #ifdef OPENMP
                 thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
+                // the static chunks give a thread ascending keys
+                size_t packRange = SIZE_MAX;
 #pragma omp for schedule(static)
                 for (size_t i = loadFirst; i < first; i++) {
                     // bits are never cleared
@@ -1623,7 +1640,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         memset(data + offsets[i], 0, offsets[i + 1] - offsets[i]);
                     } else if (rawKeys == NULL) {
                         memcpy(data + offsets[i], seqDbr.getData(keys[i], 0), offsets[i + 1] - offsets[i]);
-                    } else if (packEntry(seqDbr.getData(keys[i], 0), seqDbr.getEntryLen(keys[i]), data + offsets[i]) == false) {
+                    } else if (packEntry(seqDbr.getData(keys[i], 0), seqDbr.getSeqLenFromRange(packRange, keys[i]) + 2, data + offsets[i]) == false) {
                         data[offsets[i]] = PACKED_RAW_CODE;
                         threadRawEntries[thread_idx].push_back(i);
                     }
@@ -2012,10 +2029,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                     const char *code = requestCodes.data();
                     size_t keyCount = 0;
+                    size_t keyRange = SIZE_MAX;
                     for (size_t entrySize = 0; keyCount < readKeys && code < codeEnd; keyCount++) {
                         const char *nextCode = code;
                         const DBKeyType key = ((keyCount > 0) ? keys[keyCount - 1] : servedRequest.lastKey) + Util::getPrefKey(nextCode);
-                        const size_t keySize = isAssigned(key) ? 0 : seqDbr.getEntryLen(key);
+                        const size_t keySize = isAssigned(key) ? 0 : seqDbr.getSeqLenFromRange(keyRange, key) + 2;
                         if (keyCount > 0 && entrySize + keySize > requestEntrySize) {
                             break;
                         }
@@ -2027,11 +2045,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     servedRequest.lastKey = keys[keyCount - 1];
                     requestOffsets.resize(keyCount + 1);
                     requestOffsets[0] = (keyCount + 7) / 8;
-#pragma omp parallel for schedule(static) num_threads(serviceThreads)
-                    for (size_t j = 0; j < keyCount; j++) {
-                        const size_t packedSize = getPackedEntrySize(seqDbr.getEntryLen(keys[j]));
-                        const bool isServed = isAssigned(keys[j]) == false;
-                        requestOffsets[j + 1] = isServed ? packedSize : 0;
+#pragma omp parallel num_threads(serviceThreads)
+                    {
+                        size_t servedKeyRange = SIZE_MAX;
+#pragma omp for schedule(static)
+                        for (size_t j = 0; j < keyCount; j++) {
+                            const size_t packedSize = getPackedEntrySize(seqDbr.getSeqLenFromRange(servedKeyRange, keys[j]) + 2);
+                            const bool isServed = isAssigned(keys[j]) == false;
+                            requestOffsets[j + 1] = isServed ? packedSize : 0;
+                        }
                     }
                     for (size_t j = 0; j < keyCount; j++) {
                         requestOffsets[j + 1] += requestOffsets[j];
@@ -2053,8 +2075,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     servedFileSize += requestOffsets[keyCount];
                     requestOffsets.resize(rawKeys.size() + 1);
                     requestOffsets[0] = 0;
+                    size_t rawKeyRange = SIZE_MAX;
                     for (size_t j = 0; j < rawKeys.size(); j++) {
-                        requestOffsets[j + 1] = requestOffsets[j] + seqDbr.getEntryLen(rawKeys[j]);
+                        requestOffsets[j + 1] = requestOffsets[j] + seqDbr.getSeqLenFromRange(rawKeyRange, rawKeys[j]) + 2;
                     }
                     if (servedFileData.size() < servedFileSize + requestOffsets[rawKeys.size()]) {
                         servedFileData.resize(servedFileSize + requestOffsets[rawKeys.size()]);
@@ -2225,22 +2248,24 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     const RepTargetsRecord &record = records[i];
                     const unsigned int endTarget = (i == batchOffsets[batch + 1]) ? batchFirstTargets[batch + 1] : record.targetCount;
                     const size_t repKey = record.repOrderKeyFirstTarget.repKey % paddedDbSize;
-                    const char *repData = getFetchedSequence(currentSequences, repKey);
+                    size_t repLength = 0;
+                    const char *repData = getFetchedSequence(currentSequences, repKey, &repLength);
                     if (isAssigned(record.repOrderKeyFirstTarget.repKey) || repData == NULL) {
                         continue;
                     }
-                    query.mapSequence(repKey, repKey, repData, seqDbr.getSeqLen(repKey));
+                    query.mapSequence(repKey, repKey, repData, repLength);
                     blockAligner.setQuery(&query);
                     bool blockAlignerInitialized = false;
                     swipeTargets.startRep(record.repOrderKeyFirstTarget.repKey);
                     const DBKeyType *targets = prefilterTargets[currentSequences.prefilterBuffer].data() + record.targetOffset;
                     for (unsigned int j = (i == batchOffsets[batch]) ? batchFirstTargets[batch] : 0; j < endTarget && isAssigned(record.repOrderKeyFirstTarget.repKey) == false; j++) {
                         const DBKeyType targetKey = targets[j];
-                        const char *targetData = getFetchedSequence(currentSequences, targetKey);
+                        size_t targetLength = 0;
+                        const char *targetData = getFetchedSequence(currentSequences, targetKey, &targetLength);
                         if (isAssigned(targetKey) || targetData == NULL) {
                             continue;
                         }
-                        target.mapSequence(targetKey, targetKey, targetData, seqDbr.getSeqLen(targetKey));
+                        target.mapSequence(targetKey, targetKey, targetData, targetLength);
                         unsigned short diagonal = 0;
                         if (alignTarget(par, blockAligner, blockAlignerInitialized, query, target, scoring.scorePerColThreshold, diagonal, NULL, 0, NULL,
                                         isSwipeEnabled ? &swipeTargets : NULL)) {
@@ -2451,14 +2476,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     size_t repKey = acceptedPairs[i].repKey % paddedDbSize;
                     // an assigned key or an uncoverable member fails without a check
                     needsMemberCheck[i] = isAssigned(acceptedPairs[i].repKey) == false && isAssigned(acceptedPairs[i].memberKey) == false;
-                    memberSize[i] = seqDbr.getEntryLen(repKey) + FETCHED_KEY_SIZE;
+                    size_t repSeqLen = seqDbr.getSeqLen(repKey);
+                    memberSize[i] = repSeqLen + 2 + FETCHED_KEY_SIZE;
                     if (needsMemberCheck[i]) {
                         entryReader.start(memberLookup->find(acceptedPairs[i].memberKey));
                     }
                     DBKeyType memberKey;
                     while (needsMemberCheck[i] && memberSize[i] <= maxPendingPairSize && memberLookup->next(entryReader, memberKey)) {
-                        needsMemberCheck[i] = canCoverMember(par, static_cast<int>(seqDbr.getSeqLen(repKey)), static_cast<int>(seqDbr.getSeqLen(memberKey)));
-                        memberSize[i] += seqDbr.getEntryLen(memberKey) + FETCHED_KEY_SIZE;
+                        size_t memberSeqLen = seqDbr.getSeqLen(memberKey);
+                        needsMemberCheck[i] = canCoverMember(par, static_cast<int>(repSeqLen), static_cast<int>(memberSeqLen));
+                        memberSize[i] += memberSeqLen + 2 + FETCHED_KEY_SIZE;
                         threadKeys[thread_idx].push_back(memberKey);
                     }
                     if (needsMemberCheck[i] == false || memberSize[i] > maxPendingPairSize) {
