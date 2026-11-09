@@ -53,7 +53,19 @@ static size_t getMemberIndex(const MemberBits *memberBits, size_t pos) {
     return memberBits[pos / 64].membersBefore + __builtin_popcountll(memberBits[pos / 64].memberMask & ((1ull << (pos % 64)) - 1));
 }
 
+static size_t findRepresentative(const std::vector<std::string> &repSeqs, const char *seq, size_t length, float seqIdThr) {
+    for (size_t rep = 0; rep < repSeqs.size(); rep++) {
+        if (repSeqs[rep].size() == length
+            && static_cast<float>(DistanceCalculator::computeInverseHammingDistance(repSeqs[rep].data(), seq, length)) / static_cast<float>(length) >= seqIdThr) {
+            return rep;
+        }
+    }
+    return repSeqs.size();
+}
+
 static const size_t WRITE_SEQS_PER_THREAD = 1024 * 1024;
+static const size_t LARGE_HASH_GROUP_SIZE = 4096;
+static const size_t REP_CANDIDATES_PER_PASS = 64;
 
 static size_t findHashStart(const HashEntry *hashIdPairs, size_t pos, size_t end) {
     if (pos == 0) {
@@ -382,6 +394,8 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     size_t readChunkBytes = std::min(BatchReader::MAX_INFLIGHT_READ_SIZE, splitMemoryLimit / 4);
     size_t seqBufferLimit = isLinfinity ? splitMemoryLimit / 3 : 0;
     size_t hashIdPairsLimit = splitMemoryLimit - 2 * seqBufferLimit;
+    // an assigned byte per entry of a large hash group
+    size_t hashEntryBytes = sizeof(HashEntry) + 1;
     std::vector<size_t> hashIdPairsCapacity(nodeLengthRanges.size() - 1, 0);
     std::vector<size_t> splitRangeOffsets;
     for (size_t i = 0; i + 1 < nodeLengthRanges.size(); i++) {
@@ -391,7 +405,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             size_t readChunkSeqCount = isLinfinity ? std::min(readChunkBytes / nodeLengthRanges[i].entryLength / 64 * 64, lengthSeqCount) : 0;
             size_t chunkBufferBytes = 2 * reader.getLoadBufferSize(nodeLengthRanges[i].startKey, nodeLengthRanges[i].startKey + readChunkSeqCount);
             size_t keptBytes = isLinfinity ? (lengthSeqCount / 64 + 1) * sizeof(MemberBits) : lengthSeqCount / 4;
-            size_t hashBytes = sizeof(HashEntry) + (isLinfinity ? nodeLengthRanges[i].entryLength - 2 : 0);
+            size_t hashBytes = hashEntryBytes + (isLinfinity ? nodeLengthRanges[i].entryLength - 2 : 0);
             // pairs to write a split length in key order
             size_t pairBytes = isLinfinity ? lengthSeqCount * sizeof(ClusterPair) : 0;
             if ((isLinfinity && readChunkSeqCount == 0) || splitMemoryLimit <= keptBytes + chunkBufferBytes + pairBytes + hashBytes) {
@@ -400,11 +414,11 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                 EXIT(EXIT_FAILURE);
             }
             // copy batches go after the candidates in hashIdPairs
-            hashIdPairsCapacity[i] = (splitMemoryLimit - keptBytes - chunkBufferBytes - pairBytes) / sizeof(HashEntry);
+            hashIdPairsCapacity[i] = (splitMemoryLimit - keptBytes - chunkBufferBytes - pairBytes) / hashEntryBytes;
         }
         if (splitRangeOffsets.empty()
             || (isLinfinity ? nodeLengthRanges[i + 1].offset - nodeLengthRanges[splitRangeOffsets.back()].offset + 2 * Util::getPageSize() : 0) > seqBufferLimit
-            || (nodeLengthRanges[i + 1].startKey - nodeLengthRanges[splitRangeOffsets.back()].startKey) * sizeof(HashEntry) > hashIdPairsLimit) {
+            || (nodeLengthRanges[i + 1].startKey - nodeLengthRanges[splitRangeOffsets.back()].startKey) * hashEntryBytes > hashIdPairsLimit) {
             splitRangeOffsets.push_back(i);
         }
     }
@@ -547,6 +561,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
 
             // cut tasks before hash becomes the representative id
             cutThreadOffsets(rangeHashIdPairs, 0, hashedSeqCount, taskOffsets);
+            std::vector<std::pair<size_t, size_t>> largeGroups;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
             for (size_t task = 0; task < taskOffsets.size() - 1; task++) {
                 unsigned int thread = 0;
@@ -559,6 +574,14 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     size_t hashGroupEnd = hashGroupBegin + 1;
                     while (hashGroupEnd < taskEnd && rangeHashIdPairs[hashGroupEnd].hash == rangeHashIdPairs[hashGroupBegin].hash) {
                         hashGroupEnd++;
+                    }
+                    if (hashGroupEnd - hashGroupBegin > LARGE_HASH_GROUP_SIZE) {
+#pragma omp critical
+                        {
+                            largeGroups.emplace_back(hashGroupBegin, hashGroupEnd);
+                        }
+                        hashGroupBegin = hashGroupEnd;
+                        continue;
                     }
                     // the first id is already smallest; find the smallest unassigned id after swaps
                     for (size_t i = hashGroupBegin; i < hashGroupEnd;) {
@@ -590,6 +613,54 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                         }
                     }
                     hashGroupBegin = hashGroupEnd;
+                }
+            }
+
+            // pick representatives serially, assign the rest in parallel
+            std::sort(largeGroups.begin(), largeGroups.end());
+            std::vector<char> assigned;
+            std::vector<DBLocalId> reps;
+            std::vector<std::string> repSeqs;
+            for (size_t group = 0; group < largeGroups.size(); group++) {
+                size_t begin = largeGroups[group].first;
+                size_t end = largeGroups[group].second;
+                assigned.assign(end - begin, 0);
+                for (size_t i = begin; i < end;) {
+                    reps.clear();
+                    repSeqs.clear();
+                    for (size_t candidates = 0; i < end && candidates < REP_CANDIDATES_PER_PASS; i++) {
+                        if (assigned[i - begin]) {
+                            continue;
+                        }
+                        candidates++;
+                        DBLocalId id = rangeHashIdPairs[i].id;
+                        size_t seqLength = isCopyingSeqs ? length : reader.getSeqLen(id);
+                        const char *seq = (batchSeqs == NULL) ? reader.getData(id, 0) : batchSeqs + getMemberIndex(memberBits, id - splitFirstKey) * length;
+                        size_t rep = findRepresentative(repSeqs, seq, seqLength, par.seqIdThr);
+                        if (rep == repSeqs.size()) {
+                            reps.push_back(id);
+                            repSeqs.emplace_back(seq, seqLength);
+                        }
+                        rangeHashIdPairs[i].hash = reps[rep];
+                    }
+#pragma omp parallel for schedule(dynamic, 100) num_threads(par.threads)
+                    for (size_t j = i; j < end; j++) {
+                        unsigned int thread = 0;
+#ifdef OPENMP
+                        thread = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+                        if (assigned[j - begin]) {
+                            continue;
+                        }
+                        DBLocalId id = rangeHashIdPairs[j].id;
+                        size_t seqLength = isCopyingSeqs ? length : reader.getSeqLen(id);
+                        const char *seq = (batchSeqs == NULL) ? reader.getData(id, thread) : batchSeqs + getMemberIndex(memberBits, id - splitFirstKey) * length;
+                        size_t rep = findRepresentative(repSeqs, seq, seqLength, par.seqIdThr);
+                        if (rep < repSeqs.size()) {
+                            rangeHashIdPairs[j].hash = reps[rep];
+                            assigned[j - begin] = 1;
+                        }
+                    }
                 }
             }
 
