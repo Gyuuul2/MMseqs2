@@ -625,7 +625,8 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
         EXIT(EXIT_FAILURE);
     }
     memoryBytes = (getStorageKind(copyFds[0]) == STORAGE_MEMORY) ? totalBytes : 0;
-#pragma omp parallel num_threads(std::max(1, std::min(threads, LOCAL_COPY_THREADS)))
+    const int copyThreads = std::max(1, std::min(std::min(threads, LOCAL_COPY_THREADS), (int) chunks.size()));
+#pragma omp parallel num_threads(copyThreads)
     {
         std::vector<char> buffer(LOCAL_COPY_IO_BYTES);
 #pragma omp for schedule(dynamic, 1)

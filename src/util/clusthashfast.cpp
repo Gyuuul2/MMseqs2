@@ -381,7 +381,8 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     uint64_t *representativeBits = new(std::nothrow) uint64_t[bitWords]();
     Util::checkAllocation(representativeBits, "Can not allocate representative bit memory");
     // key, newline, entry end and index entry, doubled for growth
-    size_t writeBufferBytes = par.threads * WRITE_SEQS_PER_THREAD * 2 * (20 + 1 + 1 + 2 * sizeof(uint64_t));
+    size_t writeSeqBytes = 2 * (20 + 1 + 1 + 2 * sizeof(uint64_t));
+    size_t writeBufferBytes = std::min(localKeyCount, par.threads * WRITE_SEQS_PER_THREAD) * writeSeqBytes;
     if (bitWords * sizeof(uint64_t) + writeBufferBytes >= memoryLimit) {
         Debug(Debug::ERROR) << "Not enough memory to run clusthashfast. Memory limit: " << memoryLimit
                             << " bytes, the representative bits and write buffers need: " << bitWords * sizeof(uint64_t) + writeBufferBytes << " bytes.\n"
@@ -409,7 +410,8 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             // pairs to write a split length in key order
             size_t pairBytes = isLinfinity ? lengthSeqCount * sizeof(ClusterPair) : 0;
             if ((isLinfinity && readChunkSeqCount == 0) || splitMemoryLimit <= keptBytes + chunkBufferBytes + pairBytes + hashBytes) {
-                Debug(Debug::ERROR) << "Not enough memory to hash " << lengthSeqCount << " sequences\n"
+                Debug(Debug::ERROR) << "Not enough memory to hash " << lengthSeqCount << " sequences. Memory limit: " << splitMemoryLimit
+                                    << " bytes, the kept bits, read chunks, pairs and one hash entry need: " << keptBytes + chunkBufferBytes + pairBytes + hashBytes << " bytes.\n"
                                     << "Raise RAM size or --split-memory-limit.\n";
                 EXIT(EXIT_FAILURE);
             }
@@ -683,6 +685,12 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                             clusterEnd++;
                         }
                         DBLocalId repId = rangeHashIdPairs[clusterBegin].id;
+                        if ((clusterEnd - clusterBegin) * writeSeqBytes > writeBufferBytes) {
+                            Debug(Debug::ERROR) << "Not enough memory to write the cluster of representative " << reader.getDbKey(repId) << " with " << clusterEnd - clusterBegin
+                                                << " members. The write buffers hold: " << writeBufferBytes << " bytes, the cluster needs: " << (clusterEnd - clusterBegin) * writeSeqBytes << " bytes.\n"
+                                                << "Raise RAM size or --split-memory-limit.\n";
+                            EXIT(EXIT_FAILURE);
+                        }
                         if (isLinfinity) {
                             __sync_fetch_and_or(&representativeBits[(repId - localFirstKey) / 64], 1ull << ((repId - localFirstKey) % 64));
                         }

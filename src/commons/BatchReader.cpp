@@ -30,7 +30,7 @@ StorageKind getStorageKind(int fd) {
     if (fstatfs(fd, &fs) != 0) {
         return STORAGE_UNKNOWN;
     }
-    // GPFS, Lustre | NFS | tmpfs | ext2/3/4, xfs, btrfs, f2fs, zfs
+    // GPFS, Lustre | NFS | tmpfs | ext2/3/4, xfs, btrfs, f2fs, zfs, overlayfs
     switch (static_cast<unsigned int>(fs.f_type)) {
         case 0x47504653: case 0x0BD00BD0:
             return STORAGE_PARALLEL_FS;
@@ -38,7 +38,7 @@ StorageKind getStorageKind(int fd) {
             return STORAGE_NFS;
         case 0x01021994:
             return STORAGE_MEMORY;
-        case 0xEF53: case 0x58465342: case 0x9123683E: case 0xF2F52010: case 0x2FC12FC1:
+        case 0xEF53: case 0x58465342: case 0x9123683E: case 0xF2F52010: case 0x2FC12FC1: case 0x794C7630:
             break;
         default:
             return STORAGE_UNKNOWN;

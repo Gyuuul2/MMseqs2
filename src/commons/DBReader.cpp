@@ -1926,6 +1926,7 @@ void copyLinkDb(const std::string &databaseName, const std::string &outDb, DBFil
     const DBSuffix suffices[] = {
         { DBFiles::DATA_INDEX,    ".index"            },
         { DBFiles::DATA_INDEX,    ".bits"             },
+        { DBFiles::DATA_INDEX,    ".partitions"       },
         { DBFiles::DATA_DBTYPE,   ".dbtype"           },
         { DBFiles::HEADER,        "_h"                },
         { DBFiles::HEADER_INDEX,  "_h.index"          },

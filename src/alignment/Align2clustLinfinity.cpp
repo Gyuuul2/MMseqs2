@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/statvfs.h>
+#include <sys/stat.h>
 #include <cstring>
 #include <thread>
 #include <ctime>
@@ -1584,6 +1585,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     double servedFileWriterWaitSeconds = 0;
     double readingSeconds = 0;
     double pollingSeconds = 0;
+    double sourceLoadSeconds = 0;
+    double packSeconds = 0;
+    double servedFileWriteSeconds = 0;
+    double unpackSeconds = 0;
     // copy, or pack with rawKeys, the entries of keys; assigned keys get zeros
     const auto copyEntries = [&](const DBKeyType *keys, size_t keyCount, const size_t *offsets, char *data, std::vector<DBKeyType> *rawKeys) {
         for (size_t first = 0; first < keyCount;) {
@@ -1598,7 +1603,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     loadKeys.push_back(keys[i]);
                 }
             }
+            Timer copyTimer;
             seqDbr.loadData(loadKeys);
+            sourceLoadSeconds += copyTimer.getTimediff();
+            copyTimer.reset();
             for (int thread = 0; thread < serviceThreads; thread++) {
                 threadRawEntries[thread].clear();
             }
@@ -1627,6 +1635,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     rawKeys->push_back(keys[threadRawEntries[thread][j]]);
                 }
             }
+            packSeconds += copyTimer.getTimediff();
         }
     };
     std::thread serviceThread;
@@ -1889,8 +1898,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                     isComplete = false;
                                 } else {
                                     const size_t firstKey = requestedSequences->fetchSourceKeyOffsets[servingNode] + servingNodeReceivedKeyCount[servingNode];
+                                    Timer unpackTimer;
                                     unpackEntries(receivedEntries.data() + servedEntriesReads[i].receivedOffset, servedKeyEnds[servingNode] - servingNodeReceivedKeyCount[servingNode],
                                                   requestedSequences->entryOffsets.data() + firstKey, requestedSequences->entries, serviceThreads);
+                                    unpackSeconds += unpackTimer.getTimediff();
                                     servingNodeReceivedKeyCount[servingNode] = servedKeyEnds[servingNode];
                                     servedFileNumbers[servingNode] = SIZE_MAX;
                                     missingServedFileAttempts[servingNode] = 0;
@@ -2077,8 +2088,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     servedFileData.swap(writtenServedFileData);
                     const size_t writtenFileNumber = servedFileCount;
                     servedFileWriter = std::thread([&, servedFileSize, servedLine, writtenFileNumber]() {
+                        Timer writeTimer;
                         MMseqsNode::writeExchangeFile(served + "." + SSTR(rank) + "." + SSTR(writtenFileNumber), writtenFileNumber, writtenServedFileData.data(), servedFileSize,
                                                       servedIndexes[rank], servedLine, serviceThreads);
+                        servedFileWriteSeconds += writeTimer.getTimediff();
                     });
                     servedFileCount++;
                     servedSize += servedFileSize;
@@ -2490,8 +2503,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         serviceThread.join();
         MMseqsNode::addPhaseValue(phaseValues, "Sequence exchange bytes", SSTR(servedSize) + " served, " + SSTR(receivedServedEntriesSize) + " received, " + SSTR(requestCount) + " requests");
         MMseqsNode::addPhaseSeconds(phaseValues, "service: serving the requests", servingSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "service: loading the source sequences", sourceLoadSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "service: packing the served entries", packSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "service: writing the served files", servedFileWriteSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: waiting for the served file writer", servedFileWriterWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: reading the served entries", readingSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "service: unpacking the served entries", unpackSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: polling", pollingSeconds);
     }
     delete[] currentSequences.entries;
@@ -3180,9 +3197,13 @@ int align2clustLinfinity(Parameters &par) {
         }
         const int localTmpFd = open(par.localTmp.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         const StorageKind localTmpStorage = getStorageKind(localTmpFd);
+        struct stat localTmpStat, dbStat;
+        const bool isDbDevice = fstat(localTmpFd, &localTmpStat) == 0 && stat(par.db1Index.c_str(), &dbStat) == 0 && localTmpStat.st_dev == dbStat.st_dev;
         close(localTmpFd);
         if (localTmpStorage != STORAGE_LOCAL_FLASH) {
-            Debug(Debug::INFO) << "Not copying the served blocks to " << par.localTmp << ": it is on " << getStorageName(localTmpStorage) << ", not local flash\n";
+            Debug(Debug::WARNING) << "Not copying the served blocks to " << par.localTmp << ": it is on " << getStorageName(localTmpStorage) << ", not local flash\n";
+        } else if (isDbDevice) {
+            Debug(Debug::WARNING) << "Not copying the served blocks to " << par.localTmp << ": it is on the device of the database\n";
         } else {
             // copy only the served blocks
             DBReader<DBKeyType> blockDbr(par.db1.c_str(), par.db1Index.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
@@ -3213,7 +3234,7 @@ int align2clustLinfinity(Parameters &par) {
             struct statvfs fs;
             const size_t freeSize = (statvfs(par.localTmp.c_str(), &fs) == 0) ? static_cast<size_t>(fs.f_bavail) * fs.f_frsize : 0;
             if (freeSize < servedSize) {
-                Debug(Debug::INFO) << "Not copying the served blocks to " << par.localTmp << ": it has " << freeSize << " free bytes, the served blocks need " << servedSize << "\n";
+                Debug(Debug::WARNING) << "Not copying the served blocks to " << par.localTmp << ": it has " << freeSize << " free bytes, the served blocks need " << servedSize << "\n";
             } else {
                 seqDb = FileUtil::copyToLocalDir(par.db1, par.localTmp + "/" + FileUtil::baseName(par.db3) + "." + SSTR(MMseqsNode::rank), par.threads, localCopies, localCopySize, &servedFileRanges);
                 hasLocalServedBlocks = true;
@@ -3230,8 +3251,16 @@ int align2clustLinfinity(Parameters &par) {
     const size_t nodeMemoryLimit = std::max(Util::computeMemory(par.splitMemoryLimit), localCopySize) - localCopySize;
     const bool isMasterAligning = getFirstAlignNode() == 0;
     const size_t masterMemoryLimit = nodeMemoryLimit / (isMasterAligning ? MASTER_MEMORY_DIVISOR : 1);
-    const size_t masterMemorySize = ((par.clusteringMode == Parameters::SET_COVER) ? masterMemoryLimit : (dbSize + 63) / 64 * sizeof(uint64_t) + masterMemoryLimit / STEP_MEMORY_DIVISOR)
-                                + MMseqsNode::count * CLUSTERED_LOG_BUFFER_SIZE;
+    // the master holds the assigned bits and a log buffer per node in both clustering modes
+    const size_t masterFixedSize = (dbSize + 63) / 64 * sizeof(uint64_t) + MMseqsNode::count * CLUSTERED_LOG_BUFFER_SIZE;
+    const size_t masterMemorySize = masterFixedSize + ((par.clusteringMode == Parameters::SET_COVER) ? masterMemoryLimit : masterMemoryLimit / STEP_MEMORY_DIVISOR);
+    if (MMseqsNode::isMaster() && masterFixedSize >= nodeMemoryLimit) {
+        Debug(Debug::ERROR) << "Not enough memory to cluster. Memory limit: " << nodeMemoryLimit << " bytes, the assigned bits of " << dbSize << " sequences need: "
+                            << (dbSize + 63) / 64 * sizeof(uint64_t) << " bytes, the clustered logs of " << MMseqsNode::count << " nodes need: "
+                            << MMseqsNode::count * CLUSTERED_LOG_BUFFER_SIZE << " bytes.\n"
+                            << "Raise RAM size or --split-memory-limit. The assigned bits do not shrink with more nodes.\n";
+        EXIT(EXIT_FAILURE);
+    }
 
     // cut the groups into alignment splits of about equal cells
     const std::string partitionsData = MMseqsNode::readFile(par.db2 + ".partitions");
