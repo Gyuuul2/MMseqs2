@@ -575,7 +575,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         size_t unsplitFileCount = 0;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+:unsplitFileCount)
         for (size_t i = 0; i < filenames.size(); i++) {
-            std::vector<size_t> &cuts = fileSplitOffsets[i];
+            std::vector<size_t> &splitOffsets = fileSplitOffsets[i];
             if (fileSizes[i] > splitSize) {
                 bool isSplittable = Util::endsWith(".gz", filenames[i]) == false && Util::endsWith(".bz2", filenames[i]) == false;
                 if (isSplittable) {
@@ -594,11 +594,11 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     }
                 }
                 for (size_t cut = splitSize; isSplittable && cut < fileSizes[i]; cut += splitSize) {
-                    cuts.push_back(cut);
+                    splitOffsets.push_back(cut);
                 }
                 unsplitFileCount += isSplittable ? 0 : 1;
             }
-            cuts.push_back(fileSizes[i]);
+            splitOffsets.push_back(fileSizes[i]);
         }
 
         if (unsplitFileCount > 0) {

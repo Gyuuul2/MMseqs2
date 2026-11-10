@@ -360,9 +360,9 @@ static bool findMatchSeed(const char *querySequence, const char *targetSequence,
     if (alignment.qStart == -1 || alignment.tStart == -1) {
         return false;
     }
-    for (int blockIdx = 0; blockIdx <= alignment.alnLen - 3; ++blockIdx) {
-        int queryPos = alignment.qStart + blockIdx;
-        int targetPos = alignment.tStart + blockIdx;
+    for (int i = 0; i <= alignment.alnLen - 3; ++i) {
+        int queryPos = alignment.qStart + i;
+        int targetPos = alignment.tStart + i;
         if (querySequence[queryPos] == targetSequence[targetPos] &&
             querySequence[queryPos + 1] == targetSequence[targetPos + 1] &&
             querySequence[queryPos + 2] == targetSequence[targetPos + 2]) {
@@ -684,12 +684,12 @@ bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockA
         return false;
     }
 
-    int newQueryStartPos, newTargetStartPos;
-    if (isTargetAssigned(assignedCluster, targetId) || findMatchSeed(querySequence, targetSequence, ungappedAlignment, newQueryStartPos, newTargetStartPos) == false) {
+    int seedQuery, seedTarget;
+    if (isTargetAssigned(assignedCluster, targetId) || findMatchSeed(querySequence, targetSequence, ungappedAlignment, seedQuery, seedTarget) == false) {
         return false;
     }
     if (swipeTargets != NULL) {
-        swipeTargets->addTarget(query, target, target.getDbKey(), newQueryStartPos, newTargetStartPos);
+        swipeTargets->addTarget(query, target, target.getDbKey(), seedQuery, seedTarget);
         return false;
     }
 
@@ -699,7 +699,7 @@ bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockA
         blockAlignerInitialized = true;
     }
     int32_t xDrop = (MIN_SIZE * par.gapExtend.values.aminoacid() + par.gapOpen.values.aminoacid());
-    s_align gappedAlignment = blockAligner.bandedalign(&target, newQueryStartPos, newTargetStartPos,
+    s_align gappedAlignment = blockAligner.bandedalign(&target, seedQuery, seedTarget,
                                                        gappedBacktrace, xDrop, par.covThr, par.covMode);
     // bandedalign failed
     if (gappedAlignment.evalue < 0 || gappedBacktrace.empty()) {

@@ -123,7 +123,7 @@ static std::string readPolledFile(const std::string &file) {
             EXIT(EXIT_FAILURE);
         }
         MMseqsNode::sleepBeforePoll(polls, 7);
-        FileUtil::refreshDirectory(FileUtil::dirName(file));
+        FileUtil::refreshDirectory(file);
         fd = openFile(file, flags);
         openError = (fd < 0) ? errno : 0;
     }
@@ -1453,16 +1453,16 @@ void MMseqsNode::writeRepresentativeBits(const std::string &db, DBReader<DBKeyTy
     }
 }
 
-std::vector<size_t> MMseqsNode::getClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount, const std::string &firstKeyFile) {
-    std::string cluIndex = firstKeyFile.empty() ? clu + ".index." + SSTR(rank) : firstKeyFile;
+std::vector<size_t> MMseqsNode::getClusterKeyOffsets(const std::string &barrierFile, const std::string &clu, size_t keyCount, const std::string &firstKeySource) {
+    std::string cluIndex = firstKeySource.empty() ? clu + ".index." + SSTR(rank) : firstKeySource;
     FILE *handle = FileUtil::openFileOrDie(cluIndex.c_str(), "r", true);
-    uint64_t firstCell[2];
-    if (fread(firstCell, sizeof(uint64_t), 2, handle) != 2 || fclose(handle) != 0) {
+    uint64_t firstIndexPair[2];
+    if (fread(firstIndexPair, sizeof(uint64_t), 2, handle) != 2 || fclose(handle) != 0) {
         Debug(Debug::ERROR) << "Cannot read " << cluIndex << "\n";
         EXIT(EXIT_FAILURE);
     }
-    std::string firstKeys = barrier(file, SSTR(firstCell[0]) + "\n");
-    removeOnceRead(file);
+    std::string firstKeys = barrier(barrierFile, SSTR(firstIndexPair[0]) + "\n");
+    removeOnceRead(barrierFile);
     std::vector<size_t> offsets(count + 1, keyCount);
     char *line = (char *) firstKeys.c_str();
     for (size_t node = 0; node < count; node++, line = Util::skipLine(line)) {
@@ -1516,7 +1516,7 @@ std::vector<size_t> MMseqsNode::getBalancedClusterKeyOffsets(const std::string &
 
 void MMseqsNode::readClusterKeys(const std::string &clu, const std::vector<size_t> &cluKeyOffsets, size_t keyBegin, size_t keyEnd, std::vector<DBKeyType> &keys) {
     keys.clear();
-    size_t cellsPerRead = 1024 * 1024 / (2 * sizeof(uint64_t));
+    size_t pairsPerRead = 1024 * 1024 / (2 * sizeof(uint64_t));
     for (size_t node = 0; node < count; node++) {
         size_t from = std::max(keyBegin, cluKeyOffsets[node]);
         size_t to = std::min(keyEnd, cluKeyOffsets[node + 1]);
@@ -1535,13 +1535,13 @@ void MMseqsNode::readClusterKeys(const std::string &clu, const std::vector<size_
         keys.resize(nodeKeysBegin + entryEnd - entryBegin);
 #pragma omp parallel
         {
-            std::vector<uint64_t> cells(2 * cellsPerRead);
+            std::vector<uint64_t> indexPairs(2 * pairsPerRead);
 #pragma omp for schedule(dynamic, 1)
-            for (size_t entry = entryBegin; entry < entryEnd; entry += cellsPerRead) {
-                size_t cellCount = std::min(cellsPerRead, entryEnd - entry);
-                FileUtil::preadAll(fileno(cluIndexFile), cluIndex.c_str(), (char *) cells.data(), cellCount * 2 * sizeof(uint64_t), entry * 2 * sizeof(uint64_t));
-                for (size_t i = 0; i < cellCount; i++) {
-                    keys[nodeKeysBegin + entry - entryBegin + i] = cells[2 * i];
+            for (size_t entry = entryBegin; entry < entryEnd; entry += pairsPerRead) {
+                size_t pairCount = std::min(pairsPerRead, entryEnd - entry);
+                FileUtil::preadAll(fileno(cluIndexFile), cluIndex.c_str(), (char *) indexPairs.data(), pairCount * 2 * sizeof(uint64_t), entry * 2 * sizeof(uint64_t));
+                for (size_t i = 0; i < pairCount; i++) {
+                    keys[nodeKeysBegin + entry - entryBegin + i] = indexPairs[2 * i];
                 }
             }
         }

@@ -194,7 +194,7 @@ public:
     static uint64_t *readRepresentativeBits(const std::string &db, const std::vector<size_t> &fileKeyOffsets, size_t firstKey, size_t keyCount);
     static void writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount);
 
-    static std::vector<size_t> getClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount, const std::string &firstKeyFile = "");
+    static std::vector<size_t> getClusterKeyOffsets(const std::string &barrierFile, const std::string &clu, size_t keyCount, const std::string &firstKeySource = "");
     static std::vector<size_t> getBalancedClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount);
     static void readClusterKeys(const std::string &clu, const std::vector<size_t> &cluKeyOffsets, size_t keyBegin, size_t keyEnd, std::vector<DBKeyType> &keys);
     static void writeClusterThreadEntries(FILE *dataFile, const std::string &dataFileName, FILE *indexFile, const std::string &indexFileName,

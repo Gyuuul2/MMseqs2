@@ -2192,7 +2192,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                 return taskBits[first] > taskBits[second] || (taskBits[first] == taskBits[second] && first < second);
             });
             std::vector<std::vector<KmerThreadTaskStart> > taskResumes(passTaskCount);
-            std::vector<char> taskStops(passTaskCount, TASK_DONE);
+            std::vector<char> taskStates(passTaskCount, TASK_DONE);
             std::vector<size_t> tooBigTasks;
             for (bool isSerial = false; roundTasks.empty() == false;) {
 #pragma omp parallel num_threads(isSerial ? 1 : par.threads)
@@ -2217,7 +2217,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
 #pragma omp for schedule(dynamic, 1)
                     for (size_t i = 0; i < roundTasks.size(); i++) {
                         size_t task = roundTasks[i];
-                        taskStops[task] = TASK_DONE;
+                        taskStates[task] = TASK_DONE;
                         size_t passHashSubRange = taskHashSubRanges[task];
                         size_t hashSubRange = 0;
                         size_t hashSubRangeEnd = 0;
@@ -2280,7 +2280,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                             } else {
                                 if (takePairOutput(output, region, groupMaxRepSeqCount, memberCount) == false) {
                                     if (isSerial == false) {
-                                        taskStops[task] = (groupMaxRepSeqCount * sizeof(PairRecord) + memberCount * sizeof(DBKeyType) > output.size) ? TASK_GROUP_TOO_BIG : TASK_OUTPUT_FULL;
+                                        taskStates[task] = (groupMaxRepSeqCount * sizeof(PairRecord) + memberCount * sizeof(DBKeyType) > output.size) ? TASK_GROUP_TOO_BIG : TASK_OUTPUT_FULL;
                                         break;
                                     }
                                     flushPairOutput(exchange, pairFile, output, outputRegions, pairWriteBuffer, 1);
@@ -2403,7 +2403,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                             }
                         }
                         // resume a stopped task where it stopped
-                        if (taskStops[task] != TASK_DONE) {
+                        if (taskStates[task] != TASK_DONE) {
                             if (taskResumes[task].empty()) {
                                 taskResumes[task].assign(rowStarts, rowStarts + rowCount);
                             }
@@ -2421,9 +2421,9 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                 }
                 std::vector<size_t> fullTasks;
                 for (size_t i = 0; i < roundTasks.size(); i++) {
-                    if (taskStops[roundTasks[i]] == TASK_OUTPUT_FULL) {
+                    if (taskStates[roundTasks[i]] == TASK_OUTPUT_FULL) {
                         fullTasks.push_back(roundTasks[i]);
-                    } else if (taskStops[roundTasks[i]] == TASK_GROUP_TOO_BIG) {
+                    } else if (taskStates[roundTasks[i]] == TASK_GROUP_TOO_BIG) {
                         tooBigTasks.push_back(roundTasks[i]);
                     }
                 }

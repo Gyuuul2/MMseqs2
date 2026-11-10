@@ -210,14 +210,14 @@ template <typename T> bool DBReader<T>::open(int accessType){
     if (externalData == false && hasBinaryIndex) {
         // read only entry count and data size
         FILE *indexFile = FileUtil::openFileOrDie(indexFileName, "r", true);
-        uint64_t lastCell[2] = { 0, 0 };
-        if (fseek(indexFile, -static_cast<long>(sizeof(lastCell)), SEEK_END) != 0 || fread(lastCell, sizeof(uint64_t), 2, indexFile) != 2) {
+        uint64_t lastIndexPair[2] = { 0, 0 };
+        if (fseek(indexFile, -static_cast<long>(sizeof(lastIndexPair)), SEEK_END) != 0 || fread(lastIndexPair, sizeof(uint64_t), 2, indexFile) != 2) {
             Debug(Debug::ERROR) << "Cannot read index file " << indexFileName << "\n";
             EXIT(EXIT_FAILURE);
         }
         size_t indexFileSize = ftell(indexFile);
         // last pair is (DB_KEY_INVALID, data size)
-        if (indexFileSize % sizeof(lastCell) != 0 || lastCell[0] != static_cast<uint64_t>(DB_KEY_INVALID)) {
+        if (indexFileSize % sizeof(lastIndexPair) != 0 || lastIndexPair[0] != static_cast<uint64_t>(DB_KEY_INVALID)) {
             Debug(Debug::ERROR) << "Index file " << indexFileName << " is incomplete\n";
             EXIT(EXIT_FAILURE);
         }
@@ -227,7 +227,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
         }
 
         size = indexFileSize / (2 * sizeof(uint64_t)) - 1;
-        dataSize = lastCell[1];
+        dataSize = lastIndexPair[1];
         maxSeqLen = 0;
         lastKey = T();
         sortedByOffset = true;
