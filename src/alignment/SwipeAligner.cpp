@@ -143,6 +143,20 @@ SwipeAligner::~SwipeAligner() {
     free(trace);
 }
 
+void SwipeAligner::release() {
+    free(ring);
+    free(band);
+    free(trace);
+    ring = NULL;
+    band = NULL;
+    trace = NULL;
+    ringCapacity = 0;
+    bandCapacity = 0;
+    traceCapacity = 0;
+    std::vector<size_t>().swap(jobBuffer);
+    std::vector<BandJob>().swap(bandJobs);
+}
+
 void SwipeAligner::resize(size_t length) {
     if (length <= capacity) {
         return;
@@ -983,6 +997,26 @@ void SwipeExtender::clearQueries() {
     biases.clear();
     queryOffsets.clear();
     queryLengths.clear();
+}
+
+void SwipeExtender::release() {
+    std::vector<unsigned char>().swap(queries);
+    std::vector<int8_t>().swap(biases);
+    std::vector<size_t>().swap(queryOffsets);
+    std::vector<int>().swap(queryLengths);
+    free(band);
+    free(trace);
+    band = NULL;
+    trace = NULL;
+    bandCapacity = 0;
+    traceCapacity = 0;
+    for (size_t l = 0; l < laneTargets.size(); l++) {
+        std::vector<unsigned char>().swap(laneTargets[l]);
+        std::vector<uint16_t>().swap(laneTraces[l]);
+    }
+    std::vector<unsigned char>().swap(zeroLetters);
+    std::vector<ExtendJob>().swap(extendJobs);
+    std::vector<ExtendJob>().swap(extendPending);
 }
 
 // a lane holds its scores less its floor, FLOOR below its best score

@@ -305,10 +305,11 @@ public:
     size_t findEntryByOffset(size_t offset) {
         return findEntryByIndexColumn(1, offset);
     }
-    size_t findEntryByKey(size_t key, size_t first = 0, size_t last = SIZE_MAX) {
-        return findEntryByIndexColumn(0, key, first, last);
+    size_t findEntryByKey(size_t key) {
+        return findEntryByIndexColumn(0, key);
     }
     Index getIndexEntry(size_t id);
+    void readIndexPairs(size_t first, size_t last, uint64_t *indexPairs);
     void readData(size_t offset, size_t bytes, char *destination);
     int getBufferedFd() const { return bufferedFds[0]; }
     char *getDataFromLoadedBuffer(size_t key);
@@ -569,7 +570,7 @@ public:
 private:
     void checkClosed() const;
     size_t findLoadedEntryOffsetsPos(size_t id);
-    size_t findEntryByIndexColumn(size_t column, size_t value, size_t first = 0, size_t last = SIZE_MAX);
+    size_t findEntryByIndexColumn(size_t column, size_t value);
     size_t planReadRequests(size_t keyBegin, size_t keyEnd, bool isReadingOffsets, std::vector<BatchReader::ReadRequest> &readRequests,
                             std::vector<size_t> &entryOffsets, std::vector<size_t> &keys,
                             std::vector<BatchReader::ReadRequest> &compressedReadRequests, std::vector<size_t> &requestFirstKeys);

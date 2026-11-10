@@ -124,6 +124,23 @@ struct SwipeBatch {
         lengths.clear();
     }
 
+    // linfinity keeps the aligner over the fetches, but not the buffers of its largest batch
+    void release() {
+        std::vector<unsigned char>().swap(sequences);
+        std::vector<size_t>().swap(offsets);
+        std::vector<const unsigned char *>().swap(targets);
+        std::vector<int>().swap(lengths);
+        std::vector<int>().swap(laneLengths);
+        std::vector<int>().swap(diagonals);
+        std::vector<int>().swap(columnEnds);
+        std::vector<int>().swap(minScores);
+        std::vector<s_align>().swap(aligns);
+        std::vector<std::string>().swap(backtraces);
+        std::vector<size_t>().swap(entries);
+        std::vector<size_t>().swap(gapped);
+        aligner.release();
+    }
+
     size_t add(const Sequence &sequence) {
         offsets.push_back(sequences.size());
         sequences.insert(sequences.end(), sequence.numSequence, sequence.numSequence + sequence.L);
@@ -234,6 +251,29 @@ struct SwipeTargets {
         seedTargets.clear();
     }
 
+    // linfinity keeps the extender over the fetches, but not the buffers of its largest batch
+    void release() {
+        clearTargets();
+        std::vector<DBKeyType>().swap(repKeys);
+        std::vector<const char *>().swap(repSequences);
+        std::vector<int>().swap(repLengths);
+        std::vector<size_t>().swap(queryIds);
+        std::vector<unsigned char>().swap(sequences);
+        std::vector<size_t>().swap(offsets);
+        std::vector<const unsigned char *>().swap(targets);
+        std::vector<int>().swap(lengths);
+        std::vector<s_align>().swap(aligns);
+        std::vector<std::string>().swap(backtraces);
+        std::vector<DBKeyType>().swap(targetKeys);
+        std::vector<char>().swap(seqData);
+        std::vector<const char *>().swap(targetSequences);
+        std::vector<int>().swap(seedQueries);
+        std::vector<int>().swap(seedTargets);
+        std::vector<s_align>().swap(backAligns);
+        std::vector<std::string>().swap(backBacktraces);
+        extender.release();
+    }
+
     void startRep(DBKeyType key) {
         repKey = key;
         isQueryInitialized = false;
@@ -247,6 +287,7 @@ struct MemberCheck {
     // linfinity: fetched entries of memberKeys
     std::vector<const char *> memberData;
     std::vector<size_t> order;
+    std::vector<size_t> memberIds;
     std::vector<int> lengths;
     std::vector<std::string> records;
     size_t nextMember;
@@ -278,6 +319,17 @@ struct MemberChecks {
         check.memberKeys.clear();
         check.memberData.clear();
         return check;
+    }
+
+    // addCheck keeps the buffers of the largest checks, linfinity frees them after each fetch
+    void release() {
+        std::vector<MemberCheck>().swap(checks);
+        checkCount = 0;
+        std::vector<size_t>().swap(gappedMemberChecks);
+        std::vector<size_t>().swap(gappedMemberBatchIndices);
+        std::vector<size_t>().swap(extendedMemberChecks);
+        std::vector<size_t>().swap(gappedMembers);
+        std::vector<ClusterPair>().swap(extendedPairs);
     }
 };
 
@@ -413,8 +465,8 @@ void alignMemberChecksSwipe(const Parameters &par, BlockAligner &blockAligner, M
                 size_t g = memberChecks.extendedMemberChecks[gapped];
                 const MemberCheck &check = memberChecks.checks[g];
                 DBKeyType elementKey = check.memberKeys[i];
-                size_t elementId = cluSeqDbr->getId(elementKey);
-                element.mapSequence(elementId, elementKey, check.memberData.empty() ? cluSeqDbr->getData(elementId, threadIdx) : check.memberData[i], cluSeqDbr->getSeqLen(elementId));
+                size_t elementId = check.memberIds[i];
+                element.mapSequence(elementId, elementKey, check.memberData.empty() ? cluSeqDbr->getData(elementId, threadIdx) : check.memberData[i], check.lengths[i]);
                 swipeMembers.add(element);
                 swipeMembers.gapped.push_back(i);
                 memberChecks.gappedMemberChecks.push_back(g);

@@ -426,8 +426,8 @@ void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherIni
         }
         size_t i = swipeMembers.gapped[g];
         DBKeyType elementKey = check.memberKeys[i];
-        size_t elementId = cluSeqDbr->getId(elementKey);
-        element.mapSequence(elementId, elementKey, check.memberData.empty() ? cluSeqDbr->getData(elementId, threadIdx) : check.memberData[i], cluSeqDbr->getSeqLen(elementId));
+        size_t elementId = check.memberIds[i];
+        element.mapSequence(elementId, elementKey, check.memberData.empty() ? cluSeqDbr->getData(elementId, threadIdx) : check.memberData[i], check.lengths[i]);
         size_t l = gappedMemberBatchIndices[g];
         Matcher::result_t res_element;
         if (l == SIZE_MAX || swipeMembers.aligns[l].word >= 2) {
@@ -460,10 +460,12 @@ void prepareMemberChecks(const Parameters &par, Sequence &query, DBReader<DBKeyT
         check.nextMember = 0;
         check.isPassing = true;
         check.order.resize(check.memberKeys.size());
+        check.memberIds.resize(check.memberKeys.size());
         check.lengths.resize(check.memberKeys.size());
         for (size_t i = 0; i < check.memberKeys.size(); i++) {
             check.order[i] = i;
-            check.lengths[i] = static_cast<int>(cluSeqDbr->getSeqLen(cluSeqDbr->getId(check.memberKeys[i])));
+            check.memberIds[i] = cluSeqDbr->getId(check.memberKeys[i]);
+            check.lengths[i] = static_cast<int>(cluSeqDbr->getSeqLen(check.memberIds[i]));
             if (canCoverMember(par, query.L, check.lengths[i]) == false) {
                 check.isPassing = false;
                 break;
@@ -499,9 +501,9 @@ bool alignNextMembers(const Parameters &par, BlockAligner &blockAligner, Matcher
         for (size_t o = check.nextMember; o < batchEnd && check.isPassing; o++) {
             size_t i = check.order[o];
             DBKeyType elementKey = check.memberKeys[i];
-            size_t elementId = cluSeqDbr->getId(elementKey);
+            size_t elementId = check.memberIds[i];
             const char *elementSequence = check.memberData.empty() ? cluSeqDbr->getData(elementId, threadIdx) : check.memberData[i];
-            size_t elementLength = cluSeqDbr->getSeqLen(elementId);
+            size_t elementLength = check.lengths[i];
             short elementDiagonal = check.startDiagonal;
 
             // 1. ungapped alignment

@@ -598,8 +598,24 @@ static size_t getBlockServingNode(size_t block) {
     return getFirstAlignNode() + block % (MMseqsNode::count - getFirstAlignNode());
 }
 
-static size_t getKeyServingNode(const DBReader<DBKeyType> &seqDbr, size_t key) {
-    return getBlockServingNode(seqDbr.getKeyBlock(key));
+// a block cursor searches again only once key leaves its block
+static size_t getKeyServingNode(const DBReader<DBKeyType> &seqDbr, size_t key, size_t *block = NULL) {
+    if (block == NULL) {
+        return getBlockServingNode(seqDbr.getKeyBlock(key));
+    }
+    const std::vector<size_t> &blockKeyOffsets = seqDbr.getBlockKeyOffsets();
+    if (*block == SIZE_MAX || key < blockKeyOffsets[*block] || key >= blockKeyOffsets[*block + 1]) {
+        *block = seqDbr.getKeyBlock(key);
+    }
+    return getBlockServingNode(*block);
+}
+
+// getSeqLenFromRange only moves its range forward, a smaller key searches again
+static size_t getSeqLenFromCursor(DBReader<DBKeyType> &seqDbr, size_t &range, size_t key) {
+    if (range != SIZE_MAX && key < seqDbr.getIndex()[range].id) {
+        range = SIZE_MAX;
+    }
+    return seqDbr.getSeqLenFromRange(range, key);
 }
 
 static size_t getSizeClass(size_t targetCount, size_t sizeClassCount) {
@@ -643,10 +659,32 @@ struct FetchedSequences {
     std::vector<size_t> entryOffsets;
 };
 
-static const char *findFetchedKey(const FetchedSequences &sequences, size_t fetchSource, DBKeyType key, size_t *seqLen = NULL) {
+// per thread, where the last keys were found per fetch source and the block of the last key
+struct FetchedKeyCursor {
+    FetchedKeyCursor(size_t fetchSources) : positions(fetchSources, 0), block(SIZE_MAX) {}
+    std::vector<size_t> positions;
+    size_t block;
+};
+
+// from a position behind key the search goes on in doubling steps, so ascending keys take few steps
+static const char *findFetchedKey(const FetchedSequences &sequences, size_t fetchSource, DBKeyType key, size_t *seqLen = NULL, size_t *position = NULL) {
     const DBKeyType *keys = sequences.keys.data();
-    const DBKeyType *found = std::lower_bound(keys + sequences.fetchSourceKeyOffsets[fetchSource], keys + sequences.fetchSourceKeyOffsets[fetchSource + 1], key);
-    if (found == keys + sequences.fetchSourceKeyOffsets[fetchSource + 1] || *found != key) {
+    const size_t sourceEnd = sequences.fetchSourceKeyOffsets[fetchSource + 1];
+    size_t first = sequences.fetchSourceKeyOffsets[fetchSource];
+    size_t last = sourceEnd;
+    if (position != NULL && *position >= first && *position <= last && (*position == first || keys[*position - 1] < key)) {
+        size_t step = 1;
+        while (*position + step < last && keys[*position + step] < key) {
+            step *= 2;
+        }
+        first = *position + step / 2;
+        last = std::min(*position + step + 1, last);
+    }
+    const DBKeyType *found = std::lower_bound(keys + first, keys + last, key);
+    if (position != NULL) {
+        *position = found - keys;
+    }
+    if (found == keys + sourceEnd || *found != key) {
         return NULL;
     }
     const size_t entry = found - keys;
@@ -815,6 +853,7 @@ static size_t getStepWords(size_t masterMemoryLimit) {
 static std::atomic<size_t> memberLookupCount(0);
 static std::atomic<size_t> scannedMemberCount(0);
 static std::atomic<size_t> memberLookupReadSize(0);
+static std::atomic<size_t> memberIndexReadSize(0);
 
 struct ClusterMemberLookup {
     struct Entry {
@@ -830,14 +869,20 @@ struct ClusterMemberLookup {
         size_t lookupCount;
         size_t memberCount;
         size_t readBytes;
+        size_t indexReadBytes;
         std::vector<char> buffer;
+        // index pairs [indexFirst, indexFirst + indexPairs.size() / 2) of the cluster part indexNode
+        size_t indexNode;
+        size_t indexFirst;
+        std::vector<uint64_t> indexPairs;
 
-        EntryReader() : lookupCount(0), memberCount(0), readBytes(0) {}
+        EntryReader() : lookupCount(0), memberCount(0), readBytes(0), indexReadBytes(0), indexNode(SIZE_MAX), indexFirst(0) {}
 
         ~EntryReader() {
             memberLookupCount += lookupCount;
             scannedMemberCount += memberCount;
             memberLookupReadSize += readBytes;
+            memberIndexReadSize += indexReadBytes;
         }
 
         void start(const Entry &first) {
@@ -877,19 +922,38 @@ struct ClusterMemberLookup {
         return std::upper_bound(cluKeyOffsets.begin(), cluKeyOffsets.end(), key) - cluKeyOffsets.begin() - 1;
     }
 
-    Entry find(DBKeyType key) const {
+    // ascending keys between the same sampled keys search the index pairs that entryReader read for the first of them
+    Entry find(DBKeyType key, EntryReader &entryReader) const {
         const size_t node = getNode(key);
         Entry entry = { node, 0, 0, key };
         const DBKeyType *begin = sampledKeys.data() + nodeSampledKeyOffsets[node];
         const size_t sampledKey = std::lower_bound(begin, sampledKeys.data() + nodeSampledKeyOffsets[node + 1], key) - begin;
-        // the entry is between the sampled keys around key
-        const size_t found = nodeCluDbrs[node]->findEntryByKey(key, (sampledKey > 0) ? (sampledKey - 1) * entriesPerSampledKey : 0, std::min(sampledKey * entriesPerSampledKey + 1, nodeCluDbrs[node]->getSize()));
-        if (found < nodeCluDbrs[node]->getSize()) {
-            const DBReader<DBKeyType>::Index index = nodeCluDbrs[node]->getIndexEntry(found);
-            if (index.id == key) {
-                entry.offset = index.offset;
-                entry.end = index.offset + index.length - 1;
+        // the entry is between the sampled keys around key, it ends where the next one starts
+        const size_t entryCount = nodeCluDbrs[node]->getSize();
+        const size_t first = (sampledKey > 0) ? (sampledKey - 1) * entriesPerSampledKey : 0;
+        const size_t last = std::min(sampledKey * entriesPerSampledKey + 1, entryCount);
+        const size_t pairEnd = std::min(last + 2, entryCount + 1);
+        if (entryReader.indexNode != node || first < entryReader.indexFirst || pairEnd > entryReader.indexFirst + entryReader.indexPairs.size() / 2) {
+            entryReader.indexNode = node;
+            entryReader.indexFirst = first;
+            entryReader.indexPairs.resize(2 * (pairEnd - first));
+            nodeCluDbrs[node]->readIndexPairs(first, pairEnd, entryReader.indexPairs.data());
+            entryReader.indexReadBytes += entryReader.indexPairs.size() * sizeof(uint64_t);
+        }
+        const uint64_t *indexPairs = entryReader.indexPairs.data() + 2 * (first - entryReader.indexFirst);
+        size_t found = 0;
+        for (size_t count = last - first; count > 0;) {
+            const size_t half = count / 2;
+            if (indexPairs[2 * (found + half)] < key) {
+                found += half + 1;
+                count -= half + 1;
+            } else {
+                count = half;
             }
+        }
+        if (first + found < entryCount && indexPairs[2 * found] == key) {
+            entry.offset = indexPairs[2 * found + 1];
+            entry.end = indexPairs[2 * found + 3] - 1;
         }
         return entry;
     }
@@ -923,6 +987,11 @@ struct ClusterMemberLookup {
     size_t memorySize() const {
         return sizeof(*this) + cluKeyOffsets.capacity() * sizeof(size_t) + nodeCluDbrs.size() * sizeof(DBReader<DBKeyType>) + nodeSampledKeyOffsets.capacity() * sizeof(size_t)
                + sampledKeys.capacity() * sizeof(DBKeyType);
+    }
+
+    // the member buffer and index pairs of an EntryReader; find reads at most entriesPerSampledKey + 3 index pairs
+    size_t getEntryReaderSize() const {
+        return MEMBER_READ_SIZE + (entriesPerSampledKey + 3) * 2 * sizeof(uint64_t);
     }
 
 private:
@@ -1202,7 +1271,7 @@ private:
             for (size_t i = 0; i < answeredKeyCount; i++) {
                 if (maxMembers == 0) {
                     // the threads answer in parallel, so the offsets go whole
-                    const ClusterMemberLookup::Entry entry = lookup.find(keys[i]);
+                    const ClusterMemberLookup::Entry entry = lookup.find(keys[i], entryReader);
                     threadCodes[thread_idx].append(code, Util::putPrefKey(code, entry.offset));
                     threadCodes[thread_idx].append(code, Util::putPrefKey(code, entry.end - entry.offset));
                     continue;
@@ -1514,6 +1583,22 @@ private:
     }
 };
 
+struct TargetAligners {
+    Sequence query;
+    Sequence target;
+    BlockAligner blockAligner;
+    // --align2clust-aligner-mode 1: the reps of a batch share the SWIPE lanes
+    SwipeTargets swipeTargets;
+
+    TargetAligners(const Parameters &par, AlignmentScoring &scoring, size_t maxSeqLen)
+        : query(maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection),
+          target(maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection),
+          blockAligner(Parameters::DBTYPE_AMINO_ACIDS, maxSeqLen, scoring.subMat, &scoring.fastMatrix,
+                       &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
+                       -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid()),
+          swipeTargets(par, scoring.subMat, scoring.evaluer, maxSeqLen) {}
+};
+
 struct MemberAligners {
     Sequence query;
     Sequence element;
@@ -1711,7 +1796,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     };
     // memory besides the block cache
     const auto getReservedMemory = [&](size_t fetchSize) {
-        return ((memberLookup != NULL) ? memberLookup->memorySize() + (par.threads + 1) * MEMBER_READ_SIZE : 0) + 3 * 2 * (memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)
+        return ((memberLookup != NULL) ? memberLookup->memorySize() + (par.threads + 1) * memberLookup->getEntryReaderSize() : 0) + 3 * 2 * (memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)
                + ((memberDbr != NULL) ? 2 * memberSplitSize : 0)
                + 2 * std::max(fetchSize, repTargetsReader.maxRecordSize) + fetchSize
                + ((isAligningNode && alignNodeCount > 1) ? 3 * maxServedFileSize + 6 * maxServedKeys * sizeof(size_t) : 0);
@@ -1741,12 +1826,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                  + (isReadingDirectly ? ", the sequences are read directly" : ""));
     }
     size_t fetchBytesLimit = std::min(maxFetchSize / 64, FIRST_FETCH_SIZE);
-    const auto getFetchedEntry = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL) -> const char * {
-        const char *data = findFetchedKey(sequences, nodes, key, seqLen);
-        return (data != NULL) ? data : findFetchedKey(sequences, isReadingDirectly ? rank : getKeyServingNode(seqDbr, key), key, seqLen);
+    const auto getFetchedEntry = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL, FetchedKeyCursor *cursor = NULL) -> const char * {
+        const char *data = findFetchedKey(sequences, nodes, key, seqLen, (cursor != NULL) ? &cursor->positions[nodes] : NULL);
+        if (data != NULL) {
+            return data;
+        }
+        const size_t fetchSource = isReadingDirectly ? rank : getKeyServingNode(seqDbr, key, (cursor != NULL) ? &cursor->block : NULL);
+        return findFetchedKey(sequences, fetchSource, key, seqLen, (cursor != NULL) ? &cursor->positions[fetchSource] : NULL);
     };
-    const auto getFetchedSequence = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL) -> const char * {
-        const char *data = getFetchedEntry(sequences, key, seqLen);
+    const auto getFetchedSequence = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL, FetchedKeyCursor *cursor = NULL) -> const char * {
+        const char *data = getFetchedEntry(sequences, key, seqLen, cursor);
         // assigned keys are served as zeros
         return (data != NULL && data[0] != '\0') ? data : NULL;
     };
@@ -1847,9 +1936,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
             std::vector<size_t> fetchSourceOffsets(nodes + 2, 0);
+            FetchedKeyCursor keyCursor(nodes + 1);
 #pragma omp for schedule(static)
             for (size_t i = 0; i < uniqueKeys.size(); i++) {
-                keyFetchSources[i] = isAssigned(uniqueKeys[i]) ? nodes + 1 : ((getFetchedEntry(previous, uniqueKeys[i]) != NULL) ? nodes : (isReadingDirectly ? rank : getKeyServingNode(seqDbr, uniqueKeys[i])));
+                keyFetchSources[i] = isAssigned(uniqueKeys[i]) ? nodes + 1 : ((getFetchedEntry(previous, uniqueKeys[i], NULL, &keyCursor) != NULL) ? nodes : (isReadingDirectly ? rank : getKeyServingNode(seqDbr, uniqueKeys[i], &keyCursor.block)));
                 fetchSourceOffsets[keyFetchSources[i]]++;
             }
             for (unsigned int node = 0; node <= nodes + 1; node++) {
@@ -1876,9 +1966,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         sequences.keys.resize(keyCount);
         sequences.entryOffsets.resize(keyCount + 1);
         sequences.entryOffsets[0] = 0;
-#pragma omp parallel for schedule(static)
-        for (size_t i = 0; i < keyCount; i++) {
-            sequences.entryOffsets[i + 1] = seqDbr.getEntryLen(sequences.keys[i]);
+        // the keys of a fetch source ascend
+#pragma omp parallel
+        {
+            size_t keyRange = SIZE_MAX;
+#pragma omp for schedule(static)
+            for (size_t i = 0; i < keyCount; i++) {
+                sequences.entryOffsets[i + 1] = getSeqLenFromCursor(seqDbr, keyRange, sequences.keys[i]) + 2;
+            }
         }
         sumOffsets(sequences.entryOffsets.data(), keyCount, par.threads);
         // not zeroed, the entries overwrite it
@@ -1959,6 +2054,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<unsigned char> needsMemberCheck;
     std::vector<size_t> repPairOffsets;
     std::vector<size_t> batchRepOffsets;
+    // made by a thread when it first needs them and kept over the fetches; deleting them adds the SWIPE counters
+    std::vector<TargetAligners *> threadTargetAligners(par.threads, NULL);
+    std::vector<MemberAligners *> threadMemberAligners(par.threads, NULL);
     double waitSeconds = 0;
     double sequenceWaitSeconds = 0;
     double alignedCells = 0;
@@ -2577,16 +2675,21 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         // batches of about equal alignment cells; a large rep spans several
         const size_t maxBatches = par.threads * (isSwipeEnabled ? ALIGN_BATCHES_PER_THREAD * ALIGN_BATCH_LANES / SwipeExtender::LANES : ALIGN_BATCHES_PER_THREAD);
         recordAlignmentCells.resize(recordCount);
-#pragma omp parallel for schedule(dynamic, 100)
-        for (size_t i = 0; i < recordCount; i++) {
-            const RepTargetsRecord &record = records[currentSequences.begin + i];
-            const DBKeyType *targets = prefilterTargets[currentSequences.prefilterBuffer].data() + record.targetOffset;
-            size_t targetRange = SIZE_MAX;
-            size_t targetResidues = 0;
-            for (unsigned int j = 0; j < record.targetCount; j++) {
-                targetResidues += seqDbr.getSeqLenFromRange(targetRange, targets[j]);
+        // the reps of a size class ascend
+#pragma omp parallel
+        {
+            size_t repRange = SIZE_MAX;
+#pragma omp for schedule(dynamic, 100)
+            for (size_t i = 0; i < recordCount; i++) {
+                const RepTargetsRecord &record = records[currentSequences.begin + i];
+                const DBKeyType *targets = prefilterTargets[currentSequences.prefilterBuffer].data() + record.targetOffset;
+                size_t targetRange = SIZE_MAX;
+                size_t targetResidues = 0;
+                for (unsigned int j = 0; j < record.targetCount; j++) {
+                    targetResidues += seqDbr.getSeqLenFromRange(targetRange, targets[j]);
+                }
+                recordAlignmentCells[i] = getSeqLenFromCursor(seqDbr, repRange, record.repOrderKeyFirstTarget.repKey % paddedDbSize) * targetResidues;
             }
-            recordAlignmentCells[i] = seqDbr.getSeqLen(record.repOrderKeyFirstTarget.repKey % paddedDbSize) * targetResidues;
         }
         uint128 fetchAlignmentCells = 0;
         for (size_t i = 0; i < recordCount; i++) {
@@ -2595,12 +2698,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         batchOffsets.assign(1, currentSequences.begin);
         batchFirstTargets.assign(1, 0);
         uint128 cells = 0;
+        size_t repRange = SIZE_MAX;
         for (size_t i = currentSequences.begin; i < currentSequences.end; i++) {
             const uint128 recordEndCells = cells + recordAlignmentCells[i - currentSequences.begin];
             if (recordEndCells * maxBatches > fetchAlignmentCells * batchOffsets.size()) {
                 const RepTargetsRecord &record = records[i];
                 const DBKeyType *targets = prefilterTargets[currentSequences.prefilterBuffer].data() + record.targetOffset;
-                const size_t repLength = seqDbr.getSeqLen(record.repOrderKeyFirstTarget.repKey % paddedDbSize);
+                const size_t repLength = getSeqLenFromCursor(seqDbr, repRange, record.repOrderKeyFirstTarget.repKey % paddedDbSize);
                 size_t targetRange = SIZE_MAX;
                 for (unsigned int j = 0; j + 1 < record.targetCount && recordEndCells * maxBatches > fetchAlignmentCells * batchOffsets.size(); j++) {
                     cells += repLength * seqDbr.getSeqLenFromRange(targetRange, targets[j]);
@@ -2624,13 +2728,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         size_t firstUnfinishedBatch = 0;
 #pragma omp parallel
         {
-            Sequence query(maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection);
-            Sequence target(maxSeqLen, Parameters::DBTYPE_AMINO_ACIDS, scoring.subMat, 0, false, par.compBiasCorrection);
-            BlockAligner blockAligner(Parameters::DBTYPE_AMINO_ACIDS, maxSeqLen, scoring.subMat, &scoring.fastMatrix,
-                                     &scoring.evaluer, par.compBiasCorrection, par.compBiasCorrectionScale,
-                                     -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
-            // --align2clust-aligner-mode 1: the reps of a batch share the SWIPE lanes
-            SwipeTargets swipeTargets(par, scoring.subMat, scoring.evaluer, maxSeqLen);
+            unsigned int thread_idx = 0;
+#ifdef OPENMP
+            thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+            FetchedKeyCursor targetCursor(nodes + 1);
             std::vector<ClusterPair> pairs;
 #pragma omp for schedule(dynamic, 1)
             for (size_t batch = 0; batch < batchCount; batch++) {
@@ -2642,6 +2744,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                 }
                 pairs.clear();
+                TargetAligners *aligners = threadTargetAligners[thread_idx];
                 for (size_t i = batchOffsets[batch]; i < batchOffsets[batch + 1] + (batchFirstTargets[batch + 1] > 0); i++) {
                     const RepTargetsRecord &record = records[i];
                     const unsigned int endTarget = (i == batchOffsets[batch + 1]) ? batchFirstTargets[batch + 1] : record.targetCount;
@@ -2651,29 +2754,40 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     if (isAssigned(record.repOrderKeyFirstTarget.repKey) || repData == NULL) {
                         continue;
                     }
-                    query.mapSequence(repKey, repKey, repData, repLength);
-                    blockAligner.setQuery(&query);
+                    bool isRepMapped = false;
                     bool blockAlignerInitialized = false;
-                    swipeTargets.startRep(record.repOrderKeyFirstTarget.repKey);
                     const DBKeyType *targets = prefilterTargets[currentSequences.prefilterBuffer].data() + record.targetOffset;
                     for (unsigned int j = (i == batchOffsets[batch]) ? batchFirstTargets[batch] : 0; j < endTarget && isAssigned(record.repOrderKeyFirstTarget.repKey) == false; j++) {
                         const DBKeyType targetKey = targets[j];
                         size_t targetLength = 0;
-                        const char *targetData = getFetchedSequence(currentSequences, targetKey, &targetLength);
-                        if (isAssigned(targetKey) || targetData == NULL) {
+                        const char *targetData = getFetchedSequence(currentSequences, targetKey, &targetLength, &targetCursor);
+                        // alignTarget checks the coverage first
+                        if (isAssigned(targetKey) || targetData == NULL || Util::canBeCovered(par.covThr, par.covMode, static_cast<float>(repLength), static_cast<float>(targetLength)) == false) {
                             continue;
                         }
-                        target.mapSequence(targetKey, targetKey, targetData, targetLength);
+                        if (aligners == NULL) {
+                            aligners = new TargetAligners(par, scoring, maxSeqLen);
+                            threadTargetAligners[thread_idx] = aligners;
+                        }
+                        if (isRepMapped == false) {
+                            aligners->query.mapSequence(repKey, repKey, repData, repLength);
+                            aligners->blockAligner.setQuery(&aligners->query);
+                            aligners->swipeTargets.startRep(record.repOrderKeyFirstTarget.repKey);
+                            isRepMapped = true;
+                        }
+                        aligners->target.mapSequence(targetKey, targetKey, targetData, targetLength);
                         unsigned short diagonal = 0;
-                        if (alignTarget(par, blockAligner, blockAlignerInitialized, query, target, scoring.scorePerColThreshold, diagonal, NULL, 0, NULL,
-                                        isSwipeEnabled ? &swipeTargets : NULL)) {
+                        if (alignTarget(par, aligners->blockAligner, blockAlignerInitialized, aligners->query, aligners->target, scoring.scorePerColThreshold, diagonal, NULL, 0, NULL,
+                                        isSwipeEnabled ? &aligners->swipeTargets : NULL)) {
                             const ClusterPair pair = { record.repOrderKeyFirstTarget.repKey, targetKey };
                             pairs.push_back(pair);
                         }
                     }
                 }
-                alignTargetsSwipe(par, swipeTargets, isAssigned, pairs);
-                swipeTargets.clearTargets();
+                if (aligners != NULL) {
+                    alignTargetsSwipe(par, aligners->swipeTargets, isAssigned, pairs);
+                    aligners->swipeTargets.clearTargets();
+                }
                 // the lanes finish the pairs out of rep order
                 SORT_SERIAL(pairs.begin(), pairs.end(), ClusterPair::compareByRep);
                 // log the pairs in batch order
@@ -2715,6 +2829,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         readAssignedKeys(true);
                     }
                 }
+            }
+            // the aligners stay over the fetches, the buffers of their batches do not
+            if (threadTargetAligners[thread_idx] != NULL) {
+                threadTargetAligners[thread_idx]->swipeTargets.release();
             }
         }
         if (memberDbr != NULL) {
@@ -2788,11 +2906,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #ifdef OPENMP
                 thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-                MemberAligners aligners(par, scoring, maxMemberSeqLen, isSwipeEnabled);
                 std::vector<size_t> repMemberCheckOffsets;
                 std::vector<DBKeyType> repKeys;
 #pragma omp for schedule(dynamic, 1)
                 for (size_t batch = 0; batch < memberBatchCount; batch++) {
+                    if (threadMemberAligners[thread_idx] == NULL) {
+                        threadMemberAligners[thread_idx] = new MemberAligners(par, scoring, maxMemberSeqLen, isSwipeEnabled);
+                    }
+                    MemberAligners &aligners = *threadMemberAligners[thread_idx];
                     aligners.memberChecks.checkCount = 0;
                     repMemberCheckOffsets.assign(1, 0);
                     repKeys.clear();
@@ -2817,6 +2938,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     for (size_t g = 0; g < aligners.memberChecks.checkCount; g++) {
                         membersPassed[aligners.memberChecks.checks[g].targetId] = aligners.memberChecks.checks[g].isPassing;
                     }
+                }
+                if (threadMemberAligners[thread_idx] != NULL) {
+                    threadMemberAligners[thread_idx]->memberChecks.release();
+                    threadMemberAligners[thread_idx]->swipeMembers.release();
+                    threadMemberAligners[thread_idx]->memberTargets.release();
                 }
             }
             // a pair passes with its last part if none of its parts failed; the parts of a pair can span fetches
@@ -3046,6 +3172,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         // the reps of pending pairs are not done
         waitForSequences(nextSequences, getFirstUndoneRepKey(nextRepKey));
         std::swap(currentSequences, nextSequences);
+    }
+    for (int thread = 0; thread < par.threads; thread++) {
+        delete threadTargetAligners[thread];
+        delete threadMemberAligners[thread];
     }
     if (memberExchange != NULL && isAligningNode && nodes > 1) {
         memberExchange->finish();
@@ -4139,7 +4269,7 @@ int align2clustLinfinity(Parameters &par) {
     if (memberDbr != NULL) {
         // every reader, the serving ones too, has added its lookups by now
         MMseqsNode::addPhaseValue(phaseValues, "Cluster member lookup", SSTR(memberLookupCount.load()) + " entries read, " + SSTR(scannedMemberCount.load())
-                                  + " members, " + SSTR(memberLookupReadSize.load()) + " bytes");
+                                  + " members, " + SSTR(memberLookupReadSize.load()) + " bytes, " + SSTR(memberIndexReadSize.load()) + " index bytes");
         MMseqsNode::addPhaseValue(phaseValues, "Member block read bytes", SSTR(memberDbr->getBlockReadSize()));
         MMseqsNode::addPhaseValue(phaseValues, "Member key read bytes", SSTR(memberDbr->getKeyReadSize()));
         memberDbr->close();

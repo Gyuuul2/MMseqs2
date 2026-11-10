@@ -923,14 +923,14 @@ template <typename T> size_t DBReader<T>::getSeqLenFromRange(size_t &range, size
     return index[range].length - 2;
 }
 
-template <typename T> size_t DBReader<T>::findEntryByIndexColumn(size_t column, size_t value, size_t first, size_t last) {
+template <typename T> size_t DBReader<T>::findEntryByIndexColumn(size_t column, size_t value) {
     if (hasBinaryIndex == false || (column == 1 && value > dataSize)) {
         Debug(Debug::ERROR) << ((column == 0) ? "Key " : "Offset ") << value << " is not in the linfinity cluster or prefilter database " << dataFileName << "\n";
         EXIT(EXIT_FAILURE);
     }
     int fd = bufferedFds[dataFileNames.size()];
-    size_t entry = first;
-    for (size_t indexPairs = std::min(last, size + 1) - first; indexPairs > 0;) {
+    size_t entry = 0;
+    for (size_t indexPairs = size + 1; indexPairs > 0;) {
         size_t half = indexPairs / 2;
         uint64_t indexPair[2];
         FileUtil::preadAll(fd, indexFileName, (char *) indexPair, sizeof(indexPair), (entry + half) * sizeof(indexPair));
@@ -950,6 +950,10 @@ template <typename T> typename DBReader<T>::Index DBReader<T>::getIndexEntry(siz
     Index entry = { T(), indexPairs[1], indexPairs[3] - indexPairs[1] };
     entry.id += indexPairs[0];
     return entry;
+}
+
+template <typename T> void DBReader<T>::readIndexPairs(size_t first, size_t last, uint64_t *indexPairs) {
+    FileUtil::preadAll(bufferedFds[dataFileNames.size()], indexFileName, (char *) indexPairs, (last - first) * 2 * sizeof(uint64_t), first * 2 * sizeof(uint64_t));
 }
 
 template <typename T> void DBReader<T>::readData(size_t offset, size_t bytes, char *destination) {
