@@ -2036,7 +2036,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
     };
     const auto getFirstRepKey = [&](const FetchedSequences &sequences) {
-        return (sequences.end > sequences.begin) ? static_cast<size_t>(prefilterRecords[sequences.prefilterBuffer][sequences.begin].repOrderKeyFirstTarget.repKey) : orderKeyEnd;
+        if (sequences.end > sequences.begin) {
+            return static_cast<size_t>(prefilterRecords[sequences.prefilterBuffer][sequences.begin].repOrderKeyFirstTarget.repKey);
+        }
+        // a fetch that the member budget left without records has records behind it
+        const std::vector<RepTargetsRecord> &bufferRecords = prefilterRecords[sequences.prefilterBuffer];
+        return (sequences.end < bufferRecords.size()) ? static_cast<size_t>(bufferRecords[sequences.end].repOrderKeyFirstTarget.repKey) : orderKeyEnd;
     };
     // the reps of the pending pairs and of the accepted pairs behind them are not done
     const auto getFirstUndoneRepKey = [&](size_t nextRepKey) {
