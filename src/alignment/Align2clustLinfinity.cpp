@@ -1621,6 +1621,49 @@ struct MemberAligners {
           memberChecks(isSwipeEnabled ? &swipeMembers : NULL, true, isSwipeEnabled ? &memberTargets : NULL) {}
 };
 
+// one check of all members of a pair aligns its rounds of less than 4 members outside the SWIPE lanes; those are among the first 3 and the
+// last 3 members in the order of prepareMemberChecks, which is the order of (-length difference, list position)
+struct ScalarMembers {
+    size_t memberCount;
+    std::vector<std::pair<int, size_t> > first;
+    std::vector<std::pair<int, size_t> > last;
+
+    ScalarMembers() : memberCount(0) {}
+
+    void clear() {
+        memberCount = 0;
+        first.clear();
+        last.clear();
+    }
+
+    void add(int lengthDifference) {
+        const std::pair<int, size_t> member(-lengthDifference, memberCount++);
+        first.insert(std::upper_bound(first.begin(), first.end(), member), member);
+        if (first.size() > 3) {
+            first.pop_back();
+        }
+        last.insert(std::upper_bound(last.begin(), last.end(), member), member);
+        if (last.size() > 3) {
+            last.erase(last.begin());
+        }
+    }
+
+    // the list positions of the members outside the lanes
+    void getPositions(std::vector<size_t> &positions) const {
+        positions.clear();
+        for (size_t i = 0; i < first.size(); i++) {
+            if (isSwipeLaneMember(i, memberCount) == false) {
+                positions.push_back(first[i].second);
+            }
+        }
+        for (size_t i = 0; i < last.size(); i++) {
+            if (isSwipeLaneMember(memberCount - last.size() + i, memberCount) == false) {
+                positions.push_back(last[i].second);
+            }
+        }
+    }
+};
+
 static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTargetsReader &repTargetsReader,
                             size_t memoryLimit, size_t masterMemoryLimit, size_t servedFileEntrySize, size_t representativeResidues,
                             size_t paddedDbSize, size_t sizeClassCount, const ClusterMemberLookup *memberLookup, ClusterMemberExchange *memberExchange,
@@ -1744,6 +1787,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<size_t> pendingPairSize;
     std::vector<size_t> pendingMemberOffsets(1, 0);
     std::vector<DBKeyType> pendingMembers;
+    // the lane flags of one check of the whole pair, so that its parts align every member alike
+    std::vector<unsigned char> pendingMemberIsLane;
     // a pair whose members do not fit one fetch goes in parts, consecutive pending pairs that pass only together
     std::vector<unsigned char> pendingPairIsLastPart;
     bool isPendingPairFailing = false;
@@ -1763,6 +1808,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t slicedConsumedBytes = 0;
     bool isSlicingPair = false;
     size_t slicedRepSeqLen = 0;
+    std::vector<size_t> slicedScalarPositions;
+    size_t slicedMemberPosition = 0;
     size_t multiFetchPairCount = 0;
     size_t slicedPairCount = 0;
     // coverable bytes of a rep per serving node
@@ -2050,6 +2097,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<size_t> partMemberCounts;
     std::vector<std::vector<size_t> > threadPartSizes(par.threads);
     std::vector<std::vector<size_t> > threadPartMemberCounts(par.threads);
+    std::vector<std::vector<unsigned char> > threadMemberIsLane(par.threads);
     std::vector<unsigned char> membersPassed;
     std::vector<unsigned char> needsMemberCheck;
     std::vector<size_t> repPairOffsets;
@@ -2927,6 +2975,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             for (size_t member = pendingMemberOffsets[i]; member < pendingMemberOffsets[i + 1]; member++) {
                                 check.memberKeys.push_back(pendingMembers[member]);
                                 check.memberData.push_back(getFetchedEntry(currentSequences, pendingMembers[member]));
+                                check.isLaneMember.push_back(pendingMemberIsLane[member]);
                             }
                         }
                         if (aligners.memberChecks.checkCount > repMemberCheckOffsets.back()) {
@@ -2970,6 +3019,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             pendingPairIsLastPart.erase(pendingPairIsLastPart.begin(), pendingPairIsLastPart.begin() + pairCount);
             pendingMemberOffsets.erase(pendingMemberOffsets.begin(), pendingMemberOffsets.begin() + pairCount);
             pendingMembers.erase(pendingMembers.begin(), pendingMembers.begin() + checkedMembers);
+            pendingMemberIsLane.erase(pendingMemberIsLane.begin(), pendingMemberIsLane.begin() + checkedMembers);
             for (size_t i = 0; i < pendingMemberOffsets.size(); i++) {
                 pendingMemberOffsets[i] -= checkedMembers;
             }
@@ -3029,8 +3079,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
                 threadKeys[thread_idx].clear();
+                threadMemberIsLane[thread_idx].clear();
                 threadPartSizes[thread_idx].clear();
                 threadPartMemberCounts[thread_idx].clear();
+                ScalarMembers scalarMembers;
+                std::vector<size_t> scalarPositions;
 #pragma omp for schedule(static)
                 for (size_t i = 0; i < plannedCount; i++) {
                     const size_t memberBegin = threadKeys[thread_idx].size();
@@ -3049,6 +3102,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     size_t memberRange = SIZE_MAX;
                     size_t partSize = repSize;
                     size_t partMembers = 0;
+                    scalarMembers.clear();
                     while (needsMemberCheck[i] && member < memberEnd) {
                         const DBKeyType memberKey = lookupMembers[member++];
                         const size_t memberSeqLen = seqDbr.getSeqLenFromRange(memberRange, memberKey);
@@ -3065,14 +3119,21 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             partMembers = 0;
                         }
                         threadKeys[thread_idx].push_back(memberKey);
+                        threadMemberIsLane[thread_idx].push_back(1);
+                        scalarMembers.add(std::abs(static_cast<int>(memberSeqLen) - static_cast<int>(repSeqLen)));
                         partSize += memberSize;
                         partMembers++;
                     }
                     if (needsMemberCheck[i]) {
                         threadPartSizes[thread_idx].push_back(partSize);
                         threadPartMemberCounts[thread_idx].push_back(partMembers);
+                        scalarMembers.getPositions(scalarPositions);
+                        for (size_t p = 0; p < scalarPositions.size(); p++) {
+                            threadMemberIsLane[thread_idx][memberBegin + scalarPositions[p]] = 0;
+                        }
                     } else {
                         threadKeys[thread_idx].resize(memberBegin);
+                        threadMemberIsLane[thread_idx].resize(memberBegin);
                         threadPartSizes[thread_idx].resize(partBegin);
                         threadPartMemberCounts[thread_idx].resize(partBegin);
                     }
@@ -3083,6 +3144,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             partMemberCounts.clear();
             for (size_t thread = 0; thread < threadKeys.size(); thread++) {
                 pendingMembers.insert(pendingMembers.end(), threadKeys[thread].begin(), threadKeys[thread].end());
+                pendingMemberIsLane.insert(pendingMemberIsLane.end(), threadMemberIsLane[thread].begin(), threadMemberIsLane[thread].end());
                 partSizes.insert(partSizes.end(), threadPartSizes[thread].begin(), threadPartSizes[thread].end());
                 partMemberCounts.insert(partMemberCounts.end(), threadPartMemberCounts[thread].begin(), threadPartMemberCounts[thread].end());
             }
@@ -3108,7 +3170,25 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 isSlicingPair = true;
                 slicedPairCount++;
                 slicedConsumedBytes = 0;
+                slicedMemberPosition = 0;
                 slicedRepSeqLen = seqDbr.getSeqLen(acceptedPairs[0].repKey % paddedDbSize);
+                // a first read of the members finds those outside the lanes; the slices fail an assigned pair or one with an uncoverable member anyway
+                ScalarMembers scalarMembers;
+                bool needsCheck = isAssigned(acceptedPairs[0].repKey) == false && isAssigned(acceptedPairs[0].memberKey) == false;
+                lookupKeys.assign(1, acceptedPairs[0].memberKey);
+                for (size_t consumedBytes = 0; needsCheck && consumedBytes < acceptedEntryBytes[0];) {
+                    memberExchange->request(lookupKeys, &acceptedEntryOffsets[0], &acceptedEntryBytes[0], consumedBytes, memberKeyBudget);
+                    memberExchange->receive();
+                    memberExchange->getMembers(lookupMemberOffsets, lookupMembers);
+                    consumedBytes = memberExchange->getConsumedBytes();
+                    size_t memberRange = SIZE_MAX;
+                    for (size_t member = 0; needsCheck && member < lookupMembers.size(); member++) {
+                        const size_t memberSeqLen = seqDbr.getSeqLenFromRange(memberRange, lookupMembers[member]);
+                        needsCheck = canCoverMember(par, static_cast<int>(slicedRepSeqLen), static_cast<int>(memberSeqLen));
+                        scalarMembers.add(std::abs(static_cast<int>(memberSeqLen) - static_cast<int>(slicedRepSeqLen)));
+                    }
+                }
+                scalarMembers.getPositions(slicedScalarPositions);
             }
             // a slice of m members adds m + 1 parts at most
             if (isSlicingPair && freeKeys > 2) {
@@ -3139,6 +3219,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         partMembers = 0;
                     }
                     pendingMembers.push_back(memberKey);
+                    pendingMemberIsLane.push_back(std::find(slicedScalarPositions.begin(), slicedScalarPositions.end(), slicedMemberPosition++) == slicedScalarPositions.end());
                     partSize += memberSize;
                     partMembers++;
                     // an uncoverable member fails its part and so the pair

@@ -290,8 +290,9 @@ struct MemberCheck {
     std::vector<size_t> memberIds;
     std::vector<int> lengths;
     std::vector<std::string> records;
+    // filled by prepareMemberChecks unless a part of a pair brings those of the whole pair
+    std::vector<unsigned char> isLaneMember;
     size_t nextMember;
-    size_t currentMemberCount;
     bool isPassing;
 };
 
@@ -318,6 +319,7 @@ struct MemberChecks {
         check.startDiagonal = startDiagonal;
         check.memberKeys.clear();
         check.memberData.clear();
+        check.isLaneMember.clear();
         return check;
     }
 
@@ -338,6 +340,7 @@ Matcher::result_t createSwipeResult(const Parameters &par, EvalueComputation &ev
 void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherInitialized, MemberChecks &memberChecks, Sequence &query, Sequence &element,
                        DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer);
 bool canCoverMember(const Parameters &par, int queryLength, int memberLength);
+bool isSwipeLaneMember(size_t position, size_t memberCount);
 void prepareMemberChecks(const Parameters &par, Sequence &query, DBReader<DBKeyType> *cluSeqDbr, bool withRecords, MemberChecks &memberChecks, size_t checkBegin, size_t checkEnd);
 bool alignNextMembers(const Parameters &par, BlockAligner &blockAligner, Matcher &matcher, bool &matcherInitialized, Sequence &query, Sequence &element,
                       DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer, MemberChecks &memberChecks,

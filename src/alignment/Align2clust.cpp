@@ -374,7 +374,7 @@ static bool findMatchSeed(const char *querySequence, const char *targetSequence,
     return false;
 }
 
-// checks with at least 4 current members share the SWIPE lanes
+// the lane members share the SWIPE lanes, the others go to the scalar aligner
 void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherInitialized, MemberChecks &memberChecks, Sequence &query, Sequence &element,
                        DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer) {
     SwipeBatch &swipeMembers = *memberChecks.swipeMembers;
@@ -386,7 +386,7 @@ void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherIni
     gappedMemberBatchIndices.assign(swipeMembers.gapped.size(), SIZE_MAX);
     swipeMembers.entries.clear();
     for (size_t g = 0; g < swipeMembers.gapped.size(); g++) {
-        if (memberChecks.checks[memberChecks.gappedMemberChecks[g]].currentMemberCount >= 4) {
+        if (memberChecks.checks[memberChecks.gappedMemberChecks[g]].isLaneMember[swipeMembers.gapped[g]]) {
             gappedMemberBatchIndices[g] = swipeMembers.entries.size();
             swipeMembers.entries.push_back(g);
         }
@@ -452,6 +452,15 @@ bool canCoverMember(const Parameters &par, int queryLength, int memberLength) {
            && (par.diagonalMode != Parameters::DIAGONAL_MODE_UNGAPPED || canBeCoveredOnDiagonals(par, queryLength, memberLength, minDiag, maxDiag));
 }
 
+// the members of a check align in rounds of 1, 2, 4, ... in the order of prepareMemberChecks, and the rounds of 4 members at least share the SWIPE lanes
+bool isSwipeLaneMember(size_t position, size_t memberCount) {
+    size_t roundSize = 1;
+    while (2 * roundSize - 1 <= position) {
+        roundSize *= 2;
+    }
+    return std::min(roundSize, memberCount - (roundSize - 1)) >= 4;
+}
+
 // most different lengths first
 void prepareMemberChecks(const Parameters &par, Sequence &query, DBReader<DBKeyType> *cluSeqDbr, bool withRecords, MemberChecks &memberChecks, size_t checkBegin, size_t checkEnd) {
     int queryLength = query.L;
@@ -478,6 +487,12 @@ void prepareMemberChecks(const Parameters &par, Sequence &query, DBReader<DBKeyT
         std::stable_sort(check.order.begin(), check.order.end(), [&memberLengths, queryLength](size_t first, size_t second) {
             return std::abs(memberLengths[first] - queryLength) > std::abs(memberLengths[second] - queryLength);
         });
+        if (check.isLaneMember.empty()) {
+            check.isLaneMember.resize(check.order.size());
+            for (size_t o = 0; o < check.order.size(); o++) {
+                check.isLaneMember[check.order[o]] = isSwipeLaneMember(o, check.order.size());
+            }
+        }
         if (withRecords) {
             check.records.assign(check.memberKeys.size(), std::string());
         }
@@ -497,7 +512,6 @@ bool alignNextMembers(const Parameters &par, BlockAligner &blockAligner, Matcher
         }
         hasOpenCheck = true;
         size_t batchEnd = std::min(check.memberKeys.size(), check.nextMember + batchSize);
-        check.currentMemberCount = batchEnd - check.nextMember;
         for (size_t o = check.nextMember; o < batchEnd && check.isPassing; o++) {
             size_t i = check.order[o];
             DBKeyType elementKey = check.memberKeys[i];
