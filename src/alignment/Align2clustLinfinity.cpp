@@ -2030,9 +2030,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             sequences.entries = new(std::nothrow) char[sequences.allocatedSize];
             Util::checkAllocation(sequences.entries, "Can not allocate fetched sequence memory in align2clust");
         }
-#pragma omp parallel for schedule(dynamic, 1024)
-        for (size_t i = sequences.fetchSourceKeyOffsets[nodes]; i < keyCount; i++) {
-            memcpy(sequences.entries + sequences.entryOffsets[i], getFetchedEntry(previous, sequences.keys[i]), sequences.entryOffsets[i + 1] - sequences.entryOffsets[i]);
+#pragma omp parallel
+        {
+            FetchedKeyCursor keyCursor(nodes + 1);
+#pragma omp for schedule(dynamic, 1024)
+            for (size_t i = sequences.fetchSourceKeyOffsets[nodes]; i < keyCount; i++) {
+                memcpy(sequences.entries + sequences.entryOffsets[i], getFetchedEntry(previous, sequences.keys[i], NULL, &keyCursor), sequences.entryOffsets[i + 1] - sequences.entryOffsets[i]);
+            }
         }
     };
     const auto getFirstRepKey = [&](const FetchedSequences &sequences) {
@@ -2180,14 +2184,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #endif
                 // the static chunks give a thread ascending keys
                 size_t packRange = SIZE_MAX;
+                DBReader<DBKeyType>::LoadedBufferCursor cursor;
 #pragma omp for schedule(static)
                 for (size_t i = loadFirst; i < first; i++) {
                     // bits are never cleared
                     if (isAssigned(keys[i])) {
                         memset(data + offsets[i], 0, offsets[i + 1] - offsets[i]);
                     } else if (rawKeys == NULL) {
-                        memcpy(data + offsets[i], seqDbr.getData(keys[i], 0), offsets[i + 1] - offsets[i]);
-                    } else if (packEntry(seqDbr.getData(keys[i], 0), seqDbr.getSeqLenFromRange(packRange, keys[i]) + 2, data + offsets[i]) == false) {
+                        memcpy(data + offsets[i], seqDbr.getDataFromLoadedBuffer(keys[i], cursor), offsets[i + 1] - offsets[i]);
+                    } else if (packEntry(seqDbr.getDataFromLoadedBuffer(keys[i], cursor), seqDbr.getSeqLenFromRange(packRange, keys[i]) + 2, data + offsets[i]) == false) {
                         data[offsets[i]] = PACKED_RAW_CODE;
                         threadRawEntries[thread_idx].push_back(i);
                     }

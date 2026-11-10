@@ -1473,8 +1473,16 @@ template <typename T> void DBReader<T>::decompressLoadedBuffer() {
 }
 
 template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key) {
+    LoadedBufferCursor cursor;
+    return getDataFromLoadedBuffer(key, cursor);
+}
+
+template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key, LoadedBufferCursor &cursor) {
     if (batchReader != NULL && key < size) {
-        size_t range = findIdRange(key);
+        size_t &range = cursor.range;
+        if (range >= indexSize || key < indexIdToNum(&index[range].id) || (range + 1 < indexSize && indexIdToNum(&index[range + 1].id) <= key)) {
+            range = findIdRange(key);
+        }
         size_t fileOffset = index[range].offset + (key - indexIdToNum(&index[range].id)) * index[range].length;
         size_t length = index[range].length;
         if (entryOffsetsFileNames.empty() == false) {
@@ -1483,16 +1491,25 @@ template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key) {
             length = loadedBuffer.entryOffsets[pos + 1] - fileOffset;
         }
         if (cachedBlocks.empty() == false) {
-            size_t block = getKeyBlock(key);
-            const std::map<size_t, BatchReader::ReadRequest>::const_iterator cached = cachedBlocks.find(block);
-            if (cached != cachedBlocks.end()) {
-                return cached->second.destination + (fileOffset - cached->second.fileOffset);
+            if (cursor.block == SIZE_MAX || key < blockKeyOffsets[cursor.block] || key >= blockKeyOffsets[cursor.block + 1]) {
+                cursor.block = getKeyBlock(key);
+                const std::map<size_t, BatchReader::ReadRequest>::const_iterator cached = cachedBlocks.find(cursor.block);
+                cursor.cachedBlock = (cached != cachedBlocks.end()) ? &cached->second : NULL;
+            }
+            if (cursor.cachedBlock != NULL) {
+                return cursor.cachedBlock->destination + (fileOffset - cursor.cachedBlock->fileOffset);
             }
         }
         const std::vector<int> &fds = loadedBuffer.isKeyLoad ? bufferedFds : dataFds;
         int fd = fds[index2dbfile[range]];
         const std::vector<size_t> &firstKeys = loadedBuffer.requestFirstKeys;
-        size_t requestEnd = std::upper_bound(firstKeys.begin(), firstKeys.end(), key) - firstKeys.begin();
+        size_t &requestEnd = cursor.requestEnd;
+        if (requestEnd < firstKeys.size() && firstKeys[requestEnd] <= key) {
+            requestEnd++;
+        }
+        if (requestEnd > firstKeys.size() || (requestEnd > 0 && firstKeys[requestEnd - 1] > key) || (requestEnd < firstKeys.size() && firstKeys[requestEnd] <= key)) {
+            requestEnd = std::upper_bound(firstKeys.begin(), firstKeys.end(), key) - firstKeys.begin();
+        }
         if (requestEnd > 0) {
             const BatchReader::ReadRequest &request = loadedBuffer.readRequests[requestEnd - 1];
             if (request.fileToRead == fd && fileOffset >= request.fileOffset && fileOffset + length <= request.fileOffset + request.minBytesToRead) {
