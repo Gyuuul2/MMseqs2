@@ -72,6 +72,7 @@ Parameters::Parameters():
         PARAM_PRELOAD_MODE(PARAM_PRELOAD_MODE_ID, "--db-load-mode", "Preload mode", "Database preload mode 0: auto, 1: fread, 2: mmap, 3: mmap+touch", typeid(int), (void *) &preloadMode, "[0-3]{1}", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_SPACED_KMER_PATTERN(PARAM_SPACED_KMER_PATTERN_ID, "--spaced-kmer-pattern", "Spaced k-mer pattern", "User-specified spaced k-mer pattern", typeid(std::string), (void *) &spacedKmerPattern, "^1[01]*1$", MMseqsParameter::COMMAND_PREFILTER | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LOCAL_TMP(PARAM_LOCAL_TMP_ID, "--local-tmp", "Local temporary path", "Path on node-local flash for some temporary files. Linfinity createdb spools the sent sequences there, align2clust copies the sequence blocks it serves and kmermatcher writes its last exchange file groups there before it copies them to the shared folder", typeid(std::string), (void *) &localTmp, "", MMseqsParameter::COMMAND_PREFILTER | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LOCAL_TMP_FALLBACK(PARAM_LOCAL_TMP_FALLBACK_ID, "--local-tmp-fallback", "Local temporary path fallback", "What linfinity align2clust does when it cannot copy its served sequence blocks to --local-tmp: it is not node-local flash, is on the device of the database or has too little free space\n0: stop with an error\n1: warn and read them from the shared folder instead", typeid(bool), (void *) &localTmpFallback, "", MMseqsParameter::COMMAND_EXPERT),
         // alignment
         PARAM_ALIGNMENT_MODE(PARAM_ALIGNMENT_MODE_ID, "--alignment-mode", "Alignment mode", "How to compute the alignment:\n0: automatic\n1: only score and end_pos\n2: also start_pos and cov\n3: also seq.id\n4: only ungapped alignment", typeid(int), (void *) &alignmentMode, "^[0-5]{1}$", MMseqsParameter::COMMAND_ALIGN),
         PARAM_ALIGNMENT_OUTPUT_MODE(PARAM_ALIGNMENT_OUTPUT_MODE_ID, "--alignment-output-mode", "Alignment mode", "How to compute the alignment:\n0: automatic\n1: only score and end_pos\n2: also start_pos and cov\n3: also seq.id\n4: only ungapped alignment\n5: score only (output) cluster format", typeid(int), (void *) &alignmentOutputMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_ALIGN),
@@ -487,6 +488,7 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_FILTER_CLUDB_FILE);
     align2clust.push_back(&PARAM_FILTER_SEQDB_FILE);
     align2clust.push_back(&PARAM_LOCAL_TMP);
+    align2clust.push_back(&PARAM_LOCAL_TMP_FALLBACK);
     align2clust.push_back(&PARAM_INCLUDE_ALIGN_FILES);
     align2clust.push_back(&PARAM_DIAGONAL_MODE);
     align2clust.push_back(&PARAM_ALIGN2CLUST_ALIGNER_MODE);
@@ -2563,6 +2565,7 @@ void Parameters::setDefaults() {
     splitAA = false;
     spacedKmerPattern = "";
     localTmp = "";
+    localTmpFallback = true;
 
     // search workflow
     numIterations = 1;

@@ -45,6 +45,8 @@ public:
     }
 
     static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
+    // a --local-tmp that cannot be used is reported and the run goes on in the shared folder
+    static void reportUnusableLocalTmp(const std::string &problem);
 
     class WaitWarning {
     public:

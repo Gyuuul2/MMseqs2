@@ -3970,10 +3970,11 @@ int align2clustLinfinity(Parameters &par) {
         struct stat localTmpStat, dbStat;
         const bool isDbDevice = fstat(localTmpFd, &localTmpStat) == 0 && stat(par.db1Index.c_str(), &dbStat) == 0 && localTmpStat.st_dev == dbStat.st_dev;
         close(localTmpFd);
+        std::string localTmpProblem;
         if (localTmpStorage != STORAGE_LOCAL_FLASH) {
-            Debug(Debug::WARNING) << "Not copying the served blocks to " << par.localTmp << ": it is on " << getStorageName(localTmpStorage) << ", not local flash\n";
+            localTmpProblem = std::string("it is on ") + getStorageName(localTmpStorage) + ", not local flash";
         } else if (isDbDevice) {
-            Debug(Debug::WARNING) << "Not copying the served blocks to " << par.localTmp << ": it is on the device of the database\n";
+            localTmpProblem = "it is on the device of the database";
         } else {
             // copy only the served blocks
             DBReader<DBKeyType> blockDbr(par.db1.c_str(), par.db1Index.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
@@ -4001,16 +4002,30 @@ int align2clustLinfinity(Parameters &par) {
                 servedSize += end - begin;
             }
             blockDbr.close();
+            // a copy left by a killed run does not take the free space
+            const std::string localDir = par.localTmp + "/" + FileUtil::baseName(par.db3) + ".served." + SSTR(MMseqsNode::rank);
+            const std::vector<std::string> oldCopies = FileUtil::findDatafiles((localDir + "/" + FileUtil::baseName(par.db1)).c_str());
+            for (size_t i = 0; i < oldCopies.size(); i++) {
+                FileUtil::remove(oldCopies[i].c_str());
+            }
             struct statvfs fs;
             const size_t freeSize = (statvfs(par.localTmp.c_str(), &fs) == 0) ? static_cast<size_t>(fs.f_bavail) * fs.f_frsize : 0;
             if (freeSize < servedSize) {
-                Debug(Debug::WARNING) << "Not copying the served blocks to " << par.localTmp << ": it has " << freeSize << " free bytes, the served blocks need " << servedSize << "\n";
+                localTmpProblem = "it has " + SSTR(freeSize) + " free bytes, the served blocks need " + SSTR(servedSize);
             } else {
-                seqDb = FileUtil::copyToLocalDir(par.db1, par.localTmp + "/" + FileUtil::baseName(par.db3) + ".served." + SSTR(MMseqsNode::rank), par.threads, localCopies, localCopySize, servedFileRanges);
+                seqDb = FileUtil::copyToLocalDir(par.db1, localDir, par.threads, localCopies, localCopySize, servedFileRanges);
                 hasLocalServedBlocks = true;
                 MMseqsNode::addPhaseTime(phaseValues, "copying the served blocks to --local-tmp", phaseValueTimer);
             }
         }
+        if (hasLocalServedBlocks == false) {
+            if (par.localTmpFallback == false) {
+                Debug(Debug::ERROR) << "Cannot copy the served blocks to --local-tmp " << par.localTmp << ": " << localTmpProblem << ". Please choose another --local-tmp or set --local-tmp-fallback 1 to read them from the shared folder.\n";
+                EXIT(EXIT_FAILURE);
+            }
+            MMseqsNode::reportUnusableLocalTmp("Cannot copy the served blocks to --local-tmp " + par.localTmp + ": " + localTmpProblem);
+        }
+        MMseqsNode::addPhaseValue(phaseValues, "Local tmp", hasLocalServedBlocks ? "holds the served blocks" : "not used, " + localTmpProblem);
     }
     DBReader<DBKeyType> seqDbr(seqDb.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
     seqDbr.open(DBReader<DBKeyType>::NOSORT);

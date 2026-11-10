@@ -616,6 +616,10 @@ size_t MMseqsNode::getMemoryLimit(const Parameters &par, size_t localCopyBytes) 
     return memoryLimit - localCopyBytes;
 }
 
+void MMseqsNode::reportUnusableLocalTmp(const std::string &problem) {
+    Debug(Debug::WARNING) << problem << "; using the shared folder instead\n";
+}
+
 size_t MMseqsNode::getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads, const std::string &localDirectory, size_t *localNodes) {
     std::string localDevice;
     int fd = localDirectory.empty() ? -1 : open(localDirectory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);

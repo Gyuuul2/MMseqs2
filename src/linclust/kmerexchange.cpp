@@ -472,11 +472,14 @@ static void fitLocalFileGroups(ExchangeFileGroups &groups, const std::vector<siz
         for (size_t i = groups.count - groups.localCount; i < groups.count; i++) {
             growth += flushEnds[i] - flushStarts[i];
         }
-        if (2 * growth * groups.localNodes <= FileUtil::getFreeSpace(groups.localTmp.c_str())) {
+        size_t freeSize = FileUtil::getFreeSpace(groups.localTmp.c_str());
+        if (2 * growth * groups.localNodes <= freeSize) {
             return;
         }
         batchWriter.waitWrites();
         size_t first = groups.count - groups.localCount;
+        MMseqsNode::reportUnusableLocalTmp("Cannot keep " + FileUtil::baseName(getFileGroupName(groups, MMseqsNode::rank, first)) + " in --local-tmp " + groups.localTmp + ": it has "
+                                           + SSTR(freeSize) + " free bytes, the local file groups may need " + SSTR(2 * growth * groups.localNodes));
         groups.files[first] = copyLocalFileGroup(groups, first, groups.files[first], flushStarts[first]);
         groups.names[first] = getFileGroupName(groups, MMseqsNode::rank, first);
         groups.localCount--;
@@ -2960,6 +2963,10 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     }
     size_t localNodes = 0;
     size_t minPassLimit = std::max((size_t) 1, getPassLimit(MMseqsNode::getSmallestMemoryLimit(par.db2 + ".memory", memoryLimit, par.threads, par.localTmp, &localNodes)));
+    // localNodes counts this node too when its --local-tmp is local flash
+    if (par.localTmp.empty() == false && localNodes == 0) {
+        MMseqsNode::reportUnusableLocalTmp("Cannot keep the last exchange file groups in --local-tmp " + par.localTmp + ": it is not local flash");
+    }
     size_t passes = std::max((size_t) 1, (totalKmerCount * receiverKmerSize + minPassLimit - 1) / minPassLimit);
     exchange.hashSubRangesPerRange = (std::max(passes, exchange.hashRangeCount) * TASKS_PER_THREAD * par.threads + exchange.hashRangeCount - 1) / exchange.hashRangeCount;
     exchange.hashSubRangeCount = exchange.hashRangeCount * exchange.hashSubRangesPerRange;
@@ -2981,6 +2988,11 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         size_t pairGroupSize = std::max((size_t) 1, totalKmerCount * ((exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT) / (MMseqsNode::count * pairGroups.count));
         kmerGroups.localCount = std::min(kmerGroups.count, share / (3 * kmerGroupSize));
         pairGroups.localCount = std::min(pairGroups.count, share / (3 * pairGroupSize));
+        if (kmerGroups.localCount < kmerGroups.count || pairGroups.localCount < pairGroups.count) {
+            MMseqsNode::reportUnusableLocalTmp("Cannot keep all exchange file groups in --local-tmp " + par.localTmp + ": its " + SSTR(share) + " free bytes per node hold "
+                                               + SSTR(kmerGroups.localCount) + " of " + SSTR(kmerGroups.count) + " k-mer and " + SSTR(pairGroups.localCount) + " of "
+                                               + SSTR(pairGroups.count) + " pair file groups");
+        }
     }
     kmerGroups.localTmp = par.localTmp;
     pairGroups.localTmp = par.localTmp;

@@ -465,6 +465,7 @@ public:
     int    realignMaxSeqs;               // Max alignments to realign
     std::string spacedKmerPattern;       // User-specified kmer pattern
     std::string localTmp;                // Local temporary path
+    bool localTmpFallback;               // warn instead of stopping when align2clust cannot use --local-tmp
 
 
     // ALIGNMENT
@@ -865,6 +866,7 @@ public:
     PARAMETER(PARAM_PRELOAD_MODE)
     PARAMETER(PARAM_SPACED_KMER_PATTERN)
     PARAMETER(PARAM_LOCAL_TMP)
+    PARAMETER(PARAM_LOCAL_TMP_FALLBACK)
     std::vector<MMseqsParameter*> prefilter;
     std::vector<MMseqsParameter*> ungappedprefilter;
     std::vector<MMseqsParameter*> gappedprefilter;
