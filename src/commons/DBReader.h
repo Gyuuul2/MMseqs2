@@ -313,6 +313,15 @@ public:
     void readData(size_t offset, size_t bytes, char *destination);
     int getBufferedFd() const { return bufferedFds[0]; }
     char *getDataFromLoadedBuffer(size_t key);
+    // where the last key was found, valid until the next load
+    struct LoadedBufferCursor {
+        LoadedBufferCursor() : range(SIZE_MAX), block(SIZE_MAX), cachedBlock(NULL), requestEnd(SIZE_MAX) {}
+        size_t range;
+        size_t block;
+        const BatchReader::ReadRequest *cachedBlock;
+        size_t requestEnd;
+    };
+    char *getDataFromLoadedBuffer(size_t key, LoadedBufferCursor &cursor);
 
     size_t bsearch(const Index * index, size_t size, T value);
 
