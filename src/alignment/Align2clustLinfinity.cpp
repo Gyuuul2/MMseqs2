@@ -3213,10 +3213,7 @@ int align2clustLinfinity(Parameters &par) {
     size_t localCopySize = 0;
     bool hasLocalServedBlocks = false;
     // a master that only clusters reads no sequences
-    if (par.localDbDir.empty() == false && MMseqsNode::rank >= getFirstAlignNode()) {
-        seqDb = FileUtil::getLocalDb(par.db1, par.localDbDir, par.localDbName, par.db3, par.threads, MMseqsNode::rank, localCopies, localCopySize);
-        MMseqsNode::addPhaseTime(phaseValues, "preparing the sequences on --local-db-dir", phaseValueTimer);
-    } else if (par.localTmp.empty() == false && MMseqsNode::rank >= getFirstAlignNode()) {
+    if (par.localTmp.empty() == false && MMseqsNode::rank >= getFirstAlignNode()) {
         // ranks on one machine may create it at once
         if (FileUtil::makeDir(par.localTmp.c_str()) == false && FileUtil::directoryExists(par.localTmp.c_str()) == false) {
             Debug(Debug::ERROR) << "Cannot create local tmp dir " << par.localTmp << "\n";
@@ -3263,7 +3260,7 @@ int align2clustLinfinity(Parameters &par) {
             if (freeSize < servedSize) {
                 Debug(Debug::WARNING) << "Not copying the served blocks to " << par.localTmp << ": it has " << freeSize << " free bytes, the served blocks need " << servedSize << "\n";
             } else {
-                seqDb = FileUtil::copyToLocalDir(par.db1, par.localTmp + "/" + FileUtil::baseName(par.db3) + ".served." + SSTR(MMseqsNode::rank), par.threads, localCopies, localCopySize, &servedFileRanges);
+                seqDb = FileUtil::copyToLocalDir(par.db1, par.localTmp + "/" + FileUtil::baseName(par.db3) + ".served." + SSTR(MMseqsNode::rank), par.threads, localCopies, localCopySize, servedFileRanges);
                 hasLocalServedBlocks = true;
                 MMseqsNode::addPhaseTime(phaseValues, "copying the served blocks to --local-tmp", phaseValueTimer);
             }
@@ -3410,12 +3407,7 @@ int align2clustLinfinity(Parameters &par) {
         if (MMseqsNode::rank >= getFirstAlignNode()) {
             memberLookup = new ClusterMemberLookup(par.filterCluDBFile, sampledKeyData, entriesPerSampledKey);
         }
-        // --local-db-dir copied the data files the members share with the sequence database
-        std::string memberSeqDb = par.filterSeqDBFile;
-        if (par.localDbDir.empty() == false && MMseqsNode::rank >= getFirstAlignNode() && FileUtil::isSameDbData(par.filterSeqDBFile, par.db1)) {
-            memberSeqDb = seqDb;
-        }
-        memberDbr = new DBReader<DBKeyType>(memberSeqDb.c_str(), (par.filterSeqDBFile + ".index").c_str(), par.threads,
+        memberDbr = new DBReader<DBKeyType>(par.filterSeqDBFile.c_str(), (par.filterSeqDBFile + ".index").c_str(), par.threads,
                                             DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
         memberDbr->open(DBReader<DBKeyType>::NOSORT);
         MMseqsNode::addPhaseTime(phaseValues, "sampling the cluster index keys", phaseValueTimer);

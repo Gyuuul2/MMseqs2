@@ -609,14 +609,6 @@ void MMseqsNode::WorkQueue::removeTakenItemFiles() {
 
 size_t MMseqsNode::getMemoryLimit(const Parameters &par, size_t localCopyBytes) {
     const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
-    if (par.localDbName.empty() == false) {
-        if (par.localDbDir.empty() || FileUtil::isDbName(par.localDbName) == false) {
-            Debug(Debug::ERROR) << "--local-db-name requires --local-db-dir and a database name without a directory\n";
-            EXIT(EXIT_FAILURE);
-        }
-        const std::string localDb = FileUtil::getLocalDbPath(par.localDbDir + "/" + par.localDbName, rank);
-        localCopyBytes = FileUtil::getLocalDbMemoryBytes(localDb);
-    }
     if (localCopyBytes > 0 && localCopyBytes >= memoryLimit) {
         Debug(Debug::ERROR) << "The sequence copy on tmpfs needs " << localCopyBytes << " bytes, the available memory is " << memoryLimit << " bytes\n";
         EXIT(EXIT_FAILURE);

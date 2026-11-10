@@ -89,16 +89,7 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     FileUtil::remove(punchFile.c_str());
 
     CommandCaller cmd;
-    // The final merge runs after cleanup and must not reserve the copy's tmpfs bytes.
-    par.localDbName.clear();
     cmd.addVariable("MERGECLU_PAR", par.createParameterString(par.mergeclusters).c_str());
-    if (par.localDbDir.empty() == false) {
-        par.localDbName = "lin8clust_" + hash + "_" + FileUtil::baseName(par.db1);
-    }
-    cmd.addVariable("LOCAL_DB_NAME", par.localDbName.empty() ? NULL : par.localDbName.c_str());
-    cmd.addVariable("LOCAL_DB_COPY_PAR", par.createParameterString(par.cpdb).c_str());
-    cmd.addVariable("LOCAL_DB_REMOVE_PAR", par.createParameterString(par.rmdb).c_str());
-    cmd.addVariable("MERGECLU_LOCAL_PAR", par.createParameterString(par.mergeclusters).c_str());
     par.subDbMode = Parameters::SUBDB_MODE_SOFT;
     cmd.addVariable("CREATESUBDB_PAR", par.createParameterString(par.createsubdb).c_str());
     cmd.addVariable("REMOVE_TMP", par.removeTmpFiles ? "TRUE" : NULL);

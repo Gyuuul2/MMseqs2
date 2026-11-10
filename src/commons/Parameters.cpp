@@ -268,8 +268,6 @@ Parameters::Parameters():
         // align2clust
         PARAM_FILTER_CLUDB_FILE(PARAM_FILTER_CLUDB_FILE_ID, "--filter-cludb-file", "Filter cluDB file", "Specify a cluDB file to filter", typeid(std::string), (void *) &filterCluDBFile, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_FILTER_SEQDB_FILE(PARAM_FILTER_SEQDB_FILE_ID, "--filter-seqdb-file", "Filter seqDB file", "Specify a seqDB of cluDB file to filter", typeid(std::string), (void *) &filterSeqDBFile, "", MMseqsParameter::COMMAND_EXPERT),
-        PARAM_LOCAL_DB_DIR(PARAM_LOCAL_DB_DIR_ID, "--local-db-dir", "Local database directory", "linfinity databases (--createdb-mode 3): copy all sequences to this node-local directory (NVMe, /dev/shm); lin8clust reuses the copy across steps, every rank needs room for the whole sequence database", typeid(std::string), (void *) &localDbDir, "", MMseqsParameter::COMMAND_EXPERT),
-        PARAM_LOCAL_DB_NAME(PARAM_LOCAL_DB_NAME_ID, "--local-db-name", "Local database name", "Name of the complete sequence copy owned by the lin8clust workflow", typeid(std::string), (void *) &localDbName, "", MMseqsParameter::COMMAND_HIDDEN),
         // besthitperset
         PARAM_SIMPLE_BEST_HIT(PARAM_SIMPLE_BEST_HIT_ID, "--simple-best-hit", "Use simple best hit", "Update the p-value by a single best hit, or by best and second best hits", typeid(bool), (void *) &simpleBestHit, ""),
         PARAM_ALPHA(PARAM_ALPHA_ID, "--alpha", "Alpha", "Set alpha for combining p-values during aggregation", typeid(float), (void *) &alpha, "^0(\\.[0-9]+)?|^1(\\.0+)?$"),
@@ -383,11 +381,6 @@ Parameters::Parameters():
     onlythreads.push_back(&PARAM_THREADS);
     onlythreads.push_back(&PARAM_V);
 
-    cpdb = onlythreads;
-    cpdb.push_back(&PARAM_LOCAL_DB_DIR);
-    rmdb = onlyverbosity;
-    rmdb.push_back(&PARAM_LOCAL_DB_DIR);
-
     // threadsandcompression
     threadsandcompression.push_back(&PARAM_THREADS);
     threadsandcompression.push_back(&PARAM_COMPRESSED);
@@ -395,8 +388,6 @@ Parameters::Parameters():
 
     // mergeclusters
     mergeclusters.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
-    mergeclusters.push_back(&PARAM_LOCAL_DB_DIR);
-    mergeclusters.push_back(&PARAM_LOCAL_DB_NAME);
     mergeclusters.push_back(&PARAM_THREADS);
     mergeclusters.push_back(&PARAM_COMPRESSED);
     mergeclusters.push_back(&PARAM_V);
@@ -495,8 +486,6 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_CLUSTER_MODE);
     align2clust.push_back(&PARAM_FILTER_CLUDB_FILE);
     align2clust.push_back(&PARAM_FILTER_SEQDB_FILE);
-    align2clust.push_back(&PARAM_LOCAL_DB_DIR);
-    align2clust.push_back(&PARAM_LOCAL_DB_NAME);
     align2clust.push_back(&PARAM_LOCAL_TMP);
     align2clust.push_back(&PARAM_INCLUDE_ALIGN_FILES);
     align2clust.push_back(&PARAM_DIAGONAL_MODE);
@@ -1127,8 +1116,6 @@ Parameters::Parameters():
 
     clusthashfast = clusthash;
     clusthashfast.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
-    clusthashfast.push_back(&PARAM_LOCAL_DB_DIR);
-    clusthashfast.push_back(&PARAM_LOCAL_DB_NAME);
     // kmermatcher
     kmermatcher.push_back(&PARAM_SUB_MAT);
     kmermatcher.push_back(&PARAM_ALPH_SIZE);
@@ -1149,8 +1136,6 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_HASH_SHIFT);
     kmermatcher.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     kmermatcher.push_back(&PARAM_LOCAL_TMP);
-    kmermatcher.push_back(&PARAM_LOCAL_DB_DIR);
-    kmermatcher.push_back(&PARAM_LOCAL_DB_NAME);
     kmermatcher.push_back(&PARAM_INCLUDE_ONLY_EXTENDABLE);
     kmermatcher.push_back(&PARAM_IGNORE_MULTI_KMER);
     kmermatcher.push_back(&PARAM_THREADS);
@@ -1321,8 +1306,6 @@ Parameters::Parameters():
     createsubdb.push_back(&PARAM_SUBDB_MODE);
     createsubdb.push_back(&PARAM_ID_MODE);
     createsubdb.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
-    createsubdb.push_back(&PARAM_LOCAL_DB_DIR);
-    createsubdb.push_back(&PARAM_LOCAL_DB_NAME);
     createsubdb.push_back(&PARAM_V);
 
     // renamedbkeys
@@ -1566,7 +1549,6 @@ Parameters::Parameters():
     linclustworkflow.push_back(&PARAM_LINCLUST_ITERATIONS);
     linclustworkflow.push_back(&PARAM_REUSELATEST);
     linclustworkflow.push_back(&PARAM_RUNNER);
-    linclustworkflow = removeParameter(linclustworkflow, PARAM_LOCAL_DB_NAME);
 
     // easylinclustworkflow
     easylinclustworkflow = combineList(linclustworkflow, createdb);
@@ -2679,8 +2661,6 @@ void Parameters::setDefaults() {
         runner = "";
     }
     nodeRunner = "";
-    localDbDir = "";
-    localDbName = "";
     reuseLatest = false;
     // Clustering workflow
     removeTmpFiles = false;

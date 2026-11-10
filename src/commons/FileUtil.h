@@ -65,19 +65,12 @@ public:
     static void copyFile(const char *src, const char *dst);
     static void copyFile(const std::string& src, const std::string& dst);
 
-    // a database name that cpdb, rmdb and the workflow copy place in a local directory
-    static bool isDbName(const std::string &name);
     static bool isSameDbData(const std::string &firstDb, const std::string &secondDb);
-    static std::string getLocalDbPath(const std::string &prefix, unsigned int rank);
-    static size_t getLocalDbMemoryBytes(const std::string &db);
-    // localName: a complete workflow-owned copy; otherwise create a copy owned by this output.
-    static std::string getLocalDb(const std::string &db, const std::string &localDir, const std::string &localName, const std::string &outputDb, int threads, unsigned int rank,
-                                  std::vector<std::string> &copies, size_t &memoryBytes);
 
-    // copies the data files of db into the directory localDir and returns the name of the copy; memoryBytes: its bytes if it is on tmpfs
-    // fileRanges: only these byte ranges of each data file, into sparse copies
+    // copies the given byte ranges of each data file of db into the directory localDir as sparse copies and returns the name of the copy
+    // memoryBytes: the bytes of the copy if it is on tmpfs
     static std::string copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &memoryBytes,
-                                      const std::vector<std::vector<std::pair<size_t, size_t> > > *fileRanges = NULL, const std::string &copyName = "");
+                                      const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges);
 
     static FILE *openAndDelete(const char *fileName, const char *mode);
 
