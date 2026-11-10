@@ -32,9 +32,6 @@ int linclust(int argc, const char **argv, const Command& command) {
     par.PARAM_INCLUDE_ONLY_EXTENDABLE.addCategory(MMseqsParameter::COMMAND_EXPERT);
 
     par.parseParameters(argc, argv, command, true, 0, 0);
-    if (par.PARAM_CLUST_HASH.wasSet == false) {
-        par.clustHash = (par.linclustVersion == Parameters::LINCLUST_VERSION2);
-    }
     std::string tmpDir = par.db3;
     std::string hash = SSTR(par.hashParameter(command.databases, par.filenames, par.linclustworkflow));
     if (par.reuseLatest) {
@@ -50,6 +47,9 @@ int linclust(int argc, const char **argv, const Command& command) {
             Debug(Debug::WARNING) << "--linclust-version 2 does not support nucleotide databases; using --linclust-version 1.\n";
         }
         par.linclustVersion = Parameters::LINCLUST_VERSION1;
+    }
+    if (par.PARAM_CLUST_HASH.wasSet == false) {
+        par.clustHash = (par.linclustVersion == Parameters::LINCLUST_VERSION2);
     }
 
     CommandCaller cmd;
@@ -68,7 +68,7 @@ int linclust(int argc, const char **argv, const Command& command) {
         Debug(Debug::WARNING) << "--switch-consensus-rep requires --linclust-version 2; ignoring.\n";
         par.switchConsensusRep = false;
     }
-    if (par.alignerMode != Parameters::ALIGNER_MODE_DEFAULT && par.linclustVersion == Parameters::LINCLUST_VERSION2) {
+    if (par.alignerMode != Parameters::ALIGNER_MODE_FARRAR && par.linclustVersion == Parameters::LINCLUST_VERSION2) {
         Debug(Debug::WARNING) << "--aligner-mode applies to align, --linclust-version 2 uses --align2clust-aligner-mode; ignoring.\n";
     }
     if (par.switchConsensusRep) {
@@ -148,7 +148,7 @@ int linclust(int argc, const char **argv, const Command& command) {
     }
 
     if (DBReader<DBKeyType>::getExtendedDbtype(dbType) & Parameters::DBTYPE_EXTENDED_LINFINITY) {
-        Debug(Debug::ERROR) << "--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases are clustered with lin8clust.\n";
+        Debug(Debug::ERROR) << "Linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ") are clustered with lin8clust.\n";
         EXIT(EXIT_FAILURE);
     }
 

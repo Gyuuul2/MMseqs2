@@ -4,7 +4,7 @@ fail() {
     exit 1
 }
 
-# true if none of the files exists; an output removed once a later step consumed it counts as present, so the later step's outputs are checked too
+# true if none of the files exists, pass later outputs too
 notExists() {
     for FILE in "$@"; do
         [ -f "$FILE" ] && return 1
@@ -12,7 +12,14 @@ notExists() {
     return 0
 }
 
-# srun ends the other tasks of a step when one fails, they would wait for it forever
+# also check the refinement outputs with two iterations
+notExistsBeforeRefinement() {
+    notExists "$@" || return 1
+    [ "$LINCLUST_ITERATIONS" -ge 2 ] || return 0
+    notExists "${TMP_PATH}/clu_merged.dbtype" "${TMP_PATH}/input_rep.dbtype" "${TMP_PATH}/pref_rep.dbtype" "${TMP_PATH}/clu_rep.dbtype"
+}
+
+# end all tasks of a srun step if one fails
 export SLURM_KILL_BAD_EXIT=1
 
 [ "$#" -ne 3 ] && echo "Please provide <sequenceDB> <outDB> <tmp>" && exit 1;
@@ -31,15 +38,9 @@ if [ -n "$CLUSTHASH" ] || [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
 else
     CLUDB="$2"
 fi
-ITER2_PRODUCTS=""
-if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
-    ITER2_PRODUCTS="${TMP_PATH}/clu_merged.dbtype ${TMP_PATH}/input_rep.dbtype ${TMP_PATH}/pref_rep.dbtype ${TMP_PATH}/clu_rep.dbtype"
-fi
-
 # 0. clusthash
 if [ -n "$CLUSTHASH" ]; then
-    # shellcheck disable=SC2086
-    if notExists "${TMP_PATH}/input_clusthash_clust.dbtype" ${ITER2_PRODUCTS}; then
+    if notExistsBeforeRefinement "${TMP_PATH}/input_clusthash_clust.dbtype"; then
         # shellcheck disable=SC2086
         $RUNNER "$MMSEQS" clusthashfast "$INPUT" "${TMP_PATH}/input_clusthash_clust" ${CLUSTHASHFAST_PAR} \
             || fail "clusthashfast died"
@@ -49,15 +50,13 @@ if [ -n "$CLUSTHASH" ]; then
 fi
 
 # 1. k-mer matching
-# shellcheck disable=SC2086
-if notExists "${TMP_PATH}/pref.dbtype" "${CLUDB}.dbtype" ${ITER2_PRODUCTS}; then
+if notExistsBeforeRefinement "${TMP_PATH}/pref.dbtype" "${CLUDB}.dbtype"; then
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" kmermatcher "$INPUT" "${TMP_PATH}/pref" ${KMERMATCHER_PAR} \
         || fail "kmermatcher died"
 fi
 
-# shellcheck disable=SC2086
-if notExists "${CLUDB}.dbtype" ${ITER2_PRODUCTS}; then
+if notExistsBeforeRefinement "${CLUDB}.dbtype"; then
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" align2clust "$INPUT" "${TMP_PATH}/pref" "$CLUDB" ${ALIGN2CLUST_PAR} \
         || fail "align2clust died"
@@ -75,8 +74,7 @@ if [ -n "$CLUSTHASH" ]; then
     else
         MERGED="$2"
     fi
-    # shellcheck disable=SC2086
-    if notExists "${MERGED}.dbtype" ${ITER2_PRODUCTS}; then
+    if notExistsBeforeRefinement "${MERGED}.dbtype"; then
         # shellcheck disable=SC2086
         $RUNNER "$MMSEQS" mergeclusters "$SOURCE" "$MERGED" \
             "${TMP_PATH}/input_clusthash_clust" "$CLUDB" ${MERGECLU_PAR} \
@@ -100,7 +98,7 @@ fi
 if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
     if notExists "${TMP_PATH}/input_rep.dbtype" "${TMP_PATH}/pref_rep.dbtype" "${TMP_PATH}/clu_rep.dbtype"; then
         # shellcheck disable=SC2086
-        $RUNNER "$MMSEQS" createsubdb "$CLUDB" "$SOURCE" "${TMP_PATH}/input_rep" ${VERBOSITY} --subdb-mode 1 \
+        $RUNNER "$MMSEQS" createsubdb "$CLUDB" "$SOURCE" "${TMP_PATH}/input_rep" ${CREATESUBDB_PAR} \
             || fail "createsubdb (representatives) died"
     fi
 
@@ -143,7 +141,7 @@ if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
     fi
 fi
 
-# the databases that the next steps do not read are removed in the background, a failed removal still fails the workflow
+# wait for the background rmdb
 for PID in $PIDS; do
     wait "$PID"
 done

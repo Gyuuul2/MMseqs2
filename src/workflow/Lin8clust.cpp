@@ -24,6 +24,7 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     par.PARAM_MAX_ACCEPT.addCategory(MMseqsParameter::COMMAND_EXPERT);
     par.overrideParameterDescription(par.PARAM_S, "Sensitivity will be automatically determined but can be adjusted", NULL, par.PARAM_S.category | MMseqsParameter::COMMAND_EXPERT);
     par.PARAM_INCLUDE_ONLY_EXTENDABLE.addCategory(MMseqsParameter::COMMAND_EXPERT);
+    par.PARAM_NODE_RUNNER.removeCategory(MMseqsParameter::COMMAND_EXPERT);
 
     par.parseParameters(argc, argv, command, true, 0, 0);
     std::string tmpDir = par.db3;
@@ -35,19 +36,19 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     par.filenames.pop_back();
     par.filenames.push_back(tmpDir);
 
-    const int dbType = FileUtil::parseDbType(par.db1.c_str());
+    int dbType = FileUtil::parseDbType(par.db1.c_str());
     if ((DBReader<DBKeyType>::getExtendedDbtype(dbType) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {
-        Debug(Debug::ERROR) << "lin8clust clusters --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases only. "
+        Debug(Debug::ERROR) << "lin8clust clusters linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ") only. "
                             << "Use createdb --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " or easy-lin8clust.\n";
         EXIT(EXIT_FAILURE);
     }
-    // align2clust leaves out the singletons of a subset with representative bits, so lin8clust takes whole databases only
+    // align2clust leaves out the singletons of subsets
     if (FileUtil::fileExists((par.db1 + ".bits.0").c_str())) {
-        Debug(Debug::ERROR) << "lin8clust clusters whole --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases, not subsets such as clusthashfast or createsubdb output\n";
+        Debug(Debug::ERROR) << "lin8clust clusters whole linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << "), not subsets such as clusthashfast or createsubdb output\n";
         EXIT(EXIT_FAILURE);
     }
 
-    const bool nonSymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
+    bool nonSymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
     if (par.PARAM_CLUSTER_MODE.wasSet == false) {
         if (nonSymetric) {
             par.clusteringMode = Parameters::GREEDY_MEM;
@@ -57,26 +58,48 @@ int lin8clust(int argc, const char **argv, const Command& command) {
         std::string cluMode = (par.clusteringMode == Parameters::GREEDY_MEM) ? "GREEDY MEM" : "SET COVER";
         Debug(Debug::INFO) << "Set cluster mode " << cluMode << ".\n";
     }
+    if (par.clusteringMode != Parameters::SET_COVER && par.clusteringMode != Parameters::GREEDY && par.clusteringMode != Parameters::GREEDY_MEM) {
+        Debug(Debug::ERROR) << "align2clust supports only --cluster-mode " << Parameters::SET_COVER << ", " << Parameters::GREEDY << " and " << Parameters::GREEDY_MEM
+                            << " for linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
+        EXIT(EXIT_FAILURE);
+    }
     if (par.PARAM_ALPH_SIZE.wasSet == false) {
         par.alphabetSize = MultiParam<NuclAA<int>>(NuclAA<int>(Parameters::CLUST_LINEAR_DEFAULT_ALPH_SIZE, 5));
     }
     par.includeCountTable = false;
     par.countTableIteration = 0;
     if (par.PARAM_INCLUDE_ADJACENCY.wasSet == false && par.PARAM_NUM_ADJACENCY.wasSet == false) {
-        par.adjIteration = nonSymetric ? Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY
-                                       : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
+        if (nonSymetric) {
+            par.adjIteration = Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY;
+        } else {
+            par.adjIteration = Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
+        }
     }
 
+    // let punchHole warn before the run if it is not supported
+    std::string punchFile = tmpDir + "/punch_hole_check";
+    FILE *punchHandle = FileUtil::openAndDelete(punchFile.c_str(), "w");
+    std::vector<char> page(Util::getPageSize(), 0);
+    if (fwrite(page.data(), 1, page.size(), punchHandle) != page.size() || fflush(punchHandle) != 0) {
+        Debug(Debug::ERROR) << "Cannot write " << punchFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    FileUtil::punchHole(fileno(punchHandle), 0, page.size());
+    fclose(punchHandle);
+    FileUtil::remove(punchFile.c_str());
+
     CommandCaller cmd;
+    cmd.addVariable("MERGECLU_PAR", par.createParameterString(par.mergeclusters).c_str());
+    par.subDbMode = Parameters::SUBDB_MODE_SOFT;
+    cmd.addVariable("CREATESUBDB_PAR", par.createParameterString(par.createsubdb).c_str());
     cmd.addVariable("REMOVE_TMP", par.removeTmpFiles ? "TRUE" : NULL);
     cmd.addVariable("RUNNER", par.nodeRunner.c_str());
     cmd.addVariable("CLUSTHASH", par.clustHash ? "TRUE" : NULL);
     cmd.addVariable("KMERMATCHER_PAR", par.createParameterString(par.kmermatcher).c_str());
     cmd.addVariable("ALIGN2CLUST_PAR", par.createParameterString(par.align2clust).c_str());
-    cmd.addVariable("MERGECLU_PAR", par.createParameterString(par.mergeclusters).c_str());
     cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
     cmd.addVariable("LINCLUST_ITERATIONS", SSTR(par.linclustIterations).c_str());
-    // the second iteration matches the representatives with spaced k-mers, a tenth as many per sequence (see linclust)
+    // second iteration: spaced k-mers, a tenth per sequence (see linclust)
     if (par.linclustIterations > 1) {
         par.spacedKmer = true;
         par.kmersPerSequenceScale = 0.1;

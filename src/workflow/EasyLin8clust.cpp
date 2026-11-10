@@ -26,11 +26,12 @@ int easylin8clust(int argc, const char **argv, const Command &command) {
     }
     par.PARAM_THREADS.removeCategory(MMseqsParameter::COMMAND_EXPERT);
     par.PARAM_V.removeCategory(MMseqsParameter::COMMAND_EXPERT);
+    par.PARAM_NODE_RUNNER.removeCategory(MMseqsParameter::COMMAND_EXPERT);
 
     setEasyLinclustDefaults(&par);
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_VARIADIC, 0);
     if (par.PARAM_CREATEDB_MODE.wasSet && par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) {
-        Debug(Debug::WARNING) << "easy-lin8clust clusters --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " databases only\n";
+        Debug(Debug::WARNING) << "easy-lin8clust clusters linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ") only\n";
         Debug(Debug::WARNING) << "We recompute with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << "\n";
     }
     setEasyLinclustMustPassAlong(&par);

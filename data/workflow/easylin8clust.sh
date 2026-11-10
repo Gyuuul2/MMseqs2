@@ -8,30 +8,32 @@ notExists() {
    [ ! -f "$1" ]
 }
 
-# srun ends the other tasks of a step when one fails, they would wait for it forever
+# end all tasks of a srun step if one fails
 export SLURM_KILL_BAD_EXIT=1
 
 if notExists "${TMP_PATH}/input.dbtype"; then
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" createdb "$@" "${TMP_PATH}/input" ${CREATEDB_PAR} \
-        || fail "query createdb died"
+        || fail "createdb died"
 fi
 
 if notExists "${TMP_PATH}/clu.dbtype"; then
     # shellcheck disable=SC2086
     "$MMSEQS" lin8clust "${TMP_PATH}/input" "${TMP_PATH}/clu" "${TMP_PATH}/clu_tmp" ${CLUSTER_PAR} \
-        || fail "Search died"
+        || fail "lin8clust died"
 fi
 
-# the outputs are one file per node and a killed step can leave some of them, so a .done marker tells that a step finished
+# a killed step can leave some node files, mark finished steps
 if notExists "${TMP_PATH}/createtsv.done"; then
+    rm -f "${RESULTS}_cluster.tsv".*
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" createtsv "${TMP_PATH}/input" "${TMP_PATH}/input" "${TMP_PATH}/clu" "${TMP_PATH}/cluster.tsv" ${CREATETSV_PAR} \
-        || fail "Convert Alignments died"
+        || fail "createtsv died"
     touch "${TMP_PATH}/createtsv.done"
 fi
 
 if notExists "${TMP_PATH}/result2flat.done"; then
+    rm -f "${RESULTS}_rep_seq.fasta".*
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" result2flat "${TMP_PATH}/input" "${TMP_PATH}/input" "${TMP_PATH}/clu" "${TMP_PATH}/rep_seq.fasta" ${RESULT2FLAT_PAR} \
         || fail "result2flat died"
