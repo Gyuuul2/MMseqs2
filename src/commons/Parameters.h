@@ -311,7 +311,7 @@ public:
     static const int DIAGONAL_MODE_UNGAPPED = 1;
 
     // aligner mode
-    static const int ALIGNER_MODE_DEFAULT = 0;
+    static const int ALIGNER_MODE_FARRAR = 0;
     static const int ALIGNER_MODE_SWIPE = 1;
 
     // rescorediagonal
@@ -465,6 +465,7 @@ public:
     int    realignMaxSeqs;               // Max alignments to realign
     std::string spacedKmerPattern;       // User-specified kmer pattern
     std::string localTmp;                // Local temporary path
+    bool localTmpFallback;               // warn instead of stopping when align2clust cannot use --local-tmp
 
 
     // ALIGNMENT
@@ -682,7 +683,6 @@ public:
     // align2clust
     std::string filterCluDBFile;
     std::string filterSeqDBFile;
-    std::string localDbDir;
 
     // besthitperset
     bool simpleBestHit;
@@ -869,6 +869,7 @@ public:
     PARAMETER(PARAM_PRELOAD_MODE)
     PARAMETER(PARAM_SPACED_KMER_PATTERN)
     PARAMETER(PARAM_LOCAL_TMP)
+    PARAMETER(PARAM_LOCAL_TMP_FALLBACK)
     std::vector<MMseqsParameter*> prefilter;
     std::vector<MMseqsParameter*> ungappedprefilter;
     std::vector<MMseqsParameter*> gappedprefilter;
@@ -1095,7 +1096,6 @@ public:
     // align2clust
     PARAMETER(PARAM_FILTER_CLUDB_FILE)
     PARAMETER(PARAM_FILTER_SEQDB_FILE)
-    PARAMETER(PARAM_LOCAL_DB_DIR)
 
     //besthitperset
     PARAMETER(PARAM_SIMPLE_BEST_HIT)

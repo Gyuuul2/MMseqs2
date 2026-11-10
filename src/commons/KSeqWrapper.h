@@ -40,7 +40,7 @@ protected:
 
 class KSeqFile : public KSeqWrapper {
 public:
-    KSeqFile(const char* file, size_t start = 0, size_t end = SIZE_MAX);
+    KSeqFile(const char* file, size_t start, size_t end);
     bool ReadEntry();
     ~KSeqFile();
 private:
@@ -93,7 +93,7 @@ private:
 
 class KSeqZstd : public KSeqWrapper {
 public:
-    KSeqZstd(const char* file, size_t start = 0, size_t end = SIZE_MAX);
+    KSeqZstd(const char* file, size_t start, size_t end);
     bool ReadEntry();
     ~KSeqZstd();
 
@@ -101,11 +101,11 @@ public:
         FILE* file;
         ZSTD_DStream* dstream;
         ZSTD_inBuffer input;
-        size_t toRead;
-        size_t position;
-        size_t end;
-        size_t outputPosition;
-        size_t outputEnd;
+        size_t readHintBytes;
+        size_t compressedOffset;
+        size_t compressedEndOffset;
+        size_t decompressedOffset;
+        size_t decompressedEndOffset;
     };
 private:
     ZstdFile file;

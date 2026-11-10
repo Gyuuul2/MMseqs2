@@ -71,7 +71,8 @@ Parameters::Parameters():
         PARAM_INCLUDE_IDENTITY(PARAM_INCLUDE_IDENTITY_ID, "--add-self-matches", "Include identical seq. id.", "Artificially add entries of queries with themselves (for clustering)", typeid(bool), (void *) &includeIdentity, "", MMseqsParameter::COMMAND_PREFILTER | MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_PRELOAD_MODE(PARAM_PRELOAD_MODE_ID, "--db-load-mode", "Preload mode", "Database preload mode 0: auto, 1: fread, 2: mmap, 3: mmap+touch", typeid(int), (void *) &preloadMode, "[0-3]{1}", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_SPACED_KMER_PATTERN(PARAM_SPACED_KMER_PATTERN_ID, "--spaced-kmer-pattern", "Spaced k-mer pattern", "User-specified spaced k-mer pattern", typeid(std::string), (void *) &spacedKmerPattern, "^1[01]*1$", MMseqsParameter::COMMAND_PREFILTER | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_LOCAL_TMP(PARAM_LOCAL_TMP_ID, "--local-tmp", "Local temporary path", "Path where some of the temporary files will be created", typeid(std::string), (void *) &localTmp, "", MMseqsParameter::COMMAND_PREFILTER | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LOCAL_TMP(PARAM_LOCAL_TMP_ID, "--local-tmp", "Local temporary path", "Path on node-local flash for some temporary files. Linfinity createdb spools the sent sequences there, align2clust copies the sequence blocks it serves and kmermatcher writes its last exchange file groups there before it copies them to the shared folder", typeid(std::string), (void *) &localTmp, "", MMseqsParameter::COMMAND_PREFILTER | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LOCAL_TMP_FALLBACK(PARAM_LOCAL_TMP_FALLBACK_ID, "--local-tmp-fallback", "Local temporary path fallback", "What linfinity align2clust does when it cannot copy its served sequence blocks to --local-tmp: it is not node-local flash, is on the device of the database or has too little free space\n0: stop with an error\n1: warn and read them from the shared folder instead", typeid(bool), (void *) &localTmpFallback, "", MMseqsParameter::COMMAND_EXPERT),
         // alignment
         PARAM_ALIGNMENT_MODE(PARAM_ALIGNMENT_MODE_ID, "--alignment-mode", "Alignment mode", "How to compute the alignment:\n0: automatic\n1: only score and end_pos\n2: also start_pos and cov\n3: also seq.id\n4: only ungapped alignment", typeid(int), (void *) &alignmentMode, "^[0-5]{1}$", MMseqsParameter::COMMAND_ALIGN),
         PARAM_ALIGNMENT_OUTPUT_MODE(PARAM_ALIGNMENT_OUTPUT_MODE_ID, "--alignment-output-mode", "Alignment mode", "How to compute the alignment:\n0: automatic\n1: only score and end_pos\n2: also start_pos and cov\n3: also seq.id\n4: only ungapped alignment\n5: score only (output) cluster format", typeid(int), (void *) &alignmentOutputMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_ALIGN),
@@ -177,8 +178,8 @@ Parameters::Parameters():
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_ITERATIONS(PARAM_LINCLUST_ITERATIONS_ID, "--linclust-iterations", "Linclust iterations", "k-mer matching rounds linclust2 and lin8clust run: 2 reclusters the first round representatives, 1 stops after the first round", typeid(int), (void *) &linclustIterations, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJACENCY_ALPH_SIZE(PARAM_ADJACENCY_ALPH_SIZE_ID, "--adjacency-alph-size", "Alphabet the adjacent residues are stored in", "Alphabet size the adjacent residues are stored and scored in, 0 keeps --alph-size", typeid(int), (void *) &adjacencyAlphabetSize, "^(0|[2-9]|1[0-9]|2[01])$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: take the alignment diagonal from the k-mer match\n1: find the best diagonal by an ungapped scan in align2clust, kmermatcher runs on MPI rank 0 only", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_ALIGN2CLUST_ALIGNER_MODE(PARAM_ALIGN2CLUST_ALIGNER_MODE_ID, "--align2clust-aligner-mode", "Align2clust aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: forward pass and traceback of several targets at once (SWIPE), also the seed extensions of the rep targets of mode 3 DBs", typeid(int), (void *) &align2clustAlignerMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: align on the diagonal of the k-mer match\n1: align on the best diagonal of an ungapped scan (linclust version 2 and amino acids only)", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_ALIGN2CLUST_ALIGNER_MODE(PARAM_ALIGN2CLUST_ALIGNER_MODE_ID, "--align2clust-aligner-mode", "Align2clust aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: forward pass and traceback of several targets at once (SWIPE), also the seed extensions of the representative targets", typeid(int), (void *) &align2clustAlignerMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ALIGNER_MODE(PARAM_ALIGNER_MODE_ID, "--aligner-mode", "Aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: SWIPE forward pass for full lane batches, then the same Farrar or block backward pass and traceback as mode 0", typeid(int), (void *) &alignerMode, "^[0-1]$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_KMER_POS_FILTER(PARAM_KMER_POS_FILTER_ID, "--kmer-pos-filter", "K-mer position filter", "Drop k-mer matches whose diagonal cannot reach the coverage", typeid(bool), (void *) &kmerPosFilter, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -188,7 +189,7 @@ Parameters::Parameters():
         PARAM_CLUSTER_VERSION(PARAM_CLUSTER_VERSION_ID, "--cluster-version", "Cluster version", "Cluster version: 1: Cluster1, 2: Cluster2", typeid(int), (void *) &clusterVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         // workflow
         PARAM_RUNNER(PARAM_RUNNER_ID, "--mpi-runner", "MPI runner", "Use MPI on compute cluster with this MPI command (e.g. \"mpirun -np 42\")", typeid(std::string), (void *) &runner, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_NODE_RUNNER(PARAM_NODE_RUNNER_ID, "--node-runner", "Node runner", "Command that starts one process per node for the multi-node steps of --createdb-mode 3 (e.g. \"srun --kill-on-bad-exit=1 -N 4 --ntasks-per-node=1 -c 64\")", typeid(std::string), (void *) &nodeRunner, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_NODE_RUNNER(PARAM_NODE_RUNNER_ID, "--node-runner", "Node runner", "Command that starts one process per node for the multi-node steps of linfinity databases (--createdb-mode 3, e.g. \"srun --kill-on-bad-exit=1 -N 4 --ntasks-per-node=1 -c 64\")", typeid(std::string), (void *) &nodeRunner, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_REUSELATEST(PARAM_REUSELATEST_ID, "--force-reuse", "Force restart with latest tmp", "Reuse tmp filse in tmp/latest folder ignoring parameters and version changes", typeid(bool), (void *) &reuseLatest, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         // search workflow
         PARAM_NUM_ITERATIONS(PARAM_NUM_ITERATIONS_ID, "--num-iterations", "Search iterations", "Number of iterative profile search iterations", typeid(int), (void *) &numIterations, "^[1-9]{1}[0-9]*$", MMseqsParameter::COMMAND_PROFILE),
@@ -227,10 +228,10 @@ Parameters::Parameters():
         PARAM_USE_HEADER(PARAM_USE_HEADER_ID, "--use-fasta-header", "Use fasta header", "Use the id parsed from the fasta header as the index key instead of using incrementing numeric identifiers", typeid(bool), (void *) &useHeader, ""),
         PARAM_ID_OFFSET(PARAM_ID_OFFSET_ID, "--id-offset", "Offset of numeric ids", "Numeric ids in index file are offset by this value", typeid(int), (void *) &identifierOffset, "^(0|[1-9]{1}[0-9]*)$"),
         PARAM_DB_TYPE(PARAM_DB_TYPE_ID, "--dbtype", "Database type", "Database type 0: auto, 1: amino acid 2: nucleotides", typeid(int), (void *) &dbType, "[0-2]{1}"),
-        PARAM_CREATEDB_MODE(PARAM_CREATEDB_MODE_ID, "--createdb-mode", "Createdb mode", "Createdb mode 0: copy data, 1: soft link data and write new index (works only with single line fasta/q) 2: GPU compatible db 3: length descending multi-node db", typeid(int), (void *) &createdbMode, "^[0-3]{1}$"),
+        PARAM_CREATEDB_MODE(PARAM_CREATEDB_MODE_ID, "--createdb-mode", "Createdb mode", "Createdb mode 0: copy data, 1: soft link data and write new index (works only with single line fasta/q) 2: GPU compatible db 3: linfinity db, length descending with one data file per node (amino acids only, read by lin8clust, clusthashfast, kmermatcher, align2clust, mergeclusters, createtsv, result2flat and createsubdb)", typeid(int), (void *) &createdbMode, "^[0-3]{1}$"),
         PARAM_SHUFFLE(PARAM_SHUFFLE_ID, "--shuffle", "Shuffle input database", "Shuffle input database", typeid(bool), (void *) &shuffleDatabase, ""),
         PARAM_WRITE_LOOKUP(PARAM_WRITE_LOOKUP_ID, "--write-lookup", "Write lookup file", "write .lookup file containing mapping from internal id, fasta id and file number", typeid(int), (void *) &writeLookup, "^[0-1]{1}", MMseqsParameter::COMMAND_EXPERT),
-        PARAM_COMPRESS_HEADERS(PARAM_COMPRESS_HEADERS_ID, "--compress-headers", "Compress headers", "Compress the header data into seekable zstd frames (createdb mode 3 only)", typeid(int), (void *) &compressHeaders, "^[0-1]{1}$", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_COMPRESS_HEADERS(PARAM_COMPRESS_HEADERS_ID, "--compress-headers", "Compress headers", "Compress the header data into seekable zstd frames (linfinity databases only, --createdb-mode 3)", typeid(int), (void *) &compressHeaders, "^[0-1]{1}$", MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_HEADER_FILE(PARAM_USE_HEADER_FILE_ID, "--use-header-file", "Use header DB", "use the sequence header DB instead of the body to map the entry keys", typeid(bool), (void *) &useHeaderFile, ""),
         // setextendeddbtype
         PARAM_EXTENDED_DBTYPE(PARAM_EXTENDED_DBTYPE_ID, "--extended-dbtype", "Extended dbtype", "Set extended dbtype 1: compressed, 2: need src, 4: context pseudoe cnts", typeid(int), (void *) &extendedDbtype, "^[0-4]{1}"),
@@ -268,7 +269,6 @@ Parameters::Parameters():
         // align2clust
         PARAM_FILTER_CLUDB_FILE(PARAM_FILTER_CLUDB_FILE_ID, "--filter-cludb-file", "Filter cluDB file", "Specify a cluDB file to filter", typeid(std::string), (void *) &filterCluDBFile, "", MMseqsParameter::COMMAND_EXPERT),
         PARAM_FILTER_SEQDB_FILE(PARAM_FILTER_SEQDB_FILE_ID, "--filter-seqdb-file", "Filter seqDB file", "Specify a seqDB of cluDB file to filter", typeid(std::string), (void *) &filterSeqDBFile, "", MMseqsParameter::COMMAND_EXPERT),
-        PARAM_LOCAL_DB_DIR(PARAM_LOCAL_DB_DIR_ID, "--local-db-dir", "Local database directory", "--createdb-mode 3: copy the sequences to this node-local directory (NVMe, /dev/shm) and read them from there; every node needs room for the whole sequence database", typeid(std::string), (void *) &localDbDir, "", MMseqsParameter::COMMAND_EXPERT),
         // besthitperset
         PARAM_SIMPLE_BEST_HIT(PARAM_SIMPLE_BEST_HIT_ID, "--simple-best-hit", "Use simple best hit", "Update the p-value by a single best hit, or by best and second best hits", typeid(bool), (void *) &simpleBestHit, ""),
         PARAM_ALPHA(PARAM_ALPHA_ID, "--alpha", "Alpha", "Set alpha for combining p-values during aggregation", typeid(float), (void *) &alpha, "^0(\\.[0-9]+)?|^1(\\.0+)?$"),
@@ -490,7 +490,8 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_CLUSTER_MODE);
     align2clust.push_back(&PARAM_FILTER_CLUDB_FILE);
     align2clust.push_back(&PARAM_FILTER_SEQDB_FILE);
-    align2clust.push_back(&PARAM_LOCAL_DB_DIR);
+    align2clust.push_back(&PARAM_LOCAL_TMP);
+    align2clust.push_back(&PARAM_LOCAL_TMP_FALLBACK);
     align2clust.push_back(&PARAM_INCLUDE_ALIGN_FILES);
     align2clust.push_back(&PARAM_DIAGONAL_MODE);
     align2clust.push_back(&PARAM_ALIGN2CLUST_ALIGNER_MODE);
@@ -930,6 +931,8 @@ Parameters::Parameters():
     createdb.push_back(&PARAM_WRITE_LOOKUP);
     createdb.push_back(&PARAM_COMPRESS_HEADERS);
     createdb.push_back(&PARAM_ID_OFFSET);
+    createdb.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    createdb.push_back(&PARAM_LOCAL_TMP);
     createdb.push_back(&PARAM_THREADS);
     createdb.push_back(&PARAM_COMPRESSED);
     createdb.push_back(&PARAM_MASK_RESIDUES);
@@ -1137,6 +1140,7 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_MAX_SEQ_LEN);
     kmermatcher.push_back(&PARAM_HASH_SHIFT);
     kmermatcher.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    kmermatcher.push_back(&PARAM_LOCAL_TMP);
     kmermatcher.push_back(&PARAM_INCLUDE_ONLY_EXTENDABLE);
     kmermatcher.push_back(&PARAM_IGNORE_MULTI_KMER);
     kmermatcher.push_back(&PARAM_THREADS);
@@ -1306,6 +1310,7 @@ Parameters::Parameters():
     // createsubdb
     createsubdb.push_back(&PARAM_SUBDB_MODE);
     createsubdb.push_back(&PARAM_ID_MODE);
+    createsubdb.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     createsubdb.push_back(&PARAM_V);
 
     // renamedbkeys
@@ -2387,8 +2392,8 @@ void Parameters::checkIfDatabaseIsValid(const Command& command, int argc, const 
                     return filenames[fileIdx] != "stdin" && FileUtil::fileExists((filenames[fileIdx]).c_str()) == false && FileUtil::fileExists((filenames[fileIdx] + ".dbtype").c_str()) == false;
                 };
                 // a step on another machine may have written the input; like --latency-wait of Snakemake and exitReadTimeout of Nextflow
-                const char *stepTasks = getenv("SLURM_STEP_NUM_TASKS");
-                for (int second = 0; stepTasks != NULL && atoi(stepTasks) > 1 && second < INPUT_LATENCY_SECONDS && isMissing(); second++) {
+                const char *stepTaskCount = getenv("SLURM_STEP_NUM_TASKS");
+                for (int second = 0; stepTaskCount != NULL && atoi(stepTaskCount) > 1 && second < INPUT_LATENCY_SECONDS && isMissing(); second++) {
                     sleep(1);
                 }
                 if (isMissing()) {
@@ -2574,6 +2579,7 @@ void Parameters::setDefaults() {
     splitAA = false;
     spacedKmerPattern = "";
     localTmp = "";
+    localTmpFallback = true;
 
     // search workflow
     numIterations = 1;
@@ -2672,7 +2678,6 @@ void Parameters::setDefaults() {
         runner = "";
     }
     nodeRunner = "";
-    localDbDir = "";
     reuseLatest = false;
     // Clustering workflow
     removeTmpFiles = false;
@@ -2687,7 +2692,7 @@ void Parameters::setDefaults() {
     createdbMode = SEQUENCE_SPLIT_MODE_HARD;
     shuffleDatabase = true;
     writeLookup = true;
-    compressHeaders = 0;
+    compressHeaders = 1;
 
     // format alignment
     formatAlignmentMode = FORMAT_ALIGNMENT_BLAST_TAB;
@@ -2872,8 +2877,8 @@ void Parameters::setDefaults() {
     linclustIterations = 2;
     adjacencyAlphabetSize = 21;
     diagonalMode = DIAGONAL_MODE_KMER;
-    align2clustAlignerMode = ALIGNER_MODE_DEFAULT;
-    alignerMode = ALIGNER_MODE_DEFAULT;
+    align2clustAlignerMode = ALIGNER_MODE_SWIPE;
+    alignerMode = ALIGNER_MODE_FARRAR;
     kmerPosFilter = true;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;

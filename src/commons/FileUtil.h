@@ -33,6 +33,8 @@ public:
     static void munmapData(void * ptr, size_t dataSize);
 
     static void writeFile(const std::string &pathToFile, const unsigned char *sh, size_t len);
+    static std::string readFile(const std::string &file);
+    static void publishFile(const std::string &file, const std::string &content);
 
     static void preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset);
     static void pwriteAll(int fd, const char *fileName, const char *data, size_t size, size_t offset);
@@ -63,8 +65,12 @@ public:
     static void copyFile(const char *src, const char *dst);
     static void copyFile(const std::string& src, const std::string& dst);
 
-    // copies the data files of db into the directory localDir and returns the name of the copy; memoryBytes: its bytes if it is on tmpfs
-    static std::string copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &memoryBytes);
+    static bool isSameDbData(const std::string &firstDb, const std::string &secondDb);
+
+    // copies the given byte ranges of each data file of db into the directory localDir as sparse copies and returns the name of the copy
+    // memoryBytes: the bytes of the copy if it is on tmpfs
+    static std::string copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &memoryBytes,
+                                      const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges);
 
     static FILE *openAndDelete(const char *fileName, const char *mode);
 
