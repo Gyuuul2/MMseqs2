@@ -17,7 +17,11 @@
 
 #include "zstd/contrib/seekable_format/zstd_seekable.h"
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include <algorithm>
+#include <map>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -349,257 +353,237 @@ void processSeqBatch(Parameters & par, DBWriter &seqWriter, DBWriter &hdrWriter,
     }
 }
 
-struct LengthBin {
+enum DataFileType { SEQUENCE_DATA, HEADER_DATA, HEADER_OFFSETS, DATA_FILE_TYPE_COUNT };
+static const char *const dataFileSuffixes[DATA_FILE_TYPE_COUNT] = {".", "_h.", "_h.index."};
+
+struct LengthRangeLayout {
     size_t length;
     size_t sequenceCount;
     size_t headerBytes;
     size_t startKey;
-    size_t offset;
-    size_t headerOffset;
-    size_t headerIndexOffset;
+    size_t offsets[DATA_FILE_TYPE_COUNT];
     size_t file;
 };
 
-enum DataFileType { SEQUENCE_DATA, HEADER_DATA, HEADER_OFFSETS, DATA_FILE_TYPES };
-static const char *const dataFileSuffixes[DATA_FILE_TYPES] = {".", "_h.", "_h.index."};
-
-struct InputPiece {
+struct InputSplit {
     size_t file;
     size_t start;
     size_t end;
 };
 
-// a segment of a data file goes to the node of the file as { data file type, offset, size } then its bytes
-static const size_t SEGMENT_HEADER_SIZE = 3 * sizeof(uint64_t);
-// the most bytes of a segment, so the buffers of the exchange blocks stay small
-static const size_t MAX_SEGMENT_SIZE = 64 * 1024;
+// unit header { length, offset in length, size, stored size }
+static const size_t UNIT_HEADER_SIZE = 4 * sizeof(uint64_t);
+static const size_t MAX_UNIT_SIZE = 64 * 1024;
 
-// the most bytes of the segment headers of a flush of entryCount entries with dataSize bytes and lengths below lengthCount
-static size_t getSegmentHeadersSize(size_t entryCount, size_t lengthCount, size_t dataSize) {
-    return (DATA_FILE_TYPES * (std::min(entryCount, lengthCount) + 1) + dataSize / MAX_SEGMENT_SIZE) * SEGMENT_HEADER_SIZE;
+static size_t getCompressionUnitHeaderBytes(size_t entryCount, size_t lengthCount, size_t dataSize) {
+    return (DATA_FILE_TYPE_COUNT * (std::min(entryCount, lengthCount) + 1) + dataSize / MAX_UNIT_SIZE) * UNIT_HEADER_SIZE;
 }
 
-static std::vector<LengthBin> makeLengthBins(const std::vector<size_t> &sequenceCount, const std::vector<size_t> &headerBytes) {
-    std::vector<LengthBin> histogram;
-    for (size_t length = sequenceCount.size(); length-- > 0; ) {
-        if (sequenceCount[length] > 0) {
-            LengthBin bin = {length, sequenceCount[length], headerBytes[length], 0, 0, 0, 0, 0};
-            histogram.push_back(bin);
-        }
-    }
-    return histogram;
-}
-
-static std::vector<LengthBin> mergeLengthHistograms(const std::vector<std::vector<LengthBin>> &histograms) {
-    size_t maxLength = 0;
-    for (size_t i = 0; i < histograms.size(); i++) {
-        if (histograms[i].empty() == false) {
-            maxLength = std::max(maxLength, histograms[i][0].length);
-        }
-    }
-    std::vector<size_t> sequenceCount(maxLength + 1, 0);
-    std::vector<size_t> headerBytes(maxLength + 1, 0);
-    for (size_t i = 0; i < histograms.size(); i++) {
-        for (size_t j = 0; j < histograms[i].size(); j++) {
-            sequenceCount[histograms[i][j].length] += histograms[i][j].sequenceCount;
-            headerBytes[histograms[i][j].length] += histograms[i][j].headerBytes;
-        }
-    }
-    return makeLengthBins(sequenceCount, headerBytes);
-}
-
-static std::vector<LengthBin> getLengthToBin(const std::vector<LengthBin> &histogram) {
-    std::vector<LengthBin> lengthToBin(histogram.empty() ? 0 : histogram[0].length + 1);
-    for (size_t i = 0; i < histogram.size(); i++) {
-        lengthToBin[histogram[i].length] = histogram[i];
-    }
-    return lengthToBin;
-}
-
-static void splitStarts(const std::vector<LengthBin> &starts, std::vector<std::vector<LengthBin>> &splits) {
-    std::vector<LengthBin> lengthToStart = getLengthToBin(starts);
-    for (size_t i = 0; i < splits.size(); i++) {
-        for (size_t j = 0; j < splits[i].size(); j++) {
-            LengthBin &bin = splits[i][j];
-            LengthBin &start = lengthToStart[bin.length];
-            bin.startKey = start.startKey;
-            bin.offset = start.offset;
-            bin.headerOffset = start.headerOffset;
-            bin.headerIndexOffset = start.headerIndexOffset;
-            bin.file = start.file;
-            start.startKey += bin.sequenceCount;
-            start.offset += bin.sequenceCount * (bin.length + 2);
-            start.headerOffset += bin.headerBytes;
-            start.headerIndexOffset += bin.sequenceCount * sizeof(uint64_t);
-        }
-    }
-}
-
-// copies data behind the written bytes of a bin, leaving room for the segment headers of a bin that goes to another node
-static void copyToBin(char *buffer, size_t &written, const char *data, size_t size, bool segmented) {
-    if (segmented == false) {
-        memcpy(buffer + written, data, size);
-        written += size;
-        return;
-    }
+static void copyToCompressionUnits(char *buffer, size_t &written, const char *data, size_t size) {
     while (size > 0) {
-        const size_t bytes = std::min(size, MAX_SEGMENT_SIZE - written % MAX_SEGMENT_SIZE);
-        memcpy(buffer + (written / MAX_SEGMENT_SIZE + 1) * SEGMENT_HEADER_SIZE + written, data, bytes);
+        size_t bytes = std::min(size, MAX_UNIT_SIZE - written % MAX_UNIT_SIZE);
+        memcpy(buffer + (written / MAX_UNIT_SIZE + 1) * UNIT_HEADER_SIZE + written, data, bytes);
         written += bytes;
         data += bytes;
         size -= bytes;
     }
 }
 
-// sorts entries into sortedBuffer; writes this node's bins directly and appends the others as segments to the exchange file
-static void flushBufferToExchange(const char *buffer, size_t bufferPos, char *sortedBuffer, std::vector<LengthBin> &lengthToBin, FILE *const *dataFiles, const std::string *dataFileNames,
-                                  FILE *exchangeFile, const std::string &exchangeFileName, std::string &indexData, size_t &exchangeBytes) {
-    const size_t lengthCount = lengthToBin.size();
-    std::vector<size_t> binSizes(DATA_FILE_TYPES * lengthCount, 0);
-    for (size_t pos = 0; pos < bufferPos; ) {
-        const size_t seqSize = strlen(buffer + pos) + 1;
-        const size_t hdrSize = strlen(buffer + pos + seqSize) + 1;
-        binSizes[SEQUENCE_DATA * lengthCount + seqSize - 2] += seqSize;
-        binSizes[HEADER_DATA * lengthCount + seqSize - 2] += hdrSize;
-        binSizes[HEADER_OFFSETS * lengthCount + seqSize - 2] += sizeof(uint64_t);
-        pos += seqSize + hdrSize;
-    }
-    // the lengths of a data file follow each other, longer first; its segments are sorted by data file type and offset
-    std::vector<size_t> binStarts(DATA_FILE_TYPES * lengthCount, 0);
-    std::vector<size_t> nodeOffsets(MMseqsNode::count + 1, 0);
-    size_t node = 0;
-    size_t sortedPos = 0;
-    for (size_t lengthEnd = lengthCount; lengthEnd > 0; ) {
-        const size_t dataFile = lengthToBin[lengthEnd - 1].file;
-        size_t lengthBegin = lengthEnd - 1;
-        while (lengthBegin > 0 && (lengthToBin[lengthBegin - 1].sequenceCount == 0 || lengthToBin[lengthBegin - 1].file == dataFile)) {
-            lengthBegin--;
+struct SentLengthRow {
+    uint64_t flush;
+    uint64_t length;
+    uint64_t sequenceCount;
+    uint64_t headerBytes;
+    uint64_t starts[DATA_FILE_TYPE_COUNT];
+    uint64_t ends[DATA_FILE_TYPE_COUNT];
+
+    static bool compareByLength(const SentLengthRow &first, const SentLengthRow &second) {
+        if (first.length != second.length) {
+            return first.length > second.length;
         }
-        for (; node <= dataFile; node++) {
-            nodeOffsets[node] = sortedPos;
+        return first.flush < second.flush;
+    }
+
+    static bool compareByFlush(const SentLengthRow &first, const SentLengthRow &second) {
+        if (first.flush != second.flush) {
+            return first.flush < second.flush;
         }
-        for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
-            for (size_t length = lengthEnd; length-- > lengthBegin; ) {
-                const size_t bin = fileType * lengthCount + length;
-                const LengthBin &lengthBin = lengthToBin[length];
-                binStarts[bin] = sortedPos;
-                if (dataFile == MMseqsNode::rank) {
-                    sortedPos += binSizes[bin];
-                    continue;
-                }
-                const size_t offset = (fileType == SEQUENCE_DATA) ? lengthBin.offset : ((fileType == HEADER_DATA) ? lengthBin.headerOffset : lengthBin.headerIndexOffset);
-                for (size_t segment = 0; segment * MAX_SEGMENT_SIZE < binSizes[bin]; segment++) {
-                    const uint64_t segmentHeader[3] = { fileType, offset + segment * MAX_SEGMENT_SIZE, std::min(MAX_SEGMENT_SIZE, binSizes[bin] - segment * MAX_SEGMENT_SIZE) };
-                    memcpy(sortedBuffer + sortedPos, segmentHeader, SEGMENT_HEADER_SIZE);
-                    sortedPos += SEGMENT_HEADER_SIZE + segmentHeader[2];
-                }
-            }
+        return first.length > second.length;
+    }
+};
+
+struct SentFlush {
+    size_t inputSplit;
+    size_t inputSplitFlush;
+    std::vector<SentLengthRow> rows;
+
+    static bool compareByInputSplit(const SentFlush &first, const SentFlush &second) {
+        if (first.inputSplit != second.inputSplit) {
+            return first.inputSplit < second.inputSplit;
         }
-        lengthEnd = lengthBegin;
+        return first.inputSplitFlush < second.inputSplitFlush;
     }
-    for (; node <= MMseqsNode::count; node++) {
-        nodeOffsets[node] = sortedPos;
-    }
-    std::vector<size_t> binWritten(DATA_FILE_TYPES * lengthCount, 0);
-    for (size_t pos = 0; pos < bufferPos; ) {
-        const size_t seqSize = strlen(buffer + pos) + 1;
-        const size_t hdrSize = strlen(buffer + pos + seqSize) + 1;
-        const size_t seqBin = SEQUENCE_DATA * lengthCount + seqSize - 2;
-        const size_t hdrBin = HEADER_DATA * lengthCount + seqSize - 2;
-        const size_t offsetBin = HEADER_OFFSETS * lengthCount + seqSize - 2;
-        const uint64_t headerOffset = lengthToBin[seqSize - 2].headerOffset + binWritten[hdrBin];
-        const bool segmented = lengthToBin[seqSize - 2].file != MMseqsNode::rank;
-        copyToBin(sortedBuffer + binStarts[seqBin], binWritten[seqBin], buffer + pos, seqSize, segmented);
-        copyToBin(sortedBuffer + binStarts[hdrBin], binWritten[hdrBin], buffer + pos + seqSize, hdrSize, segmented);
-        copyToBin(sortedBuffer + binStarts[offsetBin], binWritten[offsetBin], reinterpret_cast<const char *>(&headerOffset), sizeof(uint64_t), segmented);
-        pos += seqSize + hdrSize;
-    }
-    for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
-        for (size_t length = lengthCount; length-- > 0; ) {
-            const size_t bin = fileType * lengthCount + length;
-            const LengthBin &lengthBin = lengthToBin[length];
-            if (lengthBin.file == MMseqsNode::rank && binSizes[bin] > 0) {
-                const size_t offset = (fileType == SEQUENCE_DATA) ? lengthBin.offset : ((fileType == HEADER_DATA) ? lengthBin.headerOffset : lengthBin.headerIndexOffset);
-                FileUtil::pwriteAll(fileno(dataFiles[fileType]), dataFileNames[fileType].c_str(), sortedBuffer + binStarts[bin], binSizes[bin], offset);
-            }
-        }
-    }
-    for (size_t length = 0; length < lengthCount; length++) {
-        lengthToBin[length].offset += binSizes[SEQUENCE_DATA * lengthCount + length];
-        lengthToBin[length].headerOffset += binSizes[HEADER_DATA * lengthCount + length];
-        lengthToBin[length].headerIndexOffset += binSizes[HEADER_OFFSETS * lengthCount + length];
-    }
-    const size_t ownBegin = nodeOffsets[MMseqsNode::rank];
-    const size_t ownEnd = nodeOffsets[MMseqsNode::rank + 1];
-    if (ownEnd - ownBegin == sortedPos) {
-        return;
-    }
-    for (node = MMseqsNode::rank + 1; node <= MMseqsNode::count; node++) {
-        nodeOffsets[node] -= ownEnd - ownBegin;
-    }
-    size_t exchangeOffset;
-#pragma omp critical
-    {
-        exchangeOffset = exchangeBytes;
-        MMseqsNode::addExchangeFlush(indexData, exchangeBytes, nodeOffsets);
-    }
-    FileUtil::pwriteAll(fileno(exchangeFile), exchangeFileName.c_str(), sortedBuffer, ownBegin, exchangeOffset);
-    FileUtil::pwriteAll(fileno(exchangeFile), exchangeFileName.c_str(), sortedBuffer + ownEnd, sortedPos - ownEnd, exchangeOffset + ownBegin);
+};
+
+static bool isLongerRange(const LengthRangeLayout &range, size_t length) {
+    return range.length > length;
 }
 
-static std::vector<LengthBin> readLengthBins(const std::string &file) {
-    const std::string binData = MMseqsNode::waitForRunFile(file);
-    char *binDataChar = (char *) binData.c_str();
-    std::vector<LengthBin> bins;
-    size_t currPos = 0;
-    const char *cols[8];
-    while (currPos < binData.size()) {
-        const size_t columns = Util::getWordsOfLine(binDataChar, cols, 8);
-        LengthBin bin = {Util::fast_atoi<size_t>(cols[0]), Util::fast_atoi<size_t>(cols[1]), Util::fast_atoi<size_t>(cols[2]), 0, 0, 0, 0, 0};
-        if (columns == 8) {
-            bin.startKey = Util::fast_atoi<size_t>(cols[3]);
-            bin.offset = Util::fast_atoi<size_t>(cols[4]);
-            bin.headerOffset = Util::fast_atoi<size_t>(cols[5]);
-            bin.headerIndexOffset = Util::fast_atoi<size_t>(cols[6]);
-            bin.file = Util::fast_atoi<size_t>(cols[7]);
-        }
-        bins.push_back(bin);
-        binDataChar = Util::skipLine(binDataChar);
-        currPos = binDataChar - binData.c_str();
+// sequences of one node that are next to each other in db.<file>
+struct SequenceRun {
+    size_t node;
+    size_t file;
+    size_t start;
+    size_t end;
+    size_t directStart;
+    size_t directEnd;
+    size_t edgeOffset;
+    size_t sentOffset;
+};
+
+static bool isBeforeRun(size_t sentOffset, const SequenceRun &run) {
+    return sentOffset < run.sentOffset;
+}
+
+// prints every 10 % of a node's bytes, also on the nodes besides the master
+static void printProgress(const char *step, size_t before, size_t after, size_t total, Timer &timer) {
+    if (total > 0 && after * 10 / total > before * 10 / total) {
+        Debug(Debug::INFO) << ((MMseqsNode::count > 1) ? "[node " + SSTR(MMseqsNode::rank) + "] " : "") << after * 100 / total << "% of " << step << " after "
+                           << static_cast<size_t>(timer.getTimediff()) << " s\n";
     }
-    return bins;
+}
+
+static void flushBufferToExchange(char *buffer, size_t bufferPos, char *sortedBuffer, ZSTD_CCtx *cctx, size_t lengthCount, size_t inputSplit, size_t inputSplitFlush,
+                                  FILE *exchangeFile, const std::string &exchangeFileName, FILE *sequenceFile, const std::string &sequenceFileName,
+                                  std::vector<SentFlush> &sentFlushes, size_t &exchangeBytes, size_t &sequenceBytes) {
+    std::vector<size_t> lengthBytes(DATA_FILE_TYPE_COUNT * lengthCount, 0);
+    for (size_t pos = 0; pos < bufferPos; ) {
+        size_t seqSize = strlen(buffer + pos) + 1;
+        size_t hdrSize = strlen(buffer + pos + seqSize) + 1;
+        lengthBytes[SEQUENCE_DATA * lengthCount + seqSize - 2] += seqSize;
+        lengthBytes[HEADER_DATA * lengthCount + seqSize - 2] += hdrSize;
+        lengthBytes[HEADER_OFFSETS * lengthCount + seqSize - 2] += sizeof(uint64_t);
+        pos += seqSize + hdrSize;
+    }
+
+    SentFlush flush;
+    flush.inputSplit = inputSplit;
+    flush.inputSplitFlush = inputSplitFlush;
+    for (size_t length = lengthCount; length-- > 0; ) {
+        if (lengthBytes[SEQUENCE_DATA * lengthCount + length] > 0) {
+            SentLengthRow row = {0, length, lengthBytes[SEQUENCE_DATA * lengthCount + length] / (length + 2), lengthBytes[HEADER_DATA * lengthCount + length], {}, {}};
+            flush.rows.push_back(row);
+        }
+    }
+
+    std::vector<size_t> lengthSortedOffsets(DATA_FILE_TYPE_COUNT * lengthCount, 0);
+    size_t sortedPos = 0;
+    for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
+        for (size_t i = 0; i < flush.rows.size(); i++) {
+            size_t lengthIndex = fileType * lengthCount + flush.rows[i].length;
+            lengthSortedOffsets[lengthIndex] = sortedPos;
+            for (size_t compressionUnit = 0; compressionUnit * MAX_UNIT_SIZE < lengthBytes[lengthIndex]; compressionUnit++) {
+                size_t unitOffset = compressionUnit * MAX_UNIT_SIZE;
+                uint64_t compressionUnitHeader[4] = { flush.rows[i].length, unitOffset, std::min(MAX_UNIT_SIZE, lengthBytes[lengthIndex] - unitOffset) };
+                memcpy(sortedBuffer + sortedPos, compressionUnitHeader, UNIT_HEADER_SIZE);
+                sortedPos += UNIT_HEADER_SIZE + compressionUnitHeader[2];
+            }
+        }
+    }
+
+    std::vector<size_t> lengthWrittenBytes(DATA_FILE_TYPE_COUNT * lengthCount, 0);
+    for (size_t pos = 0; pos < bufferPos; ) {
+        size_t seqSize = strlen(buffer + pos) + 1;
+        size_t hdrSize = strlen(buffer + pos + seqSize) + 1;
+        size_t seqIdx = SEQUENCE_DATA * lengthCount + seqSize - 2;
+        size_t hdrIdx = HEADER_DATA * lengthCount + seqSize - 2;
+        size_t offsetIdx = HEADER_OFFSETS * lengthCount + seqSize - 2;
+        uint64_t headerOffset = lengthWrittenBytes[hdrIdx];
+        copyToCompressionUnits(sortedBuffer + lengthSortedOffsets[seqIdx], lengthWrittenBytes[seqIdx], buffer + pos, seqSize);
+        copyToCompressionUnits(sortedBuffer + lengthSortedOffsets[hdrIdx], lengthWrittenBytes[hdrIdx], buffer + pos + seqSize, hdrSize);
+        copyToCompressionUnits(sortedBuffer + lengthSortedOffsets[offsetIdx], lengthWrittenBytes[offsetIdx], (const char *) &headerOffset, sizeof(uint64_t));
+        pos += seqSize + hdrSize;
+    }
+
+    // compress back into buffer
+    size_t compressedPos = 0;
+    size_t pos = 0;
+    for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
+        for (size_t i = 0; i < flush.rows.size(); i++) {
+            flush.rows[i].starts[fileType] = compressedPos;
+            size_t lengthIndex = fileType * lengthCount + flush.rows[i].length;
+            for (size_t compressionUnit = 0; compressionUnit * MAX_UNIT_SIZE < lengthBytes[lengthIndex]; compressionUnit++) {
+                uint64_t compressionUnitHeader[4];
+                memcpy(compressionUnitHeader, sortedBuffer + pos, UNIT_HEADER_SIZE);
+                const char *data = sortedBuffer + pos + UNIT_HEADER_SIZE;
+                char *compressed = buffer + compressedPos + UNIT_HEADER_SIZE;
+                size_t storedBytes = ZSTD_compressCCtx(cctx, compressed, compressionUnitHeader[2] - 1, data, compressionUnitHeader[2], 1);
+                if (ZSTD_isError(storedBytes)) {
+                    memcpy(compressed, data, compressionUnitHeader[2]);
+                    storedBytes = compressionUnitHeader[2];
+                }
+                compressionUnitHeader[3] = storedBytes;
+                memcpy(buffer + compressedPos, compressionUnitHeader, UNIT_HEADER_SIZE);
+                compressedPos += UNIT_HEADER_SIZE + storedBytes;
+                pos += UNIT_HEADER_SIZE + compressionUnitHeader[2];
+            }
+            flush.rows[i].ends[fileType] = compressedPos;
+        }
+    }
+
+    size_t sequenceSize = flush.rows.back().ends[SEQUENCE_DATA];
+    size_t sequenceOffset;
+    size_t offset;
+#pragma omp critical
+    {
+        // sequenceBytes is exchangeBytes if the sequences are not spooled
+        sequenceOffset = sequenceBytes;
+        sequenceBytes += sequenceSize;
+        offset = exchangeBytes;
+        exchangeBytes += compressedPos - sequenceSize;
+        for (size_t i = 0; i < flush.rows.size(); i++) {
+            flush.rows[i].starts[SEQUENCE_DATA] += sequenceOffset;
+            flush.rows[i].ends[SEQUENCE_DATA] += sequenceOffset;
+            for (size_t fileType = HEADER_DATA; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
+                flush.rows[i].starts[fileType] = flush.rows[i].starts[fileType] - sequenceSize + offset;
+                flush.rows[i].ends[fileType] = flush.rows[i].ends[fileType] - sequenceSize + offset;
+            }
+        }
+        sentFlushes.push_back(std::move(flush));
+    }
+    FileUtil::pwriteAll(fileno(sequenceFile), sequenceFileName.c_str(), buffer, sequenceSize, sequenceOffset);
+    FileUtil::pwriteAll(fileno(exchangeFile), exchangeFileName.c_str(), buffer + sequenceSize, compressedPos - sequenceSize, offset);
 }
 
 static int createdbLinfinity(Parameters &par, const std::vector<std::string> &filenames, const std::string &dataFile) {
-    const std::string planPrefix = dataFile + ".splitplan.";
+    std::string planPrefix = dataFile + ".splitplan.";
     if (MMseqsNode::isMaster()) {
         std::vector<size_t> fileSizes(filenames.size());
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+        size_t totalSize = 0;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+:totalSize)
         for (size_t i = 0; i < filenames.size(); i++) {
             fileSizes[i] = FileUtil::getFileSize(filenames[i]);
             if (fileSizes[i] == SIZE_MAX) {
                 Debug(Debug::ERROR) << "File " << filenames[i] << " does not exist\n";
                 EXIT(EXIT_FAILURE);
             }
-        }
-        size_t totalSize = 0;
-        for (size_t i = 0; i < filenames.size(); i++) {
             totalSize += fileSizes[i];
         }
-        const size_t pieceSize = std::max<size_t>(1, totalSize / (MMseqsNode::count * par.threads));
-        std::vector<std::vector<size_t>> fileCuts(filenames.size(), std::vector<size_t>(1, 0));
-        size_t unsplitFiles = 0;
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+:unsplitFiles)
+
+        size_t splitSize = std::max((size_t) 1, totalSize / (MMseqsNode::count * par.threads));
+        std::vector<std::vector<size_t>> fileSplitOffsets(filenames.size(), std::vector<size_t>(1, 0));
+        size_t unsplitFileCount = 0;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+:unsplitFileCount)
         for (size_t i = 0; i < filenames.size(); i++) {
-            std::vector<size_t> &cuts = fileCuts[i];
-            if (fileSizes[i] > pieceSize) {
+            std::vector<size_t> &splitOffsets = fileSplitOffsets[i];
+            if (fileSizes[i] > splitSize) {
                 bool isSplittable = Util::endsWith(".gz", filenames[i]) == false && Util::endsWith(".bz2", filenames[i]) == false;
                 if (isSplittable) {
                     KSeqWrapper *kseq = KSeqFactory(filenames[i].c_str());
                     isSplittable = kseq->ReadEntry() && kseq->entry.qual.l == 0;
                     delete kseq;
                 }
-                // a pzstd file starts with a skippable frame of the size of the next frame, the reader of a piece finds the frames from its cuts
+                // pzstd files start with a skippable frame
                 if (isSplittable && Util::endsWith(".zst", filenames[i]) == true) {
                     FILE *handle = FileUtil::openFileOrDie(filenames[i].c_str(), "r", true);
                     uint32_t header[3];
@@ -609,297 +593,216 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                         EXIT(EXIT_FAILURE);
                     }
                 }
-                for (size_t cut = pieceSize; isSplittable && cut < fileSizes[i]; cut += pieceSize) {
-                    cuts.push_back(cut);
+                for (size_t cut = splitSize; isSplittable && cut < fileSizes[i]; cut += splitSize) {
+                    splitOffsets.push_back(cut);
                 }
-                unsplitFiles += isSplittable ? 0 : 1;
+                unsplitFileCount += isSplittable ? 0 : 1;
             }
-            cuts.push_back(fileSizes[i]);
+            splitOffsets.push_back(fileSizes[i]);
         }
-        if (unsplitFiles > 0) {
-            Debug(Debug::WARNING) << unsplitFiles << " input files are larger than " << pieceSize << " bytes but cannot be split, so fewer threads and one node read them. "
-                                  << "Give FASTA uncompressed or compressed with pzstd\n";
+
+        if (unsplitFileCount > 0) {
+            Debug(Debug::WARNING) << unsplitFileCount << " input files larger than " << splitSize << " bytes cannot be split and are read by one thread each\n";
+            Debug(Debug::WARNING) << "Give FASTA uncompressed or compressed with pzstd\n";
         }
-        std::vector<InputPiece> pieces;
-        std::vector<size_t> pieceOffset(1, 0);
+
+        std::vector<InputSplit> inputSplits;
+        std::vector<size_t> inputSplitOffsets(1, 0);
         for (size_t i = 0; i < filenames.size(); i++) {
-            for (size_t j = 0; j + 1 < fileCuts[i].size(); j++) {
-                InputPiece piece = {i, fileCuts[i][j], fileCuts[i][j + 1]};
-                pieces.push_back(piece);
-                pieceOffset.push_back(pieceOffset.back() + (piece.end - piece.start));
+            for (size_t j = 0; j + 1 < fileSplitOffsets[i].size(); j++) {
+                InputSplit inputSplit = {i, fileSplitOffsets[i][j], fileSplitOffsets[i][j + 1]};
+                inputSplits.push_back(inputSplit);
+                inputSplitOffsets.push_back(inputSplitOffsets.back() + (inputSplit.end - inputSplit.start));
             }
         }
-        const size_t pieceCount = pieces.size();
-        std::vector<size_t> pieceBoundaries(MMseqsNode::count + 1, pieceCount);
-        pieceBoundaries[0] = 0;
+
+        size_t inputSplitCount = inputSplits.size();
+        std::vector<size_t> nodeInputSplitOffsets(MMseqsNode::count + 1, inputSplitCount);
+        nodeInputSplitOffsets[0] = 0;
         for (unsigned int node = 0; node + 1 < MMseqsNode::count; node++) {
-            const size_t targetSize = totalSize / MMseqsNode::count * (node + 1);
-            const size_t maxPieceEnd = (pieceCount >= MMseqsNode::count) ? pieceCount - (MMseqsNode::count - node - 1) : pieceCount;
-            size_t nearestEnd = std::lower_bound(pieceOffset.begin(), pieceOffset.end(), targetSize) - pieceOffset.begin();
-            if (nearestEnd > 0 && targetSize - pieceOffset[nearestEnd - 1] <= pieceOffset[nearestEnd] - targetSize) {
+            size_t targetSize = totalSize / MMseqsNode::count * (node + 1);
+            size_t maxEnd = (inputSplitCount >= MMseqsNode::count) ? inputSplitCount - (MMseqsNode::count - node - 1) : inputSplitCount;
+            size_t nearestEnd = std::lower_bound(inputSplitOffsets.begin(), inputSplitOffsets.end(), targetSize) - inputSplitOffsets.begin();
+            if (nearestEnd > 0 && targetSize - inputSplitOffsets[nearestEnd - 1] <= inputSplitOffsets[nearestEnd] - targetSize) {
                 nearestEnd--;
             }
-            pieceBoundaries[node + 1] = std::min(std::max(nearestEnd, pieceBoundaries[node] + 1), maxPieceEnd);
+            nodeInputSplitOffsets[node + 1] = std::min(std::max(nearestEnd, nodeInputSplitOffsets[node] + 1), maxEnd);
         }
+
         for (unsigned int node = 0; node < MMseqsNode::count; node++) {
             std::string planData;
-            for (size_t i = pieceBoundaries[node]; i < pieceBoundaries[node + 1]; i++) {
-                planData += SSTR(pieces[i].file) + "\t" + SSTR(pieces[i].start) + "\t" + SSTR(pieces[i].end) + "\n";
+            for (size_t i = nodeInputSplitOffsets[node]; i < nodeInputSplitOffsets[node + 1]; i++) {
+                planData += SSTR(inputSplits[i].file) + "\t" + SSTR(inputSplits[i].start) + "\t" + SSTR(inputSplits[i].end) + "\n";
             }
             MMseqsNode::publishRunFile(planPrefix + SSTR(node), planData);
         }
     }
-    const std::string planFile = planPrefix + SSTR(MMseqsNode::rank);
-    const std::string nodePlanData = MMseqsNode::waitForRunFile(planFile);
-    char *nodePlanDataChar = (char *) nodePlanData.c_str();
-    std::vector<InputPiece> nodePieces;
+
+    std::string planFile = planPrefix + SSTR(MMseqsNode::rank);
+    std::string planText = MMseqsNode::waitForRunFile(planFile);
+    char *planTextChar = (char *) planText.c_str();
+    std::vector<InputSplit> nodeInputSplits;
     size_t currPos = 0;
     const char *cols[3];
-    while (currPos < nodePlanData.size()) {
-        Util::getWordsOfLine(nodePlanDataChar, cols, 3);
-        InputPiece piece = {Util::fast_atoi<size_t>(cols[0]), Util::fast_atoi<size_t>(cols[1]), Util::fast_atoi<size_t>(cols[2])};
-        nodePieces.push_back(piece);
-        nodePlanDataChar = Util::skipLine(nodePlanDataChar);
-        currPos = nodePlanDataChar - nodePlanData.c_str();
+    while (currPos < planText.size()) {
+        Util::getWordsOfLine(planTextChar, cols, 3);
+        InputSplit inputSplit = {Util::fast_atoi<size_t>(cols[0]), Util::fast_atoi<size_t>(cols[1]), Util::fast_atoi<size_t>(cols[2])};
+        nodeInputSplits.push_back(inputSplit);
+        planTextChar = Util::skipLine(planTextChar);
+        currPos = planTextChar - planText.c_str();
     }
     FileUtil::remove(planFile.c_str());
+
     if (MMseqsNode::isMaster()) {
         Debug(Debug::INFO) << "Converting sequences from " << filenames.size() << " files on " << MMseqsNode::count << " nodes\n";
     }
+
     std::string phaseValues;
     Timer timer;
-    std::vector<std::vector<LengthBin>> pieceHistograms(nodePieces.size());
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-    for (size_t i = 0; i < nodePieces.size(); i++) {
-        std::vector<size_t> sequenceCount;
-        std::vector<size_t> headerBytes;
-        KSeqWrapper *kseq = KSeqFactory(filenames[nodePieces[i].file].c_str(), nodePieces[i].start, nodePieces[i].end);
-        while (kseq->ReadEntry()) {
-            const KSeqWrapper::KSeqEntry &e = kseq->entry;
-            const size_t nameLength = strlen(e.name.s);
-            if (nameLength == 0) {
-                Debug(Debug::ERROR) << "Fasta entry in " << filenames[nodePieces[i].file] << " is invalid\n";
-                EXIT(EXIT_FAILURE);
-            }
-            const size_t length = e.sequence.l;
-            if (length >= sequenceCount.size()) {
-                sequenceCount.resize(length + 1, 0);
-                headerBytes.resize(length + 1, 0);
-            }
-            sequenceCount[length]++;
-            headerBytes[length] += nameLength + 2;
-        }
-        delete kseq;
-        pieceHistograms[i] = makeLengthBins(sequenceCount, headerBytes);
-    }
-
-    const std::vector<LengthBin> localNodeHistogram = mergeLengthHistograms(pieceHistograms);
-
-    const std::string histogramPrefix = dataFile + ".histogram.";
-    const std::string startsPrefix = dataFile + ".starts.";
-    std::string histogramData;
-    for (size_t i = 0; i < localNodeHistogram.size(); i++) {
-        histogramData += SSTR(localNodeHistogram[i].length) + "\t" + SSTR(localNodeHistogram[i].sequenceCount) + "\t" + SSTR(localNodeHistogram[i].headerBytes) + "\n";
-    }
-    MMseqsNode::publishRunFile(histogramPrefix + SSTR(MMseqsNode::rank), histogramData);
-    MMseqsNode::addPhaseTime(phaseValues, "counting the lengths", timer);
-    if (MMseqsNode::isMaster()) {
-        std::vector<std::vector<LengthBin>> nodeHistograms(MMseqsNode::count);
-        for (unsigned int node = 0; node < MMseqsNode::count; node++) {
-            const std::string histogramFile = histogramPrefix + SSTR(node);
-            nodeHistograms[node] = readLengthBins(histogramFile);
-            FileUtil::remove(histogramFile.c_str());
-        }
-
-        std::vector<LengthBin> globalHistogram = mergeLengthHistograms(nodeHistograms);
-        if (globalHistogram.empty() == false && globalHistogram.back().length == 0) {
-            Debug(Debug::WARNING) << globalHistogram.back().sequenceCount << " sequences without residues are skipped\n";
-            globalHistogram.pop_back();
-            for (unsigned int node = 0; node < MMseqsNode::count; node++) {
-                if (nodeHistograms[node].empty() == false && nodeHistograms[node].back().length == 0) {
-                    nodeHistograms[node].pop_back();
-                }
-            }
-        }
-        if (globalHistogram.empty()) {
-            Debug(Debug::ERROR) << "The input files have no entry: ";
-            for (size_t fileIdx = 0; fileIdx < filenames.size(); fileIdx++) {
-                Debug(Debug::ERROR) << " - " << filenames[fileIdx] << "\n";
-            }
-            Debug(Debug::ERROR) << "Please check your input files. Only files in fasta/fastq[.gz|bz2|zst] are supported\n";
-            EXIT(EXIT_FAILURE);
-        }
-        size_t key = 0;
-        size_t dataSize = 0;
-        std::vector<size_t> binBytes(globalHistogram.size());
-        size_t maxFileBytes = 0;
-        for (size_t i = 0; i < globalHistogram.size(); i++) {
-            globalHistogram[i].startKey = key;
-            key += globalHistogram[i].sequenceCount;
-            binBytes[i] = globalHistogram[i].sequenceCount * (globalHistogram[i].length + 2 + sizeof(uint64_t)) + globalHistogram[i].headerBytes;
-            dataSize += binBytes[i];
-            maxFileBytes = std::max(maxFileBytes, binBytes[i]);
-        }
-        // the smallest largest file for which the lengths, filled into the files in order, fit; a length is never split
-        maxFileBytes = std::max(maxFileBytes, (dataSize + MMseqsNode::count - 1) / MMseqsNode::count);
-        for (size_t fitBytes = dataSize; maxFileBytes < fitBytes; ) {
-            const size_t fileBytes = maxFileBytes + (fitBytes - maxFileBytes) / 2;
-            size_t files = 1;
-            size_t fill = 0;
-            for (size_t i = 0; i < binBytes.size(); i++) {
-                if (fill + binBytes[i] > fileBytes) {
-                    files++;
-                    fill = 0;
-                }
-                fill += binBytes[i];
-            }
-            if (files <= MMseqsNode::count) {
-                fitBytes = fileBytes;
-            } else {
-                maxFileBytes = fileBytes + 1;
-            }
-        }
-        std::vector<size_t> dataFileSizes(DATA_FILE_TYPES * MMseqsNode::count, 0);
-        size_t file = 0;
-        size_t fill = 0;
-        std::string indexData;
-        for (size_t i = 0; i < globalHistogram.size(); i++) {
-            LengthBin &bin = globalHistogram[i];
-            if (fill + binBytes[i] > maxFileBytes) {
-                file++;
-                fill = 0;
-            }
-            fill += binBytes[i];
-            bin.file = file;
-            bin.offset = dataFileSizes[SEQUENCE_DATA * MMseqsNode::count + file];
-            bin.headerOffset = dataFileSizes[HEADER_DATA * MMseqsNode::count + file];
-            bin.headerIndexOffset = dataFileSizes[HEADER_OFFSETS * MMseqsNode::count + file];
-            dataFileSizes[SEQUENCE_DATA * MMseqsNode::count + file] += bin.sequenceCount * (bin.length + 2);
-            dataFileSizes[HEADER_DATA * MMseqsNode::count + file] += bin.headerBytes;
-            dataFileSizes[HEADER_OFFSETS * MMseqsNode::count + file] += bin.sequenceCount * sizeof(uint64_t);
-            indexData += SSTR(bin.startKey) + "\t" + SSTR(bin.offset) + "\t" + SSTR(bin.length + 2) + "\t" + SSTR(bin.sequenceCount) + "\t" + SSTR(bin.file) + "\n";
-        }
-        std::string nodeInfoData;
-        size_t fileFirstKey = 0;
-        for (size_t i = HEADER_OFFSETS * MMseqsNode::count; i < dataFileSizes.size(); i++) {
-            const size_t fileKeyCount = dataFileSizes[i] / sizeof(uint64_t);
-            nodeInfoData += SSTR(fileFirstKey) + "\t" + SSTR(fileKeyCount) + "\n";
-            fileFirstKey += fileKeyCount;
-        }
-        // the files get their final sizes now, so a file size limit or a full disk fails before the input is read again;
-        // once sent, all entries are on disk uncompressed, in the data files or the exchange files, so at least dataSize bytes are needed
-        const size_t freeSpace = FileUtil::getFreeSpace(FileUtil::dirName(dataFile).c_str());
-        if (freeSpace < dataSize) {
-            Debug(Debug::ERROR) << FileUtil::dirName(dataFile) << " needs at least " << dataSize << " free bytes for the sequences of " << dataFile << ", but has " << freeSpace << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-        for (size_t i = 0; i < dataFileSizes.size(); i++) {
-            const size_t fileType = i / MMseqsNode::count;
-            const size_t node = i % MMseqsNode::count;
-            const std::string fileName = dataFile + dataFileSuffixes[fileType] + SSTR(node);
-            const uint64_t headerDataSize = dataFileSizes[HEADER_DATA * MMseqsNode::count + node];
-            const size_t fileSize = dataFileSizes[i] + ((fileType == HEADER_OFFSETS) ? sizeof(uint64_t) : 0);
-            FILE *handle = FileUtil::openAndDelete(fileName.c_str(), "w");
-            if (ftruncate(fileno(handle), fileSize) != 0) {
-                Debug(Debug::ERROR) << "Cannot resize " << fileName << " to " << fileSize << " bytes: " << strerror(errno) << ". Run on more nodes if the file system limits the file size\n";
-                EXIT(EXIT_FAILURE);
-            }
-            if (fileType == HEADER_OFFSETS) {
-                FileUtil::pwriteAll(fileno(handle), fileName.c_str(), reinterpret_cast<const char *>(&headerDataSize), sizeof(uint64_t), dataFileSizes[i]);
-            }
-            if (fclose(handle) != 0) {
-                Debug(Debug::ERROR) << "Cannot close data file " << fileName << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-        }
-        splitStarts(globalHistogram, nodeHistograms);
-        for (unsigned int node = 0; node < MMseqsNode::count; node++) {
-            std::string startsData;
-            for (size_t i = 0; i < nodeHistograms[node].size(); i++) {
-                const LengthBin &bin = nodeHistograms[node][i];
-                startsData += SSTR(bin.length) + "\t" + SSTR(bin.sequenceCount) + "\t" + SSTR(bin.headerBytes) + "\t" + SSTR(bin.startKey) + "\t" + SSTR(bin.offset) + "\t" + SSTR(bin.headerOffset) + "\t" + SSTR(bin.headerIndexOffset) + "\t" + SSTR(bin.file) + "\n";
-            }
-            MMseqsNode::publishRunFile(startsPrefix + SSTR(node), startsData);
-        }
-        MMseqsNode::publishFile(dataFile + ".index", indexData);
-        MMseqsNode::publishFile(dataFile + ".nodeinfo", nodeInfoData);
-    }
-    const std::string startsFile = startsPrefix + SSTR(MMseqsNode::rank);
-    const std::vector<LengthBin> localNodeStarts = readLengthBins(startsFile);
-    FileUtil::remove(startsFile.c_str());
-    timer.reset();
-    for (size_t i = 0; i < pieceHistograms.size(); i++) {
-        if (pieceHistograms[i].empty() == false && pieceHistograms[i].back().length == 0) {
-            pieceHistograms[i].pop_back();
-        }
-    }
-    splitStarts(localNodeStarts, pieceHistograms);
-
-    std::string dataFileNames[DATA_FILE_TYPES];
-    FILE *dataFiles[DATA_FILE_TYPES];
-    size_t dataFileSizes[DATA_FILE_TYPES] = {};
-    // the master made the files of this node with their final sizes
-    for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
-        dataFileNames[fileType] = dataFile + dataFileSuffixes[fileType] + SSTR(MMseqsNode::rank);
-        dataFiles[fileType] = FileUtil::openFileOrDie(dataFileNames[fileType].c_str(), "r+", true);
-        dataFileSizes[fileType] = FileUtil::getFileSize(dataFileNames[fileType]);
-    }
-    const std::string exchange = dataFile + "_sent_entries";
-    const std::string exchangeFile = exchange + "." + SSTR(MMseqsNode::rank);
+    std::string exchange = dataFile + "_sent_entries";
+    std::string exchangeFile = exchange + "." + SSTR(MMseqsNode::rank);
+    std::string edges = dataFile + "_sent_edges";
     FILE *exchangeHandle = FileUtil::openAndDelete(exchangeFile.c_str(), "w");
-    std::string exchangeIndexData;
+    std::vector<SentFlush> sentFlushes;
     size_t exchangeBytes = 0;
-    const size_t activeThreads = std::max<size_t>(1, std::min<size_t>(par.threads, nodePieces.size()));
-    size_t maxPieceSize = 0;
-    size_t sentBytes = 0;
-    for (size_t i = 0; i < pieceHistograms.size(); i++) {
-        size_t pieceSize = 0;
-        size_t pieceEntryCount = 0;
-        for (size_t j = 0; j < pieceHistograms[i].size(); j++) {
-            const size_t binBytes = pieceHistograms[i][j].sequenceCount * (pieceHistograms[i][j].length + 2 + sizeof(uint64_t)) + pieceHistograms[i][j].headerBytes;
-            pieceSize += binBytes;
-            pieceEntryCount += pieceHistograms[i][j].sequenceCount;
-            sentBytes += (pieceHistograms[i][j].file != MMseqsNode::rank) ? binBytes : 0;
-        }
-        const size_t lengthCount = pieceHistograms[i].empty() ? 0 : pieceHistograms[i][0].length + 1;
-        maxPieceSize = std::max(maxPieceSize, pieceSize + getSegmentHeadersSize(pieceEntryCount, lengthCount, pieceSize));
+    size_t emptySequenceCount = 0;
+    size_t threadCnt = std::max((size_t) 1, std::min((size_t) par.threads, nodeInputSplits.size()));
+    size_t inputBytes = 0;
+    size_t spoolSize = 0;
+    for (size_t i = 0; i < nodeInputSplits.size(); i++) {
+        size_t splitBytes = nodeInputSplits[i].end - nodeInputSplits[i].start;
+        const std::string &name = filenames[nodeInputSplits[i].file];
+        bool isCompressed = Util::endsWith(".gz", name) || Util::endsWith(".bz2", name) || Util::endsWith(".zst", name);
+        inputBytes += splitBytes;
+        spoolSize += isCompressed ? splitBytes : splitBytes / 5 * 3;
     }
-    // the exchange file must hold the bytes for other nodes, about as many as sentBytes
-    if (ftruncate(fileno(exchangeHandle), sentBytes) != 0 || ftruncate(fileno(exchangeHandle), 0) != 0) {
-        Debug(Debug::ERROR) << "Cannot resize " << exchangeFile << " to " << sentBytes << " bytes: " << strerror(errno) << ". Run on more nodes if the file system limits the file size\n";
+
+    // other nodes only open these files after the first barrier
+    std::string dataFileNames[DATA_FILE_TYPE_COUNT];
+    FILE *dataFiles[DATA_FILE_TYPE_COUNT];
+    for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
+        dataFileNames[fileType] = dataFile + dataFileSuffixes[fileType] + SSTR(MMseqsNode::rank);
+        dataFiles[fileType] = FileUtil::openAndDelete(dataFileNames[fileType].c_str(), "w");
+    }
+
+    // spool the sent sequences if every node has local flash with room for them
+    struct stat dbStat;
+    if (fstat(fileno(dataFiles[SEQUENCE_DATA]), &dbStat) != 0) {
+        Debug(Debug::ERROR) << "Cannot stat " << dataFileNames[SEQUENCE_DATA] << "\n";
         EXIT(EXIT_FAILURE);
     }
-    const size_t memoryLimit = Util::computeMemory(0);
-    const size_t bufferSize = std::min(maxPieceSize, static_cast<size_t>(memoryLimit * 0.95) / (2 * activeThreads));
-#pragma omp parallel num_threads(activeThreads)
+    std::string reason = par.localTmp.empty() ? "no --local-tmp" : "";
+    std::string localDevice = "none";
+    size_t localFreeSize = 0;
+    if (par.localTmp.empty() == false) {
+        if (FileUtil::makeDir(par.localTmp.c_str()) == false && FileUtil::directoryExists(par.localTmp.c_str()) == false) {
+            Debug(Debug::ERROR) << "Cannot create local tmp dir " << par.localTmp << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        int fd = open(par.localTmp.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        StorageKind storage = getStorageKind(fd);
+        struct stat localStat;
+        struct statvfs fs;
+        if (fd < 0 || fstat(fd, &localStat) != 0 || fstatvfs(fd, &fs) != 0) {
+            reason = "it cannot be read";
+        } else if (storage != STORAGE_LOCAL_FLASH) {
+            reason = std::string("it is on ") + getStorageName(storage) + ", not local flash";
+        } else if (localStat.st_dev == dbStat.st_dev) {
+            reason = "it is on the device of the database";
+        } else {
+            char host[256] = "";
+            gethostname(host, sizeof(host) - 1);
+            localDevice = std::string(host) + ":" + SSTR((size_t) localStat.st_dev);
+            localFreeSize = (size_t) fs.f_bavail * fs.f_frsize;
+        }
+        if (fd >= 0 && close(fd) != 0) {
+            Debug(Debug::ERROR) << "Cannot close " << par.localTmp << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+    std::string nodeSpools = MMseqsNode::barrier(dataFile + ".local_tmp", SSTR(spoolSize) + "\t" + SSTR(localFreeSize) + "\t" + localDevice + "\t" + reason + "\n");
+    bool hasLocalTmp = false;
+    std::string nodeReason;
+    std::map<std::string, std::pair<size_t, size_t> > deviceSpools;
+    char *line = (char *) nodeSpools.c_str();
+    for (unsigned int node = 0; node < MMseqsNode::count; node++, line = Util::skipLine(line)) {
+        const char *columns[4];
+        Util::getFieldsOfLine(line, columns, 4);
+        std::string nodeLineReason(columns[3], Util::skipLine(line) - 1 - columns[3]);
+        hasLocalTmp |= nodeLineReason != "no --local-tmp";
+        if (nodeReason.empty() && nodeLineReason.empty() == false) {
+            nodeReason = "node " + SSTR(node) + ": " + nodeLineReason;
+        }
+        std::pair<size_t, size_t> &deviceSpool = deviceSpools[std::string(columns[2], columns[3] - 1 - columns[2])];
+        deviceSpool.first += Util::fast_atoi<size_t>(columns[0]);
+        deviceSpool.second = Util::fast_atoi<size_t>(columns[1]);
+    }
+    for (std::map<std::string, std::pair<size_t, size_t> >::const_iterator it = deviceSpools.begin(); nodeReason.empty() && it != deviceSpools.end(); ++it) {
+        if (it->second.first > it->second.second) {
+            nodeReason = it->first + " has " + SSTR(it->second.second) + " free bytes, the spooled sequences may need " + SSTR(it->second.first);
+        }
+    }
+    std::string spoolFile = par.localTmp + "/" + FileUtil::baseName(dataFile) + "_sent_sequences." + SSTR(MMseqsNode::rank) + ".XXXXXX";
+    FILE *spoolHandle = exchangeHandle;
+    if (nodeReason.empty()) {
+        Debug(Debug::INFO) << "Spooling the sent sequences to " << par.localTmp << "\n";
+        int fd = mkstemp(&spoolFile[0]);
+        if (fd < 0 || unlink(spoolFile.c_str()) != 0 || (spoolHandle = fdopen(fd, "r+")) == NULL) {
+            Debug(Debug::ERROR) << "Cannot create " << spoolFile << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    } else if (hasLocalTmp) {
+        MMseqsNode::reportUnusableLocalTmp("Cannot spool the sent sequences to --local-tmp " + par.localTmp + ": " + nodeReason);
+    }
+    if (hasLocalTmp) {
+        MMseqsNode::addPhaseValue(phaseValues, "Local tmp", nodeReason.empty() ? "holds the sent sequences" : "not used, " + nodeReason);
+    }
+    bool isSpooled = spoolHandle != exchangeHandle;
+    size_t spoolBytes = 0;
+    size_t readBytes = 0;
+    size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
+    size_t entryBufferBytes = static_cast<size_t>(memoryLimit * 0.95) / (2 * threadCnt);
+#pragma omp parallel num_threads(threadCnt) reduction(+:emptySequenceCount)
     {
-        char *buffer = new(std::nothrow) char[bufferSize];
+        char *buffer = new(std::nothrow) char[entryBufferBytes];
         Util::checkAllocation(buffer, "Can not allocate buffer memory in createdb");
-        char *sortedBuffer = new(std::nothrow) char[bufferSize];
+        char *sortedBuffer = new(std::nothrow) char[entryBufferBytes];
         Util::checkAllocation(sortedBuffer, "Can not allocate sortedBuffer memory in createdb");
+        ZSTD_CCtx *cctx = ZSTD_createCCtx();
+        if (cctx == NULL) {
+            Debug(Debug::ERROR) << "ZSTD_createCCtx() error\n";
+            EXIT(EXIT_FAILURE);
+        }
 #pragma omp for schedule(dynamic, 1)
-        for (size_t i = 0; i < nodePieces.size(); i++) {
-            std::vector<LengthBin> lengthToBin = getLengthToBin(pieceHistograms[i]);
+        for (size_t i = 0; i < nodeInputSplits.size(); i++) {
             size_t bufferPos = 0;
             size_t entryCount = 0;
-            KSeqWrapper *kseq = KSeqFactory(filenames[nodePieces[i].file].c_str(), nodePieces[i].start, nodePieces[i].end);
+            size_t lengthCount = 0;
+            size_t inputSplitFlush = 0;
+            KSeqWrapper *kseq = KSeqFactory(filenames[nodeInputSplits[i].file].c_str(), nodeInputSplits[i].start, nodeInputSplits[i].end);
             while (kseq->ReadEntry()) {
                 const KSeqWrapper::KSeqEntry &e = kseq->entry;
+                size_t nameLength = strlen(e.name.s);
+                if (nameLength == 0) {
+                    Debug(Debug::ERROR) << "Fasta entry in " << filenames[nodeInputSplits[i].file] << " is invalid\n";
+                    EXIT(EXIT_FAILURE);
+                }
                 if (e.sequence.l == 0) {
+                    emptySequenceCount++;
                     continue;
                 }
-                const size_t nameLength = strlen(e.name.s);
-                const size_t entrySize = e.sequence.l + nameLength + 4;
-                const size_t dataSize = bufferPos + entrySize + (entryCount + 1) * sizeof(uint64_t);
-                if (dataSize + getSegmentHeadersSize(entryCount + 1, lengthToBin.size(), dataSize) > bufferSize) {
-                    if (entrySize + sizeof(uint64_t) + getSegmentHeadersSize(1, lengthToBin.size(), entrySize + sizeof(uint64_t)) > bufferSize) {
+                size_t entryBytes = e.sequence.l + nameLength + 4;
+                size_t dataSize = bufferPos + entryBytes + (entryCount + 1) * sizeof(uint64_t);
+                if (dataSize + getCompressionUnitHeaderBytes(entryCount + 1, std::max(lengthCount, e.sequence.l + 1), dataSize) > entryBufferBytes) {
+                    if (entryBytes + sizeof(uint64_t) + getCompressionUnitHeaderBytes(1, e.sequence.l + 1, entryBytes + sizeof(uint64_t)) > entryBufferBytes) {
                         Debug(Debug::ERROR) << "Not enough memory for entry " << e.name.s << "\n";
                         EXIT(EXIT_FAILURE);
                     }
-                    flushBufferToExchange(buffer, bufferPos, sortedBuffer, lengthToBin, dataFiles, dataFileNames, exchangeHandle, exchangeFile, exchangeIndexData, exchangeBytes);
+                    flushBufferToExchange(buffer, bufferPos, sortedBuffer, cctx, lengthCount, i, inputSplitFlush++, exchangeHandle, exchangeFile,
+                                          spoolHandle, isSpooled ? spoolFile : exchangeFile, sentFlushes, exchangeBytes, isSpooled ? spoolBytes : exchangeBytes);
                     bufferPos = 0;
                     entryCount = 0;
+                    lengthCount = 0;
                 }
                 memcpy(buffer + bufferPos, e.sequence.s, e.sequence.l);
                 std::replace(buffer + bufferPos, buffer + bufferPos + e.sequence.l, '\0', 'X');
@@ -910,177 +813,639 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 bufferPos += nameLength;
                 buffer[bufferPos++] = '\n';
                 buffer[bufferPos++] = '\0';
+                lengthCount = std::max(lengthCount, e.sequence.l + 1);
                 entryCount++;
             }
             if (bufferPos > 0) {
-                flushBufferToExchange(buffer, bufferPos, sortedBuffer, lengthToBin, dataFiles, dataFileNames, exchangeHandle, exchangeFile, exchangeIndexData, exchangeBytes);
+                flushBufferToExchange(buffer, bufferPos, sortedBuffer, cctx, lengthCount, i, inputSplitFlush, exchangeHandle, exchangeFile,
+                                      spoolHandle, isSpooled ? spoolFile : exchangeFile, sentFlushes, exchangeBytes, isSpooled ? spoolBytes : exchangeBytes);
             }
             delete kseq;
+            size_t splitBytes = nodeInputSplits[i].end - nodeInputSplits[i].start;
+            size_t readEnd;
+#pragma omp atomic capture
+            readEnd = readBytes += splitBytes;
+            printProgress("the input read", readEnd - splitBytes, readEnd, inputBytes, timer);
         }
-        Util::releasePages(buffer, bufferSize);
-        Util::releasePages(sortedBuffer, bufferSize);
+        Util::releasePages(buffer, entryBufferBytes);
+        Util::releasePages(sortedBuffer, entryBufferBytes);
         delete[] buffer;
         delete[] sortedBuffer;
+        ZSTD_freeCCtx(cctx);
     }
-    const std::string exchangeIndex = MMseqsNode::closeExchange(exchangeHandle, exchangeFile, exchange + ".index", exchangeIndexData);
-    MMseqsNode::addPhaseTime(phaseValues, "sending the sequences", timer);
 
-    // the segments of the data files of this node that other nodes sent, written window by window
-    double compressSeconds = 0;
-    {
-        std::vector<MMseqsNode::ExchangeBlock> blocks;
-        std::vector<FILE *> exchangeFiles;
-        MMseqsNode::openExchange(exchangeIndex, exchange, blocks, exchangeFiles);
-        // the send buffers are freed, so the receive takes the same budget: half of it buffers the blocks, so each read of a block is large,
-        // and the writes of a window go on behind the reads of the next one
-        const size_t receiveMemory = static_cast<size_t>(memoryLimit * 0.95);
-        const size_t blockMemory = receiveMemory / 2;
-        const size_t windowSize = receiveMemory / 8;
-        const size_t writeSize = std::max<size_t>(1, windowSize / par.threads);
-        BatchWriter batchWriter(windowSize, par.threads, fileno(dataFiles[SEQUENCE_DATA]));
-        // a segment that starts in the window ends at most MAX_SEGMENT_SIZE behind it
-        char *window = NULL;
-        if (blocks.empty() == false || par.compressHeaders) {
-            window = new(std::nothrow) char[windowSize + MAX_SEGMENT_SIZE];
-            Util::checkAllocation(window, "Can not allocate window memory in createdb");
+    // append the row table in input split order
+    SORT_SERIAL(sentFlushes.begin(), sentFlushes.end(), SentFlush::compareByInputSplit);
+    std::vector<SentLengthRow> sentRows;
+    for (size_t i = 0; i < sentFlushes.size(); i++) {
+        for (size_t j = 0; j < sentFlushes[i].rows.size(); j++) {
+            SentLengthRow row = sentFlushes[i].rows[j];
+            row.flush = i;
+            sentRows.push_back(row);
         }
-        // --compress-headers: the headers are compressed in frames of frameSize as they are received, the frames of a window by parts of frames on all threads
-        const size_t frameSize = 1024 * 1024;
-        const size_t frameBound = ZSTD_compressBound(frameSize);
-        const std::string zstdFileName = dataFileNames[HEADER_DATA] + ".tmp";
-        FILE *zstdFile = NULL;
-        char *frames = NULL;
+    }
+    std::vector<SentFlush>().swap(sentFlushes);
+    SORT_SERIAL(sentRows.begin(), sentRows.end(), SentLengthRow::compareByLength);
+
+    // table offset, empty sequences, then count, header size and rows per length
+    std::string nodeLine = SSTR(exchangeBytes) + "\t" + SSTR(emptySequenceCount);
+    for (size_t i = 0, binEnd; i < sentRows.size(); i = binEnd) {
+        size_t sequenceCount = 0;
+        size_t headerBytes = 0;
+        for (binEnd = i; binEnd < sentRows.size() && sentRows[binEnd].length == sentRows[i].length; binEnd++) {
+            sequenceCount += sentRows[binEnd].sequenceCount;
+            headerBytes += sentRows[binEnd].headerBytes;
+        }
+        nodeLine += "\t" + SSTR(sentRows[i].length) + "\t" + SSTR(sequenceCount) + "\t" + SSTR(headerBytes) + "\t" + SSTR(binEnd - i);
+    }
+
+    if (fseeko(exchangeHandle, exchangeBytes, SEEK_SET) != 0
+        || fwrite(sentRows.data(), sizeof(SentLengthRow), sentRows.size(), exchangeHandle) != sentRows.size()) {
+        Debug(Debug::ERROR) << "Cannot write " << exchangeFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (fclose(exchangeHandle) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << exchangeFile << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (isSpooled == false) {
+        std::vector<SentLengthRow>().swap(sentRows);
+    }
+
+    std::string nodeLines = MMseqsNode::barrier(exchange + ".index", nodeLine + "\n");
+    MMseqsNode::addPhaseTime(phaseValues, "sending sequences", timer);
+
+    // every node computes the same layout
+    std::vector<size_t> tableOffsets(MMseqsNode::count);
+    std::vector<std::vector<LengthRangeLayout>> nodeHistograms(MMseqsNode::count);
+    std::vector<size_t> sequenceCount;
+    std::vector<size_t> headerBytes;
+    std::vector<std::vector<size_t>> nodeTableOffsets(MMseqsNode::count, std::vector<size_t>(1, 0));
+    size_t totalEmptyCount = 0;
+    char *nodeLinesChar = (char *) nodeLines.c_str();
+    for (unsigned int node = 0; node < MMseqsNode::count; node++) {
+        tableOffsets[node] = strtoull(nodeLinesChar, &nodeLinesChar, 10);
+        totalEmptyCount += strtoull(nodeLinesChar, &nodeLinesChar, 10);
+        while (*nodeLinesChar != '\n') {
+            LengthRangeLayout range = {0, 0, 0, 0, {}, 0};
+            range.length = strtoull(nodeLinesChar, &nodeLinesChar, 10);
+            range.sequenceCount = strtoull(nodeLinesChar, &nodeLinesChar, 10);
+            range.headerBytes = strtoull(nodeLinesChar, &nodeLinesChar, 10);
+            nodeHistograms[node].push_back(range);
+            if (range.length >= sequenceCount.size()) {
+                sequenceCount.resize(range.length + 1, 0);
+                headerBytes.resize(range.length + 1, 0);
+            }
+            sequenceCount[range.length] += range.sequenceCount;
+            headerBytes[range.length] += range.headerBytes;
+            nodeTableOffsets[node].push_back(nodeTableOffsets[node].back() + strtoull(nodeLinesChar, &nodeLinesChar, 10));
+        }
+        nodeLinesChar++;
+    }
+
+    if (totalEmptyCount > 0 && MMseqsNode::isMaster()) {
+        Debug(Debug::WARNING) << totalEmptyCount << " sequences without residues are skipped\n";
+    }
+
+    std::vector<LengthRangeLayout> globalHistogram;
+    for (size_t length = sequenceCount.size(); length-- > 0;) {
+        if (sequenceCount[length] > 0) {
+            LengthRangeLayout range = {length, sequenceCount[length], headerBytes[length], 0, {}, 0};
+            globalHistogram.push_back(range);
+        }
+    }
+
+    if (globalHistogram.empty()) {
+        if (MMseqsNode::isMaster()) {
+            Debug(Debug::ERROR) << "The input files have no entry: ";
+            for (size_t fileIdx = 0; fileIdx < filenames.size(); fileIdx++) {
+                Debug(Debug::ERROR) << " - " << filenames[fileIdx] << "\n";
+            }
+            Debug(Debug::ERROR) << "Please check your input files. Only files in fasta/fastq[.gz|bz2|zst] are supported\n";
+        }
+        EXIT(EXIT_FAILURE);
+    }
+
+    size_t key = 0;
+    size_t dataSize = 0;
+    std::vector<size_t> rangeBytes(globalHistogram.size());
+    size_t maxFileBytes = 0;
+    for (size_t i = 0; i < globalHistogram.size(); i++) {
+        globalHistogram[i].startKey = key;
+        key += globalHistogram[i].sequenceCount;
+        rangeBytes[i] = globalHistogram[i].sequenceCount * (globalHistogram[i].length + 2 + sizeof(uint64_t)) + globalHistogram[i].headerBytes;
+        dataSize += rangeBytes[i];
+        maxFileBytes = std::max(maxFileBytes, rangeBytes[i]);
+    }
+    // binary search the smallest largest file, lengths are never split
+    maxFileBytes = std::max(maxFileBytes, (dataSize + MMseqsNode::count - 1) / MMseqsNode::count);
+    for (size_t fittingFileBytes = dataSize; maxFileBytes < fittingFileBytes; ) {
+        size_t fileBytes = maxFileBytes + (fittingFileBytes - maxFileBytes) / 2;
+        size_t files = 1;
+        size_t fileFill = 0;
+        for (size_t i = 0; i < rangeBytes.size(); i++) {
+            if (fileFill + rangeBytes[i] > fileBytes) {
+                files++;
+                fileFill = 0;
+            }
+            fileFill += rangeBytes[i];
+        }
+        if (files <= MMseqsNode::count) {
+            fittingFileBytes = fileBytes;
+        } else {
+            maxFileBytes = fileBytes + 1;
+        }
+    }
+
+    std::vector<size_t> dataFileBytes(DATA_FILE_TYPE_COUNT * MMseqsNode::count, 0);
+    std::vector<LengthRangeLayout> nodeLengthRanges;
+    size_t file = 0;
+    size_t fileFill = 0;
+    std::string indexData;
+    for (size_t i = 0; i < globalHistogram.size(); i++) {
+        LengthRangeLayout &range = globalHistogram[i];
+        if (fileFill + rangeBytes[i] > maxFileBytes) {
+            file++;
+            fileFill = 0;
+        }
+        fileFill += rangeBytes[i];
+        range.file = file;
+        for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
+            range.offsets[fileType] = dataFileBytes[fileType * MMseqsNode::count + file];
+        }
+        dataFileBytes[SEQUENCE_DATA * MMseqsNode::count + file] += range.sequenceCount * (range.length + 2);
+        dataFileBytes[HEADER_DATA * MMseqsNode::count + file] += range.headerBytes;
+        dataFileBytes[HEADER_OFFSETS * MMseqsNode::count + file] += range.sequenceCount * sizeof(uint64_t);
+        if (MMseqsNode::isMaster()) {
+            indexData += SSTR(range.startKey) + "\t" + SSTR(range.offsets[SEQUENCE_DATA]) + "\t" + SSTR(range.length + 2) + "\t"
+                         + SSTR(range.sequenceCount) + "\t" + SSTR(range.file) + "\n";
+        }
+        if (range.file == MMseqsNode::rank) {
+            nodeLengthRanges.push_back(range);
+        }
+    }
+
+    if (MMseqsNode::isMaster()) {
+        std::string fileKeysText;
+        size_t fileFirstKey = 0;
+        for (size_t i = HEADER_OFFSETS * MMseqsNode::count; i < dataFileBytes.size(); i++) {
+            size_t fileKeyCount = dataFileBytes[i] / sizeof(uint64_t);
+            fileKeysText += SSTR(fileFirstKey) + "\t" + SSTR(fileKeyCount) + "\n";
+            fileFirstKey += fileKeyCount;
+        }
+        size_t freeSpace = FileUtil::getFreeSpace(FileUtil::dirName(dataFile).c_str());
+        if (freeSpace < dataSize) {
+            Debug(Debug::ERROR) << FileUtil::dirName(dataFile) << " needs at least " << dataSize << " free bytes for the sequences of " << dataFile << ", but has " << freeSpace << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        MMseqsNode::publishFile(dataFile + ".index", indexData);
+        MMseqsNode::publishFile(dataFile + ".file_keys", fileKeysText);
+    }
+
+    // resize early to fail on file size limits
+    size_t headerDataBytes = dataFileBytes[HEADER_DATA * MMseqsNode::count + MMseqsNode::rank];
+    for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
+        size_t dataBytes = dataFileBytes[fileType * MMseqsNode::count + MMseqsNode::rank];
+        size_t truncatedSize = dataBytes + ((fileType == HEADER_OFFSETS) ? sizeof(uint64_t) : 0);
+        if (ftruncate(fileno(dataFiles[fileType]), truncatedSize) != 0) {
+            Debug(Debug::ERROR) << "Cannot resize " << dataFileNames[fileType] << " to " << truncatedSize << " bytes: " << strerror(errno) << ". Run on more nodes if the file system limits the file size\n";
+            EXIT(EXIT_FAILURE);
+        }
+        if (fileType == HEADER_OFFSETS) {
+            FileUtil::pwriteAll(fileno(dataFiles[fileType]), dataFileNames[fileType].c_str(), (const char *) &headerDataBytes, sizeof(uint64_t), dataBytes);
+        }
+    }
+
+    // a page needs one writer, so the owner writes every page that is not inside the run of one other node
+    size_t pageSize = Util::getPageSize();
+    std::vector<SequenceRun> sentRuns;
+    std::vector<SequenceRun> edgeRuns;
+    std::vector<size_t> lengthSentOffsets(isSpooled ? sequenceCount.size() : 0, 0);
+    size_t sentSequenceSize = 0;
+    size_t edgeSize = 0;
+    if (isSpooled) {
+        std::vector<size_t> rangeOffsets(globalHistogram.size());
+        for (size_t i = 0; i < globalHistogram.size(); i++) {
+            rangeOffsets[i] = globalHistogram[i].offsets[SEQUENCE_DATA];
+        }
+        std::vector<SequenceRun> nodeRuns;
+        for (unsigned int node = 0; node < MMseqsNode::count; node++) {
+            nodeRuns.clear();
+            for (size_t i = 0, range = 0; i < nodeHistograms[node].size(); i++) {
+                const LengthRangeLayout &bin = nodeHistograms[node][i];
+                while (globalHistogram[range].length != bin.length) {
+                    range++;
+                }
+                size_t start = rangeOffsets[range];
+                rangeOffsets[range] += bin.sequenceCount * (bin.length + 2);
+                if (node == MMseqsNode::rank) {
+                    lengthSentOffsets[bin.length] = sentSequenceSize;
+                    sentSequenceSize += bin.sequenceCount * (bin.length + 2);
+                }
+                if (nodeRuns.empty() == false && nodeRuns.back().file == globalHistogram[range].file && nodeRuns.back().end == start) {
+                    nodeRuns.back().end = rangeOffsets[range];
+                } else {
+                    SequenceRun run = {node, globalHistogram[range].file, start, rangeOffsets[range], 0, 0, 0, (node == MMseqsNode::rank) ? lengthSentOffsets[bin.length] : 0};
+                    nodeRuns.push_back(run);
+                }
+            }
+            size_t nodeEdgeSize = 0;
+            for (size_t i = 0; i < nodeRuns.size(); i++) {
+                SequenceRun &run = nodeRuns[i];
+                run.directStart = run.start;
+                run.directEnd = run.end;
+                if (run.node != run.file) {
+                    run.directStart = std::min((run.start + pageSize - 1) / pageSize * pageSize, run.end);
+                    run.directEnd = std::max(run.end / pageSize * pageSize, run.directStart);
+                }
+                run.edgeOffset = nodeEdgeSize;
+                nodeEdgeSize += (run.directStart - run.start) + (run.end - run.directEnd);
+                if (node == MMseqsNode::rank) {
+                    sentRuns.push_back(run);
+                } else if (run.file == MMseqsNode::rank) {
+                    edgeRuns.push_back(run);
+                }
+            }
+            if (node == MMseqsNode::rank) {
+                edgeSize = nodeEdgeSize;
+            }
+        }
+    }
+
+    // receive the compression units of this node
+    double compressSeconds = 0;
+    std::string tmpHeaderName = dataFileNames[HEADER_DATA] + ".tmp";
+    {
+        std::vector<FILE *> exchangeFiles(MMseqsNode::count, NULL);
+        std::vector<std::vector<SentLengthRow> > nodeSentRows(MMseqsNode::count);
+        if (nodeLengthRanges.empty() == false) {
+#pragma omp parallel for schedule(dynamic, 1)
+            for (size_t node = 0; node < MMseqsNode::count; node++) {
+                const std::vector<LengthRangeLayout> &histogram = nodeHistograms[node];
+                size_t firstLength = std::lower_bound(histogram.begin(), histogram.end(), nodeLengthRanges.front().length, isLongerRange) - histogram.begin();
+                size_t lastLength = std::lower_bound(histogram.begin(), histogram.end(), nodeLengthRanges.back().length - 1, isLongerRange) - histogram.begin();
+                size_t firstRow = nodeTableOffsets[node][firstLength];
+                size_t lastRow = nodeTableOffsets[node][lastLength];
+                if (firstRow == lastRow) {
+                    continue;
+                }
+                std::string file = exchange + "." + SSTR(node);
+                // r+ to punch read bytes
+                exchangeFiles[node] = FileUtil::openFileOrDie(file.c_str(), "r+", true);
+                nodeSentRows[node].resize(lastRow - firstRow);
+                FileUtil::preadAll(fileno(exchangeFiles[node]), file.c_str(), (char *) nodeSentRows[node].data(),
+                                   nodeSentRows[node].size() * sizeof(SentLengthRow), tableOffsets[node] + firstRow * sizeof(SentLengthRow));
+                SORT_SERIAL(nodeSentRows[node].begin(), nodeSentRows[node].end(), SentLengthRow::compareByFlush);
+            }
+        }
+
+        // one reader per flush and data file type
+        std::vector<LengthRangeLayout> lengthStarts(nodeLengthRanges.empty() ? 0 : nodeLengthRanges[0].length + 1);
+        for (size_t i = 0; i < nodeLengthRanges.size(); i++) {
+            lengthStarts[nodeLengthRanges[i].length] = nodeLengthRanges[i];
+        }
+
+        std::vector<std::vector<MMseqsNode::ExchangeReader> > readers(DATA_FILE_TYPE_COUNT);
+        std::vector<std::vector<std::vector<std::pair<size_t, size_t> > > > readerLengthOffsets(DATA_FILE_TYPE_COUNT);
+        std::vector<std::pair<size_t, size_t> > rowHeaderStarts;
+        size_t receivedRowCount = 0;
+        size_t ownBytes = 0;
+        for (size_t node = 0; node < MMseqsNode::count; node++) {
+            const std::vector<SentLengthRow> &rows = nodeSentRows[node];
+            for (size_t i = 0; i < rows.size(); i++) {
+                LengthRangeLayout &start = lengthStarts[rows[i].length];
+                bool isFlushStart = i == 0 || rows[i - 1].flush != rows[i].flush;
+                for (size_t fileType = isSpooled ? HEADER_DATA : SEQUENCE_DATA; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
+                    if (isFlushStart) {
+                        MMseqsNode::ExchangeReader reader = { exchangeFiles[node], rows[i].starts[fileType], rows[i].ends[fileType],
+                                                               std::vector<char>(), 0, 0, 0, 0, NULL, rows[i].starts[fileType] };
+                        readers[fileType].push_back(reader);
+                        readerLengthOffsets[fileType].push_back(std::vector<std::pair<size_t, size_t> >());
+                    }
+                    readers[fileType].back().end = rows[i].ends[fileType];
+                    readerLengthOffsets[fileType].back().push_back(std::make_pair(rows[i].length, start.offsets[fileType]));
+                    ownBytes += (node == MMseqsNode::rank) ? rows[i].ends[fileType] - rows[i].starts[fileType] : 0;
+                }
+                rowHeaderStarts.push_back(std::make_pair(start.offsets[HEADER_OFFSETS], start.offsets[HEADER_DATA]));
+                start.offsets[SEQUENCE_DATA] += rows[i].sequenceCount * (rows[i].length + 2);
+                start.offsets[HEADER_DATA] += rows[i].headerBytes;
+                start.offsets[HEADER_OFFSETS] += rows[i].sequenceCount * sizeof(uint64_t);
+            }
+            receivedRowCount += rows.size();
+            std::vector<SentLengthRow>().swap(nodeSentRows[node]);
+        }
+
+        // read the spool in the order of the receiving nodes
+        SORT_SERIAL(sentRows.begin(), sentRows.end(), SentLengthRow::compareByFlush);
+        for (size_t i = 0; i < sentRows.size(); i++) {
+            if (i == 0 || sentRows[i - 1].flush != sentRows[i].flush) {
+                MMseqsNode::ExchangeReader reader = { spoolHandle, sentRows[i].starts[SEQUENCE_DATA], sentRows[i].ends[SEQUENCE_DATA],
+                                                       std::vector<char>(), 0, 0, 0, 0, NULL, sentRows[i].starts[SEQUENCE_DATA] };
+                readers[SEQUENCE_DATA].push_back(reader);
+                readerLengthOffsets[SEQUENCE_DATA].push_back(std::vector<std::pair<size_t, size_t> >());
+            }
+            readers[SEQUENCE_DATA].back().end = sentRows[i].ends[SEQUENCE_DATA];
+            readerLengthOffsets[SEQUENCE_DATA].back().push_back(std::make_pair(sentRows[i].length, lengthSentOffsets[sentRows[i].length]));
+            lengthSentOffsets[sentRows[i].length] += sentRows[i].sequenceCount * (sentRows[i].length + 2);
+        }
+        receivedRowCount += sentRows.size();
+        std::vector<SentLengthRow>().swap(sentRows);
+
+        MMseqsNode::addSentExchangeBytes(exchangeBytes, exchangeBytes - ownBytes);
+        SORT_SERIAL(rowHeaderStarts.begin(), rowHeaderStarts.end());
+
+        // half for reader buffers, an eighth for writes
+        size_t rowSize = sizeof(SentLengthRow) + (DATA_FILE_TYPE_COUNT + 1) * sizeof(std::pair<size_t, size_t>);
+        if (receivedRowCount * rowSize >= static_cast<size_t>(memoryLimit * 0.95)) {
+            Debug(Debug::ERROR) << "createdb needs more than " << receivedRowCount * rowSize << " bytes of memory for the " << receivedRowCount << " received length rows, but has " << static_cast<size_t>(memoryLimit * 0.95) << ". Run on more nodes or with more memory\n";
+            EXIT(EXIT_FAILURE);
+        }
+        size_t receiveMemory = static_cast<size_t>(memoryLimit * 0.95) - receivedRowCount * rowSize;
+        size_t readerBufferSize = receiveMemory / 2;
+        size_t writeBufferSize = receiveMemory / 8;
+        size_t frameSize = 1024 * 1024;
+        if (par.compressHeaders && writeBufferSize < std::min(frameSize, headerDataBytes)) {
+            Debug(Debug::ERROR) << "Not enough memory to compress the headers. The write buffer needs " << std::min(frameSize, headerDataBytes)
+                                << " bytes, it has " << writeBufferSize << ". Raise --split-memory-limit.\n";
+            EXIT(EXIT_FAILURE);
+        }
+        size_t threadWriteSize = std::max((size_t) 1, writeBufferSize / par.threads);
+        BatchWriter batchWriter(writeBufferSize, par.threads, fileno(dataFiles[SEQUENCE_DATA]));
+
+        char *writeBuffer = NULL;
+        if (readers[SEQUENCE_DATA].empty() == false || readers[HEADER_DATA].empty() == false || par.compressHeaders) {
+            writeBuffer = new(std::nothrow) char[writeBufferSize + MAX_UNIT_SIZE];
+            Util::checkAllocation(writeBuffer, "Can not allocate write buffer memory in createdb");
+        }
+
+        // --compress-headers
+        size_t maxCompressedSize = ZSTD_compressBound(frameSize);
+        FILE *tmpHeaderFile = NULL;
+        char *compressedFrames = NULL;
         std::vector<uint32_t> seekTable;
         size_t compressedBytes = 0;
         if (par.compressHeaders) {
-            zstdFile = FileUtil::openAndDelete(zstdFileName.c_str(), "w");
-            frames = new(std::nothrow) char[((windowSize + MAX_SEGMENT_SIZE) / frameSize + 1) * frameBound];
-            Util::checkAllocation(frames, "Can not allocate frame memory in createdb");
+            tmpHeaderFile = FileUtil::openAndDelete(tmpHeaderName.c_str(), "w");
+            compressedFrames = new(std::nothrow) char[((writeBufferSize + MAX_UNIT_SIZE) / frameSize + 1) * maxCompressedSize];
+            Util::checkAllocation(compressedFrames, "Can not allocate frame memory in createdb");
         }
-        std::vector<std::pair<size_t, size_t> > segments;
+
+        std::vector<int> sequenceFds(MMseqsNode::count, -1);
+        std::vector<std::string> sequenceFileNames(MMseqsNode::count);
+        std::string edgeFile = edges + "." + SSTR(MMseqsNode::rank);
+        FILE *edgeHandle = isSpooled ? FileUtil::openAndDelete(edgeFile.c_str(), "w") : NULL;
+        for (size_t i = 0; i < sentRuns.size(); i++) {
+            size_t file = sentRuns[i].file;
+            if (sequenceFds[file] != -1) {
+                continue;
+            }
+            sequenceFileNames[file] = dataFile + "." + SSTR(file);
+            // write only, NFS may read partial pages of files open for reading
+            sequenceFds[file] = (file == MMseqsNode::rank) ? fileno(dataFiles[SEQUENCE_DATA]) : open(sequenceFileNames[file].c_str(), O_WRONLY | O_CLOEXEC);
+            if (sequenceFds[file] < 0) {
+                Debug(Debug::ERROR) << "Cannot open " << sequenceFileNames[file] << " for writing: " << strerror(errno) << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+
+        std::vector<std::pair<size_t, size_t> > compressionUnits;
         std::vector<std::pair<size_t, size_t> > writes;
-        for (size_t fileType = 0; fileType < DATA_FILE_TYPES; fileType++) {
-            // the window holds the bytes from windowBegin to windowFill
-            size_t windowFill = 0;
-            for (size_t windowBegin = 0; windowBegin != SIZE_MAX; ) {
-                segments.clear();
-                const size_t nextOffset = MMseqsNode::readExchangeSegments(blocks, blockMemory, MAX_SEGMENT_SIZE, fileType, windowBegin, windowBegin + windowSize, window, segments, exchange);
-                SORT_SERIAL(segments.begin(), segments.end());
+        size_t outputBytes = 0;
+        for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
+            outputBytes += (isSpooled && fileType == SEQUENCE_DATA) ? sentSequenceSize : dataFileBytes[fileType * MMseqsNode::count + MMseqsNode::rank];
+        }
+        size_t writtenBytes = 0;
+        for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
+            size_t fileTypeBegin = writtenBytes;
+            size_t fileTypeBytes = (isSpooled && fileType == SEQUENCE_DATA) ? sentSequenceSize : dataFileBytes[fileType * MMseqsNode::count + MMseqsNode::rank];
+            bool isCompressedHeader = par.compressHeaders && fileType == HEADER_DATA;
+            for (size_t writeBufferBegin = 0; writeBufferBegin != SIZE_MAX; ) {
+                compressionUnits.clear();
+                size_t nextOffset = MMseqsNode::readExchangeCompressionUnits(readers[fileType], readerLengthOffsets[fileType], readerBufferSize, MAX_UNIT_SIZE,
+                                                                             writeBufferBegin, writeBufferBegin + writeBufferSize, writeBuffer, isCompressedHeader ? NULL : &compressionUnits, exchange);
+                if (fileType == HEADER_OFFSETS) {
+#pragma omp parallel for schedule(dynamic, 1)
+                    for (size_t i = 0; i < compressionUnits.size(); i++) {
+                        std::pair<size_t, size_t> unitStart = std::make_pair(compressionUnits[i].first, SIZE_MAX);
+                        uint64_t headerStart = (std::upper_bound(rowHeaderStarts.begin(), rowHeaderStarts.end(), unitStart) - 1)->second;
+                        uint64_t *headerOffsets = (uint64_t *) (writeBuffer + (compressionUnits[i].first - writeBufferBegin));
+                        for (size_t j = 0; j < compressionUnits[i].second / sizeof(uint64_t); j++) {
+                            headerOffsets[j] += headerStart;
+                        }
+                    }
+                }
                 writes.clear();
-                if (par.compressHeaders && fileType == HEADER_DATA) {
+                if (isCompressedHeader) {
                     Timer compressTimer;
-                    // the bytes of this node between the segments were written while sending and are read back
-                    const size_t windowEnd = std::min(std::min(nextOffset, dataFileSizes[HEADER_DATA]), windowBegin + windowSize + MAX_SEGMENT_SIZE);
-                    for (size_t i = 0, pos = windowFill; i <= segments.size(); i++) {
-                        const size_t readEnd = (i < segments.size()) ? segments[i].first : windowEnd;
-                        for (; pos < readEnd; pos += writes.back().second) {
-                            writes.push_back(std::make_pair(pos, std::min(writeSize, readEnd - pos)));
-                        }
-                        pos = (i < segments.size()) ? segments[i].first + segments[i].second : pos;
-                    }
-#pragma omp parallel for schedule(dynamic, 1)
-                    for (size_t i = 0; i < writes.size(); i++) {
-                        FileUtil::preadAll(fileno(dataFiles[HEADER_DATA]), dataFileNames[HEADER_DATA].c_str(), window + (writes[i].first - windowBegin), writes[i].second, writes[i].first);
-                    }
-                    // the frames up to the last whole one are compressed, the rest is carried to the next window
-                    const size_t frameEnd = (windowEnd == dataFileSizes[HEADER_DATA]) ? windowEnd : windowEnd - windowEnd % frameSize;
-                    const size_t frameCount = (frameEnd - windowBegin + frameSize - 1) / frameSize;
-                    const size_t partFrames = std::max<size_t>(1, (frameCount + par.threads - 1) / par.threads);
-                    const size_t partCount = (frameCount + partFrames - 1) / partFrames;
-                    const size_t firstFrame = seekTable.size() / 2;
+                    size_t writeBufferEnd = std::min(nextOffset, headerDataBytes);
+                    // carry the last partial frame to the next write buffer
+                    size_t frameEnd = (writeBufferEnd == headerDataBytes) ? writeBufferEnd : writeBufferEnd - writeBufferEnd % frameSize;
+                    size_t frameCount = (frameEnd - writeBufferBegin + frameSize - 1) / frameSize;
+                    size_t framesPerTask = std::max((size_t) 1, (frameCount + par.threads - 1) / par.threads);
+                    size_t taskCount = (frameCount + framesPerTask - 1) / framesPerTask;
+                    size_t firstFrame = seekTable.size() / 2;
                     seekTable.resize(seekTable.size() + 2 * frameCount);
-                    std::vector<size_t> partOffsets(partCount + 1, 0);
-#pragma omp parallel for schedule(dynamic, 1)
-                    for (size_t part = 0; part < partCount; part++) {
-                        for (size_t frame = part * partFrames; frame < std::min(frameCount, (part + 1) * partFrames); frame++) {
-                            const size_t size = std::min(frameSize, frameEnd - windowBegin - frame * frameSize);
-                            const size_t compressedSize = ZSTD_compress(frames + part * partFrames * frameBound + partOffsets[part + 1], frameBound, window + frame * frameSize, size, 3);
-                            if (ZSTD_isError(compressedSize)) {
-                                Debug(Debug::ERROR) << "ZSTD_compress " << ZSTD_getErrorName(compressedSize) << "\n";
-                                EXIT(EXIT_FAILURE);
-                            }
-                            seekTable[2 * (firstFrame + frame)] = compressedSize;
-                            seekTable[2 * (firstFrame + frame) + 1] = size;
-                            partOffsets[part + 1] += compressedSize;
+                    std::vector<size_t> frameTaskOffsets(taskCount + 1, 0);
+#pragma omp parallel
+                    {
+                        ZSTD_CCtx *cctx = ZSTD_createCCtx();
+                        if (cctx == NULL) {
+                            Debug(Debug::ERROR) << "ZSTD_createCCtx() error\n";
+                            EXIT(EXIT_FAILURE);
                         }
+#pragma omp for schedule(dynamic, 1)
+                        for (size_t task = 0; task < taskCount; task++) {
+                            for (size_t frame = task * framesPerTask; frame < std::min(frameCount, (task + 1) * framesPerTask); frame++) {
+                                size_t size = std::min(frameSize, frameEnd - writeBufferBegin - frame * frameSize);
+                                char *compressedFrame = compressedFrames + task * framesPerTask * maxCompressedSize + frameTaskOffsets[task + 1];
+                                size_t compressedSize = ZSTD_compressCCtx(cctx, compressedFrame, maxCompressedSize, writeBuffer + frame * frameSize, size, 3);
+                                if (ZSTD_isError(compressedSize)) {
+                                    Debug(Debug::ERROR) << "ZSTD_compress " << ZSTD_getErrorName(compressedSize) << "\n";
+                                    EXIT(EXIT_FAILURE);
+                                }
+                                seekTable[2 * (firstFrame + frame)] = compressedSize;
+                                seekTable[2 * (firstFrame + frame) + 1] = size;
+                                frameTaskOffsets[task + 1] += compressedSize;
+                            }
+                        }
+                        ZSTD_freeCCtx(cctx);
                     }
-                    for (size_t part = 0; part < partCount; part++) {
-                        partOffsets[part + 1] += partOffsets[part];
+                    for (size_t task = 0; task < taskCount; task++) {
+                        frameTaskOffsets[task + 1] += frameTaskOffsets[task];
                     }
 #pragma omp parallel for schedule(dynamic, 1)
-                    for (size_t part = 0; part < partCount; part++) {
-                        batchWriter.write(fileno(zstdFile), zstdFileName.c_str(), frames + part * partFrames * frameBound, partOffsets[part + 1] - partOffsets[part], compressedBytes + partOffsets[part]);
+                    for (size_t task = 0; task < taskCount; task++) {
+                        batchWriter.write(fileno(tmpHeaderFile), tmpHeaderName.c_str(), compressedFrames + task * framesPerTask * maxCompressedSize,
+                                          frameTaskOffsets[task + 1] - frameTaskOffsets[task], compressedBytes + frameTaskOffsets[task]);
                     }
-                    compressedBytes += partOffsets.back();
-                    memmove(window, window + (frameEnd - windowBegin), windowEnd - frameEnd);
-                    windowFill = windowEnd;
-                    windowBegin = (frameEnd == dataFileSizes[HEADER_DATA]) ? SIZE_MAX : frameEnd;
+                    compressedBytes += frameTaskOffsets.back();
+                    memmove(writeBuffer, writeBuffer + (frameEnd - writeBufferBegin), writeBufferEnd - frameEnd);
+                    writeBufferBegin = (frameEnd == headerDataBytes) ? SIZE_MAX : frameEnd;
                     compressSeconds += compressTimer.getTimediff();
                 } else {
-                    // segments that follow each other are written at once, the bytes of this node between them were written while sending
-                    for (size_t i = 0; i < segments.size(); i++) {
-                        if (writes.empty() == false && writes.back().first + writes.back().second == segments[i].first && writes.back().second + segments[i].second <= writeSize) {
-                            writes.back().second += segments[i].second;
+                    SORT_SERIAL(compressionUnits.begin(), compressionUnits.end());
+                    // merge adjacent compression units
+                    for (size_t i = 0; i < compressionUnits.size(); i++) {
+                        if (writes.empty() == false && writes.back().first + writes.back().second == compressionUnits[i].first
+                            && writes.back().second + compressionUnits[i].second <= threadWriteSize) {
+                            writes.back().second += compressionUnits[i].second;
                         } else {
-                            writes.push_back(segments[i]);
+                            writes.push_back(compressionUnits[i]);
                         }
                     }
 #pragma omp parallel for schedule(dynamic, 1)
                     for (size_t i = 0; i < writes.size(); i++) {
-                        batchWriter.write(fileno(dataFiles[fileType]), dataFileNames[fileType].c_str(), window + (writes[i].first - windowBegin), writes[i].second, writes[i].first);
+                        const char *data = writeBuffer + (writes[i].first - writeBufferBegin);
+                        if (isSpooled == false || fileType != SEQUENCE_DATA) {
+                            batchWriter.write(fileno(dataFiles[fileType]), dataFileNames[fileType].c_str(), data, writes[i].second, writes[i].first);
+                            continue;
+                        }
+                        // blocks inside a run go to db.<file>, its edges to the owner
+                        for (size_t pos = writes[i].first, end = pos + writes[i].second; pos < end; ) {
+                            const SequenceRun &run = *(std::upper_bound(sentRuns.begin(), sentRuns.end(), pos, isBeforeRun) - 1);
+                            size_t from = run.start + (pos - run.sentOffset);
+                            size_t to = std::min(run.end, run.start + (end - run.sentOffset));
+                            const char *fromData = data + (pos - writes[i].first);
+                            size_t headEnd = std::min(to, run.directStart);
+                            size_t directStart = std::max(from, run.directStart);
+                            size_t directEnd = std::min(to, run.directEnd);
+                            size_t tailStart = std::max(from, run.directEnd);
+                            if (from < headEnd) {
+                                batchWriter.write(fileno(edgeHandle), edgeFile.c_str(), fromData, headEnd - from, run.edgeOffset + (from - run.start));
+                            }
+                            if (directStart < directEnd) {
+                                batchWriter.write(sequenceFds[run.file], sequenceFileNames[run.file].c_str(), fromData + (directStart - from), directEnd - directStart, directStart);
+                            }
+                            if (tailStart < to) {
+                                batchWriter.write(fileno(edgeHandle), edgeFile.c_str(), fromData + (tailStart - from), to - tailStart, run.edgeOffset + (run.directStart - run.start) + (tailStart - run.directEnd));
+                            }
+                            pos += to - from;
+                        }
                     }
-                    windowBegin = nextOffset;
+                    writeBufferBegin = nextOffset;
+                }
+                size_t writtenEnd = fileTypeBegin + std::min(writeBufferBegin, fileTypeBytes);
+                printProgress("the database written", writtenBytes, writtenEnd, outputBytes, timer);
+                writtenBytes = writtenEnd;
+            }
+        }
+
+        Timer writeCompletionTimer;
+        batchWriter.waitWrites();
+        MMseqsNode::addPhaseTime(phaseValues, "writing sequences: waiting for writes", writeCompletionTimer);
+        Util::releasePages(writeBuffer, writeBufferSize + MAX_UNIT_SIZE);
+        delete[] writeBuffer;
+        MMseqsNode::closeExchangeFiles(exchangeFiles, exchange);
+        MMseqsNode::addPhaseTime(phaseValues, "writing sequences: releasing exchange files", writeCompletionTimer);
+
+        if (isSpooled) {
+            for (unsigned int file = 0; file < MMseqsNode::count; file++) {
+                if (sequenceFds[file] != -1 && file != MMseqsNode::rank && close(sequenceFds[file]) != 0) {
+                    Debug(Debug::ERROR) << "Cannot close " << sequenceFileNames[file] << "\n";
+                    EXIT(EXIT_FAILURE);
                 }
             }
+            if (fclose(edgeHandle) != 0 || fclose(spoolHandle) != 0) {
+                Debug(Debug::ERROR) << "Cannot close " << edgeFile << " or " << spoolFile << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+            MMseqsNode::addPhaseTime(phaseValues, "writing sequences: closing sequence files", writeCompletionTimer);
+            MMseqsNode::addSentExchangeBytes(edgeSize, edgeSize);
+            MMseqsNode::barrier(edges + ".index");
+            MMseqsNode::addPhaseTime(phaseValues, "writing sequences: waiting for sequence edges", writeCompletionTimer);
+            FileUtil::remove(exchangeFile.c_str());
+
+            // write the edges of the runs of other nodes, one read per node and chunk
+            size_t chunkSize = std::max(2 * pageSize, writeBufferSize / par.threads);
+            std::vector<size_t> chunkOffsets(1, 0);
+            std::vector<FILE *> edgeFiles(MMseqsNode::count, NULL);
+            for (size_t i = 0; i < edgeRuns.size(); i++) {
+                const SequenceRun &first = edgeRuns[chunkOffsets.back()];
+                if (i + 1 == edgeRuns.size() || edgeRuns[i + 1].node != first.node || edgeRuns[i + 1].edgeOffset - first.edgeOffset >= chunkSize) {
+                    chunkOffsets.push_back(i + 1);
+                }
+                if (edgeFiles[edgeRuns[i].node] == NULL) {
+                    edgeFiles[edgeRuns[i].node] = FileUtil::openFileOrDie((edges + "." + SSTR(edgeRuns[i].node)).c_str(), "r", true);
+                }
+            }
+            size_t chunkCount = chunkOffsets.size() - 1;
+#pragma omp parallel
+            {
+                std::vector<char> edgeBuffer;
+#pragma omp for schedule(dynamic, 1)
+                for (size_t chunk = 0; chunk < chunkCount; chunk++) {
+                    const SequenceRun &first = edgeRuns[chunkOffsets[chunk]];
+                    const SequenceRun &last = edgeRuns[chunkOffsets[chunk + 1] - 1];
+                    size_t size = last.edgeOffset + (last.directStart - last.start) + (last.end - last.directEnd) - first.edgeOffset;
+                    edgeBuffer.resize(size);
+                    FileUtil::preadAll(fileno(edgeFiles[first.node]), edges.c_str(), edgeBuffer.data(), size, first.edgeOffset);
+                    for (size_t i = chunkOffsets[chunk]; i < chunkOffsets[chunk + 1]; i++) {
+                        const SequenceRun &run = edgeRuns[i];
+                        const char *data = edgeBuffer.data() + (run.edgeOffset - first.edgeOffset);
+                        FileUtil::pwriteAll(fileno(dataFiles[SEQUENCE_DATA]), dataFileNames[SEQUENCE_DATA].c_str(), data, run.directStart - run.start, run.start);
+                        FileUtil::pwriteAll(fileno(dataFiles[SEQUENCE_DATA]), dataFileNames[SEQUENCE_DATA].c_str(), data + (run.directStart - run.start), run.end - run.directEnd, run.directEnd);
+                    }
+                }
+            }
+            MMseqsNode::closeExchangeFiles(edgeFiles, edges);
+            MMseqsNode::addPhaseTime(phaseValues, "writing sequences: writing sequence edges", writeCompletionTimer);
         }
-        batchWriter.waitWrites();
-        Util::releasePages(window, windowSize + MAX_SEGMENT_SIZE);
-        delete[] window;
-        MMseqsNode::closeExchangeFiles(exchangeFiles, exchange);
+
         if (par.compressHeaders) {
-            delete[] frames;
-            const uint32_t skippableHeader[2] = {ZSTD_MAGIC_SKIPPABLE_START | 0xE, static_cast<uint32_t>(seekTable.size() * sizeof(uint32_t) + ZSTD_seekTableFooterSize)};
-            const uint32_t footerFrames = seekTable.size() / 2;
-            const char footerDescriptor = 0;
-            const uint32_t footerMagic = ZSTD_SEEKABLE_MAGICNUMBER;
-            if (fseeko(zstdFile, compressedBytes, SEEK_SET) != 0
-                || fwrite(skippableHeader, sizeof(uint32_t), 2, zstdFile) != 2
-                || fwrite(seekTable.data(), sizeof(uint32_t), seekTable.size(), zstdFile) != seekTable.size()
-                || fwrite(&footerFrames, sizeof(uint32_t), 1, zstdFile) != 1
-                || fwrite(&footerDescriptor, sizeof(char), 1, zstdFile) != 1
-                || fwrite(&footerMagic, sizeof(uint32_t), 1, zstdFile) != 1) {
-                Debug(Debug::ERROR) << "Can not write to data file " << zstdFileName << "\n";
+            delete[] compressedFrames;
+            uint32_t skippableHeader[2] = {ZSTD_MAGIC_SKIPPABLE_START | 0xE, static_cast<uint32_t>(seekTable.size() * sizeof(uint32_t) + ZSTD_seekTableFooterSize)};
+            uint32_t footerFrames = seekTable.size() / 2;
+            char footerDescriptor = 0;
+            uint32_t footerMagic = ZSTD_SEEKABLE_MAGICNUMBER;
+            if (fseeko(tmpHeaderFile, compressedBytes, SEEK_SET) != 0
+                || fwrite(skippableHeader, sizeof(uint32_t), 2, tmpHeaderFile) != 2
+                || fwrite(seekTable.data(), sizeof(uint32_t), seekTable.size(), tmpHeaderFile) != seekTable.size()
+                || fwrite(&footerFrames, sizeof(uint32_t), 1, tmpHeaderFile) != 1
+                || fwrite(&footerDescriptor, sizeof(char), 1, tmpHeaderFile) != 1
+                || fwrite(&footerMagic, sizeof(uint32_t), 1, tmpHeaderFile) != 1) {
+                Debug(Debug::ERROR) << "Can not write to data file " << tmpHeaderName << "\n";
                 EXIT(EXIT_FAILURE);
             }
-            if (fclose(zstdFile) != 0) {
-                Debug(Debug::ERROR) << "Cannot close data file " << zstdFileName << "\n";
+            if (fclose(tmpHeaderFile) != 0) {
+                Debug(Debug::ERROR) << "Cannot close data file " << tmpHeaderName << "\n";
                 EXIT(EXIT_FAILURE);
             }
+            MMseqsNode::addPhaseTime(phaseValues, "writing sequences: closing headers", writeCompletionTimer);
         }
     }
-    const size_t writtenBytes = dataFileSizes[SEQUENCE_DATA] + dataFileSizes[HEADER_DATA] + dataFileSizes[HEADER_OFFSETS];
+
+    Timer closeTimer;
 #pragma omp parallel for schedule(dynamic, 1)
-    for (size_t i = 0; i < DATA_FILE_TYPES; i++) {
+    for (size_t i = 0; i < DATA_FILE_TYPE_COUNT; i++) {
         if (fclose(dataFiles[i]) != 0) {
             Debug(Debug::ERROR) << "Cannot close data file " << dataFileNames[i] << "\n";
             EXIT(EXIT_FAILURE);
         }
     }
+    MMseqsNode::addPhaseTime(phaseValues, "writing sequences: closing database files", closeTimer);
+
     if (par.compressHeaders) {
-        FileUtil::move((dataFileNames[HEADER_DATA] + ".tmp").c_str(), dataFileNames[HEADER_DATA].c_str());
-        MMseqsNode::addPhaseSeconds(phaseValues, "compressing the headers", compressSeconds);
+        FileUtil::move(tmpHeaderName.c_str(), dataFileNames[HEADER_DATA].c_str());
+        MMseqsNode::addPhaseSeconds(phaseValues, "compressing headers", compressSeconds);
     }
-    MMseqsNode::addPhaseSeconds(phaseValues, "writing the sequences", timer.getTimediff() - compressSeconds);
-    MMseqsNode::addPhaseValue(phaseValues, "Bytes written", SSTR(writtenBytes));
-    MMseqsNode::removeExchanges(dataFile, exchange, std::vector<std::string>(1, exchange), phaseValues);
+    MMseqsNode::addPhaseSeconds(phaseValues, "writing sequences", timer.getTimediff() - compressSeconds);
+    std::vector<std::string> exchanges;
+    exchanges.push_back(exchange);
+    if (isSpooled) {
+        exchanges.push_back(edges);
+    }
+    MMseqsNode::removeExchanges(dataFile, exchanges.back(), exchanges, phaseValues);
+
     if (MMseqsNode::isMaster()) {
+        FileUtil::remove((dataFile + ".local_tmp").c_str());
         std::string sourceData;
         for (size_t i = 0; i < filenames.size(); i++) {
             sourceData += SSTR(i) + "\t" + FileUtil::baseName(filenames[i]) + "\n";
         }
         MMseqsNode::publishFile(dataFile + ".source", sourceData);
-        DBWriter::writeDbtypeFile((dataFile + "_h").c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_GENERIC_DB, Parameters::DBTYPE_EXTENDED_LINFINITY), par.compressHeaders);
-        const int dbType = DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, Parameters::DBTYPE_EXTENDED_LINFINITY);
+        int headerDbType = DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_GENERIC_DB, Parameters::DBTYPE_EXTENDED_LINFINITY);
+        DBWriter::writeDbtypeFile((dataFile + "_h").c_str(), headerDbType, par.compressHeaders);
+        int dbType = DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, Parameters::DBTYPE_EXTENDED_LINFINITY);
         DBWriter::writeDbtypeFile(dataFile.c_str(), dbType, false);
         Debug(Debug::INFO) << "Database type: " << Parameters::getDbTypeName(dbType) << "\n";
     }
@@ -1132,10 +1497,13 @@ int createdb(int argc, const char **argv, const Command& command) {
         return FileUtil::baseName(a) < FileUtil::baseName(b);
     });
     
-    for (size_t i = 0; i < filenames.size(); i++) {
-        if (FileUtil::directoryExists(filenames[i].c_str()) == true) {
-            Debug(Debug::ERROR) << "File " << filenames[i] << " is a directory\n";
-            EXIT(EXIT_FAILURE);
+    // one rank checks the input files
+    if (par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH || MMseqsNode::isMaster()) {
+        for (size_t i = 0; i < filenames.size(); i++) {
+            if (FileUtil::directoryExists(filenames[i].c_str()) == true) {
+                Debug(Debug::ERROR) << "File " << filenames[i] << " is a directory\n";
+                EXIT(EXIT_FAILURE);
+            }
         }
     }
 
@@ -1176,7 +1544,8 @@ int createdb(int argc, const char **argv, const Command& command) {
         par.shuffleDatabase = true;
     }
 
-    if ((par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT || par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) && par.filenames[0] == "stdin") {
+    if ((par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT || par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH)
+        && par.filenames[0] == "stdin") {
         if (MMseqsNode::count > 1) {
             Debug(Debug::ERROR) << "Stdin input cannot be combined with --createdb-mode " << par.createdbMode << " on multiple nodes\n";
             EXIT(EXIT_FAILURE);
@@ -1194,15 +1563,18 @@ int createdb(int argc, const char **argv, const Command& command) {
     }
 
     const unsigned int shuffleSplits = par.shuffleDatabase ? 32 : 1;
-    if ((par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT || par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) && par.compressed) {
+    if ((par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT || par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH)
+        && par.compressed) {
         Debug(Debug::WARNING) << "Compressed database cannot be combined with --createdb-mode " << par.createdbMode << "\n";
         Debug(Debug::WARNING) << "We recompute with --compressed 0\n";
         par.compressed = 0;
     }
 
-    if (par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH && par.compressHeaders) {
-        Debug(Debug::WARNING) << "Header compression can only be used with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << "\n";
-        Debug(Debug::WARNING) << "We recompute with --compress-headers 0\n";
+    if (par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) {
+        if (par.PARAM_COMPRESS_HEADERS.wasSet && par.compressHeaders) {
+            Debug(Debug::WARNING) << "Header compression can only be used with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << "\n";
+            Debug(Debug::WARNING) << "We recompute with --compress-headers 0\n";
+        }
         par.compressHeaders = 0;
     }
 
@@ -1215,7 +1587,6 @@ int createdb(int argc, const char **argv, const Command& command) {
     if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH && par.dbType == 2) {
         Debug(Debug::WARNING) << "Nucleotide database cannot be combined with --createdb-mode " << par.createdbMode << "\n";
         Debug(Debug::WARNING) << "We recompute with --dbtype 1\n";
-        par.dbType = 1;
     }
 
     if(par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) {
