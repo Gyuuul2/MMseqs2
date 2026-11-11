@@ -1216,6 +1216,7 @@ struct ClusterMemberExchange {
         std::vector<size_t> requestedOffsets;
         std::vector<size_t> requestedBytes;
         std::string reply;
+        unsigned int polls = 0;
         for (size_t pollTurn = 0; requesterCount > 0;) {
             bool hasWorked = false;
             size_t polledCount = 0;
@@ -1273,8 +1274,11 @@ struct ClusterMemberExchange {
             }
             // the next pass starts behind the last polled requester
             pollTurn += i;
-            if (hasWorked == false && requesterCount > 0) {
-                usleep(pollMicroseconds);
+            if (hasWorked) {
+                polls = 0;
+            } else if (requesterCount > 0) {
+                // while idle a pass lasts 10, 20, then 40 ms, a longer pass stays as it is
+                usleep(std::max<size_t>(pollMicroseconds, 10000u << std::min(polls++, 2u)));
             }
         }
     }
@@ -4096,8 +4100,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             assignedKeysWriter = std::thread(writeAssignedKeys, clusteredOrderKey);
         }
         Timer pollTimer;
-        bool hasNewProgress = false;
-#pragma omp parallel for schedule(dynamic, 1) reduction(||:hasNewProgress)
+#pragma omp parallel for schedule(dynamic, 1)
         for (size_t node = 0; node < MMseqsNode::count; node++) {
             const std::string log = accepted + "." + SSTR(node);
             size_t repKey;
@@ -4108,7 +4111,6 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             if (nodeHasProgress[node] && repKey <= nodeRepOrderKeys[node] && logSize <= nodeLogSize[node]) {
                 continue;
             }
-            hasNewProgress = true;
             nodeHasProgress[node] = 1;
             nodeRepOrderKeys[node] = repKey;
             nodeLogSize[node] = logSize;
@@ -4123,9 +4125,8 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             }
         }
         if (doneRepOrderKey <= clusteredOrderKey) {
-            if (hasNewProgress == false) {
-                MMseqsNode::sleepBeforePoll(polls++);
-            }
+            // only the slowest node gates the step, so sleep even if other nodes progressed
+            MMseqsNode::sleepBeforePoll(polls++);
             waitWarning.check(accepted + "." + SSTR(slowestNode) + ".progress");
             waitSeconds += pollTimer.getTimediff();
             continue;
@@ -4857,8 +4858,10 @@ int align2clustLinfinity(Parameters &par) {
         }
     }
 
-    // remove the item files a killed run left
-    alignmentSplitQueue.removeTakenItemFiles();
+    // remove the item files a killed run left, with target splits no node takes alignment splits
+    if (hasTargetSplits == false) {
+        alignmentSplitQueue.removeTakenItemFiles();
+    }
     cellQueue.removeTakenItemFiles();
     // all nodes use the smallest memory limit
     const size_t smallestMemoryLimit = MMseqsNode::getSmallestMemoryLimit(par.db3 + ".memory", nodeMemoryLimit - std::min(nodeMemoryLimit, assignedMemorySize));
@@ -4979,7 +4982,9 @@ int align2clustLinfinity(Parameters &par) {
     size_t clusteredSize;
     MMseqsNode::waitForLog(clusteredLogFile, clusteredKey, clusteredSize);
     // every node took its last alignment split
-    alignmentSplitQueue.removeTakenItemFiles();
+    if (hasTargetSplits == false) {
+        alignmentSplitQueue.removeTakenItemFiles();
+    }
     cellQueue.removeTakenItemFiles();
     if (MMseqsNode::isMaster()) {
         clusterThread.join();
