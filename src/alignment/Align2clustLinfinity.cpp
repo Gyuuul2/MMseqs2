@@ -22,6 +22,7 @@
 #include <functional>
 #include <list>
 #include <queue>
+#include <deque>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -841,6 +842,8 @@ static void unpackEntries(const char *servedEntries, size_t keyCount, const size
 static const size_t SERVICE_POLL_NODES = 8;
 static const size_t SERVICE_OPENS_PER_SECOND = 10000;
 static const size_t MAX_SERVICE_PASS_MICROSECONDS = 1280000;
+// the sequence service reads the progress files of other nodes at most this often a second
+static const size_t PROGRESS_READS_PER_SECOND = 100;
 
 // prefix sums in parallel
 static void sumOffsets(size_t *offsets, size_t count, int threads) {
@@ -2274,6 +2277,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             size_t memoryLimit, size_t masterMemoryLimit, size_t servedFileEntrySize, size_t representativeResidues,
                             size_t paddedDbSize, size_t sizeClassCount, const ClusterMemberLookup *memberLookup, ClusterMemberExchange *memberExchange,
                             size_t memberKeyBudget, DBReader<DBKeyType> *memberDbr, bool hasLocalServedBlocks, std::string &phaseValues) {
+    Timer startTimer;
     const unsigned int nodes = MMseqsNode::count;
     const unsigned int rank = MMseqsNode::rank;
     const size_t firstAlignNode = MMseqsNode::getFirstAlignNode();
@@ -2766,8 +2770,18 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<std::vector<size_t> > threadRawEntries(serviceThreads);
     size_t servedFileCount = 0;
     size_t servedSize = 0;
+    size_t servedEntrySize = 0;
     size_t receivedServedEntriesSize = 0;
+    size_t receivedEntrySize = 0;
+    Timer serviceTimer;
     size_t requestCount = 0;
+    size_t requestedEntrySize = 0;
+    size_t progressReadCount = 0;
+    size_t objectReadCount = 0;
+    size_t objectWriteCount = 0;
+    size_t deleteCount = 0;
+    size_t liveServedSize = 0;
+    size_t maxLiveServedSize = 0;
     double servingSeconds = 0;
     double servedFileWriterWaitSeconds = 0;
     double readingSeconds = 0;
@@ -2839,79 +2853,406 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #ifdef OPENMP
             omp_set_num_threads(1);
 #endif
-            std::vector<std::string> requestIndexes(nodes);
-            std::vector<std::string> requestFiles(nodes);
-            std::vector<std::string> servedIndexes(nodes);
-            for (unsigned int node = firstAlignNode; node < nodes; node++) {
-                requestIndexes[node] = requests + ".index." + SSTR(node);
-                requestFiles[node] = requests + "." + SSTR(node);
-                servedIndexes[node] = served + ".index." + SSTR(node);
-            }
-            // request index line: request, isLast, key offsets per node, end, magic
-            std::vector<uint64_t> requestLine(nodes + 4);
-            // served index line: file, entry offsets per node, end, key ends per node, magic
-            const size_t servedLineWords = 2 * nodes + 3;
-            std::vector<uint64_t> servedLine(servedLineWords);
-            std::vector<uint64_t> servedLines(nodes * servedLineWords);
-            std::vector<size_t> nodeRequests(nodes, 0);
-            std::vector<size_t> nextServedIndexLines(nodes, 0);
-            std::vector<size_t> servedFileNumbers(nodes, SIZE_MAX);
-            std::vector<size_t> servedEntriesBegins(nodes, 0);
-            std::vector<size_t> servedEntriesEnds(nodes, 0);
-            std::vector<size_t> polledServedFileSize(nodes, 0);
-            std::vector<size_t> servedKeyEnds(nodes, 0);
-            std::vector<size_t> alignNodeReceivedKeyCount(nodes, 0);
-            std::vector<unsigned char> isRequesting(nodes, 0);
-            for (size_t node = firstAlignNode; node < nodes; node++) {
-                isRequesting[node] = (node != rank);
-            }
-            const size_t polledNodes = std::min<size_t>(SERVICE_POLL_NODES, nodes - 1);
-            // idle and busy passes open the same number of indexes
-            const size_t pollMicroseconds = std::min(MAX_SERVICE_PASS_MICROSECONDS, 2 * polledNodes * nodes * 1000000 / SERVICE_OPENS_PER_SECOND);
+            // a node reads the progress file of another node at most once in progressSeconds
+            const double progressSeconds = std::max(BATCH_READ_SECONDS, 2.0 * (nodes - 1) / PROGRESS_READS_PER_SECOND);
             Timer serviceClock;
-            std::vector<double> nextServedIndexPolls(nodes, 0);
-            std::vector<double> nextRequestIndexPolls(nodes, 0);
-            std::vector<time_t> missingServedFileSince(nodes, 0);
-            std::vector<unsigned int> missingServedFileAttempts(nodes, 0);
-            std::vector<time_t> missingRequestSince(nodes, 0);
-            std::vector<unsigned int> missingRequestAttempts(nodes, 0);
-            struct ServedRequest {
-                unsigned int node;
-                size_t requestFileNumber;
-                size_t codeStart;
-                size_t codeOffset;
-                size_t codeEnd;
-                size_t requestSize;
-                size_t servedKeys;
-                DBKeyType lastKey;
+            // a request of this node: the sequences it fills, its number and size, the code offsets of the nodes and the files and keys received from them
+            struct SequenceRequest {
+                FetchedSequences *sequences;
+                size_t number;
+                size_t size;
+                std::vector<size_t> codeOffsets;
+                std::vector<size_t> receivedFiles;
+                std::vector<size_t> receivedKeys;
+                bool isComplete;
             };
-            std::vector<ServedRequest> servedRequests;
-            std::vector<unsigned char> isServing(nodes, 0);
-            std::vector<DBKeyType> requestKeys;
-            std::vector<char> requestCodes((alignNodeCount > 1) ? maxServedKeys * sizeof(DBKeyType) + 10 : 0);
-            std::vector<std::vector<size_t> > nodeUnreadServedFiles(nodes);
-            std::map<size_t, size_t> servedFileUnreadNodes;
+            std::deque<SequenceRequest> ownRequests;
+            size_t receivedRequestCount = 0;
+            bool isLastRequested = false;
+            FetchedSequences *requestedSequences = NULL;
+            bool isRequestComplete = false;
+            std::vector<char> requestCodes;
+            // a served file: request, file of the request, entry bytes and keys
+            struct ServedFile {
+                size_t request;
+                size_t file;
+                size_t size;
+                size_t keyCount;
+            };
+            std::vector<double> nextServedProgressReads(nodes, 0);
+            std::vector<std::vector<ServedFile> > servedFiles(nodes);
+            // a requesting node: its progress, the code range of this node in its open requests, the keys being served and the served files not yet deleted
+            struct Requester {
+                Requester() : requestCount(0), receivedCount(0), isLast(false), isDone(false), nextProgressRead(0), servedCount(0), keyPos(0), file(0) {}
+                size_t requestCount;
+                size_t receivedCount;
+                bool isLast;
+                bool isDone;
+                double nextProgressRead;
+                std::vector<size_t> openRequests;
+                size_t servedCount;
+                std::vector<DBKeyType> keys;
+                size_t keyPos;
+                size_t file;
+                std::vector<ServedFile> files;
+            };
+            std::vector<Requester> requesters(nodes);
+            for (unsigned int node = 0; node < nodes; node++) {
+                requesters[node].isDone = node == rank || node < firstAlignNode;
+            }
+            bool isServedProgressChanged = false;
+            std::vector<char> receivedEntries;
+            std::vector<DBKeyType> rawKeys;
             std::vector<size_t> requestOffsets;
             std::vector<char> servedFileData;
+            std::vector<char> writtenServedFileData;
             // a thread writes the served file while the next one is built
             std::thread servedFileWriter;
-            std::vector<char> writtenServedFileData;
-            std::vector<DBKeyType> rawKeys;
-            std::vector<char> receivedEntries;
-            struct ServedEntriesRead {
-                int fd;
-                unsigned int alignNode;
-                size_t receivedOffset;
-                size_t bytes;
+            unsigned int writtenRequester = UINT_MAX;
+            ServedFile writtenFile = { 0, 0, 0, 0 };
+            std::vector<time_t> missingFileSince(nodes, 0);
+            std::vector<unsigned int> missingFileAttempts(nodes, 0);
+            const std::string requestProgress = requests + "." + SSTR(rank) + ".progress";
+            const std::string servedProgress = served + "." + SSTR(rank) + ".progress";
+            const auto getServedFile = [&](unsigned int alignNode, unsigned int requester, const ServedFile &file) {
+                return served + "." + SSTR(alignNode) + "." + SSTR(requester) + "." + SSTR(file.request) + "." + SSTR(file.file);
             };
-            std::vector<ServedEntriesRead> servedEntriesReads;
+            // the keys of a node ascend, so a request holds their gaps
+            const auto writeRequest = [&](FetchedSequences *sequences) {
+                SequenceRequest request;
+                request.sequences = sequences;
+                request.number = requestCount;
+                request.codeOffsets.assign(nodes + 1, 0);
+                requestCodes.clear();
+                for (unsigned int node = 0; node < nodes; node++) {
+                    request.codeOffsets[node] = requestCodes.size();
+                    const size_t keyBegin = sequences->fetchSourceKeyOffsets[node];
+                    const size_t keyEnd = (node != rank) ? sequences->fetchSourceKeyOffsets[node + 1] : keyBegin;
+                    for (size_t i = keyBegin; i < keyEnd; i++) {
+                        char code[10];
+                        requestCodes.insert(requestCodes.end(), code, code + Util::putPrefKey(code, sequences->keys[i] - ((i > keyBegin) ? sequences->keys[i - 1] : 0)));
+                        requestedEntrySize += sequences->entryOffsets[i + 1] - sequences->entryOffsets[i];
+                    }
+                }
+                request.codeOffsets[nodes] = requestCodes.size();
+                if (requestCodes.empty()) {
+                    return false;
+                }
+                MMseqsNode::writeExchangeFile(requests + "." + SSTR(rank) + "." + SSTR(request.number), request.number, requestCodes.data(), requestCodes.size(), "", std::vector<uint64_t>(), 1);
+                request.size = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + requestCodes.size();
+                request.receivedFiles.assign(nodes, 0);
+                request.receivedKeys.assign(nodes, 0);
+                request.isComplete = false;
+                ownRequests.push_back(request);
+                requestCount++;
+                objectWriteCount++;
+                return true;
+            };
+            // the requests not received yet with the code offsets of all nodes
+            const auto publishRequestProgress = [&]() {
+                std::string content = SSTR(requestCount) + "\t" + SSTR(receivedRequestCount) + "\t" + SSTR(isLastRequested ? 1 : 0) + "\n";
+                for (size_t i = 0; i < ownRequests.size(); i++) {
+                    content += SSTR(ownRequests[i].number) + "\t" + SSTR(ownRequests[i].size);
+                    for (unsigned int node = 0; node <= nodes; node++) {
+                        content += "\t" + SSTR(ownRequests[i].codeOffsets[node]);
+                    }
+                    content += "\n";
+                }
+                MMseqsNode::publishRunFile(requestProgress, content);
+                objectWriteCount++;
+            };
+            // the served files not yet deleted, per requester
+            const auto publishServedProgress = [&]() {
+                std::string content;
+                for (unsigned int node = 0; node < nodes; node++) {
+                    for (size_t i = 0; i < requesters[node].files.size(); i++) {
+                        const ServedFile &file = requesters[node].files[i];
+                        content += SSTR(node) + "\t" + SSTR(file.request) + "\t" + SSTR(file.file) + "\t" + SSTR(file.size) + "\t" + SSTR(file.keyCount) + "\n";
+                    }
+                }
+                MMseqsNode::publishRunFile(servedProgress, content);
+                objectWriteCount++;
+                isServedProgressChanged = false;
+            };
+            const auto readServedProgress = [&](unsigned int alignNode) {
+                Timer pollTimer;
+                std::string content;
+                nextServedProgressReads[alignNode] = serviceClock.getTimediff() + progressSeconds;
+                progressReadCount++;
+                const bool hasProgress = MMseqsNode::readRunFile(served + "." + SSTR(alignNode) + ".progress", content);
+                pollingSeconds += pollTimer.getTimediff();
+                if (hasProgress == false) {
+                    return;
+                }
+                servedFiles[alignNode].clear();
+                for (char *line = &content[0]; *line != '\0'; line = Util::skipLine(line)) {
+                    const char *columns[5];
+                    if (Util::getWordsOfLine(line, columns, 5) == 5 && Util::fast_atoi<size_t>(columns[0]) == rank) {
+                        const ServedFile file = { Util::fast_atoi<size_t>(columns[1]), Util::fast_atoi<size_t>(columns[2]), Util::fast_atoi<size_t>(columns[3]), Util::fast_atoi<size_t>(columns[4]) };
+                        servedFiles[alignNode].push_back(file);
+                    }
+                }
+            };
+            // a served file whole, in parts that keep their errors
+            const auto readServedFile = [&](unsigned int alignNode, SequenceRequest &request, const ServedFile &file) {
+                const std::string fileName = getServedFile(alignNode, rank, file);
+                size_t observedSize;
+                uint64_t observedNumber;
+                int lastError;
+                Timer readTimer;
+                objectReadCount++;
+                const int fd = MMseqsNode::tryOpenExchangeFile(fileName, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + file.size, file.request, observedSize, observedNumber, lastError);
+                if (fd < 0) {
+                    readingSeconds += readTimer.getTimediff();
+                    if (lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
+                        Debug(Debug::ERROR) << "Cannot open served sequence file " << fileName << ": " << strerror(lastError) << "\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    failIfMissingTooLong(missingFileSince[alignNode], missingFileAttempts[alignNode], "Cannot open complete served sequence file " + fileName
+                                         + describeServedFile(MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + file.size, observedSize, file.request, observedNumber, lastError));
+                    return false;
+                }
+                if (receivedEntries.size() < file.size) {
+                    receivedEntries.resize(file.size);
+                }
+                const size_t partCount = (file.size + BatchReader::MAX_READ_REQUEST_SIZE - 1) / BatchReader::MAX_READ_REQUEST_SIZE;
+                std::vector<int> readErrors(partCount, 0);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(serviceThreads)
+                for (size_t part = 0; part < partCount; part++) {
+                    const size_t offset = part * BatchReader::MAX_READ_REQUEST_SIZE;
+                    int readError;
+                    if (MMseqsNode::tryPreadAll(fd, receivedEntries.data() + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, file.size - offset), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + offset, readError) == false) {
+                        readErrors[part] = (readError != 0) ? readError : -1;
+                    }
+                }
+                int readError = 0;
+                for (size_t part = 0; part < partCount; part++) {
+                    readError = (readErrors[part] != 0) ? readErrors[part] : readError;
+                }
+                const int closeError = (close(fd) != 0) ? errno : 0;
+                readingSeconds += readTimer.getTimediff();
+                const int error = (readError > 0) ? readError : closeError;
+                if (error != 0 && error != ESTALE && error != EINTR) {
+                    Debug(Debug::ERROR) << "Cannot read served sequence file " << fileName << ": " << strerror(error) << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                if (readError != 0 || closeError != 0) {
+                    failIfMissingTooLong(missingFileSince[alignNode], missingFileAttempts[alignNode], "Cannot read complete served sequence file " + fileName + " (error " + SSTR(error) + ")\n");
+                    return false;
+                }
+                missingFileAttempts[alignNode] = 0;
+                const size_t firstKey = request.sequences->fetchSourceKeyOffsets[alignNode] + request.receivedKeys[alignNode];
+                Timer unpackTimer;
+                unpackEntries(receivedEntries.data(), file.keyCount, request.sequences->entryOffsets.data() + firstKey, request.sequences->entries, serviceThreads);
+                unpackSeconds += unpackTimer.getTimediff();
+                size_t entrySize = 0;
+                for (size_t i = firstKey; i < firstKey + file.keyCount; i++) {
+                    entrySize += (request.sequences->entries[request.sequences->entryOffsets[i]] != '\0') ? request.sequences->entryOffsets[i + 1] - request.sequences->entryOffsets[i] : 0;
+                }
+                receivedEntrySize += entrySize;
+                request.receivedKeys[alignNode] += file.keyCount;
+                request.receivedFiles[alignNode]++;
+                receivedServedEntriesSize += file.size;
+                return true;
+            };
+            const auto readRequestProgress = [&](unsigned int node) {
+                Requester &requester = requesters[node];
+                Timer pollTimer;
+                std::string content;
+                requester.nextProgressRead = serviceClock.getTimediff() + progressSeconds;
+                progressReadCount++;
+                const bool hasProgress = MMseqsNode::readRunFile(requests + "." + SSTR(node) + ".progress", content);
+                pollingSeconds += pollTimer.getTimediff();
+                if (hasProgress == false) {
+                    return;
+                }
+                char *line = &content[0];
+                const char *columns[3];
+                if (Util::getWordsOfLine(line, columns, 3) < 3) {
+                    Debug(Debug::ERROR) << "Cannot read " << requests << "." << node << ".progress\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                requester.requestCount = Util::fast_atoi<size_t>(columns[0]);
+                requester.receivedCount = Util::fast_atoi<size_t>(columns[1]);
+                requester.isLast = Util::fast_atoi<size_t>(columns[2]) != 0;
+                // a received request was served, also one without keys of this node
+                requester.servedCount = std::max(requester.servedCount, requester.receivedCount);
+                // per open request: number, size and the codes of this node
+                requester.openRequests.clear();
+                std::vector<const char *> requestColumns(nodes + 3);
+                for (line = Util::skipLine(line); *line != '\0'; line = Util::skipLine(line)) {
+                    Util::getWordsOfLine(line, requestColumns.data(), nodes + 3);
+                    requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[0]));
+                    requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[1]));
+                    requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[2 + rank]));
+                    requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[3 + rank]));
+                }
+                // the files of the received requests go
+                size_t keptFiles = 0;
+                for (size_t i = 0; i < requester.files.size(); i++) {
+                    if (requester.files[i].request < requester.receivedCount) {
+                        FileUtil::remove(getServedFile(rank, node, requester.files[i]).c_str());
+                        deleteCount++;
+                        liveServedSize -= requester.files[i].size;
+                        isServedProgressChanged = true;
+                    } else {
+                        requester.files[keptFiles++] = requester.files[i];
+                    }
+                }
+                requester.files.resize(keptFiles);
+                requester.isDone = requester.isLast && requester.receivedCount == requester.requestCount;
+            };
+            const auto finishServedFileWrite = [&]() {
+                if (servedFileWriter.joinable()) {
+                    Timer waitTimer;
+                    servedFileWriter.join();
+                    servedFileWriterWaitSeconds += waitTimer.getTimediff();
+                }
+                if (writtenRequester != UINT_MAX) {
+                    requesters[writtenRequester].files.push_back(writtenFile);
+                    liveServedSize += writtenFile.size;
+                    maxLiveServedSize = std::max(maxLiveServedSize, liveServedSize);
+                    writtenRequester = UINT_MAX;
+                    isServedProgressChanged = true;
+                }
+            };
+            // one served file of the next open request of a node
+            const auto serveRequester = [&](unsigned int node) {
+                Requester &requester = requesters[node];
+                while (requester.servedCount < requester.requestCount) {
+                    size_t request = 0;
+                    while (request < requester.openRequests.size() && requester.openRequests[request] != requester.servedCount) {
+                        request += 4;
+                    }
+                    if (request == requester.openRequests.size()) {
+                        return false;
+                    }
+                    const size_t requestSize = requester.openRequests[request + 1];
+                    const size_t codeBegin = requester.openRequests[request + 2];
+                    const size_t codeEnd = requester.openRequests[request + 3];
+                    if (codeBegin == codeEnd) {
+                        requester.servedCount++;
+                        continue;
+                    }
+                    Timer servingTimer;
+                    if (requester.keys.empty()) {
+                        const std::string requestFile = requests + "." + SSTR(node) + "." + SSTR(requester.servedCount);
+                        size_t observedSize;
+                        uint64_t observedNumber;
+                        int lastError;
+                        objectReadCount++;
+                        const int requestFd = MMseqsNode::tryOpenExchangeFile(requestFile, requestSize, requester.servedCount, observedSize, observedNumber, lastError);
+                        if (requestFd < 0 && lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
+                            Debug(Debug::ERROR) << "Cannot open sequence request " << requestFile << ": " << strerror(lastError) << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        requestCodes.resize(codeEnd - codeBegin);
+                        bool isRequestRead = requestFd >= 0 && MMseqsNode::tryPreadAll(requestFd, requestCodes.data(), requestCodes.size(), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + codeBegin, lastError);
+                        if (requestFd >= 0 && close(requestFd) != 0 && isRequestRead) {
+                            lastError = errno;
+                            isRequestRead = false;
+                        }
+                        if (isRequestRead == false) {
+                            servingSeconds += servingTimer.getTimediff();
+                            if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EINTR) {
+                                Debug(Debug::ERROR) << "Cannot read sequence request " << requestFile << ": " << strerror(lastError) << "\n";
+                                EXIT(EXIT_FAILURE);
+                            }
+                            failIfMissingTooLong(missingFileSince[node], missingFileAttempts[node], "Cannot read complete sequence request " + requestFile
+                                                 + describeServedFile(requestSize, observedSize, requester.servedCount, observedNumber, lastError));
+                            return false;
+                        }
+                        missingFileAttempts[node] = 0;
+                        const char *code = requestCodes.data();
+                        for (DBKeyType key = 0; code < requestCodes.data() + requestCodes.size();) {
+                            key += Util::getPrefKey(code);
+                            requester.keys.push_back(key);
+                        }
+                        requester.keyPos = 0;
+                        requester.file = 0;
+                    }
+                    // the unassigned entries of at least one key, up to servedFileEntrySize bytes
+                    const DBKeyType *keys = requester.keys.data() + requester.keyPos;
+                    size_t keyCount = 0;
+                    size_t keyRange = SIZE_MAX;
+                    for (size_t entrySize = 0; requester.keyPos + keyCount < requester.keys.size(); keyCount++) {
+                        const size_t keySize = isAssigned(keys[keyCount]) ? 0 : seqDbr.getSeqLenFromRange(keyRange, keys[keyCount]) + 2;
+                        if (keyCount > 0 && entrySize + keySize > servedFileEntrySize) {
+                            break;
+                        }
+                        entrySize += keySize;
+                    }
+                    requestOffsets.resize(keyCount + 1);
+                    requestOffsets[0] = (keyCount + 7) / 8;
+#pragma omp parallel num_threads(serviceThreads)
+                    {
+                        size_t servedKeyRange = SIZE_MAX;
+#pragma omp for schedule(static)
+                        for (size_t j = 0; j < keyCount; j++) {
+                            const size_t packedSize = getPackedEntrySize(seqDbr.getSeqLenFromRange(servedKeyRange, keys[j]) + 2);
+                            requestOffsets[j + 1] = isAssigned(keys[j]) ? 0 : packedSize;
+                        }
+                    }
+                    for (size_t j = 0; j < keyCount; j++) {
+                        requestOffsets[j + 1] += requestOffsets[j];
+                    }
+                    servedFileData.resize(requestOffsets[keyCount]);
+                    // an empty slot marks an assigned key
+#pragma omp parallel for schedule(static) num_threads(serviceThreads)
+                    for (size_t byte = 0; byte < requestOffsets[0]; byte++) {
+                        unsigned char bits = 0;
+                        for (size_t j = 8 * byte; j < std::min(keyCount, 8 * byte + 8); j++) {
+                            bits |= static_cast<unsigned char>(requestOffsets[j + 1] == requestOffsets[j]) << (j % 8);
+                        }
+                        servedFileData[byte] = static_cast<char>(bits);
+                    }
+                    rawKeys.clear();
+                    copyEntries(keys, keyCount, requestOffsets.data(), servedFileData.data(), &rawKeys);
+                    size_t servedFileSize = requestOffsets[keyCount];
+                    requestOffsets.resize(rawKeys.size() + 1);
+                    requestOffsets[0] = 0;
+                    size_t rawKeyRange = SIZE_MAX;
+                    for (size_t j = 0; j < rawKeys.size(); j++) {
+                        requestOffsets[j + 1] = requestOffsets[j] + seqDbr.getSeqLenFromRange(rawKeyRange, rawKeys[j]) + 2;
+                    }
+                    servedFileData.resize(servedFileSize + requestOffsets[rawKeys.size()]);
+                    copyEntries(rawKeys.data(), rawKeys.size(), requestOffsets.data(), servedFileData.data() + servedFileSize, NULL);
+                    servedFileSize += requestOffsets[rawKeys.size()];
+                    size_t entryRange = SIZE_MAX;
+                    for (size_t j = 0; j < keyCount; j++) {
+                        servedEntrySize += isAssigned(keys[j]) ? 0 : seqDbr.getSeqLenFromRange(entryRange, keys[j]) + 2;
+                    }
+                    servingSeconds += servingTimer.getTimediff();
+                    finishServedFileWrite();
+                    servedFileData.swap(writtenServedFileData);
+                    writtenFile.request = requester.servedCount;
+                    writtenFile.file = requester.file;
+                    writtenFile.size = servedFileSize;
+                    writtenFile.keyCount = keyCount;
+                    writtenRequester = node;
+                    const std::string servedFile = getServedFile(rank, node, writtenFile);
+                    const uint64_t servedRequest = writtenFile.request;
+                    servedFileWriter = std::thread([&, servedFile, servedRequest, servedFileSize]() {
+                        Timer writeTimer;
+                        MMseqsNode::writeExchangeFile(servedFile, servedRequest, writtenServedFileData.data(), servedFileSize, "", std::vector<uint64_t>(), serviceThreads);
+                        servedFileWriteSeconds += writeTimer.getTimediff();
+                    });
+                    servedSize += servedFileSize;
+                    servedFileCount++;
+                    objectWriteCount++;
+                    requester.keyPos += keyCount;
+                    requester.file++;
+                    if (requester.keyPos == requester.keys.size()) {
+                        requester.keys.clear();
+                        requester.servedCount++;
+                    }
+                    return true;
+                }
+                return false;
+            };
             MMseqsNode::WaitWarning waitWarning;
-            FetchedSequences *requestedSequences = NULL;
-            bool isLastRequested = false;
             time_t assignedKeysReadTime = 0;
-            size_t pollTurn = 0;
-            for (unsigned int polls = 0; isLastRequested == false || requestedSequences != NULL || std::find(isRequesting.begin(), isRequesting.end(), 1) != isRequesting.end()
-                                         || servedRequests.empty() == false;) {
+            for (unsigned int polls = 0;;) {
                 bool hasWorked = false;
                 // keep the bits of the served keys current
                 const time_t passTime = time(NULL);
@@ -2922,6 +3263,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         assignedKeysReadTime = passTime;
                     }
                 }
+                bool isRequestProgressChanged = false;
                 // request once the master is close enough behind
                 FetchedSequences *nextRequest = NULL;
                 size_t nextAcceptedSize = 0;
@@ -2951,361 +3293,93 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         }
                     }
                     if (isAhead == false) {
-                        if (alignNodeCount > 1) {
-                            FILE *requestHandle = MMseqsNode::createExchangeFile(requestFiles[rank], requestCount);
-                            size_t requestSize = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
-                            for (unsigned int node = 0; node < nodes; node++) {
-                                requestLine[2 + node] = requestSize;
-                                const size_t keyBegin = nextRequest->fetchSourceKeyOffsets[node];
-                                const size_t keyEnd = (node != rank) ? nextRequest->fetchSourceKeyOffsets[node + 1] : keyBegin;
-                                // keys ascend, so send their gaps
-                                for (size_t i = keyBegin; i < keyEnd;) {
-                                    size_t codeSize = 0;
-                                    for (; i < keyEnd && codeSize + 10 <= requestCodes.size(); i++) {
-                                        codeSize += Util::putPrefKey(requestCodes.data() + codeSize, nextRequest->keys[i] - ((i > keyBegin) ? nextRequest->keys[i - 1] : 0));
-                                    }
-                                    if (fwrite(requestCodes.data(), sizeof(char), codeSize, requestHandle) != codeSize) {
-                                        Debug(Debug::ERROR) << "Cannot write " << requestFiles[rank] << "\n";
-                                        EXIT(EXIT_FAILURE);
-                                    }
-                                    requestSize += codeSize;
-                                }
-                            }
-                            requestLine[0] = requestCount++;
-                            requestLine[1] = isLast;
-                            requestLine[2 + nodes] = requestSize;
-                            MMseqsNode::publishExchangeFile(requestHandle, requestFiles[rank], requestSize, requestIndexes[rank], requestLine);
-                        }
+                        // the keys of other nodes
+                        isRequestComplete = writeRequest(nextRequest) == false;
                         const size_t ownKey = nextRequest->fetchSourceKeyOffsets[rank];
                         copyEntries(nextRequest->keys.data() + ownKey, nextRequest->fetchSourceKeyOffsets[rank + 1] - ownKey, nextRequest->entryOffsets.data() + ownKey, nextRequest->entries, NULL);
+                        isRequestProgressChanged |= isRequestComplete == false || isLast;
                         isLastRequested = isLast;
                         requestedSequences = nextRequest;
                         hasWorked = true;
                     }
                 }
-                // receive served entries from up to SERVICE_POLL_NODES nodes
-                if (requestedSequences != NULL) {
-                    bool isComplete = true;
-                    size_t polledAlignNodeCount = 0;
-                    size_t receivedSize = 0;
-                    for (size_t i = 0; i + 1 < nodes; i++) {
-                        const unsigned int alignNode = (rank + 1 + (i + pollTurn) % (nodes - 1)) % nodes;
-                        const size_t alignNodeKeyCount = requestedSequences->fetchSourceKeyOffsets[alignNode + 1] - requestedSequences->fetchSourceKeyOffsets[alignNode];
-                        if (alignNodeReceivedKeyCount[alignNode] == alignNodeKeyCount) {
-                            continue;
-                        }
-                        if (++polledAlignNodeCount > polledNodes) {
-                            isComplete = false;
-                            continue;
-                        }
-                        // stop at the line with entries for this node
-                        if (servedFileNumbers[alignNode] == SIZE_MAX) {
-                            if (serviceClock.getTimediff() < nextServedIndexPolls[alignNode]) {
-                                isComplete = false;
-                                continue;
-                            }
-                            Timer pollTimer;
-                            const size_t lineCount = MMseqsNode::readExchangeIndexLines(servedIndexes[alignNode], nextServedIndexLines[alignNode], servedLineWords, servedLines);
-                            pollingSeconds += pollTimer.getTimediff();
-                            if (lineCount == 0) {
-                                nextServedIndexPolls[alignNode] = serviceClock.getTimediff() + pollMicroseconds / 1e6;
-                            }
-                            for (size_t line = 0; line < lineCount && servedFileNumbers[alignNode] == SIZE_MAX; line++) {
-                                const uint64_t *servedEntriesOffsets = servedLines.data() + line * servedLineWords + 1;
-                                if (servedEntriesOffsets[rank] < servedEntriesOffsets[rank + 1]) {
-                                    servedFileNumbers[alignNode] = nextServedIndexLines[alignNode];
-                                    servedEntriesBegins[alignNode] = servedEntriesOffsets[rank];
-                                    servedEntriesEnds[alignNode] = servedEntriesOffsets[rank + 1];
-                                    polledServedFileSize[alignNode] = servedEntriesOffsets[nodes];
-                                    servedKeyEnds[alignNode] = servedEntriesOffsets[nodes + 1 + rank];
-                                }
-                                nextServedIndexLines[alignNode]++;
-                            }
-                            if (servedFileNumbers[alignNode] == SIZE_MAX) {
-                                isComplete = false;
-                                continue;
-                            }
-                        }
-                        if (servedEntriesReads.empty() == false && receivedSize + servedEntriesEnds[alignNode] - servedEntriesBegins[alignNode] > maxServedFileSize) {
-                            isComplete = false;
-                            continue;
-                        }
-                        const std::string servedFile = served + "." + SSTR(alignNode) + "." + SSTR(servedFileNumbers[alignNode]);
-                        size_t observedSize;
-                        uint64_t observedExchangeFileNumber;
-                        int lastError;
-                        Timer openTimer;
-                        const int fd = MMseqsNode::tryOpenExchangeFile(servedFile, polledServedFileSize[alignNode], servedFileNumbers[alignNode], observedSize, observedExchangeFileNumber, lastError);
-                        readingSeconds += openTimer.getTimediff();
-                        if (fd < 0) {
-                            if (lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
-                                Debug(Debug::ERROR) << "Cannot open served sequence file " << servedFile << ": " << strerror(lastError) << "\n";
-                                EXIT(EXIT_FAILURE);
-                            }
-                            failIfMissingTooLong(missingServedFileSince[alignNode], missingServedFileAttempts[alignNode], "Cannot open complete served sequence file " + servedFile
-                                                 + describeServedFile(polledServedFileSize[alignNode], observedSize, servedFileNumbers[alignNode], observedExchangeFileNumber, lastError));
-                            isComplete = false;
-                            continue;
-                        }
-                        const ServedEntriesRead request = { fd, alignNode, receivedSize, servedEntriesEnds[alignNode] - servedEntriesBegins[alignNode] };
-                        servedEntriesReads.push_back(request);
-                        receivedSize += request.bytes;
+                // receive from the nodes that owe a request
+                for (unsigned int node = 0; node < nodes; node++) {
+                    bool isOwed = false;
+                    for (size_t i = 0; i < ownRequests.size() && isOwed == false; i++) {
+                        isOwed = node != rank && ownRequests[i].receivedKeys[node] < ownRequests[i].sequences->fetchSourceKeyOffsets[node + 1] - ownRequests[i].sequences->fetchSourceKeyOffsets[node];
                     }
-                    if (isComplete || servedEntriesReads.empty() == false) {
-                        if (servedEntriesReads.empty() == false) {
-                            Timer readTimer;
-                            if (receivedEntries.size() < receivedSize) {
-                                receivedEntries.resize(receivedSize);
-                            }
-                            // read in parts; a failed part keeps its error
-                            std::vector<std::pair<size_t, size_t> > readRequests;
-                            for (size_t i = 0; i < servedEntriesReads.size(); i++) {
-                                for (size_t offset = 0; offset < servedEntriesReads[i].bytes; offset += BatchReader::MAX_READ_REQUEST_SIZE) {
-                                    readRequests.push_back(std::make_pair(i, offset));
+                    if (isOwed == false || serviceClock.getTimediff() < nextServedProgressReads[node]) {
+                        continue;
+                    }
+                    readServedProgress(node);
+                    for (size_t i = 0; i < ownRequests.size(); i++) {
+                        for (size_t j = 0; j < servedFiles[node].size(); j++) {
+                            const ServedFile &file = servedFiles[node][j];
+                            if (file.request == ownRequests[i].number && file.file == ownRequests[i].receivedFiles[node]) {
+                                if (readServedFile(node, ownRequests[i], file) == false) {
+                                    break;
                                 }
+                                hasWorked = true;
                             }
-                            std::vector<int> readErrors(readRequests.size(), 0);
-#pragma omp parallel for schedule(dynamic, 1) num_threads(serviceThreads)
-                            for (size_t i = 0; i < readRequests.size(); i++) {
-                                const ServedEntriesRead &request = servedEntriesReads[readRequests[i].first];
-                                const size_t offset = readRequests[i].second;
-                                int readError;
-                                if (MMseqsNode::tryPreadAll(request.fd, receivedEntries.data() + request.receivedOffset + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, request.bytes - offset),
-                                                            servedEntriesBegins[request.alignNode] + offset, readError) == false) {
-                                    readErrors[i] = (readError != 0) ? readError : -1;
-                                }
-                            }
-                            readingSeconds += readTimer.getTimediff();
-                            for (size_t i = 0, readRequest = 0; i < servedEntriesReads.size(); i++) {
-                                int readError = 0;
-                                for (; readRequest < readRequests.size() && readRequests[readRequest].first == i; readRequest++) {
-                                    readError = (readErrors[readRequest] != 0) ? readErrors[readRequest] : readError;
-                                }
-                                const unsigned int alignNode = servedEntriesReads[i].alignNode;
-                                const std::string servedFile = served + "." + SSTR(alignNode) + "." + SSTR(servedFileNumbers[alignNode]);
-                                const int closeError = (close(servedEntriesReads[i].fd) != 0) ? errno : 0;
-                                const int error = (readError > 0) ? readError : closeError;
-                                if (error != 0 && error != ESTALE && error != EINTR) {
-                                    Debug(Debug::ERROR) << "Cannot read served sequence file " << servedFile << ": " << strerror(error) << "\n";
-                                    EXIT(EXIT_FAILURE);
-                                }
-                                if (readError != 0 || closeError != 0) {
-                                    failIfMissingTooLong(missingServedFileSince[alignNode], missingServedFileAttempts[alignNode],
-                                                         "Cannot read complete served sequence file " + servedFile + " (file number " + SSTR(servedFileNumbers[alignNode]) + "; error " + SSTR(error) + ")\n");
-                                    isComplete = false;
-                                } else {
-                                    const size_t firstKey = requestedSequences->fetchSourceKeyOffsets[alignNode] + alignNodeReceivedKeyCount[alignNode];
-                                    Timer unpackTimer;
-                                    unpackEntries(receivedEntries.data() + servedEntriesReads[i].receivedOffset, servedKeyEnds[alignNode] - alignNodeReceivedKeyCount[alignNode],
-                                                  requestedSequences->entryOffsets.data() + firstKey, requestedSequences->entries, serviceThreads);
-                                    unpackSeconds += unpackTimer.getTimediff();
-                                    alignNodeReceivedKeyCount[alignNode] = servedKeyEnds[alignNode];
-                                    servedFileNumbers[alignNode] = SIZE_MAX;
-                                    missingServedFileAttempts[alignNode] = 0;
-                                    receivedServedEntriesSize += servedEntriesReads[i].bytes;
-                                    hasWorked = true;
-                                    if (alignNodeReceivedKeyCount[alignNode] < requestedSequences->fetchSourceKeyOffsets[alignNode + 1] - requestedSequences->fetchSourceKeyOffsets[alignNode]) {
-                                        isComplete = false;
-                                    }
-                                }
-                            }
-                        }
-                        servedEntriesReads.clear();
-                        if (isComplete) {
-                            alignNodeReceivedKeyCount.assign(nodes, 0);
-                            {
-                                std::lock_guard<std::mutex> lock(serviceMutex);
-                                completedSequences = requestedSequences;
-                            }
-                            serviceCondition.notify_all();
-                            requestedSequences = NULL;
-                            hasWorked = true;
                         }
                     }
                 }
-                // take the next requests of the polled nodes
-                for (size_t i = 0; i < polledNodes; i++) {
-                    const unsigned int node = (rank + 1 + (i + pollTurn) % (nodes - 1)) % nodes;
-                    while (servedRequests.size() < SERVICE_POLL_NODES && isRequesting[node] && isServing[node] == 0 && serviceClock.getTimediff() >= nextRequestIndexPolls[node]) {
-                        Timer pollTimer;
-                        const bool hasLine = MMseqsNode::readExchangeIndexLines(requestIndexes[node], nodeRequests[node], requestLine.size(), requestLine) == 1;
-                        pollingSeconds += pollTimer.getTimediff();
-                        if (hasLine == false) {
-                            nextRequestIndexPolls[node] = serviceClock.getTimediff() + pollMicroseconds / 1e6;
-                            break;
-                        }
-                        // a served file goes once all nodes have read it
-                        for (size_t j = 0; j < nodeUnreadServedFiles[node].size(); j++) {
-                            const size_t unreadServedFile = nodeUnreadServedFiles[node][j];
-                            if (--servedFileUnreadNodes[unreadServedFile] == 0) {
-                                FileUtil::remove((served + "." + SSTR(rank) + "." + SSTR(unreadServedFile)).c_str());
-                                servedFileUnreadNodes.erase(unreadServedFile);
-                            }
-                        }
-                        nodeUnreadServedFiles[node].clear();
-                        if (requestLine[1] != 0) {
-                            isRequesting[node] = 0;
-                        } else if (requestLine[3 + rank] > requestLine[2 + rank]) {
-                            const ServedRequest request = { node, nodeRequests[node], requestLine[2 + rank], requestLine[2 + rank], requestLine[3 + rank], requestLine[2 + nodes], 0, 0 };
-                            servedRequests.push_back(request);
-                            isServing[node] = 1;
-                        }
-                        nodeRequests[node]++;
+                for (size_t i = 0; i < ownRequests.size(); i++) {
+                    SequenceRequest &request = ownRequests[i];
+                    bool isComplete = request.isComplete == false;
+                    for (unsigned int node = 0; node < nodes && isComplete; node++) {
+                        isComplete = node == rank || request.receivedKeys[node] == request.sequences->fetchSourceKeyOffsets[node + 1] - request.sequences->fetchSourceKeyOffsets[node];
+                    }
+                    if (isComplete) {
+                        request.isComplete = true;
+                        isRequestComplete |= request.sequences == requestedSequences;
+                        FileUtil::remove((requests + "." + SSTR(rank) + "." + SSTR(request.number)).c_str());
+                        deleteCount++;
                         hasWorked = true;
                     }
                 }
-                // one served file a pass, in node order
-                size_t servedNodeCount = 0;
-                size_t servedFileSize = 0;
-                std::sort(servedRequests.begin(), servedRequests.end(), [](const ServedRequest &first, const ServedRequest &second) { return first.node < second.node; });
-                const size_t requestEntrySize = servedFileEntrySize / std::max<size_t>(1, servedRequests.size());
-                for (size_t request = 0, node = 0; node < nodes && servedRequests.empty() == false; node++) {
-                    servedLine[1 + node] = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + servedFileSize;
-                    servedLine[nodes + 2 + node] = 0;
-                    if (request == servedRequests.size() || servedRequests[request].node != node) {
-                        continue;
-                    }
-                    ServedRequest &servedRequest = servedRequests[request++];
-                    const size_t readKeys = std::min(maxServedKeys, 2 * requestEntrySize / averageEntrySize + 1);
-                    // guess the code bytes of the next keys
-                    const double keyCodeSize = (servedRequest.servedKeys > 0) ? static_cast<double>(servedRequest.codeOffset - servedRequest.codeStart) / servedRequest.servedKeys : sizeof(DBKeyType);
-                    const size_t codeSize = std::min(std::min(servedRequest.codeEnd - servedRequest.codeOffset, requestCodes.size()), static_cast<size_t>(readKeys * keyCodeSize) + 10);
-                    requestKeys.resize(readKeys);
-                    size_t observedSize;
-                    uint64_t observedExchangeFileNumber;
-                    int lastError;
-                    Timer requestTimer;
-                    const int requestFd = MMseqsNode::tryOpenExchangeFile(requestFiles[node], servedRequest.requestSize, servedRequest.requestFileNumber,
-                                                                            observedSize, observedExchangeFileNumber, lastError);
-                    if (requestFd < 0 && lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
-                        Debug(Debug::ERROR) << "Cannot open sequence request " << requestFiles[node] << ": " << strerror(lastError) << "\n";
-                        EXIT(EXIT_FAILURE);
-                    }
-                    bool isRequestRead = requestFd >= 0;
-                    if (isRequestRead) {
-                        isRequestRead = MMseqsNode::tryPreadAll(requestFd, requestCodes.data(), codeSize, servedRequest.codeOffset, lastError);
-                        if (close(requestFd) != 0 && isRequestRead) {
-                            lastError = errno;
-                            isRequestRead = false;
-                        }
-                    }
-                    servingSeconds += requestTimer.getTimediff();
-                    if (isRequestRead == false) {
-                        if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EINTR) {
-                            Debug(Debug::ERROR) << "Cannot read sequence request " << requestFiles[node] << ": " << strerror(lastError) << "\n";
-                            EXIT(EXIT_FAILURE);
-                        }
-                        failIfMissingTooLong(missingRequestSince[node], missingRequestAttempts[node], "Cannot read complete sequence request " + requestFiles[node]
-                                             + describeServedFile(servedRequest.requestSize, observedSize, servedRequest.requestFileNumber, observedExchangeFileNumber, lastError));
-                        continue;
-                    }
-                    missingRequestAttempts[node] = 0;
-                    Timer servingTimer;
-                    const DBKeyType *keys = requestKeys.data();
-                    // only the last byte of a code is below 0x80
-                    const char *codeEnd = requestCodes.data() + codeSize;
-                    while (codeEnd > requestCodes.data() && static_cast<unsigned char>(codeEnd[-1]) >= 0x80) {
-                        codeEnd--;
-                    }
-                    const char *code = requestCodes.data();
-                    size_t keyCount = 0;
-                    size_t keyRange = SIZE_MAX;
-                    for (size_t entrySize = 0; keyCount < readKeys && code < codeEnd; keyCount++) {
-                        const char *nextCode = code;
-                        const DBKeyType key = ((keyCount > 0) ? keys[keyCount - 1] : servedRequest.lastKey) + Util::getPrefKey(nextCode);
-                        const size_t keySize = isAssigned(key) ? 0 : seqDbr.getSeqLenFromRange(keyRange, key) + 2;
-                        if (keyCount > 0 && entrySize + keySize > requestEntrySize) {
-                            break;
-                        }
-                        requestKeys[keyCount] = key;
-                        code = nextCode;
-                        entrySize += keySize;
-                    }
-                    servedRequest.codeOffset += code - requestCodes.data();
-                    servedRequest.lastKey = keys[keyCount - 1];
-                    requestOffsets.resize(keyCount + 1);
-                    requestOffsets[0] = (keyCount + 7) / 8;
-#pragma omp parallel num_threads(serviceThreads)
+                for (; ownRequests.empty() == false && ownRequests.front().isComplete; receivedRequestCount++) {
+                    ownRequests.pop_front();
+                    isRequestProgressChanged = true;
+                }
+                if (isRequestProgressChanged && alignNodeCount > 1) {
+                    publishRequestProgress();
+                }
+                // a fetch goes to the aligning threads once its request is complete
+                if (requestedSequences != NULL && isRequestComplete) {
                     {
-                        size_t servedKeyRange = SIZE_MAX;
-#pragma omp for schedule(static)
-                        for (size_t j = 0; j < keyCount; j++) {
-                            const size_t packedSize = getPackedEntrySize(seqDbr.getSeqLenFromRange(servedKeyRange, keys[j]) + 2);
-                            const bool isServed = isAssigned(keys[j]) == false;
-                            requestOffsets[j + 1] = isServed ? packedSize : 0;
-                        }
+                        std::lock_guard<std::mutex> lock(serviceMutex);
+                        completedSequences = requestedSequences;
                     }
-                    for (size_t j = 0; j < keyCount; j++) {
-                        requestOffsets[j + 1] += requestOffsets[j];
-                    }
-                    if (servedFileData.size() < servedFileSize + requestOffsets[keyCount]) {
-                        servedFileData.resize(servedFileSize + requestOffsets[keyCount]);
-                    }
-                    // an empty slot marks an assigned key
-#pragma omp parallel for schedule(static) num_threads(serviceThreads)
-                    for (size_t byte = 0; byte < requestOffsets[0]; byte++) {
-                        unsigned char bits = 0;
-                        for (size_t j = 8 * byte; j < std::min(keyCount, 8 * byte + 8); j++) {
-                            bits |= static_cast<unsigned char>(requestOffsets[j + 1] == requestOffsets[j]) << (j % 8);
-                        }
-                        servedFileData[servedFileSize + byte] = static_cast<char>(bits);
-                    }
-                    rawKeys.clear();
-                    copyEntries(keys, keyCount, requestOffsets.data(), servedFileData.data() + servedFileSize, &rawKeys);
-                    servedFileSize += requestOffsets[keyCount];
-                    requestOffsets.resize(rawKeys.size() + 1);
-                    requestOffsets[0] = 0;
-                    size_t rawKeyRange = SIZE_MAX;
-                    for (size_t j = 0; j < rawKeys.size(); j++) {
-                        requestOffsets[j + 1] = requestOffsets[j] + seqDbr.getSeqLenFromRange(rawKeyRange, rawKeys[j]) + 2;
-                    }
-                    if (servedFileData.size() < servedFileSize + requestOffsets[rawKeys.size()]) {
-                        servedFileData.resize(servedFileSize + requestOffsets[rawKeys.size()]);
-                    }
-                    copyEntries(rawKeys.data(), rawKeys.size(), requestOffsets.data(), servedFileData.data() + servedFileSize, NULL);
-                    servedFileSize += requestOffsets[rawKeys.size()];
-                    servingSeconds += servingTimer.getTimediff();
-                    servedRequest.servedKeys += keyCount;
-                    servedLine[nodes + 2 + node] = servedRequest.servedKeys;
-                    nodeUnreadServedFiles[node].push_back(servedFileCount);
-                    servedNodeCount++;
-                }
-                for (size_t request = 0; request < servedRequests.size();) {
-                    if (servedRequests[request].codeOffset == servedRequests[request].codeEnd) {
-                        isServing[servedRequests[request].node] = 0;
-                        servedRequests.erase(servedRequests.begin() + request);
-                    } else {
-                        request++;
-                    }
-                }
-                if (servedNodeCount > 0) {
-                    servedLine[0] = servedFileCount;
-                    servedLine[1 + nodes] = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + servedFileSize;
-                    servedFileUnreadNodes[servedFileCount] = servedNodeCount;
-                    // one served file at a time keeps the index in file order
-                    Timer waitTimer;
-                    if (servedFileWriter.joinable()) {
-                        servedFileWriter.join();
-                    }
-                    servedFileWriterWaitSeconds += waitTimer.getTimediff();
-                    servedFileData.swap(writtenServedFileData);
-                    const size_t writtenFileNumber = servedFileCount;
-                    servedFileWriter = std::thread([&, servedFileSize, servedLine, writtenFileNumber]() {
-                        Timer writeTimer;
-                        MMseqsNode::writeExchangeFile(served + "." + SSTR(rank) + "." + SSTR(writtenFileNumber), writtenFileNumber, writtenServedFileData.data(), servedFileSize,
-                                                      servedIndexes[rank], servedLine, serviceThreads);
-                        servedFileWriteSeconds += writeTimer.getTimediff();
-                    });
-                    servedFileCount++;
-                    servedSize += servedFileSize;
+                    serviceCondition.notify_all();
+                    requestedSequences = NULL;
                     hasWorked = true;
                 }
-                pollTurn += polledNodes;
+                // a served file a pass for each requesting node
+                bool isServing = false;
+                for (unsigned int i = 1; i < nodes; i++) {
+                    const unsigned int node = (rank + i) % nodes;
+                    if (requesters[node].isDone) {
+                        continue;
+                    }
+                    if (serviceClock.getTimediff() >= requesters[node].nextProgressRead) {
+                        readRequestProgress(node);
+                    }
+                    hasWorked |= serveRequester(node);
+                    isServing |= requesters[node].isDone == false;
+                }
+                finishServedFileWrite();
+                if (isServedProgressChanged) {
+                    publishServedProgress();
+                }
+                if (isLastRequested && ownRequests.empty() && requestedSequences == NULL && isServing == false) {
+                    break;
+                }
                 // sleep longer while no node waits
                 if (hasWorked) {
                     polls = 0;
                 } else {
-                    usleep(pollMicroseconds);
                     MMseqsNode::sleepBeforePoll(polls++, (alignNodeCount > 1 || requestedSequences != NULL || nextRequest != NULL) ? 4 : 7);
                 }
                 // aligning without a request is no wait
@@ -3314,9 +3388,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 } else {
                     waitWarning.check(requestedSequences != NULL ? served + " of other nodes" : (nextRequest != NULL ? assignedKeysLog : requests + " of other nodes"));
                 }
-            }
-            if (servedFileWriter.joinable()) {
-                servedFileWriter.join();
             }
         });
     }
@@ -3344,6 +3415,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
         waitForSequences(currentSequences, getFirstRepKey(currentSequences));
     }
+    const double firstFetchSeconds = startTimer.getTimediff();
     while (currentSequences.isLast == false) {
         selectRecordKeys(nextSequences, currentSequences);
         {
@@ -3963,7 +4035,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     // serve until every aligning node is done
     if (isAligningNode) {
         serviceThread.join();
-        MMseqsNode::addPhaseValue(phaseValues, "Sequence exchange bytes", SSTR(servedSize) + " served, " + SSTR(receivedServedEntriesSize) + " received, " + SSTR(requestCount) + " requests");
+        MMseqsNode::addPhaseValue(phaseValues, "Sequence exchange bytes", SSTR(servedSize) + " served for " + SSTR(servedEntrySize) + " entry bytes, " + SSTR(receivedServedEntriesSize) + " received, "
+                                  + SSTR(requestCount) + " requests");
         MMseqsNode::addPhaseSeconds(phaseValues, "service: serving the requests", servingSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: loading the source sequences", sourceLoadSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: packing the served entries", packSeconds);
@@ -3972,6 +4045,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         MMseqsNode::addPhaseSeconds(phaseValues, "service: reading the served entries", readingSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: unpacking the served entries", unpackSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: polling", pollingSeconds);
+        MMseqsNode::addPhaseValue(phaseValues, "Requested entry bytes", SSTR(requestedEntrySize) + " requested, " + SSTR(receivedEntrySize) + " received not assigned, of " + SSTR(rangeByteOffsets[rangeCount]) + " sequence bytes");
+        MMseqsNode::addPhaseValue(phaseValues, "Sequence service requests", SSTR(progressReadCount) + " polls, " + SSTR(objectReadCount) + " object reads, " + SSTR(objectWriteCount) + " object writes, "
+                                  + SSTR(deleteCount) + " deletes in " + SSTR(static_cast<size_t>(serviceTimer.getTimediff())) + " s");
+        MMseqsNode::addPhaseValue(phaseValues, "Served files", SSTR(servedFileCount) + ", at most " + SSTR(maxLiveServedSize) + " bytes not yet deleted");
     }
     delete[] currentSequences.entries;
     delete[] nextSequences.entries;
@@ -3989,6 +4066,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         MMseqsNode::addPhaseSeconds(phaseValues, "aligning the fetches", alignSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Fetches with fewer SWIPE batches", SSTR(fewerBatchFetchCount) + " of " + SSTR(fetchCount));
         MMseqsNode::addPhaseValue(phaseValues, "Assigned keys read", SSTR(assignedKeyCount) + " in " + SSTR(assignedKeysSize) + " bytes");
+        MMseqsNode::addPhaseSeconds(phaseValues, "the first fetch", firstFetchSeconds);
     }
     if (memberLookup != NULL) {
         MMseqsNode::addPhaseValue(phaseValues, "Cluster member pairs", SSTR(multiFetchPairCount) + " over several fetches, " + SSTR(slicedPairCount) + " in slices");
@@ -4891,10 +4969,10 @@ int align2clustLinfinity(Parameters &par) {
     const std::string servedMembers = par.db3 + "_members";
     std::vector<std::string> sequenceIndexes;
     std::vector<std::string> sequenceFiles;
+    // an empty progress file has no requests and no served files
     if (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode() && alignNodeCount > 1) {
-        sequenceIndexes.push_back(requests + ".index." + SSTR(MMseqsNode::rank));
-        sequenceIndexes.push_back(served + ".index." + SSTR(MMseqsNode::rank));
-        sequenceFiles.push_back(requests + "." + SSTR(MMseqsNode::rank));
+        sequenceIndexes.push_back(requests + "." + SSTR(MMseqsNode::rank) + ".progress");
+        sequenceIndexes.push_back(served + "." + SSTR(MMseqsNode::rank) + ".progress");
     }
     // every node serves the members of its own cluster part, the aligning nodes ask for them
     if (par.filterCluDBFile.empty() == false && MMseqsNode::count > 1) {

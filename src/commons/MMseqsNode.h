@@ -67,6 +67,8 @@ public:
     static std::string readFile(const std::string &file);
     static void publishRunFile(const std::string &file, const std::string &content);
     static std::string waitForRunFile(const std::string &file);
+    // false while the file holds no content of this run
+    static bool readRunFile(const std::string &file, std::string &content);
     static void waitForRunFilesChange(const std::string &prefix, std::string &content);
     static std::string gatherRunFiles(const std::string &prefix);
 

@@ -192,6 +192,15 @@ std::string MMseqsNode::waitForRunFile(const std::string &file) {
     return content.substr(runId.size());
 }
 
+bool MMseqsNode::readRunFile(const std::string &file, std::string &content) {
+    content = readPolledFile(file);
+    if (content.compare(0, runId.size(), runId) != 0) {
+        return false;
+    }
+    content.erase(0, runId.size());
+    return true;
+}
+
 void MMseqsNode::publishRunFile(const std::string &file, const std::string &content) {
     publishFile(file, runId + content);
 }
@@ -327,6 +336,10 @@ void MMseqsNode::publishExchangeFile(FILE *file, const std::string &fileName, si
     }
     __sync_fetch_and_add(&sentExchangeSize, size);
     __sync_fetch_and_add(&sentOtherNodeExchangeSize, size);
+    // without an index the reader learns of the file from a run file
+    if (indexFile.empty()) {
+        return;
+    }
     FILE *handle = FileUtil::openFileOrDie(indexFile.c_str(), "a", true);
     uint64_t magic = getExchangeFileMagic();
     if (fwrite(line.data(), sizeof(uint64_t), line.size() - 1, handle) != line.size() - 1
