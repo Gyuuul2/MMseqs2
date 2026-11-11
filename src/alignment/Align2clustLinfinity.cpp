@@ -4421,8 +4421,8 @@ int align2clustLinfinity(Parameters &par) {
     std::string phaseValues;
     Timer phaseValueTimer;
     const size_t alignNodeCount = MMseqsNode::count - MMseqsNode::getFirstAlignNode();
-    // A2C_OWNER: kmermatcher wrote the pref by target split, its first .partitions line holds the first block of every target split
-    const bool hasTargetSplits = getenv("A2C_OWNER") != NULL && alignNodeCount > 1;
+    // kmermatcher wrote the pref by target split, its first .partitions line holds the first block of every target split
+    const bool hasTargetSplits = par.align2clustMode == Parameters::ALIGN2CLUST_MODE_TARGET_SPLIT && alignNodeCount > 1;
     const std::string partitionsData = MMseqsNode::readFile(par.db2 + ".partitions");
     char *partitionLine = (char *) partitionsData.c_str();
     for (; hasTargetSplits && *partitionLine != '\n'; partitionLine += Util::skipWhitespace(partitionLine)) {
