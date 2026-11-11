@@ -317,14 +317,15 @@ static void fitLocalFileGroups(ExchangeFileGroups &groups, const std::vector<siz
         for (size_t i = groups.count - groups.localCount; i < groups.count; i++) {
             growth += flushEnds[i] - flushStarts[i];
         }
+        // SIZE_MAX if statvfs failed
         size_t freeSize = FileUtil::getFreeSpace(groups.localTmp.c_str());
-        if (2 * growth * groups.localNodes <= freeSize) {
+        if (freeSize != SIZE_MAX && 2 * growth * groups.localNodes <= freeSize) {
             return;
         }
         batchWriter.waitWrites();
         size_t first = groups.count - groups.localCount;
-        MMseqsNode::reportUnusableLocalTmp("Cannot keep " + FileUtil::baseName(getFileGroupName(groups, MMseqsNode::rank, first)) + " in --local-tmp " + groups.localTmp + ": it has "
-                                           + SSTR(freeSize) + " free bytes, the local file groups may need " + SSTR(2 * growth * groups.localNodes));
+        MMseqsNode::reportUnusableLocalTmp("Cannot keep " + FileUtil::baseName(getFileGroupName(groups, MMseqsNode::rank, first)) + " in --local-tmp " + groups.localTmp + ": "
+                                           + ((freeSize == SIZE_MAX) ? std::string("its free space is unknown") : "it has " + SSTR(freeSize) + " free bytes, the local file groups may need " + SSTR(2 * growth * groups.localNodes)));
         groups.files[first] = copyLocalFileGroup(groups, first, groups.files[first], flushStarts[first]);
         groups.names[first] = getFileGroupName(groups, MMseqsNode::rank, first);
         groups.localCount--;
@@ -3012,13 +3013,14 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     size_t partitionsPerGroup = (partitionCount + kmerGroups.count - 1) / kmerGroups.count;
     initFileGroups(pairGroups, par.db2 + ".pairs", partitionCount, partitionsPerGroup, 4 + partitionsPerGroup);
     if (localNodes > 0) {
-        size_t share = FileUtil::getFreeSpace(par.localTmp.c_str()) / localNodes;
+        size_t freeSize = FileUtil::getFreeSpace(par.localTmp.c_str());
+        size_t share = (freeSize == SIZE_MAX) ? 0 : freeSize / localNodes;
         size_t kmerGroupSize = std::max((size_t) 1, totalKmerCount * receiverKmerSize / (MMseqsNode::count * kmerGroups.count));
         size_t pairGroupSize = std::max((size_t) 1, totalKmerCount * ((exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT) / (MMseqsNode::count * pairGroups.count));
         kmerGroups.localCount = std::min(kmerGroups.count, share / (3 * kmerGroupSize));
         pairGroups.localCount = std::min(pairGroups.count, share / (3 * pairGroupSize));
         if (kmerGroups.localCount < kmerGroups.count || pairGroups.localCount < pairGroups.count) {
-            MMseqsNode::reportUnusableLocalTmp("Cannot keep all exchange file groups in --local-tmp " + par.localTmp + ": its " + SSTR(share) + " free bytes per node hold "
+            MMseqsNode::reportUnusableLocalTmp("Cannot keep all exchange file groups in --local-tmp " + par.localTmp + ": its " + ((freeSize == SIZE_MAX) ? std::string("unknown free space holds ") : SSTR(share) + " free bytes per node hold ")
                                                + SSTR(kmerGroups.localCount) + " of " + SSTR(kmerGroups.count) + " k-mer and " + SSTR(pairGroups.localCount) + " of "
                                                + SSTR(pairGroups.count) + " pair file groups");
         }
