@@ -1940,7 +1940,11 @@ private:
             behindNodes++;
             behindWindows[node] = std::min(behind - 1, (size_t) (0.5 / STEAL_SHARE_STEP));
         }
-        windowDoneRepKeys.push_back(__atomic_load_n(&doneRepKeys[MMseqsNode::rank], __ATOMIC_RELAXED));
+        // a done key once, so behind counts the master steps and not the claims between them
+        size_t ownDoneRepKey = __atomic_load_n(&doneRepKeys[MMseqsNode::rank], __ATOMIC_RELAXED);
+        if (windowDoneRepKeys.empty() || windowDoneRepKeys.back() != ownDoneRepKey) {
+            windowDoneRepKeys.push_back(ownDoneRepKey);
+        }
 
         double idleCells = cellsPerSecond * std::max(0.0, waitSeconds - usedWaitSeconds);
         usedWaitSeconds = waitSeconds;
@@ -2889,6 +2893,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             double fastReadSeconds = BATCH_READ_SECONDS;
             double fastReadEnd = 0;
             double nextRequestListing = 0;
+            // the master progress while the gate is closed, about as often as before the faster polls
+            double nextGateRead = 0;
             std::vector<std::string> requestNames;
             std::vector<std::vector<ServedFile> > servedFiles(nodes);
             // requesting node: progress, code range of this node per open request, codes served so far, served files not yet deleted
@@ -2981,7 +2987,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     {
                         std::lock_guard<std::mutex> assignedKeysLock(assignedKeysMutex);
                         size_t repKey = std::min(nextRequest->firstPendingRepKey, getFirstRepKey(*nextRequest));
-                        if (canWait && repKey > clusteredOrderKey && nextAcceptedSize >= clusteredAcceptedSize + maxUnclusteredAcceptedSize) {
+                        if (canWait && repKey > clusteredOrderKey && nextAcceptedSize >= clusteredAcceptedSize + maxUnclusteredAcceptedSize && serviceTimer.getTimediff() >= nextGateRead) {
+                            nextGateRead = serviceTimer.getTimediff() + BATCH_READ_SECONDS / 2;
                             readAssignedKeys(true);
                         }
                         isAhead = canWait && repKey > clusteredOrderKey && nextAcceptedSize >= clusteredAcceptedSize + maxUnclusteredAcceptedSize;
