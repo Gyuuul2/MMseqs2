@@ -838,9 +838,7 @@ static void unpackEntries(const char *servedEntries, size_t keyCount, const size
 }
 
 static const size_t SERVICE_POLL_NODES = 8;
-static const size_t SERVICE_OPENS_PER_SECOND = 10000;
-static const size_t MAX_SERVICE_PASS_MICROSECONDS = 1280000;
-// progress file reads of the sequence service per second
+// progress file reads of the sequence service, or index reads of the cluster member exchange, per node and second
 static const size_t PROGRESS_READS_PER_SECOND = 100;
 
 // prefix sums in parallel
@@ -1120,25 +1118,20 @@ struct ClusterMemberExchange {
         const unsigned int nodes = MMseqsNode::count;
         const unsigned int rank = MMseqsNode::rank;
         size_t owingCount = std::count(isAnswered.begin(), isAnswered.end(), 0);
-        const size_t polledNodes = std::min<size_t>(SERVICE_POLL_NODES, std::max<size_t>(1, owingCount));
-        const size_t pollMicroseconds = std::min(MAX_SERVICE_PASS_MICROSECONDS, polledNodes * nodes * 1000000 / SERVICE_OPENS_PER_SECOND);
-        std::vector<uint64_t> memberLines(16 * MEMBER_LINE_WORDS);
+        // a node answers every requester between two answers to this node
+        std::vector<uint64_t> memberLines(std::max<size_t>(16, 2 * nodes) * MEMBER_LINE_WORDS);
         MMseqsNode::WaitWarning waitWarning;
         Timer waitTimer;
-        for (size_t pollTurn = 0; owingCount > 0;) {
-            bool hasWorked = false;
-            size_t polledCount = 0;
-            size_t i = 0;
-            for (; i < nodes && polledCount < polledNodes; i++) {
-                unsigned int node = static_cast<unsigned int>((pollTurn + i) % nodes);
+        while (owingCount > 0) {
+            bool hasMoreLines = false;
+            for (unsigned int node = 0; node < nodes; node++) {
                 if (isAnswered[node]) {
                     continue;
                 }
-                polledCount++;
                 const size_t lineCount = MMseqsNode::readExchangeIndexLines(getMemberIndex(node), nextMemberLines[node], MEMBER_LINE_WORDS, memberLines);
                 nextMemberLines[node] += lineCount;
                 // more lines may follow a full read
-                hasWorked |= lineCount * MEMBER_LINE_WORDS == memberLines.size();
+                hasMoreLines |= lineCount * MEMBER_LINE_WORDS == memberLines.size();
                 for (size_t l = 0; l < lineCount; l++) {
                     // member line: member file, requester, request, size, consumed bytes, magic; a line of another requester is skipped
                     const uint64_t *line = memberLines.data() + l * MEMBER_LINE_WORDS;
@@ -1158,13 +1151,11 @@ struct ClusterMemberExchange {
                     nodeConsumedBytes[node] = line[4];
                     isAnswered[node] = 1;
                     owingCount--;
-                    hasWorked = true;
                 }
             }
-            // start the next pass behind the last node
-            pollTurn += i;
-            if (hasWorked == false && owingCount > 0) {
-                usleep(pollMicroseconds);
+            // only the nodes that owe an answer are read, PROGRESS_READS_PER_SECOND indexes a second at most
+            if (hasMoreLines == false && owingCount > 0) {
+                usleep(std::max<size_t>(10000, owingCount * 1000000 / PROGRESS_READS_PER_SECOND));
                 waitWarning.check(served);
             }
         }
@@ -1233,27 +1224,32 @@ struct ClusterMemberExchange {
             isRequesting[node] = node != rank;
             requesterCount += isRequesting[node];
         }
-        // like the sequence service, every node opens at most SERVICE_OPENS_PER_SECOND / nodes indexes a second while idle
-        const size_t polledNodes = std::min<size_t>(SERVICE_POLL_NODES, std::max<size_t>(1, requesterCount));
-        const size_t pollMicroseconds = std::min(MAX_SERVICE_PASS_MICROSECONDS, polledNodes * nodes * 1000000 / SERVICE_OPENS_PER_SECOND);
+        // an idle requester is read every idleSeconds, PROGRESS_READS_PER_SECOND indexes a second at most; a requester that asked asks again soon,
+        // it is read after 10 ms and then at twice the interval each time
+        const double idleSeconds = std::max(0.04, (double) requesterCount / PROGRESS_READS_PER_SECOND);
+        std::vector<double> readSeconds(nodes, idleSeconds);
+        std::vector<double> nextReads(nodes, 0);
+        Timer serveTimer;
         std::vector<char> section;
         std::vector<DBKeyType> requestedKeys;
         std::vector<size_t> requestedOffsets;
         std::vector<size_t> requestedBytes;
         std::string reply;
-        unsigned int polls = 0;
-        for (size_t pollTurn = 0; requesterCount > 0;) {
-            bool hasWorked = false;
-            size_t polledCount = 0;
-            size_t i = 0;
-            for (; i < nodes - firstAlignNode && polledCount < polledNodes; i++) {
-                unsigned int requester = static_cast<unsigned int>(firstAlignNode + (pollTurn + i) % (nodes - firstAlignNode));
+        while (requesterCount > 0) {
+            double nextRead = serveTimer.getTimediff() + idleSeconds;
+            for (unsigned int requester = firstAlignNode; requester < nodes; requester++) {
                 if (isRequesting[requester] == 0) {
                     continue;
                 }
-                polledCount++;
+                if (serveTimer.getTimediff() < nextReads[requester]) {
+                    nextRead = std::min(nextRead, nextReads[requester]);
+                    continue;
+                }
                 const size_t lineCount = MMseqsNode::readExchangeIndexLines(getRequestIndex(requester), nextRequestLines[requester], requestLineWords, requestLines);
                 nextRequestLines[requester] += lineCount;
+                readSeconds[requester] = (lineCount > 0) ? 0.01 : std::min(2.0 * readSeconds[requester], idleSeconds);
+                nextReads[requester] = serveTimer.getTimediff() + readSeconds[requester];
+                nextRead = std::min(nextRead, nextReads[requester]);
                 for (size_t l = 0; l < lineCount; l++) {
                     const uint64_t *line = requestLines.data() + l * requestLineWords;
                     const size_t sectionBegin = line[4 + rank];
@@ -1294,16 +1290,11 @@ struct ClusterMemberExchange {
                         isRequesting[requester] = 0;
                         requesterCount--;
                     }
-                    hasWorked = true;
                 }
             }
-            // start the next pass behind the last requester
-            pollTurn += i;
-            if (hasWorked) {
-                polls = 0;
-            } else if (requesterCount > 0) {
-                // idle passes last 10, 20, then 40 ms
-                usleep(std::max(pollMicroseconds, (size_t) 10000 << std::min(polls++, 2u)));
+            const double waitSeconds = nextRead - serveTimer.getTimediff();
+            if (requesterCount > 0 && waitSeconds > 0) {
+                usleep(static_cast<useconds_t>(waitSeconds * 1000000));
             }
         }
     }
@@ -2341,26 +2332,23 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         if (MMseqsNode::readLogProgress(assignedKeysLog, publishedKey, publishedSize) == false) {
             return;
         }
-        while (assignedKeysSize < publishedSize) {
-            assignedKeyWords.resize(headerWords);
-            if (MMseqsNode::readLog(assignedKeysLog, assignedKeysSize, assignedKeysSize + headerWords * sizeof(uint64_t), (char *) assignedKeyWords.data(), wait) == false) {
-                return;
-            }
-            const size_t stepClusteredKey = assignedKeyWords[0];
-            const size_t stepClusteredSize = assignedKeyWords[1 + MMseqsNode::rank];
-            size_t keyCount = assignedKeyWords[1 + MMseqsNode::count];
-            size_t key = assignedKeyWords[2 + MMseqsNode::count];
-            unsigned int keyDiffLowBits = assignedKeyWords[3 + MMseqsNode::count];
-            size_t codeWords = assignedKeyWords[4 + MMseqsNode::count];
+        // the published steps in one read
+        assignedKeyWords.resize((publishedSize - assignedKeysSize) / sizeof(uint64_t));
+        if (MMseqsNode::readLog(assignedKeysLog, assignedKeysSize, publishedSize, (char *) assignedKeyWords.data(), wait) == false) {
+            return;
+        }
+        for (const uint64_t *step = assignedKeyWords.data(); assignedKeysSize < publishedSize;) {
+            const size_t stepClusteredKey = step[0];
+            const size_t stepClusteredSize = step[1 + MMseqsNode::rank];
+            size_t keyCount = step[1 + MMseqsNode::count];
+            size_t key = step[2 + MMseqsNode::count];
+            unsigned int keyDiffLowBits = step[3 + MMseqsNode::count];
+            size_t codeWords = step[4 + MMseqsNode::count];
             for (size_t node = 0; targetSplitReader != NULL && node < MMseqsNode::count; node++) {
-                __atomic_store_n(&targetSplitReader->doneRepKeys[node], assignedKeyWords[5 + MMseqsNode::count + node], __ATOMIC_RELAXED);
+                __atomic_store_n(&targetSplitReader->doneRepKeys[node], step[5 + MMseqsNode::count + node], __ATOMIC_RELAXED);
             }
-            size_t codeStart = assignedKeysSize + headerWords * sizeof(uint64_t);
-            assignedKeyWords.resize(codeWords);
-            if (MMseqsNode::readLog(assignedKeysLog, codeStart, codeStart + codeWords * sizeof(uint64_t), (char *) assignedKeyWords.data(), wait) == false) {
-                return;
-            }
-            KmerCodeReader codeRead = { (char *) assignedKeyWords.data(), 0, 0, 0, -1, assignedKeysLog.c_str(), codeWords * sizeof(uint64_t), 0, codeWords * sizeof(uint64_t) };
+            step += headerWords;
+            KmerCodeReader codeRead = { (char *) step, 0, 0, 0, -1, assignedKeysLog.c_str(), codeWords * sizeof(uint64_t), 0, codeWords * sizeof(uint64_t) };
             // only the thread that holds assignedKeysMutex adds pages
             for (size_t i = 0; i < keyCount; i++) {
                 key += (i > 0) ? getRice(codeRead, keyDiffLowBits) + 1 : 0;
@@ -2372,7 +2360,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 }
                 __atomic_fetch_or(&page[key % ASSIGNED_PAGE_KEYS / 64], 1ULL << (key % 64), __ATOMIC_RELAXED);
             }
-            assignedKeysSize = codeStart + codeWords * sizeof(uint64_t);
+            step += codeWords;
+            assignedKeysSize += (headerWords + codeWords) * sizeof(uint64_t);
             assignedKeyCount += keyCount;
             clusteredOrderKey = stepClusteredKey;
             clusteredAcceptedSize = stepClusteredSize;
