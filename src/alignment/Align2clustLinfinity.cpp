@@ -2892,9 +2892,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             };
             std::vector<double> nextServedProgressReads(nodes, 0);
             std::vector<std::vector<ServedFile> > servedFiles(nodes);
-            // requesting node: progress, code range of this node per open request, keys being served, served files not yet deleted
+            // requesting node: progress, code range of this node per open request, codes served so far, served files not yet deleted
             struct Requester {
-                Requester() : requestCount(0), receivedCount(0), isLast(false), isDone(false), nextProgressRead(0), servedCount(0), keyPos(0), file(0) {}
+                Requester() : requestCount(0), receivedCount(0), isLast(false), isDone(false), nextProgressRead(0), servedCount(0), codePos(0), lastKey(0), file(0) {}
                 size_t requestCount;
                 size_t receivedCount;
                 bool isLast;
@@ -2902,8 +2902,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 double nextProgressRead;
                 std::vector<size_t> openRequests;
                 size_t servedCount;
-                std::vector<DBKeyType> keys;
-                size_t keyPos;
+                size_t codePos;
+                DBKeyType lastKey;
                 size_t file;
                 std::vector<ServedFile> files;
             };
@@ -2914,6 +2914,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             std::vector<const char *> requestColumns(nodes + 3);
             bool isServedProgressChanged = false;
             std::vector<char> receivedEntries;
+            std::vector<DBKeyType> servedKeys;
             std::vector<DBKeyType> rawKeys;
             std::vector<size_t> requestOffsets;
             std::vector<char> servedFileData;
@@ -3016,9 +3017,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             objectWriteCount++;
                             isRequestProgressChanged = true;
                         }
-                        // the keys of this node
-                        size_t ownKey = nextRequest->fetchSourceKeyOffsets[rank];
-                        copyEntries(nextRequest->keys.data() + ownKey, nextRequest->fetchSourceKeyOffsets[rank + 1] - ownKey, nextRequest->entryOffsets.data() + ownKey, nextRequest->entries, NULL);
                         isRequestProgressChanged |= isLast;
                         isLastRequested = isLast;
                         requestedSequences = nextRequest;
@@ -3150,6 +3148,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     MMseqsNode::publishRunFile(requestProgress, content);
                     objectWriteCount++;
                 }
+                // the keys of this node while the other nodes serve the new request
+                if (nextRequest != NULL && requestedSequences == nextRequest) {
+                    size_t ownKey = nextRequest->fetchSourceKeyOffsets[rank];
+                    copyEntries(nextRequest->keys.data() + ownKey, nextRequest->fetchSourceKeyOffsets[rank + 1] - ownKey, nextRequest->entryOffsets.data() + ownKey, nextRequest->entries, NULL);
+                }
                 // a fetch goes to the aligning threads once its request is received
                 if (requestedSequences != NULL && ownRequests.empty()) {
                     {
@@ -3234,54 +3237,59 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             continue;
                         }
                         Timer servingTimer;
-                        if (requester.keys.empty()) {
-                            std::string requestFile = requests + "." + SSTR(node) + "." + SSTR(requester.servedCount);
-                            size_t observedSize;
-                            uint64_t observedNumber;
-                            int lastError;
-                            objectReadCount++;
-                            int requestFd = MMseqsNode::tryOpenExchangeFile(requestFile, requestSize, requester.servedCount, observedSize, observedNumber, lastError);
-                            if (requestFd < 0 && lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
-                                Debug(Debug::ERROR) << "Cannot open sequence request " << requestFile << ": " << strerror(lastError) << "\n";
+                        // the codes of the next keys, a request is read in pieces
+                        std::string requestFile = requests + "." + SSTR(node) + "." + SSTR(requester.servedCount);
+                        size_t observedSize;
+                        uint64_t observedNumber;
+                        int lastError;
+                        objectReadCount++;
+                        int requestFd = MMseqsNode::tryOpenExchangeFile(requestFile, requestSize, requester.servedCount, observedSize, observedNumber, lastError);
+                        if (requestFd < 0 && lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
+                            Debug(Debug::ERROR) << "Cannot open sequence request " << requestFile << ": " << strerror(lastError) << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        requestCodes.resize(std::min(codeEnd - codeBegin - requester.codePos, maxServedKeys * sizeof(DBKeyType)));
+                        bool isRequestRead = requestFd >= 0 && MMseqsNode::tryPreadAll(requestFd, requestCodes.data(), requestCodes.size(), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + codeBegin + requester.codePos, lastError);
+                        if (requestFd >= 0 && close(requestFd) != 0 && isRequestRead) {
+                            lastError = errno;
+                            isRequestRead = false;
+                        }
+                        // a missing or short request is tried again in the next pass
+                        if (isRequestRead == false) {
+                            servingSeconds += servingTimer.getTimediff();
+                            if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EINTR) {
+                                Debug(Debug::ERROR) << "Cannot read sequence request " << requestFile << ": " << strerror(lastError) << "\n";
                                 EXIT(EXIT_FAILURE);
                             }
-                            requestCodes.resize(codeEnd - codeBegin);
-                            bool isRequestRead = requestFd >= 0 && MMseqsNode::tryPreadAll(requestFd, requestCodes.data(), requestCodes.size(), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + codeBegin, lastError);
-                            if (requestFd >= 0 && close(requestFd) != 0 && isRequestRead) {
-                                lastError = errno;
-                                isRequestRead = false;
-                            }
-                            // a missing or short request is tried again in the next pass
-                            if (isRequestRead == false) {
-                                servingSeconds += servingTimer.getTimediff();
-                                if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EINTR) {
-                                    Debug(Debug::ERROR) << "Cannot read sequence request " << requestFile << ": " << strerror(lastError) << "\n";
-                                    EXIT(EXIT_FAILURE);
-                                }
-                                failIfMissingTooLong(missingFileSince[node], missingFileAttempts[node], "Cannot read complete sequence request " + requestFile
-                                                     + describeServedFile(requestSize, observedSize, requester.servedCount, observedNumber, lastError));
-                                break;
-                            }
-                            missingFileAttempts[node] = 0;
-                            const char *code = requestCodes.data();
-                            for (DBKeyType key = 0; code < requestCodes.data() + requestCodes.size();) {
-                                key += Util::getPrefKey(code);
-                                requester.keys.push_back(key);
-                            }
-                            requester.keyPos = 0;
-                            requester.file = 0;
+                            failIfMissingTooLong(missingFileSince[node], missingFileAttempts[node], "Cannot read complete sequence request " + requestFile
+                                                 + describeServedFile(requestSize, observedSize, requester.servedCount, observedNumber, lastError));
+                            break;
                         }
-                        // the unassigned entries of at least one key, up to servedFileEntrySize bytes
-                        const DBKeyType *keys = requester.keys.data() + requester.keyPos;
-                        size_t keyCount = 0;
+                        missingFileAttempts[node] = 0;
+                        // only the last byte of a code is below 0x80
+                        const char *codesEnd = requestCodes.data() + requestCodes.size();
+                        while (codesEnd > requestCodes.data() && static_cast<unsigned char>(codesEnd[-1]) >= 0x80) {
+                            codesEnd--;
+                        }
+                        // the unassigned entries of at least one key, up to servedFileEntrySize bytes and maxServedKeys keys
+                        servedKeys.clear();
+                        const char *code = requestCodes.data();
                         size_t keyRange = SIZE_MAX;
-                        for (size_t entrySize = 0; requester.keyPos + keyCount < requester.keys.size(); keyCount++) {
-                            size_t keySize = isAssigned(keys[keyCount]) ? 0 : seqDbr.getSeqLenFromRange(keyRange, keys[keyCount]) + 2;
-                            if (keyCount > 0 && entrySize + keySize > servedFileEntrySize) {
+                        for (size_t entrySize = 0; servedKeys.size() < maxServedKeys && code < codesEnd;) {
+                            const char *nextCode = code;
+                            DBKeyType key = requester.lastKey + Util::getPrefKey(nextCode);
+                            size_t keySize = isAssigned(key) ? 0 : seqDbr.getSeqLenFromRange(keyRange, key) + 2;
+                            if (servedKeys.empty() == false && entrySize + keySize > servedFileEntrySize) {
                                 break;
                             }
+                            servedKeys.push_back(key);
+                            requester.lastKey = key;
+                            code = nextCode;
                             entrySize += keySize;
                         }
+                        requester.codePos += code - requestCodes.data();
+                        const DBKeyType *keys = servedKeys.data();
+                        size_t keyCount = servedKeys.size();
                         requestOffsets.resize(keyCount + 1);
                         requestOffsets[0] = (keyCount + 7) / 8;
 #pragma omp parallel num_threads(serviceThreads)
@@ -3340,10 +3348,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         servedSize += servedFileSize;
                         servedFileCount++;
                         objectWriteCount++;
-                        requester.keyPos += keyCount;
                         requester.file++;
-                        if (requester.keyPos == requester.keys.size()) {
-                            requester.keys.clear();
+                        if (requester.codePos == codeEnd - codeBegin) {
+                            requester.codePos = 0;
+                            requester.lastKey = 0;
+                            requester.file = 0;
                             requester.servedCount++;
                         }
                         hasWorked = true;
