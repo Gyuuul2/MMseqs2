@@ -46,7 +46,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
     std::vector<size_t> splitKeyOffsets;
     std::vector<size_t> cluKeyOffsets;
     if (isLinfinity) {
-        cluKeyOffsets = MMseqsNode::getClusterKeyOffsets(par.db4 + ".cluster_key_offsets", par.db3, seqDbr.getSize());
+        cluKeyOffsets = MMseqsNode::getClusterKeyOffsets(par.db3 + "_fasta.cluster_key_offsets", par.db3, seqDbr.getSize());
         std::vector<size_t> fileKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
         size_t fileFirstKey = fileKeyOffsets[MMseqsNode::rank];
         size_t fileEndKey = fileKeyOffsets[MMseqsNode::rank + 1];

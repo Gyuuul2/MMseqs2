@@ -370,12 +370,13 @@ int createtsv(int argc, const char **argv, const Command &command) {
         std::string phaseValues;
         Timer timer;
 
-        std::string sortedByMember = par.db4 + "_by_member";
+        // exchange files next to the clustering, the TSV can be on another file system
+        std::string sortedByMember = par.db3 + "_tsv_by_member";
         std::string sortedByMemberIndex = MMseqsNode::sendClusterPairs(par.db3, true, ClusterPair::compareByMember, nodeKeyOffsets, sortedByMember);
         MMseqsNode::addPhaseTime(phaseValues, "sending cluster pairs", timer);
 
-        std::string sortedByRep = par.db4 + "_by_rep";
-        std::vector<size_t> tsvKeyOffsets = MMseqsNode::getBalancedClusterKeyOffsets(par.db4 + ".cluster_key_offsets", par.db3, headers.getSize());
+        std::string sortedByRep = par.db3 + "_tsv_by_rep";
+        std::vector<size_t> tsvKeyOffsets = MMseqsNode::getBalancedClusterKeyOffsets(par.db3 + "_tsv.cluster_key_offsets", par.db3, headers.getSize());
         std::string sortedByRepIndex = readMemberAccessions(sortedByMemberIndex, sortedByMember, headers, nodeKeyOffsets, tsvKeyOffsets,
                                                             Util::computeMemory(par.splitMemoryLimit), sortedByRep);
         headers.close();
