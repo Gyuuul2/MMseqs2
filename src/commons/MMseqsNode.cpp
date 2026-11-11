@@ -1481,29 +1481,33 @@ std::vector<size_t> MMseqsNode::getClusterKeyOffsets(const std::string &barrierF
 std::vector<size_t> MMseqsNode::getBalancedClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount) {
     if (isMaster()) {
         std::vector<size_t> partOffsets(count + 1, 0);
+#pragma omp parallel for schedule(dynamic, 1)
         for (size_t node = 0; node < count; node++) {
             DBReader<DBKeyType> cluDb((clu + "." + SSTR(node)).c_str(), (clu + ".index." + SSTR(node)).c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
             cluDb.open(DBReader<DBKeyType>::NOSORT);
-            partOffsets[node + 1] = partOffsets[node] + cluDb.getDataSize();
+            partOffsets[node + 1] = cluDb.getDataSize();
             cluDb.close();
         }
-        std::string firstKeys;
-        size_t split = 1;
-        for (size_t node = 0; node < count && split < count; node++) {
-            if (partOffsets[count] * split / count >= partOffsets[node + 1]) {
+        for (size_t node = 0; node < count; node++) {
+            partOffsets[node + 1] += partOffsets[node];
+        }
+        std::vector<size_t> splitFirstKeys(count, keyCount);
+#pragma omp parallel for schedule(dynamic, 1)
+        for (size_t split = 1; split < count; split++) {
+            size_t offset = partOffsets[count] * split / count;
+            size_t node = std::upper_bound(partOffsets.begin(), partOffsets.end(), offset) - partOffsets.begin() - 1;
+            if (node == count) {
                 continue;
             }
             DBReader<DBKeyType> cluDb((clu + "." + SSTR(node)).c_str(), (clu + ".index." + SSTR(node)).c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
             cluDb.open(DBReader<DBKeyType>::NOSORT);
-            for (; split < count && partOffsets[count] * split / count < partOffsets[node + 1]; split++) {
-                size_t entry = cluDb.findEntryByOffset(partOffsets[count] * split / count - partOffsets[node]);
-                size_t firstKey = (entry < cluDb.getSize()) ? static_cast<size_t>(cluDb.getIndexEntry(entry).id) : static_cast<size_t>(cluDb.getIndexEntry(cluDb.getSize() - 1).id) + 1;
-                firstKeys += SSTR(firstKey) + "\n";
-            }
+            size_t entry = cluDb.findEntryByOffset(offset - partOffsets[node]);
+            splitFirstKeys[split] = (entry < cluDb.getSize()) ? static_cast<size_t>(cluDb.getIndexEntry(entry).id) : static_cast<size_t>(cluDb.getIndexEntry(cluDb.getSize() - 1).id) + 1;
             cluDb.close();
         }
-        for (; split < count; split++) {
-            firstKeys += SSTR(keyCount) + "\n";
+        std::string firstKeys;
+        for (size_t split = 1; split < count; split++) {
+            firstKeys += SSTR(splitFirstKeys[split]) + "\n";
         }
         publishRunFile(file, firstKeys);
     }

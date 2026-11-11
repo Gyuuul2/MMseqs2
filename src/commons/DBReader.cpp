@@ -1923,10 +1923,12 @@ void DBReader<T>::moveDb(const std::string &srcDbName, const std::string &dstDbN
 template<typename T>
 void DBReader<T>::removeDb(const std::string &databaseName){
     std::vector<std::string> files = FileUtil::findDatafiles(databaseName.c_str());
+#pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < files.size(); ++i) {
         FileUtil::remove(files[i].c_str());
     }
     std::vector<std::string> indexFiles = FileUtil::findDatafiles((databaseName + ".index").c_str());
+#pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < indexFiles.size(); ++i) {
         FileUtil::remove(indexFiles[i].c_str());
     }
@@ -1934,6 +1936,7 @@ void DBReader<T>::removeDb(const std::string &databaseName){
         FileUtil::remove((databaseName + ".index").c_str());
     }
     std::vector<std::string> bitsFiles = FileUtil::findDatafiles((databaseName + ".bits").c_str());
+#pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < bitsFiles.size(); ++i) {
         FileUtil::remove(bitsFiles[i].c_str());
     }
