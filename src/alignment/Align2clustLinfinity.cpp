@@ -3031,7 +3031,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             for (unsigned int node = 0; node < nodes; node++) {
                                 owedCount += request.codeOffsets[node + 1] > request.codeOffsets[node];
                             }
-                            fastReadSeconds = std::max(0.01, std::min(BATCH_READ_SECONDS, 2.0 * owedCount / PROGRESS_READS_PER_SECOND));
+                            fastReadSeconds = std::max(0.01, 2.0 * owedCount / PROGRESS_READS_PER_SECOND);
                             fastReadEnd = serviceTimer.getTimediff() + BATCH_READ_SECONDS;
                             std::fill(servedProgressSeconds.begin(), servedProgressSeconds.end(), fastReadSeconds);
                             std::fill(nextServedProgressReads.begin(), nextServedProgressReads.end(), serviceTimer.getTimediff() + fastReadSeconds);
@@ -3139,7 +3139,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             request.receivedKeys[node] += file.keyCount;
                             request.receivedFiles[node]++;
                             receivedServedEntriesSize += file.size;
-                            fastReadEnd = serviceTimer.getTimediff() + BATCH_READ_SECONDS;
                             servedProgressSeconds[node] = fastReadSeconds;
                             nextServedProgressReads[node] = serviceTimer.getTimediff() + fastReadSeconds;
                             hasWorked = true;
@@ -3207,7 +3206,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 }
                 // the progress of a node is read at once when the names hold a request it did not show yet
                 if (serviceTimer.getTimediff() >= nextRequestListing) {
-                    nextRequestListing = serviceTimer.getTimediff() + std::max(BATCH_READ_SECONDS, (nodes - 1.0) / PROGRESS_READS_PER_SECOND) / 8.0;
+                    nextRequestListing = serviceTimer.getTimediff() + std::max(BATCH_READ_SECONDS, (nodes - 1.0) / PROGRESS_READS_PER_SECOND) / 4.0;
                     MMseqsNode::listDirectory(requests, requestNames);
                     requestListingCount++;
                     for (size_t i = 0; i < requestNames.size(); i++) {
@@ -5046,15 +5045,6 @@ int align2clustLinfinity(Parameters &par) {
         if (FileUtil::makeDir(requests.c_str()) == false && FileUtil::directoryExists(requests.c_str()) == false) {
             Debug(Debug::ERROR) << "Cannot create " << requests << "\n";
             EXIT(EXIT_FAILURE);
-        }
-        // remove the requests of an earlier run
-        std::vector<std::string> names;
-        MMseqsNode::listDirectory(requests, names);
-        std::string prefix = SSTR(MMseqsNode::rank) + ".";
-        for (size_t i = 0; i < names.size(); i++) {
-            if (names[i].compare(0, prefix.size(), prefix) == 0) {
-                FileUtil::remove((requests + "/" + names[i]).c_str());
-            }
         }
     }
     // every node serves the members of its own cluster part, the aligning nodes ask for them
