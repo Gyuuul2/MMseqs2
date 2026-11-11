@@ -1382,9 +1382,9 @@ struct TargetSplitFiles {
     std::vector<std::string> dataNames;
     std::vector<std::string> indexNames;
     std::vector<FILE *> dataFiles;
-    std::vector<FILE *> indexFiles;
     std::vector<size_t> dataSizes;
-    std::vector<size_t> indexSizes;
+    // (first key, data offset) of every entry, written when the files are closed
+    std::vector<std::vector<uint64_t> > indexCells;
     // the cells of the window being written
     std::vector<size_t> cellOffsets;
     std::vector<size_t> cellCosts;
@@ -1405,9 +1405,8 @@ static void writeTargetSplits(const PrefFiles &prefFiles, TargetSplitFiles &file
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     const size_t splitCount = files.dataSizes.size();
     for (size_t split = 0; split < splitCount; split++) {
-        uint64_t indexCell[2] = {firstKey, files.dataSizes[split]};
-        prefFiles.batchWriter->write(fileno(files.indexFiles[split]), files.indexNames[split].c_str(), (const char *) indexCell, sizeof(indexCell), files.indexSizes[split]);
-        files.indexSizes[split] += sizeof(indexCell);
+        files.indexCells[split].push_back(firstKey);
+        files.indexCells[split].push_back(files.dataSizes[split]);
     }
     // a task keeps its pieces by target split in the second write buffer of a thread, so it has at most that many targets or one key
     const size_t pieceCapacity = KMER_FILE_BUFFER_SIZE / sizeof(TargetSplitPiece);
@@ -2498,10 +2497,9 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             targetSplitFiles.dataNames.push_back(par.db2 + "." + SSTR(file));
             targetSplitFiles.indexNames.push_back(par.db2 + ".index." + SSTR(file));
             targetSplitFiles.dataFiles.push_back(FileUtil::openAndDelete(targetSplitFiles.dataNames.back().c_str(), "w"));
-            targetSplitFiles.indexFiles.push_back(FileUtil::openAndDelete(targetSplitFiles.indexNames.back().c_str(), "w"));
         }
         targetSplitFiles.dataSizes.assign(targetSplitCount, 0);
-        targetSplitFiles.indexSizes.assign(targetSplitCount, 0);
+        targetSplitFiles.indexCells.resize(targetSplitCount);
         targetSplitFiles.cellOffsets.assign(targetSplitCount, 0);
         targetSplitFiles.cellCosts.assign(targetSplitCount, 0);
     } else {
@@ -2928,9 +2926,12 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     delete[] pairPassTargets;
     delete[] prefFiles.writeBuffers;
     for (size_t split = 0; split < targetSplitFiles.dataFiles.size(); split++) {
-        MMseqsNode::closeClusterFiles(targetSplitFiles.dataFiles[split], targetSplitFiles.dataNames[split], targetSplitFiles.indexFiles[split], targetSplitFiles.indexNames[split],
-                                      targetSplitFiles.dataSizes[split], targetSplitFiles.indexSizes[split]);
-        prefSize += targetSplitFiles.dataSizes[split] + targetSplitFiles.indexSizes[split] + 2 * sizeof(uint64_t);
+        FILE *indexFile = FileUtil::openAndDelete(targetSplitFiles.indexNames[split].c_str(), "w");
+        size_t indexSize = targetSplitFiles.indexCells[split].size() * sizeof(uint64_t);
+        FileUtil::pwriteAll(fileno(indexFile), targetSplitFiles.indexNames[split].c_str(), (const char *) targetSplitFiles.indexCells[split].data(), indexSize, 0);
+        MMseqsNode::closeClusterFiles(targetSplitFiles.dataFiles[split], targetSplitFiles.dataNames[split], indexFile, targetSplitFiles.indexNames[split],
+                                      targetSplitFiles.dataSizes[split], indexSize);
+        prefSize += targetSplitFiles.dataSizes[split] + indexSize + 2 * sizeof(uint64_t);
     }
     if (exchange.hasTargetSplits == false) {
         MMseqsNode::closeClusterFiles(prefFiles.dataFile, prefFiles.dataName, prefFiles.indexFile, prefFiles.indexName, prefDataSize, prefIndexSize);
