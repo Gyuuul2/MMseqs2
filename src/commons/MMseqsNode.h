@@ -105,7 +105,6 @@ public:
         WorkQueue(const std::string &name, size_t itemCount);
         size_t takeNextItem();
         size_t takeNextItemInOrder();
-        unsigned int getNode(size_t item) const;
         void removeTakenItemFiles();
         bool takeItem(size_t item);
 

@@ -727,7 +727,7 @@ static size_t getRepOrderKey(uint64_t word) {
     return word & ~ACCEPTED_REP_BIT;
 }
 static size_t getAssignedKeysHeaderWords() {
-    return MMseqsNode::count + 5;
+    return 2 * MMseqsNode::count + 5;
 }
 
 // fractions of the memory limit
@@ -1686,7 +1686,7 @@ struct TargetSplitReader {
     TargetSplitReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &cells, MMseqsNode::WorkQueue &cellQueue, size_t maxRecordSize, size_t memoryLimit,
                       size_t paddedDbSize, size_t sizeClassCount)
         : readSize(0), prefSize(0), homeCellCount(0), stolenCellCount(0), lostCellCount(0), stolenCost(0), takenCost(0), stolenTargetBytes(0), targetBytes(0),
-          stealShares(MMseqsNode::count, 0), stolenCostSignChanges(0), stealWindowCount(0),
+          stealShares(MMseqsNode::count, 0), doneRepKeys(MMseqsNode::count, 0), stolenCostSignChanges(0), stealWindowCount(0),
           isClaiming(sizeClassCount == 1 && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()), par(par), seqDbr(seqDbr), cells(cells), cellQueue(cellQueue),
           targetSplitCount(targetSplitBlockOffsets.size() - 1), paddedDbSize(paddedDbSize), sizeClassCount(sizeClassCount),
           maxPrefilterBufferSize(std::max((size_t) 1, memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)),
@@ -1778,6 +1778,7 @@ struct TargetSplitReader {
     size_t stolenTargetBytes;
     size_t targetBytes;
     std::vector<double> stealShares;
+    std::vector<size_t> doneRepKeys;
     size_t stolenCostSignChanges;
     size_t stealWindowCount;
     const bool isClaiming;
@@ -1794,6 +1795,7 @@ private:
     const size_t maxRecordTargetCount;
     std::vector<double> idleShares;
     std::vector<double> stealCarries;
+    std::vector<size_t> windowDoneRepKeys;
     std::vector<unsigned char> wasStolen;
     double cellsPerSecond;
     double waitSeconds;
@@ -1899,21 +1901,6 @@ private:
         return prefReads.size() > prefReadsBefore;
     }
 
-    // node if it took a home cell, count if one is free
-    unsigned int findHomeClaim(size_t window, size_t node) const {
-        for (size_t split = 0; split < targetSplitCount; split++) {
-            size_t cell = window * targetSplitCount + split;
-            if (targetSplitAlignNodes[split] != node || cells[cell].alignmentCells == 0) {
-                continue;
-            }
-            unsigned int claimer = cellQueue.getNode(cell);
-            if (claimer == node || claimer >= MMseqsNode::count) {
-                return std::min(claimer, MMseqsNode::count);
-            }
-        }
-        return UINT_MAX;
-    }
-
     // take the free home cells, then cells of nodes behind
     void claimWindowCells(size_t window) {
         size_t firstCell = window * targetSplitCount;
@@ -1933,7 +1920,7 @@ private:
             }
         }
 
-        // a node without its home cells is behind
+        // a node is behind by the windows since this node had its done rep key
         std::vector<unsigned char> isBehind(MMseqsNode::count, 0);
         std::vector<size_t> behindWindows(MMseqsNode::count, 0);
         size_t behindNodes = 0;
@@ -1942,23 +1929,18 @@ private:
             if (node == MMseqsNode::rank || nodeCosts[node] == 0) {
                 continue;
             }
-            unsigned int claimer = findHomeClaim(window, node);
-            if (claimer == node) {
+            size_t doneRepKey = __atomic_load_n(&doneRepKeys[node], __ATOMIC_RELAXED);
+            size_t behind = windowDoneRepKeys.end() - std::upper_bound(windowDoneRepKeys.begin(), windowDoneRepKeys.end(), doneRepKey);
+            if (behind == 0) {
                 idleShares[node] /= 2;
                 aheadNodes++;
-            } else if (claimer == MMseqsNode::count) {
-                isBehind[node] = 1;
-                behindNodes++;
-                // count the earlier windows with free home cells
-                for (size_t back = 1; back <= window && back * STEAL_SHARE_STEP <= 1 && behindWindows[node] * STEAL_SHARE_STEP < 0.5; back++) {
-                    unsigned int earlier = findHomeClaim(window - back, node);
-                    if (earlier == node) {
-                        break;
-                    }
-                    behindWindows[node] += earlier == MMseqsNode::count;
-                }
+                continue;
             }
+            isBehind[node] = 1;
+            behindNodes++;
+            behindWindows[node] = std::min(behind - 1, (size_t) (0.5 / STEAL_SHARE_STEP));
         }
+        windowDoneRepKeys.push_back(__atomic_load_n(&doneRepKeys[MMseqsNode::rank], __ATOMIC_RELAXED));
 
         double idleCells = cellsPerSecond * std::max(0.0, waitSeconds - usedWaitSeconds);
         usedWaitSeconds = waitSeconds;
@@ -2366,6 +2348,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             size_t key = assignedKeyWords[2 + MMseqsNode::count];
             unsigned int keyDiffLowBits = assignedKeyWords[3 + MMseqsNode::count];
             size_t codeWords = assignedKeyWords[4 + MMseqsNode::count];
+            for (size_t node = 0; targetSplitReader != NULL && node < MMseqsNode::count; node++) {
+                __atomic_store_n(&targetSplitReader->doneRepKeys[node], assignedKeyWords[5 + MMseqsNode::count + node], __ATOMIC_RELAXED);
+            }
             size_t codeStart = assignedKeysSize + headerWords * sizeof(uint64_t);
             assignedKeyWords.resize(codeWords);
             if (MMseqsNode::readLog(assignedKeysLog, codeStart, codeStart + codeWords * sizeof(uint64_t), (char *) assignedKeyWords.data(), wait) == false) {
@@ -4662,6 +4647,9 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         assignedKeyWords[stepStart + 2 + MMseqsNode::count] = stepKeys.empty() ? 0 : stepKeys.front();
         assignedKeyWords[stepStart + 3 + MMseqsNode::count] = keyDiffLowBits;
         assignedKeyWords[stepStart + 4 + MMseqsNode::count] = codeWords;
+        for (size_t node = 0; node < MMseqsNode::count; node++) {
+            assignedKeyWords[stepStart + 5 + MMseqsNode::count + node] = nodeHasProgress[node] ? nodeRepOrderKeys[node] : 0;
+        }
         KmerCodeWriter codeWrite((char *) (assignedKeyWords.data() + stepStart + headerWords), codeWords * sizeof(uint64_t), 0);
         for (size_t i = 1; i < stepKeys.size(); i++) {
             putRice(codeWrite, stepKeys[i] - stepKeys[i - 1] - 1, keyDiffLowBits);

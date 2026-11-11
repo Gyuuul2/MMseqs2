@@ -604,19 +604,6 @@ size_t MMseqsNode::WorkQueue::takeNextItemInOrder() {
     return item;
 }
 
-unsigned int MMseqsNode::WorkQueue::getNode(size_t item) const {
-    unsigned int node = count;
-    std::string file = name + "." + SSTR(item);
-    int fd = openListedFile(file);
-    if (fd >= 0) {
-        if (pread(fd, &node, sizeof(node), 0) != static_cast<ssize_t>(sizeof(node))) {
-            node = count;
-        }
-        close(fd);
-    }
-    return node;
-}
-
 void MMseqsNode::WorkQueue::removeTakenItemFiles() {
     for (size_t item = rank; item < itemCount; item += count) {
         std::string file = name + "." + SSTR(item);
