@@ -43,6 +43,10 @@ public:
     static inline bool isMaster() {
         return rank == MASTER;
     }
+    // from two nodes the master clusters while the other nodes align
+    static inline unsigned int getFirstAlignNode() {
+        return (count > 1) ? 1 : 0;
+    }
 
     static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
     // a --local-tmp that cannot be used is reported and the run goes on in the shared folder
