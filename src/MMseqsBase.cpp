@@ -86,7 +86,7 @@ std::vector<Command> baseCommands = {
         {"easy-lin8clust",       easylin8clust,        &par.easylin8clustworkflow, COMMAND_EASY,
                 "Fast linear time clustering of protein FASTA files on one or many nodes",
                 "mmseqs easy-lin8clust examples/DB.fasta result tmp\n\n"
-                "# Many nodes inside an sbatch allocation, tmp shared by the nodes (srun steps do not inherit --cpus-per-task, so give -c)\n"
+                "# Many nodes inside an sbatch allocation, result and tmp shared by the nodes (srun steps do not inherit --cpus-per-task, so give -c)\n"
                 "mmseqs easy-lin8clust *.fasta result /shared/tmp --node-runner \"srun --kill-on-bad-exit=1 -N 4 --ntasks-per-node=1 -c 64\"\n\n"
                 "# lin8clust output\n"
                 "#  - result_rep_seq.fasta.<node>: Representatives that the node holds\n"

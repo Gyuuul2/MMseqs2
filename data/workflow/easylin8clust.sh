@@ -25,26 +25,21 @@ fi
 
 # a killed step can leave some node files, mark finished steps
 if notExists "${TMP_PATH}/createtsv.done"; then
-    rm -f "${RESULTS}_cluster.tsv".*
+    rm -f "${RESULTS}_cluster.tsv".* "${TMP_PATH}/clu_tsv"*
     # shellcheck disable=SC2086
-    $RUNNER "$MMSEQS" createtsv "${TMP_PATH}/input" "${TMP_PATH}/input" "${TMP_PATH}/clu" "${TMP_PATH}/cluster.tsv" ${CREATETSV_PAR} \
+    $RUNNER "$MMSEQS" createtsv "${TMP_PATH}/input" "${TMP_PATH}/input" "${TMP_PATH}/clu" "${RESULTS}_cluster.tsv" ${CREATETSV_PAR} \
         || fail "createtsv died"
     touch "${TMP_PATH}/createtsv.done"
 fi
 
 if notExists "${TMP_PATH}/result2flat.done"; then
-    rm -f "${RESULTS}_rep_seq.fasta".*
+    rm -f "${RESULTS}_rep_seq.fasta".* "${TMP_PATH}/clu_fasta"*
     # shellcheck disable=SC2086
-    $RUNNER "$MMSEQS" result2flat "${TMP_PATH}/input" "${TMP_PATH}/input" "${TMP_PATH}/clu" "${TMP_PATH}/rep_seq.fasta" ${RESULT2FLAT_PAR} \
+    $RUNNER "$MMSEQS" result2flat "${TMP_PATH}/input" "${TMP_PATH}/input" "${TMP_PATH}/clu" "${RESULTS}_rep_seq.fasta" ${RESULT2FLAT_PAR} \
         || fail "result2flat died"
     touch "${TMP_PATH}/result2flat.done"
 fi
 
-for FILE in "${TMP_PATH}/cluster.tsv".* "${TMP_PATH}/rep_seq.fasta".*; do
-    [ -e "$FILE" ] || continue
-    NAME="${FILE##*/}"
-    mv "$FILE" "${RESULTS}_${NAME}"
-done
 rm -f "${TMP_PATH}/createtsv.done" "${TMP_PATH}/result2flat.done"
 
 if [ -n "${REMOVE_TMP}" ]; then
