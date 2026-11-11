@@ -1016,7 +1016,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
     }
 
-    // a page needs one writer, so the owner writes every page that is not inside the run of one other node
+    // a page needs one writer, so the node of db.<file> writes every page that is not inside the run of one other node
     size_t pageSize = Util::getPageSize();
     std::vector<SequenceRun> sentRuns;
     std::vector<SequenceRun> edgeRuns;
@@ -1300,7 +1300,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                             batchWriter.write(fileno(dataFiles[fileType]), dataFileNames[fileType].c_str(), data, writes[i].second, writes[i].first);
                             continue;
                         }
-                        // blocks inside a run go to db.<file>, its edges to the owner
+                        // blocks inside a run go to db.<file>, its edges to the node of that file
                         for (size_t pos = writes[i].first, end = pos + writes[i].second; pos < end; ) {
                             const SequenceRun &run = *(std::upper_bound(sentRuns.begin(), sentRuns.end(), pos, isBeforeRun) - 1);
                             size_t from = run.start + (pos - run.sentOffset);
