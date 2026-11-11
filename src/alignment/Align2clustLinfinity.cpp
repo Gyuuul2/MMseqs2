@@ -3179,10 +3179,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 if (nextRequest != NULL && requestedSequences == nextRequest) {
                     isLoaded = false;
                     isOwnKeysLoaded = false;
-                    ownKeyLoader = std::thread([&, nextRequest]() {
-#ifdef OPENMP
-                        omp_set_num_threads(1);
-#endif
+                    {
                         size_t ownKey = nextRequest->fetchSourceKeyOffsets[rank];
                         copyEntries(nextRequest->keys.data() + ownKey, nextRequest->fetchSourceKeyOffsets[rank + 1] - ownKey, nextRequest->entryOffsets.data() + ownKey, nextRequest->entries, NULL);
                         {
@@ -3191,11 +3188,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             hasServiceWork = true;
                         }
                         serviceCondition.notify_all();
-                    });
+                        isLoaded = true;
+                    }
                 }
                 // a fetch goes to the aligning threads once its request is received
                 if (requestedSequences != NULL && ownRequests.empty() && isLoaded) {
-                    ownKeyLoader.join();
+                    if (ownKeyLoader.joinable()) {
+                        ownKeyLoader.join();
+                    }
                     {
                         std::lock_guard<std::mutex> lock(serviceMutex);
                         completedSequences = requestedSequences;
