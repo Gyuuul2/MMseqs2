@@ -1390,54 +1390,110 @@ struct TargetSplitFiles {
     std::vector<size_t> cellCosts;
 };
 
+// the targets of a rep in one target split
+struct TargetSplitPiece {
+    size_t key;
+    size_t targetCount;
+    const DBKeyType *first;
+    const DBKeyType *last;
+};
+
 // an entry of every target split for the keys from firstKey; a piece of a rep in the entry is the rep key gap, the size class of all
 // targets of the rep, its targets in the target split as gaps from the target split start and a 0
 static void writeTargetSplits(const PrefFiles &prefFiles, TargetSplitFiles &files, DBReader<DBKeyType> &seqDbr, size_t firstKey, size_t keyCount, const size_t *keyOffsets,
                               const DBKeyType *targets, int threads) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
-#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
-    for (size_t split = 0; split < files.dataSizes.size(); split++) {
-        unsigned int thread_idx = 0;
-#ifdef OPENMP
-        thread_idx = static_cast<unsigned int>(omp_get_thread_num());
-#endif
+    const size_t splitCount = files.dataSizes.size();
+    for (size_t split = 0; split < splitCount; split++) {
         uint64_t indexCell[2] = {firstKey, files.dataSizes[split]};
         prefFiles.batchWriter->write(fileno(files.indexFiles[split]), files.indexNames[split].c_str(), (const char *) indexCell, sizeof(indexCell), files.indexSizes[split]);
         files.indexSizes[split] += sizeof(indexCell);
-        KmerCodeWriter dataWrite(fileno(files.dataFiles[split]), files.dataNames[split].c_str(), prefFiles.writeBuffers + 2 * thread_idx * KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE,
-                                 files.dataSizes[split], prefFiles.batchWriter);
-        const DBKeyType splitFirstKey = files.keyOffsets[split];
-        const DBKeyType splitEndKey = files.keyOffsets[split + 1];
-        size_t prevKey = firstKey;
-        for (size_t key = 0; key < keyCount; key++) {
-            const DBKeyType *begin = targets + keyOffsets[key];
-            const DBKeyType *end = std::lower_bound(begin, targets + keyOffsets[key + 1], DB_KEY_INVALID);
-            if (begin == end || *begin >= splitEndKey || *(end - 1) < splitFirstKey || isRepresentative(firstKey + key) == false) {
-                continue;
-            }
-            const DBKeyType *first = std::lower_bound(begin, end, splitFirstKey);
-            const DBKeyType *last = std::lower_bound(first, end, splitEndKey);
-            if (first == last) {
-                continue;
-            }
-            putPrefKey(dataWrite, firstKey + key - prevKey);
-            putPrefKey(dataWrite, getBitWidth(end - begin) - 1);
-            DBKeyType prevTarget = splitFirstKey - 1;
-            size_t targetRange = SIZE_MAX;
-            size_t targetResidues = 0;
-            for (const DBKeyType *target = first; target < last; target++) {
-                putPrefKey(dataWrite, *target - prevTarget);
-                prevTarget = *target;
-                targetResidues += seqDbr.getSeqLenFromRange(targetRange, *target);
-            }
-            putBytes(dataWrite, "", 1);
-            files.cellCosts[split] += (index[seqDbr.findIdRange(firstKey + key)].length - 2) * targetResidues;
-            prevKey = firstKey + key;
-        }
-        putBytes(dataWrite, "", 1);
-        writeKmerCodeBuffer(dataWrite);
-        files.dataSizes[split] = dataWrite.writePos;
     }
+    // a task keeps its pieces by target split in the second write buffer of a thread, so it has at most that many targets or one key
+    const size_t pieceCapacity = KMER_FILE_BUFFER_SIZE / sizeof(TargetSplitPiece);
+    std::vector<size_t> prevKeys(splitCount, firstKey);
+    std::vector<size_t> taskKeyOffsets;
+    std::vector<size_t> taskPieceOffsets(threads * (splitCount + 1));
+    size_t chunkFirstKey = 0;
+    do {
+        size_t taskTargets = std::min(pieceCapacity, (keyOffsets[keyCount] - keyOffsets[chunkFirstKey] + threads - 1) / threads);
+        taskKeyOffsets.assign(1, chunkFirstKey);
+        while (taskKeyOffsets.size() <= static_cast<size_t>(threads) && taskKeyOffsets.back() < keyCount) {
+            size_t taskFirstKey = taskKeyOffsets.back();
+            size_t taskEndKey = std::upper_bound(keyOffsets + taskFirstKey + 1, keyOffsets + keyCount + 1, keyOffsets[taskFirstKey] + taskTargets) - keyOffsets - 1;
+            taskKeyOffsets.push_back(std::max(taskFirstKey + 1, taskEndKey));
+        }
+        size_t taskCount = taskKeyOffsets.size() - 1;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+        for (size_t task = 0; task < taskCount; task++) {
+            TargetSplitPiece *pieces = (TargetSplitPiece *) (prefFiles.writeBuffers + (2 * task + 1) * KMER_FILE_BUFFER_SIZE);
+            size_t *pieceOffsets = taskPieceOffsets.data() + task * (splitCount + 1);
+            std::fill(pieceOffsets, pieceOffsets + splitCount + 1, 0);
+            std::vector<size_t> nextPiece;
+            // count the pieces of each target split, then fill them in key order
+            for (int fill = 0; fill < 2; fill++) {
+                for (size_t key = taskKeyOffsets[task]; key < taskKeyOffsets[task + 1]; key++) {
+                    const DBKeyType *begin = targets + keyOffsets[key];
+                    const DBKeyType *end = std::lower_bound(begin, targets + keyOffsets[key + 1], DB_KEY_INVALID);
+                    if (begin == end || isRepresentative(firstKey + key) == false) {
+                        continue;
+                    }
+                    for (const DBKeyType *first = begin; first < end;) {
+                        size_t split = std::upper_bound(files.keyOffsets.begin(), files.keyOffsets.end(), *first) - files.keyOffsets.begin() - 1;
+                        const DBKeyType *last = std::lower_bound(first, end, files.keyOffsets[split + 1]);
+                        if (fill == 0) {
+                            pieceOffsets[split + 1]++;
+                        } else {
+                            TargetSplitPiece piece = { key, static_cast<size_t>(end - begin), first, last };
+                            pieces[nextPiece[split]++] = piece;
+                        }
+                        first = last;
+                    }
+                }
+                if (fill == 0) {
+                    for (size_t split = 0; split < splitCount; split++) {
+                        pieceOffsets[split + 1] += pieceOffsets[split];
+                    }
+                    nextPiece.assign(pieceOffsets, pieceOffsets + splitCount);
+                }
+            }
+        }
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+        for (size_t split = 0; split < splitCount; split++) {
+            unsigned int thread_idx = 0;
+#ifdef OPENMP
+            thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+            KmerCodeWriter dataWrite(fileno(files.dataFiles[split]), files.dataNames[split].c_str(), prefFiles.writeBuffers + 2 * thread_idx * KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE,
+                                     files.dataSizes[split], prefFiles.batchWriter);
+            const DBKeyType splitFirstKey = files.keyOffsets[split];
+            for (size_t task = 0; task < taskCount; task++) {
+                const TargetSplitPiece *pieces = (const TargetSplitPiece *) (prefFiles.writeBuffers + (2 * task + 1) * KMER_FILE_BUFFER_SIZE);
+                const size_t *pieceOffsets = taskPieceOffsets.data() + task * (splitCount + 1);
+                for (size_t i = pieceOffsets[split]; i < pieceOffsets[split + 1]; i++) {
+                    putPrefKey(dataWrite, firstKey + pieces[i].key - prevKeys[split]);
+                    putPrefKey(dataWrite, getBitWidth(pieces[i].targetCount) - 1);
+                    DBKeyType prevTarget = splitFirstKey - 1;
+                    size_t targetRange = SIZE_MAX;
+                    size_t targetResidues = 0;
+                    for (const DBKeyType *target = pieces[i].first; target < pieces[i].last; target++) {
+                        putPrefKey(dataWrite, *target - prevTarget);
+                        prevTarget = *target;
+                        targetResidues += seqDbr.getSeqLenFromRange(targetRange, *target);
+                    }
+                    putBytes(dataWrite, "", 1);
+                    files.cellCosts[split] += (index[seqDbr.findIdRange(firstKey + pieces[i].key)].length - 2) * targetResidues;
+                    prevKeys[split] = firstKey + pieces[i].key;
+                }
+            }
+            if (taskKeyOffsets.back() == keyCount) {
+                putBytes(dataWrite, "", 1);
+            }
+            writeKmerCodeBuffer(dataWrite);
+            files.dataSizes[split] = dataWrite.writePos;
+        }
+        chunkFirstKey = taskKeyOffsets.back();
+    } while (chunkFirstKey < keyCount);
 }
 
 // one row per (window, target split): first key, offset, size, cost, node, target split, window
