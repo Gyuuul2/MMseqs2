@@ -13,6 +13,7 @@
 #include <sys/mman.h>
 #include <sys/statvfs.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <cstring>
 #include <thread>
 #include <ctime>
@@ -4753,7 +4754,7 @@ int align2clustLinfinity(Parameters &par) {
     if (hasTargetSplits) {
         size_t targetSplitCount = targetSplitBlockOffsets.size() - 1;
         const DBReader<DBKeyType>::Index *blockIndex = blockDbr.getIndex();
-        std::vector<size_t> splitCosts(targetSplitCount, 0);
+        std::vector<uint128> splitCosts(targetSplitCount, 0);
         for (size_t i = 0; i < partitions.size(); i++) {
             splitCosts[partitions[i].targetSplit] += partitions[i].alignmentCells;
         }
@@ -4888,6 +4889,14 @@ int align2clustLinfinity(Parameters &par) {
     blockDbr.close();
     DBReader<DBKeyType> seqDbr(seqDb.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
     seqDbr.open(DBReader<DBKeyType>::NOSORT);
+    // a claiming node may read every target split, three files each
+    struct rlimit openFileLimit = {0, 0};
+    getrlimit(RLIMIT_NOFILE, &openFileLimit);
+    size_t minOpenFiles = seqDbr.getDataFileCnt() + 64 + 2 * MMseqsNode::count + 3 * (hasTargetSplits ? targetSplitBlockOffsets.size() - 1 : 0);
+    if (minOpenFiles > openFileLimit.rlim_cur) {
+        Debug(Debug::ERROR) << "Raise the open file limit (ulimit -n) to at least " << minOpenFiles << "\n";
+        EXIT(EXIT_FAILURE);
+    }
     const std::vector<size_t> nodeKeyOffsets = seqDbr.getEvenNodeKeyOffsets(MMseqsNode::count);
     const size_t dbSize = seqDbr.getSize();
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
