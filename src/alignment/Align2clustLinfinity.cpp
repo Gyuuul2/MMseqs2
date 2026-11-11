@@ -3375,16 +3375,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #pragma omp parallel
         {
             size_t repRange = SIZE_MAX;
-#pragma omp for schedule(dynamic, 100)
+#pragma omp for schedule(static)
             for (size_t i = 0; i < recordCount; i++) {
                 const RepTargetsRecord &record = records[currentSequences.begin + i];
-                const DBKeyType *targets = prefilterTargets[currentSequences.prefilterBuffer].data() + record.targetOffset;
-                size_t targetRange = SIZE_MAX;
-                size_t targetResidues = 0;
-                for (unsigned int j = 0; j < record.targetCount; j++) {
-                    targetResidues += seqDbr.getSeqLenFromRange(targetRange, targets[j]);
-                }
-                recordAlignmentCells[i] = getSeqLenFromCursor(seqDbr, repRange, record.repOrderKeyFirstTarget.repKey % paddedDbSize) * targetResidues;
+                size_t repLength = getSeqLenFromCursor(seqDbr, repRange, record.repOrderKeyFirstTarget.repKey % paddedDbSize);
+                // readSize holds the rep and target entries
+                recordAlignmentCells[i] = repLength * (record.readSize - (repLength + 2 + FETCHED_KEY_SIZE) - record.targetCount * (2 + FETCHED_KEY_SIZE));
             }
         }
         uint128 fetchAlignmentCells = 0;
@@ -3452,11 +3448,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     const unsigned int endTarget = (i == batchOffsets[batch + 1]) ? batchFirstTargets[batch + 1] : record.targetCount;
                     examinedCount += endTarget - firstTarget;
                     const size_t repKey = record.repOrderKeyFirstTarget.repKey % paddedDbSize;
+                    if (isAssigned(record.repOrderKeyFirstTarget.repKey)) {
+                        repSkippedCount += endTarget - firstTarget;
+                        continue;
+                    }
                     size_t repLength = 0;
                     const char *repData = getFetchedSequence(currentSequences, repKey, &repLength);
-                    if (isAssigned(record.repOrderKeyFirstTarget.repKey) || repData == NULL) {
+                    if (repData == NULL) {
                         repSkippedCount += endTarget - firstTarget;
-                        repSlotSkippedCount += isAssigned(record.repOrderKeyFirstTarget.repKey) ? 0 : endTarget - firstTarget;
+                        repSlotSkippedCount += endTarget - firstTarget;
                         continue;
                     }
                     bool isRepMapped = false;
@@ -3465,9 +3465,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     unsigned int j = firstTarget;
                     for (; j < endTarget && isAssigned(record.repOrderKeyFirstTarget.repKey) == false; j++) {
                         const DBKeyType targetKey = targets[j];
+                        if (isAssigned(targetKey)) {
+                            targetSkippedCount++;
+                            continue;
+                        }
                         size_t targetLength = 0;
                         const char *targetData = getFetchedSequence(currentSequences, targetKey, &targetLength, &targetCursor);
-                        if (isAssigned(targetKey) || targetData == NULL) {
+                        if (targetData == NULL) {
                             targetSkippedCount++;
                             continue;
                         }
