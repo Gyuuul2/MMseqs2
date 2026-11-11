@@ -1241,6 +1241,7 @@ struct ClusterMemberExchange {
                 if (isRequesting[requester] == 0) {
                     continue;
                 }
+                nextReads[requester] = std::min(nextReads[requester], serveTimer.getTimediff() + idleSeconds);
                 if (serveTimer.getTimediff() < nextReads[requester]) {
                     nextRead = std::min(nextRead, nextReads[requester]);
                     continue;
@@ -2330,6 +2331,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         size_t publishedKey;
         size_t publishedSize;
         if (MMseqsNode::readLogProgress(assignedKeysLog, publishedKey, publishedSize) == false) {
+            return;
+        }
+        if (publishedSize <= assignedKeysSize) {
             return;
         }
         // the published steps in one read
