@@ -701,6 +701,7 @@ static const double BATCH_READ_SECONDS = PUBLISH_SECONDS / 4.0;
 static const double PREFILTER_BUFFER_WORK_SECONDS = 2.0 * PUBLISH_SECONDS;
 static const size_t ALIGN_BATCHES_PER_THREAD = 64;
 static const size_t ALIGN_BATCH_LANES = 16;
+static const size_t MIN_BATCH_SWIPE_JOBS = 64 * SwipeExtender::LANES;
 static const int CLUSTER_THREADS = 4;
 static const uint64_t ACCEPTED_REP_BIT = 1ULL << 63;
 
@@ -1959,6 +1960,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t slicedMemberPosition = 0;
     size_t multiFetchPairCount = 0;
     size_t slicedPairCount = 0;
+    size_t fetchCount = 0;
+    size_t fewerBatchFetchCount = 0;
     // coverable bytes of a rep per serving node
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     const size_t rangeCount = seqDbr.getIndexSize();
@@ -2885,7 +2888,19 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         const std::vector<RepTargetsRecord> &records = prefilterRecords[currentSequences.prefilterBuffer];
         const size_t recordCount = currentSequences.end - currentSequences.begin;
         // batches of about equal alignment cells; a large rep spans several
-        const size_t maxBatches = par.threads * (isSwipeEnabled ? ALIGN_BATCHES_PER_THREAD * ALIGN_BATCH_LANES / SwipeExtender::LANES : ALIGN_BATCHES_PER_THREAD);
+        size_t maxBatches = par.threads * (isSwipeEnabled ? ALIGN_BATCHES_PER_THREAD * ALIGN_BATCH_LANES / SwipeExtender::LANES : ALIGN_BATCHES_PER_THREAD);
+        if (isSwipeEnabled) {
+            // the SWIPE jobs of this fetch at the ratio of SWIPE jobs to examined targets so far
+            size_t swipeJobCount = 0;
+            for (int thread = 0; thread < par.threads; thread++) {
+                swipeJobCount += (threadTargetAligners[thread] != NULL) ? threadTargetAligners[thread]->swipeTargets.targetPairs : 0;
+            }
+            const size_t fetchSwipeJobs = static_cast<size_t>(static_cast<uint128>(currentSequences.targetCount) * swipeJobCount / std::max<size_t>(1, examinedTargetPairCount.load()));
+            const size_t swipeBatches = std::max<size_t>(8 * par.threads, fetchSwipeJobs / MIN_BATCH_SWIPE_JOBS);
+            fetchCount++;
+            fewerBatchFetchCount += swipeBatches < maxBatches;
+            maxBatches = std::min(maxBatches, swipeBatches);
+        }
         recordAlignmentCells.resize(recordCount);
         // the reps of a size class ascend
 #pragma omp parallel
@@ -3479,6 +3494,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the master", waitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences", sequenceWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the prefilter", prefilterWaitSeconds);
+        MMseqsNode::addPhaseValue(phaseValues, "Fetches with fewer SWIPE batches", SSTR(fewerBatchFetchCount) + " of " + SSTR(fetchCount));
     }
     if (memberLookup != NULL) {
         MMseqsNode::addPhaseValue(phaseValues, "Cluster member pairs", SSTR(multiFetchPairCount) + " over several fetches, " + SSTR(slicedPairCount) + " in slices");
