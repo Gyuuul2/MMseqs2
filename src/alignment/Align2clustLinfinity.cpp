@@ -470,7 +470,18 @@ private:
         }
         runs[index].path = prefix + "." + SSTR(nextFile++);
         file = FileUtil::openAndDelete(runs[index].path.c_str(), "wb");
+        // one more run shares the read buffers
+        const size_t bufferWords = getBufferWords();
+        for (size_t run = 0; run < runs.size(); run++) {
+            if (runs[run].buffer.size() > bufferWords) {
+                std::vector<DBKeyType>(runs[run].buffer.begin(), runs[run].buffer.begin() + bufferWords).swap(runs[run].buffer);
+            }
+        }
         return index;
+    }
+    // the open runs share memoryBudget for their read buffers, at least 64 KiB each
+    size_t getBufferWords() const {
+        return std::max<size_t>(8192, memoryBudget / sizeof(DBKeyType) / (runs.size() - freeRuns.size()));
     }
     void writeWord(FILE *file, DBKeyType word) {
         writeBuffer.push_back(word);
@@ -499,9 +510,8 @@ private:
     DBKeyType readWord(size_t run, size_t offset) {
         Run &source = runs[run];
         if (source.buffer.empty() || offset < source.bufferStart || offset >= source.bufferStart + source.buffer.size()) {
-            const size_t bufferWords = 8192;
-            source.bufferStart = (offset / bufferWords) * bufferWords;
-            source.buffer.resize(std::min(bufferWords, source.words - source.bufferStart));
+            source.bufferStart = offset;
+            std::vector<DBKeyType>(std::min(getBufferWords(), source.words - offset)).swap(source.buffer);
             if (source.reader == NULL) {
                 if (openRuns.size() == 256) {
                     Run &oldest = runs[openRuns.front()];
@@ -915,17 +925,22 @@ struct ClusterMemberLookup {
                                          DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
         cluDbr->open(DBReader<DBKeyType>::NOSORT);
         sampledKeys.resize((cluDbr->getSize() + entriesPerSampledKey - 1) / entriesPerSampledKey);
-#pragma omp parallel for schedule(static)
-        for (size_t sampledKey = 0; sampledKey < sampledKeys.size(); sampledKey++) {
-            sampledKeys[sampledKey] = cluDbr->getIndexEntry(sampledKey * entriesPerSampledKey).id;
-        }
-        // read the part index and data once each if they fit
+        // read the part index and data once each if they fit, else only the sampled keys
         const size_t partIndexSize = (cluDbr->getSize() + 1) * 2 * sizeof(uint64_t);
         if (partIndexSize <= partMemorySize) {
             partIndexPairs.resize(partIndexSize / sizeof(uint64_t));
             cluDbr->readIndexPairs(0, cluDbr->getSize() + 1, partIndexPairs.data());
             memberIndexReadSize += partIndexSize;
             memberIndexReadCount++;
+            for (size_t sampledKey = 0; sampledKey < sampledKeys.size(); sampledKey++) {
+                sampledKeys[sampledKey] = partIndexPairs[2 * sampledKey * entriesPerSampledKey];
+            }
+        } else {
+            size_t readSize = 0;
+            size_t readCount = 0;
+            cluDbr->readSampledKeys(entriesPerSampledKey, std::max(BatchReader::MAX_READ_REQUEST_SIZE, partMemorySize), sampledKeys.data(), readSize, readCount);
+            memberIndexReadSize += readSize;
+            memberIndexReadCount += readCount;
         }
         if (localClu == clu && partIndexSize + cluDbr->getDataSize() <= partMemorySize) {
             partData.resize(cluDbr->getDataSize());
@@ -1684,6 +1699,7 @@ struct TargetSplitReader {
         for (size_t i = 0; isClaiming == false && i < cells.size(); i++) {
             prefSize += (targetSplitAlignNodes[cells[i].targetSplit] == MMseqsNode::rank) ? cells[i].prefSize : 0;
         }
+        prefOffsets.resize(MMseqsNode::count * targetSplitCount);
     }
 
     // the alignment cells per second and the seconds waited for the master so far
@@ -1790,7 +1806,8 @@ private:
     std::vector<size_t> classSize;
     std::vector<DBReader<DBKeyType> *> prefDbs;
     size_t prefNode;
-    std::vector<uint64_t> indexPairs;
+    // per node and own target split
+    std::vector<std::vector<uint64_t> > prefOffsets;
     std::vector<size_t> entrySizes;
     size_t bufferFetchSize;
     size_t bufferAlignmentCells;
@@ -1837,15 +1854,26 @@ private:
                 continue;
             }
             const PrefPartition &cell = cells[cellPos + targetSplits[0]];
-            openPrefDbs(cell.node);
-            const size_t firstEntry = prefDbs[0]->findEntryByOffset(cell.prefOffset);
-            const size_t entryCount = prefDbs[0]->findEntryByOffset(cell.prefOffset + cell.prefSize) - firstEntry;
+            // the entry offsets of the target split files of a node, each index read once
+            std::vector<uint64_t> *offsets = prefOffsets.data() + cell.node * targetSplitCount;
+            for (size_t i = 0; i < targetSplits.size(); i++) {
+                std::vector<uint64_t> &splitOffsets = offsets[targetSplits[i]];
+                if (splitOffsets.empty()) {
+                    const std::string index = MMseqsNode::readFile(par.db2 + ".index." + SSTR(cell.node * targetSplitCount + targetSplits[i]));
+                    splitOffsets.resize(index.size() / (2 * sizeof(uint64_t)));
+                    for (size_t entry = 0; entry < splitOffsets.size(); entry++) {
+                        memcpy(&splitOffsets[entry], index.data() + (2 * entry + 1) * sizeof(uint64_t), sizeof(uint64_t));
+                    }
+                }
+            }
+            const std::vector<uint64_t> &firstOffsets = offsets[targetSplits[0]];
+            const size_t firstEntry = std::lower_bound(firstOffsets.begin(), firstOffsets.end(), cell.prefOffset) - firstOffsets.begin();
+            const size_t entryCount = std::lower_bound(firstOffsets.begin(), firstOffsets.end(), cell.prefOffset + cell.prefSize) - firstOffsets.begin() - firstEntry;
             entrySizes.assign(entryCount, 0);
-            indexPairs.resize(2 * (entryCount + 1));
-            for (size_t i = 0; i < prefDbs.size(); i++) {
-                prefDbs[i]->readIndexPairs(firstEntry, firstEntry + entryCount + 1, indexPairs.data());
+            for (size_t i = 0; i < targetSplits.size(); i++) {
+                const std::vector<uint64_t> &splitOffsets = offsets[targetSplits[i]];
                 for (size_t entry = 0; entry < entryCount; entry++) {
-                    entrySizes[entry] += indexPairs[2 * entry + 3] - indexPairs[2 * entry + 1];
+                    entrySizes[entry] += splitOffsets[firstEntry + entry + 1] - splitOffsets[firstEntry + entry];
                 }
             }
             size_t prefReadSize = 0;
@@ -3993,7 +4021,8 @@ static size_t getKeyAlignNodeFromPage(const std::vector<unsigned int> &pageAlign
 // linfinity: the master clusters the accepted pairs in key order
 static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimit, const DBReader<DBKeyType> &seqDbr,
                                    const std::vector<unsigned int> &pageAlignNodes, int mode, size_t paddedDbSize, size_t sizeClassCount,
-                                   const std::string &accepted, const std::string &assignedKeysLog, const std::string &clusteredLogPrefix, const std::string &assignedBits, std::string &phaseValues) {
+                                   const std::string &accepted, const std::string &assignedKeysLog, const std::string &clusteredLogPrefix, const std::string &setCoverPrefix,
+                                   const std::string &assignedBits, std::string &phaseValues) {
     const size_t assignedWords = (dbSize + 63) / 64;
     const size_t orderKeyEnd = (sizeClassCount - 1) * paddedDbSize + dbSize;
     uint64_t *assigned = static_cast<uint64_t *>(mem_align(2 * 1024 * 1024, assignedWords * sizeof(uint64_t)));
@@ -4071,9 +4100,9 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     size_t memberCount = 0;
     // --cluster-mode 0: open sets in a heap, sets of two as pairs
     std::vector<ClusterPair> pairSets;
-    SetCoverPairFile pairFile(pairSets, clusteredLogPrefix + "_pairsets", stepWords, memoryLimit, assigned);
-    SetCoverSmallSetFiles smallSetFiles(clusteredLogPrefix + "_sets", memoryLimit, assigned);
-    SetCoverLargeSetFiles largeSetFiles(clusteredLogPrefix + "_large", memoryLimit);
+    SetCoverPairFile pairFile(pairSets, setCoverPrefix + "_clustered_pairsets", stepWords, memoryLimit, assigned);
+    SetCoverSmallSetFiles smallSetFiles(setCoverPrefix + "_clustered_sets", memoryLimit, assigned);
+    SetCoverLargeSetFiles largeSetFiles(setCoverPrefix + "_clustered_large", memoryLimit);
     const auto addClusterPair = [&](DBKeyType repKey, DBKeyType memberKey) {
         const ClusterPair pair = { repKey, memberKey };
         ClusteredLog &nodeFile = nodeClusteredLogs[getKeyAlignNodeFromPage(pageAlignNodes, seqDbr, repKey)];
@@ -4581,6 +4610,24 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     return memberCount;
 }
 
+// why --local-tmp cannot hold files of this rank, empty if it can
+static std::string getLocalTmpProblem(const Parameters &par) {
+    // ranks on one machine may create it at once
+    if (FileUtil::makeDir(par.localTmp.c_str()) == false && FileUtil::directoryExists(par.localTmp.c_str()) == false) {
+        Debug(Debug::ERROR) << "Cannot create local tmp dir " << par.localTmp << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    const int localTmpFd = open(par.localTmp.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const StorageKind localTmpStorage = getStorageKind(localTmpFd);
+    struct stat localTmpStat, dbStat;
+    const bool isDbDevice = fstat(localTmpFd, &localTmpStat) == 0 && stat(par.db1Index.c_str(), &dbStat) == 0 && localTmpStat.st_dev == dbStat.st_dev;
+    close(localTmpFd);
+    if (localTmpStorage != STORAGE_LOCAL_FLASH) {
+        return std::string("it is on ") + getStorageName(localTmpStorage) + ", not local flash";
+    }
+    return isDbDevice ? "it is on the device of the database" : "";
+}
+
 static uint64_t *readSingletonBits(FILE *assignedHandle, const std::string &assignedBits, size_t firstKey, size_t keyCount) {
     size_t words = (keyCount + 63) / 64;
     std::vector<uint64_t> assignedWords(words + 1, 0);
@@ -4683,22 +4730,8 @@ int align2clustLinfinity(Parameters &par) {
     bool hasLocalServedBlocks = false;
     // a master that only clusters reads no sequences
     if (par.localTmp.empty() == false && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) {
-        // ranks on one machine may create it at once
-        if (FileUtil::makeDir(par.localTmp.c_str()) == false && FileUtil::directoryExists(par.localTmp.c_str()) == false) {
-            Debug(Debug::ERROR) << "Cannot create local tmp dir " << par.localTmp << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        const int localTmpFd = open(par.localTmp.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-        const StorageKind localTmpStorage = getStorageKind(localTmpFd);
-        struct stat localTmpStat, dbStat;
-        const bool isDbDevice = fstat(localTmpFd, &localTmpStat) == 0 && stat(par.db1Index.c_str(), &dbStat) == 0 && localTmpStat.st_dev == dbStat.st_dev;
-        close(localTmpFd);
-        std::string localTmpProblem;
-        if (localTmpStorage != STORAGE_LOCAL_FLASH) {
-            localTmpProblem = std::string("it is on ") + getStorageName(localTmpStorage) + ", not local flash";
-        } else if (isDbDevice) {
-            localTmpProblem = "it is on the device of the database";
-        } else {
+        std::string localTmpProblem = getLocalTmpProblem(par);
+        if (localTmpProblem.empty()) {
             // copy only the served blocks
             const std::vector<size_t> &blockKeyOffsets = blockDbr.getBlockKeyOffsets();
             const DBReader<DBKeyType>::Index *blockIndex = blockDbr.getIndex();
@@ -4759,6 +4792,22 @@ int align2clustLinfinity(Parameters &par) {
         }
         MMseqsNode::addPhaseValue(phaseValues, "Local tmp", hasLocalServedBlocks ? (par.filterCluDBFile.empty() ? "holds the served blocks" : "holds the served blocks and the cluster part") : "not used, " + localTmpProblem);
     }
+
+    // only the master writes and reads the open sets of set cover
+    std::string setCoverPrefix = par.db3;
+    if (MMseqsNode::isMaster() && par.clusteringMode == Parameters::SET_COVER && par.localTmp.empty() == false) {
+        const std::string localTmpProblem = getLocalTmpProblem(par);
+        if (localTmpProblem.empty()) {
+            setCoverPrefix = par.localTmp + "/" + FileUtil::baseName(par.db3);
+        } else if (par.localTmpFallback == false) {
+            Debug(Debug::ERROR) << "Cannot keep the open sets in --local-tmp " << par.localTmp << ": " << localTmpProblem << ". Please choose another --local-tmp or set --local-tmp-fallback 1 to keep them in the shared folder.\n";
+            EXIT(EXIT_FAILURE);
+        } else {
+            MMseqsNode::reportUnusableLocalTmp("Cannot keep the open sets in --local-tmp " + par.localTmp + ": " + localTmpProblem);
+        }
+        MMseqsNode::addPhaseValue(phaseValues, "Open sets", localTmpProblem.empty() ? "in --local-tmp" : "in the shared folder, " + localTmpProblem);
+    }
+
     blockDbr.close();
     DBReader<DBKeyType> seqDbr(seqDb.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
     seqDbr.open(DBReader<DBKeyType>::NOSORT);
@@ -4908,7 +4957,7 @@ int align2clustLinfinity(Parameters &par) {
             omp_set_num_threads(clusterThreads);
 #endif
             memberCount = clusterAcceptedPairs(clusterThreads, dbSize, masterMemoryLimit, seqDbr, pageAlignNodes, par.clusteringMode, paddedDbSize, sizeClassCount,
-                                               accepted, assignedKeysLog, clusteredLogPrefix, assignedBits, clusterPhaseValues);
+                                               accepted, assignedKeysLog, clusteredLogPrefix, setCoverPrefix, assignedBits, clusterPhaseValues);
         });
     }
     phaseValueTimer.reset();

@@ -310,6 +310,7 @@ public:
     }
     Index getIndexEntry(size_t id);
     void readIndexPairs(size_t first, size_t last, uint64_t *indexPairs);
+    void readSampledKeys(size_t entryStep, size_t bufferSize, T *keys, size_t &readSize, size_t &readCount);
     void readData(size_t offset, size_t bytes, char *destination);
     int getBufferedFd() const { return bufferedFds[0]; }
     char *getDataFromLoadedBuffer(size_t key);
