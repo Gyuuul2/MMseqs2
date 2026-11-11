@@ -224,6 +224,19 @@ void MMseqsNode::waitForRunFilesChange(const std::string &prefix, std::string &c
     }
 }
 
+// opening a directory asks an NFS server for its state
+void MMseqsNode::listDirectory(const std::string &directory, std::vector<std::string> &names) {
+    names.clear();
+    DIR *handle = opendir(directory.c_str());
+    if (handle == NULL) {
+        return;
+    }
+    for (struct dirent *entry; (entry = readdir(handle)) != NULL;) {
+        names.push_back(entry->d_name);
+    }
+    closedir(handle);
+}
+
 std::string MMseqsNode::gatherRunFiles(const std::string &prefix) {
     std::vector<std::string> nodeContents(count);
 #pragma omp parallel for schedule(dynamic, 1)

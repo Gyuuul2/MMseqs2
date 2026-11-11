@@ -71,6 +71,8 @@ public:
     static bool readRunFile(const std::string &file, std::string &content);
     static void waitForRunFilesChange(const std::string &prefix, std::string &content);
     static std::string gatherRunFiles(const std::string &prefix);
+    // the names in a directory, none if it cannot be opened
+    static void listDirectory(const std::string &directory, std::vector<std::string> &names);
 
     static void publishLog(FILE *file, const std::string &log, size_t key, size_t size);
     static bool readLogProgress(const std::string &log, size_t &key, size_t &size);
