@@ -43,7 +43,7 @@ public:
     static inline bool isMaster() {
         return rank == MASTER;
     }
-    // from two nodes the master clusters while the other nodes align
+    // with two or more nodes the master only clusters
     static inline unsigned int getFirstAlignNode() {
         return (count > 1) ? 1 : 0;
     }
@@ -72,8 +72,8 @@ public:
     static void waitForRunFilesChange(const std::string &prefix, std::string &content);
     static std::string gatherRunFiles(const std::string &prefix);
 
-    static void publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t takenItemCount = 0);
-    static bool readLogProgress(const std::string &log, size_t &key, size_t &size, size_t *takenItemCount = NULL);
+    static void publishLog(FILE *file, const std::string &log, size_t key, size_t size);
+    static bool readLogProgress(const std::string &log, size_t &key, size_t &size);
     static void waitForLog(const std::string &log, size_t &key, size_t &size);
     static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true);
     static void removeLog(const std::string &log);
@@ -103,7 +103,6 @@ public:
         WorkQueue(const std::string &name, size_t itemCount);
         size_t takeNextItem();
         size_t takeNextItemInOrder();
-        size_t getTakenItemCount() const;
         unsigned int getNode(size_t item) const;
         void removeTakenItemFiles();
         bool takeItem(size_t item);

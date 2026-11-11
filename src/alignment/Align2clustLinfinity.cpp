@@ -471,8 +471,8 @@ private:
         }
         runs[index].path = prefix + "." + SSTR(nextFile++);
         file = FileUtil::openAndDelete(runs[index].path.c_str(), "wb");
-        // one more run shares the read buffers
-        const size_t bufferWords = getBufferWords();
+        // share the read buffers with the new run
+        size_t bufferWords = getBufferWords();
         for (size_t run = 0; run < runs.size(); run++) {
             if (runs[run].buffer.size() > bufferWords) {
                 std::vector<DBKeyType>(runs[run].buffer.begin(), runs[run].buffer.begin() + bufferWords).swap(runs[run].buffer);
@@ -480,9 +480,9 @@ private:
         }
         return index;
     }
-    // the open runs share memoryBudget for their read buffers, at least 64 KiB each
+    // at least 64 KiB per open run
     size_t getBufferWords() const {
-        return std::max<size_t>(8192, memoryBudget / sizeof(DBKeyType) / (runs.size() - freeRuns.size()));
+        return std::max((size_t) 8192, memoryBudget / sizeof(DBKeyType) / (runs.size() - freeRuns.size()));
     }
     void writeWord(FILE *file, DBKeyType word) {
         writeBuffer.push_back(word);
@@ -577,7 +577,6 @@ private:
 __extension__ typedef unsigned __int128 uint128;
 
 struct PrefPartition {
-    size_t firstKey;
     size_t prefOffset;
     size_t prefSize;
     size_t alignmentCells;
@@ -601,14 +600,14 @@ static const size_t ALIGNMENT_SPLITS_PER_NODE = 4096;
 // at least 8 MiB of prefilter per split
 static const size_t MIN_ALIGNMENT_SPLIT_PREF_SIZE = 8 * 1024 * 1024;
 
-// share of a window of an align node that the nodes ahead of it steal per window it is behind
+// stolen share per window behind
 static const double STEAL_SHARE_STEP = 1.0 / 8;
 
-// target split mode: runs of blocks, each aligned by one align node
+// target split mode
 static std::vector<size_t> targetSplitBlockOffsets;
 static std::vector<unsigned int> targetSplitAlignNodes;
 
-// aligning nodes serve the blocks in turn, or the blocks of their target splits
+// blocks in turn or by target split
 static size_t getBlockAlignNode(size_t block) {
     if (targetSplitAlignNodes.empty()) {
         return MMseqsNode::getFirstAlignNode() + block % (MMseqsNode::count - MMseqsNode::getFirstAlignNode());
@@ -720,7 +719,6 @@ static const double BATCH_READ_SECONDS = PUBLISH_SECONDS / 4.0;
 static const double PREFILTER_BUFFER_WORK_SECONDS = 2.0 * PUBLISH_SECONDS;
 static const size_t ALIGN_BATCHES_PER_THREAD = 64;
 static const size_t ALIGN_BATCH_LANES = 16;
-static const size_t MIN_BATCH_SWIPE_JOBS = 64 * SwipeExtender::LANES;
 static const int CLUSTER_THREADS = 4;
 static const uint64_t ACCEPTED_REP_BIT = 1ULL << 63;
 
@@ -746,7 +744,6 @@ static const size_t CLUSTERED_LOG_BUFFER_SIZE = 16 * 1024 * 1024;
 static const size_t CLUSTER_PAIRS_MEMORY_DIVISOR = 16;
 static const size_t SAMPLED_KEY_MEMORY_DIVISOR = 64;
 static const size_t MIN_ENTRIES_PER_SAMPLED_KEY = 256;
-static const size_t CLUSTER_PART_MEMORY_DIVISOR = 16;
 static const size_t MEMBER_READ_SIZE = 1024 * 1024;
 static const size_t FETCHED_KEY_SIZE = 4 * sizeof(DBKeyType) + sizeof(unsigned int) + sizeof(size_t);
 // same on every node whatever its page size
@@ -867,6 +864,15 @@ static void sumOffsets(size_t *offsets, size_t count, int threads) {
     }
 }
 
+// the parts of a pair follow each other
+static size_t getPairPartEnd(const std::vector<unsigned char> &isLastPart, size_t pairCount, size_t part) {
+    size_t partEnd = part + 1;
+    while (partEnd < pairCount && isLastPart[partEnd - 1] == 0) {
+        partEnd++;
+    }
+    return partEnd;
+}
+
 static size_t getStepWords(size_t masterMemoryLimit) {
     return std::max<size_t>(1, masterMemoryLimit / STEP_PAIRS_MEMORY_DIVISOR / (sizeof(uint64_t) + 4 * sizeof(std::pair<DBKeyType, size_t>)));
 }
@@ -895,10 +901,10 @@ struct ClusterMemberLookup {
         size_t indexReadBytes;
         size_t readCount;
         size_t indexReadCount;
-        // buffer or the part data, from bufferBegin
+        // buffer or part data
         const char *data;
         std::vector<char> buffer;
-        // index pairs [indexFirst, indexFirst + indexPairs.size() / 2) of the own cluster part
+        // index pairs from indexFirst
         size_t indexFirst;
         std::vector<uint64_t> indexPairs;
 
@@ -921,15 +927,15 @@ struct ClusterMemberLookup {
         }
     };
 
-    // localClu is the --local-tmp copy of clu or clu itself; a node answers only for its own part, find and next read only that part
+    // a node answers only for its own cluster part
     ClusterMemberLookup(const std::string &clu, const std::string &localClu, const std::vector<size_t> &cluKeyOffsets, size_t entriesPerSampledKey, size_t partMemorySize)
         : entriesPerSampledKey(entriesPerSampledKey), cluKeyOffsets(cluKeyOffsets) {
         cluDbr = new DBReader<DBKeyType>((localClu + "." + SSTR(MMseqsNode::rank)).c_str(), (clu + ".index." + SSTR(MMseqsNode::rank)).c_str(), 1,
                                          DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
         cluDbr->open(DBReader<DBKeyType>::NOSORT);
         sampledKeys.resize((cluDbr->getSize() + entriesPerSampledKey - 1) / entriesPerSampledKey);
-        // read the part index and data once each if they fit, else only the sampled keys
-        const size_t partIndexSize = (cluDbr->getSize() + 1) * 2 * sizeof(uint64_t);
+        // read the whole part if it fits
+        size_t partIndexSize = (cluDbr->getSize() + 1) * 2 * sizeof(uint64_t);
         if (partIndexSize <= partMemorySize) {
             partIndexPairs.resize(partIndexSize / sizeof(uint64_t));
             cluDbr->readIndexPairs(0, cluDbr->getSize() + 1, partIndexPairs.data());
@@ -963,12 +969,12 @@ struct ClusterMemberLookup {
         return std::upper_bound(cluKeyOffsets.begin(), cluKeyOffsets.end(), key) - cluKeyOffsets.begin() - 1;
     }
 
-    // ascending keys between the same sampled keys search the index pairs that entryReader read for the first of them, or the own part index in memory
+    // search the index pairs between two sampled keys
     Entry find(DBKeyType key, EntryReader &entryReader) const {
         Entry entry = { 0, 0, key };
-        const size_t sampledKey = std::lower_bound(sampledKeys.begin(), sampledKeys.end(), key) - sampledKeys.begin();
+        size_t sampledKey = std::lower_bound(sampledKeys.begin(), sampledKeys.end(), key) - sampledKeys.begin();
         // the entry is between the sampled keys around key, it ends where the next one starts
-        const size_t entryCount = cluDbr->getSize();
+        size_t entryCount = cluDbr->getSize();
         const size_t first = (sampledKey > 0) ? (sampledKey - 1) * entriesPerSampledKey : 0;
         const size_t last = std::min(sampledKey * entriesPerSampledKey + 1, entryCount);
         const size_t pairEnd = std::min(last + 2, entryCount + 1);
@@ -1047,7 +1053,7 @@ private:
     DBReader<DBKeyType> *cluDbr;
     std::vector<size_t> cluKeyOffsets;
     std::vector<DBKeyType> sampledKeys;
-    // this rank's part, empty if it does not fit
+    // empty if the part does not fit
     std::vector<uint64_t> partIndexPairs;
     std::vector<char> partData;
 };
@@ -1086,7 +1092,7 @@ struct ClusterMemberExchange {
                 line[4 + node] = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + requestCodes.size();
                 for (size_t i = nodeKeyOffsets[node]; node != rank && i < nodeKeyOffsets[node + 1]; i++) {
                     requestCodes.append(code, Util::putPrefKey(code, keys[i] - ((i > nodeKeyOffsets[node]) ? keys[i - 1] : 0)));
-                    // the answering node reads the members where its answer for the entry bytes said, without searching its index again
+                    // read the members at the answered offsets
                     if (maxMembers != 0) {
                         requestCodes.append(code, Util::putPrefKey(code, entryOffsets[i] - ((i > nodeKeyOffsets[node]) ? entryOffsets[i - 1] : 0)));
                         requestCodes.append(code, Util::putPrefKey(code, entryBytes[i]));
@@ -1108,7 +1114,7 @@ struct ClusterMemberExchange {
                consumedBytes, maxMembers, nodeCodes[rank], nodeConsumedBytes[rank]);
     }
 
-    // waits for the answers to the last request, like the served sequences a pass opens at most SERVICE_POLL_NODES indexes
+    // wait for the answers to the last request
     void receive() {
         const unsigned int nodes = MMseqsNode::count;
         const unsigned int rank = MMseqsNode::rank;
@@ -1123,14 +1129,14 @@ struct ClusterMemberExchange {
             size_t polledCount = 0;
             size_t i = 0;
             for (; i < nodes && polledCount < polledNodes; i++) {
-                const unsigned int node = static_cast<unsigned int>((pollTurn + i) % nodes);
+                unsigned int node = static_cast<unsigned int>((pollTurn + i) % nodes);
                 if (isAnswered[node]) {
                     continue;
                 }
                 polledCount++;
                 const size_t lineCount = MMseqsNode::readExchangeIndexLines(getMemberIndex(node), nextMemberLines[node], MEMBER_LINE_WORDS, memberLines);
                 nextMemberLines[node] += lineCount;
-                // a full read may have more lines behind it
+                // more lines may follow a full read
                 hasWorked |= lineCount * MEMBER_LINE_WORDS == memberLines.size();
                 for (size_t l = 0; l < lineCount; l++) {
                     // member line: member file, requester, request, size, consumed bytes, magic; a line of another requester is skipped
@@ -1154,7 +1160,7 @@ struct ClusterMemberExchange {
                     hasWorked = true;
                 }
             }
-            // the next pass starts behind the last polled node
+            // start the next pass behind the last node
             pollTurn += i;
             if (hasWorked == false && owingCount > 0) {
                 usleep(pollMicroseconds);
@@ -1203,7 +1209,7 @@ struct ClusterMemberExchange {
         return nodeConsumedBytes[node];
     }
 
-    // tells every node that this node asks for no more members
+    // no more requests from this node
     void finish() {
         const unsigned int nodes = MMseqsNode::count;
         std::vector<uint64_t> line(nodes + 6, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES);
@@ -1240,7 +1246,7 @@ struct ClusterMemberExchange {
             size_t polledCount = 0;
             size_t i = 0;
             for (; i < nodes - firstAlignNode && polledCount < polledNodes; i++) {
-                const unsigned int requester = static_cast<unsigned int>(firstAlignNode + (pollTurn + i) % (nodes - firstAlignNode));
+                unsigned int requester = static_cast<unsigned int>(firstAlignNode + (pollTurn + i) % (nodes - firstAlignNode));
                 if (isRequesting[requester] == 0) {
                     continue;
                 }
@@ -1290,13 +1296,13 @@ struct ClusterMemberExchange {
                     hasWorked = true;
                 }
             }
-            // the next pass starts behind the last polled requester
+            // start the next pass behind the last requester
             pollTurn += i;
             if (hasWorked) {
                 polls = 0;
             } else if (requesterCount > 0) {
-                // while idle a pass lasts 10, 20, then 40 ms, a longer pass stays as it is
-                usleep(std::max<size_t>(pollMicroseconds, 10000u << std::min(polls++, 2u)));
+                // idle passes last 10, 20, then 40 ms
+                usleep(std::max(pollMicroseconds, (size_t) 10000 << std::min(polls++, 2u)));
             }
         }
     }
@@ -1342,7 +1348,7 @@ private:
                     continue;
                 }
                 const size_t entryBegin = entryOffsets[i];
-                const ClusterMemberLookup::Entry entry = { entryBegin + consumedBytes, entryBegin + entryBytes[i], keys[i] };
+                ClusterMemberLookup::Entry entry = { entryBegin + consumedBytes, entryBegin + entryBytes[i], keys[i] };
                 entryReader.start(entry);
                 DBKeyType memberKey;
                 for (size_t member = 0; member < maxMembers && lookup.next(entryReader, memberKey); member++) {
@@ -1381,7 +1387,7 @@ public:
     size_t requestedKeyCount;
     size_t servedKeyCount;
     size_t servedSize;
-    // receive waits, for the entry sizes and for the members
+    // seconds in receive
     double sizeWaitSeconds;
     double memberWaitSeconds;
 
@@ -1416,7 +1422,7 @@ struct RepTargetsReader {
         const size_t alignmentSplitCount = alignmentSplitPartitionOffsets.size() - 1;
         const size_t prefReadsBefore = prefReads.size();
         while (prefReads.size() == prefReadsBefore) {
-            const size_t alignmentSplit = (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) ? alignmentSplitQueue.takeNextItemInOrder() : alignmentSplitCount;
+            size_t alignmentSplit = (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) ? alignmentSplitQueue.takeNextItemInOrder() : alignmentSplitCount;
             if (alignmentSplit == alignmentSplitCount) {
                 break;
             }
@@ -1507,10 +1513,6 @@ struct RepTargetsReader {
         closePrefDb();
         delete[] entryTargetOffsets;
         delete[] entryRecordOffsets;
-    }
-
-    size_t getTakenItemCount() const {
-        return alignmentSplitQueue.getTakenItemCount();
     }
 
     const size_t maxRecordSize;
@@ -1652,7 +1654,7 @@ private:
     }
 };
 
-// a piece of a target split entry: the rep key, the size class of all targets of the rep and its targets in the target split
+// targets of a rep in one target split
 struct TargetSplitPiece {
     const char *data;
     const char *end;
@@ -1670,7 +1672,7 @@ struct TargetSplitPiece {
         repKey += Util::getPrefKey(data);
         sizeClass = Util::getPrefKey(data);
         targets = data;
-        // a target gap is at least 1, only the end of the piece is a 0 byte
+        // target gaps are >= 1, a 0 byte ends the piece
         for (targetCount = 0; *data != '\0'; data++) {
             targetCount += static_cast<unsigned char>(*data) < 0x80;
         }
@@ -1678,8 +1680,7 @@ struct TargetSplitPiece {
     }
 };
 
-// target split mode: an align node reads the pieces of the targets in its target splits window by window in rep order;
-// an entry has the same keys in every target split file of a node, so the pieces of a rep join entry by entry
+// target split mode: join the pieces of a rep entry by entry
 struct TargetSplitReader {
     TargetSplitReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &cells, MMseqsNode::WorkQueue &cellQueue, size_t maxRecordSize, size_t memoryLimit,
                       size_t paddedDbSize, size_t sizeClassCount)
@@ -1687,11 +1688,11 @@ struct TargetSplitReader {
           stealShares(MMseqsNode::count, 0), stolenCostSignChanges(0), stealWindowCount(0),
           isClaiming(sizeClassCount == 1 && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()), par(par), seqDbr(seqDbr), cells(cells), cellQueue(cellQueue),
           targetSplitCount(targetSplitBlockOffsets.size() - 1), paddedDbSize(paddedDbSize), sizeClassCount(sizeClassCount),
-          maxPrefilterBufferSize(std::max<size_t>(1, memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)),
-          maxRecordTargetCount(std::min<size_t>(UINT_MAX, std::max<size_t>(1, maxRecordSize / std::max<size_t>(seqDbr.getMaxSeqLen() + 2, Util::getPageSize())))),
+          maxPrefilterBufferSize(std::max((size_t) 1, memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)),
+          maxRecordTargetCount(std::min((size_t) UINT_MAX, std::max((size_t) 1, maxRecordSize / std::max(seqDbr.getMaxSeqLen() + 2, Util::getPageSize())))),
           idleShares(MMseqsNode::count, 0), stealCarries(MMseqsNode::count, 0), wasStolen(targetSplitCount, 0), cellsPerSecond(0), waitSeconds(0), usedWaitSeconds(0),
           lastStolenCost(0), lastStolenCostChange(0), cellPos(0), prefReadPos(0), passClasses(1), endClass(0), classSize(sizeClassCount, 0), prefNode(SIZE_MAX), bufferFetchSize(0), bufferAlignmentCells(0) {
-        // greedy takes its splits per window in claimWindowCells
+        // greedy claims its splits per window
         for (size_t split = 0; isClaiming == false && split < targetSplitCount; split++) {
             if (targetSplitAlignNodes[split] == MMseqsNode::rank) {
                 targetSplits.push_back(split);
@@ -1705,13 +1706,13 @@ struct TargetSplitReader {
         prefOffsets.resize(MMseqsNode::count * targetSplitCount);
     }
 
-    // the alignment cells per second and the seconds waited for the master so far
+    // cells per second and master wait so far
     void setWindowWork(double rate, double idle) {
         cellsPerSecond = rate;
         waitSeconds = idle;
     }
 
-    // every window once; set cover then walks the windows once per pass and skips the prefilter reads without its size classes
+    // load every window once and mark its size classes
     void countSizeClasses() {
         std::vector<RepTargetsRecord> records;
         std::vector<DBKeyType> targets;
@@ -1728,7 +1729,7 @@ struct TargetSplitReader {
 #pragma omp for schedule(dynamic, 100) reduction(|:sizeClasses)
                 for (size_t i = 0; i < records.size(); i++) {
                     const RepTargetsRecord &record = records[i];
-                    const size_t sizeClass = sizeClassCount - 1 - record.repOrderKeyFirstTarget.repKey / paddedDbSize;
+                    size_t sizeClass = sizeClassCount - 1 - record.repOrderKeyFirstTarget.repKey / paddedDbSize;
                     sizeClasses |= 1ULL << sizeClass;
                     threadClassSize[sizeClass] += sizeof(RepTargetsRecord) + record.targetCount * sizeof(DBKeyType);
                 }
@@ -1750,7 +1751,7 @@ struct TargetSplitReader {
         while (records.size() * sizeof(RepTargetsRecord) + targets.size() * sizeof(DBKeyType) < maxPrefilterBufferSize) {
             // a buffer ends at a window end
             if (prefReadPos < prefReads.size() || (records.empty() && takeWindow())) {
-                // a pass of several size classes stays in one buffer, it fits by countSizeClasses
+                // keep a pass of several size classes in one buffer
                 if (records.empty() == false && (passClasses & (passClasses - 1)) == 0 && (bufferFetchSize >= maxReadSize || bufferAlignmentCells >= maxBufferAlignmentCells)) {
                     break;
                 }
@@ -1809,7 +1810,7 @@ private:
     std::vector<size_t> classSize;
     std::vector<DBReader<DBKeyType> *> prefDbs;
     size_t prefNode;
-    // per node and own target split
+    // per node and target split
     std::vector<std::vector<uint64_t> > prefOffsets;
     std::vector<size_t> entrySizes;
     size_t bufferFetchSize;
@@ -1824,7 +1825,7 @@ private:
         closePrefDbs();
         prefNode = node;
         for (size_t i = 0; i < targetSplits.size(); i++) {
-            const std::string file = SSTR(node * targetSplitCount + targetSplits[i]);
+            std::string file = SSTR(node * targetSplitCount + targetSplits[i]);
             prefDbs.push_back(new DBReader<DBKeyType>((par.db2 + "." + file).c_str(), (par.db2 + ".index." + file).c_str(), par.threads,
                                                       DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY));
             prefDbs.back()->open(DBReader<DBKeyType>::NOSORT);
@@ -1840,11 +1841,11 @@ private:
         prefNode = SIZE_MAX;
     }
 
-    // the cells of a window are a row per target split; its prefilter reads end at entries
+    // a window has a cell per target split
     bool takeWindow() {
-        // per pref byte two buffers and 8 bytes of targets, per piece of 4 bytes at least 48 bytes and a record
-        const size_t maxPrefReadSize = std::max<size_t>(1, maxPrefilterBufferSize / (10 + (48 + sizeof(RepTargetsRecord)) / 4));
-        const size_t prefReadsBefore = prefReads.size();
+        // 10 bytes per pref byte, 48 bytes and a record per piece
+        size_t maxPrefReadSize = std::max((size_t) 1, maxPrefilterBufferSize / (10 + (48 + sizeof(RepTargetsRecord)) / 4));
+        size_t prefReadsBefore = prefReads.size();
         for (; prefReads.size() == prefReadsBefore && cellPos < cells.size(); cellPos += targetSplitCount) {
             if (isClaiming) {
                 claimWindowCells(cellPos / targetSplitCount);
@@ -1857,21 +1858,22 @@ private:
                 continue;
             }
             const PrefPartition &cell = cells[cellPos + targetSplits[0]];
-            // the entry offsets of the target split files of a node, each index read once
+            // read each index once
             std::vector<uint64_t> *offsets = prefOffsets.data() + cell.node * targetSplitCount;
             for (size_t i = 0; i < targetSplits.size(); i++) {
                 std::vector<uint64_t> &splitOffsets = offsets[targetSplits[i]];
                 if (splitOffsets.empty()) {
-                    const std::string index = MMseqsNode::readFile(par.db2 + ".index." + SSTR(cell.node * targetSplitCount + targetSplits[i]));
+                    std::string index = MMseqsNode::readFile(par.db2 + ".index." + SSTR(cell.node * targetSplitCount + targetSplits[i]));
                     splitOffsets.resize(index.size() / (2 * sizeof(uint64_t)));
                     for (size_t entry = 0; entry < splitOffsets.size(); entry++) {
                         memcpy(&splitOffsets[entry], index.data() + (2 * entry + 1) * sizeof(uint64_t), sizeof(uint64_t));
                     }
                 }
             }
+
             const std::vector<uint64_t> &firstOffsets = offsets[targetSplits[0]];
-            const size_t firstEntry = std::lower_bound(firstOffsets.begin(), firstOffsets.end(), cell.prefOffset) - firstOffsets.begin();
-            const size_t entryCount = std::lower_bound(firstOffsets.begin(), firstOffsets.end(), cell.prefOffset + cell.prefSize) - firstOffsets.begin() - firstEntry;
+            size_t firstEntry = std::lower_bound(firstOffsets.begin(), firstOffsets.end(), cell.prefOffset) - firstOffsets.begin();
+            size_t entryCount = std::lower_bound(firstOffsets.begin(), firstOffsets.end(), cell.prefOffset + cell.prefSize) - firstOffsets.begin() - firstEntry;
             entrySizes.assign(entryCount, 0);
             for (size_t i = 0; i < targetSplits.size(); i++) {
                 const std::vector<uint64_t> &splitOffsets = offsets[targetSplits[i]];
@@ -1879,29 +1881,31 @@ private:
                     entrySizes[entry] += splitOffsets[firstEntry + entry + 1] - splitOffsets[firstEntry + entry];
                 }
             }
-            size_t prefReadSize = 0;
+
+            // cut the window into pref reads
+            size_t size = 0;
             for (size_t entry = 0; entry < entryCount; entry++) {
-                if (entry == 0 || prefReadSize + entrySizes[entry] > maxPrefReadSize) {
-                    const PrefRead prefRead = { cell.node, firstEntry + entry, firstEntry + entry + 1, ~0ULL };
+                if (entry == 0 || size + entrySizes[entry] > maxPrefReadSize) {
+                    PrefRead prefRead = { cell.node, firstEntry + entry, firstEntry + entry + 1, ~0ULL };
                     prefReads.push_back(prefRead);
-                    prefReadSize = 0;
+                    size = 0;
                 } else {
                     prefReads.back().endEntry++;
                 }
-                prefReadSize += entrySizes[entry];
+                size += entrySizes[entry];
             }
         }
         return prefReads.size() > prefReadsBefore;
     }
 
-    // the claimer of the first home cell of node in window that is free or its own: count if free, UINT_MAX if there is none
+    // node if it took a home cell, count if one is free
     unsigned int findHomeClaim(size_t window, size_t node) const {
         for (size_t split = 0; split < targetSplitCount; split++) {
-            const size_t cell = window * targetSplitCount + split;
+            size_t cell = window * targetSplitCount + split;
             if (targetSplitAlignNodes[split] != node || cells[cell].alignmentCells == 0) {
                 continue;
             }
-            const unsigned int claimer = cellQueue.getNode(cell);
+            unsigned int claimer = cellQueue.getNode(cell);
             if (claimer == node || claimer >= MMseqsNode::count) {
                 return std::min(claimer, MMseqsNode::count);
             }
@@ -1909,16 +1913,16 @@ private:
         return UINT_MAX;
     }
 
-    // greedy, before any prefilter read of the window: the free home cells, then cells of the align nodes that have not reached the window
+    // take the free home cells, then cells of nodes behind
     void claimWindowCells(size_t window) {
-        const size_t firstCell = window * targetSplitCount;
-        const size_t firstAlignNode = MMseqsNode::getFirstAlignNode();
-        const size_t alignNodeCount = MMseqsNode::count - firstAlignNode;
+        size_t firstCell = window * targetSplitCount;
+        size_t firstAlignNode = MMseqsNode::getFirstAlignNode();
+        size_t alignNodeCount = MMseqsNode::count - firstAlignNode;
         std::vector<size_t> nodeCosts(MMseqsNode::count, 0);
         std::vector<unsigned char> isTaken(targetSplitCount, 0);
         double windowTakenCost = 0;
         for (size_t split = 0; split < targetSplitCount; split++) {
-            const size_t cost = cells[firstCell + split].alignmentCells;
+            size_t cost = cells[firstCell + split].alignmentCells;
             nodeCosts[targetSplitAlignNodes[split]] += cost;
             if (cost > 0 && targetSplitAlignNodes[split] == MMseqsNode::rank) {
                 isTaken[split] = cellQueue.takeItem(firstCell + split);
@@ -1927,7 +1931,8 @@ private:
                 windowTakenCost += isTaken[split] ? cost : 0;
             }
         }
-        // a node that has not taken its cells of the window is behind, by the windows before that it has not reached either
+
+        // a node without its home cells is behind
         std::vector<unsigned char> isBehind(MMseqsNode::count, 0);
         std::vector<size_t> behindWindows(MMseqsNode::count, 0);
         size_t behindNodes = 0;
@@ -1936,39 +1941,40 @@ private:
             if (node == MMseqsNode::rank || nodeCosts[node] == 0) {
                 continue;
             }
-            const unsigned int claimer = findHomeClaim(window, node);
+            unsigned int claimer = findHomeClaim(window, node);
             if (claimer == node) {
                 idleShares[node] /= 2;
                 aheadNodes++;
             } else if (claimer == MMseqsNode::count) {
                 isBehind[node] = 1;
                 behindNodes++;
-                // a window without free cells of the node is no work behind
+                // count the earlier windows with free home cells
                 for (size_t back = 1; back <= window && back * STEAL_SHARE_STEP <= 1 && behindWindows[node] * STEAL_SHARE_STEP < 0.5; back++) {
-                    const unsigned int earlierClaimer = findHomeClaim(window - back, node);
-                    if (earlierClaimer == node) {
+                    unsigned int earlier = findHomeClaim(window - back, node);
+                    if (earlier == node) {
                         break;
                     }
-                    behindWindows[node] += earlierClaimer == MMseqsNode::count;
+                    behindWindows[node] += earlier == MMseqsNode::count;
                 }
             }
         }
-        const double idleCells = cellsPerSecond * std::max(0.0, waitSeconds - usedWaitSeconds);
+
+        double idleCells = cellsPerSecond * std::max(0.0, waitSeconds - usedWaitSeconds);
         usedWaitSeconds = waitSeconds;
         double windowStolenCost = 0;
         std::vector<size_t> splits;
         for (size_t i = 1; i < alignNodeCount; i++) {
-            const size_t node = firstAlignNode + (MMseqsNode::rank - firstAlignNode + i) % alignNodeCount;
+            size_t node = firstAlignNode + (MMseqsNode::rank - firstAlignNode + i) % alignNodeCount;
             if (isBehind[node] == 0) {
                 continue;
             }
-            // idle seconds add up; a window behind adds the cost difference of the window, both shared by the nodes that reached the window
-            const double cost = static_cast<double>(nodeCosts[node]);
+            // idle seconds add up, windows behind add the cost difference
+            double cost = static_cast<double>(nodeCosts[node]);
             idleShares[node] = std::min(0.5, idleShares[node] + idleCells / (2.0 * cost * behindNodes));
-            const double balanceShare = (behindWindows[node] > 0) ? std::max(0.0, cost - windowTakenCost) / (2.0 * cost) : 0.0;
+            double balanceShare = (behindWindows[node] > 0) ? std::max(0.0, cost - windowTakenCost) / (2.0 * cost) : 0.0;
             stealShares[node] = std::min(0.5, idleShares[node] + (balanceShare + behindWindows[node] * STEAL_SHARE_STEP) / aheadNodes);
             stealCarries[node] = std::min(stealCarries[node] + stealShares[node] * cost, cost);
-            // the splits stolen before first, then the largest cells, while they fit the carry
+            // splits stolen before first, then the largest cells
             splits.clear();
             for (size_t split = 0; split < targetSplitCount; split++) {
                 if (targetSplitAlignNodes[split] == node && cells[firstCell + split].alignmentCells > 0) {
@@ -1976,8 +1982,8 @@ private:
                 }
             }
             std::sort(splits.begin(), splits.end(), [&](size_t first, size_t second) {
-                const size_t firstCost = cells[firstCell + first].alignmentCells;
-                const size_t secondCost = cells[firstCell + second].alignmentCells;
+                size_t firstCost = cells[firstCell + first].alignmentCells;
+                size_t secondCost = cells[firstCell + second].alignmentCells;
                 return wasStolen[first] > wasStolen[second] || (wasStolen[first] == wasStolen[second] && (firstCost > secondCost || (firstCost == secondCost && first < second)));
             });
             for (size_t j = 0; j < splits.size() && cells[firstCell + splits[j]].alignmentCells <= stealCarries[node]; j++) {
@@ -1990,14 +1996,16 @@ private:
                 }
             }
         }
+
         stolenCost += windowStolenCost;
         stealWindowCount += windowStolenCost > 0;
         if (windowStolenCost != lastStolenCost) {
-            const int change = (windowStolenCost > lastStolenCost) ? 1 : -1;
+            int change = (windowStolenCost > lastStolenCost) ? 1 : -1;
             stolenCostSignChanges += lastStolenCostChange != 0 && change != lastStolenCostChange;
             lastStolenCostChange = change;
             lastStolenCost = windowStolenCost;
         }
+
         splits.clear();
         targetSplitIsStolen.clear();
         for (size_t split = 0; split < targetSplitCount; split++) {
@@ -2009,7 +2017,7 @@ private:
                 takenCost += cells[firstCell + split].alignmentCells;
             }
         }
-        // the pref readers follow the splits of the window
+        // reopen the pref readers for new splits
         if (splits != targetSplits) {
             closePrefDbs();
             targetSplits.swap(splits);
@@ -2071,14 +2079,16 @@ private:
                 prefDbs[i]->prefetchData(prefReads[prefReadPos].firstEntry, prefReads[prefReadPos].endEntry);
             }
         }
-        const size_t firstEntry = prefRead.firstEntry;
-        const size_t entryCount = prefRead.endEntry - firstEntry;
+
+        // count the targets and records of every entry
+        size_t firstEntry = prefRead.firstEntry;
+        size_t entryCount = prefRead.endEntry - firstEntry;
         entryTargetOffsets.resize(entryCount + 1);
         entryRecordOffsets.resize(entryCount + 1);
         entryTargetOffsets[0] = 0;
         entryRecordOffsets[0] = 0;
-        size_t prefReadSize = 0;
-#pragma omp parallel reduction(+:prefReadSize)
+        size_t size = 0;
+#pragma omp parallel reduction(+:size)
         {
             std::vector<TargetSplitPiece> pieces(prefDbs.size());
 #pragma omp for schedule(dynamic, 1)
@@ -2104,23 +2114,24 @@ private:
                 entryTargetOffsets[entry + 1] = targetCount;
                 entryRecordOffsets[entry + 1] = recordCount;
                 for (size_t i = 0; i < prefDbs.size(); i++) {
-                    prefReadSize += prefDbs[i]->getEntryLen(firstEntry + entry);
+                    size += prefDbs[i]->getEntryLen(firstEntry + entry);
                 }
             }
         }
-        readSize += prefReadSize;
+        readSize += size;
         sumOffsets(entryTargetOffsets.data(), entryCount, par.threads);
         sumOffsets(entryRecordOffsets.data(), entryCount, par.threads);
-        const size_t firstRecord = records.size();
-        const size_t firstTarget = targets.size();
-        // the threads write the records of an entry at its offsets
+
+        // write the records of an entry at its offsets
+        size_t firstRecord = records.size();
+        size_t firstTarget = targets.size();
         records.resize(firstRecord + entryRecordOffsets[entryCount]);
         targets.resize(firstTarget + entryTargetOffsets[entryCount]);
-        size_t prefReadFetchSize = 0;
-        size_t prefReadAlignmentCells = 0;
-        size_t prefReadTargetBytes = 0;
-        size_t prefReadStolenTargetBytes = 0;
-#pragma omp parallel reduction(+:prefReadFetchSize, prefReadAlignmentCells, prefReadTargetBytes, prefReadStolenTargetBytes)
+        size_t fetchSize = 0;
+        size_t alignCells = 0;
+        size_t targetSize = 0;
+        size_t stolenSize = 0;
+#pragma omp parallel reduction(+:fetchSize, alignCells, targetSize, stolenSize)
         {
             std::vector<TargetSplitPiece> pieces(prefDbs.size());
             size_t stolenRange = SIZE_MAX;
@@ -2133,19 +2144,19 @@ private:
                 DBKeyType *repTargets = targets.data() + firstTarget + entryTargetOffsets[entry];
                 size_t j = firstRecord + entryRecordOffsets[entry];
                 for (DBKeyType repKey = getNextRepKey(pieces); repKey != DB_KEY_INVALID; repKey = getNextRepKey(pieces)) {
-                    // the pieces of a rep in target split order, so its targets ascend
+                    // pieces in target split order, so targets ascend
                     size_t repTargetCount = 0;
                     size_t sizeClass = 0;
                     for (size_t i = 0; i < pieces.size(); i++) {
                         if (pieces[i].repKey == repKey) {
                             sizeClass = std::min(sizeClassCount - 1, pieces[i].sizeClass);
                             const char *data = pieces[i].targets;
-                            const size_t targetCount = (((passClasses >> sizeClass) & 1) != 0) ? pieces[i].targetCount : 0;
+                            size_t targetCount = (((passClasses >> sizeClass) & 1) != 0) ? pieces[i].targetCount : 0;
                             DBKeyType target = targetSplitFirstKeys[i] - 1;
                             for (size_t k = 0; k < targetCount; k++) {
                                 target += Util::getPrefKey(data);
                                 repTargets[repTargetCount++] = target;
-                                prefReadStolenTargetBytes += targetSplitIsStolen[i] ? getSeqLenFromCursor(seqDbr, stolenRange, target) + 2 : 0;
+                                stolenSize += targetSplitIsStolen[i] ? getSeqLenFromCursor(seqDbr, stolenRange, target) + 2 : 0;
                             }
                             pieces[i].next();
                         }
@@ -2153,7 +2164,7 @@ private:
                     if (repTargetCount == 0) {
                         continue;
                     }
-                    const size_t repSize = seqDbr.getEntryLen(repKey) + FETCHED_KEY_SIZE;
+                    size_t repSize = seqDbr.getEntryLen(repKey) + FETCHED_KEY_SIZE;
                     size_t targetRange = SIZE_MAX;
                     for (size_t first = 0; first < repTargetCount; first += maxRecordTargetCount, j++) {
                         RepTargetsRecord &record = records[j];
@@ -2163,21 +2174,21 @@ private:
                         record.targetOffset = repTargets + first - targets.data();
                         record.readSize = repSize;
                         for (unsigned int i = 0; i < record.targetCount; i++) {
-                            const size_t targetLength = seqDbr.getSeqLenFromRange(targetRange, repTargets[first + i]);
+                            size_t targetLength = seqDbr.getSeqLenFromRange(targetRange, repTargets[first + i]);
                             record.readSize += targetLength + 2 + FETCHED_KEY_SIZE;
-                            prefReadAlignmentCells += (repSize - FETCHED_KEY_SIZE - 2) * targetLength;
-                            prefReadTargetBytes += targetLength + 2;
+                            alignCells += (repSize - FETCHED_KEY_SIZE - 2) * targetLength;
+                            targetSize += targetLength + 2;
                         }
-                        prefReadFetchSize += record.readSize;
+                        fetchSize += record.readSize;
                     }
                     repTargets += repTargetCount;
                 }
             }
         }
-        bufferFetchSize += prefReadFetchSize;
-        bufferAlignmentCells += prefReadAlignmentCells;
-        targetBytes += prefReadTargetBytes;
-        stolenTargetBytes += prefReadStolenTargetBytes;
+        bufferFetchSize += fetchSize;
+        bufferAlignmentCells += alignCells;
+        targetBytes += targetSize;
+        stolenTargetBytes += stolenSize;
     }
 };
 
@@ -2187,7 +2198,7 @@ static std::atomic<size_t> repSkippedTargetPairCount(0);
 static std::atomic<size_t> targetSkippedTargetPairCount(0);
 static std::atomic<size_t> uncoverableTargetPairCount(0);
 static std::atomic<size_t> alignedTargetPairCount(0);
-// rep skips by a served empty slot vs by the assigned bit; logged pairs the master drops
+// skips by empty slot and pairs the master drops
 static std::atomic<size_t> repSlotSkippedTargetPairCount(0);
 static std::atomic<size_t> repDroppedAcceptedPairCount(0);
 static std::atomic<size_t> targetDroppedAcceptedPairCount(0);
@@ -2301,7 +2312,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<uint64_t> acceptedWords;
     DBKeyType loggedRepOrderKey = DB_KEY_INVALID;
     const auto publishAccepted = [&](size_t repKey, size_t bytes) {
-        MMseqsNode::publishLog(acceptedHandle, acceptedFile, repKey, bytes, repTargetsReader.getTakenItemCount());
+        MMseqsNode::publishLog(acceptedHandle, acceptedFile, repKey, bytes);
     };
 
     // assigned bits of the served and aligned keys, by page
@@ -2350,16 +2361,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             }
             const size_t stepClusteredKey = assignedKeyWords[0];
             const size_t stepClusteredSize = assignedKeyWords[1 + MMseqsNode::rank];
-            const size_t keyCount = assignedKeyWords[1 + MMseqsNode::count];
+            size_t keyCount = assignedKeyWords[1 + MMseqsNode::count];
             size_t key = assignedKeyWords[2 + MMseqsNode::count];
-            const unsigned int keyDiffLowBits = assignedKeyWords[3 + MMseqsNode::count];
-            const size_t codeWords = assignedKeyWords[4 + MMseqsNode::count];
-            const size_t codeStart = assignedKeysSize + headerWords * sizeof(uint64_t);
+            unsigned int keyDiffLowBits = assignedKeyWords[3 + MMseqsNode::count];
+            size_t codeWords = assignedKeyWords[4 + MMseqsNode::count];
+            size_t codeStart = assignedKeysSize + headerWords * sizeof(uint64_t);
             assignedKeyWords.resize(codeWords);
             if (MMseqsNode::readLog(assignedKeysLog, codeStart, codeStart + codeWords * sizeof(uint64_t), (char *) assignedKeyWords.data(), wait) == false) {
                 return;
             }
-            KmerCodeReader codeRead = { reinterpret_cast<char *>(assignedKeyWords.data()), 0, 0, 0, -1, assignedKeysLog.c_str(), codeWords * sizeof(uint64_t), 0, codeWords * sizeof(uint64_t) };
+            KmerCodeReader codeRead = { (char *) assignedKeyWords.data(), 0, 0, 0, -1, assignedKeysLog.c_str(), codeWords * sizeof(uint64_t), 0, codeWords * sizeof(uint64_t) };
             // only the thread that holds assignedKeysMutex adds pages
             for (size_t i = 0; i < keyCount; i++) {
                 key += (i > 0) ? getRice(codeRead, keyDiffLowBits) + 1 : 0;
@@ -2453,7 +2464,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         const size_t keyEnd = (range + 1 < rangeCount) ? static_cast<size_t>(index[range + 1].id) : dbSize;
         coverableBytesSum += static_cast<double>(keyEnd - index[range].id) * (nodeRangeByteOffsets[coveredEnd] - nodeRangeByteOffsets[coveredFirst]);
     }
-    const double alignNodeCoverableSize = coverableBytesSum / std::max<size_t>(1, dbSize);
+    double alignNodeCoverableSize = coverableBytesSum / std::max((size_t) 1, dbSize);
     const size_t averageEntrySize = std::max<size_t>(1, rangeByteOffsets[rangeCount] / std::max<size_t>(1, dbSize));
     const size_t maxServedKeys = std::max<size_t>(1, servedFileEntrySize / FETCHED_KEY_SIZE);
     const size_t maxServedFileEntrySize = servedFileEntrySize + SERVICE_POLL_NODES * (maxSeqLen + 2);
@@ -2471,7 +2482,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     };
     // largest fetch that leaves a block cache for the coverable sequences
     const bool canCache = isCacheTooSmall(memoryLimit - std::min(memoryLimit, getReservedMemory(0))) == false;
-    const size_t servedSequenceSize = nodeRangeByteOffsets[rangeCount];
+    size_t servedSequenceSize = nodeRangeByteOffsets[rangeCount];
     // a fetch holds a rep and a member of the largest length at least
     const size_t minFetchSize = 2 * (maxMemberSeqLen + 2 + FETCHED_KEY_SIZE);
     size_t maxFetchSize = std::max(memoryLimit / FETCH_MEMORY_DIVISOR, minFetchSize);
@@ -2499,7 +2510,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         if (data != NULL) {
             return data;
         }
-        const size_t fetchSource = isReadingDirectly ? rank : getKeyAlignNode(seqDbr, key, (cursor != NULL) ? &cursor->block : NULL);
+        size_t fetchSource = isReadingDirectly ? rank : getKeyAlignNode(seqDbr, key, (cursor != NULL) ? &cursor->block : NULL);
         return findFetchedKey(sequences, fetchSource, key, seqLen, (cursor != NULL) ? &cursor->positions[fetchSource] : NULL);
     };
     const auto getFetchedSequence = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL, FetchedKeyCursor *cursor = NULL) -> const char * {
@@ -3412,13 +3423,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         // batches of about equal alignment cells; a large rep spans several
         size_t maxBatches = par.threads * (isSwipeEnabled ? ALIGN_BATCHES_PER_THREAD * ALIGN_BATCH_LANES / SwipeExtender::LANES : ALIGN_BATCHES_PER_THREAD);
         if (isSwipeEnabled) {
-            // the SWIPE jobs of this fetch at the ratio of SWIPE jobs to examined targets so far
+            // estimate the SWIPE jobs of this fetch
             size_t swipeJobCount = 0;
             for (int thread = 0; thread < par.threads; thread++) {
                 swipeJobCount += (threadTargetAligners[thread] != NULL) ? threadTargetAligners[thread]->swipeTargets.targetPairs : 0;
             }
-            const size_t fetchSwipeJobs = static_cast<size_t>(static_cast<uint128>(currentSequences.targetCount) * swipeJobCount / std::max<size_t>(1, examinedTargetPairCount.load()));
-            const size_t swipeBatches = std::max<size_t>(8 * par.threads, fetchSwipeJobs / MIN_BATCH_SWIPE_JOBS);
+            size_t fetchSwipeJobs = static_cast<size_t>(static_cast<uint128>(currentSequences.targetCount) * swipeJobCount / std::max((size_t) 1, examinedTargetPairCount.load()));
+            size_t swipeBatches = std::max((size_t) 8 * par.threads, fetchSwipeJobs / (64 * SwipeExtender::LANES));
             fetchCount++;
             fewerBatchFetchCount += swipeBatches < maxBatches;
             maxBatches = std::min(maxBatches, swipeBatches);
@@ -3497,7 +3508,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 size_t uncoverableCount = 0;
                 for (size_t i = batchOffsets[batch]; i < batchOffsets[batch + 1] + (batchFirstTargets[batch + 1] > 0); i++) {
                     const RepTargetsRecord &record = records[i];
-                    const unsigned int firstTarget = (i == batchOffsets[batch]) ? batchFirstTargets[batch] : 0;
+                    unsigned int firstTarget = (i == batchOffsets[batch]) ? batchFirstTargets[batch] : 0;
                     const unsigned int endTarget = (i == batchOffsets[batch + 1]) ? batchFirstTargets[batch + 1] : record.targetCount;
                     examinedCount += endTarget - firstTarget;
                     const size_t repKey = record.repOrderKeyFirstTarget.repKey % paddedDbSize;
@@ -3618,7 +3629,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     readAssignedKeys(false);
                 }
             }
-            // the answering nodes size the entries of the new pairs while their member checks align; a pair assigned by now is not sized, one assigned later fails when planned
+            // size the entries of the new pairs during the member checks
             const size_t sizedCount = acceptedEntryBytes.size();
             for (size_t batch = 0; batch < batchCount; batch++) {
                 acceptedPairs.insert(acceptedPairs.end(), batchPairs[batch].begin(), batchPairs[batch].end());
@@ -3675,14 +3686,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 }
             }
             const size_t memberBatchCount = batchRepOffsets.size() - 1;
-            // the parts of a pair in this fetch follow each other, a rep and so a batch holds all of them
-            const auto getPairPartEnd = [&](size_t part) {
-                size_t partEnd = part + 1;
-                while (partEnd < pairCount && pendingPairIsLastPart[partEnd - 1] == 0) {
-                    partEnd++;
-                }
-                return partEnd;
-            };
 #pragma omp parallel reduction(+:multiPartPairCount, unstartedMemberCount)
             {
                 unsigned int thread_idx = 0;
@@ -3701,14 +3704,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     repMemberCheckOffsets.assign(1, 0);
                     repKeys.clear();
                     for (size_t rep = batchRepOffsets[batch]; rep < batchRepOffsets[batch + 1]; rep++) {
-                        // the parts of a pair in this fetch make one check, so its first failing member stops all of them
-                        for (size_t i = repPairOffsets[rep]; i < repPairOffsets[rep + 1]; i = getPairPartEnd(i)) {
+                        // one check for all parts of a pair
+                        for (size_t i = repPairOffsets[rep]; i < repPairOffsets[rep + 1]; i = getPairPartEnd(pendingPairIsLastPart, pairCount, i)) {
                             const ClusterPair &pair = pendingPairs[i];
                             if (i < failedPartEnd || isAssigned(pair.repKey) || isAssigned(pair.memberKey) || getFetchedSequence(currentSequences, pair.repKey % paddedDbSize) == NULL) {
                                 continue;
                             }
                             MemberCheck &check = aligners.memberChecks.addCheck(i, 0);
-                            const size_t memberEnd = pendingMemberOffsets[getPairPartEnd(i)];
+                            size_t memberEnd = pendingMemberOffsets[getPairPartEnd(pendingPairIsLastPart, pairCount, i)];
                             for (size_t member = pendingMemberOffsets[i]; member < memberEnd; member++) {
                                 check.memberKeys.push_back(pendingMembers[member]);
                                 check.memberData.push_back(getFetchedEntry(currentSequences, pendingMembers[member]));
@@ -3723,7 +3726,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     alignMemberChecks(aligners, thread_idx, repMemberCheckOffsets, repKeys);
                     for (size_t g = 0; g < aligners.memberChecks.checkCount; g++) {
                         const MemberCheck &check = aligners.memberChecks.checks[g];
-                        const size_t partEnd = getPairPartEnd(check.targetId);
+                        size_t partEnd = getPairPartEnd(pendingPairIsLastPart, pairCount, check.targetId);
                         for (size_t i = check.targetId; i < partEnd; i++) {
                             membersPassed[i] = check.isPassing;
                         }
@@ -4219,7 +4222,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             }
         }
         if (doneRepOrderKey <= clusteredOrderKey) {
-            // only the slowest node gates the step, so sleep even if other nodes progressed
+            // only the slowest node gates the step
             MMseqsNode::sleepBeforePoll(polls++);
             waitWarning.check(accepted + "." + SSTR(slowestNode) + ".progress");
             waitSeconds += pollTimer.getTimediff();
@@ -4361,7 +4364,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         targetDroppedAcceptedPairCount += targetDroppedPairs;
         sumOffsets(repKeyOffsets.data(), repCount, threads);
         if (mode == Parameters::SET_COVER) {
-            // the pieces of a rep from several align nodes are one set
+            // pieces of a rep from several align nodes are one set
             setReps.clear();
             setSizes.clear();
             for (size_t rep = 0; rep < repCount; rep++) {
@@ -4369,7 +4372,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                     setReps.push_back(rep);
                     setSizes.push_back(1);
                 }
-                setSizes.back() += std::max<size_t>(1, repKeyOffsets[rep + 1] - repKeyOffsets[rep]) - 1;
+                setSizes.back() += std::max((size_t) 1, repKeyOffsets[rep + 1] - repKeyOffsets[rep]) - 1;
             }
             setReps.push_back(repCount);
             // a set waits until no larger set can come
@@ -4399,7 +4402,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             }
             DBKeyType smallMembers[SetCoverSmallSetFiles::MAX_SIZE];
             for (size_t set = 0; set < setSizes.size(); set++) {
-                const size_t setSize = setSizes[set];
+                size_t setSize = setSizes[set];
                 if (setSize < 3 || setSize > SetCoverSmallSetFiles::MAX_SIZE) {
                     continue;
                 }
@@ -4488,7 +4491,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                 size_t firstRep = __atomic_load_n(&keyReps[slot].second, __ATOMIC_RELAXED);
                 while (rep < firstRep && __atomic_compare_exchange_n(&keyReps[slot].second, &firstRep, rep, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED) == false) {
                 }
-                // the pieces of one rep from several align nodes share only the rep key
+                // pieces of one rep share only the rep key
                 if (firstRep != std::numeric_limits<size_t>::max() && (firstRep == rep || reps[firstRep].repKey != reps[rep].repKey)) {
                     __atomic_store_n(&repSharesKey[std::max(rep, firstRep)], 1, __ATOMIC_RELAXED);
                 }
@@ -4505,7 +4508,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                     }
                 }
             }
-            // the pieces of a rep go together, in parallel or in order
+            // pieces of a rep go together
             for (size_t rep = 1; rep < repCount; rep++) {
                 if (reps[rep].repKey == reps[rep - 1].repKey) {
                     repSharesKey[rep] |= repSharesKey[rep - 1];
@@ -4600,21 +4603,21 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         }
         clusteredOrderKey = stepRepOrderKey;
 
-        // the keys of the step, sorted and Rice coded once for all nodes
+        // sort and Rice code the keys of the step
         stepKeys.clear();
         for (int thread = 0; thread < threads; thread++) {
             stepKeys.insert(stepKeys.end(), threadAssignedKeys[thread].begin(), threadAssignedKeys[thread].end());
             threadAssignedKeys[thread].clear();
         }
         SORT_PARALLEL(stepKeys.begin(), stepKeys.end());
-        const unsigned int keyDiffLowBits = stepKeys.empty() ? 0 : getBitWidth(std::max<size_t>(1, (stepKeys.back() - stepKeys.front() + 1) / stepKeys.size())) - 1;
+        unsigned int keyDiffLowBits = stepKeys.empty() ? 0 : getBitWidth(std::max((size_t) 1, (stepKeys.back() - stepKeys.front() + 1) / stepKeys.size())) - 1;
         size_t codeBits = 0;
         for (size_t i = 1; i < stepKeys.size(); i++) {
             codeBits += ((stepKeys[i] - stepKeys[i - 1] - 1) >> keyDiffLowBits) + 1 + keyDiffLowBits;
         }
         const size_t headerWords = getAssignedKeysHeaderWords();
         const size_t stepStart = assignedKeyWords.size();
-        const size_t codeWords = (codeBits + 63) / 64;
+        size_t codeWords = (codeBits + 63) / 64;
         assignedKeyWords.resize(stepStart + headerWords + codeWords, 0);
         assignedKeyWords[stepStart] = clusteredOrderKey;
         for (size_t node = 0; node < MMseqsNode::count; node++) {
@@ -4624,7 +4627,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         assignedKeyWords[stepStart + 2 + MMseqsNode::count] = stepKeys.empty() ? 0 : stepKeys.front();
         assignedKeyWords[stepStart + 3 + MMseqsNode::count] = keyDiffLowBits;
         assignedKeyWords[stepStart + 4 + MMseqsNode::count] = codeWords;
-        KmerCodeWriter codeWrite(reinterpret_cast<char *>(assignedKeyWords.data() + stepStart + headerWords), codeWords * sizeof(uint64_t), 0);
+        KmerCodeWriter codeWrite((char *) (assignedKeyWords.data() + stepStart + headerWords), codeWords * sizeof(uint64_t), 0);
         for (size_t i = 1; i < stepKeys.size(); i++) {
             putRice(codeWrite, stepKeys[i] - stepKeys[i - 1] - 1, keyDiffLowBits);
         }
@@ -4675,14 +4678,14 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     return memberCount;
 }
 
-// why --local-tmp cannot hold files of this rank, empty if it can
+// empty if --local-tmp can hold files of this rank
 static std::string getLocalTmpProblem(const Parameters &par) {
     // ranks on one machine may create it at once
     if (FileUtil::makeDir(par.localTmp.c_str()) == false && FileUtil::directoryExists(par.localTmp.c_str()) == false) {
         Debug(Debug::ERROR) << "Cannot create local tmp dir " << par.localTmp << "\n";
         EXIT(EXIT_FAILURE);
     }
-    const int localTmpFd = open(par.localTmp.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int localTmpFd = open(par.localTmp.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     const StorageKind localTmpStorage = getStorageKind(localTmpFd);
     struct stat localTmpStat, dbStat;
     const bool isDbDevice = fstat(localTmpFd, &localTmpStat) == 0 && stat(par.db1Index.c_str(), &dbStat) == 0 && localTmpStat.st_dev == dbStat.st_dev;
@@ -4709,10 +4712,10 @@ int align2clustLinfinity(Parameters &par) {
     Timer timer;
     std::string phaseValues;
     Timer phaseValueTimer;
-    const size_t alignNodeCount = MMseqsNode::count - MMseqsNode::getFirstAlignNode();
-    // kmermatcher wrote the pref by target split, its first .partitions line holds the first block of every target split
+    size_t alignNodeCount = MMseqsNode::count - MMseqsNode::getFirstAlignNode();
+    // the first .partitions line holds the target split blocks
     const bool hasTargetSplits = par.align2clustMode == Parameters::ALIGN2CLUST_MODE_TARGET_SPLIT && alignNodeCount > 1;
-    const std::string partitionsData = MMseqsNode::readFile(par.db2 + ".partitions");
+    std::string partitionsData = MMseqsNode::readFile(par.db2 + ".partitions");
     char *partitionLine = (char *) partitionsData.c_str();
     for (; hasTargetSplits && *partitionLine != '\n'; partitionLine += Util::skipWhitespace(partitionLine)) {
         targetSplitBlockOffsets.push_back(Util::fast_atoi<size_t>(partitionLine));
@@ -4725,7 +4728,6 @@ int align2clustLinfinity(Parameters &par) {
         const char *columns[6];
         Util::getWordsOfLine(line, columns, 6);
         PrefPartition partition;
-        partition.firstKey = Util::fast_atoi<size_t>(columns[0]);
         partition.prefOffset = Util::fast_atoi<size_t>(columns[1]);
         partition.prefSize = Util::fast_atoi<size_t>(columns[2]);
         partition.alignmentCells = Util::fast_atoi<size_t>(columns[3]);
@@ -4735,57 +4737,58 @@ int align2clustLinfinity(Parameters &par) {
         totalAlignmentCells += partition.alignmentCells;
         totalPrefSize += partition.prefSize;
     }
-    // the block table for the align nodes of the target splits and the local copy
+    // block table for the target splits and the local copy
     DBReader<DBKeyType> blockDbr(par.db1.c_str(), par.db1Index.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
     blockDbr.open(DBReader<DBKeyType>::NOSORT);
     blockDbr.setBlockCacheSize(0);
     if (hasTargetSplits) {
-        // largest cost first to the align node with the least cost that stays within its share of the sequence bytes and one target split
-        const size_t targetSplitCount = targetSplitBlockOffsets.size() - 1;
+        size_t targetSplitCount = targetSplitBlockOffsets.size() - 1;
         const DBReader<DBKeyType>::Index *blockIndex = blockDbr.getIndex();
-        std::vector<size_t> targetSplitCosts(targetSplitCount, 0);
+        std::vector<size_t> splitCosts(targetSplitCount, 0);
         for (size_t i = 0; i < partitions.size(); i++) {
-            targetSplitCosts[partitions[i].targetSplit] += partitions[i].alignmentCells;
+            splitCosts[partitions[i].targetSplit] += partitions[i].alignmentCells;
         }
-        std::vector<size_t> targetSplitBytes(targetSplitCount, 0);
-        std::vector<size_t> targetSplitOrder(targetSplitCount);
-        size_t totalBytes = 0;
-        size_t maxTargetSplitBytes = 0;
+        std::vector<size_t> splitSizes(targetSplitCount, 0);
+        std::vector<size_t> order(targetSplitCount);
+        size_t totalSize = 0;
+        size_t maxSplitSize = 0;
         for (size_t split = 0; split < targetSplitCount; split++) {
-            const size_t keyBegin = blockDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[split]];
-            const size_t keyEnd = blockDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[split + 1]];
+            size_t keyBegin = blockDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[split]];
+            size_t keyEnd = blockDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[split + 1]];
             for (size_t range = blockDbr.findIdRange(keyBegin); range < blockDbr.getIndexSize() && static_cast<size_t>(blockIndex[range].id) < keyEnd; range++) {
-                const size_t rangeEnd = (range + 1 < blockDbr.getIndexSize()) ? static_cast<size_t>(blockIndex[range + 1].id) : blockDbr.getSize();
-                targetSplitBytes[split] += (std::min(keyEnd, rangeEnd) - std::max(keyBegin, static_cast<size_t>(blockIndex[range].id))) * blockIndex[range].length;
+                size_t rangeEnd = (range + 1 < blockDbr.getIndexSize()) ? static_cast<size_t>(blockIndex[range + 1].id) : blockDbr.getSize();
+                splitSizes[split] += (std::min(keyEnd, rangeEnd) - std::max(keyBegin, static_cast<size_t>(blockIndex[range].id))) * blockIndex[range].length;
             }
-            totalBytes += targetSplitBytes[split];
-            maxTargetSplitBytes = std::max(maxTargetSplitBytes, targetSplitBytes[split]);
-            targetSplitOrder[split] = split;
+            totalSize += splitSizes[split];
+            maxSplitSize = std::max(maxSplitSize, splitSizes[split]);
+            order[split] = split;
         }
-        SORT_SERIAL(targetSplitOrder.begin(), targetSplitOrder.end(), [&](size_t first, size_t second) {
-            return targetSplitCosts[first] > targetSplitCosts[second] || (targetSplitCosts[first] == targetSplitCosts[second] && first < second);
+
+        // largest cost first to the align node with the least cost
+        SORT_SERIAL(order.begin(), order.end(), [&](size_t first, size_t second) {
+            return splitCosts[first] > splitCosts[second] || (splitCosts[first] == splitCosts[second] && first < second);
         });
-        const size_t maxNodeBytes = (totalBytes + alignNodeCount - 1) / alignNodeCount + maxTargetSplitBytes;
+        size_t maxNodeSize = (totalSize + alignNodeCount - 1) / alignNodeCount + maxSplitSize;
         std::vector<uint128> nodeCosts(alignNodeCount, 0);
-        std::vector<size_t> nodeBytes(alignNodeCount, 0);
+        std::vector<size_t> nodeSizes(alignNodeCount, 0);
         targetSplitAlignNodes.resize(targetSplitCount);
         for (size_t i = 0; i < targetSplitCount; i++) {
-            const size_t split = targetSplitOrder[i];
+            size_t split = order[i];
             size_t node = SIZE_MAX;
             for (size_t alignNode = 0; alignNode < alignNodeCount; alignNode++) {
-                if (nodeBytes[alignNode] + targetSplitBytes[split] <= maxNodeBytes && (node == SIZE_MAX || nodeCosts[alignNode] < nodeCosts[node])) {
+                if (nodeSizes[alignNode] + splitSizes[split] <= maxNodeSize && (node == SIZE_MAX || nodeCosts[alignNode] < nodeCosts[node])) {
                     node = alignNode;
                 }
             }
-            nodeCosts[node] += targetSplitCosts[split];
-            nodeBytes[node] += targetSplitBytes[split];
+            nodeCosts[node] += splitCosts[split];
+            nodeSizes[node] += splitSizes[split];
             targetSplitAlignNodes[split] = MMseqsNode::getFirstAlignNode() + node;
         }
         if (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) {
-            const size_t alignNode = MMseqsNode::rank - MMseqsNode::getFirstAlignNode();
+            size_t alignNode = MMseqsNode::rank - MMseqsNode::getFirstAlignNode();
             MMseqsNode::addPhaseValue(phaseValues, "Target splits", SSTR(std::count(targetSplitAlignNodes.begin(), targetSplitAlignNodes.end(), MMseqsNode::rank)) + " of " + SSTR(targetSplitCount)
-                                      + " with " + SSTR(nodeBytes[alignNode]) + " of " + SSTR(totalBytes) + " sequence bytes and "
-                                      + SSTR(static_cast<size_t>(nodeCosts[alignNode] * 1000 / std::max<uint128>(1, totalAlignmentCells))) + " per mille of the cost");
+                                      + " with " + SSTR(nodeSizes[alignNode]) + " of " + SSTR(totalSize) + " sequence bytes and "
+                                      + SSTR(static_cast<size_t>(nodeCosts[alignNode] * 1000 / std::max((uint128) 1, totalAlignmentCells))) + " per mille of the cost");
         }
     }
     std::string seqDb = par.db1;
@@ -4822,10 +4825,10 @@ int align2clustLinfinity(Parameters &par) {
             // a copy left by a killed run does not take the free space
             const std::string localDir = par.localTmp + "/" + FileUtil::baseName(par.db3) + ".served." + SSTR(MMseqsNode::rank);
             std::vector<std::string> oldCopies = FileUtil::findDatafiles((localDir + "/" + FileUtil::baseName(par.db1)).c_str());
-            // and the cluster part whose members this rank answers for
+            // and the own cluster part
             std::vector<std::vector<std::pair<size_t, size_t> > > cluFileRanges(par.filterCluDBFile.empty() ? 0 : MMseqsNode::count);
             if (cluFileRanges.empty() == false) {
-                const std::vector<std::string> oldCluCopies = FileUtil::findDatafiles((localDir + "/" + FileUtil::baseName(par.filterCluDBFile)).c_str());
+                std::vector<std::string> oldCluCopies = FileUtil::findDatafiles((localDir + "/" + FileUtil::baseName(par.filterCluDBFile)).c_str());
                 oldCopies.insert(oldCopies.end(), oldCluCopies.begin(), oldCluCopies.end());
                 cluFileRanges[MMseqsNode::rank].emplace_back(0, FileUtil::getFileSize(par.filterCluDBFile + "." + SSTR(MMseqsNode::rank)));
                 servedSize += cluFileRanges[MMseqsNode::rank][0].second;
@@ -4861,7 +4864,7 @@ int align2clustLinfinity(Parameters &par) {
     // only the master writes and reads the open sets of set cover
     std::string setCoverPrefix = par.db3;
     if (MMseqsNode::isMaster() && par.clusteringMode == Parameters::SET_COVER && par.localTmp.empty() == false) {
-        const std::string localTmpProblem = getLocalTmpProblem(par);
+        std::string localTmpProblem = getLocalTmpProblem(par);
         if (localTmpProblem.empty()) {
             setCoverPrefix = par.localTmp + "/" + FileUtil::baseName(par.db3);
         } else if (par.localTmpFallback == false) {
@@ -4906,7 +4909,7 @@ int align2clustLinfinity(Parameters &par) {
     }
     alignmentSplitPartitionOffsets.push_back(partitions.size());
     MMseqsNode::WorkQueue alignmentSplitQueue(par.db3 + "_alignment_splits", alignmentSplitPartitionOffsets.size() - 1);
-    // target split mode: a cell (window, target split) is aligned by the node that claims it
+    // a cell is a window of a target split
     MMseqsNode::WorkQueue cellQueue(par.db3 + "_cells", hasTargetSplits ? partitions.size() : 0);
 
     // builds the block table of getKeyBlock
@@ -4916,8 +4919,8 @@ int align2clustLinfinity(Parameters &par) {
     const size_t pageCount = (dbSize + ASSIGNED_PAGE_KEYS - 1) / ASSIGNED_PAGE_KEYS;
     std::vector<unsigned int> pageAlignNodes(MMseqsNode::isMaster() ? pageCount : 0);
     for (size_t block = 0, pageEnd = 0; MMseqsNode::isMaster() && block + 1 < blockKeyOffsets.size(); block++) {
-        const unsigned int node = getBlockAlignNode(block);
-        const size_t firstPage = blockKeyOffsets[block] / ASSIGNED_PAGE_KEYS;
+        unsigned int node = getBlockAlignNode(block);
+        size_t firstPage = blockKeyOffsets[block] / ASSIGNED_PAGE_KEYS;
         const size_t lastPage = (blockKeyOffsets[block + 1] - 1) / ASSIGNED_PAGE_KEYS;
         for (size_t page = firstPage; page <= lastPage; page++) {
             // a page with keys of two nodes uses getKeyAlignNode
@@ -4926,8 +4929,8 @@ int align2clustLinfinity(Parameters &par) {
         pageEnd = lastPage + 1;
     }
     // an align node gets every assigned key
-    const size_t assignedPageCount = (MMseqsNode::rank < MMseqsNode::getFirstAlignNode()) ? 0 : pageCount;
-    const size_t assignedMemorySize = assignedPageCount * (ASSIGNED_PAGE_KEYS / 8) + ((assignedPageCount > 0) ? pageCount * sizeof(uint64_t *) : 0) + pageAlignNodes.size() * sizeof(unsigned int);
+    size_t assignedPageCount = (MMseqsNode::rank < MMseqsNode::getFirstAlignNode()) ? 0 : pageCount;
+    size_t assignedMemorySize = assignedPageCount * (ASSIGNED_PAGE_KEYS / 8) + ((assignedPageCount > 0) ? pageCount * sizeof(uint64_t *) : 0) + pageAlignNodes.size() * sizeof(unsigned int);
     const size_t memoryLimit = nodeMemoryLimit - std::min(nodeMemoryLimit, (isMasterAligning ? std::min(masterMemoryLimit, masterMemorySize) : 0) + assignedMemorySize);
     const int clusterThreads = isMasterAligning ? std::min(par.threads, CLUSTER_THREADS) : par.threads;
 
@@ -4972,7 +4975,7 @@ int align2clustLinfinity(Parameters &par) {
         }
     }
 
-    // remove the item files a killed run left, with target splits no node takes alignment splits
+    // remove the item files a killed run left
     if (hasTargetSplits == false) {
         alignmentSplitQueue.removeTakenItemFiles();
     }
@@ -5003,8 +5006,8 @@ int align2clustLinfinity(Parameters &par) {
         cluKeyOffsets[0] = 0;
         // every node, the master too, answers for its own cluster part
         // the master clusters while it answers, aligning or not
-        const size_t lookupMemoryLimit = nodeMemoryLimit - std::min(nodeMemoryLimit, (MMseqsNode::isMaster() ? std::min(masterMemoryLimit, masterMemorySize) : 0) + assignedMemorySize);
-        memberLookup = new ClusterMemberLookup(par.filterCluDBFile, cluPartDb, cluKeyOffsets, entriesPerSampledKey, lookupMemoryLimit / CLUSTER_PART_MEMORY_DIVISOR);
+        size_t lookupMemoryLimit = nodeMemoryLimit - std::min(nodeMemoryLimit, (MMseqsNode::isMaster() ? std::min(masterMemoryLimit, masterMemorySize) : 0) + assignedMemorySize);
+        memberLookup = new ClusterMemberLookup(par.filterCluDBFile, cluPartDb, cluKeyOffsets, entriesPerSampledKey, lookupMemoryLimit / 16);
         memberExchange = new ClusterMemberExchange(memberRequests, servedMembers, *memberLookup, std::max(1, par.threads / 4));
         memberDbr = new DBReader<DBKeyType>(par.filterSeqDBFile.c_str(), (par.filterSeqDBFile + ".index").c_str(), par.threads,
                                             DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);

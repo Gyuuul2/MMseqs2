@@ -956,7 +956,7 @@ template <typename T> void DBReader<T>::readIndexPairs(size_t first, size_t last
     FileUtil::preadAll(bufferedFds[dataFileNames.size()], indexFileName, (char *) indexPairs, (last - first) * 2 * sizeof(uint64_t), first * 2 * sizeof(uint64_t));
 }
 
-// keys[i] is the key of entry i * entryStep; like planKeyReadRequests, entries less than a page apart are read together, at most bufferSize bytes at once
+// read the key of every entryStep-th index entry
 template <typename T> void DBReader<T>::readSampledKeys(size_t entryStep, size_t bufferSize, T *keys, size_t &readSize, size_t &readCount) {
     size_t pageSize = Util::getPageSize();
     size_t keyCount = (size + entryStep - 1) / entryStep;
