@@ -590,6 +590,9 @@ static const size_t ALIGNMENT_SPLITS_PER_NODE = 4096;
 // at least 8 MiB of prefilter per split
 static const size_t MIN_ALIGNMENT_SPLIT_PREF_SIZE = 8 * 1024 * 1024;
 
+// share of a window of an align node that the nodes ahead of it steal per window it is behind
+static const double STEAL_SHARE_STEP = 1.0 / 8;
+
 // target split mode: runs of blocks, each aligned by one align node
 static std::vector<size_t> targetSplitBlockOffsets;
 static std::vector<unsigned int> targetSplitAlignNodes;
@@ -1656,20 +1659,33 @@ struct TargetSplitPiece {
 // target split mode: an align node reads the pieces of the targets in its target splits window by window in rep order;
 // an entry has the same keys in every target split file of a node, so the pieces of a rep join entry by entry
 struct TargetSplitReader {
-    TargetSplitReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &cells, size_t maxRecordSize, size_t memoryLimit, size_t paddedDbSize, size_t sizeClassCount)
-        : readSize(0), prefSize(0), par(par), seqDbr(seqDbr), cells(cells), targetSplitCount(targetSplitBlockOffsets.size() - 1), paddedDbSize(paddedDbSize), sizeClassCount(sizeClassCount),
+    TargetSplitReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &cells, MMseqsNode::WorkQueue &cellQueue, size_t maxRecordSize, size_t memoryLimit,
+                      size_t paddedDbSize, size_t sizeClassCount)
+        : readSize(0), prefSize(0), homeCellCount(0), stolenCellCount(0), lostCellCount(0), stolenCost(0), takenCost(0), stolenTargetBytes(0), targetBytes(0),
+          stealShares(MMseqsNode::count, 0), stolenCostSignChanges(0), stealWindowCount(0),
+          isClaiming(sizeClassCount == 1 && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()), par(par), seqDbr(seqDbr), cells(cells), cellQueue(cellQueue),
+          targetSplitCount(targetSplitBlockOffsets.size() - 1), paddedDbSize(paddedDbSize), sizeClassCount(sizeClassCount),
           maxPrefilterBufferSize(std::max<size_t>(1, memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)),
           maxRecordTargetCount(std::min<size_t>(UINT_MAX, std::max<size_t>(1, maxRecordSize / std::max<size_t>(seqDbr.getMaxSeqLen() + 2, Util::getPageSize())))),
-          cellPos(0), prefReadPos(0), passClasses(1), endClass(0), classSize(sizeClassCount, 0), prefNode(SIZE_MAX), bufferFetchSize(0), bufferAlignmentCells(0) {
-        for (size_t split = 0; split < targetSplitCount; split++) {
+          idleShares(MMseqsNode::count, 0), stealCarries(MMseqsNode::count, 0), wasStolen(targetSplitCount, 0), cellsPerSecond(0), waitSeconds(0), usedWaitSeconds(0),
+          lastStolenCost(0), lastStolenCostChange(0), cellPos(0), prefReadPos(0), passClasses(1), endClass(0), classSize(sizeClassCount, 0), prefNode(SIZE_MAX), bufferFetchSize(0), bufferAlignmentCells(0) {
+        // greedy takes its splits per window in claimWindowCells
+        for (size_t split = 0; isClaiming == false && split < targetSplitCount; split++) {
             if (targetSplitAlignNodes[split] == MMseqsNode::rank) {
                 targetSplits.push_back(split);
                 targetSplitFirstKeys.push_back(seqDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[split]]);
+                targetSplitIsStolen.push_back(0);
             }
         }
-        for (size_t i = 0; i < cells.size(); i++) {
+        for (size_t i = 0; isClaiming == false && i < cells.size(); i++) {
             prefSize += (targetSplitAlignNodes[cells[i].targetSplit] == MMseqsNode::rank) ? cells[i].prefSize : 0;
         }
+    }
+
+    // the alignment cells per second and the seconds waited for the master so far
+    void setWindowWork(double rate, double idle) {
+        cellsPerSecond = rate;
+        waitSeconds = idle;
     }
 
     // every window once; set cover then walks the windows once per pass and skips the prefilter reads without its size classes
@@ -1709,7 +1725,8 @@ struct TargetSplitReader {
         bufferFetchSize = 0;
         bufferAlignmentCells = 0;
         while (records.size() * sizeof(RepTargetsRecord) + targets.size() * sizeof(DBKeyType) < maxPrefilterBufferSize) {
-            if (prefReadPos < prefReads.size() || takeWindow()) {
+            // a buffer ends at a window end
+            if (prefReadPos < prefReads.size() || (records.empty() && takeWindow())) {
                 // a pass of several size classes stays in one buffer, it fits by countSizeClasses
                 if (records.empty() == false && (passClasses & (passClasses - 1)) == 0 && (bufferFetchSize >= maxReadSize || bufferAlignmentCells >= maxBufferAlignmentCells)) {
                     break;
@@ -1728,18 +1745,39 @@ struct TargetSplitReader {
 
     size_t readSize;
     size_t prefSize;
+    size_t homeCellCount;
+    size_t stolenCellCount;
+    size_t lostCellCount;
+    double stolenCost;
+    double takenCost;
+    size_t stolenTargetBytes;
+    size_t targetBytes;
+    std::vector<double> stealShares;
+    size_t stolenCostSignChanges;
+    size_t stealWindowCount;
+    const bool isClaiming;
 
 private:
     Parameters &par;
     DBReader<DBKeyType> &seqDbr;
     const std::vector<PrefPartition> &cells;
+    MMseqsNode::WorkQueue &cellQueue;
     const size_t targetSplitCount;
     const size_t paddedDbSize;
     const size_t sizeClassCount;
     const size_t maxPrefilterBufferSize;
     const size_t maxRecordTargetCount;
+    std::vector<double> idleShares;
+    std::vector<double> stealCarries;
+    std::vector<unsigned char> wasStolen;
+    double cellsPerSecond;
+    double waitSeconds;
+    double usedWaitSeconds;
+    double lastStolenCost;
+    int lastStolenCostChange;
     std::vector<size_t> targetSplits;
     std::vector<DBKeyType> targetSplitFirstKeys;
+    std::vector<unsigned char> targetSplitIsStolen;
     size_t cellPos;
     std::vector<PrefRead> prefReads;
     size_t prefReadPos;
@@ -1783,7 +1821,10 @@ private:
         // per pref byte two buffers and 8 bytes of targets, per piece of 4 bytes at least 48 bytes and a record
         const size_t maxPrefReadSize = std::max<size_t>(1, maxPrefilterBufferSize / (10 + (48 + sizeof(RepTargetsRecord)) / 4));
         const size_t prefReadsBefore = prefReads.size();
-        for (; prefReads.size() == prefReadsBefore && targetSplits.empty() == false && cellPos < cells.size(); cellPos += targetSplitCount) {
+        for (; prefReads.size() == prefReadsBefore && cellPos < cells.size(); cellPos += targetSplitCount) {
+            if (isClaiming) {
+                claimWindowCells(cellPos / targetSplitCount);
+            }
             size_t windowCost = 0;
             for (size_t i = 0; i < targetSplits.size(); i++) {
                 windowCost += cells[cellPos + targetSplits[i]].alignmentCells;
@@ -1816,6 +1857,132 @@ private:
             }
         }
         return prefReads.size() > prefReadsBefore;
+    }
+
+    // the claimer of the first home cell of node in window that is free or its own: count if free, UINT_MAX if there is none
+    unsigned int findHomeClaim(size_t window, size_t node) const {
+        for (size_t split = 0; split < targetSplitCount; split++) {
+            const size_t cell = window * targetSplitCount + split;
+            if (targetSplitAlignNodes[split] != node || cells[cell].alignmentCells == 0) {
+                continue;
+            }
+            const unsigned int claimer = cellQueue.getNode(cell);
+            if (claimer == node || claimer >= MMseqsNode::count) {
+                return std::min(claimer, MMseqsNode::count);
+            }
+        }
+        return UINT_MAX;
+    }
+
+    // greedy, before any prefilter read of the window: the free home cells, then cells of the align nodes that have not reached the window
+    void claimWindowCells(size_t window) {
+        const size_t firstCell = window * targetSplitCount;
+        const size_t firstAlignNode = MMseqsNode::getFirstAlignNode();
+        const size_t alignNodeCount = MMseqsNode::count - firstAlignNode;
+        std::vector<size_t> nodeCosts(MMseqsNode::count, 0);
+        std::vector<unsigned char> isTaken(targetSplitCount, 0);
+        double windowTakenCost = 0;
+        for (size_t split = 0; split < targetSplitCount; split++) {
+            const size_t cost = cells[firstCell + split].alignmentCells;
+            nodeCosts[targetSplitAlignNodes[split]] += cost;
+            if (cost > 0 && targetSplitAlignNodes[split] == MMseqsNode::rank) {
+                isTaken[split] = cellQueue.takeItem(firstCell + split);
+                homeCellCount += isTaken[split];
+                lostCellCount += 1 - isTaken[split];
+                windowTakenCost += isTaken[split] ? cost : 0;
+            }
+        }
+        // a node that has not taken its cells of the window is behind, by the windows before that it has not reached either
+        std::vector<unsigned char> isBehind(MMseqsNode::count, 0);
+        std::vector<size_t> behindWindows(MMseqsNode::count, 0);
+        size_t behindNodes = 0;
+        size_t aheadNodes = 1;
+        for (size_t node = firstAlignNode; node < MMseqsNode::count; node++) {
+            if (node == MMseqsNode::rank || nodeCosts[node] == 0) {
+                continue;
+            }
+            const unsigned int claimer = findHomeClaim(window, node);
+            if (claimer == node) {
+                idleShares[node] /= 2;
+                aheadNodes++;
+            } else if (claimer == MMseqsNode::count) {
+                isBehind[node] = 1;
+                behindNodes++;
+                // a window without free cells of the node is no work behind
+                for (size_t back = 1; back <= window && back * STEAL_SHARE_STEP <= 1 && behindWindows[node] * STEAL_SHARE_STEP < 0.5; back++) {
+                    const unsigned int earlierClaimer = findHomeClaim(window - back, node);
+                    if (earlierClaimer == node) {
+                        break;
+                    }
+                    behindWindows[node] += earlierClaimer == MMseqsNode::count;
+                }
+            }
+        }
+        const double idleCells = cellsPerSecond * std::max(0.0, waitSeconds - usedWaitSeconds);
+        usedWaitSeconds = waitSeconds;
+        double windowStolenCost = 0;
+        std::vector<size_t> splits;
+        for (size_t i = 1; i < alignNodeCount; i++) {
+            const size_t node = firstAlignNode + (MMseqsNode::rank - firstAlignNode + i) % alignNodeCount;
+            if (isBehind[node] == 0) {
+                continue;
+            }
+            // idle seconds add up; a window behind adds the cost difference of the window, both shared by the nodes that reached the window
+            const double cost = static_cast<double>(nodeCosts[node]);
+            idleShares[node] = std::min(0.5, idleShares[node] + idleCells / (2.0 * cost * behindNodes));
+            const double balanceShare = (behindWindows[node] > 0) ? std::max(0.0, cost - windowTakenCost) / (2.0 * cost) : 0.0;
+            stealShares[node] = std::min(0.5, idleShares[node] + (balanceShare + behindWindows[node] * STEAL_SHARE_STEP) / aheadNodes);
+            stealCarries[node] = std::min(stealCarries[node] + stealShares[node] * cost, cost);
+            // the splits stolen before first, then the largest cells, while they fit the carry
+            splits.clear();
+            for (size_t split = 0; split < targetSplitCount; split++) {
+                if (targetSplitAlignNodes[split] == node && cells[firstCell + split].alignmentCells > 0) {
+                    splits.push_back(split);
+                }
+            }
+            std::sort(splits.begin(), splits.end(), [&](size_t first, size_t second) {
+                const size_t firstCost = cells[firstCell + first].alignmentCells;
+                const size_t secondCost = cells[firstCell + second].alignmentCells;
+                return wasStolen[first] > wasStolen[second] || (wasStolen[first] == wasStolen[second] && (firstCost > secondCost || (firstCost == secondCost && first < second)));
+            });
+            for (size_t j = 0; j < splits.size() && cells[firstCell + splits[j]].alignmentCells <= stealCarries[node]; j++) {
+                if (cellQueue.takeItem(firstCell + splits[j])) {
+                    isTaken[splits[j]] = 1;
+                    stealCarries[node] -= cells[firstCell + splits[j]].alignmentCells;
+                    windowTakenCost += cells[firstCell + splits[j]].alignmentCells;
+                    windowStolenCost += cells[firstCell + splits[j]].alignmentCells;
+                    stolenCellCount++;
+                }
+            }
+        }
+        stolenCost += windowStolenCost;
+        stealWindowCount += windowStolenCost > 0;
+        if (windowStolenCost != lastStolenCost) {
+            const int change = (windowStolenCost > lastStolenCost) ? 1 : -1;
+            stolenCostSignChanges += lastStolenCostChange != 0 && change != lastStolenCostChange;
+            lastStolenCostChange = change;
+            lastStolenCost = windowStolenCost;
+        }
+        splits.clear();
+        targetSplitIsStolen.clear();
+        for (size_t split = 0; split < targetSplitCount; split++) {
+            wasStolen[split] = isTaken[split] && targetSplitAlignNodes[split] != MMseqsNode::rank;
+            if (isTaken[split]) {
+                splits.push_back(split);
+                targetSplitIsStolen.push_back(wasStolen[split]);
+                prefSize += cells[firstCell + split].prefSize;
+                takenCost += cells[firstCell + split].alignmentCells;
+            }
+        }
+        // the pref readers follow the splits of the window
+        if (splits != targetSplits) {
+            closePrefDbs();
+            targetSplits.swap(splits);
+            targetSplitFirstKeys.clear();
+            for (size_t i = 0; i < targetSplits.size(); i++) {
+                targetSplitFirstKeys.push_back(seqDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[targetSplits[i]]]);
+            }
+        }
     }
 
     size_t findPassPrefRead(size_t prefRead) {
@@ -1916,9 +2083,12 @@ private:
         targets.resize(firstTarget + entryTargetOffsets[entryCount]);
         size_t prefReadFetchSize = 0;
         size_t prefReadAlignmentCells = 0;
-#pragma omp parallel reduction(+:prefReadFetchSize, prefReadAlignmentCells)
+        size_t prefReadTargetBytes = 0;
+        size_t prefReadStolenTargetBytes = 0;
+#pragma omp parallel reduction(+:prefReadFetchSize, prefReadAlignmentCells, prefReadTargetBytes, prefReadStolenTargetBytes)
         {
             std::vector<TargetSplitPiece> pieces(prefDbs.size());
+            size_t stolenRange = SIZE_MAX;
 #pragma omp for schedule(dynamic, 1)
             for (size_t entry = 0; entry < entryCount; entry++) {
                 if (entryTargetOffsets[entry + 1] == entryTargetOffsets[entry]) {
@@ -1940,6 +2110,7 @@ private:
                             for (size_t k = 0; k < targetCount; k++) {
                                 target += Util::getPrefKey(data);
                                 repTargets[repTargetCount++] = target;
+                                prefReadStolenTargetBytes += targetSplitIsStolen[i] ? getSeqLenFromCursor(seqDbr, stolenRange, target) + 2 : 0;
                             }
                             pieces[i].next();
                         }
@@ -1960,6 +2131,7 @@ private:
                             const size_t targetLength = seqDbr.getSeqLenFromRange(targetRange, repTargets[first + i]);
                             record.readSize += targetLength + 2 + FETCHED_KEY_SIZE;
                             prefReadAlignmentCells += (repSize - FETCHED_KEY_SIZE - 2) * targetLength;
+                            prefReadTargetBytes += targetLength + 2;
                         }
                         prefReadFetchSize += record.readSize;
                     }
@@ -1969,6 +2141,8 @@ private:
         }
         bufferFetchSize += prefReadFetchSize;
         bufferAlignmentCells += prefReadAlignmentCells;
+        targetBytes += prefReadTargetBytes;
+        stolenTargetBytes += prefReadStolenTargetBytes;
     }
 };
 
@@ -2472,8 +2646,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     // the service thread and the loader use a quarter of the threads
     const int serviceThreads = std::max(1, par.threads / 4);
     std::atomic<double> alignedCellsPerSecond(0);
+    std::atomic<double> masterWaitSeconds(0);
     const auto fillPrefilterBuffer = [&](size_t buffer, size_t maxBufferAlignmentCells) {
         if (targetSplitReader != NULL) {
+            targetSplitReader->setWindowWork(alignedCellsPerSecond.load(), masterWaitSeconds.load());
             targetSplitReader->fillPrefilterBuffer(prefilterRecords[buffer], prefilterTargets[buffer], maxFetchSize, maxBufferAlignmentCells);
         } else {
             repTargetsReader.fillPrefilterBuffer(prefilterRecords[buffer], prefilterTargets[buffer], maxFetchSize, maxBufferAlignmentCells);
@@ -3730,6 +3906,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         alignedCells += static_cast<double>(fetchAlignmentCells);
         alignSeconds += alignTimer.getTimediff();
         alignedCellsPerSecond.store(alignedCells / std::max(alignSeconds, 1e-3));
+        masterWaitSeconds.store(waitSeconds);
         // the reps of pending pairs are not done
         waitForSequences(nextSequences, getFirstUndoneRepKey(nextRepKey));
         std::swap(currentSequences, nextSequences);
@@ -4614,6 +4791,8 @@ int align2clustLinfinity(Parameters &par) {
     }
     alignmentSplitPartitionOffsets.push_back(partitions.size());
     MMseqsNode::WorkQueue alignmentSplitQueue(par.db3 + "_alignment_splits", alignmentSplitPartitionOffsets.size() - 1);
+    // target split mode: a cell (window, target split) is aligned by the node that claims it
+    MMseqsNode::WorkQueue cellQueue(par.db3 + "_cells", hasTargetSplits ? partitions.size() : 0);
 
     // builds the block table of getKeyBlock
     seqDbr.setBlockCacheSize(0);
@@ -4680,6 +4859,7 @@ int align2clustLinfinity(Parameters &par) {
 
     // remove the item files a killed run left
     alignmentSplitQueue.removeTakenItemFiles();
+    cellQueue.removeTakenItemFiles();
     // all nodes use the smallest memory limit
     const size_t smallestMemoryLimit = MMseqsNode::getSmallestMemoryLimit(par.db3 + ".memory", nodeMemoryLimit - std::min(nodeMemoryLimit, assignedMemorySize));
     const size_t paddedDbSize = (dbSize + 63) / 64 * 64;
@@ -4689,7 +4869,7 @@ int align2clustLinfinity(Parameters &par) {
     const size_t servedFileEntrySize = std::max(BatchReader::MAX_READ_REQUEST_SIZE, smallestMemoryLimit / SERVED_FILE_MEMORY_DIVISOR);
 
     RepTargetsReader repTargetsReader(par, seqDbr, partitions, alignmentSplitPartitionOffsets, alignmentSplitQueue, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount);
-    TargetSplitReader *targetSplitReader = hasTargetSplits ? new TargetSplitReader(par, seqDbr, partitions, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount) : NULL;
+    TargetSplitReader *targetSplitReader = hasTargetSplits ? new TargetSplitReader(par, seqDbr, partitions, cellQueue, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount) : NULL;
     if (sizeClassCount > 1 && targetSplitReader != NULL) {
         targetSplitReader->countSizeClasses();
     } else if (sizeClassCount > 1) {
@@ -4758,6 +4938,17 @@ int align2clustLinfinity(Parameters &par) {
         if (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) {
             MMseqsNode::addPhaseValue(phaseValues, "Target split prefilter bytes", SSTR(targetSplitReader->readSize) + " read of " + SSTR(targetSplitReader->prefSize));
         }
+        if (targetSplitReader->isClaiming) {
+            std::string stealShares;
+            for (size_t node = MMseqsNode::getFirstAlignNode(); node < MMseqsNode::count; node++) {
+                stealShares += ((stealShares.empty()) ? "" : " ") + ((node == MMseqsNode::rank) ? std::string("-") : SSTR(static_cast<int>(targetSplitReader->stealShares[node] * 1000)));
+            }
+            MMseqsNode::addPhaseValue(phaseValues, "Target split cells", SSTR(targetSplitReader->homeCellCount) + " home, " + SSTR(targetSplitReader->stolenCellCount) + " stolen, "
+                                      + SSTR(targetSplitReader->lostCellCount) + " lost; stolen cost " + SSTR(static_cast<size_t>(1000 * targetSplitReader->stolenCost / std::max(1.0, targetSplitReader->takenCost)))
+                                      + " per mille of the cost in " + SSTR(targetSplitReader->stealWindowCount) + " windows, "
+                                      + SSTR(targetSplitReader->stolenCostSignChanges) + " sign changes of its difference; steal shares per mille " + stealShares);
+            MMseqsNode::addPhaseValue(phaseValues, "Stolen target bytes", SSTR(targetSplitReader->stolenTargetBytes) + " of " + SSTR(targetSplitReader->targetBytes) + " target bytes");
+        }
         delete targetSplitReader;
     }
     if (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) {
@@ -4789,6 +4980,7 @@ int align2clustLinfinity(Parameters &par) {
     MMseqsNode::waitForLog(clusteredLogFile, clusteredKey, clusteredSize);
     // every node took its last alignment split
     alignmentSplitQueue.removeTakenItemFiles();
+    cellQueue.removeTakenItemFiles();
     if (MMseqsNode::isMaster()) {
         clusterThread.join();
         Debug(Debug::INFO) << "Number of clusters: " << representativeCount - memberCount << "\n";

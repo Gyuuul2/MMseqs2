@@ -104,10 +104,9 @@ public:
         size_t getTakenItemCount() const;
         unsigned int getNode(size_t item) const;
         void removeTakenItemFiles();
-
-    private:
         bool takeItem(size_t item);
 
+    private:
         const std::string name;
         const size_t itemCount;
         size_t nextItem;
