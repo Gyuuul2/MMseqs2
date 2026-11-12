@@ -721,6 +721,8 @@ static const time_t READ_SECONDS = 1;
 // read the assigned keys a few times a second
 static const double BATCH_READ_SECONDS = PUBLISH_SECONDS / 4.0;
 static const double PREFILTER_BUFFER_WORK_SECONDS = 2.0 * PUBLISH_SECONDS;
+// a node takes its home cells this far ahead of the last node, the master step tells the home windows about that late
+static const double CLAIM_LEAD_SECONDS = 2.0 * PUBLISH_SECONDS;
 static const size_t ALIGN_BATCHES_PER_THREAD = 64;
 static const size_t ALIGN_BATCH_LANES = 16;
 static const int CLUSTER_THREADS = 4;
@@ -732,7 +734,7 @@ static size_t getRepOrderKey(uint64_t word) {
     return word & ~ACCEPTED_REP_BIT;
 }
 static size_t getAssignedKeysHeaderWords() {
-    return 2 * MMseqsNode::count + 5;
+    return 3 * MMseqsNode::count + 5;
 }
 
 // fractions of the memory limit
@@ -1685,13 +1687,13 @@ struct TargetSplitPiece {
 struct TargetSplitReader {
     TargetSplitReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &cells, MMseqsNode::WorkQueue &cellQueue, size_t maxRecordSize, size_t memoryLimit,
                       size_t paddedDbSize, size_t sizeClassCount, const std::string &claimedCells)
-        : claimedCellsFile(claimedCells), claimedCellsHandle(NULL), claimedCellsSize(0), publishedClaimedCellsSize(0), startedClaimCount(0), readSize(0), prefSize(0), homeCellCount(0), stolenCellCount(0), lostCellCount(0), stolenCost(0), takenCost(0), stolenTargetBytes(0), targetBytes(0),
-          stealShares(MMseqsNode::count, 0), doneRepKeys(MMseqsNode::count, 0), stolenCostSignChanges(0), stealWindowCount(0),
+        : claimedCellsFile(claimedCells), claimedCellsHandle(NULL), claimedCellsSize(0), publishedClaimedCellsSize(0), startedClaimCount(0), homeWindow(0), readSize(0), prefSize(0), homeCellCount(0), stolenCellCount(0), lostCellCount(0), stolenCost(0), takenCost(0), stolenTargetBytes(0), targetBytes(0),
+          stealShares(MMseqsNode::count, 0), doneRepKeys(MMseqsNode::count, 0), nodeHomeWindows(MMseqsNode::count, 0), stolenCostSignChanges(0), stealWindowCount(0),
           isClaiming(sizeClassCount == 1 && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()), par(par), seqDbr(seqDbr), cells(cells), cellQueue(cellQueue),
           targetSplitCount(targetSplitBlockOffsets.size() - 1), paddedDbSize(paddedDbSize), sizeClassCount(sizeClassCount),
           maxPrefilterBufferSize(std::max((size_t) 1, memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)),
           maxRecordTargetCount(std::min((size_t) UINT_MAX, std::max((size_t) 1, maxRecordSize / std::max(seqDbr.getMaxSeqLen() + 2, Util::getPageSize())))),
-          idleShares(MMseqsNode::count, 0), stealCarries(MMseqsNode::count, 0), wasStolen(targetSplitCount, 0), cellsPerSecond(0), waitSeconds(0), usedWaitSeconds(0),
+          idleShares(MMseqsNode::count, 0), stealCarries(MMseqsNode::count, 0), triedHomeWindows(MMseqsNode::count, 0), wasStolen(targetSplitCount, 0), cellsPerSecond(0), waitSeconds(0), usedWaitSeconds(0),
           lastStolenCost(0), lastStolenCostChange(0), cellPos(0), prefReadPos(0), passClasses(1), endClass(0), classSize(sizeClassCount, 0), prefNode(SIZE_MAX), bufferFetchSize(0), bufferAlignmentCells(0) {
         // greedy claims its splits per window
         for (size_t split = 0; isClaiming == false && split < targetSplitCount; split++) {
@@ -1818,6 +1820,8 @@ struct TargetSplitReader {
     size_t publishedClaimedCellsSize;
     size_t startedClaimCount;
     std::vector<size_t> claimWindows;
+    // first window whose home cells this node did not take yet
+    size_t homeWindow;
     size_t readSize;
     size_t prefSize;
     size_t homeCellCount;
@@ -1829,6 +1833,8 @@ struct TargetSplitReader {
     size_t targetBytes;
     std::vector<double> stealShares;
     std::vector<size_t> doneRepKeys;
+    // home window of every node at the last master step
+    std::vector<size_t> nodeHomeWindows;
     size_t stolenCostSignChanges;
     size_t stealWindowCount;
     const bool isClaiming;
@@ -1845,6 +1851,8 @@ private:
     const size_t maxRecordTargetCount;
     std::vector<double> idleShares;
     std::vector<double> stealCarries;
+    // first window of every node whose home cells this node did not try to take
+    std::vector<size_t> triedHomeWindows;
     std::vector<size_t> windowDoneRepKeys;
     std::vector<unsigned char> wasStolen;
     double cellsPerSecond;
@@ -1870,6 +1878,7 @@ private:
     std::vector<size_t> entrySizes;
     size_t bufferFetchSize;
     size_t bufferAlignmentCells;
+    Timer claimTimer;
     std::vector<size_t> entryTargetOffsets;
     std::vector<size_t> entryRecordOffsets;
 
@@ -1909,18 +1918,27 @@ private:
         // 10 bytes per pref byte, 48 bytes and a record per piece
         size_t maxPrefReadSize = std::max((size_t) 1, maxPrefilterBufferSize / (10 + (48 + sizeof(RepTargetsRecord)) / 4));
         size_t prefReadsBefore = prefReads.size();
-        for (; prefReads.size() == prefReadsBefore && cellPos < cells.size(); cellPos += targetSplitCount) {
-            if (isClaiming) {
-                claimWindowCells(cellPos / targetSplitCount);
+        while (prefReads.size() == prefReadsBefore) {
+            size_t firstCell = cellPos;
+            if (hasClaimLog()) {
+                firstCell = claimCells();
+            } else if (cellPos < cells.size()) {
+                if (isClaiming) {
+                    claimWindowCells(cellPos / targetSplitCount);
+                }
+                cellPos += targetSplitCount;
+            }
+            if (firstCell == cells.size()) {
+                break;
             }
             size_t windowCost = 0;
             for (size_t i = 0; i < targetSplits.size(); i++) {
-                windowCost += cells[cellPos + targetSplits[i]].alignmentCells;
+                windowCost += cells[firstCell + targetSplits[i]].alignmentCells;
             }
             if (windowCost == 0) {
                 continue;
             }
-            const PrefPartition &cell = cells[cellPos + targetSplits[0]];
+            const PrefPartition &cell = cells[firstCell + targetSplits[0]];
             // read each index once
             std::vector<uint64_t> *offsets = prefOffsets.data() + cell.node * targetSplitCount;
             for (size_t i = 0; i < targetSplits.size(); i++) {
@@ -2061,13 +2079,110 @@ private:
             lastStolenCost = windowStolenCost;
         }
 
-        splits.clear();
-        targetSplitIsStolen.clear();
         for (size_t split = 0; split < targetSplitCount; split++) {
             wasStolen[split] = isTaken[split] && targetSplitAlignNodes[split] != MMseqsNode::rank;
+        }
+        addClaim(window, isTaken);
+    }
+
+    // iteration 1: the home cells of the next window while it is at most lead windows after the home window of the last node,
+    // else up to half of the home cells of the nodes behind, window by window; returns the first cell of the window, cells.size() at the end
+    size_t claimCells() {
+        const size_t windowCount = cells.size() / targetSplitCount;
+        const size_t firstAlignNode = MMseqsNode::getFirstAlignNode();
+        const size_t alignNodeCount = MMseqsNode::count - firstAlignNode;
+        std::vector<unsigned char> isTaken(targetSplitCount, 0);
+        std::vector<size_t> splits;
+        while (true) {
+            size_t lastWindow = homeWindow;
+            for (size_t node = firstAlignNode; node < MMseqsNode::count; node++) {
+                if (node != MMseqsNode::rank) {
+                    triedHomeWindows[node] = std::max(triedHomeWindows[node], __atomic_load_n(&nodeHomeWindows[node], __ATOMIC_RELAXED));
+                    lastWindow = std::min(lastWindow, triedHomeWindows[node]);
+                }
+            }
+            // the home windows of this node in CLAIM_LEAD_SECONDS, at least one
+            const size_t lead = std::max((size_t) 1, static_cast<size_t>(homeWindow * CLAIM_LEAD_SECONDS / std::max(claimTimer.getTimediff(), 1e-3)));
+            // without home windows left every window is behind
+            const size_t endWindow = (homeWindow == windowCount) ? windowCount : homeWindow - std::min(homeWindow, lead);
+            for (size_t window = lastWindow; window < endWindow; window++) {
+                const size_t firstCell = window * targetSplitCount;
+                double windowStolenCost = 0;
+                for (size_t i = 1; i < alignNodeCount; i++) {
+                    const size_t node = firstAlignNode + (MMseqsNode::rank - firstAlignNode + i) % alignNodeCount;
+                    if (triedHomeWindows[node] > window) {
+                        continue;
+                    }
+                    triedHomeWindows[node] = window + 1;
+                    // splits stolen before first, then the largest cells
+                    splits.clear();
+                    size_t nodeCost = 0;
+                    for (size_t split = 0; split < targetSplitCount; split++) {
+                        if (targetSplitAlignNodes[split] == node && cells[firstCell + split].alignmentCells > 0) {
+                            splits.push_back(split);
+                            nodeCost += cells[firstCell + split].alignmentCells;
+                        }
+                    }
+                    std::sort(splits.begin(), splits.end(), [&](size_t first, size_t second) {
+                        size_t firstCost = cells[firstCell + first].alignmentCells;
+                        size_t secondCost = cells[firstCell + second].alignmentCells;
+                        return wasStolen[first] > wasStolen[second] || (wasStolen[first] == wasStolen[second] && (firstCost > secondCost || (firstCost == secondCost && first < second)));
+                    });
+                    size_t nodeStolenCost = 0;
+                    for (size_t j = 0; j < splits.size(); j++) {
+                        const size_t cost = cells[firstCell + splits[j]].alignmentCells;
+                        if (2 * (nodeStolenCost + cost) > nodeCost) {
+                            continue;
+                        }
+                        // a taken cell: the node or another one is past this window
+                        if (cellQueue.takeItem(firstCell + splits[j]) == false) {
+                            break;
+                        }
+                        isTaken[splits[j]] = 1;
+                        nodeStolenCost += cost;
+                        stolenCellCount++;
+                    }
+                    windowStolenCost += nodeStolenCost;
+                }
+                if (windowStolenCost > 0) {
+                    stolenCost += windowStolenCost;
+                    stealWindowCount++;
+                    wasStolen = isTaken;
+                    addClaim(window, isTaken);
+                    return firstCell;
+                }
+            }
+            if (homeWindow == windowCount) {
+                return cells.size();
+            }
+            const size_t firstCell = homeWindow * targetSplitCount;
+            double windowTakenCost = 0;
+            for (size_t split = 0; split < targetSplitCount; split++) {
+                const size_t cost = cells[firstCell + split].alignmentCells;
+                if (cost > 0 && targetSplitAlignNodes[split] == MMseqsNode::rank) {
+                    isTaken[split] = cellQueue.takeItem(firstCell + split);
+                    homeCellCount += isTaken[split];
+                    lostCellCount += 1 - isTaken[split];
+                    windowTakenCost += isTaken[split] ? cost : 0;
+                }
+            }
+            __atomic_store_n(&homeWindow, homeWindow + 1, __ATOMIC_RELAXED);
+            if (windowTakenCost > 0) {
+                addClaim(homeWindow - 1, isTaken);
+                return firstCell;
+            }
+        }
+    }
+
+    // the taken cells of a window are a claim
+    void addClaim(size_t window, const std::vector<unsigned char> &isTaken) {
+        size_t firstCell = window * targetSplitCount;
+        std::vector<size_t> splits;
+        targetSplitIsStolen.clear();
+        for (size_t split = 0; split < targetSplitCount; split++) {
             if (isTaken[split]) {
                 splits.push_back(split);
-                targetSplitIsStolen.push_back(wasStolen[split]);
+                targetSplitIsStolen.push_back(targetSplitAlignNodes[split] != MMseqsNode::rank);
                 prefSize += cells[firstCell + split].prefSize;
                 takenCost += cells[firstCell + split].alignmentCells;
             }
@@ -2382,7 +2497,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t publishedRepKey = 0;
     const auto publishAccepted = [&](size_t repKey, size_t bytes) {
         const size_t claimsSize = hasClaimLog ? targetSplitReader->publishClaims() : 0;
-        MMseqsNode::publishLog(acceptedHandle, acceptedFile, repKey, bytes, claimsSize);
+        const size_t homeWindow = hasClaimLog ? __atomic_load_n(&targetSplitReader->homeWindow, __ATOMIC_RELAXED) : 0;
+        MMseqsNode::publishLog(acceptedHandle, acceptedFile, repKey, bytes, claimsSize, homeWindow);
         __atomic_store_n(&publishedRepKey, repKey, __ATOMIC_RELAXED);
     };
 
@@ -2442,6 +2558,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             size_t codeWords = step[4 + MMseqsNode::count];
             for (size_t node = 0; targetSplitReader != NULL && node < MMseqsNode::count; node++) {
                 __atomic_store_n(&targetSplitReader->doneRepKeys[node], step[5 + MMseqsNode::count + node], __ATOMIC_RELAXED);
+                __atomic_store_n(&targetSplitReader->nodeHomeWindows[node], step[5 + 2 * MMseqsNode::count + node], __ATOMIC_RELAXED);
             }
             step += headerWords;
             KmerCodeReader codeRead = { (char *) step, 0, 0, 0, -1, assignedKeysLog.c_str(), codeWords * sizeof(uint64_t), 0, codeWords * sizeof(uint64_t) };
@@ -4330,6 +4447,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     std::vector<ClaimLog *> stepLogs;
     std::vector<size_t> nodeStepLogCounts(MMseqsNode::count, 0);
     std::vector<size_t> nodeClaimsSize(MMseqsNode::count, 0);
+    std::vector<size_t> nodeHomeWindows(MMseqsNode::count, 0);
     std::vector<std::vector<uint64_t> > nodeClaimWords(MMseqsNode::count);
     // first key of the window of every claim, SIZE_MAX once its log started
     std::vector<std::vector<size_t> > nodeClaimKeys(MMseqsNode::count);
@@ -4411,8 +4529,9 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             size_t repKey;
             size_t logSize;
             size_t claimsSize;
+            size_t homeWindow;
             nodeClaimWords[node].clear();
-            if ((nodeHasProgress[node] && nodeRepOrderKeys[node] == orderKeyEnd) || MMseqsNode::readLogProgress(log, repKey, logSize, &claimsSize) == false) {
+            if ((nodeHasProgress[node] && nodeRepOrderKeys[node] == orderKeyEnd) || MMseqsNode::readLogProgress(log, repKey, logSize, &claimsSize, &homeWindow) == false) {
                 continue;
             }
             // an older progress has fewer claims, or the same claims and no larger key or size
@@ -4428,6 +4547,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             nodeHasProgress[node] = 1;
             nodeRepOrderKeys[node] = repKey;
             nodeLogSize[node] = logSize;
+            nodeHomeWindows[node] = homeWindow;
         }
         size_t doneRepOrderKey = orderKeyEnd;
         size_t slowestNode = 0;
@@ -4907,6 +5027,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         assignedKeyWords[stepStart + 4 + MMseqsNode::count] = codeWords;
         for (size_t node = 0; node < MMseqsNode::count; node++) {
             assignedKeyWords[stepStart + 5 + MMseqsNode::count + node] = nodeHasProgress[node] ? nodeRepOrderKeys[node] : 0;
+            assignedKeyWords[stepStart + 5 + 2 * MMseqsNode::count + node] = nodeHomeWindows[node];
         }
         KmerCodeWriter codeWrite((char *) (assignedKeyWords.data() + stepStart + headerWords), codeWords * sizeof(uint64_t), 0);
         for (size_t i = 1; i < stepKeys.size(); i++) {
