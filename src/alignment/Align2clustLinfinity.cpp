@@ -2131,7 +2131,8 @@ private:
                     size_t nodeStolenCost = 0;
                     for (size_t j = 0; j < splits.size(); j++) {
                         const size_t cost = cells[firstCell + splits[j]].alignmentCells;
-                        if (2 * (nodeStolenCost + cost) > nodeCost) {
+                        // the first cell even above half, a single large cell of a slow node gets help in the next windows
+                        if (nodeStolenCost > 0 && 2 * (nodeStolenCost + cost) > nodeCost) {
                             continue;
                         }
                         // a taken cell: the node or another one is past this window
