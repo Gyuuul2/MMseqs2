@@ -1398,6 +1398,9 @@ struct TargetSplitFiles {
     // the cells of the window being written
     std::vector<size_t> cellOffsets;
     std::vector<size_t> cellCosts;
+    // a window ends before an entry once it has this cost and size
+    size_t rowCost;
+    size_t rowSize;
 };
 
 // the targets of a rep in one target split
@@ -1408,11 +1411,31 @@ struct RepTargetsPiece {
     const DBKeyType *last;
 };
 
+// a row per target split: first key, offset, size, cost, node, target split
+static void addTargetSplitRows(TargetSplitFiles &files, size_t windowFirstKey, std::string &partitionsData) {
+    for (size_t split = 0; split < files.dataSizes.size(); split++) {
+        partitionsData += SSTR(windowFirstKey) + "\t" + SSTR(files.cellOffsets[split]) + "\t" + SSTR(files.dataSizes[split] - files.cellOffsets[split]) + "\t" + SSTR(files.cellCosts[split])
+                          + "\t" + SSTR(MMseqsNode::rank) + "\t" + SSTR(split) + "\n";
+        files.cellOffsets[split] = files.dataSizes[split];
+        files.cellCosts[split] = 0;
+    }
+}
+
 // write an entry in every target split: rep key gap, size class, target gaps, 0
 static void writeTargetSplits(const PrefFiles &prefFiles, TargetSplitFiles &files, DBReader<DBKeyType> &seqDbr, size_t firstKey, size_t keyCount, const size_t *keyOffsets,
-                              const DBKeyType *targets, int threads) {
+                              const DBKeyType *targets, int threads, size_t &windowFirstKey, std::string &partitionsData) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     size_t splitCount = files.dataSizes.size();
+    size_t windowCost = 0;
+    size_t windowSize = 0;
+    for (size_t split = 0; split < splitCount; split++) {
+        windowCost += files.cellCosts[split];
+        windowSize += files.dataSizes[split] - files.cellOffsets[split];
+    }
+    if (keyCount > 0 && windowCost >= files.rowCost && windowSize >= files.rowSize) {
+        addTargetSplitRows(files, windowFirstKey, partitionsData);
+        windowFirstKey = firstKey;
+    }
     for (size_t split = 0; split < splitCount; split++) {
         files.indexCells[split].push_back(firstKey);
         files.indexCells[split].push_back(files.dataSizes[split]);
@@ -1502,16 +1525,6 @@ static void writeTargetSplits(const PrefFiles &prefFiles, TargetSplitFiles &file
         }
         chunkFirstKey = taskKeyOffsets.back();
     } while (chunkFirstKey < keyCount);
-}
-
-// a row per target split: first key, offset, size, cost, node, target split
-static void addTargetSplitRows(TargetSplitFiles &files, size_t windowFirstKey, std::string &partitionsData) {
-    for (size_t split = 0; split < files.dataSizes.size(); split++) {
-        partitionsData += SSTR(windowFirstKey) + "\t" + SSTR(files.cellOffsets[split]) + "\t" + SSTR(files.dataSizes[split] - files.cellOffsets[split]) + "\t" + SSTR(files.cellCosts[split])
-                          + "\t" + SSTR(MMseqsNode::rank) + "\t" + SSTR(split) + "\n";
-        files.cellOffsets[split] = files.dataSizes[split];
-        files.cellCosts[split] = 0;
-    }
 }
 
 struct OwnKmers {
@@ -2543,6 +2556,26 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     }
     size_t mergeSplitCount = exchange.sendSplitCount;
     size_t mergeSplitCost = std::max((size_t) 1, (globalCost + mergeSplitCount - 1) / mergeSplitCount);
+    if (exchange.hasTargetSplits) {
+        // about a merge split of alignment cost per window: pair bytes times the squared rep length
+        double estimatedCost = 0;
+        size_t pairBytes = 0;
+        for (size_t partition = 0; partition < partitionCount; partition++) {
+            size_t sendSplit = partition / exchange.partitionsPerRange;
+            size_t keyBegin = getPartitionFirstKey(exchange, sendSplit, partition % exchange.partitionsPerRange);
+            size_t keyEnd = getPartitionFirstKey(exchange, sendSplit, partition % exchange.partitionsPerRange + 1);
+            double squaredLengths = 0;
+            for (size_t range = seqDbr.findIdRange(keyBegin); keyBegin < keyEnd && range < seqDbr.getIndexSize() && static_cast<size_t>(index[range].id) < keyEnd; range++) {
+                size_t rangeEnd = (range + 1 < seqDbr.getIndexSize()) ? static_cast<size_t>(index[range + 1].id) : seqDbr.getSize();
+                double length = index[range].length - 2;
+                squaredLengths += (std::min(keyEnd, rangeEnd) - std::max(keyBegin, static_cast<size_t>(index[range].id))) * length * length;
+            }
+            estimatedCost += (keyEnd > keyBegin) ? partitionPairSizes[partition] * squaredLengths / (keyEnd - keyBegin) : 0;
+            pairBytes += partitionPairSizes[partition];
+        }
+        targetSplitFiles.rowCost = std::max((size_t) 1, static_cast<size_t>(estimatedCost * exchange.pairTargetCount / std::max((size_t) 1, pairBytes) / mergeSplitCount));
+        targetSplitFiles.rowSize = 1024 * 1024;
+    }
     std::vector<size_t> splitPartitionOffsets(mergeSplitCount + 1, partitionCount);
     splitPartitionOffsets[0] = 0;
     size_t costBefore = 0;
@@ -2760,7 +2793,7 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                         for (size_t passPartition = 0; passPartition < passPartitions; passPartition++) {
                             const PartitionMerge &merge = partitionMerges[passPartition];
                             writeTargetSplits(prefFiles, targetSplitFiles, seqDbr, getPartitionFirstKey(exchange, sendSplit, passFirstPartition + passPartition), merge.keyOffsets.size() - 1,
-                                              merge.keyOffsets.data(), merge.targets, par.threads);
+                                              merge.keyOffsets.data(), merge.targets, par.threads, windowFirstKey, partitionsData);
                             partitionMerges[passPartition] = PartitionMerge();
                         }
                         continue;
@@ -2811,7 +2844,8 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                                                   partitionKeys, partitionTargets[partition], merge, mergeThreads);
                             mergePartitionTargets(exchange, seqDbr, partitionFirstKey, merge, pairPassTargets, mergeThreads);
                             if (exchange.hasTargetSplits) {
-                                writeTargetSplits(prefFiles, targetSplitFiles, seqDbr, partitionFirstKey, partitionKeys, merge.keyOffsets.data(), merge.targets, par.threads);
+                                writeTargetSplits(prefFiles, targetSplitFiles, seqDbr, partitionFirstKey, partitionKeys, merge.keyOffsets.data(), merge.targets, par.threads, windowFirstKey,
+                                                  partitionsData);
                                 continue;
                             }
                             writePartition(prefFiles, partitionFirstKey, merge, prefDataSize, prefIndexSize, 0, par.threads);
@@ -2854,7 +2888,7 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                                     size_t nextKey = repKeyQueue.empty() ? partitionKeys : static_cast<size_t>(repKeyQueue.top().value);
                                     if (nextKey == partitionKeys || chunkTargets.size() + nextKey - chunkFirstKey >= chunkSize) {
                                         writeTargetSplits(prefFiles, targetSplitFiles, seqDbr, partitionFirstKey + chunkFirstKey, key + 1 - chunkFirstKey, chunkKeyOffsets.data(), chunkTargets.data(),
-                                                          par.threads);
+                                                          par.threads, windowFirstKey, partitionsData);
                                         chunkFirstKey = nextKey;
                                         chunkKeyOffsets.assign(1, 0);
                                         chunkTargets.clear();
