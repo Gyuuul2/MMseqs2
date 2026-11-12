@@ -5,6 +5,7 @@
 #include "Debug.h"
 #include "Util.h"
 #include "MMseqsNode.h"
+#include "S3Client.h"
 
 #include <climits>
 
@@ -33,11 +34,15 @@ int createsubdb(int argc, const char **argv, const Command& command) {
         }
         MMseqsNode::writeRepresentativeBits(par.db3, reader, bits.data(), firstKey, keyCount);
 
-        if (MMseqsNode::isMaster()) {
+        // aws backend: every node links the data files, the later steps stage the targets
+        if (MMseqsNode::isMaster() || S3Client::isEnabled()) {
             // the next steps read no headers, lookup or source
             DBReader<DBKeyType>::softlinkDb(par.db2, par.db3, DBFiles::DATA);
+        }
+        if (MMseqsNode::isMaster()) {
             DBWriter::writeDbtypeFile(par.db3.c_str(), reader.getDbtype(), reader.isCompressed());
         }
+        MMseqsNode::publishDatabase(par.db3);
         reader.close();
         return EXIT_SUCCESS;
     }

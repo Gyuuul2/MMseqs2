@@ -16,6 +16,8 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
+#include <climits>
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <dirent.h>
@@ -50,7 +52,7 @@ void MMseqsNode::init() {
             break;
         }
     }
-    const char *runVariables[] = { "SLURM_JOB_ID", "SLURM_STEP_ID", "SLURM_RESTART_COUNT", "OMPI_MCA_ess_base_jobid", "PMIX_NAMESPACE" };
+    const char *runVariables[] = { "SLURM_JOB_ID", "SLURM_STEP_ID", "SLURM_RESTART_COUNT", "OMPI_MCA_ess_base_jobid", "PMIX_NAMESPACE", "MMSEQS_RUN_ID", "MMSEQS_STEP_ID" };
     runId.clear();
     for (size_t i = 0; i < sizeof(runVariables) / sizeof(runVariables[0]); i++) {
         const char *value = getenv(runVariables[i]);
@@ -174,8 +176,21 @@ void MMseqsNode::WaitWarning::reset() {
     nextSeconds = WAIT_WARNING_SECONDS;
 }
 
+// MMSEQS_WAIT_TIMEOUT: seconds of one wait before the node stops; aws backend: the launcher writes the object failed when the run fails
 void MMseqsNode::WaitWarning::check(const std::string &what) {
-    if (static_cast<size_t>(time(NULL) - start) >= nextSeconds) {
+    static const char *timeout = getenv("MMSEQS_WAIT_TIMEOUT");
+    static time_t lastFailedCheck = 0;
+    const time_t now = time(NULL);
+    if (timeout != NULL && *timeout != '\0' && now - start > strtol(timeout, NULL, 10)) {
+        Debug(Debug::ERROR) << "Node " << rank << " waited more than MMSEQS_WAIT_TIMEOUT=" << timeout << " s for " << what << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    const time_t last = __atomic_load_n(&lastFailedCheck, __ATOMIC_RELAXED);
+    if (S3Client::isEnabled() && now - last >= 60 && __sync_bool_compare_and_swap(&lastFailedCheck, last, now) && S3Client::head("failed", NULL)) {
+        Debug(Debug::ERROR) << "Node " << rank << " stops while it waits for " << what << ": the run failed, the object failed exists below the run prefix\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (static_cast<size_t>(now - start) >= nextSeconds) {
         Debug(Debug::ERROR) << "Node " << rank << " waited " << nextSeconds << " s for " << what << ". Check that no node has died and that all nodes share this directory\n";
         nextSeconds *= 2;
     }
@@ -186,7 +201,7 @@ static void sleepInWait(unsigned int polls) {
 }
 
 std::string MMseqsNode::readFile(const std::string &file) {
-    if (S3Client::isEnabled() && FileUtil::fileExists(file.c_str()) == false) {
+    if (S3Client::isEnabled() && (FileUtil::fileExists(file.c_str()) == false || FileUtil::fileExists((file + ".staged").c_str()))) {
         std::string content;
         if (S3Client::get(S3Client::getObjectName(file), content) == false) {
             Debug(Debug::ERROR) << "Cannot find " << file << " on this node or in S3\n";
@@ -257,6 +272,10 @@ void MMseqsNode::waitForRunFilesChange(const std::string &prefix, std::string &c
 
 // opening a directory asks an NFS server for its state
 void MMseqsNode::listDirectory(const std::string &directory, std::vector<std::string> &names) {
+    if (S3Client::isEnabled()) {
+        S3Client::list(S3Client::getObjectName(directory), names);
+        return;
+    }
     names.clear();
     DIR *handle = opendir(directory.c_str());
     if (handle == NULL) {
@@ -288,27 +307,31 @@ static std::mutex logMutex;
 static std::map<std::string, std::pair<size_t, size_t> > publishedLogs;
 static std::map<std::string, std::vector<size_t> > logChunkEnds;
 
-void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t claimsSize, size_t homeWindow) {
+size_t MMseqsNode::syncLog(FILE *file, const std::string &log, size_t size) {
     if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
         Debug(Debug::ERROR) << "Cannot flush " << log << "\n";
         EXIT(EXIT_FAILURE);
     }
-    std::string chunks;
-    if (S3Client::isEnabled()) {
-        std::pair<size_t, size_t> published;
-        {
-            std::lock_guard<std::mutex> lock(logMutex);
-            published = publishedLogs[log];
-        }
-        if (size > published.second) {
-            S3Client::putFile(S3Client::getObjectName(log) + "." + SSTR(published.first), log, published.second, size - published.second);
-            published = std::make_pair(published.first + 1, size);
-            std::lock_guard<std::mutex> lock(logMutex);
-            publishedLogs[log] = published;
-        }
-        chunks = "\t" + SSTR(published.first);
+    if (S3Client::isEnabled() == false) {
+        return 0;
     }
-    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(size) + "\t" + SSTR(claimsSize) + "\t" + SSTR(homeWindow) + chunks + "\n");
+    std::pair<size_t, size_t> published;
+    {
+        std::lock_guard<std::mutex> lock(logMutex);
+        published = publishedLogs[log];
+    }
+    if (size > published.second) {
+        S3Client::putFile(S3Client::getObjectName(log) + "." + SSTR(published.first), log, published.second, size - published.second);
+        published = std::make_pair(published.first + 1, size);
+        std::lock_guard<std::mutex> lock(logMutex);
+        publishedLogs[log] = published;
+    }
+    return published.first;
+}
+
+void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t claimsSize, size_t homeWindow) {
+    size_t chunks = syncLog(file, log, size);
+    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(size) + "\t" + SSTR(claimsSize) + "\t" + SSTR(homeWindow) + (S3Client::isEnabled() ? "\t" + SSTR(chunks) : "") + "\n");
 }
 
 bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &size, size_t *claimsSize, size_t *homeWindow) {
@@ -418,18 +441,31 @@ bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
     EXIT(EXIT_FAILURE);
 }
 
-void MMseqsNode::removeLog(const std::string &log) {
+void MMseqsNode::removeLog(const std::string &log, bool hasProgress) {
     if (S3Client::isEnabled()) {
-        std::string progress = readPolledFile(log + ".progress");
-        const char *columns[5];
-        size_t chunks = (progress.compare(0, runId.size(), runId) == 0 && Util::getWordsOfLine((char *) progress.c_str() + runId.size(), columns, 5) == 5)
-                        ? Util::fast_atoi<size_t>(columns[4]) : 0;
+        // the writer knows its chunks, another node reads their count in the progress
+        size_t chunks = 0;
+        bool isPublished;
+        {
+            std::lock_guard<std::mutex> lock(logMutex);
+            std::map<std::string, std::pair<size_t, size_t> >::const_iterator it = publishedLogs.find(log);
+            isPublished = it != publishedLogs.end();
+            chunks = isPublished ? it->second.first : 0;
+        }
+        if (isPublished == false && hasProgress) {
+            std::string progress = readPolledFile(log + ".progress");
+            const char *columns[5];
+            chunks = (progress.compare(0, runId.size(), runId) == 0 && Util::getWordsOfLine((char *) progress.c_str() + runId.size(), columns, 5) == 5)
+                     ? Util::fast_atoi<size_t>(columns[4]) : 0;
+        }
         const std::string object = S3Client::getObjectName(log);
 #pragma omp parallel for schedule(dynamic, 1)
         for (size_t i = 0; i < chunks; i++) {
             S3Client::remove(object + "." + SSTR(i));
         }
-        removeRunFile(log + ".progress");
+        if (hasProgress) {
+            removeRunFile(log + ".progress");
+        }
         if (FileUtil::fileExists(log.c_str())) {
             FileUtil::remove(log.c_str());
         }
@@ -439,7 +475,9 @@ void MMseqsNode::removeLog(const std::string &log) {
         return;
     }
     FileUtil::remove(log.c_str());
-    FileUtil::remove((log + ".progress").c_str());
+    if (hasProgress) {
+        FileUtil::remove((log + ".progress").c_str());
+    }
 }
 
 struct ExchangeFileHeader {
@@ -447,6 +485,12 @@ struct ExchangeFileHeader {
     uint64_t exchangeFileNumber;
 };
 static_assert(sizeof(ExchangeFileHeader) == MMseqsNode::EXCHANGE_FILE_HEADER_BYTES, "Unexpected exchange file header layout");
+
+static std::string getExchangeObjectName(const std::string &file, uint64_t exchangeFileNumber) {
+    return S3Client::getObjectName(file) + "~" + SSTR(exchangeFileNumber);
+}
+
+static int openRemoteExchangeFile(const std::string &file, const std::string &object, size_t size, const std::vector<size_t> &segmentOffsets = std::vector<size_t>());
 
 static uint64_t getExchangeFileMagic() {
     uint64_t magic = 0x4d4d533258434831ULL;
@@ -457,10 +501,35 @@ static uint64_t getExchangeFileMagic() {
     return magic;
 }
 
-void MMseqsNode::publishExchangeFile(FILE *file, const std::string &fileName, size_t size, const std::string &indexFile, const std::vector<uint64_t> &line) {
+void MMseqsNode::publishExchangeFile(FILE *file, const std::string &fileName, size_t size, const std::string &indexFile, const std::vector<uint64_t> &line,
+                                     const std::vector<size_t> *segmentOffsets) {
+    ExchangeFileHeader header = { 0, 0 };
+    // size 0 publishes no file yet; a rewritten file gets an object per exchange file number
+    bool isUploaded = S3Client::isEnabled() && size > 0;
+    if (isUploaded) {
+        if (fflush(file) != 0) {
+            Debug(Debug::ERROR) << "Cannot flush " << fileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        FileUtil::preadAll(fileno(file), fileName.c_str(), (char *) &header, sizeof(header), 0);
+    }
     if (fclose(file) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
         EXIT(EXIT_FAILURE);
+    }
+    // no exchange data stays on the local disk after its upload
+    if (isUploaded && segmentOffsets != NULL) {
+        // the earlier segments are up already, the last one holds the table
+        std::vector<size_t> offsets(*segmentOffsets);
+        offsets.push_back(size);
+        const std::string object = getExchangeObjectName(fileName, header.exchangeFileNumber);
+        const size_t lastBegin = offsets[offsets.size() - 2];
+        S3Client::putFile(object + "." + SSTR(offsets.size() - 2), fileName, lastBegin, size - lastBegin);
+        S3Client::put(object + ".segments", (const char *) offsets.data(), offsets.size() * sizeof(size_t));
+        FileUtil::remove(fileName.c_str());
+    } else if (isUploaded) {
+        uploadFile(fileName, getExchangeObjectName(fileName, header.exchangeFileNumber));
+        FileUtil::remove(fileName.c_str());
     }
     __sync_fetch_and_add(&sentExchangeSize, size);
     __sync_fetch_and_add(&sentOtherNodeExchangeSize, size);
@@ -556,7 +625,8 @@ FILE *MMseqsNode::createExchangeFile(const std::string &fileName, uint64_t excha
 
 void MMseqsNode::writeExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *data, size_t size, const std::string &indexFile,
                                    const std::vector<uint64_t> &line, int threads) {
-    FILE *file = createExchangeFile(fileName, exchangeFileNumber);
+    // aws backend: publishExchangeFile reads the header back
+    FILE *file = createExchangeFile(fileName, exchangeFileNumber, "w+");
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
     for (size_t offset = 0; offset < size; offset += BatchReader::MAX_READ_REQUEST_SIZE) {
         FileUtil::pwriteAll(fileno(file), fileName.c_str(), data + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, size - offset), EXCHANGE_FILE_HEADER_BYTES + offset);
@@ -570,6 +640,10 @@ int MMseqsNode::tryOpenExchangeFile(const std::string &file, size_t expectedSize
     observedNumber = UINT64_MAX;
     lastError = 0;
     int fd = openListedFile(file, O_RDONLY | O_CLOEXEC | openFlags);
+    if (fd < 0 && errno == ENOENT && S3Client::isEnabled()) {
+        // the writer uploads the file before its index line and removes it, so it is in S3 with the published size
+        fd = openRemoteExchangeFile(file, getExchangeObjectName(file, expectedNumber), expectedSize);
+    }
     if (fd < 0) {
         lastError = errno;
         return -1;
@@ -584,9 +658,14 @@ int MMseqsNode::tryOpenExchangeFile(const std::string &file, size_t expectedSize
         if (observedSize == expectedSize) {
             ExchangeFileHeader header;
             ssize_t headerSize;
-            do {
-                headerSize = pread(fd, &header, sizeof(header), 0);
-            } while (headerSize < 0 && errno == EINTR);
+            size_t remoteSize;
+            if (readRemoteFile(fd, (char *) &header, sizeof(header), 0, remoteSize)) {
+                headerSize = remoteSize;
+            } else {
+                do {
+                    headerSize = pread(fd, &header, sizeof(header), 0);
+                } while (headerSize < 0 && errno == EINTR);
+            }
             if (headerSize == static_cast<ssize_t>(sizeof(header))) {
                 observedNumber = header.exchangeFileNumber;
             }
@@ -601,6 +680,7 @@ int MMseqsNode::tryOpenExchangeFile(const std::string &file, size_t expectedSize
     } else {
         lastError = errno;
     }
+    releaseExchangeCopy(fd);
     close(fd);
     return -1;
 }
@@ -625,6 +705,11 @@ int MMseqsNode::waitForExchangeFile(const std::string &file, size_t size, uint64
 }
 
 bool MMseqsNode::tryPreadAll(int fd, char *data, size_t size, size_t offset, int &readError) {
+    size_t remoteSize;
+    if (readRemoteFile(fd, data, size, offset, remoteSize)) {
+        readError = 0;
+        return remoteSize == size;
+    }
     for (size_t done = 0; done < size;) {
         ssize_t count = pread(fd, data + done, size - done, offset + done);
         if (count < 0 && errno == EINTR) {
@@ -723,6 +808,17 @@ bool MMseqsNode::WorkQueue::takeItem(size_t item) {
         EXIT(EXIT_FAILURE);
     }
     return true;
+}
+
+// aws backend: a claim waits for a round trip, so the claims go out at once
+void MMseqsNode::WorkQueue::takeItems(size_t firstItem, const std::vector<unsigned char> &isTried, std::vector<unsigned char> &isTaken) {
+    const int threads = S3Client::isEnabled() ? std::max(1, static_cast<int>(std::count(isTried.begin(), isTried.end(), 1))) : 1;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads) if (threads > 1)
+    for (size_t i = 0; i < isTried.size(); i++) {
+        if (isTried[i]) {
+            isTaken[i] = takeItem(firstItem + i);
+        }
+    }
 }
 
 size_t MMseqsNode::WorkQueue::takeNextItem() {
@@ -861,6 +957,10 @@ std::string MMseqsNode::closeExchange(FILE *file, const std::string &fileName, c
         Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
+    if (S3Client::isEnabled()) {
+        uploadFile(fileName);
+        FileUtil::remove(fileName.c_str());
+    }
     return barrier(indexFile, SSTR(writtenSize) + "\t" + SSTR(flushCount) + "\n");
 }
 
@@ -876,12 +976,19 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
         flushCounts[node] = Util::fast_atoi<size_t>(columns[1]);
     }
     std::vector<std::vector<size_t> > flushOffsets(count);
+    std::vector<std::string> objects(count);
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t node = 0; node < count; node++) {
         if (flushCounts[node] == 0) {
             continue;
         }
         std::string file = prefix + "." + SSTR(node);
+        if (S3Client::isEnabled()) {
+            objects[node] = S3Client::getObjectName(file);
+            flushOffsets[node].resize(2 * flushCounts[node]);
+            S3Client::getRange(objects[node], writtenSizes[node] + rank * flushCounts[node] * sizeof(size_t), flushOffsets[node].size() * sizeof(size_t), (char *) flushOffsets[node].data());
+            continue;
+        }
         // writable to punch holes
         files[node] = FileUtil::openFileOrDie(file.c_str(), "r+", true);
         readExchangeTableColumns(fileno(files[node]), file, writtenSizes[node], flushCounts[node], rank, flushOffsets[node]);
@@ -892,7 +999,7 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
             size_t pos = flushOffsets[node][flush];
             size_t end = flushOffsets[node][flushCounts[node] + flush];
             if (pos < end) {
-                ExchangeReader reader = { files[node], pos, end, std::vector<char>(), 0, 0, 0, 0, NULL, pos };
+                ExchangeReader reader = { files[node], pos, end, std::vector<char>(), 0, 0, 0, 0, NULL, pos, objects[node] };
                 readers.push_back(reader);
             }
         }
@@ -907,7 +1014,7 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
     std::map<std::string, std::vector<std::pair<char *, size_t> > >::iterator own = ownExchangeRecords.find(prefix);
     if (own != ownExchangeRecords.end()) {
         for (size_t i = 0; i < own->second.size(); i++) {
-            ExchangeReader reader = { NULL, 0, own->second[i].second, std::vector<char>(), 0, 0, 0, 0, own->second[i].first, 0 };
+            ExchangeReader reader = { NULL, 0, own->second[i].second, std::vector<char>(), 0, 0, 0, 0, own->second[i].first, 0, std::string() };
             readers.push_back(reader);
         }
         ownExchangeRecords.erase(own);
@@ -935,7 +1042,7 @@ static void fillExchangeReader(MMseqsNode::ExchangeReader &reader, size_t size, 
         return;
     }
     size_t punchEnd = (reader.pos - reader.bufferEnd + reader.bufferPos) / PUNCH_HOLE_ALIGNMENT * PUNCH_HOLE_ALIGNMENT;
-    if (punchEnd >= reader.punchEnd + 1024 * 1024 * 1024) {
+    if (reader.file != NULL && punchEnd >= reader.punchEnd + 1024 * 1024 * 1024) {
         FileUtil::punchHole(fileno(reader.file), reader.punchEnd, punchEnd - reader.punchEnd);
         reader.punchEnd = punchEnd;
     }
@@ -961,7 +1068,11 @@ static void fillExchangeReader(MMseqsNode::ExchangeReader &reader, size_t size, 
     reads.push_back(std::make_pair(reader.pos, reader.bufferEnd));
 #pragma omp parallel for schedule(dynamic, 1) if (omp_in_parallel() == 0)
     for (size_t i = 0; i < readCount; i++) {
-        FileUtil::preadAll(fileno(reader.file), prefix.c_str(), reader.buffer.data() + reads[i].second, reads[i + 1].second - reads[i].second, reads[i].first);
+        if (reader.file == NULL) {
+            S3Client::getRange(reader.object, reads[i].first, reads[i + 1].second - reads[i].second, reader.buffer.data() + reads[i].second);
+        } else {
+            FileUtil::preadAll(fileno(reader.file), prefix.c_str(), reader.buffer.data() + reads[i].second, reads[i + 1].second - reads[i].second, reads[i].first);
+        }
     }
 }
 
@@ -972,7 +1083,9 @@ static void releaseExchangeReader(MMseqsNode::ExchangeReader &reader) {
             free(reader.ownRecords);
             reader.ownRecords = NULL;
         } else {
-            FileUtil::punchHole(fileno(reader.file), reader.punchEnd, reader.end - reader.punchEnd);
+            if (reader.file != NULL) {
+                FileUtil::punchHole(fileno(reader.file), reader.punchEnd, reader.end - reader.punchEnd);
+            }
             std::vector<char>().swap(reader.buffer);
         }
         reader.bufferPos = 0;
@@ -1341,6 +1454,9 @@ static void writeKeyBits(const std::string &bitsFile, const uint64_t *bits, size
         Debug(Debug::ERROR) << "Cannot write " << bitsFile << "\n";
         EXIT(EXIT_FAILURE);
     }
+    if (S3Client::isEnabled()) {
+        MMseqsNode::uploadFile(bitsFile);
+    }
 }
 
 static bool readEntryKeys(DBReader<DBKeyType> &cluDb, DBReader<DBKeyType>::Index &entry, size_t memoryLimit, std::vector<char> &buffer, std::vector<DBKeyType> &keys) {
@@ -1579,6 +1695,7 @@ uint64_t *MMseqsNode::readRepresentativeBits(const std::string &db, const std::v
             continue;
         }
         std::string bitsFile = db + ".bits." + SSTR(node);
+        addRemoteDatabaseFile(bitsFile);
         FILE *file = FileUtil::openFileOrDie(bitsFile.c_str(), "r", true);
         uint64_t keyRange[2];
         FileUtil::preadAll(fileno(file), bitsFile.c_str(), (char *) keyRange, sizeof(keyRange), 0);
@@ -1895,9 +2012,320 @@ void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &l
     addPhaseValue(phaseValues, "Exchange index opens", SSTR(exchangeIndexOpenCount));
     printPhaseValues(phaseValues);
     barrier(prefix + ".merged");
-    FileUtil::remove((lastExchange + "." + SSTR(rank)).c_str());
+    removeFile(lastExchange + "." + SSTR(rank));
     for (size_t i = 0; isMaster() && i < exchanges.size(); i++) {
         FileUtil::remove((exchanges[i] + ".index").c_str());
     }
     removeOnceRead(prefix + ".merged");
+}
+
+void MMseqsNode::uploadFile(const std::string &file, const std::string &object) {
+    S3Client::putFile(object.empty() ? S3Client::getObjectName(file) : object, file);
+}
+
+// aws backend: the local file may be gone already, written exchange files are removed after their upload
+void MMseqsNode::removeFile(const std::string &file) {
+    if (S3Client::isEnabled() == false) {
+        FileUtil::remove(file.c_str());
+        return;
+    }
+    if (FileUtil::fileExists(file.c_str())) {
+        FileUtil::remove(file.c_str());
+    }
+    S3Client::remove(S3Client::getObjectName(file));
+}
+
+bool MMseqsNode::fetchFile(const std::string &file, bool mustExist) {
+    if (S3Client::isEnabled() == false || FileUtil::fileExists(file.c_str())) {
+        return true;
+    }
+    std::string content;
+    if (S3Client::get(S3Client::getObjectName(file), content) == false) {
+        if (mustExist) {
+            Debug(Debug::ERROR) << "Cannot find " << file << " in S3\n";
+            EXIT(EXIT_FAILURE);
+        }
+        return false;
+    }
+    FileUtil::publishFile(file, content);
+    return true;
+}
+
+// another node's file is an empty sparse placeholder of the object size; reads of it go from S3 straight into the read buffer
+struct RemoteFile {
+    std::string object;
+    // empty for an exchange file, whose placeholder is unlinked
+    std::string path;
+    // keeps the inode, so no other file takes it
+    int fd;
+    size_t size;
+    bool isExchange;
+    // segment starts and the size; segment k is the object <object>.<k>
+    std::vector<size_t> segmentOffsets;
+};
+
+static std::map<std::pair<dev_t, ino_t>, RemoteFile *> remoteFiles;
+static size_t remoteFileCount = 0;
+static std::mutex remoteMutex;
+
+static RemoteFile *findRemoteFile(int fd) {
+    struct stat sb;
+    if (__atomic_load_n(&remoteFileCount, __ATOMIC_ACQUIRE) == 0 || fstat(fd, &sb) != 0) {
+        return NULL;
+    }
+    std::lock_guard<std::mutex> lock(remoteMutex);
+    std::map<std::pair<dev_t, ino_t>, RemoteFile *>::iterator it = remoteFiles.find(std::make_pair(sb.st_dev, sb.st_ino));
+    return (it == remoteFiles.end()) ? NULL : it->second;
+}
+
+static void addRemoteFile(RemoteFile *remote) {
+    struct stat sb;
+    if (fstat(remote->fd, &sb) != 0) {
+        Debug(Debug::ERROR) << "Cannot stat the placeholder of " << remote->object << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    remoteFiles[std::make_pair(sb.st_dev, sb.st_ino)] = remote;
+    __atomic_store_n(&remoteFileCount, remoteFiles.size(), __ATOMIC_RELEASE);
+}
+
+bool MMseqsNode::isRemoteFile(int fd) {
+    return findRemoteFile(fd) != NULL;
+}
+
+bool MMseqsNode::readRemoteFile(int fd, char *data, size_t size, size_t offset, size_t &readSize) {
+    RemoteFile *remote = findRemoteFile(fd);
+    if (remote == NULL) {
+        return false;
+    }
+    readSize = (offset < remote->size) ? std::min(size, remote->size - offset) : 0;
+    if (readSize > 0 && remote->segmentOffsets.empty()) {
+        S3Client::getRange(remote->object, offset, readSize, data);
+    }
+    const std::vector<size_t> &segments = remote->segmentOffsets;
+    for (size_t pos = offset; segments.empty() == false && pos < offset + readSize;) {
+        size_t segment = std::upper_bound(segments.begin(), segments.end(), pos) - segments.begin() - 1;
+        size_t end = std::min(offset + readSize, segments[segment + 1]);
+        S3Client::getRange(remote->object + "." + SSTR(segment), pos - segments[segment], end - pos, data + (pos - offset));
+        pos = end;
+    }
+    return true;
+}
+
+// for the few fread readers: the bytes go into the placeholder until releaseStagedReads
+void MMseqsNode::stageRead(int fd, size_t offset, size_t size) {
+    RemoteFile *remote = findRemoteFile(fd);
+    if (remote == NULL || remote->path.empty() || offset >= remote->size) {
+        return;
+    }
+    S3Client::getRanges(remote->object, std::vector<std::pair<size_t, size_t> >(1, std::make_pair(offset, std::min(size, remote->size - offset))), remote->path);
+}
+
+void MMseqsNode::releaseStagedReads(int fd) {
+    RemoteFile *remote = findRemoteFile(fd);
+    if (remote != NULL && remote->path.empty() == false) {
+        FileUtil::punchHole(remote->fd, 0, remote->size);
+    }
+}
+
+// <file>.staged holds the object and its size, so later steps know the placeholder; a local file without it was written by this node
+void MMseqsNode::addRemoteDatabaseFile(const std::string &file) {
+    if (S3Client::isEnabled() == false) {
+        return;
+    }
+    std::string path = file;
+    char target[PATH_MAX];
+    ssize_t targetSize = readlink(file.c_str(), target, sizeof(target) - 1);
+    if (targetSize > 0) {
+        target[targetSize] = '\0';
+        path = (target[0] == '/') ? std::string(target) : FileUtil::dirName(file) + "/" + target;
+    }
+    std::string statePath = path + ".staged";
+    std::lock_guard<std::mutex> lock(remoteMutex);
+    struct stat sb;
+    bool hasFile = stat(path.c_str(), &sb) == 0;
+    bool hasState = FileUtil::fileExists(statePath.c_str());
+    if (hasFile && (hasState == false || remoteFiles.find(std::make_pair(sb.st_dev, sb.st_ino)) != remoteFiles.end())) {
+        return;
+    }
+    RemoteFile *remote = new RemoteFile();
+    remote->object = S3Client::getObjectName(path);
+    remote->path = path;
+    remote->isExchange = false;
+    std::string state = hasState ? FileUtil::readFile(statePath) : std::string();
+    size_t objectEnd = state.find('\n');
+    if (hasFile && objectEnd != std::string::npos && state.compare(0, objectEnd, remote->object) == 0) {
+        remote->size = Util::fast_atoi<size_t>(state.c_str() + objectEnd + 1);
+    } else {
+        remote->size = S3Client::getSize(remote->object);
+        // the state first, a crash must not leave a placeholder that looks like a file of this node
+        FileUtil::publishFile(statePath, remote->object + "\n" + SSTR(remote->size) + "\n");
+        int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
+        if (fd < 0 || ftruncate(fd, remote->size) != 0 || close(fd) != 0) {
+            Debug(Debug::ERROR) << "Cannot create the placeholder " << path << " of " << remote->object << ": " << strerror(errno) << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+    remote->fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
+    if (remote->fd < 0) {
+        Debug(Debug::ERROR) << "Cannot open the placeholder " << path << ": " << strerror(errno) << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    addRemoteFile(remote);
+}
+
+// an unlinked placeholder per open, released by releaseExchangeCopy before the caller closes the fd
+static int openRemoteExchangeFile(const std::string &file, const std::string &object, size_t size, const std::vector<size_t> &segmentOffsets) {
+    std::string placeholder = file + "~XXXXXX";
+    int fd = mkstemp(&placeholder[0]);
+    if (fd < 0 || unlink(placeholder.c_str()) != 0 || ftruncate(fd, size) != 0) {
+        Debug(Debug::ERROR) << "Cannot create a placeholder for " << file << ": " << strerror(errno) << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    RemoteFile *remote = new RemoteFile();
+    remote->object = object;
+    remote->fd = fd;
+    remote->size = size;
+    remote->isExchange = true;
+    remote->segmentOffsets = segmentOffsets;
+    {
+        std::lock_guard<std::mutex> lock(remoteMutex);
+        addRemoteFile(remote);
+    }
+    int callerFd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (callerFd < 0) {
+        Debug(Debug::ERROR) << "Cannot open a placeholder for " << file << ": " << strerror(errno) << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return callerFd;
+}
+
+// the writer's file or, on another node, nothing; the object or the flush segments in both cases
+void MMseqsNode::removeExchangeFile(const std::string &file, uint64_t exchangeFileNumber, bool isSegmented) {
+    if (S3Client::isEnabled() == false) {
+        FileUtil::remove(file.c_str());
+        return;
+    }
+    if (FileUtil::fileExists(file.c_str())) {
+        FileUtil::remove(file.c_str());
+    }
+    std::string object = getExchangeObjectName(file, exchangeFileNumber);
+    std::string segments;
+    if (isSegmented && S3Client::get(object + ".segments", segments)) {
+        for (size_t segment = 0; segment + 1 < segments.size() / sizeof(size_t); segment++) {
+            S3Client::remove(object + "." + SSTR(segment));
+        }
+        S3Client::remove(object + ".segments");
+    } else if (isSegmented == false) {
+        S3Client::remove(object);
+    }
+}
+
+// the local range goes once it is up, so a file written in flushes holds only the flushes not yet uploaded
+void MMseqsNode::uploadExchangeSegment(const std::string &file, int fd, uint64_t exchangeFileNumber, size_t segment, size_t begin, size_t end) {
+    if (end > begin) {
+        S3Client::putFile(getExchangeObjectName(file, exchangeFileNumber) + "." + SSTR(segment), file, begin, end - begin);
+        FileUtil::punchHole(fd, begin, end - begin);
+    }
+}
+
+int MMseqsNode::openSegmentedExchangeFile(const std::string &file, uint64_t exchangeFileNumber, size_t size) {
+    std::string object = getExchangeObjectName(file, exchangeFileNumber);
+    std::string segments;
+    if (S3Client::get(object + ".segments", segments) == false) {
+        Debug(Debug::ERROR) << "Cannot find " << object << ".segments in S3\n";
+        EXIT(EXIT_FAILURE);
+    }
+    std::vector<size_t> segmentOffsets(segments.size() / sizeof(size_t));
+    memcpy(segmentOffsets.data(), segments.data(), segmentOffsets.size() * sizeof(size_t));
+    if (segmentOffsets.size() < 2 || segmentOffsets.back() != size) {
+        Debug(Debug::ERROR) << "Invalid segments of " << object << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return openRemoteExchangeFile(file, object, size, segmentOffsets);
+}
+
+void MMseqsNode::releaseExchangeCopy(int fd) {
+    struct stat sb;
+    if (__atomic_load_n(&remoteFileCount, __ATOMIC_ACQUIRE) == 0 || fstat(fd, &sb) != 0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(remoteMutex);
+    std::map<std::pair<dev_t, ino_t>, RemoteFile *>::iterator it = remoteFiles.find(std::make_pair(sb.st_dev, sb.st_ino));
+    if (it != remoteFiles.end() && it->second->isExchange) {
+        close(it->second->fd);
+        delete it->second;
+        remoteFiles.erase(it);
+        __atomic_store_n(&remoteFileCount, remoteFiles.size(), __ATOMIC_RELEASE);
+    }
+}
+
+// the metadata whole, the data and binary indexes as sparse copies of the files of all nodes, which cost one size request each until read
+void MMseqsNode::stageDatabase(const std::string &dataFile, const char *indexFile) {
+    if (S3Client::isEnabled() == false) {
+        return;
+    }
+    // <clu>.<node> uses <clu>.dbtype like in DBReader::open; once fetched, the parts of all nodes find it locally
+    std::string dbtypeName = dataFile;
+    size_t nodePos = dataFile.find_last_of('.');
+    bool isPart = nodePos != std::string::npos && Util::isNumber(dataFile.substr(nodePos + 1)) && FileUtil::fileExists((dataFile + ".dbtype").c_str()) == false
+                  && fetchFile(dataFile.substr(0, nodePos) + ".dbtype", false);
+    if (isPart) {
+        dbtypeName.resize(nodePos);
+    }
+    fetchFile(dbtypeName + ".dbtype");
+    int dbtype = FileUtil::parseDbType(dbtypeName.c_str());
+    if ((DBReader<DBKeyType>::getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {
+        return;
+    }
+    bool isHeader = Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_GENERIC_DB);
+    if (indexFile != NULL) {
+        if (Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_CLUSTER_RES) || Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_PREFILTER_RES)) {
+            addRemoteDatabaseFile(indexFile);
+        } else {
+            fetchFile(indexFile);
+        }
+    }
+    // also without USE_DATA, getFileKeyOffsets counts the data files
+    if (isPart) {
+        addRemoteDatabaseFile(dataFile);
+        return;
+    }
+    for (unsigned int node = 0; node < count; node++) {
+        addRemoteDatabaseFile(dataFile + "." + SSTR(node));
+        if (isHeader) {
+            addRemoteDatabaseFile(dataFile + ".index." + SSTR(node));
+        }
+    }
+}
+
+static bool isNodeCopy(const std::string &file) {
+    struct stat sb;
+    return lstat(file.c_str(), &sb) != 0 || S_ISREG(sb.st_mode) == false || FileUtil::fileExists((file + ".staged").c_str());
+}
+
+// each node its own parts, the master the files of all nodes and the dbtype last
+void MMseqsNode::publishDatabase(const std::string &db, size_t filesPerNode) {
+    if (S3Client::isEnabled() == false) {
+        return;
+    }
+    // writeKeyBits uploads the bits
+    const char *nodeSuffixes[] = { ".", ".index." };
+    for (size_t part = rank * filesPerNode; part < (rank + 1) * filesPerNode; part++) {
+        for (size_t i = 0; i < sizeof(nodeSuffixes) / sizeof(nodeSuffixes[0]); i++) {
+            std::string file = db + nodeSuffixes[i] + SSTR(part);
+            if (isNodeCopy(file) == false) {
+                uploadFile(file);
+            }
+        }
+    }
+    if (isMaster() == false) {
+        return;
+    }
+    const char *masterSuffixes[] = { ".index", ".file_keys", ".partitions", ".source", ".lookup", ".dbtype" };
+    for (size_t i = 0; i < sizeof(masterSuffixes) / sizeof(masterSuffixes[0]); i++) {
+        std::string file = db + masterSuffixes[i];
+        if (isNodeCopy(file) == false) {
+            uploadFile(file);
+        }
+    }
 }

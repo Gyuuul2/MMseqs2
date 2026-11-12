@@ -6,6 +6,7 @@
 #include "FastSort.h"
 #include "Alignment.h"
 #include "FileUtil.h"
+#include "S3Client.h"
 #include <cerrno>
 #include <climits>
 #include <unistd.h>
@@ -1132,12 +1133,13 @@ struct ClusterMemberExchange {
                     const int fd = MMseqsNode::waitForExchangeFile(memberFile, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + line[3], line[0]);
                     nodeCodes[node].resize(line[3]);
                     FileUtil::preadAll(fd, memberFile.c_str(), &nodeCodes[node][0], nodeCodes[node].size(), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES);
+                    MMseqsNode::releaseExchangeCopy(fd);
                     if (close(fd) != 0) {
                         Debug(Debug::ERROR) << "Cannot close " << memberFile << "\n";
                         EXIT(EXIT_FAILURE);
                     }
                     // only this node reads it
-                    FileUtil::remove(memberFile.c_str());
+                    MMseqsNode::removeExchangeFile(memberFile, line[0]);
                     nodeConsumedBytes[node] = line[4];
                     isAnswered[node] = 1;
                     owingCount--;
@@ -1249,6 +1251,7 @@ struct ClusterMemberExchange {
                         const int fd = MMseqsNode::waitForExchangeFile(requestFile, line[4 + nodes], line[0]);
                         section.resize(sectionEnd - sectionBegin);
                         FileUtil::preadAll(fd, requestFile.c_str(), section.data(), section.size(), sectionBegin);
+                        MMseqsNode::releaseExchangeCopy(fd);
                         if (close(fd) != 0) {
                             Debug(Debug::ERROR) << "Cannot close " << requestFile << "\n";
                             EXIT(EXIT_FAILURE);
@@ -1714,9 +1717,8 @@ struct TargetSplitReader {
     // sync the claims before the progress that counts them
     size_t publishClaims() {
         std::lock_guard<std::mutex> lock(claimsMutex);
-        if (claimedCellsSize > publishedClaimedCellsSize && (fflush(claimedCellsHandle) != 0 || fsync(fileno(claimedCellsHandle)) != 0)) {
-            Debug(Debug::ERROR) << "Cannot flush " << claimedCellsFile << "\n";
-            EXIT(EXIT_FAILURE);
+        if (claimedCellsSize > publishedClaimedCellsSize) {
+            MMseqsNode::syncLog(claimedCellsHandle, claimedCellsFile, claimedCellsSize);
         }
         publishedClaimedCellsSize = claimedCellsSize;
         return claimedCellsSize;
@@ -1974,15 +1976,19 @@ private:
         size_t alignNodeCount = MMseqsNode::count - firstAlignNode;
         std::vector<size_t> nodeCosts(MMseqsNode::count, 0);
         std::vector<unsigned char> isTaken(targetSplitCount, 0);
+        std::vector<unsigned char> isHome(targetSplitCount, 0);
         double windowTakenCost = 0;
         for (size_t split = 0; split < targetSplitCount; split++) {
             size_t cost = cells[firstCell + split].alignmentCells;
             nodeCosts[targetSplitAlignNodes[split]] += cost;
-            if (cost > 0 && targetSplitAlignNodes[split] == MMseqsNode::rank) {
-                isTaken[split] = cellQueue.takeItem(firstCell + split);
+            isHome[split] = cost > 0 && targetSplitAlignNodes[split] == MMseqsNode::rank;
+        }
+        cellQueue.takeItems(firstCell, isHome, isTaken);
+        for (size_t split = 0; split < targetSplitCount; split++) {
+            if (isHome[split]) {
                 homeCellCount += isTaken[split];
                 lostCellCount += 1 - isTaken[split];
-                windowTakenCost += isTaken[split] ? cost : 0;
+                windowTakenCost += isTaken[split] ? cells[firstCell + split].alignmentCells : 0;
             }
         }
 
@@ -2140,13 +2146,16 @@ private:
             }
             const size_t firstCell = homeWindow * targetSplitCount;
             double windowTakenCost = 0;
+            std::vector<unsigned char> isHome(targetSplitCount, 0);
             for (size_t split = 0; windowAlignGroups[homeWindow] == alignGroup && split < targetSplitCount; split++) {
-                const size_t cost = cells[firstCell + split].alignmentCells;
-                if (cost > 0 && targetSplitAlignNodes[split] == MMseqsNode::rank) {
-                    isTaken[split] = cellQueue.takeItem(firstCell + split);
+                isHome[split] = cells[firstCell + split].alignmentCells > 0 && targetSplitAlignNodes[split] == MMseqsNode::rank;
+            }
+            cellQueue.takeItems(firstCell, isHome, isTaken);
+            for (size_t split = 0; split < targetSplitCount; split++) {
+                if (isHome[split]) {
                     homeCellCount += isTaken[split];
                     lostCellCount += 1 - isTaken[split];
-                    windowTakenCost += isTaken[split] ? cost : 0;
+                    windowTakenCost += isTaken[split] ? cells[firstCell + split].alignmentCells : 0;
                 }
             }
             __atomic_store_n(&homeWindow, homeWindow + 1, __ATOMIC_RELAXED);
@@ -3334,6 +3343,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             for (size_t part = 0; part < partCount; part++) {
                                 readError = (readErrors[part] != 0) ? readErrors[part] : readError;
                             }
+                            MMseqsNode::releaseExchangeCopy(fd);
                             int closeError = (close(fd) != 0) ? errno : 0;
                             readingSeconds += readTimer.getTimediff();
                             int error = (readError > 0) ? readError : closeError;
@@ -3371,7 +3381,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                     if (isComplete) {
                         request.isComplete = true;
-                        FileUtil::remove((requests + "/" + SSTR(rank) + "." + SSTR(request.number)).c_str());
+                        MMseqsNode::removeExchangeFile(requests + "/" + SSTR(rank) + "." + SSTR(request.number), request.number);
                         deleteCount++;
                         hasWorked = true;
                     }
@@ -3481,7 +3491,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             size_t keptFiles = 0;
                             for (size_t j = 0; j < requester.files.size(); j++) {
                                 if (requester.files[j].request < received) {
-                                    FileUtil::remove(getServedFile(rank, node, requester.files[j]).c_str());
+                                    MMseqsNode::removeExchangeFile(getServedFile(rank, node, requester.files[j]), requester.files[j].request);
                                     deleteCount++;
                                     liveServedSize -= requester.files[j].size;
                                     isServedProgressChanged = true;
@@ -3523,6 +3533,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         }
                         requestCodes.resize(std::min(codeEnd - codeBegin - requester.codePos, maxServedKeys * sizeof(DBKeyType)));
                         bool isRequestRead = requestFd >= 0 && MMseqsNode::tryPreadAll(requestFd, requestCodes.data(), requestCodes.size(), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + codeBegin + requester.codePos, lastError);
+                        if (requestFd >= 0) {
+                            MMseqsNode::releaseExchangeCopy(requestFd);
+                        }
                         if (requestFd >= 0 && close(requestFd) != 0 && isRequestRead) {
                             lastError = errno;
                             isRequestRead = false;
@@ -5119,6 +5132,7 @@ int align2clustLinfinity(Parameters &par) {
     const bool hasTargetSplits = alignNodeCount > 1;
     alignGroupNodeBegin = MMseqsNode::getFirstAlignNode();
     alignGroupNodeEnd = MMseqsNode::count;
+    MMseqsNode::fetchFile(par.db2 + ".partitions");
     std::string partitionsData = MMseqsNode::readFile(par.db2 + ".partitions");
     char *partitionLine = (char *) partitionsData.c_str();
     for (; hasTargetSplits && *partitionLine != '\n'; partitionLine += Util::skipWhitespace(partitionLine)) {
@@ -5294,8 +5308,8 @@ int align2clustLinfinity(Parameters &par) {
     std::vector<std::string> localCopies;
     size_t localCopySize = 0;
     bool hasLocalServedBlocks = false;
-    // a master that only clusters reads no sequences
-    if (par.localTmp.empty() == false && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) {
+    // a master that only clusters reads no sequences; with S3 the local sparse copies replace the copies
+    if (par.localTmp.empty() == false && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode() && S3Client::isEnabled() == false) {
         std::string localTmpProblem = getLocalTmpProblem(par);
         if (localTmpProblem.empty()) {
             // copy only the served blocks
@@ -5713,7 +5727,7 @@ int align2clustLinfinity(Parameters &par) {
     MMseqsNode::removeLog(clusteredLogFile);
     MMseqsNode::removeLog(acceptedFile);
     if (claimedCells.empty() == false && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) {
-        FileUtil::remove((claimedCells + "." + SSTR(MMseqsNode::rank)).c_str());
+        MMseqsNode::removeLog(claimedCells + "." + SSTR(MMseqsNode::rank), false);
     }
     // write the clusters and, without bits, the singletons
     uint64_t *singletonBits = NULL;
@@ -5726,7 +5740,7 @@ int align2clustLinfinity(Parameters &par) {
     const std::string clusterPairsIndex = clusterPairWriter.close(singletonBits, nodeFirstKey, nodeKeys);
     // every node has read the sequences that this node requested and served
     for (size_t i = 0; i < sequenceIndexes.size(); i++) {
-        FileUtil::remove(sequenceIndexes[i].c_str());
+        MMseqsNode::removeFile(sequenceIndexes[i]);
     }
     for (size_t i = 0; i < sequenceFiles.size(); i++) {
         if (FileUtil::fileExists(sequenceFiles[i].c_str())) {
@@ -5766,6 +5780,7 @@ int align2clustLinfinity(Parameters &par) {
         }
         DBWriter::writeDbtypeFile(par.db3.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_CLUSTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
     }
+    MMseqsNode::publishDatabase(par.db3);
     Debug(Debug::INFO) << "Time for run Align2Clust: " << timer.lap() << " sec\n";
     return EXIT_SUCCESS;
 }

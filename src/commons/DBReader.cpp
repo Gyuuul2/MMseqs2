@@ -1,5 +1,7 @@
 #include "DBReader.h"
 #include "FastSort.h"
+#include "MMseqsNode.h"
+#include "S3Client.h"
 #include <algorithm>
 #include <climits>
 #include <cstring>
@@ -106,6 +108,9 @@ template <typename T> bool DBReader<T>::open(int accessType){
     // count the number of entries
     this->accessType = accessType;
     bool isLinfinity = false;
+    if ((dataMode & USE_LINFINITY) && dataFileName != NULL) {
+        MMseqsNode::stageDatabase(dataFileName, externalData ? NULL : indexFileName);
+    }
     if (dataFileName != NULL) {
         // <clu>.<node> of a linfinity cluster db uses <clu>.dbtype
         std::string dbtypeName(dataFileName);
@@ -211,6 +216,8 @@ template <typename T> bool DBReader<T>::open(int accessType){
         // read only entry count and data size
         FILE *indexFile = FileUtil::openFileOrDie(indexFileName, "r", true);
         uint64_t lastIndexPair[2] = { 0, 0 };
+        size_t stagedSize = FileUtil::getFileSize(indexFileName);
+        MMseqsNode::stageRead(fileno(indexFile), stagedSize - std::min(stagedSize, sizeof(lastIndexPair)), sizeof(lastIndexPair));
         if (fseek(indexFile, -static_cast<long>(sizeof(lastIndexPair)), SEEK_END) != 0 || fread(lastIndexPair, sizeof(uint64_t), 2, indexFile) != 2) {
             Debug(Debug::ERROR) << "Cannot read index file " << indexFileName << "\n";
             EXIT(EXIT_FAILURE);
@@ -221,6 +228,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
             Debug(Debug::ERROR) << "Index file " << indexFileName << " is incomplete\n";
             EXIT(EXIT_FAILURE);
         }
+        MMseqsNode::releaseStagedReads(fileno(indexFile));
         if (fclose(indexFile) != 0) {
             Debug(Debug::ERROR) << "Cannot close index file " << indexFileName << "\n";
             EXIT(EXIT_FAILURE);
@@ -1103,6 +1111,8 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
             FILE *file = FileUtil::openFileOrDie(dataFileNames[fileIdx].c_str(), "r", true);
             const size_t footerSize = ZSTD_seekTableFooterSize;
             char footer[footerSize];
+            size_t stagedSize = FileUtil::getFileSize(dataFileNames[fileIdx]);
+            MMseqsNode::stageRead(fileno(file), stagedSize - std::min(stagedSize, footerSize), footerSize);
             bool isValid = fseek(file, -static_cast<long>(footerSize), SEEK_END) == 0 && fread(footer, sizeof(char), footerSize, file) == footerSize;
             size_t fileSize = isValid ? ftell(file) : 0;
             uint32_t frameCount = 0;
@@ -1114,9 +1124,13 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
             size_t seekTableSize = 8 + static_cast<size_t>(frameCount) * 8 + footerSize;
             isValid = isValid && magic == ZSTD_SEEKABLE_MAGICNUMBER && (footer[4] & 0xFC) == 0 && seekTableSize <= fileSize;
             std::vector<uint32_t> seekTable(isValid ? 2 + 2 * static_cast<size_t>(frameCount) : 0);
+            if (isValid) {
+                MMseqsNode::stageRead(fileno(file), fileSize - seekTableSize, seekTableSize);
+            }
             isValid = isValid && fseek(file, fileSize - seekTableSize, SEEK_SET) == 0
                       && fread(seekTable.data(), sizeof(uint32_t), seekTable.size(), file) == seekTable.size()
                       && seekTable[0] == (ZSTD_MAGIC_SKIPPABLE_START | 0xE) && seekTable[1] == seekTableSize - 8;
+            MMseqsNode::releaseStagedReads(fileno(file));
             if (fclose(file) != 0) {
                 Debug(Debug::ERROR) << "Cannot close file " << dataFileNames[fileIdx] << "\n";
                 EXIT(EXIT_FAILURE);
@@ -1920,17 +1934,29 @@ void DBReader<T>::moveDb(const std::string &srcDbName, const std::string &dstDbN
     }
 }
 
+// aws backend: <file>.staged marks a local copy of another node's file, the writer removes the object
+static void removeNodeFile(const std::string &file) {
+    std::string state = file + ".staged";
+    bool isCopy = FileUtil::fileExists(state.c_str());
+    FileUtil::remove(file.c_str());
+    if (isCopy) {
+        FileUtil::remove(state.c_str());
+    } else if (S3Client::isEnabled()) {
+        S3Client::remove(S3Client::getObjectName(file));
+    }
+}
+
 template<typename T>
 void DBReader<T>::removeDb(const std::string &databaseName){
     std::vector<std::string> files = FileUtil::findDatafiles(databaseName.c_str());
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < files.size(); ++i) {
-        FileUtil::remove(files[i].c_str());
+        removeNodeFile(files[i]);
     }
     std::vector<std::string> indexFiles = FileUtil::findDatafiles((databaseName + ".index").c_str());
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < indexFiles.size(); ++i) {
-        FileUtil::remove(indexFiles[i].c_str());
+        removeNodeFile(indexFiles[i]);
     }
     if (FileUtil::fileExists((databaseName + ".index").c_str())) {
         FileUtil::remove((databaseName + ".index").c_str());
@@ -1938,7 +1964,7 @@ void DBReader<T>::removeDb(const std::string &databaseName){
     std::vector<std::string> bitsFiles = FileUtil::findDatafiles((databaseName + ".bits").c_str());
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < bitsFiles.size(); ++i) {
-        FileUtil::remove(bitsFiles[i].c_str());
+        removeNodeFile(bitsFiles[i]);
     }
     std::string dbTypeFile = databaseName + ".dbtype";
     if (FileUtil::fileExists(dbTypeFile.c_str())) {

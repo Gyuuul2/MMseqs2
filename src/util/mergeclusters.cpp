@@ -24,6 +24,7 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         bool hasSecondClu = par.filenames.size() > 3;
         // clusthashfast keeps its singletons in representative bits
         std::string representativeDb = par.filenames[2] + "_redundancy";
+        MMseqsNode::fetchFile(representativeDb + ".dbtype", false);
         bool hasRepBits = FileUtil::fileExists((representativeDb + ".dbtype").c_str());
         std::vector<size_t> firstCluKeyOffsets;
         if (hasSecondClu || hasRepBits) {
@@ -58,7 +59,7 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         delete[] repBits;
         MMseqsNode::addPhaseTime(phaseValues, "sending cluster pairs", timer);
         if (hasSecondClu) {
-            FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
+            MMseqsNode::removeFile(sortedByMember + "." + SSTR(MMseqsNode::rank));
         }
 
         size_t repFirstKey = repKeyOffsets[MMseqsNode::rank];
@@ -78,11 +79,12 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         }
         MMseqsNode::removeExchanges(par.db2, sortedByRep, exchanges, phaseValues);
         if (hasRepBits) {
-            FileUtil::remove((sortedByRep + ".bits." + SSTR(MMseqsNode::rank)).c_str());
+            MMseqsNode::removeFile(sortedByRep + ".bits." + SSTR(MMseqsNode::rank));
         }
         if (MMseqsNode::isMaster()) {
             DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_CLUSTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
         }
+        MMseqsNode::publishDatabase(par.db2);
         return EXIT_SUCCESS;
     }
 

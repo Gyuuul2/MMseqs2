@@ -4,6 +4,7 @@
 #include "FastSort.h"
 #include "MMseqsNode.h"
 #include "BatchReader.h"
+#include "S3Client.h"
 
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -231,6 +232,9 @@ static void readItemRows(const ReceivedFile &receivedFile, size_t item, std::vec
 
 static void closeReceivedFiles(std::vector<ReceivedFile> &receivedFiles) {
     for (size_t i = 0; i < receivedFiles.size(); i++) {
+        if (receivedFiles[i].file != NULL) {
+            MMseqsNode::releaseExchangeCopy(fileno(receivedFiles[i].file));
+        }
         if (receivedFiles[i].file != NULL && fclose(receivedFiles[i].file) != 0) {
             Debug(Debug::ERROR) << "Cannot close " << receivedFiles[i].fileName << "\n";
             EXIT(EXIT_FAILURE);
@@ -258,6 +262,9 @@ struct ExchangeFileGroups {
     std::vector<std::vector<size_t> > flushRowOffsets;
     size_t flushCount;
     double waitSeconds;
+    // aws backend: the uploaded flush segments of every group and the thread that uploads the last flush
+    std::vector<std::vector<size_t> > segmentOffsets;
+    std::thread uploadThread;
 };
 
 static void initFileGroups(ExchangeFileGroups &groups, const std::string &prefix, size_t itemCount, size_t itemsPerGroup, size_t lineWords) {
@@ -336,13 +343,46 @@ static void createFileGroups(ExchangeFileGroups &groups) {
     groups.files.resize(groups.count);
     groups.sizes.assign(groups.count, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES);
     groups.flushRowOffsets.assign(groups.count, std::vector<size_t>());
+    groups.segmentOffsets.assign(groups.count, std::vector<size_t>(1, 0));
     for (size_t i = 0; i < groups.count; i++) {
         groups.names[i] = isLocalFileGroup(groups, i) ? getLocalFileGroupName(groups, i) : getFileGroupName(groups, MMseqsNode::rank, i);
         groups.files[i] = MMseqsNode::createExchangeFile(groups.names[i], i, "w+");
     }
 }
 
+// a connection per group, at most one per thread
+static void uploadFileGroupSegments(const ExchangeFileGroups &groups, size_t segment, std::vector<std::pair<size_t, size_t> > ranges, int threads) {
+#pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
+    for (size_t i = 0; i < groups.count; i++) {
+        MMseqsNode::uploadExchangeSegment(groups.names[i], fileno(groups.files[i]), i, segment, ranges[i].first, ranges[i].second);
+    }
+}
+
+// aws backend: a flush goes up while the next one is written and the sender waits for it, so the local disk holds at most two flushes
+static void uploadFileGroupFlush(ExchangeFileGroups &groups, BatchWriter &batchWriter) {
+    if (S3Client::isEnabled() == false) {
+        return;
+    }
+    batchWriter.waitWrites();
+    if (groups.uploadThread.joinable()) {
+        groups.uploadThread.join();
+    }
+    std::vector<std::pair<size_t, size_t> > ranges(groups.count);
+    for (size_t i = 0; i < groups.count; i++) {
+        ranges[i] = std::make_pair(groups.segmentOffsets[i].back(), groups.sizes[i]);
+        groups.segmentOffsets[i].push_back(groups.sizes[i]);
+    }
+    int threads = 1;
+#ifdef OPENMP
+    threads = static_cast<int>(std::min<size_t>(groups.count, omp_get_max_threads()));
+#endif
+    groups.uploadThread = std::thread(uploadFileGroupSegments, std::cref(groups), groups.segmentOffsets[0].size() - 2, ranges, threads);
+}
+
 static size_t closeFileGroups(ExchangeFileGroups &groups, const std::vector<size_t> &itemSizes) {
+    if (groups.uploadThread.joinable()) {
+        groups.uploadThread.join();
+    }
     size_t sent = 0;
     for (size_t i = 0; i < groups.count; i++) {
         size_t begin = i * groups.itemsPerGroup;
@@ -363,7 +403,8 @@ static size_t closeFileGroups(ExchangeFileGroups &groups, const std::vector<size
         if (isLocalFileGroup(groups, i)) {
             groups.localLines.push_back(line);
         }
-        MMseqsNode::publishExchangeFile(groups.files[i], groups.names[i], line[2], groups.prefix + ".index." + SSTR(MMseqsNode::rank), line);
+        MMseqsNode::publishExchangeFile(groups.files[i], groups.names[i], line[2], groups.prefix + ".index." + SSTR(MMseqsNode::rank), line,
+                                        S3Client::isEnabled() ? &groups.segmentOffsets[i] : NULL);
         sent += groups.sizes[i] - MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
     }
     return sent;
@@ -404,7 +445,8 @@ static void openFileGroups(const ExchangeFileGroups &groups, size_t group, std::
         ReceivedFile &receivedFile = receivedFiles[node];
         receivedFile.fileName = getFileGroupName(groups, node, group);
         size_t fileSize = groups.nodeFileSizes[node][group];
-        receivedFile.file = fdopen(MMseqsNode::waitForExchangeFile(receivedFile.fileName, fileSize, group), "r+");
+        int fd = S3Client::isEnabled() ? MMseqsNode::openSegmentedExchangeFile(receivedFile.fileName, group, fileSize) : MMseqsNode::waitForExchangeFile(receivedFile.fileName, fileSize, group);
+        receivedFile.file = fdopen(fd, "r+");
         if (receivedFile.file == NULL) {
             Debug(Debug::ERROR) << "Cannot open " << receivedFile.fileName << "\n";
             EXIT(EXIT_FAILURE);
@@ -437,7 +479,7 @@ static void followFileGroups(ExchangeFileGroups &groups) {
             break;
         }
         MMseqsNode::waitForRunFile(groups.prefix + ".released." + SSTR(i));
-        FileUtil::remove(getFileGroupName(groups, MMseqsNode::rank, i).c_str());
+        MMseqsNode::removeExchangeFile(getFileGroupName(groups, MMseqsNode::rank, i), i, S3Client::isEnabled());
     }
 }
 
@@ -1007,6 +1049,7 @@ static void writePairFileRows(const KmerExchange &exchange, PairFile &pairFile, 
         groups.flushRowOffsets[i].push_back(groups.sizes[i]);
     }
     groups.flushCount++;
+    uploadFileGroupFlush(groups, *pairFile.batchWriter);
 }
 
 struct PairOutput {
@@ -1881,6 +1924,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                 }
             }
             kmerGroups.flushCount++;
+            uploadFileGroupFlush(kmerGroups, batchWriter);
         }
         delete[] groupBuffers;
     }
@@ -3120,6 +3164,11 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
                                                + SSTR(pairGroups.count) + " pair file groups");
         }
     }
+    // aws backend: other nodes read the exchange file groups from S3 only
+    if (S3Client::isEnabled()) {
+        kmerGroups.localCount = 0;
+        pairGroups.localCount = 0;
+    }
     kmerGroups.localTmp = par.localTmp;
     pairGroups.localTmp = par.localTmp;
     kmerGroups.localNodes = localNodes;
@@ -3263,6 +3312,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     for (size_t i = 0; i < FILE_GROUP_KINDS; i++) {
         FileUtil::remove(indexFiles[i].c_str());
     }
+    MMseqsNode::publishDatabase(par.db2, targetSplitBlockOffsets.empty() ? 1 : targetSplitBlockOffsets.size() - 1);
 }
 
 template void kmermatcherLinfinity<short, true, unsigned short>(Parameters &, DBReader<DBKeyType> &, BaseMatrix *, size_t);

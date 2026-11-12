@@ -14,6 +14,7 @@
 #include "Masker.h"
 #include "MMseqsNode.h"
 #include "BatchReader.h"
+#include "S3Client.h"
 
 #include "zstd/contrib/seekable_format/zstd_seekable.h"
 #include <sys/stat.h>
@@ -651,7 +652,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         planTextChar = Util::skipLine(planTextChar);
         currPos = planTextChar - planText.c_str();
     }
-    FileUtil::remove(planFile.c_str());
+    MMseqsNode::removeFile(planFile);
 
     if (MMseqsNode::isMaster()) {
         Debug(Debug::INFO) << "Converting sequences from " << filenames.size() << " files on " << MMseqsNode::count << " nodes\n";
@@ -719,6 +720,10 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             Debug(Debug::ERROR) << "Cannot close " << par.localTmp << "\n";
             EXIT(EXIT_FAILURE);
         }
+    }
+    // the spool writes into the files of other nodes
+    if (S3Client::isEnabled() && reason.empty()) {
+        reason = "the nodes share files only through S3";
     }
     std::string nodeSpools = MMseqsNode::barrier(dataFile + ".local_tmp", SSTR(spoolSize) + "\t" + SSTR(localFreeSize) + "\t" + localDevice + "\t" + reason + "\n");
     bool hasLocalTmp = false;
@@ -867,6 +872,10 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     if (fclose(exchangeHandle) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << exchangeFile << "\n";
         EXIT(EXIT_FAILURE);
+    }
+    if (S3Client::isEnabled()) {
+        MMseqsNode::uploadFile(exchangeFile);
+        FileUtil::remove(exchangeFile.c_str());
     }
     if (isSpooled == false) {
         std::vector<SentLengthRow>().swap(sentRows);
@@ -1077,6 +1086,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     std::string tmpHeaderName = dataFileNames[HEADER_DATA] + ".tmp";
     {
         std::vector<FILE *> exchangeFiles(MMseqsNode::count, NULL);
+        std::vector<std::string> exchangeObjects(MMseqsNode::count);
         std::vector<std::vector<SentLengthRow> > nodeSentRows(MMseqsNode::count);
         if (nodeLengthRanges.empty() == false) {
 #pragma omp parallel for schedule(dynamic, 1)
@@ -1090,11 +1100,17 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     continue;
                 }
                 std::string file = exchange + "." + SSTR(node);
-                // r+ to punch read bytes
-                exchangeFiles[node] = FileUtil::openFileOrDie(file.c_str(), "r+", true);
                 nodeSentRows[node].resize(lastRow - firstRow);
-                FileUtil::preadAll(fileno(exchangeFiles[node]), file.c_str(), (char *) nodeSentRows[node].data(),
-                                   nodeSentRows[node].size() * sizeof(SentLengthRow), tableOffsets[node] + firstRow * sizeof(SentLengthRow));
+                if (S3Client::isEnabled()) {
+                    exchangeObjects[node] = S3Client::getObjectName(file);
+                    S3Client::getRange(exchangeObjects[node], tableOffsets[node] + firstRow * sizeof(SentLengthRow), nodeSentRows[node].size() * sizeof(SentLengthRow),
+                                       (char *) nodeSentRows[node].data());
+                } else {
+                    // r+ to punch read bytes
+                    exchangeFiles[node] = FileUtil::openFileOrDie(file.c_str(), "r+", true);
+                    FileUtil::preadAll(fileno(exchangeFiles[node]), file.c_str(), (char *) nodeSentRows[node].data(),
+                                       nodeSentRows[node].size() * sizeof(SentLengthRow), tableOffsets[node] + firstRow * sizeof(SentLengthRow));
+                }
                 SORT_SERIAL(nodeSentRows[node].begin(), nodeSentRows[node].end(), SentLengthRow::compareByFlush);
             }
         }
@@ -1118,7 +1134,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 for (size_t fileType = isSpooled ? HEADER_DATA : SEQUENCE_DATA; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
                     if (isFlushStart) {
                         MMseqsNode::ExchangeReader reader = { exchangeFiles[node], rows[i].starts[fileType], rows[i].ends[fileType],
-                                                               std::vector<char>(), 0, 0, 0, 0, NULL, rows[i].starts[fileType] };
+                                                               std::vector<char>(), 0, 0, 0, 0, NULL, rows[i].starts[fileType], exchangeObjects[node] };
                         readers[fileType].push_back(reader);
                         readerLengthOffsets[fileType].push_back(std::vector<std::pair<size_t, size_t> >());
                     }
@@ -1140,7 +1156,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         for (size_t i = 0; i < sentRows.size(); i++) {
             if (i == 0 || sentRows[i - 1].flush != sentRows[i].flush) {
                 MMseqsNode::ExchangeReader reader = { spoolHandle, sentRows[i].starts[SEQUENCE_DATA], sentRows[i].ends[SEQUENCE_DATA],
-                                                       std::vector<char>(), 0, 0, 0, 0, NULL, sentRows[i].starts[SEQUENCE_DATA] };
+                                                       std::vector<char>(), 0, 0, 0, 0, NULL, sentRows[i].starts[SEQUENCE_DATA], std::string() };
                 readers[SEQUENCE_DATA].push_back(reader);
                 readerLengthOffsets[SEQUENCE_DATA].push_back(std::vector<std::pair<size_t, size_t> >());
             }
@@ -1449,6 +1465,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         DBWriter::writeDbtypeFile(dataFile.c_str(), dbType, false);
         Debug(Debug::INFO) << "Database type: " << Parameters::getDbTypeName(dbType) << "\n";
     }
+    MMseqsNode::publishDatabase(dataFile + "_h");
+    MMseqsNode::publishDatabase(dataFile);
 
     return EXIT_SUCCESS;
 }

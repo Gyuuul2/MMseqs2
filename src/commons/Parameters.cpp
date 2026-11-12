@@ -2349,11 +2349,7 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
         if (runId == NULL || *runId == '\0') {
             runId = getenv("SLURM_JOB_ID");
         }
-        if (awsBucket.empty() || runId == NULL || *runId == '\0') {
-            Debug(Debug::ERROR) << "--backend aws needs --aws-bucket and a run id that all steps of the run share in MMSEQS_RUN_ID or SLURM_JOB_ID\n";
-            EXIT(EXIT_FAILURE);
-        }
-        S3Client::init(awsBucket, runId);
+        S3Client::init(awsBucket, (runId != NULL) ? runId : "");
         // no shared folder: each node keeps the directories of the run
         for (size_t i = 0; i < filenames.size(); i++) {
             std::string dir = FileUtil::dirName(filenames[i]);
@@ -2423,6 +2419,13 @@ void Parameters::checkIfDatabaseIsValid(const Command& command, int argc, const 
                     continue;
                 }
 
+                // aws backend: the dbtypes of other nodes come from S3
+                if (S3Client::isEnabled() && filenames[fileIdx] != "stdin") {
+                    MMseqsNode::fetchFile(filenames[fileIdx] + ".dbtype", false);
+                    if (db.specialType & DbType::NEED_HEADER) {
+                        MMseqsNode::fetchFile(filenames[fileIdx] + "_h.dbtype", false);
+                    }
+                }
                 const auto isMissing = [&]() {
                     FileUtil::refreshDirectory(filenames[fileIdx]);
                     return filenames[fileIdx] != "stdin" && FileUtil::fileExists((filenames[fileIdx]).c_str()) == false && FileUtil::fileExists((filenames[fileIdx] + ".dbtype").c_str()) == false;

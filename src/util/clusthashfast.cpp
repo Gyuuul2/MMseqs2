@@ -8,6 +8,7 @@
 #include "DistanceCalculator.h"
 #include "FastSort.h"
 #include "MMseqsNode.h"
+#include "S3Client.h"
 #include "itoa.h"
 #include "FileUtil.h"
 #include "Timer.h"
@@ -800,8 +801,11 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         representativeWriter.close(false, needsSort);
     }
 
-    if (MMseqsNode::isMaster()) {
+    // aws backend: every node links the data files, the later steps stage the targets
+    if (MMseqsNode::isMaster() || (isLinfinity && S3Client::isEnabled())) {
         DBReader<DBKeyType>::softlinkDb(par.db1, representativeDb, DBFiles::DATA);
+    }
+    if (MMseqsNode::isMaster()) {
         DBWriter::writeDbtypeFile(representativeDb.c_str(), reader.getDbtype(), reader.isCompressed());
         if (isLinfinity) {
             DBReader<DBKeyType> representativeReader(representativeDb.c_str(), (representativeDb + ".index").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
@@ -817,6 +821,10 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         }
         Debug(Debug::INFO) << "Size of the sequence database: " << reader.getSize() << "\n";
         Debug(Debug::INFO) << "Number of clusters: " << clusters << "\n";
+    }
+    if (isLinfinity) {
+        MMseqsNode::publishDatabase(par.db2);
+        MMseqsNode::publishDatabase(representativeDb);
     }
     delete[] representativeBits;
     Util::releasePages(hashIdPairs, allocatedHashEntryCount * sizeof(HashEntry));

@@ -20,6 +20,8 @@ public:
     static bool get(const std::string &path, std::string &data);
     static bool head(const std::string &path, size_t *size);
     static void remove(const std::string &path);
+    // the object names below path/, without it
+    static void list(const std::string &path, std::vector<std::string> &names);
     // 256 MiB segment objects of a local file, manifest written last
     static void putFile(const std::string &path, const std::string &localFile, size_t offset = 0, size_t size = SIZE_MAX);
     // segmented or plain objects; any error including 404 is fatal
@@ -27,9 +29,9 @@ public:
     static void getRanges(const std::string &path, const std::vector<std::pair<size_t, size_t> > &ranges, const std::string &localFile);
     static size_t getSize(const std::string &path);
 
-    // SigV4 Authorization of a request without query; headers hold host, x-amz-date and x-amz-content-sha256
+    // SigV4 Authorization; headers hold host, x-amz-date and x-amz-content-sha256, query is the canonical query string
     static std::string getAuthorization(const std::string &method, const std::string &path, std::vector<std::pair<std::string, std::string> > headers,
-                                        const std::string &region, const std::string &accessKey, const std::string &secretKey);
+                                        const std::string &region, const std::string &accessKey, const std::string &secretKey, const std::string &query = "");
 };
 
 #endif

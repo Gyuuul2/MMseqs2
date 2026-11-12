@@ -2,6 +2,7 @@
 #include "Debug.h"
 #include "FileUtil.h"
 #include "Util.h"
+#include "MMseqsNode.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -58,6 +59,8 @@ std::string S3Client::getObjectName(const std::string &file) {
 #ifdef HAVE_S3
 static const size_t SEGMENT_SIZE = 256 * 1024 * 1024;
 static const unsigned int MAX_ATTEMPTS = 10;
+// a prefix that S3 scales answers 503 SlowDown for minutes
+static const time_t MAX_SLOWDOWN_SECONDS = 300;
 
 static std::string bucket;
 static std::string keyPrefix;
@@ -66,6 +69,16 @@ static std::string endpoint;
 static std::string host;
 static bool isPathStyle = false;
 static double faultRate = 0.0;
+static unsigned int latencyMilliseconds = 0;
+
+// counted per attempt, printed at exit
+static const char *verbNames[] = { "GET", "HEAD", "PUT", "conditional PUT", "DELETE", "LIST" };
+static const char *outcomeNames[] = { "2xx", "404", "412", "other 3xx/4xx", "5xx", "transport errors" };
+static size_t verbCounts[6];
+static size_t outcomeCounts[6];
+static size_t sentBytes = 0;
+static size_t receivedBytes = 0;
+static size_t requestMicroseconds = 0;
 
 struct Credentials {
     std::string accessKey;
@@ -164,7 +177,7 @@ static std::string hmac(const std::string &key, const std::string &data) {
 }
 
 std::string S3Client::getAuthorization(const std::string &method, const std::string &path, std::vector<std::pair<std::string, std::string> > headers,
-                                       const std::string &region, const std::string &accessKey, const std::string &secretKey) {
+                                       const std::string &region, const std::string &accessKey, const std::string &secretKey, const std::string &query) {
     std::sort(headers.begin(), headers.end());
     std::string canonicalHeaders;
     std::string signedHeaders;
@@ -180,17 +193,17 @@ std::string S3Client::getAuthorization(const std::string &method, const std::str
         }
     }
     std::string scope = amzDate.substr(0, 8) + "/" + region + "/s3/aws4_request";
-    std::string request = method + "\n" + path + "\n\n" + canonicalHeaders + "\n" + signedHeaders + "\n" + payloadHash;
+    std::string request = method + "\n" + path + "\n" + query + "\n" + canonicalHeaders + "\n" + signedHeaders + "\n" + payloadHash;
     std::string stringToSign = "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + toHex(sha256(request));
     std::string key = hmac(hmac(hmac(hmac("AWS4" + secretKey, amzDate.substr(0, 8)), region), "s3"), "aws4_request");
     return "AWS4-HMAC-SHA256 Credential=" + accessKey + "/" + scope + ",SignedHeaders=" + signedHeaders + ",Signature=" + toHex(hmac(key, stringToSign));
 }
 
-static std::string encodePath(const std::string &path) {
+static std::string encodePath(const std::string &path, bool isQuery = false) {
     std::string encoded;
     for (size_t i = 0; i < path.size(); i++) {
         unsigned char c = path[i];
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' || c == '/') {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~' || (c == '/' && isQuery == false)) {
             encoded += c;
         } else {
             char hex[4];
@@ -215,6 +228,8 @@ struct Request {
     std::string method;
     std::string path;
     std::vector<std::pair<std::string, std::string> > headers;
+    // a request with a query goes to the bucket
+    std::vector<std::pair<std::string, std::string> > query;
     // a PUT body from memory or a file
     const char *upload;
     int uploadFd;
@@ -330,6 +345,23 @@ static unsigned int getRandom() {
     return rand_r(&seed);
 }
 
+static void printStatistics() {
+    std::string requests;
+    std::string outcomes;
+    for (size_t i = 0; i < 6; i++) {
+        requests += (i > 0 ? ", " : "") + std::string(verbNames[i]) + " " + SSTR(verbCounts[i]);
+        outcomes += (i > 0 ? ", " : "") + std::string(outcomeNames[i]) + " " + SSTR(outcomeCounts[i]);
+    }
+    char seconds[32];
+    snprintf(seconds, sizeof(seconds), "%.3f s", requestMicroseconds / 1e6);
+    std::string values;
+    MMseqsNode::addPhaseValue(values, "S3 requests", requests);
+    MMseqsNode::addPhaseValue(values, "S3 responses", outcomes);
+    MMseqsNode::addPhaseValue(values, "S3 bytes", SSTR(sentBytes) + " up, " + SSTR(receivedBytes) + " down");
+    MMseqsNode::addPhaseValue(values, "S3 request time summed over threads", seconds);
+    MMseqsNode::printPhaseValues(values);
+}
+
 // full jitter
 static void sleepBeforeRetry(unsigned int attempt) {
     unsigned int maxMilliseconds = std::min(20000u, 100u << std::min(attempt, 8u));
@@ -341,8 +373,21 @@ static long perform(const Request &request, Response &response, bool *isAmbiguou
     static thread_local CurlHandle handle;
     CURL *curl = handle.curl;
     const bool isPut = request.method == "PUT";
+    bool isConditional = false;
+    for (size_t i = 0; i < request.headers.size(); i++) {
+        isConditional |= request.headers[i].first == "if-none-match";
+    }
+    const size_t verb = (request.query.empty() == false) ? 5 : (request.method == "GET") ? 0 : (request.method == "HEAD") ? 1 : (request.method == "DELETE") ? 4 : (isConditional ? 3 : 2);
+    const time_t firstAttempt = time(NULL);
+    unsigned int failures = 0;
     const bool isFixedDownload = request.download != NULL || request.downloadFd >= 0;
-    const std::string uriPath = encodePath((isPathStyle ? "/" + bucket : "") + "/" + keyPrefix + "/" + request.path);
+    const std::string uriPath = encodePath(request.query.empty() ? (isPathStyle ? "/" + bucket : "") + "/" + keyPrefix + "/" + request.path : (isPathStyle ? "/" + bucket : "/"));
+    std::vector<std::pair<std::string, std::string> > sortedQuery = request.query;
+    std::sort(sortedQuery.begin(), sortedQuery.end());
+    std::string query;
+    for (size_t i = 0; i < sortedQuery.size(); i++) {
+        query += (i > 0 ? "&" : "") + encodePath(sortedQuery[i].first, true) + "=" + encodePath(sortedQuery[i].second, true);
+    }
     for (unsigned int attempt = 1;; attempt++) {
         Credentials used;
         {
@@ -365,7 +410,7 @@ static long perform(const Request &request, Response &response, bool *isAmbiguou
         for (size_t i = 0; i < headers.size(); i++) {
             list = curl_slist_append(list, (headers[i].first + ": " + headers[i].second).c_str());
         }
-        list = curl_slist_append(list, ("Authorization: " + S3Client::getAuthorization(request.method, uriPath, headers, region, used.accessKey, used.secretKey)).c_str());
+        list = curl_slist_append(list, ("Authorization: " + S3Client::getAuthorization(request.method, uriPath, headers, region, used.accessKey, used.secretKey, query)).c_str());
         list = curl_slist_append(list, "Expect:");
 
         response.status = 0;
@@ -374,14 +419,14 @@ static long perform(const Request &request, Response &response, bool *isAmbiguou
         response.received = 0;
         Transfer transfer = { curl, &request, &response, 0, false };
         curl_easy_reset(curl);
-        curl_easy_setopt(curl, CURLOPT_URL, (endpoint + uriPath).c_str());
+        curl_easy_setopt(curl, CURLOPT_URL, (endpoint + uriPath + (query.empty() ? "" : "?" + query)).c_str());
         curl_easy_setopt(curl, CURLOPT_HTTPHEADER, list);
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
         curl_easy_setopt(curl, CURLOPT_PATH_AS_IS, 1L);
         curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1024L);
-        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 60L);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 256L * 1024);
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, 30L);
         curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, onBody);
         curl_easy_setopt(curl, CURLOPT_WRITEDATA, &transfer);
         curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, onHeader);
@@ -398,7 +443,10 @@ static long perform(const Request &request, Response &response, bool *isAmbiguou
         } else if (request.method != "GET") {
             curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, request.method.c_str());
         }
-        // MMSEQS_S3_FAULT_RATE: a 503 or a timeout instead of the request, or a reset after it
+        // MMSEQS_S3_LATENCY_MS: a delay before each request; MMSEQS_S3_FAULT_RATE: a 503 or a timeout instead of the request, or a reset after it
+        if (latencyMilliseconds > 0) {
+            usleep(latencyMilliseconds * 1000u);
+        }
         unsigned int fault = (faultRate > 0.0 && getRandom() < faultRate * RAND_MAX) ? 1 + getRandom() % 3 : 0;
         CURLcode code = (fault == 1 || fault == 2) ? CURLE_OK : curl_easy_perform(curl);
         curl_slist_free_all(list);
@@ -407,6 +455,20 @@ static long perform(const Request &request, Response &response, bool *isAmbiguou
             response.status = 503;
         } else if (fault > 1) {
             code = (fault == 2) ? CURLE_OPERATION_TIMEDOUT : CURLE_RECV_ERROR;
+        }
+        if (fault == 0 || fault == 3) {
+            curl_off_t up = 0;
+            curl_off_t down = 0;
+            double seconds = 0;
+            curl_easy_getinfo(curl, CURLINFO_SIZE_UPLOAD_T, &up);
+            curl_easy_getinfo(curl, CURLINFO_SIZE_DOWNLOAD_T, &down);
+            curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &seconds);
+            size_t outcome = (code != CURLE_OK) ? 5 : (response.status >= 500) ? 4 : (response.status / 100 == 2) ? 0 : (response.status == 404) ? 1 : (response.status == 412) ? 2 : 3;
+            __sync_fetch_and_add(&verbCounts[verb], 1);
+            __sync_fetch_and_add(&outcomeCounts[outcome], 1);
+            __sync_fetch_and_add(&sentBytes, (size_t) up);
+            __sync_fetch_and_add(&receivedBytes, (size_t) down);
+            __sync_fetch_and_add(&requestMicroseconds, (size_t) (seconds * 1e6));
         }
         if (transfer.isTooLong) {
             Debug(Debug::ERROR) << "S3 GET s3://" << bucket << "/" << keyPrefix << "/" << request.path << " returned more than the " << request.downloadSize << " requested bytes\n";
@@ -423,7 +485,8 @@ static long perform(const Request &request, Response &response, bool *isAmbiguou
         } else if (errorCode == "RequestTimeout" || errorCode == "ConditionalRequestConflict" || errorCode == "OperationAborted") {
             error = errorCode;
         } else if ((response.status == 400 || response.status == 403)
-                   && (reloadCredentials(used) || errorCode == "ExpiredToken" || errorCode == "TokenRefreshRequired")) {
+                   && (reloadCredentials(used) || errorCode == "ExpiredToken" || errorCode == "TokenRefreshRequired" || request.method == "HEAD")) {
+            // a HEAD answer has no body that names the error
             error = "expired credentials";
         }
         if (error.empty()) {
@@ -432,8 +495,11 @@ static long perform(const Request &request, Response &response, bool *isAmbiguou
         if (isAmbiguous != NULL && isPut && (code != CURLE_OK || response.status >= 500)) {
             *isAmbiguous = true;
         }
-        if (attempt == MAX_ATTEMPTS) {
-            Debug(Debug::ERROR) << "S3 " << request.method << " s3://" << bucket << "/" << keyPrefix << "/" << request.path << " failed " << MAX_ATTEMPTS << " times, last: " << error << "\n";
+        const bool isSlowDown = code == CURLE_OK && (response.status >= 500 || response.status == 429);
+        failures += isSlowDown ? 0 : 1;
+        if (isSlowDown ? time(NULL) - firstAttempt >= MAX_SLOWDOWN_SECONDS : failures == MAX_ATTEMPTS) {
+            Debug(Debug::ERROR) << "S3 " << request.method << " s3://" << bucket << "/" << keyPrefix << "/" << request.path << " failed " << attempt << " times in "
+                                << time(NULL) - firstAttempt << " s, last: " << error << "\n";
             EXIT(EXIT_FAILURE);
         }
         Debug(Debug::WARNING) << "S3 " << request.method << " s3://" << bucket << "/" << keyPrefix << "/" << request.path << ": " << error << ", retrying\n";
@@ -500,17 +566,25 @@ static void deleteObject(const std::string &path) {
     }
 }
 
-// pieces of at most one segment, into memory or a file at the same offsets
+// pieces of at most one segment, in parallel, into memory or a file at the same offsets
 static void readRange(const std::string &path, const std::pair<size_t, size_t> &layout, size_t offset, size_t size, char *destination, int fd) {
     if (offset > layout.first || size > layout.first - offset) {
         Debug(Debug::ERROR) << "Cannot read bytes " << offset << " to " << offset + size << " of s3://" << bucket << "/" << keyPrefix << "/" << path << " with " << layout.first << " bytes\n";
         EXIT(EXIT_FAILURE);
     }
-    for (size_t done = 0; done < size;) {
-        size_t pos = offset + done;
+    std::vector<size_t> pieceOffsets(1, offset);
+    while (pieceOffsets.back() < offset + size) {
+        size_t pos = pieceOffsets.back();
+        size_t segmentEnd = (layout.second > 0) ? std::min(pos / layout.second * layout.second + layout.second, layout.first) : layout.first;
+        pieceOffsets.push_back(std::min(offset + size, segmentEnd));
+    }
+    const size_t pieces = pieceOffsets.size() - 1;
+#pragma omp parallel for schedule(dynamic, 1) if (omp_in_parallel() == 0 && pieces > 1)
+    for (size_t i = 0; i < pieces; i++) {
+        size_t pos = pieceOffsets[i];
+        size_t done = pos - offset;
         size_t segmentBegin = (layout.second > 0) ? pos / layout.second * layout.second : 0;
-        size_t segmentEnd = (layout.second > 0) ? std::min(segmentBegin + layout.second, layout.first) : layout.first;
-        size_t bytes = std::min(size - done, segmentEnd - pos);
+        size_t bytes = pieceOffsets[i + 1] - pos;
         Request request("GET", (layout.second > 0) ? path + "/" + SSTR(pos / layout.second) : path);
         request.headers.push_back(std::make_pair("range", "bytes=" + SSTR(pos - segmentBegin) + "-" + SSTR(pos - segmentBegin + bytes - 1)));
         request.download = (destination != NULL) ? destination + done : NULL;
@@ -522,7 +596,6 @@ static void readRange(const std::string &path, const std::pair<size_t, size_t> &
         if (status != 206 && status != 200) {
             fail(request, response);
         }
-        done += bytes;
     }
 }
 
@@ -534,7 +607,7 @@ void S3Client::init(const std::string &bucketPrefix, const std::string &runId) {
         prefix.erase(prefix.size() - 1);
     }
     if (bucket.empty() || runId.empty() || runId.find('/') != std::string::npos) {
-        Debug(Debug::ERROR) << "Cannot use --aws-bucket " << bucketPrefix << " with run id " << runId << ": the bucket and a run id without / are needed\n";
+        Debug(Debug::ERROR) << "--backend aws needs --aws-bucket and a run id without / that all steps of the run share in MMSEQS_RUN_ID or SLURM_JOB_ID\n";
         EXIT(EXIT_FAILURE);
     }
     keyPrefix = prefix.empty() ? runId : prefix + "/" + runId;
@@ -542,6 +615,8 @@ void S3Client::init(const std::string &bucketPrefix, const std::string &runId) {
     region = (regionName != NULL && *regionName != '\0') ? regionName : "us-east-1";
     const char *rate = getenv("MMSEQS_S3_FAULT_RATE");
     faultRate = (rate != NULL) ? strtod(rate, NULL) : 0.0;
+    const char *latency = getenv("MMSEQS_S3_LATENCY_MS");
+    latencyMilliseconds = (latency != NULL) ? strtoul(latency, NULL, 10) : 0;
     const char *endpointUrl = getenv("AWS_ENDPOINT_URL");
     if (endpointUrl != NULL && *endpointUrl != '\0') {
         endpoint = endpointUrl;
@@ -577,6 +652,19 @@ void S3Client::init(const std::string &bucketPrefix, const std::string &runId) {
     }
     // the working directory of the run, before any chdir
     getObjectName("");
+    atexit(printStatistics);
+    // a server that ignores If-None-Match gives a claim two winners
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    char hostName[256] = "";
+    gethostname(hostName, sizeof(hostName) - 1);
+    const std::string probe = "if-none-match." + std::string(hostName) + "." + SSTR(getpid()) + "." + SSTR(now.tv_sec) + "." + SSTR(now.tv_nsec);
+    // putIfAbsent resolves a retried PUT by its data, so the two PUTs differ
+    if (putIfAbsent(probe, "1", 1) == false || putIfAbsent(probe, "2", 1)) {
+        Debug(Debug::ERROR) << "Cannot use s3://" << bucket << "/" << keyPrefix << ": the S3 server ignores If-None-Match\n";
+        EXIT(EXIT_FAILURE);
+    }
+    deleteObject(probe);
     enabled = true;
 }
 
@@ -656,6 +744,35 @@ void S3Client::remove(const std::string &path) {
     }
     std::lock_guard<std::mutex> lock(layoutMutex);
     layouts.erase(path);
+}
+
+// ListObjectsV2, a request per 1000 names
+void S3Client::list(const std::string &path, std::vector<std::string> &names) {
+    names.clear();
+    const std::string prefix = keyPrefix + "/" + path + "/";
+    std::string token;
+    do {
+        Request request("GET", path + "/");
+        request.query.push_back(std::make_pair("list-type", "2"));
+        request.query.push_back(std::make_pair("prefix", prefix));
+        if (token.empty() == false) {
+            request.query.push_back(std::make_pair("continuation-token", token));
+        }
+        Response response;
+        if (perform(request, response) != 200) {
+            fail(request, response);
+        }
+        for (size_t begin = response.body.find("<Key>"); begin != std::string::npos; begin = response.body.find("<Key>", begin)) {
+            begin += 5;
+            size_t end = response.body.find("</Key>", begin);
+            if (end == std::string::npos || response.body.compare(begin, prefix.size(), prefix) != 0) {
+                fail(request, response);
+            }
+            names.push_back(response.body.substr(begin + prefix.size(), end - begin - prefix.size()));
+            begin = end;
+        }
+        token = (getXmlValue(response.body, "IsTruncated") == "true") ? getXmlValue(response.body, "NextContinuationToken") : "";
+    } while (token.empty() == false);
 }
 
 void S3Client::putFile(const std::string &path, const std::string &localFile, size_t offset, size_t size) {
@@ -751,6 +868,10 @@ void S3Client::remove(const std::string &) {
     notBuilt();
 }
 
+void S3Client::list(const std::string &, std::vector<std::string> &) {
+    notBuilt();
+}
+
 void S3Client::putFile(const std::string &, const std::string &, size_t, size_t) {
     notBuilt();
 }
@@ -769,7 +890,7 @@ size_t S3Client::getSize(const std::string &) {
 }
 
 std::string S3Client::getAuthorization(const std::string &, const std::string &, std::vector<std::pair<std::string, std::string> >,
-                                       const std::string &, const std::string &, const std::string &) {
+                                       const std::string &, const std::string &, const std::string &, const std::string &) {
     notBuilt();
     return "";
 }
