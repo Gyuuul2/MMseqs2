@@ -112,7 +112,6 @@ public:
     public:
         WorkQueue(const std::string &name, size_t itemCount);
         size_t takeNextItem();
-        size_t takeNextItemInOrder();
         void removeTakenItemFiles();
         bool takeItem(size_t item);
 
@@ -120,7 +119,6 @@ public:
         const std::string name;
         const size_t itemCount;
         size_t nextItem;
-        size_t nextOrderedItem;
         std::vector<size_t> itemsLeft;
         size_t nextNode;
     };

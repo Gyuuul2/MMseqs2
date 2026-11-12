@@ -3029,7 +3029,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     exchange.fileKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
     exchange.hasRepresentativeBits = FileUtil::fileExists((par.db1 + ".bits." + SSTR(MMseqsNode::rank)).c_str());
     // write the pref by target split for two or more align nodes
-    exchange.hasTargetSplits = par.align2clustMode == Parameters::ALIGN2CLUST_MODE_TARGET_SPLIT && MMseqsNode::count - MMseqsNode::getFirstAlignNode() > 1;
+    exchange.hasTargetSplits = MMseqsNode::count - MMseqsNode::getFirstAlignNode() > 1;
     if (exchange.hasTargetSplits) {
         seqDbr.setBlockCacheSize(0);
     }

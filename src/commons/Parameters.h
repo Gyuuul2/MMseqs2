@@ -314,10 +314,6 @@ public:
     static const int ALIGNER_MODE_FARRAR = 0;
     static const int ALIGNER_MODE_SWIPE = 1;
 
-    // align2clust mode
-    static const int ALIGN2CLUST_MODE_QUERY_SPLIT = 0;
-    static const int ALIGN2CLUST_MODE_TARGET_SPLIT = 1;
-
     // rescorediagonal
     static const int RESCORE_MODE_HAMMING = 0;
     static const int RESCORE_MODE_SUBSTITUTION = 1;
@@ -622,7 +618,6 @@ public:
     int adjacencyAlphabetSize;
     int diagonalMode;
     int align2clustAlignerMode;
-    int align2clustMode;
     int align2clustSplit;
     int alignerMode;
     bool kmerPosFilter;
@@ -996,7 +991,6 @@ public:
     PARAMETER(PARAM_ADJACENCY_ALPH_SIZE)
     PARAMETER(PARAM_DIAGONAL_MODE)
     PARAMETER(PARAM_ALIGN2CLUST_ALIGNER_MODE)
-    PARAMETER(PARAM_ALIGN2CLUST_MODE)
     PARAMETER(PARAM_ALIGN2CLUST_SPLIT)
     PARAMETER(PARAM_ALIGNER_MODE)
     PARAMETER(PARAM_KMER_POS_FILTER)

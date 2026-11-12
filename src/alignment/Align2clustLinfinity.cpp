@@ -614,10 +614,10 @@ static std::vector<unsigned int> targetSplitAlignNodes;
 static std::vector<unsigned int> windowAlignGroups;
 static unsigned int alignGroup;
 
-// blocks in turn or by target split
+// by target split, without target splits there is one align node
 static size_t getBlockAlignNode(size_t block) {
     if (targetSplitAlignNodes.empty()) {
-        return MMseqsNode::getFirstAlignNode() + block % (MMseqsNode::count - MMseqsNode::getFirstAlignNode());
+        return MMseqsNode::getFirstAlignNode();
     }
     return targetSplitAlignNodes[std::upper_bound(targetSplitBlockOffsets.begin(), targetSplitBlockOffsets.end(), block) - targetSplitBlockOffsets.begin() - 1];
 }
@@ -1420,8 +1420,9 @@ struct PrefRead {
 
 struct RepTargetsReader {
     RepTargetsReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &partitions, const std::vector<size_t> &alignmentSplitPartitionOffsets,
-                     MMseqsNode::WorkQueue &alignmentSplitQueue, size_t maxRecordSize, size_t memoryLimit, size_t paddedDbSize, size_t sizeClassCount)
-        : maxRecordSize(maxRecordSize), par(par), seqDbr(seqDbr), partitions(partitions), alignmentSplitPartitionOffsets(alignmentSplitPartitionOffsets), alignmentSplitQueue(alignmentSplitQueue),
+                     size_t maxRecordSize, size_t memoryLimit, size_t paddedDbSize, size_t sizeClassCount)
+        : maxRecordSize(maxRecordSize), par(par), seqDbr(seqDbr), partitions(partitions), alignmentSplitPartitionOffsets(alignmentSplitPartitionOffsets),
+          alignmentSplit((MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) ? 0 : alignmentSplitPartitionOffsets.size() - 1),
           paddedDbSize(paddedDbSize), sizeClassCount(sizeClassCount), maxPrefilterBufferSize(std::max<size_t>(1, memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)),
           maxRecordTargetCount(std::min<size_t>(UINT_MAX, std::max<size_t>(1, maxRecordSize / std::max<size_t>(seqDbr.getMaxSeqLen() + 2, Util::getPageSize())))),
           prefReadPos(0), passClasses(~0ULL), endClass(0), classSize(sizeClassCount, 0), prefDb(NULL), prefNode(0), bufferRecordCount(0), bufferTargetCount(0), bufferFetchSize(0), bufferAlignmentCells(0),
@@ -1431,13 +1432,8 @@ struct RepTargetsReader {
         // per pref byte two buffers and 8 bytes of targets, per entry 48 bytes and a record
         const double bytesPerPrefByte = 10.0;
         const double bytesPerEntry = 48.0 + sizeof(RepTargetsRecord);
-        const size_t alignmentSplitCount = alignmentSplitPartitionOffsets.size() - 1;
         const size_t prefReadsBefore = prefReads.size();
-        while (prefReads.size() == prefReadsBefore) {
-            size_t alignmentSplit = (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) ? alignmentSplitQueue.takeNextItemInOrder() : alignmentSplitCount;
-            if (alignmentSplit == alignmentSplitCount) {
-                break;
-            }
+        for (; prefReads.size() == prefReadsBefore && alignmentSplit + 1 < alignmentSplitPartitionOffsets.size(); alignmentSplit++) {
             for (size_t i = alignmentSplitPartitionOffsets[alignmentSplit]; i < alignmentSplitPartitionOffsets[alignmentSplit + 1];) {
                 if (partitions[i].alignmentCells == 0) {
                     i++;
@@ -1534,7 +1530,7 @@ private:
     DBReader<DBKeyType> &seqDbr;
     const std::vector<PrefPartition> &partitions;
     const std::vector<size_t> &alignmentSplitPartitionOffsets;
-    MMseqsNode::WorkQueue &alignmentSplitQueue;
+    size_t alignmentSplit;
     const size_t paddedDbSize;
     const size_t sizeClassCount;
     const size_t maxPrefilterBufferSize;
@@ -5148,7 +5144,7 @@ int align2clustLinfinity(Parameters &par) {
     Timer phaseValueTimer;
     size_t alignNodeCount = MMseqsNode::count - MMseqsNode::getFirstAlignNode();
     // the first .partitions line holds the target split blocks
-    const bool hasTargetSplits = par.align2clustMode == Parameters::ALIGN2CLUST_MODE_TARGET_SPLIT && alignNodeCount > 1;
+    const bool hasTargetSplits = alignNodeCount > 1;
     std::string partitionsData = MMseqsNode::readFile(par.db2 + ".partitions");
     char *partitionLine = (char *) partitionsData.c_str();
     for (; hasTargetSplits && *partitionLine != '\n'; partitionLine += Util::skipWhitespace(partitionLine)) {
@@ -5433,7 +5429,7 @@ int align2clustLinfinity(Parameters &par) {
     }
 
     // cut the groups into alignment splits of about equal cells
-    const size_t maxAlignmentSplitCount = std::max<size_t>(1, std::min(ALIGNMENT_SPLITS_PER_NODE * alignNodeCount, totalPrefSize / MIN_ALIGNMENT_SPLIT_PREF_SIZE));
+    const size_t maxAlignmentSplitCount = std::max<size_t>(1, std::min(ALIGNMENT_SPLITS_PER_NODE, totalPrefSize / MIN_ALIGNMENT_SPLIT_PREF_SIZE));
     std::vector<size_t> alignmentSplitPartitionOffsets(1, 0);
     uint128 cells = 0;
     for (size_t i = 0; i + 1 < partitions.size(); i++) {
@@ -5443,7 +5439,6 @@ int align2clustLinfinity(Parameters &par) {
         }
     }
     alignmentSplitPartitionOffsets.push_back(partitions.size());
-    MMseqsNode::WorkQueue alignmentSplitQueue(par.db3 + "_alignment_splits", alignmentSplitPartitionOffsets.size() - 1);
     // a cell is a window of a target split
     MMseqsNode::WorkQueue cellQueue(par.db3 + "_cells", hasTargetSplits ? partitions.size() : 0);
 
@@ -5516,9 +5511,6 @@ int align2clustLinfinity(Parameters &par) {
     }
 
     // remove the item files a killed run left
-    if (hasTargetSplits == false) {
-        alignmentSplitQueue.removeTakenItemFiles();
-    }
     cellQueue.removeTakenItemFiles();
     // all nodes use the smallest memory limit
     const size_t smallestMemoryLimit = MMseqsNode::getSmallestMemoryLimit(par.db3 + ".memory", nodeMemoryLimit - std::min(nodeMemoryLimit, assignedMemorySize));
@@ -5528,7 +5520,7 @@ int align2clustLinfinity(Parameters &par) {
     // all nodes cut served files at the same size
     const size_t servedFileEntrySize = std::max(BatchReader::MAX_READ_REQUEST_SIZE, smallestMemoryLimit / SERVED_FILE_MEMORY_DIVISOR);
 
-    RepTargetsReader repTargetsReader(par, seqDbr, partitions, alignmentSplitPartitionOffsets, alignmentSplitQueue, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount);
+    RepTargetsReader repTargetsReader(par, seqDbr, partitions, alignmentSplitPartitionOffsets, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount);
     // the member checks of iteration 2 log the pairs of a claim after the fetches of the next one, so its nodes publish no claims and the master confirms by node
     const std::string claimedCells = (hasTargetSplits && sizeClassCount == 1 && par.filterCluDBFile.empty()) ? par.db3 + "_claimed_cells" : "";
     TargetSplitReader *targetSplitReader = hasTargetSplits ? new TargetSplitReader(par, seqDbr, partitions, cellQueue, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount,
@@ -5654,10 +5646,7 @@ int align2clustLinfinity(Parameters &par) {
     size_t clusteredKey;
     size_t clusteredSize;
     MMseqsNode::waitForLog(clusteredLogFile, clusteredKey, clusteredSize);
-    // every node took its last alignment split
-    if (hasTargetSplits == false) {
-        alignmentSplitQueue.removeTakenItemFiles();
-    }
+    // every node took its last cell
     cellQueue.removeTakenItemFiles();
     if (MMseqsNode::isMaster()) {
         clusterThread.join();

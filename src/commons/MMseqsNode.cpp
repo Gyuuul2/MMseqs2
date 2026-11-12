@@ -556,7 +556,7 @@ void MMseqsNode::printPhaseValues(const std::string &values) {
     Debug(Debug::INFO) << output;
 }
 
-MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextItem(rank), nextOrderedItem(0), itemsLeft(count, 0), nextNode((rank + 1) % count) {
+MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextItem(rank), itemsLeft(count, 0), nextNode((rank + 1) % count) {
     for (size_t node = 0; node < count; node++) {
         if (node != rank && node < itemCount) {
             itemsLeft[node] = (itemCount - 1 - node) / count + 1;
@@ -599,15 +599,6 @@ size_t MMseqsNode::WorkQueue::takeNextItem() {
         itemsLeft[node] = 0;
     }
     return itemCount;
-}
-
-size_t MMseqsNode::WorkQueue::takeNextItemInOrder() {
-    size_t item = nextOrderedItem;
-    while (item < itemCount && takeItem(item) == false) {
-        item++;
-    }
-    nextOrderedItem = std::min(item + 1, itemCount);
-    return item;
 }
 
 void MMseqsNode::WorkQueue::removeTakenItemFiles() {
