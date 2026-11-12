@@ -1216,10 +1216,12 @@ struct ClusterMemberExchange {
             isRequesting[node] = node != rank;
             requesterCount += isRequesting[node];
         }
-        // an idle requester is read every idleSeconds, one that asked after 10 ms and then at doubling intervals
+        // an idle requester is read every idleSeconds, one that asked after 10 ms and then at doubling intervals;
+        // a size request is followed by the member request of the same fetch, so its requester is read every 10 ms for up to a second
         const double idleSeconds = std::max(0.04, (double) requesterCount / PROGRESS_READS_PER_SECOND);
         std::vector<double> readSeconds(nodes, idleSeconds);
         std::vector<double> nextReads(nodes, 0);
+        std::vector<double> fastReadEnds(nodes, 0);
         Timer serveTimer;
         std::vector<char> section;
         std::vector<DBKeyType> requestedKeys;
@@ -1239,7 +1241,10 @@ struct ClusterMemberExchange {
                 }
                 const size_t lineCount = MMseqsNode::readExchangeIndexLines(getRequestIndex(requester), nextRequestLines[requester], requestLineWords, requestLines);
                 nextRequestLines[requester] += lineCount;
-                readSeconds[requester] = (lineCount > 0) ? 0.01 : std::min(2.0 * readSeconds[requester], idleSeconds);
+                if (lineCount > 0) {
+                    fastReadEnds[requester] = (requestLines[(lineCount - 1) * requestLineWords + 3] == 0) ? serveTimer.getTimediff() + 1.0 : 0;
+                }
+                readSeconds[requester] = (lineCount > 0 || serveTimer.getTimediff() < fastReadEnds[requester]) ? 0.01 : std::min(2.0 * readSeconds[requester], idleSeconds);
                 nextReads[requester] = serveTimer.getTimediff() + readSeconds[requester];
                 nextRead = std::min(nextRead, nextReads[requester]);
                 for (size_t l = 0; l < lineCount; l++) {
