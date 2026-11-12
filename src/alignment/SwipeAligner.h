@@ -60,7 +60,8 @@ private:
     int queryLength;
     std::vector<unsigned char> query;
     std::vector<int8_t> bias;
-    float *queryBiasBuffer;
+    std::vector<int8_t> biasTable;
+    std::vector<int> biasTableOffsets;
 
     int matrixBias;
     int byteBias;
@@ -150,7 +151,8 @@ private:
     std::vector<size_t> queryOffsets;
     std::vector<int> queryLengths;
     std::vector<int8_t> bias;
-    float *queryBiasBuffer;
+    std::vector<int8_t> biasTable;
+    std::vector<int> biasTableOffsets;
 
     int8_t *scoreRows;
 
