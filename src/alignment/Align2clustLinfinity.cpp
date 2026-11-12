@@ -2565,6 +2565,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         MMseqsNode::addPhaseValue(phaseValues, "Block cache", SSTR(blockCacheSize) + " bytes for " + SSTR(static_cast<size_t>(alignNodeCoverableSize)) + " coverable bytes and " + SSTR(servedSequenceSize) + " sequence bytes of the align node"
                                  + (isReadingDirectly ? ", the sequences are read directly" : ""));
     }
+    if (isAligningNode && blockCacheSize < servedSequenceSize) {
+        Debug(Debug::WARNING) << "Node " << rank << " holds " << servedSequenceSize << " sequence bytes but its block cache has " << blockCacheSize
+                              << " bytes, the other sequences are read one by one. Use more nodes or increase --split-memory-limit\n";
+    }
     size_t fetchBytesLimit = std::min(maxFetchSize / 64, FIRST_FETCH_SIZE);
     const auto getFetchedEntry = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL, FetchedKeyCursor *cursor = NULL) -> const char * {
         const char *data = findFetchedKey(sequences, nodes, key, seqLen, (cursor != NULL) ? &cursor->positions[nodes] : NULL);
