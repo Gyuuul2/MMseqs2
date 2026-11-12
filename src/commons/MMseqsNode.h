@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -46,6 +47,13 @@ public:
     // with two or more nodes the master only clusters
     static inline unsigned int getFirstAlignNode() {
         return (count > 1) ? 1 : 0;
+    }
+
+    // align groups of align2clust in target split mode from --align2clust-split, 0 is floor(sqrt(align nodes))
+    static inline size_t getAlignGroupCount(int align2clustSplit) {
+        const size_t alignNodeCount = count - getFirstAlignNode();
+        const size_t groups = (align2clustSplit > 0) ? align2clustSplit : static_cast<size_t>(std::sqrt(static_cast<double>(alignNodeCount)));
+        return std::min(alignNodeCount, std::max((size_t) 1, groups));
     }
 
     static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);

@@ -181,6 +181,7 @@ Parameters::Parameters():
         PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: align on the diagonal of the k-mer match\n1: align on the best diagonal of an ungapped scan (linclust version 2 and amino acids only)", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ALIGN2CLUST_ALIGNER_MODE(PARAM_ALIGN2CLUST_ALIGNER_MODE_ID, "--align2clust-aligner-mode", "Align2clust aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: forward pass and traceback of several targets at once (SWIPE), also the seed extensions of the representative targets", typeid(int), (void *) &align2clustAlignerMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ALIGN2CLUST_MODE(PARAM_ALIGN2CLUST_MODE_ID, "--align2clust-mode", "Align2clust mode", "0: query split, align nodes take ranges of representatives\n1: target split, each align node aligns the targets of its target splits (linfinity databases with 2 or more align nodes)", typeid(int), (void *) &align2clustMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_ALIGN2CLUST_SPLIT(PARAM_ALIGN2CLUST_SPLIT_ID, "--align2clust-split", "Align2clust split", "Split the align nodes into N groups that each align every N-th window of the representatives (target split mode). 0: set automatically to the square root of the align node count, 1: no split", typeid(int), (void *) &align2clustSplit, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ALIGNER_MODE(PARAM_ALIGNER_MODE_ID, "--aligner-mode", "Aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: SWIPE forward pass for full lane batches, then the same Farrar or block backward pass and traceback as mode 0", typeid(int), (void *) &alignerMode, "^[0-1]$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_KMER_POS_FILTER(PARAM_KMER_POS_FILTER_ID, "--kmer-pos-filter", "K-mer position filter", "Drop k-mer matches whose diagonal cannot reach the coverage", typeid(bool), (void *) &kmerPosFilter, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -494,6 +495,7 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_DIAGONAL_MODE);
     align2clust.push_back(&PARAM_ALIGN2CLUST_ALIGNER_MODE);
     align2clust.push_back(&PARAM_ALIGN2CLUST_MODE);
+    align2clust.push_back(&PARAM_ALIGN2CLUST_SPLIT);
 
     // prefilter
     prefilter.push_back(&PARAM_SUB_MAT);
@@ -1158,6 +1160,7 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
     kmermatcher.push_back(&PARAM_LINCLUST_VERSION);
     kmermatcher.push_back(&PARAM_ALIGN2CLUST_MODE);
+    kmermatcher.push_back(&PARAM_ALIGN2CLUST_SPLIT);
 
     // kmermatcher
     kmersearch.push_back(&PARAM_SEED_SUB_MAT);
@@ -2868,6 +2871,7 @@ void Parameters::setDefaults() {
     diagonalMode = DIAGONAL_MODE_KMER;
     align2clustAlignerMode = ALIGNER_MODE_SWIPE;
     align2clustMode = ALIGN2CLUST_MODE_TARGET_SPLIT;
+    align2clustSplit = 0;
     alignerMode = ALIGNER_MODE_FARRAR;
     kmerPosFilter = true;
     clustHash = false;

@@ -610,6 +610,9 @@ static const double STEAL_SHARE_STEP = 1.0 / 8;
 // target split mode
 static std::vector<size_t> targetSplitBlockOffsets;
 static std::vector<unsigned int> targetSplitAlignNodes;
+// a window belongs to one align group, a node holds the target split table of its own group
+static std::vector<unsigned int> windowAlignGroups;
+static unsigned int alignGroup;
 
 // blocks in turn or by target split
 static size_t getBlockAlignNode(size_t block) {
@@ -1710,7 +1713,7 @@ struct TargetSplitReader {
             }
         }
         for (size_t i = 0; isClaiming == false && i < cells.size(); i++) {
-            prefSize += (targetSplitAlignNodes[cells[i].targetSplit] == MMseqsNode::rank) ? cells[i].prefSize : 0;
+            prefSize += (windowAlignGroups[i / targetSplitCount] == alignGroup && targetSplitAlignNodes[cells[i].targetSplit] == MMseqsNode::rank) ? cells[i].prefSize : 0;
         }
         prefOffsets.resize(MMseqsNode::count * targetSplitCount);
         prefKeys.resize(MMseqsNode::count);
@@ -1929,10 +1932,14 @@ private:
             if (hasClaimLog()) {
                 firstCell = claimCells();
             } else if (cellPos < cells.size()) {
-                if (isClaiming) {
-                    claimWindowCells(cellPos / targetSplitCount);
-                }
                 cellPos += targetSplitCount;
+                // only the windows of the own align group
+                if (windowAlignGroups[firstCell / targetSplitCount] != alignGroup) {
+                    continue;
+                }
+                if (isClaiming) {
+                    claimWindowCells(firstCell / targetSplitCount);
+                }
             }
             if (firstCell == cells.size()) {
                 break;
@@ -2112,6 +2119,9 @@ private:
             // without home windows left every window is behind
             const size_t endWindow = (homeWindow == windowCount) ? windowCount : homeWindow - std::min(homeWindow, lead);
             for (size_t window = lastWindow; window < endWindow; window++) {
+                if (windowAlignGroups[window] != alignGroup) {
+                    continue;
+                }
                 const size_t firstCell = window * targetSplitCount;
                 double windowStolenCost = 0;
                 for (size_t i = 1; i < alignNodeCount; i++) {
@@ -2164,7 +2174,7 @@ private:
             }
             const size_t firstCell = homeWindow * targetSplitCount;
             double windowTakenCost = 0;
-            for (size_t split = 0; split < targetSplitCount; split++) {
+            for (size_t split = 0; windowAlignGroups[homeWindow] == alignGroup && split < targetSplitCount; split++) {
                 const size_t cost = cells[firstCell + split].alignmentCells;
                 if (cost > 0 && targetSplitAlignNodes[split] == MMseqsNode::rank) {
                     isTaken[split] = cellQueue.takeItem(firstCell + split);
@@ -5190,31 +5200,45 @@ int align2clustLinfinity(Parameters &par) {
             order[split] = split;
         }
 
-        // largest cost first to the align node with the least cost
+        // the align nodes in groups, the master is in no group
+        const size_t alignGroupCount = MMseqsNode::getAlignGroupCount(par.align2clustSplit);
+        std::vector<size_t> groupNodeOffsets(alignGroupCount + 1);
+        for (size_t group = 0; group <= alignGroupCount; group++) {
+            groupNodeOffsets[group] = group * alignNodeCount / alignGroupCount;
+        }
+        const size_t alignNode = MMseqsNode::rank - std::min<size_t>(MMseqsNode::rank, MMseqsNode::getFirstAlignNode());
+        alignGroup = (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) ? std::upper_bound(groupNodeOffsets.begin(), groupNodeOffsets.end(), alignNode) - groupNodeOffsets.begin() - 1 : alignGroupCount;
+
+        // largest cost first to the node of the align group with the least cost; the master spreads the splits over the groups
         SORT_SERIAL(order.begin(), order.end(), [&](size_t first, size_t second) {
             return splitCosts[first] > splitCosts[second] || (splitCosts[first] == splitCosts[second] && first < second);
         });
-        size_t maxNodeSize = (totalSize + alignNodeCount - 1) / alignNodeCount + maxSplitSize;
-        std::vector<uint128> nodeCosts(alignNodeCount, 0);
-        std::vector<size_t> nodeSizes(alignNodeCount, 0);
         targetSplitAlignNodes.resize(targetSplitCount);
-        for (size_t i = 0; i < targetSplitCount; i++) {
-            size_t split = order[i];
-            size_t node = SIZE_MAX;
-            for (size_t alignNode = 0; alignNode < alignNodeCount; alignNode++) {
-                if (nodeSizes[alignNode] + splitSizes[split] <= maxNodeSize && (node == SIZE_MAX || nodeCosts[alignNode] < nodeCosts[node])) {
-                    node = alignNode;
+        for (size_t group = 0; group < alignGroupCount; group++) {
+            const size_t groupNodeCount = groupNodeOffsets[group + 1] - groupNodeOffsets[group];
+            size_t maxNodeSize = (totalSize + groupNodeCount - 1) / groupNodeCount + maxSplitSize;
+            std::vector<uint128> nodeCosts(groupNodeCount, 0);
+            std::vector<size_t> nodeSizes(groupNodeCount, 0);
+            for (size_t i = 0; i < targetSplitCount; i++) {
+                size_t split = order[i];
+                size_t node = SIZE_MAX;
+                for (size_t groupNode = 0; groupNode < groupNodeCount; groupNode++) {
+                    if (nodeSizes[groupNode] + splitSizes[split] <= maxNodeSize && (node == SIZE_MAX || nodeCosts[groupNode] < nodeCosts[node])) {
+                        node = groupNode;
+                    }
+                }
+                nodeCosts[node] += splitCosts[split];
+                nodeSizes[node] += splitSizes[split];
+                if (group == ((alignGroup < alignGroupCount) ? alignGroup : split % alignGroupCount)) {
+                    targetSplitAlignNodes[split] = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[group] + node;
                 }
             }
-            nodeCosts[node] += splitCosts[split];
-            nodeSizes[node] += splitSizes[split];
-            targetSplitAlignNodes[split] = MMseqsNode::getFirstAlignNode() + node;
-        }
-        if (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) {
-            size_t alignNode = MMseqsNode::rank - MMseqsNode::getFirstAlignNode();
-            MMseqsNode::addPhaseValue(phaseValues, "Target splits", SSTR(std::count(targetSplitAlignNodes.begin(), targetSplitAlignNodes.end(), MMseqsNode::rank)) + " of " + SSTR(targetSplitCount)
-                                      + " with " + SSTR(nodeSizes[alignNode]) + " of " + SSTR(totalSize) + " sequence bytes and "
-                                      + SSTR(static_cast<size_t>(nodeCosts[alignNode] * 1000 / std::max((uint128) 1, totalAlignmentCells))) + " per mille of the cost");
+            if (group == alignGroup) {
+                const size_t groupNode = alignNode - groupNodeOffsets[group];
+                MMseqsNode::addPhaseValue(phaseValues, "Target splits", SSTR(std::count(targetSplitAlignNodes.begin(), targetSplitAlignNodes.end(), MMseqsNode::rank)) + " of " + SSTR(targetSplitCount)
+                                          + " with " + SSTR(nodeSizes[groupNode]) + " of " + SSTR(totalSize) + " sequence bytes and "
+                                          + SSTR(static_cast<size_t>(nodeCosts[groupNode] * 1000 / std::max((uint128) 1, totalAlignmentCells))) + " per mille of the cost");
+            }
         }
         // with claims, a window above the mean cost becomes rep key parts of about the mean cost (a key costs its squared length),
         // so that the nodes ahead take the parts that a slow node has not started
@@ -5271,6 +5295,27 @@ int align2clustLinfinity(Parameters &par) {
                 }
             }
             partitions.swap(parts);
+        }
+
+        // windows and parts in key order to the align group with the least cost per node, so that the groups pass the keys side by side
+        std::vector<uint128> groupCosts(alignGroupCount, 0);
+        windowAlignGroups.resize(partitions.size() / targetSplitCount);
+        for (size_t window = 0; window < windowAlignGroups.size(); window++) {
+            size_t windowGroup = 0;
+            for (size_t group = 1; group < alignGroupCount; group++) {
+                if (groupCosts[group] * (groupNodeOffsets[windowGroup + 1] - groupNodeOffsets[windowGroup]) < groupCosts[windowGroup] * (groupNodeOffsets[group + 1] - groupNodeOffsets[group])) {
+                    windowGroup = group;
+                }
+            }
+            windowAlignGroups[window] = windowGroup;
+            for (size_t split = 0; split < targetSplitCount; split++) {
+                groupCosts[windowGroup] += partitions[window * targetSplitCount + split].alignmentCells;
+            }
+        }
+        if (alignGroup < alignGroupCount) {
+            MMseqsNode::addPhaseValue(phaseValues, "Align group", SSTR(alignGroup) + " of " + SSTR(alignGroupCount) + " with " + SSTR(groupNodeOffsets[alignGroup + 1] - groupNodeOffsets[alignGroup]) + " nodes, "
+                                      + SSTR(std::count(windowAlignGroups.begin(), windowAlignGroups.end(), alignGroup)) + " of " + SSTR(windowAlignGroups.size()) + " windows and "
+                                      + SSTR(static_cast<size_t>(groupCosts[alignGroup] * 1000 / std::max((uint128) 1, totalAlignmentCells))) + " per mille of the cost");
         }
     }
     std::string seqDb = par.db1;

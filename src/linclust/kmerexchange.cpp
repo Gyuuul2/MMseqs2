@@ -2504,7 +2504,9 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
         for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {
             representativeCount += seqDbr.getRangeRepresentativeCount(range);
         }
-        size_t alignNodeCount = MMseqsNode::count - MMseqsNode::getFirstAlignNode();
+        // an align group shares the target splits of a window
+        size_t alignGroupCount = MMseqsNode::getAlignGroupCount(par.align2clustSplit);
+        size_t alignNodeCount = (MMseqsNode::count - MMseqsNode::getFirstAlignNode() + alignGroupCount - 1) / alignGroupCount;
         size_t targetsPerRep = exchange.pairTargetCount / std::max((size_t) 1, representativeCount);
         size_t blockCount = seqDbr.getBlockKeyOffsets().size() - 1;
         size_t targetSplitCount = std::min(blockCount, std::max(2 * alignNodeCount, std::min(MAX_TARGET_SPLITS_PER_NODE * alignNodeCount, targetsPerRep / 4)));
@@ -2573,7 +2575,8 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             estimatedCost += (keyEnd > keyBegin) ? partitionPairSizes[partition] * squaredLengths / (keyEnd - keyBegin) : 0;
             pairBytes += partitionPairSizes[partition];
         }
-        targetSplitFiles.rowCost = std::max((size_t) 1, static_cast<size_t>(estimatedCost * exchange.pairTargetCount / std::max((size_t) 1, pairBytes) / mergeSplitCount));
+        // every align group gets as many windows
+        targetSplitFiles.rowCost = std::max((size_t) 1, static_cast<size_t>(estimatedCost * exchange.pairTargetCount / std::max((size_t) 1, pairBytes) / mergeSplitCount / MMseqsNode::getAlignGroupCount(par.align2clustSplit)));
         targetSplitFiles.rowSize = 1024 * 1024;
     }
     std::vector<size_t> splitPartitionOffsets(mergeSplitCount + 1, partitionCount);
