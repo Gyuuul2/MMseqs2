@@ -62,7 +62,7 @@ if notExistsBeforeRefinement "${CLUDB}.dbtype"; then
         || fail "align2clust died"
     if [ -n "$REMOVE_TMP" ]; then
         # shellcheck disable=SC2086
-        "$MMSEQS" rmdb "${TMP_PATH}/pref" ${VERBOSITY} &
+        MMSEQS_NUM_THREADS=1 "$MMSEQS" rmdb "${TMP_PATH}/pref" ${VERBOSITY} &
         PIDS="$PIDS $!"
     fi
 fi
@@ -81,13 +81,13 @@ if [ -n "$CLUSTHASH" ]; then
             || fail "mergeclusters died"
         if [ -n "$REMOVE_TMP" ]; then
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust" ${VERBOSITY} &
+            MMSEQS_NUM_THREADS=1 "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust" ${VERBOSITY} &
             PIDS="$PIDS $!"
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust_redundancy" ${VERBOSITY} &
+            MMSEQS_NUM_THREADS=1 "$MMSEQS" rmdb "${TMP_PATH}/input_clusthash_clust_redundancy" ${VERBOSITY} &
             PIDS="$PIDS $!"
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY} &
+            MMSEQS_NUM_THREADS=1 "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY} &
             PIDS="$PIDS $!"
         fi
     fi
@@ -117,10 +117,10 @@ if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
             || fail "align2clust (representatives) died"
         if [ -n "$REMOVE_TMP" ]; then
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/pref_rep" ${VERBOSITY} &
+            MMSEQS_NUM_THREADS=1 "$MMSEQS" rmdb "${TMP_PATH}/pref_rep" ${VERBOSITY} &
             PIDS="$PIDS $!"
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/input_rep" ${VERBOSITY} &
+            MMSEQS_NUM_THREADS=1 "$MMSEQS" rmdb "${TMP_PATH}/input_rep" ${VERBOSITY} &
             PIDS="$PIDS $!"
         fi
     fi
@@ -132,10 +132,10 @@ if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
             || fail "mergeclusters died"
         if [ -n "$REMOVE_TMP" ]; then
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "${TMP_PATH}/clu_rep" ${VERBOSITY} &
+            MMSEQS_NUM_THREADS=1 "$MMSEQS" rmdb "${TMP_PATH}/clu_rep" ${VERBOSITY} &
             PIDS="$PIDS $!"
             # shellcheck disable=SC2086
-            "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY} &
+            MMSEQS_NUM_THREADS=1 "$MMSEQS" rmdb "$CLUDB" ${VERBOSITY} &
             PIDS="$PIDS $!"
         fi
     fi
