@@ -720,6 +720,12 @@ static const time_t PUBLISH_SECONDS = 1;
 static const time_t READ_SECONDS = 1;
 // read the assigned keys a few times a second
 static const double BATCH_READ_SECONDS = PUBLISH_SECONDS / 4.0;
+// a thread spends 1 / LOG_COST_FACTOR of its time on publishing and on reading at most, so a slow file system gets the periods above and a fast one these
+static const double LOG_COST_FACTOR = 16;
+static const double MIN_PUBLISH_SECONDS = 0.1;
+static const double MIN_READ_SECONDS = 0.05;
+static const double MIN_POLL_SECONDS = 0.01;
+static const double MAX_POLL_SECONDS = 0.16;
 static const double PREFILTER_BUFFER_WORK_SECONDS = 2.0 * PUBLISH_SECONDS;
 // a node takes its home cells this far ahead of the last node, the master step tells the home windows about that late
 static const double CLAIM_LEAD_SECONDS = 2.0 * PUBLISH_SECONDS;
@@ -2496,11 +2502,18 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     // with a claim log, the master confirms by claim: the published key is of the claim whose log started last
     const bool hasClaimLog = targetSplitReader != NULL && targetSplitReader->hasClaimLog();
     size_t publishedRepKey = 0;
+    size_t publishCount = 0;
+    double publishCostSeconds = 0;
+    std::atomic<double> publishPeriod(MIN_PUBLISH_SECONDS);
     const auto publishAccepted = [&](size_t repKey, size_t bytes) {
+        Timer publishTimer;
+        publishCount++;
         const size_t claimsSize = hasClaimLog ? targetSplitReader->publishClaims() : 0;
         const size_t homeWindow = hasClaimLog ? __atomic_load_n(&targetSplitReader->homeWindow, __ATOMIC_RELAXED) : 0;
         MMseqsNode::publishLog(acceptedHandle, acceptedFile, repKey, bytes, claimsSize, homeWindow);
         __atomic_store_n(&publishedRepKey, repKey, __ATOMIC_RELAXED);
+        publishCostSeconds += publishTimer.getTimediff();
+        publishPeriod.store(std::min<double>(PUBLISH_SECONDS, std::max(MIN_PUBLISH_SECONDS, LOG_COST_FACTOR * publishCostSeconds / publishCount)));
     };
 
     // assigned bits of the served and aligned keys, by page
@@ -2941,10 +2954,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     startClaim(currentSequences);
     publishAccepted(getFirstRepKey(currentSequences), 0);
     size_t publishedSize = 0;
-    time_t publishTime = time(NULL);
-    time_t assignedKeysTime = publishTime;
+    double publishTime = startTimer.getTimediff();
+    double assignedKeysTime = publishTime;
     Timer assignedKeysTimer;
     double lastBatchReadTime = 0;
+    size_t batchReadCount = 0;
+    double batchReadSeconds = 0;
+    double batchReadPeriod = MIN_READ_SECONDS;
     std::mutex acceptedMutex;
     std::mutex publishMutex;
     std::mutex assignedKeysMutex;
@@ -3683,7 +3699,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         lock.unlock();
         publishAccepted(doneRepOrderKey, acceptedSize);
         publishedSize = acceptedSize;
-        publishTime = time(NULL);
+        publishTime = startTimer.getTimediff();
         Timer waitTimer;
         lock.lock();
         const bool waitsForMaster = isWaitingForMaster;
@@ -3790,9 +3806,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             for (size_t batch = 0; batch < batchCount; batch++) {
                 {
                     std::unique_lock<std::mutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
-                    if (assignedKeysLock.owns_lock() && assignedKeysTimer.getTimediff() - lastBatchReadTime >= BATCH_READ_SECONDS) {
+                    if (assignedKeysLock.owns_lock() && assignedKeysTimer.getTimediff() - lastBatchReadTime >= batchReadPeriod) {
+                        Timer readTimer;
                         readAssignedKeys(false);
                         lastBatchReadTime = assignedKeysTimer.getTimediff();
+                        batchReadCount++;
+                        batchReadSeconds += readTimer.getTimediff();
+                        batchReadPeriod = std::min(BATCH_READ_SECONDS, std::max(MIN_READ_SECONDS, LOG_COST_FACTOR * batchReadSeconds / batchReadCount));
                     }
                 }
                 pairs.clear();
@@ -3886,9 +3906,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             logAcceptedPairs(batchPairs[firstUnfinishedBatch].data(), batchPairs[firstUnfinishedBatch].size());
                             std::vector<ClusterPair>().swap(batchPairs[firstUnfinishedBatch]);
                         }
-                        const time_t now = time(NULL);
+                        const double now = startTimer.getTimediff();
                         // one thread publishes at a time
-                        if ((acceptedSize - publishedSize >= PUBLISH_SIZE || now - publishTime >= PUBLISH_SECONDS) && publishLock.try_lock()) {
+                        if ((acceptedSize - publishedSize >= PUBLISH_SIZE || now - publishTime >= publishPeriod.load()) && publishLock.try_lock()) {
                             doneRepOrderKey = (firstUnfinishedBatch < batchCount) ? static_cast<size_t>(records[batchOffsets[firstUnfinishedBatch]].repOrderKeyFirstTarget.repKey) : nextRepKey;
                             doneSize = acceptedSize;
                             publishedSize = acceptedSize;
@@ -3909,6 +3929,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     std::unique_lock<std::mutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
                     if (assignedKeysLock.owns_lock()) {
                         readAssignedKeys(true);
+                        lastBatchReadTime = assignedKeysTimer.getTimediff();
                     }
                 }
             }
@@ -4285,7 +4306,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             memberLookupSeconds += memberLookupTimer.getTimediff();
             publishAccepted(getFirstUndoneRepKey(nextRepKey), acceptedSize);
             publishedSize = acceptedSize;
-            publishTime = time(NULL);
+            publishTime = startTimer.getTimediff();
             if (nextRepKey < orderKeyEnd) {
                 std::lock_guard<std::mutex> assignedKeysLock(assignedKeysMutex);
                 readAssignedKeys(true);
@@ -4510,7 +4531,6 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     };
     double waitSeconds = 0;
     Timer clusterTimer;
-    unsigned int polls = 0;
     MMseqsNode::WaitWarning waitWarning;
     for (size_t clusteredOrderKey = 0; clusteredOrderKey < orderKeyEnd;) {
         // write and publish the steps decided while the writer is busy
@@ -4550,6 +4570,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             nodeLogSize[node] = logSize;
             nodeHomeWindows[node] = homeWindow;
         }
+        const double pollCostSeconds = pollTimer.getTimediff();
         size_t doneRepOrderKey = orderKeyEnd;
         size_t slowestNode = 0;
         for (size_t node = 0; node < MMseqsNode::count; node++) {
@@ -4592,12 +4613,11 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         }
         if (doneRepOrderKey <= clusteredOrderKey) {
             // only the slowest node gates the step
-            MMseqsNode::sleepBeforePoll(polls++);
+            usleep(static_cast<useconds_t>(1000000 * std::min(MAX_POLL_SECONDS, std::max(MIN_POLL_SECONDS, LOG_COST_FACTOR * pollCostSeconds))));
             waitWarning.check(accepted + "." + SSTR(slowestNode) + ".progress");
             waitSeconds += pollTimer.getTimediff();
             continue;
         }
-        polls = 0;
         // the logs of the claims with reps below doneRepOrderKey, without those the step before clustered to their end
         stepLogs.clear();
         for (size_t node = 0; node < MMseqsNode::count; node++) {
