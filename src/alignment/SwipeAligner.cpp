@@ -69,12 +69,58 @@ static inline void setLaneValue(simd_int *v, int lane, T value) {
     ((T *) v)[lane] = value;
 }
 
-static void computeQueryBias(BaseMatrix *subMat, const Sequence *q, bool aaBiasCorrection, float aaBiasCorrectionScale, float *queryBiasBuffer, std::vector<int8_t> &bias) {
+// as SubstitutionMatrix::calcLocalAaBiasCorrection
+static const int BIAS_WINDOW_SIZE = 40;
+
+// float part of SubstitutionMatrix::calcLocalAaBiasCorrection, not inlined so that the table and the window ends use the same instructions
+__attribute__((noinline)) static int8_t computeLetterBias(const BaseMatrix *subMat, const short *subMatRow, int sumSubScores, int windowLength, float scale) {
+    float deltaS_i = (float) sumSubScores;
+    deltaS_i /= -1.0 * static_cast<float>(windowLength);
+    for (int a = 0; a < subMat->alphabetSize; a++) {
+        deltaS_i += subMat->pBack[a] * static_cast<float>(subMatRow[a]);
+    }
+    float compositionBias = scale * deltaS_i;
+    return static_cast<int8_t>((compositionBias < 0.0) ? compositionBias - 0.5 : compositionBias + 0.5);
+}
+
+// bias of a letter with a full window for each sum of the scores of the other letters
+static void fillBiasTable(const BaseMatrix *subMat, float scale, std::vector<int8_t> &biasTable, std::vector<int> &biasTableOffsets) {
+    const int otherLetters = BIAS_WINDOW_SIZE - 1;
+    biasTableOffsets.resize(subMat->alphabetSize);
+    for (int r = 0; r < subMat->alphabetSize; r++) {
+        const short *subMatRow = subMat->subMatrix[r];
+        int minScore = *std::min_element(subMatRow, subMatRow + subMat->alphabetSize);
+        int maxScore = *std::max_element(subMatRow, subMatRow + subMat->alphabetSize);
+        biasTableOffsets[r] = static_cast<int>(biasTable.size()) - otherLetters * minScore;
+        for (int sum = otherLetters * minScore; sum <= otherLetters * maxScore; sum++) {
+            biasTable.push_back(computeLetterBias(subMat, subMatRow, sum, BIAS_WINDOW_SIZE, scale));
+        }
+    }
+}
+
+static void computeQueryBias(BaseMatrix *subMat, const Sequence *q, bool aaBiasCorrection, float aaBiasCorrectionScale,
+                             const std::vector<int8_t> &biasTable, const std::vector<int> &biasTableOffsets, std::vector<int8_t> &bias) {
     bias.assign(q->L, 0);
     if (aaBiasCorrection) {
-        SubstitutionMatrix::calcLocalAaBiasCorrection(subMat, q->numSequence, q->L, queryBiasBuffer, aaBiasCorrectionScale);
+        const unsigned char *seq = q->numSequence;
+        int letterCounts[32] = {0};
+        int minPos = 0;
+        int maxPos = 0;
         for (int i = 0; i < q->L; i++) {
-            bias[i] = static_cast<int8_t>((queryBiasBuffer[i] < 0.0) ? queryBiasBuffer[i] - 0.5 : queryBiasBuffer[i] + 0.5);
+            for (; maxPos < std::min(q->L, i + BIAS_WINDOW_SIZE / 2); maxPos++) {
+                letterCounts[seq[maxPos]]++;
+            }
+            for (; minPos < std::max(0, i - BIAS_WINDOW_SIZE / 2); minPos++) {
+                letterCounts[seq[minPos]]--;
+            }
+            const short *subMatRow = subMat->subMatrix[seq[i]];
+            int sumSubScores = -subMatRow[seq[i]];
+            for (int a = 0; a < subMat->alphabetSize; a++) {
+                sumSubScores += letterCounts[a] * subMatRow[a];
+            }
+            int windowLength = maxPos - minPos;
+            bias[i] = (windowLength == BIAS_WINDOW_SIZE) ? biasTable[biasTableOffsets[seq[i]] + sumSubScores]
+                                                         : computeLetterBias(subMat, subMatRow, sumSubScores, windowLength, aaBiasCorrectionScale);
         }
     }
 }
@@ -95,7 +141,8 @@ SwipeAligner::SwipeAligner(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorr
         Debug(Debug::ERROR) << "SWIPE supports alphabets of at most 32 letters\n";
         EXIT(EXIT_FAILURE);
     }
-    queryBiasBuffer = new float[maxSeqLen + 1];
+    bias.reserve(maxSeqLen);
+    fillBiasTable(subMat, aaBiasCorrectionScale, biasTable, biasTableOffsets);
     columnScores = malloc_simd_int(2 * alphabetSize * sizeof(simd_int));
     scoreLo8 = malloc_simd_int(alphabetSize * sizeof(simd_int));
     scoreHi8 = malloc_simd_int(alphabetSize * sizeof(simd_int));
@@ -126,7 +173,6 @@ SwipeAligner::SwipeAligner(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorr
 }
 
 SwipeAligner::~SwipeAligner() {
-    delete[] queryBiasBuffer;
     free(scoreLo8);
     free(scoreHi8);
     free(scoreLo16);
@@ -180,7 +226,7 @@ void SwipeAligner::initQuery(const Sequence *q) {
     queryLength = q->L;
     resize(static_cast<size_t>(queryLength) + 1);
     query.assign(q->numSequence, q->numSequence + queryLength);
-    computeQueryBias(subMat, q, aaBiasCorrection, aaBiasCorrectionScale, queryBiasBuffer, bias);
+    computeQueryBias(subMat, q, aaBiasCorrection, aaBiasCorrectionScale, biasTable, biasTableOffsets, bias);
     int minBias = 0;
     for (int i = 0; i < queryLength; i++) {
         minBias = std::min(minBias, static_cast<int>(bias[i]));
@@ -964,7 +1010,8 @@ SwipeExtender::SwipeExtender(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCo
         Debug(Debug::ERROR) << "SWIPE supports alphabets of at most 32 letters\n";
         EXIT(EXIT_FAILURE);
     }
-    queryBiasBuffer = new float[maxSeqLen + 1];
+    bias.reserve(maxSeqLen);
+    fillBiasTable(subMat, aaBiasCorrectionScale, biasTable, biasTableOffsets);
     scoreRows = new int8_t[32 * 32];
     for (int a = 0; a < 32; a++) {
         for (int t = 0; t < 32; t++) {
@@ -975,7 +1022,6 @@ SwipeExtender::SwipeExtender(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCo
 }
 
 SwipeExtender::~SwipeExtender() {
-    delete[] queryBiasBuffer;
     delete[] scoreRows;
     free(band);
     free(trace);
@@ -986,7 +1032,7 @@ size_t SwipeExtender::addQuery(const Sequence *q) {
     queryLengths.push_back(q->L);
     queries.insert(queries.end(), q->numSequence, q->numSequence + q->L);
     queries.insert(queries.end(), std::reverse_iterator<const unsigned char *>(q->numSequence + q->L), std::reverse_iterator<const unsigned char *>(q->numSequence));
-    computeQueryBias(subMat, q, aaBiasCorrection, aaBiasCorrectionScale, queryBiasBuffer, bias);
+    computeQueryBias(subMat, q, aaBiasCorrection, aaBiasCorrectionScale, biasTable, biasTableOffsets, bias);
     biases.insert(biases.end(), bias.begin(), bias.end());
     biases.insert(biases.end(), bias.rbegin(), bias.rend());
     return queryLengths.size() - 1;

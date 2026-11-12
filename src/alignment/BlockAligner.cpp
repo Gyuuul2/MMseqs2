@@ -391,7 +391,19 @@ unsigned short BlockAligner::computeBestDiagonal(Sequence* currentTarget, int mi
             const int diagonalCount = std::min(DIAG_GROUP, endDiag - d0);
             const int groupDbBegin = std::max(0, -(d0 + DIAG_GROUP - 1));
             const int groupDbEnd = std::min(dbLength, queryLength - d0);
-            // a lane below DIAG_BYTE_SATURATED never saturated, so only the 16 bit vectors of the saturated lanes rerun
+            int8_t groupMaxScore = -128;
+            for (int k = 0; k < diagonalCount; k++) {
+                groupMaxScore = std::max(groupMaxScore, groupMaxScores[k]);
+            }
+            // a lane below DIAG_BYTE_SATURATED never saturated, so the first lane with the group maximum is the best of the group
+            if (groupMaxScore < DIAG_BYTE_SATURATED) {
+                if (groupMaxScore + 128 > maxScore) {
+                    maxScore = groupMaxScore + 128;
+                    maxDiagonal = d0 + (std::find(groupMaxScores, groupMaxScores + diagonalCount, groupMaxScore) - groupMaxScores);
+                }
+                continue;
+            }
+            // only the 16 bit vectors of the saturated lanes rerun, in one pass if there are several
             const int wordLanes = VECSIZE_INT * 2;
             unsigned int saturatedVectors = 0;
             for (int k = 0; k < diagonalCount; k++) {
@@ -400,22 +412,23 @@ unsigned short BlockAligner::computeBestDiagonal(Sequence* currentTarget, int mi
                     saturatedVectors |= 1u << (k / wordLanes);
                 }
             }
-            const bool saturated = (saturatedVectors != 0);
-            if (saturated) {
-                if (isDiagWordProfileStale) {
-                    std::copy(diagProfileByte, diagProfileByte + subMat->alphabetSize * diagProfileStride, diagProfileWord);
-                    isDiagWordProfileStale = false;
-                }
-                for (int c = 0; (saturatedVectors >> c) != 0; c++) {
-                    if ((saturatedVectors >> c) & 1) {
-                        computeDiagonalMaxScores<int16_t, 1>(diagProfileWord + 2 * DIAG_GROUP + d0 + c * wordLanes, dbSequence, diagProfileStride,
-                                                  groupDbBegin, groupDbEnd, maxScoresWord + c * wordLanes);
-                    }
+            if (isDiagWordProfileStale) {
+                std::copy(diagProfileByte, diagProfileByte + subMat->alphabetSize * diagProfileStride, diagProfileWord);
+                isDiagWordProfileStale = false;
+            }
+            if ((saturatedVectors & (saturatedVectors - 1)) != 0) {
+                computeDiagonalMaxScores<int16_t>(diagProfileWord + 2 * DIAG_GROUP + d0, dbSequence, diagProfileStride, groupDbBegin, groupDbEnd, maxScoresWord);
+                saturatedVectors = 0;
+            }
+            for (int c = 0; (saturatedVectors >> c) != 0; c++) {
+                if ((saturatedVectors >> c) & 1) {
+                    computeDiagonalMaxScores<int16_t, 1>(diagProfileWord + 2 * DIAG_GROUP + d0 + c * wordLanes, dbSequence, diagProfileStride,
+                                              groupDbBegin, groupDbEnd, maxScoresWord + c * wordLanes);
                 }
             }
             for (int k = 0; k < diagonalCount; k++) {
                 int64_t score = static_cast<int>(maxScoresWord[k]) + 32768;
-                if (saturated && maxScoresWord[k] >= DIAG_WORD_SATURATED) {
+                if (maxScoresWord[k] >= DIAG_WORD_SATURATED) {
                     const int tailBegin = groupDbBegin + (groupDbEnd - groupDbBegin) / DIAG_MAX_STEP * DIAG_MAX_STEP;
                     int64_t wideScore = 0;
                     score = 0;
