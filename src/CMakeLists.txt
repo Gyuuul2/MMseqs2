@@ -249,6 +249,18 @@ else ()
 endif ()
 endif ()
 
+# S3 backend: libcurl and the OpenSSL crypto library
+find_package(CURL QUIET)
+find_package(OpenSSL QUIET COMPONENTS Crypto)
+if (CURL_FOUND AND OPENSSL_FOUND)
+    message("-- Found CURL and OpenSSL crypto, S3 backend works")
+    target_include_directories(mmseqs-framework PUBLIC ${CURL_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
+    target_compile_definitions(mmseqs-framework PUBLIC -DHAVE_S3=1)
+    target_link_libraries(mmseqs-framework ${CURL_LIBRARIES} ${OPENSSL_CRYPTO_LIBRARY})
+else ()
+    message("-- Could not find CURL and OpenSSL crypto, no S3 backend")
+endif ()
+
 # MPI
 if (HAVE_MPI)
     find_package(MPI REQUIRED)

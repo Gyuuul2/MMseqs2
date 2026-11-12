@@ -30,6 +30,7 @@ set(commons_header_files
         commons/MemoryTracker.h
         commons/MMseqsMPI.h
         commons/MMseqsNode.h
+        commons/S3Client.h
         commons/MultiParam.h
         commons/NucleotideMatrix.h
         commons/Orf.h
@@ -73,6 +74,7 @@ set(commons_source_files
         commons/MemoryTracker.cpp
         commons/MMseqsMPI.cpp
         commons/MMseqsNode.cpp
+        commons/S3Client.cpp
         commons/MultiParam.cpp
         commons/NucleotideMatrix.cpp
         commons/Orf.cpp

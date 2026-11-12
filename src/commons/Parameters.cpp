@@ -6,6 +6,7 @@
 #include "ByteParser.h"
 #include "FileUtil.h"
 #include "MMseqsNode.h"
+#include "S3Client.h"
 
 #include <map>
 #include <iomanip>
@@ -73,6 +74,8 @@ Parameters::Parameters():
         PARAM_SPACED_KMER_PATTERN(PARAM_SPACED_KMER_PATTERN_ID, "--spaced-kmer-pattern", "Spaced k-mer pattern", "User-specified spaced k-mer pattern", typeid(std::string), (void *) &spacedKmerPattern, "^1[01]*1$", MMseqsParameter::COMMAND_PREFILTER | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LOCAL_TMP(PARAM_LOCAL_TMP_ID, "--local-tmp", "Local temporary path", "Path on node-local flash for some temporary files. Linfinity createdb spools the sent sequences there, align2clust copies the sequence blocks it serves and kmermatcher writes its last exchange file groups there before it copies them to the shared folder", typeid(std::string), (void *) &localTmp, "", MMseqsParameter::COMMAND_PREFILTER | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LOCAL_TMP_FALLBACK(PARAM_LOCAL_TMP_FALLBACK_ID, "--local-tmp-fallback", "Local temporary path fallback", "What linfinity align2clust does when it cannot copy its served sequence blocks to --local-tmp: it is not node-local flash, is on the device of the database or has too little free space\n0: stop with an error\n1: warn and read them from the shared folder instead", typeid(bool), (void *) &localTmpFallback, "", MMseqsParameter::COMMAND_EXPERT),
+        PARAM_BACKEND(PARAM_BACKEND_ID, "--backend", "Storage backend", "How the nodes of linfinity steps share files\nposix: a folder that all nodes mount\naws: an S3 bucket (--aws-bucket), each node keeps its own files in its own folder", typeid(std::string), (void *) &backend, "^(posix|aws)$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_AWS_BUCKET(PARAM_AWS_BUCKET_ID, "--aws-bucket", "AWS bucket", "S3 bucket[/prefix] of --backend aws, giving it selects that backend. The objects go below <prefix>/<run id>, the run id is MMSEQS_RUN_ID or else SLURM_JOB_ID. AWS_REGION, AWS_ENDPOINT_URL and the credentials come from the environment or AWS_SHARED_CREDENTIALS_FILE", typeid(std::string), (void *) &awsBucket, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         // alignment
         PARAM_ALIGNMENT_MODE(PARAM_ALIGNMENT_MODE_ID, "--alignment-mode", "Alignment mode", "How to compute the alignment:\n0: automatic\n1: only score and end_pos\n2: also start_pos and cov\n3: also seq.id\n4: only ungapped alignment", typeid(int), (void *) &alignmentMode, "^[0-5]{1}$", MMseqsParameter::COMMAND_ALIGN),
         PARAM_ALIGNMENT_OUTPUT_MODE(PARAM_ALIGNMENT_OUTPUT_MODE_ID, "--alignment-output-mode", "Alignment mode", "How to compute the alignment:\n0: automatic\n1: only score and end_pos\n2: also start_pos and cov\n3: also seq.id\n4: only ungapped alignment\n5: score only (output) cluster format", typeid(int), (void *) &alignmentOutputMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_ALIGN),
@@ -392,6 +395,8 @@ Parameters::Parameters():
     mergeclusters.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     mergeclusters.push_back(&PARAM_THREADS);
     mergeclusters.push_back(&PARAM_COMPRESSED);
+    mergeclusters.push_back(&PARAM_BACKEND);
+    mergeclusters.push_back(&PARAM_AWS_BUCKET);
     mergeclusters.push_back(&PARAM_V);
 
     // createclusearchdb
@@ -484,6 +489,8 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     align2clust.push_back(&PARAM_THREADS);
     align2clust.push_back(&PARAM_COMPRESSED);
+    align2clust.push_back(&PARAM_BACKEND);
+    align2clust.push_back(&PARAM_AWS_BUCKET);
     align2clust.push_back(&PARAM_V);
     align2clust.push_back(&PARAM_CLUSTER_MODE);
     align2clust.push_back(&PARAM_FILTER_CLUDB_FILE);
@@ -677,6 +684,8 @@ Parameters::Parameters():
     createtsv.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     createtsv.push_back(&PARAM_THREADS);
     createtsv.push_back(&PARAM_COMPRESSED);
+    createtsv.push_back(&PARAM_BACKEND);
+    createtsv.push_back(&PARAM_AWS_BUCKET);
     createtsv.push_back(&PARAM_V);
 
     //result2stats
@@ -939,6 +948,8 @@ Parameters::Parameters():
     createdb.push_back(&PARAM_MASK_LOWER_CASE);
     createdb.push_back(&PARAM_MASK_N_REPEAT);
     createdb.push_back(&PARAM_GPU);
+    createdb.push_back(&PARAM_BACKEND);
+    createdb.push_back(&PARAM_AWS_BUCKET);
     createdb.push_back(&PARAM_V);
 
     // makepaddedseqdb
@@ -960,6 +971,8 @@ Parameters::Parameters():
     result2flat.push_back(&PARAM_USE_HEADER);
     result2flat.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     result2flat.push_back(&PARAM_THREADS);
+    result2flat.push_back(&PARAM_BACKEND);
+    result2flat.push_back(&PARAM_AWS_BUCKET);
     result2flat.push_back(&PARAM_V);
 
     // result2repseq
@@ -1120,6 +1133,8 @@ Parameters::Parameters():
 
     clusthashfast = clusthash;
     clusthashfast.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    clusthashfast.push_back(&PARAM_BACKEND);
+    clusthashfast.push_back(&PARAM_AWS_BUCKET);
     // kmermatcher
     kmermatcher.push_back(&PARAM_SUB_MAT);
     kmermatcher.push_back(&PARAM_ALPH_SIZE);
@@ -1144,6 +1159,8 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_IGNORE_MULTI_KMER);
     kmermatcher.push_back(&PARAM_THREADS);
     kmermatcher.push_back(&PARAM_COMPRESSED);
+    kmermatcher.push_back(&PARAM_BACKEND);
+    kmermatcher.push_back(&PARAM_AWS_BUCKET);
     kmermatcher.push_back(&PARAM_V);
     kmermatcher.push_back(&PARAM_WEIGHT_FILE);
     kmermatcher.push_back(&PARAM_WEIGHT_THR);
@@ -1311,6 +1328,8 @@ Parameters::Parameters():
     createsubdb.push_back(&PARAM_SUBDB_MODE);
     createsubdb.push_back(&PARAM_ID_MODE);
     createsubdb.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+    createsubdb.push_back(&PARAM_BACKEND);
+    createsubdb.push_back(&PARAM_AWS_BUCKET);
     createsubdb.push_back(&PARAM_V);
 
     // renamedbkeys
@@ -2322,6 +2341,34 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
 
     initMatrices();
 
+    if (awsBucket.empty() == false) {
+        backend = "aws";
+    }
+    if (backend == "aws") {
+        const char *runId = getenv("MMSEQS_RUN_ID");
+        if (runId == NULL || *runId == '\0') {
+            runId = getenv("SLURM_JOB_ID");
+        }
+        if (awsBucket.empty() || runId == NULL || *runId == '\0') {
+            Debug(Debug::ERROR) << "--backend aws needs --aws-bucket and a run id that all steps of the run share in MMSEQS_RUN_ID or SLURM_JOB_ID\n";
+            EXIT(EXIT_FAILURE);
+        }
+        S3Client::init(awsBucket, runId);
+        // no shared folder: each node keeps the directories of the run
+        for (size_t i = 0; i < filenames.size(); i++) {
+            std::string dir = FileUtil::dirName(filenames[i]);
+            for (size_t pos = dir.find('/', 1); filenames[i].find("://") == std::string::npos && FileUtil::directoryExists(dir.c_str()) == false; pos = dir.find('/', pos + 1)) {
+                FileUtil::makeDir(dir.substr(0, pos).c_str());
+                if (pos == std::string::npos) {
+                    break;
+                }
+            }
+        }
+    } else if (backend != "posix") {
+        Debug(Debug::ERROR) << "--backend must be posix or aws\n";
+        EXIT(EXIT_FAILURE);
+    }
+
     if (ignorePathCountChecks == false) {
         checkIfDatabaseIsValid(command, argc, pargv, isStartVar, isMiddleVar, isEndVar);
     }
@@ -2569,6 +2616,8 @@ void Parameters::setDefaults() {
     spacedKmerPattern = "";
     localTmp = "";
     localTmpFallback = true;
+    backend = "posix";
+    awsBucket = "";
 
     // search workflow
     numIterations = 1;

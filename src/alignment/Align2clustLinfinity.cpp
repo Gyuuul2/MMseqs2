@@ -5090,14 +5090,22 @@ static std::string getLocalTmpProblem(const Parameters &par) {
     return isDbDevice ? "it is on the device of the database" : "";
 }
 
-static uint64_t *readSingletonBits(FILE *assignedHandle, const std::string &assignedBits, size_t firstKey, size_t keyCount) {
+// the log of the master, read by the other nodes from S3 in aws mode
+static uint64_t *readSingletonBits(const std::string &assignedBits, size_t firstKey, size_t keyCount) {
     size_t words = (keyCount + 63) / 64;
-    std::vector<uint64_t> assignedWords(words + 1, 0);
-    MMseqsNode::readKeyBits(fileno(assignedHandle), assignedBits, 0, 0, firstKey, firstKey + keyCount, firstKey, assignedWords.data());
+    size_t firstWord = firstKey / 64;
+    size_t logWords = (keyCount > 0) ? (firstKey + keyCount - 1) / 64 + 1 - firstWord : 0;
+    std::vector<uint64_t> assignedWords(logWords + 1, 0);
+    MMseqsNode::readLog(assignedBits, firstWord * sizeof(uint64_t), (firstWord + logWords) * sizeof(uint64_t), (char *) assignedWords.data());
     uint64_t *bits = new(std::nothrow) uint64_t[words];
     Util::checkAllocation(bits, "Can not allocate singletonBits memory in align2clust");
+    size_t shift = firstKey % 64;
     for (size_t word = 0; word < words; word++) {
-        bits[word] = ~assignedWords[word];
+        uint64_t assigned = (assignedWords[word] >> shift) | ((shift > 0) ? assignedWords[word + 1] << (64 - shift) : 0);
+        if (word + 1 == words && keyCount % 64 != 0) {
+            assigned &= (1ULL << (keyCount % 64)) - 1;
+        }
+        bits[word] = ~assigned;
     }
     return bits;
 }
@@ -5709,13 +5717,11 @@ int align2clustLinfinity(Parameters &par) {
     }
     // write the clusters and, without bits, the singletons
     uint64_t *singletonBits = NULL;
-    FILE *assignedHandle = NULL;
     if (assignedBits.empty() == false) {
         size_t assignedKey;
         size_t assignedSize;
         MMseqsNode::waitForLog(assignedBits, assignedKey, assignedSize);
-        assignedHandle = FileUtil::openFileOrDie(assignedBits.c_str(), "r", true);
-        singletonBits = readSingletonBits(assignedHandle, assignedBits, nodeFirstKey, nodeKeys);
+        singletonBits = readSingletonBits(assignedBits, nodeFirstKey, nodeKeys);
     }
     const std::string clusterPairsIndex = clusterPairWriter.close(singletonBits, nodeFirstKey, nodeKeys);
     // every node has read the sequences that this node requested and served
@@ -5743,13 +5749,9 @@ int align2clustLinfinity(Parameters &par) {
     // write the representatives of the balanced keys and their singletons
     const size_t repFirstKey = balancedKeyOffsets[MMseqsNode::rank];
     const size_t repKeyCount = balancedKeyOffsets[MMseqsNode::rank + 1] - repFirstKey;
-    if (assignedHandle != NULL) {
+    if (assignedBits.empty() == false) {
         delete[] singletonBits;
-        singletonBits = readSingletonBits(assignedHandle, assignedBits, repFirstKey, repKeyCount);
-        if (fclose(assignedHandle) != 0) {
-            Debug(Debug::ERROR) << "Cannot close " << assignedBits << "\n";
-            EXIT(EXIT_FAILURE);
-        }
+        singletonBits = readSingletonBits(assignedBits, repFirstKey, repKeyCount);
     }
     MMseqsNode::writeClusterPairs(clusterPairsIndex, clusterPairs, par.db3, singletonBits, repFirstKey, repKeyCount);
     delete[] singletonBits;

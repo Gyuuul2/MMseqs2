@@ -8,6 +8,7 @@
 #include "itoa.h"
 #include "Timer.h"
 #include "BatchReader.h"
+#include "S3Client.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -16,6 +17,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <map>
+#include <mutex>
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -113,6 +115,12 @@ static int openListedFile(const std::string &file, int flags = O_RDONLY) {
 
 // NFS caches a missing name, so poll on an empty file
 static std::string readPolledFile(const std::string &file) {
+    // aws backend: a missing object is not there yet
+    if (S3Client::isEnabled()) {
+        std::string content;
+        S3Client::get(S3Client::getObjectName(file), content);
+        return content;
+    }
     int flags = FileUtil::needsDirectoryRefresh(file) ? (O_RDONLY | O_CREAT) : O_RDONLY;
     int fd = openFile(file, flags);
     int openError = (fd < 0) ? errno : 0;
@@ -178,6 +186,14 @@ static void sleepInWait(unsigned int polls) {
 }
 
 std::string MMseqsNode::readFile(const std::string &file) {
+    if (S3Client::isEnabled() && FileUtil::fileExists(file.c_str()) == false) {
+        std::string content;
+        if (S3Client::get(S3Client::getObjectName(file), content) == false) {
+            Debug(Debug::ERROR) << "Cannot find " << file << " on this node or in S3\n";
+            EXIT(EXIT_FAILURE);
+        }
+        return content;
+    }
     return FileUtil::readFile(file);
 }
 
@@ -202,7 +218,22 @@ bool MMseqsNode::readRunFile(const std::string &file, std::string &content) {
 }
 
 void MMseqsNode::publishRunFile(const std::string &file, const std::string &content) {
-    publishFile(file, runId + content);
+    std::string runContent = runId + content;
+    publishFile(file, runContent);
+    if (S3Client::isEnabled()) {
+        S3Client::put(S3Client::getObjectName(file), runContent.data(), runContent.size());
+    }
+}
+
+// aws backend: only the node that published a run file has a local copy
+static void removeRunFile(const std::string &file) {
+    if (S3Client::isEnabled()) {
+        S3Client::remove(S3Client::getObjectName(file));
+        if (FileUtil::fileExists(file.c_str()) == false) {
+            return;
+        }
+    }
+    FileUtil::remove(file.c_str());
 }
 
 void MMseqsNode::waitForRunFilesChange(const std::string &prefix, std::string &content) {
@@ -243,7 +274,7 @@ std::string MMseqsNode::gatherRunFiles(const std::string &prefix) {
     for (unsigned int node = 0; node < count; node++) {
         std::string file = prefix + SSTR(node);
         nodeContents[node] = waitForRunFile(file);
-        FileUtil::remove(file.c_str());
+        removeRunFile(file);
     }
     std::string content;
     for (unsigned int node = 0; node < count; node++) {
@@ -252,12 +283,32 @@ std::string MMseqsNode::gatherRunFiles(const std::string &prefix) {
     return content;
 }
 
+// aws backend: the bytes of a publish are the object <log>.<n>, the progress has the count of these chunks
+static std::mutex logMutex;
+static std::map<std::string, std::pair<size_t, size_t> > publishedLogs;
+static std::map<std::string, std::vector<size_t> > logChunkEnds;
+
 void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t claimsSize, size_t homeWindow) {
     if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
         Debug(Debug::ERROR) << "Cannot flush " << log << "\n";
         EXIT(EXIT_FAILURE);
     }
-    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(size) + "\t" + SSTR(claimsSize) + "\t" + SSTR(homeWindow) + "\n");
+    std::string chunks;
+    if (S3Client::isEnabled()) {
+        std::pair<size_t, size_t> published;
+        {
+            std::lock_guard<std::mutex> lock(logMutex);
+            published = publishedLogs[log];
+        }
+        if (size > published.second) {
+            S3Client::putFile(S3Client::getObjectName(log) + "." + SSTR(published.first), log, published.second, size - published.second);
+            published = std::make_pair(published.first + 1, size);
+            std::lock_guard<std::mutex> lock(logMutex);
+            publishedLogs[log] = published;
+        }
+        chunks = "\t" + SSTR(published.first);
+    }
+    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(size) + "\t" + SSTR(claimsSize) + "\t" + SSTR(homeWindow) + chunks + "\n");
 }
 
 bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &size, size_t *claimsSize, size_t *homeWindow) {
@@ -290,10 +341,52 @@ void MMseqsNode::waitForLog(const std::string &log, size_t &key, size_t &size) {
     }
 }
 
+// the chunks exist once a progress counts them; a reader learns the chunk sizes once
+static void readLogChunks(const std::string &log, size_t from, size_t to, char *data) {
+    const std::string object = S3Client::getObjectName(log);
+    while (from < to) {
+        size_t chunk;
+        size_t chunkBegin;
+        size_t chunkEnd = SIZE_MAX;
+        {
+            std::lock_guard<std::mutex> lock(logMutex);
+            const std::vector<size_t> &ends = logChunkEnds[log];
+            chunk = std::upper_bound(ends.begin(), ends.end(), from) - ends.begin();
+            chunkBegin = (chunk > 0) ? ends[chunk - 1] : 0;
+            if (chunk < ends.size()) {
+                chunkEnd = ends[chunk];
+            }
+        }
+        std::string chunkObject = object + "." + SSTR(chunk);
+        if (chunkEnd == SIZE_MAX) {
+            chunkEnd = chunkBegin + S3Client::getSize(chunkObject);
+            std::lock_guard<std::mutex> lock(logMutex);
+            std::vector<size_t> &ends = logChunkEnds[log];
+            if (ends.size() == chunk) {
+                ends.push_back(chunkEnd);
+            }
+            continue;
+        }
+        size_t size = std::min(to, chunkEnd) - from;
+        S3Client::getRange(chunkObject, from - chunkBegin, size, data);
+        data += size;
+        from += size;
+    }
+}
+
 bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *data, bool wait) {
     size_t size = to - from;
     if (size == 0) {
         return true;
+    }
+    // aws backend: a log of this node from the local file
+    if (S3Client::isEnabled()) {
+        std::unique_lock<std::mutex> lock(logMutex);
+        if (publishedLogs.find(log) == publishedLogs.end()) {
+            lock.unlock();
+            readLogChunks(log, from, to, data);
+            return true;
+        }
     }
     // NFS can expose the progress before the log
     for (unsigned int polls = 0; polls < MAX_READ_POLLS; polls++) {
@@ -326,6 +419,25 @@ bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
 }
 
 void MMseqsNode::removeLog(const std::string &log) {
+    if (S3Client::isEnabled()) {
+        std::string progress = readPolledFile(log + ".progress");
+        const char *columns[5];
+        size_t chunks = (progress.compare(0, runId.size(), runId) == 0 && Util::getWordsOfLine((char *) progress.c_str() + runId.size(), columns, 5) == 5)
+                        ? Util::fast_atoi<size_t>(columns[4]) : 0;
+        const std::string object = S3Client::getObjectName(log);
+#pragma omp parallel for schedule(dynamic, 1)
+        for (size_t i = 0; i < chunks; i++) {
+            S3Client::remove(object + "." + SSTR(i));
+        }
+        removeRunFile(log + ".progress");
+        if (FileUtil::fileExists(log.c_str())) {
+            FileUtil::remove(log.c_str());
+        }
+        std::lock_guard<std::mutex> lock(logMutex);
+        publishedLogs.erase(log);
+        logChunkEnds.erase(log);
+        return;
+    }
     FileUtil::remove(log.c_str());
     FileUtil::remove((log + ".progress").c_str());
 }
@@ -363,10 +475,31 @@ void MMseqsNode::publishExchangeFile(FILE *file, const std::string &fileName, si
         Debug(Debug::ERROR) << "Cannot write " << indexFile << "\n";
         EXIT(EXIT_FAILURE);
     }
+    // aws backend: line n of an index is the object <index>.<n>
+    if (S3Client::isEnabled()) {
+        std::vector<uint64_t> words(line.begin(), line.end() - 1);
+        words.push_back(magic);
+        S3Client::put(S3Client::getObjectName(indexFile) + "." + SSTR(line[0]), (const char *) words.data(), words.size() * sizeof(uint64_t));
+    }
 }
 
 size_t MMseqsNode::readExchangeIndexLines(const std::string &indexFile, size_t firstLine, size_t lineWords, std::vector<uint64_t> &lines) {
     size_t lineSize = lineWords * sizeof(uint64_t);
+    if (S3Client::isEnabled()) {
+        const std::string object = S3Client::getObjectName(indexFile);
+        size_t lineCount = 0;
+        for (std::string line; (lineCount + 1) * lineWords <= lines.size(); lineCount++) {
+            __sync_fetch_and_add(&exchangeIndexOpenCount, 1);
+            if (S3Client::get(object + "." + SSTR(firstLine + lineCount), line) == false || line.size() != lineSize) {
+                break;
+            }
+            memcpy(lines.data() + lineCount * lineWords, line.data(), lineSize);
+            if (lines[lineCount * lineWords] != firstLine + lineCount || lines[(lineCount + 1) * lineWords - 1] != getExchangeFileMagic()) {
+                break;
+            }
+        }
+        return lineCount;
+    }
     int fd = openListedFile(indexFile);
     __sync_fetch_and_add(&exchangeIndexOpenCount, 1);
     int openError = (fd < 0) ? errno : 0;
@@ -511,14 +644,14 @@ void MMseqsNode::removeOnceRead(const std::string &file) {
     publishRunFile(file + ".read." + SSTR(rank), "");
     if (isMaster()) {
         gatherRunFiles(file + ".read.");
-        FileUtil::remove(file.c_str());
+        removeRunFile(file);
     }
 }
 
 std::string MMseqsNode::barrier(const std::string &file, const std::string &content) {
-    publishFile(file + "." + SSTR(rank), runId + content);
+    publishRunFile(file + "." + SSTR(rank), content);
     if (isMaster()) {
-        publishFile(file, runId + gatherRunFiles(file + "."));
+        publishRunFile(file, gatherRunFiles(file + "."));
     }
     return waitForRunFile(file);
 }
@@ -564,8 +697,23 @@ MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : na
     }
 }
 
+// unique to this process
+static std::string getClaimNonce() {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    char host[256] = "";
+    gethostname(host, sizeof(host) - 1);
+    return std::string(host) + "\t" + SSTR(getpid()) + "\t" + SSTR(now.tv_sec) + "." + SSTR(now.tv_nsec) + "\n";
+}
+
 bool MMseqsNode::WorkQueue::takeItem(size_t item) {
     std::string file = name + "." + SSTR(item);
+    // aws backend: the first PUT of a claim wins
+    if (S3Client::isEnabled()) {
+        static const std::string nonce = getClaimNonce();
+        std::string claim = std::string((const char *) &rank, sizeof(rank)) + runId + nonce;
+        return S3Client::putIfAbsent(S3Client::getObjectName(file), claim.data(), claim.size());
+    }
     int fd = open(file.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
     if (fd < 0 && errno == EEXIST) {
         return false;
@@ -602,6 +750,13 @@ size_t MMseqsNode::WorkQueue::takeNextItem() {
 }
 
 void MMseqsNode::WorkQueue::removeTakenItemFiles() {
+    if (S3Client::isEnabled()) {
+#pragma omp parallel for schedule(dynamic, 1)
+        for (size_t item = rank; item < itemCount; item += count) {
+            S3Client::remove(S3Client::getObjectName(name + "." + SSTR(item)));
+        }
+        return;
+    }
     for (size_t item = rank; item < itemCount; item += count) {
         std::string file = name + "." + SSTR(item);
         if (FileUtil::fileExists(file.c_str())) {
@@ -1118,7 +1273,7 @@ std::string MMseqsNode::ClusterPairWriter::close(const uint64_t *singletonBits, 
             for (unsigned int node = 0; node < count; node++) {
                 std::string file = binFile + "." + SSTR(node);
                 std::string nodeBinLines = waitForRunFile(file);
-                FileUtil::remove(file.c_str());
+                removeRunFile(file);
 #pragma omp critical
                 for (size_t bin = 0; bin < bins; bin++) {
                     uint64_t lines;
