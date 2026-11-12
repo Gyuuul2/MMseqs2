@@ -608,6 +608,9 @@ static std::vector<unsigned int> targetSplitAlignNodes;
 // a window belongs to one align group, a node holds the target split table of its own group
 static std::vector<unsigned int> windowAlignGroups;
 static unsigned int alignGroup;
+// the nodes of the align group share its target split table, so only they request sequences from each other
+static size_t alignGroupNodeBegin;
+static size_t alignGroupNodeEnd;
 
 // by target split, without target splits there is one align node
 static size_t getBlockAlignNode(size_t block) {
@@ -3071,8 +3074,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #ifdef OPENMP
             omp_set_num_threads(1);
 #endif
-            // seconds between two reads of the progress file of a node
-            double progressSeconds = std::max(BATCH_READ_SECONDS, 2.0 * (nodes - 1) / PROGRESS_READS_PER_SECOND);
             // own request: code offsets per node, files and keys received per node
             struct SequenceRequest {
                 FetchedSequences *sequences;
@@ -3122,9 +3123,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 std::vector<ServedFile> files;
             };
             std::vector<Requester> requesters(nodes);
+            size_t requesterCount = 0;
             for (unsigned int node = 0; node < nodes; node++) {
-                requesters[node].isDone = node == rank || node < firstAlignNode;
+                requesters[node].isDone = node == rank || node < alignGroupNodeBegin || node >= alignGroupNodeEnd;
+                requesterCount += requesters[node].isDone == false;
             }
+            // seconds between two reads of the progress file of a node
+            const double progressSeconds = std::max(BATCH_READ_SECONDS, 2.0 * requesterCount / PROGRESS_READS_PER_SECOND);
             std::vector<const char *> requestColumns(nodes + 3);
             bool isServedProgressChanged = false;
             std::vector<char> receivedEntries;
@@ -5104,6 +5109,8 @@ int align2clustLinfinity(Parameters &par) {
     size_t alignNodeCount = MMseqsNode::count - MMseqsNode::getFirstAlignNode();
     // the first .partitions line holds the target split blocks
     const bool hasTargetSplits = alignNodeCount > 1;
+    alignGroupNodeBegin = MMseqsNode::getFirstAlignNode();
+    alignGroupNodeEnd = MMseqsNode::count;
     std::string partitionsData = MMseqsNode::readFile(par.db2 + ".partitions");
     char *partitionLine = (char *) partitionsData.c_str();
     for (; hasTargetSplits && *partitionLine != '\n'; partitionLine += Util::skipWhitespace(partitionLine)) {
@@ -5267,6 +5274,8 @@ int align2clustLinfinity(Parameters &par) {
             }
         }
         if (alignGroup < alignGroupCount) {
+            alignGroupNodeBegin = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[alignGroup];
+            alignGroupNodeEnd = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[alignGroup + 1];
             MMseqsNode::addPhaseValue(phaseValues, "Align group", SSTR(alignGroup) + " of " + SSTR(alignGroupCount) + " with " + SSTR(groupNodeOffsets[alignGroup + 1] - groupNodeOffsets[alignGroup]) + " nodes, "
                                       + SSTR(std::count(windowAlignGroups.begin(), windowAlignGroups.end(), alignGroup)) + " of " + SSTR(windowAlignGroups.size()) + " windows and "
                                       + SSTR(static_cast<size_t>(groupCosts[alignGroup] * 1000 / std::max((uint128) 1, totalAlignmentCells))) + " per mille of the cost");
