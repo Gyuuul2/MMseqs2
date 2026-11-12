@@ -958,6 +958,53 @@ template <typename T> void DBReader<T>::readIndexPairs(size_t first, size_t last
     FileUtil::preadAll(bufferedFds[dataFileNames.size()], indexFileName, (char *) indexPairs, (last - first) * 2 * sizeof(uint64_t), first * 2 * sizeof(uint64_t));
 }
 
+// read the key of every entryStep-th index entry
+template <typename T> void DBReader<T>::readSampledKeys(size_t entryStep, size_t bufferSize, T *keys, size_t &readSize, size_t &readCount) {
+    size_t pageSize = Util::getPageSize();
+    size_t keyCount = (size + entryStep - 1) / entryStep;
+    std::vector<BatchReader::ReadRequest> readRequests;
+    std::vector<size_t> requestFirstKeys;
+    std::vector<char> buffer;
+    for (size_t first = 0, end = 0; first < keyCount; first = end) {
+        readRequests.clear();
+        requestFirstKeys.clear();
+        size_t bytes = 0;
+        for (; end < keyCount; end++) {
+            size_t begin = end * entryStep * 2 * sizeof(uint64_t);
+            bool isJoined = readRequests.empty() == false && begin - (readRequests.back().fileOffset + readRequests.back().minBytesToRead) <= pageSize;
+            size_t requestBegin = isJoined ? readRequests.back().fileOffset : begin / pageSize * pageSize;
+            size_t requestBytes = (begin + sizeof(uint64_t) + pageSize - 1) / pageSize * pageSize - requestBegin;
+            size_t nextBytes = bytes + requestBytes - (isJoined ? readRequests.back().bytesToRead : 0);
+            if (end > first && nextBytes > bufferSize) {
+                break;
+            }
+            if (isJoined == false) {
+                BatchReader::ReadRequest request = { bufferedFds[dataFileNames.size()], indexFileName, NULL, requestBegin, 0, 0 };
+                readRequests.push_back(request);
+                requestFirstKeys.push_back(end);
+            }
+            readRequests.back().minBytesToRead = begin + sizeof(uint64_t) - requestBegin;
+            readRequests.back().bytesToRead = requestBytes;
+            bytes = nextBytes;
+        }
+        buffer.resize(bytes);
+        for (size_t i = 0, offset = 0; i < readRequests.size(); offset += readRequests[i].bytesToRead, i++) {
+            readRequests[i].destination = buffer.data() + offset;
+        }
+        batchReader->readSync(readRequests);
+        for (size_t i = 0; i < readRequests.size(); i++) {
+            for (size_t key = requestFirstKeys[i]; key < ((i + 1 < readRequests.size()) ? requestFirstKeys[i + 1] : end); key++) {
+                uint64_t indexKey;
+                memcpy(&indexKey, readRequests[i].destination + key * entryStep * 2 * sizeof(uint64_t) - readRequests[i].fileOffset, sizeof(uint64_t));
+                keys[key] = T();
+                keys[key] += indexKey;
+            }
+        }
+        readSize += bytes;
+        readCount += readRequests.size();
+    }
+}
+
 template <typename T> void DBReader<T>::readData(size_t offset, size_t bytes, char *destination) {
     BatchReader::ReadRequest request = { bufferedFds[0], dataFileNames[0].c_str(), destination, offset, bytes, bytes };
     batchReader->readSync(std::vector<BatchReader::ReadRequest>(1, request));
@@ -1475,8 +1522,16 @@ template <typename T> void DBReader<T>::decompressLoadedBuffer() {
 }
 
 template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key) {
+    LoadedBufferCursor cursor;
+    return getDataFromLoadedBuffer(key, cursor);
+}
+
+template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key, LoadedBufferCursor &cursor) {
     if (batchReader != NULL && key < size) {
-        size_t range = findIdRange(key);
+        size_t &range = cursor.range;
+        if (range >= indexSize || key < indexIdToNum(&index[range].id) || (range + 1 < indexSize && indexIdToNum(&index[range + 1].id) <= key)) {
+            range = findIdRange(key);
+        }
         size_t fileOffset = index[range].offset + (key - indexIdToNum(&index[range].id)) * index[range].length;
         size_t length = index[range].length;
         if (entryOffsetsFileNames.empty() == false) {
@@ -1485,16 +1540,25 @@ template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key) {
             length = loadedBuffer.entryOffsets[pos + 1] - fileOffset;
         }
         if (cachedBlocks.empty() == false) {
-            size_t block = getKeyBlock(key);
-            const std::map<size_t, BatchReader::ReadRequest>::const_iterator cached = cachedBlocks.find(block);
-            if (cached != cachedBlocks.end()) {
-                return cached->second.destination + (fileOffset - cached->second.fileOffset);
+            if (cursor.block == SIZE_MAX || key < blockKeyOffsets[cursor.block] || key >= blockKeyOffsets[cursor.block + 1]) {
+                cursor.block = getKeyBlock(key);
+                const std::map<size_t, BatchReader::ReadRequest>::const_iterator cached = cachedBlocks.find(cursor.block);
+                cursor.cachedBlock = (cached != cachedBlocks.end()) ? &cached->second : NULL;
+            }
+            if (cursor.cachedBlock != NULL) {
+                return cursor.cachedBlock->destination + (fileOffset - cursor.cachedBlock->fileOffset);
             }
         }
         const std::vector<int> &fds = loadedBuffer.isKeyLoad ? bufferedFds : dataFds;
         int fd = fds[index2dbfile[range]];
         const std::vector<size_t> &firstKeys = loadedBuffer.requestFirstKeys;
-        size_t requestEnd = std::upper_bound(firstKeys.begin(), firstKeys.end(), key) - firstKeys.begin();
+        size_t &requestEnd = cursor.requestEnd;
+        if (requestEnd < firstKeys.size() && firstKeys[requestEnd] <= key) {
+            requestEnd++;
+        }
+        if (requestEnd > firstKeys.size() || (requestEnd > 0 && firstKeys[requestEnd - 1] > key) || (requestEnd < firstKeys.size() && firstKeys[requestEnd] <= key)) {
+            requestEnd = std::upper_bound(firstKeys.begin(), firstKeys.end(), key) - firstKeys.begin();
+        }
         if (requestEnd > 0) {
             const BatchReader::ReadRequest &request = loadedBuffer.readRequests[requestEnd - 1];
             if (request.fileToRead == fd && fileOffset >= request.fileOffset && fileOffset + length <= request.fileOffset + request.minBytesToRead) {
@@ -1861,10 +1925,12 @@ void DBReader<T>::moveDb(const std::string &srcDbName, const std::string &dstDbN
 template<typename T>
 void DBReader<T>::removeDb(const std::string &databaseName){
     std::vector<std::string> files = FileUtil::findDatafiles(databaseName.c_str());
+#pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < files.size(); ++i) {
         FileUtil::remove(files[i].c_str());
     }
     std::vector<std::string> indexFiles = FileUtil::findDatafiles((databaseName + ".index").c_str());
+#pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < indexFiles.size(); ++i) {
         FileUtil::remove(indexFiles[i].c_str());
     }
@@ -1872,6 +1938,7 @@ void DBReader<T>::removeDb(const std::string &databaseName){
         FileUtil::remove((databaseName + ".index").c_str());
     }
     std::vector<std::string> bitsFiles = FileUtil::findDatafiles((databaseName + ".bits").c_str());
+#pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < bitsFiles.size(); ++i) {
         FileUtil::remove(bitsFiles[i].c_str());
     }

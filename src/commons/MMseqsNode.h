@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cmath>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -43,6 +44,17 @@ public:
     static inline bool isMaster() {
         return rank == MASTER;
     }
+    // with two or more nodes the master only clusters
+    static inline unsigned int getFirstAlignNode() {
+        return (count > 1) ? 1 : 0;
+    }
+
+    // align groups of align2clust in target split mode from --align2clust-split, 0 is floor(sqrt(align nodes))
+    static inline size_t getAlignGroupCount(int align2clustSplit) {
+        const size_t alignNodeCount = count - getFirstAlignNode();
+        const size_t groups = (align2clustSplit > 0) ? align2clustSplit : static_cast<size_t>(std::sqrt(static_cast<double>(alignNodeCount)));
+        return std::min(alignNodeCount, std::max((size_t) 1, groups));
+    }
 
     static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
     // a --local-tmp that cannot be used is reported and the run goes on in the shared folder
@@ -63,11 +75,15 @@ public:
     static std::string readFile(const std::string &file);
     static void publishRunFile(const std::string &file, const std::string &content);
     static std::string waitForRunFile(const std::string &file);
+    // false while the file holds no content of this run
+    static bool readRunFile(const std::string &file, std::string &content);
     static void waitForRunFilesChange(const std::string &prefix, std::string &content);
     static std::string gatherRunFiles(const std::string &prefix);
+    // the names in a directory, none if it cannot be opened
+    static void listDirectory(const std::string &directory, std::vector<std::string> &names);
 
-    static void publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t takenItemCount = 0);
-    static bool readLogProgress(const std::string &log, size_t &key, size_t &size, size_t *takenItemCount = NULL);
+    static void publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t claimsSize = 0, size_t homeWindow = 0);
+    static bool readLogProgress(const std::string &log, size_t &key, size_t &size, size_t *claimsSize = NULL, size_t *homeWindow = NULL);
     static void waitForLog(const std::string &log, size_t &key, size_t &size);
     static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true);
     static void removeLog(const std::string &log);
@@ -96,18 +112,13 @@ public:
     public:
         WorkQueue(const std::string &name, size_t itemCount);
         size_t takeNextItem();
-        size_t takeNextItemInOrder();
-        size_t getTakenItemCount() const;
-        unsigned int getNode(size_t item) const;
         void removeTakenItemFiles();
-
-    private:
         bool takeItem(size_t item);
 
+    private:
         const std::string name;
         const size_t itemCount;
         size_t nextItem;
-        size_t nextOrderedItem;
         std::vector<size_t> itemsLeft;
         size_t nextNode;
     };

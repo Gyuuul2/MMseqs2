@@ -618,6 +618,7 @@ public:
     int adjacencyAlphabetSize;
     int diagonalMode;
     int align2clustAlignerMode;
+    int align2clustSplit;
     int alignerMode;
     bool kmerPosFilter;
     bool clustHash;
@@ -993,6 +994,7 @@ public:
     PARAMETER(PARAM_ADJACENCY_ALPH_SIZE)
     PARAMETER(PARAM_DIAGONAL_MODE)
     PARAMETER(PARAM_ALIGN2CLUST_ALIGNER_MODE)
+    PARAMETER(PARAM_ALIGN2CLUST_SPLIT)
     PARAMETER(PARAM_ALIGNER_MODE)
     PARAMETER(PARAM_KMER_POS_FILTER)
     PARAMETER(PARAM_USE_PARALLELISM)

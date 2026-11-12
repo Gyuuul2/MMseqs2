@@ -262,7 +262,7 @@ size_t FileUtil::getFreeSpace(const char *path) {
     }
 
     // the available size is f_bsize * f_bavail
-    return stat.f_bfree * stat.f_frsize;
+    return stat.f_bavail * stat.f_frsize;
 }
 
 

@@ -192,6 +192,15 @@ std::string MMseqsNode::waitForRunFile(const std::string &file) {
     return content.substr(runId.size());
 }
 
+bool MMseqsNode::readRunFile(const std::string &file, std::string &content) {
+    content = readPolledFile(file);
+    if (content.compare(0, runId.size(), runId) != 0) {
+        return false;
+    }
+    content.erase(0, runId.size());
+    return true;
+}
+
 void MMseqsNode::publishRunFile(const std::string &file, const std::string &content) {
     publishFile(file, runId + content);
 }
@@ -215,6 +224,19 @@ void MMseqsNode::waitForRunFilesChange(const std::string &prefix, std::string &c
     }
 }
 
+// opening a directory asks an NFS server for its state
+void MMseqsNode::listDirectory(const std::string &directory, std::vector<std::string> &names) {
+    names.clear();
+    DIR *handle = opendir(directory.c_str());
+    if (handle == NULL) {
+        return;
+    }
+    for (struct dirent *entry; (entry = readdir(handle)) != NULL;) {
+        names.push_back(entry->d_name);
+    }
+    closedir(handle);
+}
+
 std::string MMseqsNode::gatherRunFiles(const std::string &prefix) {
     std::vector<std::string> nodeContents(count);
 #pragma omp parallel for schedule(dynamic, 1)
@@ -230,29 +252,32 @@ std::string MMseqsNode::gatherRunFiles(const std::string &prefix) {
     return content;
 }
 
-void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t takenItemCount) {
+void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t claimsSize, size_t homeWindow) {
     if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
         Debug(Debug::ERROR) << "Cannot flush " << log << "\n";
         EXIT(EXIT_FAILURE);
     }
-    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(size) + "\t" + SSTR(takenItemCount) + "\n");
+    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(size) + "\t" + SSTR(claimsSize) + "\t" + SSTR(homeWindow) + "\n");
 }
 
-bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &size, size_t *takenItemCount) {
+bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &size, size_t *claimsSize, size_t *homeWindow) {
     std::string file = log + ".progress";
     std::string content = readPolledFile(file);
     if (content.compare(0, runId.size(), runId) != 0) {
         return false;
     }
-    const char *columns[3];
-    if (Util::getWordsOfLine((char *) content.c_str() + runId.size(), columns, 3) < 3) {
+    const char *columns[4];
+    if (Util::getWordsOfLine((char *) content.c_str() + runId.size(), columns, 4) < 4) {
         Debug(Debug::ERROR) << "Cannot read " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
     key = Util::fast_atoi<size_t>(columns[0]);
     size = Util::fast_atoi<size_t>(columns[1]);
-    if (takenItemCount != NULL) {
-        *takenItemCount = Util::fast_atoi<size_t>(columns[2]);
+    if (claimsSize != NULL) {
+        *claimsSize = Util::fast_atoi<size_t>(columns[2]);
+    }
+    if (homeWindow != NULL) {
+        *homeWindow = Util::fast_atoi<size_t>(columns[3]);
     }
     return true;
 }
@@ -327,6 +352,10 @@ void MMseqsNode::publishExchangeFile(FILE *file, const std::string &fileName, si
     }
     __sync_fetch_and_add(&sentExchangeSize, size);
     __sync_fetch_and_add(&sentOtherNodeExchangeSize, size);
+    // without an index the reader learns of the file from a run file
+    if (indexFile.empty()) {
+        return;
+    }
     FILE *handle = FileUtil::openFileOrDie(indexFile.c_str(), "a", true);
     uint64_t magic = getExchangeFileMagic();
     if (fwrite(line.data(), sizeof(uint64_t), line.size() - 1, handle) != line.size() - 1
@@ -527,10 +556,10 @@ void MMseqsNode::printPhaseValues(const std::string &values) {
     Debug(Debug::INFO) << output;
 }
 
-MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextItem(rank), nextOrderedItem(0), itemsLeft(count, 0), nextNode((rank + 1) % count) {
-    for (size_t owner = 0; owner < count; owner++) {
-        if (owner != rank && owner < itemCount) {
-            itemsLeft[owner] = (itemCount - 1 - owner) / count + 1;
+MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextItem(rank), itemsLeft(count, 0), nextNode((rank + 1) % count) {
+    for (size_t node = 0; node < count; node++) {
+        if (node != rank && node < itemCount) {
+            itemsLeft[node] = (itemCount - 1 - node) / count + 1;
         }
     }
 }
@@ -556,46 +585,20 @@ size_t MMseqsNode::WorkQueue::takeNextItem() {
         }
     }
     for (size_t emptyNodes = 0; emptyNodes < count;) {
-        size_t owner = nextNode;
+        size_t node = nextNode;
         nextNode = (nextNode + 1) % count;
-        if (itemsLeft[owner] == 0) {
+        if (itemsLeft[node] == 0) {
             emptyNodes++;
             continue;
         }
         emptyNodes = 0;
-        itemsLeft[owner]--;
-        if (takeItem(owner + itemsLeft[owner] * count)) {
-            return owner + itemsLeft[owner] * count;
+        itemsLeft[node]--;
+        if (takeItem(node + itemsLeft[node] * count)) {
+            return node + itemsLeft[node] * count;
         }
-        itemsLeft[owner] = 0;
+        itemsLeft[node] = 0;
     }
     return itemCount;
-}
-
-size_t MMseqsNode::WorkQueue::takeNextItemInOrder() {
-    size_t item = nextOrderedItem;
-    while (item < itemCount && takeItem(item) == false) {
-        item++;
-    }
-    __atomic_store_n(&nextOrderedItem, std::min(item + 1, itemCount), __ATOMIC_RELAXED);
-    return item;
-}
-
-size_t MMseqsNode::WorkQueue::getTakenItemCount() const {
-    return __atomic_load_n(&nextOrderedItem, __ATOMIC_RELAXED);
-}
-
-unsigned int MMseqsNode::WorkQueue::getNode(size_t item) const {
-    unsigned int node = count;
-    std::string file = name + "." + SSTR(item);
-    int fd = openListedFile(file);
-    if (fd >= 0) {
-        if (pread(fd, &node, sizeof(node), 0) != static_cast<ssize_t>(sizeof(node))) {
-            node = count;
-        }
-        close(fd);
-    }
-    return node;
 }
 
 void MMseqsNode::WorkQueue::removeTakenItemFiles() {
@@ -1481,29 +1484,33 @@ std::vector<size_t> MMseqsNode::getClusterKeyOffsets(const std::string &barrierF
 std::vector<size_t> MMseqsNode::getBalancedClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount) {
     if (isMaster()) {
         std::vector<size_t> partOffsets(count + 1, 0);
+#pragma omp parallel for schedule(dynamic, 1)
         for (size_t node = 0; node < count; node++) {
             DBReader<DBKeyType> cluDb((clu + "." + SSTR(node)).c_str(), (clu + ".index." + SSTR(node)).c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
             cluDb.open(DBReader<DBKeyType>::NOSORT);
-            partOffsets[node + 1] = partOffsets[node] + cluDb.getDataSize();
+            partOffsets[node + 1] = cluDb.getDataSize();
             cluDb.close();
         }
-        std::string firstKeys;
-        size_t split = 1;
-        for (size_t node = 0; node < count && split < count; node++) {
-            if (partOffsets[count] * split / count >= partOffsets[node + 1]) {
+        for (size_t node = 0; node < count; node++) {
+            partOffsets[node + 1] += partOffsets[node];
+        }
+        std::vector<size_t> splitFirstKeys(count, keyCount);
+#pragma omp parallel for schedule(dynamic, 1)
+        for (size_t split = 1; split < count; split++) {
+            size_t offset = partOffsets[count] * split / count;
+            size_t node = std::upper_bound(partOffsets.begin(), partOffsets.end(), offset) - partOffsets.begin() - 1;
+            if (node == count) {
                 continue;
             }
             DBReader<DBKeyType> cluDb((clu + "." + SSTR(node)).c_str(), (clu + ".index." + SSTR(node)).c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
             cluDb.open(DBReader<DBKeyType>::NOSORT);
-            for (; split < count && partOffsets[count] * split / count < partOffsets[node + 1]; split++) {
-                size_t entry = cluDb.findEntryByOffset(partOffsets[count] * split / count - partOffsets[node]);
-                size_t firstKey = (entry < cluDb.getSize()) ? static_cast<size_t>(cluDb.getIndexEntry(entry).id) : static_cast<size_t>(cluDb.getIndexEntry(cluDb.getSize() - 1).id) + 1;
-                firstKeys += SSTR(firstKey) + "\n";
-            }
+            size_t entry = cluDb.findEntryByOffset(offset - partOffsets[node]);
+            splitFirstKeys[split] = (entry < cluDb.getSize()) ? static_cast<size_t>(cluDb.getIndexEntry(entry).id) : static_cast<size_t>(cluDb.getIndexEntry(cluDb.getSize() - 1).id) + 1;
             cluDb.close();
         }
-        for (; split < count; split++) {
-            firstKeys += SSTR(keyCount) + "\n";
+        std::string firstKeys;
+        for (size_t split = 1; split < count; split++) {
+            firstKeys += SSTR(splitFirstKeys[split]) + "\n";
         }
         publishRunFile(file, firstKeys);
     }
