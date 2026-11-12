@@ -252,27 +252,30 @@ std::string MMseqsNode::gatherRunFiles(const std::string &prefix) {
     return content;
 }
 
-void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t size) {
+void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t claimsSize) {
     if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
         Debug(Debug::ERROR) << "Cannot flush " << log << "\n";
         EXIT(EXIT_FAILURE);
     }
-    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(size) + "\n");
+    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(size) + "\t" + SSTR(claimsSize) + "\n");
 }
 
-bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &size) {
+bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &size, size_t *claimsSize) {
     std::string file = log + ".progress";
     std::string content = readPolledFile(file);
     if (content.compare(0, runId.size(), runId) != 0) {
         return false;
     }
-    const char *columns[2];
-    if (Util::getWordsOfLine((char *) content.c_str() + runId.size(), columns, 2) < 2) {
+    const char *columns[3];
+    if (Util::getWordsOfLine((char *) content.c_str() + runId.size(), columns, 3) < 3) {
         Debug(Debug::ERROR) << "Cannot read " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
     key = Util::fast_atoi<size_t>(columns[0]);
     size = Util::fast_atoi<size_t>(columns[1]);
+    if (claimsSize != NULL) {
+        *claimsSize = Util::fast_atoi<size_t>(columns[2]);
+    }
     return true;
 }
 

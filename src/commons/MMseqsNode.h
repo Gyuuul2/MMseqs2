@@ -74,8 +74,8 @@ public:
     // the names in a directory, none if it cannot be opened
     static void listDirectory(const std::string &directory, std::vector<std::string> &names);
 
-    static void publishLog(FILE *file, const std::string &log, size_t key, size_t size);
-    static bool readLogProgress(const std::string &log, size_t &key, size_t &size);
+    static void publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t claimsSize = 0);
+    static bool readLogProgress(const std::string &log, size_t &key, size_t &size, size_t *claimsSize = NULL);
     static void waitForLog(const std::string &log, size_t &key, size_t &size);
     static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true);
     static void removeLog(const std::string &log);

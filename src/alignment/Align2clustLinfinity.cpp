@@ -578,6 +578,7 @@ private:
 __extension__ typedef unsigned __int128 uint128;
 
 struct PrefPartition {
+    size_t windowFirstKey;
     size_t prefOffset;
     size_t prefSize;
     size_t alignmentCells;
@@ -722,6 +723,8 @@ static const size_t ALIGN_BATCHES_PER_THREAD = 64;
 static const size_t ALIGN_BATCH_LANES = 16;
 static const int CLUSTER_THREADS = 4;
 static const uint64_t ACCEPTED_REP_BIT = 1ULL << 63;
+// claimed cells file: a claim is window, cell count, target splits; a log start is its claim with this bit, accepted log bytes
+static const uint64_t CLAIM_LOG_BIT = 1ULL << 63;
 
 static size_t getRepOrderKey(uint64_t word) {
     return word & ~ACCEPTED_REP_BIT;
@@ -1676,8 +1679,8 @@ struct TargetSplitPiece {
 // target split mode: join the pieces of a rep entry by entry
 struct TargetSplitReader {
     TargetSplitReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &cells, MMseqsNode::WorkQueue &cellQueue, size_t maxRecordSize, size_t memoryLimit,
-                      size_t paddedDbSize, size_t sizeClassCount)
-        : readSize(0), prefSize(0), homeCellCount(0), stolenCellCount(0), lostCellCount(0), stolenCost(0), takenCost(0), stolenTargetBytes(0), targetBytes(0),
+                      size_t paddedDbSize, size_t sizeClassCount, const std::string &claimedCells)
+        : claimedCellsFile(claimedCells), claimedCellsHandle(NULL), claimedCellsSize(0), publishedClaimedCellsSize(0), startedClaimCount(0), readSize(0), prefSize(0), homeCellCount(0), stolenCellCount(0), lostCellCount(0), stolenCost(0), takenCost(0), stolenTargetBytes(0), targetBytes(0),
           stealShares(MMseqsNode::count, 0), doneRepKeys(MMseqsNode::count, 0), stolenCostSignChanges(0), stealWindowCount(0),
           isClaiming(sizeClassCount == 1 && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()), par(par), seqDbr(seqDbr), cells(cells), cellQueue(cellQueue),
           targetSplitCount(targetSplitBlockOffsets.size() - 1), paddedDbSize(paddedDbSize), sizeClassCount(sizeClassCount),
@@ -1697,6 +1700,42 @@ struct TargetSplitReader {
             prefSize += (targetSplitAlignNodes[cells[i].targetSplit] == MMseqsNode::rank) ? cells[i].prefSize : 0;
         }
         prefOffsets.resize(MMseqsNode::count * targetSplitCount);
+        if (isClaiming && claimedCellsFile.empty() == false) {
+            claimedCellsHandle = FileUtil::openAndDelete(claimedCellsFile.c_str(), "w");
+        }
+    }
+
+    bool hasClaimLog() const {
+        return claimedCellsHandle != NULL;
+    }
+
+    // the accepted pairs from logSize on are of claim
+    void startClaimLog(size_t claim, size_t logSize) {
+        std::lock_guard<std::mutex> lock(claimsMutex);
+        const uint64_t words[2] = { claim | CLAIM_LOG_BIT, logSize };
+        writeClaimWords(words, 2);
+        startedClaimCount = claim + 1;
+    }
+
+    // first key of the windows whose claims have no log start yet
+    size_t getUnstartedClaimKey() {
+        std::lock_guard<std::mutex> lock(claimsMutex);
+        size_t key = SIZE_MAX;
+        for (size_t claim = startedClaimCount; claim < claimWindows.size(); claim++) {
+            key = std::min(key, cells[claimWindows[claim] * targetSplitCount].windowFirstKey);
+        }
+        return key;
+    }
+
+    // sync the claims before the progress that counts them
+    size_t publishClaims() {
+        std::lock_guard<std::mutex> lock(claimsMutex);
+        if (claimedCellsSize > publishedClaimedCellsSize && (fflush(claimedCellsHandle) != 0 || fsync(fileno(claimedCellsHandle)) != 0)) {
+            Debug(Debug::ERROR) << "Cannot flush " << claimedCellsFile << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        publishedClaimedCellsSize = claimedCellsSize;
+        return claimedCellsSize;
     }
 
     // cells per second and master wait so far
@@ -1758,8 +1797,21 @@ struct TargetSplitReader {
 
     void close() {
         closePrefDbs();
+        if (claimedCellsHandle != NULL && fclose(claimedCellsHandle) != 0) {
+            Debug(Debug::ERROR) << "Cannot close " << claimedCellsFile << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        claimedCellsHandle = NULL;
     }
 
+    const std::string claimedCellsFile;
+    FILE *claimedCellsHandle;
+    // the loader claims while the aligning threads start and publish
+    std::mutex claimsMutex;
+    size_t claimedCellsSize;
+    size_t publishedClaimedCellsSize;
+    size_t startedClaimCount;
+    std::vector<size_t> claimWindows;
     size_t readSize;
     size_t prefSize;
     size_t homeCellCount;
@@ -1812,6 +1864,14 @@ private:
     size_t bufferAlignmentCells;
     std::vector<size_t> entryTargetOffsets;
     std::vector<size_t> entryRecordOffsets;
+
+    void writeClaimWords(const uint64_t *words, size_t wordCount) {
+        if (fwrite(words, sizeof(uint64_t), wordCount, claimedCellsHandle) != wordCount) {
+            Debug(Debug::ERROR) << "Cannot write " << claimedCellsFile << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        claimedCellsSize += wordCount * sizeof(uint64_t);
+    }
 
     void openPrefDbs(size_t node) {
         if (node == prefNode) {
@@ -1994,6 +2054,16 @@ private:
                 targetSplitIsStolen.push_back(wasStolen[split]);
                 prefSize += cells[firstCell + split].prefSize;
                 takenCost += cells[firstCell + split].alignmentCells;
+            }
+        }
+        if (splits.empty() == false) {
+            std::lock_guard<std::mutex> lock(claimsMutex);
+            claimWindows.push_back(window);
+            if (claimedCellsHandle != NULL) {
+                std::vector<uint64_t> words(1, window);
+                words.push_back(splits.size());
+                words.insert(words.end(), splits.begin(), splits.end());
+                writeClaimWords(words.data(), words.size());
             }
         }
         // reopen the pref readers for new splits
@@ -2290,8 +2360,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t acceptedSize = 0;
     std::vector<uint64_t> acceptedWords;
     DBKeyType loggedRepOrderKey = DB_KEY_INVALID;
+    // with a claim log, the master confirms by claim: the published key is of the claim whose log started last
+    const bool hasClaimLog = targetSplitReader != NULL && targetSplitReader->hasClaimLog();
+    size_t publishedRepKey = 0;
     const auto publishAccepted = [&](size_t repKey, size_t bytes) {
-        MMseqsNode::publishLog(acceptedHandle, acceptedFile, repKey, bytes);
+        const size_t claimsSize = hasClaimLog ? targetSplitReader->publishClaims() : 0;
+        MMseqsNode::publishLog(acceptedHandle, acceptedFile, repKey, bytes, claimsSize);
+        __atomic_store_n(&publishedRepKey, repKey, __ATOMIC_RELAXED);
     };
 
     // assigned bits of the served and aligned keys, by page
@@ -2376,6 +2451,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<RepTargetsRecord> prefilterRecords[3];
     std::vector<DBKeyType> prefilterTargets[3];
     size_t prefilterRecordPos[3] = { 0, 0, 0 };
+    // the last claim of a buffer
+    size_t prefilterBufferClaims[3] = { 0, 0, 0 };
+    size_t alignedClaim = SIZE_MAX;
     size_t prefilterBuffer = 0;
     std::mutex prefilterBufferMutex;
     std::condition_variable prefilterBufferCondition;
@@ -2681,6 +2759,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         if (targetSplitReader != NULL) {
             targetSplitReader->setWindowWork(alignedCellsPerSecond.load(), masterWaitSeconds.load());
             targetSplitReader->fillPrefilterBuffer(prefilterRecords[buffer], prefilterTargets[buffer], maxFetchSize, maxBufferAlignmentCells);
+            prefilterBufferClaims[buffer] = targetSplitReader->claimWindows.size() - 1;
         } else {
             repTargetsReader.fillPrefilterBuffer(prefilterRecords[buffer], prefilterTargets[buffer], maxFetchSize, maxBufferAlignmentCells);
         }
@@ -2711,6 +2790,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
     });
     selectRecordKeys(currentSequences, nextSequences);
+    // the fetches before sequences are aligned; without member checks their pairs are logged
+    const auto startClaim = [&](const FetchedSequences &sequences) {
+        if (hasClaimLog && sequences.end > sequences.begin && prefilterBufferClaims[sequences.prefilterBuffer] != alignedClaim) {
+            alignedClaim = prefilterBufferClaims[sequences.prefilterBuffer];
+            targetSplitReader->startClaimLog(alignedClaim, acceptedSize);
+            // the log of a claim starts with a rep
+            loggedRepOrderKey = DB_KEY_INVALID;
+        }
+    };
+    startClaim(currentSequences);
     publishAccepted(getFirstRepKey(currentSequences), 0);
     size_t publishedSize = 0;
     time_t publishTime = time(NULL);
@@ -2980,6 +3069,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     {
                         std::lock_guard<std::mutex> assignedKeysLock(assignedKeysMutex);
                         size_t repKey = std::min(nextRequest->firstPendingRepKey, getFirstRepKey(*nextRequest));
+                        // a node that holds the confirmed key never waits: the master sees the published key and the claims without a log start
+                        if (hasClaimLog) {
+                            repKey = std::min(repKey, std::min(__atomic_load_n(&publishedRepKey, __ATOMIC_RELAXED), targetSplitReader->getUnstartedClaimKey()));
+                        }
                         if (canWait && repKey > clusteredOrderKey && nextAcceptedSize >= clusteredAcceptedSize + maxUnclusteredAcceptedSize && serviceTimer.getTimediff() >= nextGateRead) {
                             nextGateRead = serviceTimer.getTimediff() + BATCH_READ_SECONDS / 2;
                             readAssignedKeys(true);
@@ -4063,6 +4156,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         alignSeconds += alignTimer.getTimediff();
         alignedCellsPerSecond.store(alignedCells / std::max(alignSeconds, 1e-3));
         masterWaitSeconds.store(waitSeconds);
+        startClaim(nextSequences);
         // the reps of pending pairs are not done
         waitForSequences(nextSequences, getFirstUndoneRepKey(nextRepKey));
         std::swap(currentSequences, nextSequences);
@@ -4129,20 +4223,43 @@ struct AcceptedRep {
     size_t repKey;
     size_t begin;
     size_t end;
-    unsigned int node;
+    unsigned int log;
 };
 
 struct MergedReps {
-    size_t firstNodeRep;
+    size_t firstLogRep;
     size_t firstMergedRep;
+    unsigned int log;
+};
+
+// the accepted pairs of a claim, in rep order; the whole log of a node that publishes no claims
+struct ClaimLog {
+    ClaimLog(unsigned int node, size_t firstKey, size_t begin)
+        : node(node), firstKey(firstKey), begin(begin), end(SIZE_MAX), readSize(0), nextRepKey(0), clusteredWordCount(0), wordOffset(0), bitOffset(0), mergedReps(0) {}
     unsigned int node;
+    // first key of the window
+    size_t firstKey;
+    // bytes in the accepted log of the node, end is SIZE_MAX while the node writes it
+    size_t begin;
+    size_t end;
+    // clustered bytes
+    size_t readSize;
+    // read and not clustered
+    std::vector<uint64_t> unclusteredWords;
+    std::vector<size_t> repWordOffsets;
+    size_t nextRepKey;
+    size_t clusteredWordCount;
+    size_t wordOffset;
+    size_t bitOffset;
+    size_t mergedReps;
 };
 
 struct ClusteredLog {
     FILE *file;
     size_t bytes;
-    uint64_t partialWord;
-    unsigned int partialWordBits;
+    // bits of the log words from 64 * firstBitsWord on, written once the words before them are clustered
+    std::vector<uint64_t> bits;
+    size_t firstBitsWord;
     char *buffer;
 };
 
@@ -4154,7 +4271,8 @@ static size_t getKeyAlignNodeFromPage(const std::vector<unsigned int> &pageAlign
 static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimit, const DBReader<DBKeyType> &seqDbr,
                                    const std::vector<unsigned int> &pageAlignNodes, int mode, size_t paddedDbSize, size_t sizeClassCount,
                                    const std::string &accepted, const std::string &assignedKeysLog, const std::string &clusteredLogPrefix, const std::string &setCoverPrefix,
-                                   const std::string &assignedBits, std::string &phaseValues) {
+                                   const std::string &assignedBits, const std::vector<size_t> &windowFirstKeys, const std::string &claimedCells, std::vector<size_t> windowFreeCells,
+                                   std::string &phaseValues) {
     const size_t assignedWords = (dbSize + 63) / 64;
     const size_t orderKeyEnd = (sizeClassCount - 1) * paddedDbSize + dbSize;
     uint64_t *assigned = static_cast<uint64_t *>(mem_align(2 * 1024 * 1024, assignedWords * sizeof(uint64_t)));
@@ -4186,13 +4304,24 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     std::vector<size_t> nodeLogSize(MMseqsNode::count, 0);
     std::vector<size_t> nodeReadSize(MMseqsNode::count, 0);
     std::vector<ClusteredLog> nodeClusteredLogs(MMseqsNode::count);
-    std::vector<std::vector<uint64_t> > nodeClusteredBits(MMseqsNode::count);
-    std::vector<size_t> nodeClusteredWordCounts(MMseqsNode::count, 0);
+    // with claimed cells files the master confirms by claim: a cell counts at the first key of its window until the node that took it publishes the claim
+    std::vector<std::vector<ClaimLog> > nodeClaimLogs(MMseqsNode::count);
+    std::vector<ClaimLog *> stepLogs;
+    std::vector<size_t> nodeStepLogCounts(MMseqsNode::count, 0);
+    std::vector<size_t> nodeClaimsSize(MMseqsNode::count, 0);
+    std::vector<std::vector<uint64_t> > nodeClaimWords(MMseqsNode::count);
+    // first key of the window of every claim, SIZE_MAX once its log started
+    std::vector<std::vector<size_t> > nodeClaimKeys(MMseqsNode::count);
+    std::vector<size_t> nodeFirstUnstartedClaims(MMseqsNode::count, 0);
+    size_t firstFreeWindow = 0;
     for (size_t node = 0; node < MMseqsNode::count; node++) {
-        const ClusteredLog clusteredLog = { FileUtil::openAndDelete((clusteredLogPrefix + "." + SSTR(node)).c_str(), "w"), 0, 0, 0, new(std::nothrow) char[CLUSTERED_LOG_BUFFER_SIZE] };
+        const ClusteredLog clusteredLog = { FileUtil::openAndDelete((clusteredLogPrefix + "." + SSTR(node)).c_str(), "w"), 0, std::vector<uint64_t>(), 0, new(std::nothrow) char[CLUSTERED_LOG_BUFFER_SIZE] };
         Util::checkAllocation(clusteredLog.buffer, "Can not allocate clustered log buffer memory in align2clust");
         setvbuf(clusteredLog.file, clusteredLog.buffer, _IOFBF, CLUSTERED_LOG_BUFFER_SIZE);
         nodeClusteredLogs[node] = clusteredLog;
+        if (claimedCells.empty()) {
+            nodeClaimLogs[node].push_back(ClaimLog(node, 0, 0));
+        }
     }
     FILE *assignedKeysHandle = FileUtil::openAndDelete(assignedKeysLog.c_str(), "w");
     size_t assignedKeysSize = 0;
@@ -4200,11 +4329,6 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     const size_t nodeStepWords = std::max<size_t>(1, stepWords / MMseqsNode::count);
     const size_t logReadBytesPerNode = std::max<size_t>(1, std::min(stepWords, memoryLimit / LOG_READ_MEMORY_DIVISOR / sizeof(uint64_t)) / MMseqsNode::count) * sizeof(uint64_t);
     std::vector<uint64_t> logWords;
-    std::vector<std::vector<uint64_t> > nodeUnclusteredWords(MMseqsNode::count);
-    std::vector<size_t> nodeWordOffsets(MMseqsNode::count, 0);
-    std::vector<std::vector<size_t> > nodeRepWordOffsets(MMseqsNode::count);
-    std::vector<size_t> nodeNextRepKeys(MMseqsNode::count, 0);
-    std::vector<size_t> nodeMergedReps(MMseqsNode::count, 0);
     std::vector<MergedReps> mergedReps;
     std::vector<AcceptedRep> reps;
     std::vector<unsigned char> pairIsFree;
@@ -4214,7 +4338,6 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     std::vector<std::pair<DBKeyType, size_t> > keyReps;
     std::vector<unsigned char> repSharesKey;
     std::vector<size_t> sharingReps;
-    std::vector<uint64_t> words;
     std::vector<uint64_t> assignedKeyWords;
     std::vector<uint64_t> writtenAssignedKeys;
     std::thread assignedKeysWriter;
@@ -4266,11 +4389,20 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             const std::string log = accepted + "." + SSTR(node);
             size_t repKey;
             size_t logSize;
-            if ((nodeHasProgress[node] && nodeRepOrderKeys[node] == orderKeyEnd) || MMseqsNode::readLogProgress(log, repKey, logSize) == false) {
+            size_t claimsSize;
+            nodeClaimWords[node].clear();
+            if ((nodeHasProgress[node] && nodeRepOrderKeys[node] == orderKeyEnd) || MMseqsNode::readLogProgress(log, repKey, logSize, &claimsSize) == false) {
                 continue;
             }
-            if (nodeHasProgress[node] && repKey <= nodeRepOrderKeys[node] && logSize <= nodeLogSize[node]) {
+            // an older progress has fewer claims, or the same claims and no larger key or size
+            if (nodeHasProgress[node] && (claimsSize < nodeClaimsSize[node] || (claimsSize == nodeClaimsSize[node] && repKey <= nodeRepOrderKeys[node] && logSize <= nodeLogSize[node]))) {
                 continue;
+            }
+            // the claims the progress counts, they were synced before it
+            if (claimsSize > nodeClaimsSize[node]) {
+                nodeClaimWords[node].resize((claimsSize - nodeClaimsSize[node]) / sizeof(uint64_t));
+                MMseqsNode::readLog(claimedCells + "." + SSTR(node), nodeClaimsSize[node], claimsSize, reinterpret_cast<char *>(nodeClaimWords[node].data()));
+                nodeClaimsSize[node] = claimsSize;
             }
             nodeHasProgress[node] = 1;
             nodeRepOrderKeys[node] = repKey;
@@ -4279,11 +4411,40 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         size_t doneRepOrderKey = orderKeyEnd;
         size_t slowestNode = 0;
         for (size_t node = 0; node < MMseqsNode::count; node++) {
-            const size_t nodeRepKey = nodeHasProgress[node] ? nodeRepOrderKeys[node] : 0;
+            const std::vector<uint64_t> &claimWords = nodeClaimWords[node];
+            std::vector<ClaimLog> &claimLogs = nodeClaimLogs[node];
+            std::vector<size_t> &claimKeys = nodeClaimKeys[node];
+            for (size_t word = 0; word < claimWords.size();) {
+                if ((claimWords[word] & CLAIM_LOG_BIT) != 0) {
+                    // the log of the claim before ends here
+                    if (claimLogs.empty() == false) {
+                        claimLogs.back().end = claimWords[word + 1];
+                    }
+                    const size_t claim = claimWords[word] & ~CLAIM_LOG_BIT;
+                    claimLogs.push_back(ClaimLog(node, claimKeys[claim], claimWords[word + 1]));
+                    claimKeys[claim] = SIZE_MAX;
+                    word += 2;
+                } else {
+                    claimKeys.push_back(windowFirstKeys[claimWords[word]]);
+                    windowFreeCells[claimWords[word]] -= claimWords[word + 1];
+                    word += 2 + claimWords[word + 1];
+                }
+            }
+            // the published key is of the claim whose log started last, a claim without a log start counts at its window
+            size_t nodeRepKey = nodeHasProgress[node] ? nodeRepOrderKeys[node] : 0;
+            size_t &firstUnstartedClaim = nodeFirstUnstartedClaims[node];
+            for (; firstUnstartedClaim < claimKeys.size() && claimKeys[firstUnstartedClaim] == SIZE_MAX; firstUnstartedClaim++) {}
+            for (size_t claim = firstUnstartedClaim; claim < claimKeys.size(); claim++) {
+                nodeRepKey = std::min(nodeRepKey, claimKeys[claim]);
+            }
             if (nodeRepKey < doneRepOrderKey) {
                 doneRepOrderKey = nodeRepKey;
                 slowestNode = node;
             }
+        }
+        for (; firstFreeWindow < windowFreeCells.size() && windowFreeCells[firstFreeWindow] == 0; firstFreeWindow++) {}
+        if (firstFreeWindow < windowFreeCells.size()) {
+            doneRepOrderKey = std::min(doneRepOrderKey, windowFirstKeys[firstFreeWindow]);
         }
         if (doneRepOrderKey <= clusteredOrderKey) {
             // only the slowest node gates the step
@@ -4293,17 +4454,37 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             continue;
         }
         polls = 0;
+        // the logs of the claims with reps below doneRepOrderKey, without those the step before clustered to their end
+        stepLogs.clear();
+        for (size_t node = 0; node < MMseqsNode::count; node++) {
+            std::vector<ClaimLog> &claimLogs = nodeClaimLogs[node];
+            claimLogs.erase(std::remove_if(claimLogs.begin(), claimLogs.end(), [](const ClaimLog &claimLog) { return claimLog.begin + claimLog.readSize == claimLog.end; }), claimLogs.end());
+            nodeStepLogCounts[node] = 0;
+            for (size_t i = 0; i < claimLogs.size(); i++) {
+                if (claimLogs[i].firstKey < doneRepOrderKey) {
+                    stepLogs.push_back(&claimLogs[i]);
+                    nodeStepLogCounts[node]++;
+                }
+            }
+        }
         // read every log up to doneRepOrderKey
 #pragma omp parallel for schedule(dynamic, 1)
-        for (size_t node = 0; node < MMseqsNode::count; node++) {
-            std::vector<uint64_t> &nodeWords = nodeUnclusteredWords[node];
-            std::vector<size_t> &repWordOffsets = nodeRepWordOffsets[node];
+        for (size_t i = 0; i < stepLogs.size(); i++) {
+            ClaimLog &claimLog = *stepLogs[i];
+            const size_t node = claimLog.node;
+            std::vector<uint64_t> &nodeWords = claimLog.unclusteredWords;
+            std::vector<size_t> &repWordOffsets = claimLog.repWordOffsets;
             repWordOffsets.clear();
             size_t word = 0;
-            if (nodeNextRepKeys[node] < doneRepOrderKey) {
-                nodeNextRepKeys[node] = nodeRepOrderKeys[node];
+            if (claimLog.nextRepKey < doneRepOrderKey) {
+                // the claims of a node share its part of the step
+                const size_t logStepWords = std::max<size_t>(1, nodeStepWords / nodeStepLogCounts[node]);
+                const size_t logReadBytes = std::max<size_t>(1, logReadBytesPerNode / sizeof(uint64_t) / nodeStepLogCounts[node]) * sizeof(uint64_t);
+                const size_t logEnd = (claimLog.end != SIZE_MAX) ? claimLog.end : nodeLogSize[node];
+                // no rep comes after the end of a claim
+                claimLog.nextRepKey = (claimLog.end != SIZE_MAX) ? orderKeyEnd : nodeRepOrderKeys[node];
                 const std::string log = accepted + "." + SSTR(node);
-                size_t from = nodeReadSize[node] + nodeWords.size() * sizeof(uint64_t);
+                size_t from = claimLog.begin + claimLog.readSize + nodeWords.size() * sizeof(uint64_t);
                 bool isCut = false;
                 while (true) {
                     for (; word < nodeWords.size(); word++) {
@@ -4311,17 +4492,17 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                             continue;
                         }
                         const size_t repKey = getRepOrderKey(nodeWords[word]);
-                        if (repKey >= doneRepOrderKey || (word >= nodeStepWords && repKey > clusteredOrderKey)) {
-                            nodeNextRepKeys[node] = repKey;
+                        if (repKey >= doneRepOrderKey || (word >= logStepWords && repKey > clusteredOrderKey)) {
+                            claimLog.nextRepKey = repKey;
                             isCut = true;
                             break;
                         }
                         repWordOffsets.push_back(word);
                     }
-                    if (isCut || from >= nodeLogSize[node]) {
+                    if (isCut || from >= logEnd) {
                         break;
                     }
-                    const size_t to = std::min(nodeLogSize[node], from + logReadBytesPerNode);
+                    const size_t to = std::min(logEnd, from + logReadBytes);
                     nodeWords.resize(word + (to - from) / sizeof(uint64_t));
                     MMseqsNode::readLog(log, from, to, reinterpret_cast<char *>(nodeWords.data() + word));
                     from = to;
@@ -4331,60 +4512,65 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         }
         // end the step at the first cut rep
         size_t stepRepOrderKey = doneRepOrderKey;
-        for (size_t node = 0; node < MMseqsNode::count; node++) {
-            stepRepOrderKey = std::min(stepRepOrderKey, nodeNextRepKeys[node]);
+        for (size_t i = 0; i < stepLogs.size(); i++) {
+            stepRepOrderKey = std::min(stepRepOrderKey, stepLogs[i]->nextRepKey);
         }
         size_t stepWordCount = 0;
-        for (size_t node = 0; node < MMseqsNode::count; node++) {
-            std::vector<size_t> &repWordOffsets = nodeRepWordOffsets[node];
-            const std::vector<uint64_t> &nodeWords = nodeUnclusteredWords[node];
+        for (size_t i = 0; i < stepLogs.size(); i++) {
+            ClaimLog &claimLog = *stepLogs[i];
+            std::vector<size_t> &repWordOffsets = claimLog.repWordOffsets;
+            const std::vector<uint64_t> &nodeWords = claimLog.unclusteredWords;
             const size_t clusteredReps = std::lower_bound(repWordOffsets.begin(), repWordOffsets.end() - 1, stepRepOrderKey,
                 [&](size_t word, size_t repKey) { return getRepOrderKey(nodeWords[word]) < repKey; }) - repWordOffsets.begin();
             if (clusteredReps + 1 < repWordOffsets.size()) {
-                nodeNextRepKeys[node] = getRepOrderKey(nodeWords[repWordOffsets[clusteredReps]]);
+                claimLog.nextRepKey = getRepOrderKey(nodeWords[repWordOffsets[clusteredReps]]);
             }
-            nodeClusteredWordCounts[node] = repWordOffsets[clusteredReps];
+            claimLog.clusteredWordCount = repWordOffsets[clusteredReps];
             repWordOffsets.resize(clusteredReps);
-            repWordOffsets.push_back(nodeClusteredWordCounts[node]);
-            nodeWordOffsets[node] = stepWordCount;
-            stepWordCount += nodeClusteredWordCounts[node];
+            repWordOffsets.push_back(claimLog.clusteredWordCount);
+            claimLog.wordOffset = stepWordCount;
+            stepWordCount += claimLog.clusteredWordCount;
+            // the clustered bit of a word is at its position in the log of the node
+            claimLog.bitOffset = (claimLog.begin + claimLog.readSize) / sizeof(uint64_t) - 64 * nodeClusteredLogs[claimLog.node].firstBitsWord;
+            claimLog.readSize += claimLog.clusteredWordCount * sizeof(uint64_t);
+            nodeReadSize[claimLog.node] += claimLog.clusteredWordCount * sizeof(uint64_t);
         }
         logWords.resize(stepWordCount);
 #pragma omp parallel for schedule(dynamic, 1)
-        for (size_t node = 0; node < MMseqsNode::count; node++) {
-            std::vector<uint64_t> &nodeWords = nodeUnclusteredWords[node];
-            std::copy(nodeWords.begin(), nodeWords.begin() + nodeClusteredWordCounts[node], logWords.begin() + nodeWordOffsets[node]);
-            nodeWords.erase(nodeWords.begin(), nodeWords.begin() + nodeClusteredWordCounts[node]);
-            std::vector<size_t> &repWordOffsets = nodeRepWordOffsets[node];
+        for (size_t i = 0; i < stepLogs.size(); i++) {
+            ClaimLog &claimLog = *stepLogs[i];
+            std::vector<uint64_t> &nodeWords = claimLog.unclusteredWords;
+            std::copy(nodeWords.begin(), nodeWords.begin() + claimLog.clusteredWordCount, logWords.begin() + claimLog.wordOffset);
+            nodeWords.erase(nodeWords.begin(), nodeWords.begin() + claimLog.clusteredWordCount);
+            std::vector<size_t> &repWordOffsets = claimLog.repWordOffsets;
             for (size_t rep = 0; rep < repWordOffsets.size(); rep++) {
-                repWordOffsets[rep] += nodeWordOffsets[node];
+                repWordOffsets[rep] += claimLog.wordOffset;
             }
-            nodeReadSize[node] += nodeClusteredWordCounts[node] * sizeof(uint64_t);
-            nodeClusteredBits[node].assign((nodeClusteredWordCounts[node] + 63) / 64, 0);
         }
         // merge the reps of the logs in key order
         std::priority_queue<std::pair<size_t, unsigned int>, std::vector<std::pair<size_t, unsigned int> >, std::greater<std::pair<size_t, unsigned int> > > nextReps;
-        for (unsigned int node = 0; node < MMseqsNode::count; node++) {
-            nodeMergedReps[node] = 0;
-            if (nodeRepWordOffsets[node].size() > 1) {
-                nextReps.push(std::make_pair(getRepOrderKey(logWords[nodeRepWordOffsets[node][0]]), node));
+        for (unsigned int log = 0; log < stepLogs.size(); log++) {
+            stepLogs[log]->mergedReps = 0;
+            if (stepLogs[log]->repWordOffsets.size() > 1) {
+                nextReps.push(std::make_pair(getRepOrderKey(logWords[stepLogs[log]->repWordOffsets[0]]), log));
             }
         }
         mergedReps.clear();
         size_t repCount = 0;
         while (nextReps.empty() == false) {
-            const unsigned int node = nextReps.top().second;
+            const unsigned int log = nextReps.top().second;
             nextReps.pop();
-            const std::vector<size_t> &repWordOffsets = nodeRepWordOffsets[node];
+            ClaimLog &claimLog = *stepLogs[log];
+            const std::vector<size_t> &repWordOffsets = claimLog.repWordOffsets;
             const size_t endKey = nextReps.empty() ? stepRepOrderKey : nextReps.top().first;
-            const size_t endRep = std::lower_bound(repWordOffsets.begin() + nodeMergedReps[node] + 1, repWordOffsets.end() - 1, endKey,
+            const size_t endRep = std::lower_bound(repWordOffsets.begin() + claimLog.mergedReps + 1, repWordOffsets.end() - 1, endKey,
                 [&](size_t word, size_t repKey) { return getRepOrderKey(logWords[word]) < repKey; }) - repWordOffsets.begin();
-            const MergedReps nodeReps = { nodeMergedReps[node], repCount, node };
-            mergedReps.push_back(nodeReps);
-            repCount += endRep - nodeMergedReps[node];
-            nodeMergedReps[node] = endRep;
+            const MergedReps logReps = { claimLog.mergedReps, repCount, log };
+            mergedReps.push_back(logReps);
+            repCount += endRep - claimLog.mergedReps;
+            claimLog.mergedReps = endRep;
             if (endRep + 1 < repWordOffsets.size()) {
-                nextReps.push(std::make_pair(getRepOrderKey(logWords[repWordOffsets[endRep]]), node));
+                nextReps.push(std::make_pair(getRepOrderKey(logWords[repWordOffsets[endRep]]), log));
             }
         }
         reps.resize(repCount);
@@ -4395,12 +4581,12 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             size_t merged = std::upper_bound(mergedReps.begin(), mergedReps.end(), first,
                 [](size_t rep, const MergedReps &next) { return rep < next.firstMergedRep; }) - mergedReps.begin() - 1;
             for (size_t rep = first; rep < end;) {
-                const MergedReps &nodeReps = mergedReps[merged];
+                const MergedReps &logReps = mergedReps[merged];
                 const size_t segmentEnd = std::min(end, (merged + 1 < mergedReps.size()) ? mergedReps[merged + 1].firstMergedRep : repCount);
-                const std::vector<size_t> &repWordOffsets = nodeRepWordOffsets[nodeReps.node];
+                const std::vector<size_t> &repWordOffsets = stepLogs[logReps.log]->repWordOffsets;
                 for (; rep < segmentEnd; rep++) {
-                    const size_t nodeRep = nodeReps.firstNodeRep + rep - nodeReps.firstMergedRep;
-                    const AcceptedRep acceptedRep = { getRepOrderKey(logWords[repWordOffsets[nodeRep]]), repWordOffsets[nodeRep] + 1, repWordOffsets[nodeRep + 1], nodeReps.node };
+                    const size_t logRep = logReps.firstLogRep + rep - logReps.firstMergedRep;
+                    const AcceptedRep acceptedRep = { getRepOrderKey(logWords[repWordOffsets[logRep]]), repWordOffsets[logRep] + 1, repWordOffsets[logRep + 1], logReps.log };
                     reps[rep] = acceptedRep;
                 }
                 merged++;
@@ -4539,6 +4725,10 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                 tableBits++;
             }
             const size_t tableSize = 1ULL << tableBits;
+            for (size_t i = 0; i < stepLogs.size(); i++) {
+                std::vector<uint64_t> &bits = nodeClusteredLogs[stepLogs[i]->node].bits;
+                bits.resize(std::max(bits.size(), (stepLogs[i]->bitOffset + stepLogs[i]->clusteredWordCount + 63) / 64), 0);
+            }
             keyReps.resize(std::max(keyReps.size(), tableSize));
             repSharesKey.assign(repCount, 0);
 #pragma omp parallel for schedule(static)
@@ -4598,8 +4788,9 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                     for (size_t i = reps[rep].begin; i < reps[rep].end; i++) {
                         if (pairIsFree[i]) {
                             setAssigned(logWords[i], threadAssignedKeys[thread_idx]);
-                            const size_t bit = i - nodeWordOffsets[reps[rep].node];
-                            __sync_fetch_and_or(&nodeClusteredBits[reps[rep].node][bit / 64], 1ULL << (bit % 64));
+                            const ClaimLog &claimLog = *stepLogs[reps[rep].log];
+                            const size_t bit = i - claimLog.wordOffset + claimLog.bitOffset;
+                            __sync_fetch_and_or(&nodeClusteredLogs[claimLog.node].bits[bit / 64], 1ULL << (bit % 64));
                             memberCount++;
                         }
                     }
@@ -4637,32 +4828,32 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
                     if (pairIsFree[i] && isAssigned(memberKey) == false) {
                         setAssignedSerial(repKey, threadAssignedKeys[0]);
                         setAssignedSerial(memberKey, threadAssignedKeys[0]);
-                        const size_t bit = i - nodeWordOffsets[reps[rep].node];
-                        nodeClusteredBits[reps[rep].node][bit / 64] |= 1ULL << (bit % 64);
+                        const ClaimLog &claimLog = *stepLogs[reps[rep].log];
+                        const size_t bit = i - claimLog.wordOffset + claimLog.bitOffset;
+                        nodeClusteredLogs[claimLog.node].bits[bit / 64] |= 1ULL << (bit % 64);
                         memberCount++;
                     }
                 }
             }
             for (size_t node = 0; node < MMseqsNode::count; node++) {
-                ClusteredLog &nodeFile = nodeClusteredLogs[node];
-                words.clear();
-                for (size_t i = 0; i < nodeClusteredWordCounts[node]; i += 64) {
-                    const uint64_t bits = nodeClusteredBits[node][i / 64];
-                    const unsigned int wordBits = std::min<size_t>(64, nodeClusteredWordCounts[node] - i);
-                    nodeFile.partialWord |= bits << nodeFile.partialWordBits;
-                    if (nodeFile.partialWordBits + wordBits >= 64) {
-                        words.push_back(nodeFile.partialWord);
-                        nodeFile.partialWord = (nodeFile.partialWordBits > 0) ? bits >> (64 - nodeFile.partialWordBits) : 0;
-                        nodeFile.partialWordBits = nodeFile.partialWordBits + wordBits - 64;
-                    } else {
-                        nodeFile.partialWordBits += wordBits;
-                    }
+                // the claim logs of a node follow in its log; write the bits before its first word that is not clustered
+                const std::vector<ClaimLog> &claimLogs = nodeClaimLogs[node];
+                if (claimLogs.empty()) {
+                    continue;
                 }
-                if (words.empty() == false && fwrite(words.data(), sizeof(uint64_t), words.size(), nodeFile.file) != words.size()) {
+                size_t log = 0;
+                while (log + 1 < claimLogs.size() && claimLogs[log].begin + claimLogs[log].readSize == claimLogs[log].end) {
+                    log++;
+                }
+                ClusteredLog &nodeFile = nodeClusteredLogs[node];
+                const size_t wordCount = (claimLogs[log].begin + claimLogs[log].readSize) / sizeof(uint64_t) / 64 - nodeFile.firstBitsWord;
+                if (wordCount > 0 && fwrite(nodeFile.bits.data(), sizeof(uint64_t), wordCount, nodeFile.file) != wordCount) {
                     Debug(Debug::ERROR) << "Cannot write " << clusteredLogPrefix << "." << node << "\n";
                     EXIT(EXIT_FAILURE);
                 }
-                nodeFile.bytes += words.size() * sizeof(uint64_t);
+                nodeFile.bits.erase(nodeFile.bits.begin(), nodeFile.bits.begin() + wordCount);
+                nodeFile.firstBitsWord += wordCount;
+                nodeFile.bytes += wordCount * sizeof(uint64_t);
             }
         }
         clusteredOrderKey = stepRepOrderKey;
@@ -4731,11 +4922,12 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
     free(assigned);
     for (size_t node = 0; node < MMseqsNode::count; node++) {
         const std::string clusteredLogFile = clusteredLogPrefix + "." + SSTR(node);
-        if (nodeClusteredLogs[node].partialWordBits > 0 && fwrite(&nodeClusteredLogs[node].partialWord, sizeof(uint64_t), 1, nodeClusteredLogs[node].file) != 1) {
+        const std::vector<uint64_t> &bits = nodeClusteredLogs[node].bits;
+        if (bits.empty() == false && fwrite(bits.data(), sizeof(uint64_t), bits.size(), nodeClusteredLogs[node].file) != bits.size()) {
             Debug(Debug::ERROR) << "Cannot write " << clusteredLogFile << "\n";
             EXIT(EXIT_FAILURE);
         }
-        MMseqsNode::publishLog(nodeClusteredLogs[node].file, clusteredLogFile, dbSize, nodeClusteredLogs[node].bytes + ((nodeClusteredLogs[node].partialWordBits > 0) ? sizeof(uint64_t) : 0));
+        MMseqsNode::publishLog(nodeClusteredLogs[node].file, clusteredLogFile, dbSize, nodeClusteredLogs[node].bytes + bits.size() * sizeof(uint64_t));
         if (fclose(nodeClusteredLogs[node].file) != 0) {
             Debug(Debug::ERROR) << "Cannot close " << clusteredLogFile << "\n";
             EXIT(EXIT_FAILURE);
@@ -4795,6 +4987,7 @@ int align2clustLinfinity(Parameters &par) {
         const char *columns[6];
         Util::getWordsOfLine(line, columns, 6);
         PrefPartition partition;
+        partition.windowFirstKey = Util::fast_atoi<size_t>(columns[0]);
         partition.prefOffset = Util::fast_atoi<size_t>(columns[1]);
         partition.prefSize = Util::fast_atoi<size_t>(columns[2]);
         partition.alignmentCells = Util::fast_atoi<size_t>(columns[3]);
@@ -5069,7 +5262,10 @@ int align2clustLinfinity(Parameters &par) {
     const size_t servedFileEntrySize = std::max(BatchReader::MAX_READ_REQUEST_SIZE, smallestMemoryLimit / SERVED_FILE_MEMORY_DIVISOR);
 
     RepTargetsReader repTargetsReader(par, seqDbr, partitions, alignmentSplitPartitionOffsets, alignmentSplitQueue, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount);
-    TargetSplitReader *targetSplitReader = hasTargetSplits ? new TargetSplitReader(par, seqDbr, partitions, cellQueue, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount) : NULL;
+    // the member checks of iteration 2 log the pairs of a claim after the fetches of the next one, so its nodes publish no claims and the master confirms by node
+    const std::string claimedCells = (hasTargetSplits && sizeClassCount == 1 && par.filterCluDBFile.empty()) ? par.db3 + "_claimed_cells" : "";
+    TargetSplitReader *targetSplitReader = hasTargetSplits ? new TargetSplitReader(par, seqDbr, partitions, cellQueue, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount,
+                                                                                   claimedCells.empty() ? "" : claimedCells + "." + SSTR(MMseqsNode::rank)) : NULL;
     if (sizeClassCount > 1 && targetSplitReader != NULL) {
         targetSplitReader->countSizeClasses();
     } else if (sizeClassCount > 1) {
@@ -5095,6 +5291,19 @@ int align2clustLinfinity(Parameters &par) {
         MMseqsNode::addPhaseTime(phaseValues, "sampling the cluster index keys", phaseValueTimer);
     }
 
+    // greedy windows in key order, and their cells with a cost: a node takes those
+    std::vector<size_t> windowFirstKeys;
+    std::vector<size_t> windowFreeCells;
+    for (size_t cell = 0; hasTargetSplits && sizeClassCount == 1 && cell < partitions.size(); cell++) {
+        if (partitions[cell].targetSplit == 0) {
+            windowFirstKeys.push_back(partitions[cell].windowFirstKey);
+            windowFreeCells.push_back(0);
+        }
+        windowFreeCells.back() += partitions[cell].alignmentCells > 0;
+    }
+    if (claimedCells.empty()) {
+        windowFreeCells.clear();
+    }
     // the master clusters while the nodes align
     size_t memberCount = 0;
     std::string clusterPhaseValues;
@@ -5105,7 +5314,7 @@ int align2clustLinfinity(Parameters &par) {
             omp_set_num_threads(clusterThreads);
 #endif
             memberCount = clusterAcceptedPairs(clusterThreads, dbSize, masterMemoryLimit, seqDbr, pageAlignNodes, par.clusteringMode, paddedDbSize, sizeClassCount,
-                                               accepted, assignedKeysLog, clusteredLogPrefix, setCoverPrefix, assignedBits, clusterPhaseValues);
+                                               accepted, assignedKeysLog, clusteredLogPrefix, setCoverPrefix, assignedBits, windowFirstKeys, claimedCells, windowFreeCells, clusterPhaseValues);
         });
     }
     phaseValueTimer.reset();
@@ -5277,6 +5486,9 @@ int align2clustLinfinity(Parameters &par) {
     }
     MMseqsNode::removeLog(clusteredLogFile);
     MMseqsNode::removeLog(acceptedFile);
+    if (claimedCells.empty() == false && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) {
+        FileUtil::remove((claimedCells + "." + SSTR(MMseqsNode::rank)).c_str());
+    }
     // write the clusters and, without bits, the singletons
     uint64_t *singletonBits = NULL;
     FILE *assignedHandle = NULL;
