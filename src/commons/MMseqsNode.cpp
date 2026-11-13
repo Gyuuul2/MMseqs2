@@ -2224,7 +2224,13 @@ void MMseqsNode::removeExchangeFile(const std::string &file, uint64_t exchangeFi
 void MMseqsNode::uploadExchangeSegment(const std::string &file, int fd, uint64_t exchangeFileNumber, size_t segment, size_t begin, size_t end) {
     if (end > begin) {
         S3Client::putFile(getExchangeObjectName(file, exchangeFileNumber) + "." + SSTR(segment), file, begin, end - begin);
-        FileUtil::punchHole(fd, begin, end - begin);
+        // whole pages only, and never the first page: the close reads the header there
+        const size_t page = Util::getPageSize();
+        const size_t punchBegin = std::max(page, (begin + page - 1) / page * page);
+        const size_t punchEnd = end / page * page;
+        if (punchEnd > punchBegin) {
+            FileUtil::punchHole(fd, punchBegin, punchEnd - punchBegin, true);
+        }
     }
 }
 

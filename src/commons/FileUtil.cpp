@@ -146,9 +146,9 @@ void FileUtil::pwriteAll(int fd, const char *fileName, const char *data, size_t 
     }
 }
 
-void FileUtil::punchHole(int fd, size_t offset, size_t size) {
+void FileUtil::punchHole(int fd, size_t offset, size_t size, bool isUploaded) {
     // aws backend: a punched local copy of another node's file would read as zeros
-    if (S3Client::isEnabled()) {
+    if (S3Client::isEnabled() && isUploaded == false) {
         return;
     }
 #ifdef FALLOC_FL_PUNCH_HOLE
