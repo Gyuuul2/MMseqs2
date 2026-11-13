@@ -2543,17 +2543,11 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     PrefFiles prefFiles;
     TargetSplitFiles targetSplitFiles;
     if (exchange.hasTargetSplits) {
-        // runs of whole blocks, fewer for few targets per rep
-        size_t representativeCount = 0;
-        for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {
-            representativeCount += seqDbr.getRangeRepresentativeCount(range);
-        }
-        // an align group shares the target splits of a window
+        // runs of whole blocks, an align group shares the target splits of a window
         size_t alignGroupCount = MMseqsNode::getAlignGroupCount(par.align2clustSplit);
         size_t alignNodeCount = (MMseqsNode::count - MMseqsNode::getFirstAlignNode() + alignGroupCount - 1) / alignGroupCount;
-        size_t targetsPerRep = exchange.pairTargetCount / std::max((size_t) 1, representativeCount);
         size_t blockCount = seqDbr.getBlockKeyOffsets().size() - 1;
-        size_t targetSplitCount = std::min(blockCount, std::max(2 * alignNodeCount, std::min(MAX_TARGET_SPLITS_PER_NODE * alignNodeCount, targetsPerRep / 4)));
+        size_t targetSplitCount = std::min(blockCount, MAX_TARGET_SPLITS_PER_NODE * alignNodeCount);
         targetSplitBlockOffsets.resize(targetSplitCount + 1);
         targetSplitFiles.keyOffsets.resize(targetSplitCount + 1);
         for (size_t split = 0; split <= targetSplitCount; split++) {
