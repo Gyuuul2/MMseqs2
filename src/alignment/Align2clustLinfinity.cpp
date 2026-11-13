@@ -609,6 +609,8 @@ static std::vector<unsigned int> targetSplitAlignNodes;
 // a window belongs to one align group, a node holds the target split table of its own group
 static std::vector<unsigned int> windowAlignGroups;
 static unsigned int alignGroup;
+// the target split table of every align group, the same on every node
+static std::vector<std::vector<unsigned int> > groupTargetSplitAlignNodes;
 // the nodes of the align group share its target split table, so only they request sequences from each other
 static size_t alignGroupNodeBegin;
 static size_t alignGroupNodeEnd;
@@ -2096,9 +2098,10 @@ private:
             // without home windows left every window is behind
             const size_t endWindow = (homeWindow == windowCount) ? windowCount : homeWindow - std::min(homeWindow, lead);
             for (size_t window = lastWindow; window < endWindow; window++) {
-                if (windowAlignGroups[window] != alignGroup) {
-                    continue;
-                }
+                // the master confirms the windows of all groups in one order, so a window of another group behind is helped too,
+                // but only with the cells of the own target splits: their targets are in the own blocks
+                const unsigned int windowGroup = windowAlignGroups[window];
+                const std::vector<unsigned int> &windowSplitAlignNodes = groupTargetSplitAlignNodes[windowGroup];
                 const size_t firstCell = window * targetSplitCount;
                 double windowStolenCost = 0;
                 for (size_t i = 1; i < alignNodeCount; i++) {
@@ -2111,8 +2114,10 @@ private:
                     splits.clear();
                     size_t nodeCost = 0;
                     for (size_t split = 0; split < targetSplitCount; split++) {
-                        if (targetSplitAlignNodes[split] == node && cells[firstCell + split].alignmentCells > 0) {
-                            splits.push_back(split);
+                        if (windowSplitAlignNodes[split] == node && cells[firstCell + split].alignmentCells > 0) {
+                            if (windowGroup == alignGroup || targetSplitAlignNodes[split] == MMseqsNode::rank) {
+                                splits.push_back(split);
+                            }
                             nodeCost += cells[firstCell + split].alignmentCells;
                         }
                     }
@@ -5203,6 +5208,7 @@ int align2clustLinfinity(Parameters &par) {
             return splitCosts[first] > splitCosts[second] || (splitCosts[first] == splitCosts[second] && first < second);
         });
         targetSplitAlignNodes.resize(targetSplitCount);
+        groupTargetSplitAlignNodes.assign(alignGroupCount, std::vector<unsigned int>(targetSplitCount));
         for (size_t group = 0; group < alignGroupCount; group++) {
             const size_t groupNodeCount = groupNodeOffsets[group + 1] - groupNodeOffsets[group];
             size_t maxNodeSize = (totalSize + groupNodeCount - 1) / groupNodeCount + maxSplitSize;
@@ -5218,8 +5224,9 @@ int align2clustLinfinity(Parameters &par) {
                 }
                 nodeCosts[node] += splitCosts[split];
                 nodeSizes[node] += splitSizes[split];
+                groupTargetSplitAlignNodes[group][split] = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[group] + node;
                 if (group == ((alignGroup < alignGroupCount) ? alignGroup : split % alignGroupCount)) {
-                    targetSplitAlignNodes[split] = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[group] + node;
+                    targetSplitAlignNodes[split] = groupTargetSplitAlignNodes[group][split];
                 }
             }
             if (group == alignGroup) {
