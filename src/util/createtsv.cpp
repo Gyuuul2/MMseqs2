@@ -6,6 +6,7 @@
 #include "IndexReader.h"
 #include "FileUtil.h"
 #include "MMseqsNode.h"
+#include "S3Client.h"
 #include "FastSort.h"
 
 #ifdef OPENMP
@@ -357,6 +358,7 @@ int createtsv(int argc, const char **argv, const Command &command) {
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_VARIADIC, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
+        MMseqsNode::fetchFile(par.db3 + ".dbtype");
         int clusterDbtype = FileUtil::parseDbType(par.db3.c_str());
         if (Parameters::isEqualDbtype(clusterDbtype, Parameters::DBTYPE_CLUSTER_RES) == false
             || (DBReader<DBKeyType>::getExtendedDbtype(clusterDbtype) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {
@@ -381,9 +383,12 @@ int createtsv(int argc, const char **argv, const Command &command) {
                                                             Util::computeMemory(par.splitMemoryLimit), sortedByRep);
         headers.close();
         MMseqsNode::addPhaseTime(phaseValues, "sending member accessions", timer);
-        FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
+        MMseqsNode::removeFile(sortedByMember + "." + SSTR(MMseqsNode::rank));
 
         writeClusterTsvLines(sortedByRepIndex, sortedByRep, par.db4, par);
+        if (S3Client::isEnabled()) {
+            MMseqsNode::uploadFile(par.db4 + "." + SSTR(MMseqsNode::rank));
+        }
         MMseqsNode::addPhaseTime(phaseValues, "writing TSV", timer);
 
         std::vector<std::string> exchanges;

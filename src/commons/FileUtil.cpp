@@ -1,8 +1,10 @@
 #include "FileUtil.h"
 #include "Util.h"
+#include "S3Client.h"
 #include "Debug.h"
 #include "simd.h"
 #include "BatchReader.h"
+#include "MMseqsNode.h"
 
 #include <cstddef>
 #include <cerrno>
@@ -105,6 +107,14 @@ void FileUtil::deleteTempFiles(const std::list<std::string> &tmpFiles) {
 }
 
 void FileUtil::preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset) {
+    size_t remoteSize;
+    if (MMseqsNode::readRemoteFile(fd, data, size, offset, remoteSize)) {
+        if (remoteSize < size) {
+            Debug(Debug::ERROR) << "Cannot read " << fileName << " at offset " << offset + remoteSize << " (" << size - remoteSize << " bytes remaining): end of file\n";
+            EXIT(EXIT_FAILURE);
+        }
+        return;
+    }
     for (size_t done = 0; done < size;) {
         const ssize_t count = pread(fd, data + done, size - done, offset + done);
         if (count < 0 && errno == EINTR) {
@@ -136,7 +146,11 @@ void FileUtil::pwriteAll(int fd, const char *fileName, const char *data, size_t 
     }
 }
 
-void FileUtil::punchHole(int fd, size_t offset, size_t size) {
+void FileUtil::punchHole(int fd, size_t offset, size_t size, bool isUploaded) {
+    // aws backend: a punched local copy of another node's file would read as zeros
+    if (S3Client::isEnabled() && isUploaded == false) {
+        return;
+    }
 #ifdef FALLOC_FL_PUNCH_HOLE
     static int warned = 0;
     if (size > 0 && fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size) != 0 && errno == EOPNOTSUPP

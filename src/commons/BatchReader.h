@@ -59,6 +59,8 @@ private:
     int maxInflightRequests;
     std::vector<ReadRequest> splitReadRequests;
     size_t nextSplitReadRequest;
+    // aws backend: reads of another node's file go from S3 into the buffers, in the pread threads
+    bool hasRemoteReads;
     // errno, -1 for an unexpected end of file
     int readError;
     const char *readErrorFileName;
