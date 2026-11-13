@@ -3163,6 +3163,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             ServedFile writtenFile = { 0, 0, 0, 0 };
             // a thread loads the keys of this node while the service thread serves and receives
             std::thread ownKeyLoader;
+            FetchedSequences *ownKeyRequest = NULL;
             bool isOwnKeysLoaded = false;
             std::vector<time_t> missingFileSince(nodes, 0);
             std::vector<unsigned int> missingFileAttempts(nodes, 0);
@@ -3416,24 +3417,41 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 // the keys of this node while the other nodes serve the new request
                 if (nextRequest != NULL && requestedSequences == nextRequest) {
                     isLoaded = false;
-                    isOwnKeysLoaded = false;
-                    ownKeyLoader = std::thread([&, nextRequest]() {
+                    {
+                        std::lock_guard<std::mutex> lock(serviceMutex);
+                        isOwnKeysLoaded = false;
+                        ownKeyRequest = nextRequest;
+                    }
+                    serviceCondition.notify_all();
+                    // one loader for all fetches: a thread that read with io_uring takes seconds to exit
+                    if (ownKeyLoader.joinable() == false) {
+                        ownKeyLoader = std::thread([&]() {
 #ifdef OPENMP
-                        omp_set_num_threads(1);
+                            omp_set_num_threads(1);
 #endif
-                        size_t ownKey = nextRequest->fetchSourceKeyOffsets[rank];
-                        copyEntries(nextRequest->keys.data() + ownKey, nextRequest->fetchSourceKeyOffsets[rank + 1] - ownKey, nextRequest->entryOffsets.data() + ownKey, nextRequest->entries, NULL);
-                        {
-                            std::lock_guard<std::mutex> lock(serviceMutex);
-                            isOwnKeysLoaded = true;
-                            hasServiceWork = true;
-                        }
-                        serviceCondition.notify_all();
-                    });
+                            for (bool isLast = false; isLast == false;) {
+                                FetchedSequences *request;
+                                {
+                                    std::unique_lock<std::mutex> lock(serviceMutex);
+                                    serviceCondition.wait(lock, [&]() { return ownKeyRequest != NULL; });
+                                    request = ownKeyRequest;
+                                }
+                                size_t ownKey = request->fetchSourceKeyOffsets[rank];
+                                copyEntries(request->keys.data() + ownKey, request->fetchSourceKeyOffsets[rank + 1] - ownKey, request->entryOffsets.data() + ownKey, request->entries, NULL);
+                                isLast = request->isLast;
+                                {
+                                    std::lock_guard<std::mutex> lock(serviceMutex);
+                                    ownKeyRequest = NULL;
+                                    isOwnKeysLoaded = true;
+                                    hasServiceWork = true;
+                                }
+                                serviceCondition.notify_all();
+                            }
+                        });
+                    }
                 }
                 // a fetch goes to the aligning threads once its request is received
                 if (requestedSequences != NULL && ownRequests.empty() && isLoaded) {
-                    ownKeyLoader.join();
                     {
                         std::lock_guard<std::mutex> lock(serviceMutex);
                         completedSequences = requestedSequences;
@@ -3689,6 +3707,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     waitWarning.check(requestedSequences != NULL ? served + " of other nodes" : (nextRequest != NULL ? assignedKeysLog : requests + " of other nodes"));
                 }
             }
+            ownKeyLoader.join();
         });
     }
     const auto waitForSequences = [&](FetchedSequences &fetched, size_t doneRepOrderKey) {
