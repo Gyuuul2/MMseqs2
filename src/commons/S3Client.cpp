@@ -837,7 +837,7 @@ size_t S3Client::getSize(const std::string &path) {
 
 #else
 static void notBuilt() {
-    Debug(Debug::ERROR) << "MMseqs2 was built without S3 support: --backend aws needs libcurl and the OpenSSL crypto library at build time\n";
+    Debug(Debug::ERROR) << "MMseqs2 was built without S3 support: --backend aws needs a build with -DHAVE_S3=1, libcurl and the OpenSSL crypto library\n";
     EXIT(EXIT_FAILURE);
 }
 
