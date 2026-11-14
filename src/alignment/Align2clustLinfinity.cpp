@@ -5199,9 +5199,7 @@ int align2clustLinfinity(Parameters &par) {
             splitCosts[partitions[i].targetSplit] += partitions[i].alignmentCells;
         }
         std::vector<size_t> splitSizes(targetSplitCount, 0);
-        std::vector<size_t> order(targetSplitCount);
         size_t totalSize = 0;
-        size_t maxSplitSize = 0;
         for (size_t split = 0; split < targetSplitCount; split++) {
             size_t keyBegin = blockDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[split]];
             size_t keyEnd = blockDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[split + 1]];
@@ -5210,8 +5208,6 @@ int align2clustLinfinity(Parameters &par) {
                 splitSizes[split] += (std::min(keyEnd, rangeEnd) - std::max(keyBegin, static_cast<size_t>(blockIndex[range].id))) * blockIndex[range].length;
             }
             totalSize += splitSizes[split];
-            maxSplitSize = std::max(maxSplitSize, splitSizes[split]);
-            order[split] = split;
         }
 
         // the align nodes in groups, the master is in no group
@@ -5222,28 +5218,18 @@ int align2clustLinfinity(Parameters &par) {
         const size_t alignNode = MMseqsNode::rank - std::min<size_t>(MMseqsNode::rank, MMseqsNode::getFirstAlignNode());
         alignGroup = (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) ? std::upper_bound(groupNodeOffsets.begin(), groupNodeOffsets.end(), alignNode) - groupNodeOffsets.begin() - 1 : alignGroupCount;
 
-        // largest cost first to the node of the align group with the least cost; the master spreads the splits over the groups
-        SORT_SERIAL(order.begin(), order.end(), [&](size_t first, size_t second) {
-            return splitCosts[first] > splitCosts[second] || (splitCosts[first] == splitCosts[second] && first < second);
-        });
+        // the splits go over the group nodes back and forth (0 1 2 2 1 0 0 1 ...); the master spreads the splits over the groups
         targetSplitAlignNodes.resize(targetSplitCount);
         groupTargetSplitAlignNodes.assign(alignGroupCount, std::vector<unsigned int>(targetSplitCount));
         for (size_t group = 0; group < alignGroupCount; group++) {
             const size_t groupNodeCount = groupNodeOffsets[group + 1] - groupNodeOffsets[group];
-            size_t maxNodeSize = (totalSize + groupNodeCount - 1) / groupNodeCount + maxSplitSize;
             std::vector<uint128> nodeCosts(groupNodeCount, 0);
             std::vector<size_t> nodeSizes(groupNodeCount, 0);
-            for (size_t i = 0; i < targetSplitCount; i++) {
-                size_t split = order[i];
-                size_t node = SIZE_MAX;
-                for (size_t groupNode = 0; groupNode < groupNodeCount; groupNode++) {
-                    if (nodeSizes[groupNode] + splitSizes[split] <= maxNodeSize && (node == SIZE_MAX || nodeCosts[groupNode] < nodeCosts[node])) {
-                        node = groupNode;
-                    }
-                }
-                nodeCosts[node] += splitCosts[split];
-                nodeSizes[node] += splitSizes[split];
-                groupTargetSplitAlignNodes[group][split] = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[group] + node;
+            for (size_t split = 0; split < targetSplitCount; split++) {
+                const size_t groupNode = ((split / groupNodeCount) % 2 == 0) ? split % groupNodeCount : groupNodeCount - 1 - split % groupNodeCount;
+                nodeCosts[groupNode] += splitCosts[split];
+                nodeSizes[groupNode] += splitSizes[split];
+                groupTargetSplitAlignNodes[group][split] = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[group] + groupNode;
                 if (group == ((alignGroup < alignGroupCount) ? alignGroup : split % alignGroupCount)) {
                     targetSplitAlignNodes[split] = groupTargetSplitAlignNodes[group][split];
                 }
