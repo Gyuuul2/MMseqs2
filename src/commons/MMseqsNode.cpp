@@ -307,7 +307,7 @@ static std::mutex logMutex;
 static std::map<std::string, std::pair<size_t, size_t> > publishedLogs;
 static std::map<std::string, std::vector<size_t> > logChunkEnds;
 
-size_t MMseqsNode::syncLog(FILE *file, const std::string &log, size_t size) {
+static size_t syncLog(FILE *file, const std::string &log, size_t size) {
     if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
         Debug(Debug::ERROR) << "Cannot flush " << log << "\n";
         EXIT(EXIT_FAILURE);
@@ -329,30 +329,24 @@ size_t MMseqsNode::syncLog(FILE *file, const std::string &log, size_t size) {
     return published.first;
 }
 
-void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t claimsSize, size_t homeWindow) {
+void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t size) {
     size_t chunks = syncLog(file, log, size);
-    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(size) + "\t" + SSTR(claimsSize) + "\t" + SSTR(homeWindow) + (S3Client::isEnabled() ? "\t" + SSTR(chunks) : "") + "\n");
+    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(size) + (S3Client::isEnabled() ? "\t" + SSTR(chunks) : "") + "\n");
 }
 
-bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &size, size_t *claimsSize, size_t *homeWindow) {
+bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &size) {
     std::string file = log + ".progress";
     std::string content = readPolledFile(file);
     if (content.compare(0, runId.size(), runId) != 0) {
         return false;
     }
-    const char *columns[4];
-    if (Util::getWordsOfLine((char *) content.c_str() + runId.size(), columns, 4) < 4) {
+    const char *columns[2];
+    if (Util::getWordsOfLine((char *) content.c_str() + runId.size(), columns, 2) < 2) {
         Debug(Debug::ERROR) << "Cannot read " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
     key = Util::fast_atoi<size_t>(columns[0]);
     size = Util::fast_atoi<size_t>(columns[1]);
-    if (claimsSize != NULL) {
-        *claimsSize = Util::fast_atoi<size_t>(columns[2]);
-    }
-    if (homeWindow != NULL) {
-        *homeWindow = Util::fast_atoi<size_t>(columns[3]);
-    }
     return true;
 }
 
@@ -441,7 +435,7 @@ bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
     EXIT(EXIT_FAILURE);
 }
 
-void MMseqsNode::removeLog(const std::string &log, bool hasProgress) {
+void MMseqsNode::removeLog(const std::string &log) {
     if (S3Client::isEnabled()) {
         // the writer knows its chunks, another node reads their count in the progress
         size_t chunks = 0;
@@ -452,20 +446,18 @@ void MMseqsNode::removeLog(const std::string &log, bool hasProgress) {
             isPublished = it != publishedLogs.end();
             chunks = isPublished ? it->second.first : 0;
         }
-        if (isPublished == false && hasProgress) {
+        if (isPublished == false) {
             std::string progress = readPolledFile(log + ".progress");
-            const char *columns[5];
-            chunks = (progress.compare(0, runId.size(), runId) == 0 && Util::getWordsOfLine((char *) progress.c_str() + runId.size(), columns, 5) == 5)
-                     ? Util::fast_atoi<size_t>(columns[4]) : 0;
+            const char *columns[3];
+            chunks = (progress.compare(0, runId.size(), runId) == 0 && Util::getWordsOfLine((char *) progress.c_str() + runId.size(), columns, 3) == 3)
+                     ? Util::fast_atoi<size_t>(columns[2]) : 0;
         }
         const std::string object = S3Client::getObjectName(log);
 #pragma omp parallel for schedule(dynamic, 1)
         for (size_t i = 0; i < chunks; i++) {
             S3Client::remove(object + "." + SSTR(i));
         }
-        if (hasProgress) {
-            removeRunFile(log + ".progress");
-        }
+        removeRunFile(log + ".progress");
         if (FileUtil::fileExists(log.c_str())) {
             FileUtil::remove(log.c_str());
         }
@@ -475,9 +467,7 @@ void MMseqsNode::removeLog(const std::string &log, bool hasProgress) {
         return;
     }
     FileUtil::remove(log.c_str());
-    if (hasProgress) {
-        FileUtil::remove((log + ".progress").c_str());
-    }
+    FileUtil::remove((log + ".progress").c_str());
 }
 
 struct ExchangeFileHeader {
@@ -808,17 +798,6 @@ bool MMseqsNode::WorkQueue::takeItem(size_t item) {
         EXIT(EXIT_FAILURE);
     }
     return true;
-}
-
-// aws backend: a claim waits for a round trip, so the claims go out at once
-void MMseqsNode::WorkQueue::takeItems(size_t firstItem, const std::vector<unsigned char> &isTried, std::vector<unsigned char> &isTaken) {
-    const int threads = S3Client::isEnabled() ? std::max(1, static_cast<int>(std::count(isTried.begin(), isTried.end(), 1))) : 1;
-#pragma omp parallel for schedule(dynamic, 1) num_threads(threads) if (threads > 1)
-    for (size_t i = 0; i < isTried.size(); i++) {
-        if (isTried[i]) {
-            isTaken[i] = takeItem(firstItem + i);
-        }
-    }
 }
 
 size_t MMseqsNode::WorkQueue::takeNextItem() {
