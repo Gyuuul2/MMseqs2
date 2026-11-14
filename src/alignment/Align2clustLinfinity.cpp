@@ -5362,73 +5362,73 @@ int align2clustLinfinity(Parameters &par) {
                                           + SSTR(static_cast<size_t>(nodeCosts[groupNode] * 1000 / std::max((uint128) 1, totalAlignmentCells))) + " per mille of the cost");
             }
         }
-        // with claims or set cover, a window above the mean cost becomes rep key parts of about the mean cost, a key costs its squared length
-        if (par.clusteringMode == Parameters::SET_COVER || par.filterCluDBFile.empty()) {
-            const size_t windowCount = partitions.size() / targetSplitCount;
-            std::vector<PrefPartition> parts;
-            std::vector<size_t> cutKeys;
-            std::vector<uint128> cutWeights;
-            for (size_t window = 0; window < windowCount; window++) {
-                const PrefPartition *cells = partitions.data() + window * targetSplitCount;
-                const size_t keyBegin = cells[0].windowFirstKey;
-                const size_t keyEnd = (window + 1 < windowCount) ? cells[targetSplitCount].windowFirstKey : blockDbr.getSize();
-                uint128 windowCost = 0;
-                for (size_t split = 0; split < targetSplitCount; split++) {
-                    windowCost += cells[split].alignmentCells;
-                }
-                const size_t partCount = std::min<uint128>(keyEnd - keyBegin, (windowCost * windowCount + totalAlignmentCells - 1) / std::max((uint128) 1, totalAlignmentCells));
-                if (partCount <= 1) {
-                    parts.insert(parts.end(), cells, cells + targetSplitCount);
-                    continue;
-                }
-                uint128 windowWeight = 0;
-                for (int pass = 0; pass < 2; pass++) {
-                    cutKeys.assign(1, keyBegin);
-                    cutWeights.assign(1, 0);
-                    uint128 weight = 0;
-                    for (size_t range = blockDbr.findIdRange(keyBegin); range < blockDbr.getIndexSize() && static_cast<size_t>(blockIndex[range].id) < keyEnd; range++) {
-                        const size_t first = std::max(keyBegin, static_cast<size_t>(blockIndex[range].id));
-                        const size_t end = std::min(keyEnd, (range + 1 < blockDbr.getIndexSize()) ? static_cast<size_t>(blockIndex[range + 1].id) : blockDbr.getSize());
-                        const uint128 keyWeight = static_cast<uint128>(blockIndex[range].length) * blockIndex[range].length;
-                        // the first key of part p has at least p / partCount of the window weight before it
-                        while (pass == 1 && cutKeys.size() < partCount) {
-                            const uint128 cut = windowWeight * cutKeys.size() / partCount;
-                            const size_t key = std::max(cutKeys.back() + 1, first + static_cast<size_t>((std::max(cut, weight) - weight + keyWeight - 1) / keyWeight));
-                            if (key >= end) {
-                                break;
-                            }
-                            cutKeys.push_back(key);
-                            cutWeights.push_back(weight + keyWeight * (key - first));
+        // a window above the mean cost becomes rep key parts of about the mean cost, a key costs its squared length
+        const size_t windowCount = partitions.size() / targetSplitCount;
+        std::vector<PrefPartition> parts;
+        std::vector<size_t> cutKeys;
+        std::vector<uint128> cutWeights;
+        for (size_t window = 0; window < windowCount; window++) {
+            const PrefPartition *cells = partitions.data() + window * targetSplitCount;
+            const size_t keyBegin = cells[0].windowFirstKey;
+            const size_t keyEnd = (window + 1 < windowCount) ? cells[targetSplitCount].windowFirstKey : blockDbr.getSize();
+            uint128 windowCost = 0;
+            for (size_t split = 0; split < targetSplitCount; split++) {
+                windowCost += cells[split].alignmentCells;
+            }
+            const size_t partCount = std::min<uint128>(keyEnd - keyBegin, (windowCost * windowCount + totalAlignmentCells - 1) / std::max((uint128) 1, totalAlignmentCells));
+            if (partCount <= 1) {
+                parts.insert(parts.end(), cells, cells + targetSplitCount);
+                continue;
+            }
+            uint128 windowWeight = 0;
+            for (int pass = 0; pass < 2; pass++) {
+                cutKeys.assign(1, keyBegin);
+                cutWeights.assign(1, 0);
+                uint128 weight = 0;
+                for (size_t range = blockDbr.findIdRange(keyBegin); range < blockDbr.getIndexSize() && static_cast<size_t>(blockIndex[range].id) < keyEnd; range++) {
+                    const size_t first = std::max(keyBegin, static_cast<size_t>(blockIndex[range].id));
+                    const size_t end = std::min(keyEnd, (range + 1 < blockDbr.getIndexSize()) ? static_cast<size_t>(blockIndex[range + 1].id) : blockDbr.getSize());
+                    const uint128 keyWeight = static_cast<uint128>(blockIndex[range].length) * blockIndex[range].length;
+                    // the first key of part p has at least p / partCount of the window weight before it
+                    while (pass == 1 && cutKeys.size() < partCount) {
+                        const uint128 cut = windowWeight * cutKeys.size() / partCount;
+                        const size_t key = std::max(cutKeys.back() + 1, first + static_cast<size_t>((std::max(cut, weight) - weight + keyWeight - 1) / keyWeight));
+                        if (key >= end) {
+                            break;
                         }
-                        weight += keyWeight * (end - first);
+                        cutKeys.push_back(key);
+                        cutWeights.push_back(weight + keyWeight * (key - first));
                     }
-                    windowWeight = weight;
+                    weight += keyWeight * (end - first);
                 }
-                for (size_t part = 0; part < cutKeys.size(); part++) {
-                    const uint128 partWeight = ((part + 1 < cutKeys.size()) ? cutWeights[part + 1] : windowWeight) - cutWeights[part];
-                    for (size_t split = 0; split < targetSplitCount; split++) {
-                        PrefPartition cell = cells[split];
-                        cell.windowFirstKey = cutKeys[part];
-                        cell.repKeyEnd = (part + 1 < cutKeys.size()) ? cutKeys[part + 1] : cells[split].repKeyEnd;
-                        cell.alignmentCells = (cell.alignmentCells > 0) ? std::max<size_t>(1, static_cast<size_t>(cell.alignmentCells * partWeight / windowWeight)) : 0;
-                        parts.push_back(cell);
-                    }
+                windowWeight = weight;
+            }
+            for (size_t part = 0; part < cutKeys.size(); part++) {
+                const uint128 partWeight = ((part + 1 < cutKeys.size()) ? cutWeights[part + 1] : windowWeight) - cutWeights[part];
+                for (size_t split = 0; split < targetSplitCount; split++) {
+                    PrefPartition cell = cells[split];
+                    cell.windowFirstKey = cutKeys[part];
+                    cell.repKeyEnd = (part + 1 < cutKeys.size()) ? cutKeys[part + 1] : cells[split].repKeyEnd;
+                    cell.alignmentCells = (cell.alignmentCells > 0) ? std::max<size_t>(1, static_cast<size_t>(cell.alignmentCells * partWeight / windowWeight)) : 0;
+                    parts.push_back(cell);
                 }
             }
-            partitions.swap(parts);
         }
+        partitions.swap(parts);
 
-        // windows and parts in key order to the align group with the least cost per node, so that the groups pass the keys side by side
+        // windows and parts in key order to the align group with the fewest windows per node, so that the groups pass the keys side by side
         std::vector<uint128> groupCosts(alignGroupCount, 0);
+        std::vector<size_t> groupWindows(alignGroupCount, 0);
         windowAlignGroups.resize(partitions.size() / targetSplitCount);
         for (size_t window = 0; window < windowAlignGroups.size(); window++) {
             size_t windowGroup = 0;
             for (size_t group = 1; group < alignGroupCount; group++) {
-                if (groupCosts[group] * (groupNodeOffsets[windowGroup + 1] - groupNodeOffsets[windowGroup]) < groupCosts[windowGroup] * (groupNodeOffsets[group + 1] - groupNodeOffsets[group])) {
+                if (groupWindows[group] * (groupNodeOffsets[windowGroup + 1] - groupNodeOffsets[windowGroup]) < groupWindows[windowGroup] * (groupNodeOffsets[group + 1] - groupNodeOffsets[group])) {
                     windowGroup = group;
                 }
             }
             windowAlignGroups[window] = windowGroup;
+            groupWindows[windowGroup]++;
             for (size_t split = 0; split < targetSplitCount; split++) {
                 groupCosts[windowGroup] += partitions[window * targetSplitCount + split].alignmentCells;
             }
@@ -5437,7 +5437,7 @@ int align2clustLinfinity(Parameters &par) {
             alignGroupNodeBegin = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[alignGroup];
             alignGroupNodeEnd = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[alignGroup + 1];
             MMseqsNode::addPhaseValue(phaseValues, "Align group", SSTR(alignGroup) + " of " + SSTR(alignGroupCount) + " with " + SSTR(groupNodeOffsets[alignGroup + 1] - groupNodeOffsets[alignGroup]) + " nodes, "
-                                      + SSTR(std::count(windowAlignGroups.begin(), windowAlignGroups.end(), alignGroup)) + " of " + SSTR(windowAlignGroups.size()) + " windows and "
+                                      + SSTR(groupWindows[alignGroup]) + " of " + SSTR(windowAlignGroups.size()) + " windows and "
                                       + SSTR(static_cast<size_t>(groupCosts[alignGroup] * 1000 / std::max((uint128) 1, totalAlignmentCells))) + " per mille of the cost");
         }
     }
