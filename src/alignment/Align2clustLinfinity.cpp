@@ -5157,13 +5157,14 @@ int align2clustLinfinity(Parameters &par) {
     std::string phaseValues;
     Timer phaseValueTimer;
     size_t alignNodeCount = MMseqsNode::count - MMseqsNode::getFirstAlignNode();
-    // the first .partitions line holds the target split blocks
     const bool hasTargetSplits = alignNodeCount > 1;
     alignGroupNodeBegin = MMseqsNode::getFirstAlignNode();
     alignGroupNodeEnd = MMseqsNode::count;
+    // the first .partitions line holds the align group count kmermatcher chose, the second the target split blocks
     MMseqsNode::fetchFile(par.db2 + ".partitions");
     std::string partitionsData = MMseqsNode::readFile(par.db2 + ".partitions");
-    char *partitionLine = (char *) partitionsData.c_str();
+    const size_t alignGroupCount = Util::fast_atoi<size_t>(partitionsData.c_str());
+    char *partitionLine = Util::skipLine((char *) partitionsData.c_str());
     for (; hasTargetSplits && *partitionLine != '\n'; partitionLine += Util::skipWhitespace(partitionLine)) {
         targetSplitBlockOffsets.push_back(Util::fast_atoi<size_t>(partitionLine));
         partitionLine += Util::skipNoneWhitespace(partitionLine);
@@ -5214,7 +5215,6 @@ int align2clustLinfinity(Parameters &par) {
         }
 
         // the align nodes in groups, the master is in no group
-        const size_t alignGroupCount = MMseqsNode::getAlignGroupCount(par.align2clustSplit);
         std::vector<size_t> groupNodeOffsets(alignGroupCount + 1);
         for (size_t group = 0; group <= alignGroupCount; group++) {
             groupNodeOffsets[group] = group * alignNodeCount / alignGroupCount;

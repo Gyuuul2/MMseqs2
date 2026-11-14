@@ -656,6 +656,7 @@ struct KmerExchange {
     size_t pairTargetCount;
     size_t selfMergedSendSplitCount;
     bool hasTargetSplits;
+    size_t alignGroupCount;
     size_t hashRangeCount;
     size_t hashSubRangesPerRange;
     size_t hashSubRangeCount;
@@ -2544,8 +2545,7 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     TargetSplitFiles targetSplitFiles;
     if (exchange.hasTargetSplits) {
         // runs of whole blocks, an align group shares the target splits of a window
-        size_t alignGroupCount = MMseqsNode::getAlignGroupCount(par.align2clustSplit);
-        size_t alignNodeCount = (MMseqsNode::count - MMseqsNode::getFirstAlignNode() + alignGroupCount - 1) / alignGroupCount;
+        size_t alignNodeCount = (MMseqsNode::count - MMseqsNode::getFirstAlignNode() + exchange.alignGroupCount - 1) / exchange.alignGroupCount;
         size_t blockCount = seqDbr.getBlockKeyOffsets().size() - 1;
         size_t targetSplitCount = std::min(blockCount, MAX_TARGET_SPLITS_PER_NODE * alignNodeCount);
         targetSplitBlockOffsets.resize(targetSplitCount + 1);
@@ -2614,7 +2614,7 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             pairBytes += partitionPairSizes[partition];
         }
         // every align group gets as many windows
-        targetSplitFiles.rowCost = std::max((size_t) 1, static_cast<size_t>(estimatedCost * exchange.pairTargetCount / std::max((size_t) 1, pairBytes) / mergeSplitCount / MMseqsNode::getAlignGroupCount(par.align2clustSplit)));
+        targetSplitFiles.rowCost = std::max((size_t) 1, static_cast<size_t>(estimatedCost * exchange.pairTargetCount / std::max((size_t) 1, pairBytes) / mergeSplitCount / exchange.alignGroupCount));
         targetSplitFiles.rowSize = 1024 * 1024;
     }
     std::vector<size_t> splitPartitionOffsets(mergeSplitCount + 1, partitionCount);
@@ -3088,7 +3088,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
 
     struct rlimit openFileLimit = {0, 0};
     getrlimit(RLIMIT_NOFILE, &openFileLimit);
-    size_t minOpenFiles = seqDbr.getDataFileCnt() + 64 + kmerGroups.count + 2 * MMseqsNode::count + 2 * (exchange.hasTargetSplits ? MAX_TARGET_SPLITS_PER_NODE * (MMseqsNode::count - MMseqsNode::getFirstAlignNode()) : 1);
+    // align2clust opens three files per target split
+    size_t minOpenFiles = seqDbr.getDataFileCnt() + 64 + kmerGroups.count + 2 * MMseqsNode::count + 3 * (exchange.hasTargetSplits ? MAX_TARGET_SPLITS_PER_NODE * (MMseqsNode::count - MMseqsNode::getFirstAlignNode()) : 1);
     if (minOpenFiles > openFileLimit.rlim_cur) {
         Debug(Debug::ERROR) << "Raise the open file limit (ulimit -n) to at least " << minOpenFiles << "\n";
         EXIT(EXIT_FAILURE);
@@ -3123,7 +3124,12 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         }
     }
     size_t localNodes = 0;
-    size_t minPassLimit = std::max((size_t) 1, getPassLimit(MMseqsNode::getSmallestMemoryLimit(par.db2 + ".memory", memoryLimit, par.threads, par.localTmp, &localNodes)));
+    size_t smallestMemoryLimit = MMseqsNode::getSmallestMemoryLimit(par.db2 + ".memory", memoryLimit, par.threads, par.localTmp, &localNodes);
+    size_t minPassLimit = std::max((size_t) 1, getPassLimit(smallestMemoryLimit));
+    // --align2clust-split 0: floor(sqrt(align nodes)), fewer if a group node's share of the sequences does not fit a quarter of the smallest memory limit
+    size_t alignNodeCount = MMseqsNode::count - MMseqsNode::getFirstAlignNode();
+    exchange.alignGroupCount = (par.align2clustSplit > 0) ? par.align2clustSplit : std::min(static_cast<size_t>(std::sqrt(static_cast<double>(alignNodeCount))), alignNodeCount * (smallestMemoryLimit / 4) / seqDbr.getDataSize());
+    exchange.alignGroupCount = std::min(alignNodeCount, std::max((size_t) 1, exchange.alignGroupCount));
     // localNodes counts this node too when its --local-tmp is local flash
     if (par.localTmp.empty() == false && localNodes == 0) {
         MMseqsNode::reportUnusableLocalTmp("Cannot keep the last exchange file groups in --local-tmp " + par.localTmp + ": it is not local flash");
@@ -3283,8 +3289,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
             partitionRows.push_back(std::make_pair(Util::fast_atoi<size_t>(row), row));
         }
         SORT_SERIAL(partitionRows.begin(), partitionRows.end());
-        // first line: first block of every target split
-        std::string sortedPartitions;
+        // first line: the align group count, second line: first block of every target split
+        std::string sortedPartitions = SSTR(exchange.alignGroupCount) + "\n";
         for (size_t i = 0; i < targetSplitBlockOffsets.size(); i++) {
             sortedPartitions += SSTR(targetSplitBlockOffsets[i]) + ((i + 1 < targetSplitBlockOffsets.size()) ? "\t" : "\n");
         }
