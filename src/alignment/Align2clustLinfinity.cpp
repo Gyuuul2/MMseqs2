@@ -2896,6 +2896,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<DBKeyType> loadKeys;
     std::vector<std::vector<size_t> > threadRawEntries(serviceThreads);
     size_t servedFileCount = 0;
+    size_t servedPieceCount = 0;
+    size_t maxPassPieceCount = 0;
+    size_t receivedPieceCount = 0;
     size_t servedSize = 0;
     size_t servedEntrySize = 0;
     size_t receivedServedEntriesSize = 0;
@@ -2913,7 +2916,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t liveServedSize = 0;
     size_t maxLiveServedSize = 0;
     double servingSeconds = 0;
-    double servedFileWriterWaitSeconds = 0;
     double readingSeconds = 0;
     double pollingSeconds = 0;
     double sourceLoadSeconds = 0;
@@ -2984,13 +2986,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #ifdef OPENMP
             omp_set_num_threads(1);
 #endif
-            // own request: code offsets per node, files and keys received per node
+            // own request: code offsets per node, pieces and keys received per node
             struct SequenceRequest {
                 FetchedSequences *sequences;
                 size_t number;
                 size_t size;
                 std::vector<size_t> codeOffsets;
-                std::vector<size_t> receivedFiles;
+                std::vector<size_t> receivedPieces;
                 std::vector<size_t> receivedKeys;
                 bool isComplete;
             };
@@ -2999,10 +3001,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             bool isLastRequested = false;
             FetchedSequences *requestedSequences = NULL;
             std::vector<char> requestCodes;
-            // served file: request, file of the request, entry bytes, keys
-            struct ServedFile {
+            // piece of a served file: request, piece of the request, served file and its size, offset, bytes, keys
+            struct ServedPiece {
                 size_t request;
+                size_t piece;
                 size_t file;
+                size_t fileSize;
+                size_t offset;
                 size_t size;
                 size_t keyCount;
             };
@@ -3016,10 +3021,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             // the master progress while the gate is closed, about as often as before the faster polls
             double nextGateRead = 0;
             std::vector<std::string> requestNames;
-            std::vector<std::vector<ServedFile> > servedFiles(nodes);
-            // requesting node: progress, code range of this node per open request, codes served so far, served files not yet deleted
+            std::vector<std::vector<ServedPiece> > servedPieces(nodes);
+            // requesting node: progress, code range of this node per open request, codes served so far, pieces not yet deleted
             struct Requester {
-                Requester() : requestCount(0), receivedCount(0), isLast(false), isDone(false), nextProgressRead(0), servedCount(0), codePos(0), lastKey(0), file(0) {}
+                Requester() : requestCount(0), receivedCount(0), isLast(false), isDone(false), nextProgressRead(0), servedCount(0), codePos(0), lastKey(0), piece(0) {}
                 size_t requestCount;
                 size_t receivedCount;
                 bool isLast;
@@ -3029,8 +3034,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 size_t servedCount;
                 size_t codePos;
                 DBKeyType lastKey;
-                size_t file;
-                std::vector<ServedFile> files;
+                size_t piece;
+                std::vector<ServedPiece> pieces;
             };
             std::vector<Requester> requesters(nodes);
             size_t requesterCount = 0;
@@ -3046,12 +3051,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             std::vector<DBKeyType> servedKeys;
             std::vector<DBKeyType> rawKeys;
             std::vector<size_t> requestOffsets;
+            // the pieces of a pass in one served file
             std::vector<char> servedFileData;
-            std::vector<char> writtenServedFileData;
-            // a thread writes the served file while the next one is built
-            std::thread servedFileWriter;
-            unsigned int writtenRequester = UINT_MAX;
-            ServedFile writtenFile = { 0, 0, 0, 0 };
+            std::vector<std::pair<unsigned int, ServedPiece> > passPieces;
+            std::vector<size_t> filePieceCounts;
+            // the next pass starts with the first requester left out of a full served file
+            unsigned int firstRequester = rank + 1;
             // a thread loads the keys of this node while the service thread serves and receives
             std::thread ownKeyLoader;
             FetchedSequences *ownKeyRequest = NULL;
@@ -3060,22 +3065,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             std::vector<unsigned int> missingFileAttempts(nodes, 0);
             std::string requestProgress = requests + "." + SSTR(rank) + ".progress";
             std::string servedProgress = served + "." + SSTR(rank) + ".progress";
-            const auto getServedFile = [&](unsigned int alignNode, unsigned int requester, const ServedFile &file) {
-                return served + "." + SSTR(alignNode) + "." + SSTR(requester) + "." + SSTR(file.request) + "." + SSTR(file.file);
-            };
-            const auto finishServedFileWrite = [&]() {
-                if (servedFileWriter.joinable()) {
-                    Timer waitTimer;
-                    servedFileWriter.join();
-                    servedFileWriterWaitSeconds += waitTimer.getTimediff();
-                }
-                if (writtenRequester != UINT_MAX) {
-                    requesters[writtenRequester].files.push_back(writtenFile);
-                    liveServedSize += writtenFile.size;
-                    maxLiveServedSize = std::max(maxLiveServedSize, liveServedSize);
-                    writtenRequester = UINT_MAX;
-                    isServedProgressChanged = true;
-                }
+            const auto getServedFile = [&](unsigned int alignNode, size_t file) {
+                return served + "." + SSTR(alignNode) + "." + SSTR(file);
             };
             MMseqsNode::WaitWarning waitWarning;
             time_t assignedKeysReadTime = 0;
@@ -3148,7 +3139,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         if (requestCodes.empty() == false) {
                             MMseqsNode::writeExchangeFile(requests + "/" + SSTR(rank) + "." + SSTR(request.number), request.number, requestCodes.data(), requestCodes.size(), "", std::vector<uint64_t>(), 1);
                             request.size = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + requestCodes.size();
-                            request.receivedFiles.assign(nodes, 0);
+                            request.receivedPieces.assign(nodes, 0);
                             request.receivedKeys.assign(nodes, 0);
                             request.isComplete = false;
                             ownRequests.push_back(request);
@@ -3189,30 +3180,31 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     bool hasProgress = MMseqsNode::readRunFile(served + "." + SSTR(node) + ".progress", content);
                     pollingSeconds += pollTimer.getTimediff();
                     if (hasProgress) {
-                        servedFiles[node].clear();
+                        servedPieces[node].clear();
                         for (char *line = &content[0]; *line != '\0'; line = Util::skipLine(line)) {
-                            const char *columns[5];
-                            if (Util::getWordsOfLine(line, columns, 5) == 5 && Util::fast_atoi<size_t>(columns[0]) == rank) {
-                                ServedFile file = { Util::fast_atoi<size_t>(columns[1]), Util::fast_atoi<size_t>(columns[2]), Util::fast_atoi<size_t>(columns[3]), Util::fast_atoi<size_t>(columns[4]) };
-                                servedFiles[node].push_back(file);
+                            const char *columns[8];
+                            if (Util::getWordsOfLine(line, columns, 8) == 8 && Util::fast_atoi<size_t>(columns[0]) == rank) {
+                                ServedPiece piece = { Util::fast_atoi<size_t>(columns[1]), Util::fast_atoi<size_t>(columns[2]), Util::fast_atoi<size_t>(columns[3]), Util::fast_atoi<size_t>(columns[4]),
+                                                      Util::fast_atoi<size_t>(columns[5]), Util::fast_atoi<size_t>(columns[6]), Util::fast_atoi<size_t>(columns[7]) };
+                                servedPieces[node].push_back(piece);
                             }
                         }
                     }
                     for (size_t i = 0; i < ownRequests.size(); i++) {
                         SequenceRequest &request = ownRequests[i];
-                        for (size_t j = 0; j < servedFiles[node].size(); j++) {
-                            const ServedFile &file = servedFiles[node][j];
-                            if (file.request != request.number || file.file != request.receivedFiles[node]) {
+                        for (size_t j = 0; j < servedPieces[node].size(); j++) {
+                            const ServedPiece &piece = servedPieces[node][j];
+                            if (piece.request != request.number || piece.piece != request.receivedPieces[node]) {
                                 continue;
                             }
-                            // the next served file whole, a failed read is tried again after the next progress read
-                            std::string fileName = getServedFile(node, rank, file);
+                            // the next piece from its served file, a failed read is tried again after the next progress read
+                            std::string fileName = getServedFile(node, piece.file);
                             size_t observedSize;
                             uint64_t observedNumber;
                             int lastError;
                             Timer readTimer;
                             objectReadCount++;
-                            int fd = MMseqsNode::tryOpenExchangeFile(fileName, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + file.size, file.request, observedSize, observedNumber, lastError);
+                            int fd = MMseqsNode::tryOpenExchangeFile(fileName, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.fileSize, piece.file, observedSize, observedNumber, lastError);
                             if (fd < 0) {
                                 readingSeconds += readTimer.getTimediff();
                                 if (lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
@@ -3220,20 +3212,20 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                     EXIT(EXIT_FAILURE);
                                 }
                                 failIfMissingTooLong(missingFileSince[node], missingFileAttempts[node], "Cannot open complete served sequence file " + fileName
-                                                     + describeServedFile(MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + file.size, observedSize, file.request, observedNumber, lastError));
+                                                     + describeServedFile(MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.fileSize, observedSize, piece.file, observedNumber, lastError));
                                 break;
                             }
-                            if (receivedEntries.size() < file.size) {
-                                receivedEntries.resize(file.size);
+                            if (receivedEntries.size() < piece.size) {
+                                receivedEntries.resize(piece.size);
                             }
                             // the parts keep their errors
-                            size_t partCount = (file.size + BatchReader::MAX_READ_REQUEST_SIZE - 1) / BatchReader::MAX_READ_REQUEST_SIZE;
+                            size_t partCount = (piece.size + BatchReader::MAX_READ_REQUEST_SIZE - 1) / BatchReader::MAX_READ_REQUEST_SIZE;
                             std::vector<int> readErrors(partCount, 0);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(serviceThreads)
                             for (size_t part = 0; part < partCount; part++) {
                                 size_t offset = part * BatchReader::MAX_READ_REQUEST_SIZE;
                                 int partError;
-                                if (MMseqsNode::tryPreadAll(fd, receivedEntries.data() + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, file.size - offset), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + offset, partError) == false) {
+                                if (MMseqsNode::tryPreadAll(fd, receivedEntries.data() + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, piece.size - offset), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.offset + offset, partError) == false) {
                                     readErrors[part] = (partError != 0) ? partError : -1;
                                 }
                             }
@@ -3257,14 +3249,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             FetchedSequences *sequences = request.sequences;
                             size_t firstKey = sequences->fetchSourceKeyOffsets[node] + request.receivedKeys[node];
                             Timer unpackTimer;
-                            unpackEntries(receivedEntries.data(), file.keyCount, sequences->entryOffsets.data() + firstKey, sequences->entries, serviceThreads);
+                            unpackEntries(receivedEntries.data(), piece.keyCount, sequences->entryOffsets.data() + firstKey, sequences->entries, serviceThreads);
                             unpackSeconds += unpackTimer.getTimediff();
-                            for (size_t key = firstKey; key < firstKey + file.keyCount; key++) {
+                            for (size_t key = firstKey; key < firstKey + piece.keyCount; key++) {
                                 receivedEntrySize += (sequences->entries[sequences->entryOffsets[key]] != '\0') ? sequences->entryOffsets[key + 1] - sequences->entryOffsets[key] : 0;
                             }
-                            request.receivedKeys[node] += file.keyCount;
-                            request.receivedFiles[node]++;
-                            receivedServedEntriesSize += file.size;
+                            request.receivedKeys[node] += piece.keyCount;
+                            request.receivedPieces[node]++;
+                            receivedPieceCount++;
+                            receivedServedEntriesSize += piece.size;
                             servedProgressSeconds[node] = fastReadSeconds;
                             nextServedProgressReads[node] = serviceTimer.getTimediff() + fastReadSeconds;
                             hasWorked = true;
@@ -3361,10 +3354,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         }
                     }
                 }
-                // a served file a pass for each requesting node
+                // a piece a pass for each requesting node
                 bool isServing = false;
-                for (unsigned int i = 1; i < nodes; i++) {
-                    unsigned int node = (rank + i) % nodes;
+                size_t passEntrySize = 0;
+                size_t passKeyCount = 0;
+                unsigned int deferredRequester = UINT_MAX;
+                for (unsigned int i = 0; i < nodes; i++) {
+                    unsigned int node = (firstRequester + i) % nodes;
                     Requester &requester = requesters[node];
                     if (requester.isDone) {
                         continue;
@@ -3402,23 +3398,26 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[2 + rank]));
                                 requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[3 + rank]));
                             }
-                            // the files of the received requests go
-                            size_t keptFiles = 0;
-                            for (size_t j = 0; j < requester.files.size(); j++) {
-                                if (requester.files[j].request < received) {
-                                    MMseqsNode::removeExchangeFile(getServedFile(rank, node, requester.files[j]), requester.files[j].request);
-                                    deleteCount++;
-                                    liveServedSize -= requester.files[j].size;
+                            // the pieces of the received requests go, a served file with its last piece
+                            size_t keptPieces = 0;
+                            for (size_t j = 0; j < requester.pieces.size(); j++) {
+                                const ServedPiece &piece = requester.pieces[j];
+                                if (piece.request < received) {
+                                    if (--filePieceCounts[piece.file] == 0) {
+                                        MMseqsNode::removeExchangeFile(getServedFile(rank, piece.file), piece.file);
+                                        deleteCount++;
+                                        liveServedSize -= piece.fileSize;
+                                    }
                                     isServedProgressChanged = true;
                                 } else {
-                                    requester.files[keptFiles++] = requester.files[j];
+                                    requester.pieces[keptPieces++] = piece;
                                 }
                             }
-                            requester.files.resize(keptFiles);
+                            requester.pieces.resize(keptPieces);
                             requester.isDone = isLast && received == count;
                         }
                     }
-                    // one served file of the next open request
+                    // one piece of the next open request
                     while (requester.servedCount < requester.requestCount) {
                         size_t request = 0;
                         while (request < requester.openRequests.size() && requester.openRequests[request] != requester.servedCount) {
@@ -3433,6 +3432,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         if (codeBegin == codeEnd) {
                             requester.servedCount++;
                             continue;
+                        }
+                        // a full pass leaves the rest to the next pass
+                        if (passEntrySize >= servedFileEntrySize || passKeyCount >= maxServedKeys) {
+                            deferredRequester = (deferredRequester == UINT_MAX) ? node : deferredRequester;
+                            break;
                         }
                         Timer servingTimer;
                         // the codes of the next keys, a request is read in pieces
@@ -3472,25 +3476,27 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         while (codesEnd > requestCodes.data() && static_cast<unsigned char>(codesEnd[-1]) >= 0x80) {
                             codesEnd--;
                         }
-                        // the unassigned entries of at least one key, up to servedFileEntrySize bytes and maxServedKeys keys
+                        // the unassigned entries of at least one key, up to servedFileEntrySize bytes and maxServedKeys keys a pass
                         servedKeys.clear();
                         const char *code = requestCodes.data();
                         size_t keyRange = SIZE_MAX;
-                        for (size_t entrySize = 0; servedKeys.size() < maxServedKeys && code < codesEnd;) {
+                        while (passKeyCount + servedKeys.size() < maxServedKeys && code < codesEnd) {
                             const char *nextCode = code;
                             DBKeyType key = requester.lastKey + Util::getPrefKey(nextCode);
                             size_t keySize = isAssigned(key) ? 0 : seqDbr.getSeqLenFromRange(keyRange, key) + 2;
-                            if (servedKeys.empty() == false && entrySize + keySize > servedFileEntrySize) {
+                            if (servedKeys.empty() == false && passEntrySize + keySize > servedFileEntrySize) {
                                 break;
                             }
                             servedKeys.push_back(key);
                             requester.lastKey = key;
                             code = nextCode;
-                            entrySize += keySize;
+                            passEntrySize += keySize;
                         }
                         requester.codePos += code - requestCodes.data();
                         const DBKeyType *keys = servedKeys.data();
                         size_t keyCount = servedKeys.size();
+                        // the bitmap of a piece takes whole bytes
+                        passKeyCount += (keyCount + 7) / 8 * 8;
                         requestOffsets.resize(keyCount + 1);
                         requestOffsets[0] = (keyCount + 7) / 8;
 #pragma omp parallel num_threads(serviceThreads)
@@ -3505,7 +3511,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         for (size_t j = 0; j < keyCount; j++) {
                             requestOffsets[j + 1] += requestOffsets[j];
                         }
-                        servedFileData.resize(requestOffsets[keyCount]);
+                        size_t pieceOffset = servedFileData.size();
+                        // the served file of a pass fits maxServedFileSize
+                        servedFileData.reserve(maxServedFileSize);
+                        servedFileData.resize(pieceOffset + requestOffsets[keyCount]);
                         // an empty slot marks an assigned key
 #pragma omp parallel for schedule(static) num_threads(serviceThreads)
                         for (size_t byte = 0; byte < requestOffsets[0]; byte++) {
@@ -3513,47 +3522,34 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             for (size_t j = 8 * byte; j < std::min(keyCount, 8 * byte + 8); j++) {
                                 bits |= static_cast<unsigned char>(requestOffsets[j + 1] == requestOffsets[j]) << (j % 8);
                             }
-                            servedFileData[byte] = static_cast<char>(bits);
+                            servedFileData[pieceOffset + byte] = static_cast<char>(bits);
                         }
                         rawKeys.clear();
-                        copyEntries(keys, keyCount, requestOffsets.data(), servedFileData.data(), &rawKeys);
-                        size_t servedFileSize = requestOffsets[keyCount];
+                        copyEntries(keys, keyCount, requestOffsets.data(), servedFileData.data() + pieceOffset, &rawKeys);
+                        size_t pieceSize = requestOffsets[keyCount];
                         requestOffsets.resize(rawKeys.size() + 1);
                         requestOffsets[0] = 0;
                         size_t rawKeyRange = SIZE_MAX;
                         for (size_t j = 0; j < rawKeys.size(); j++) {
                             requestOffsets[j + 1] = requestOffsets[j] + seqDbr.getSeqLenFromRange(rawKeyRange, rawKeys[j]) + 2;
                         }
-                        servedFileData.resize(servedFileSize + requestOffsets[rawKeys.size()]);
-                        copyEntries(rawKeys.data(), rawKeys.size(), requestOffsets.data(), servedFileData.data() + servedFileSize, NULL);
-                        servedFileSize += requestOffsets[rawKeys.size()];
+                        servedFileData.resize(pieceOffset + pieceSize + requestOffsets[rawKeys.size()]);
+                        copyEntries(rawKeys.data(), rawKeys.size(), requestOffsets.data(), servedFileData.data() + pieceOffset + pieceSize, NULL);
+                        pieceSize += requestOffsets[rawKeys.size()];
                         size_t entryRange = SIZE_MAX;
                         for (size_t j = 0; j < keyCount; j++) {
                             servedEntrySize += isAssigned(keys[j]) ? 0 : seqDbr.getSeqLenFromRange(entryRange, keys[j]) + 2;
                         }
                         servingSeconds += servingTimer.getTimediff();
-                        finishServedFileWrite();
-                        servedFileData.swap(writtenServedFileData);
-                        writtenFile.request = requester.servedCount;
-                        writtenFile.file = requester.file;
-                        writtenFile.size = servedFileSize;
-                        writtenFile.keyCount = keyCount;
-                        writtenRequester = node;
-                        std::string servedFile = getServedFile(rank, node, writtenFile);
-                        uint64_t servedRequest = writtenFile.request;
-                        servedFileWriter = std::thread([&, servedFile, servedRequest, servedFileSize]() {
-                            Timer writeTimer;
-                            MMseqsNode::writeExchangeFile(servedFile, servedRequest, writtenServedFileData.data(), servedFileSize, "", std::vector<uint64_t>(), serviceThreads);
-                            servedFileWriteSeconds += writeTimer.getTimediff();
-                        });
-                        servedSize += servedFileSize;
-                        servedFileCount++;
-                        objectWriteCount++;
-                        requester.file++;
+                        ServedPiece piece = { requester.servedCount, requester.piece, servedFileCount, 0, pieceOffset, pieceSize, keyCount };
+                        passPieces.push_back(std::make_pair(node, piece));
+                        servedSize += pieceSize;
+                        servedPieceCount++;
+                        requester.piece++;
                         if (requester.codePos == codeEnd - codeBegin) {
                             requester.codePos = 0;
                             requester.lastKey = 0;
-                            requester.file = 0;
+                            requester.piece = 0;
                             requester.servedCount++;
                         }
                         hasWorked = true;
@@ -3561,14 +3557,33 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                     isServing |= requester.isDone == false;
                 }
-                finishServedFileWrite();
-                // the served files not yet deleted, per requester
+                firstRequester = (deferredRequester == UINT_MAX) ? firstRequester : deferredRequester;
+                if (passPieces.empty() == false) {
+                    Timer writeTimer;
+                    MMseqsNode::writeExchangeFile(getServedFile(rank, servedFileCount), servedFileCount, servedFileData.data(), servedFileData.size(), "", std::vector<uint64_t>(), serviceThreads);
+                    servedFileWriteSeconds += writeTimer.getTimediff();
+                    for (size_t j = 0; j < passPieces.size(); j++) {
+                        passPieces[j].second.fileSize = servedFileData.size();
+                        requesters[passPieces[j].first].pieces.push_back(passPieces[j].second);
+                    }
+                    filePieceCounts.push_back(passPieces.size());
+                    maxPassPieceCount = std::max(maxPassPieceCount, passPieces.size());
+                    liveServedSize += servedFileData.size();
+                    maxLiveServedSize = std::max(maxLiveServedSize, liveServedSize);
+                    passPieces.clear();
+                    servedFileData.clear();
+                    servedFileCount++;
+                    objectWriteCount++;
+                    isServedProgressChanged = true;
+                }
+                // the pieces not yet deleted, per requester
                 if (isServedProgressChanged) {
                     std::string content;
                     for (unsigned int node = 0; node < nodes; node++) {
-                        for (size_t i = 0; i < requesters[node].files.size(); i++) {
-                            const ServedFile &file = requesters[node].files[i];
-                            content += SSTR(node) + "\t" + SSTR(file.request) + "\t" + SSTR(file.file) + "\t" + SSTR(file.size) + "\t" + SSTR(file.keyCount) + "\n";
+                        for (size_t i = 0; i < requesters[node].pieces.size(); i++) {
+                            const ServedPiece &piece = requesters[node].pieces[i];
+                            content += SSTR(node) + "\t" + SSTR(piece.request) + "\t" + SSTR(piece.piece) + "\t" + SSTR(piece.file) + "\t" + SSTR(piece.fileSize)
+                                       + "\t" + SSTR(piece.offset) + "\t" + SSTR(piece.size) + "\t" + SSTR(piece.keyCount) + "\n";
                         }
                     }
                     MMseqsNode::publishRunFile(servedProgress, content);
@@ -4239,12 +4254,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     if (isAligningNode) {
         serviceThread.join();
         MMseqsNode::addPhaseValue(phaseValues, "Sequence exchange bytes", SSTR(servedSize) + " served for " + SSTR(servedEntrySize) + " entry bytes, " + SSTR(receivedServedEntriesSize) + " received, "
-                                  + SSTR(requestCount) + " requests");
+                                  + SSTR(requestCount) + " requests, " + SSTR(receivedPieceCount) + " received pieces");
         MMseqsNode::addPhaseSeconds(phaseValues, "service: serving the requests", servingSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: loading the source sequences", sourceLoadSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: packing the served entries", packSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: writing the served files", servedFileWriteSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "service: waiting for the served file writer", servedFileWriterWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: reading the served entries", readingSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: unpacking the served entries", unpackSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: polling", pollingSeconds);
@@ -4253,7 +4267,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                   + SSTR(deleteCount) + " deletes in " + SSTR(static_cast<size_t>(serviceTimer.getTimediff())) + " s");
         MMseqsNode::addPhaseValue(phaseValues, "Request progress reads", SSTR(requestProgressReadCount) + ", unchanged: " + SSTR(requestProgressReadCount - requestProgressChangeCount)
                                   + ", changes: " + SSTR(requestProgressChangeCount) + ", request listings: " + SSTR(requestListingCount));
-        MMseqsNode::addPhaseValue(phaseValues, "Served files", SSTR(servedFileCount) + ", at most " + SSTR(maxLiveServedSize) + " bytes not yet deleted");
+        MMseqsNode::addPhaseValue(phaseValues, "Served files", SSTR(servedFileCount) + ", at most " + SSTR(maxLiveServedSize) + " bytes not yet deleted, " + SSTR(servedPieceCount) + " pieces, at most "
+                                  + SSTR(maxPassPieceCount) + " pieces a file");
     }
     delete[] currentSequences.entries;
     delete[] nextSequences.entries;
