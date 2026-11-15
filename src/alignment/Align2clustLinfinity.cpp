@@ -25,6 +25,7 @@
 #include <list>
 #include <queue>
 #include <deque>
+#include <map>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -829,6 +830,11 @@ static void unpackEntries(const char *servedEntries, size_t keyCount, const size
 static const size_t SERVICE_POLL_NODES = 8;
 // progress or index reads per node and second
 static const size_t PROGRESS_READS_PER_SECOND = 100;
+
+// dev: wall clock seconds, so that the times of two nodes compare
+static double getWallSeconds() {
+    return std::chrono::duration<double>(std::chrono::system_clock::now().time_since_epoch()).count();
+}
 
 // prefix sums in parallel
 static void sumOffsets(size_t *offsets, size_t count, int threads) {
@@ -2869,6 +2875,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<MemberAligners *> threadMemberAligners(par.threads, NULL);
     double waitSeconds = 0;
     double sequenceWaitSeconds = 0;
+    // dev: sequence waits below 10 ms, 100 ms, 1 s and above
+    size_t sequenceWaitCounts[4] = { 0, 0, 0, 0 };
+    double sequenceWaitSums[4] = { 0, 0, 0, 0 };
     double alignedCells = 0;
     double alignSeconds = 0;
     // wall time of the lookup blocks, not the sum of the thread times
@@ -2910,6 +2919,19 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t requestProgressReadCount = 0;
     size_t requestProgressChangeCount = 0;
     size_t requestListingCount = 0;
+    // dev: the round trips of the requests and the parts of their last pieces
+    size_t timedRequestCount = 0;
+    size_t owedNodeSum = 0;
+    size_t noticedRequestCount = 0;
+    size_t listedNoticeCount = 0;
+    double requestRoundTripSeconds = 0;
+    double maxRequestRoundTrip = 0;
+    double requestNoticeSeconds = 0;
+    double requestServeSeconds = 0;
+    double requestDetectSeconds = 0;
+    double requestReadSeconds = 0;
+    double afterLastPieceSeconds = 0;
+    double lastPieceTime = 0;
     size_t objectReadCount = 0;
     size_t objectWriteCount = 0;
     size_t deleteCount = 0;
@@ -2995,6 +3017,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 std::vector<size_t> receivedPieces;
                 std::vector<size_t> receivedKeys;
                 bool isComplete;
+                double writtenTime;
+                double noticeSeconds;
+                double serveSeconds;
+                double detectSeconds;
+                double readSeconds;
+                double lastPieceTime;
             };
             std::deque<SequenceRequest> ownRequests;
             size_t receivedRequestCount = 0;
@@ -3010,6 +3038,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 size_t offset;
                 size_t size;
                 size_t keyCount;
+                double requestTime;
+                double noticeTime;
+                double publishTime;
             };
             std::vector<double> nextServedProgressReads(nodes, 0);
             // seconds to the next read of a node that owes a request, doubled up to progressSeconds while it has not served
@@ -3024,7 +3055,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             std::vector<std::vector<ServedPiece> > servedPieces(nodes);
             // requesting node: progress, code range of this node per open request, codes served so far, pieces not yet deleted
             struct Requester {
-                Requester() : requestCount(0), receivedCount(0), isLast(false), isDone(false), nextProgressRead(0), servedCount(0), codePos(0), lastKey(0), piece(0) {}
+                Requester() : requestCount(0), receivedCount(0), isLast(false), isDone(false), nextProgressRead(0), servedCount(0), codePos(0), lastKey(0), piece(0), isListed(false) {}
                 size_t requestCount;
                 size_t receivedCount;
                 bool isLast;
@@ -3036,6 +3067,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 DBKeyType lastKey;
                 size_t piece;
                 std::vector<ServedPiece> pieces;
+                // dev: request number to its written time and the time this node noticed it
+                std::map<size_t, std::pair<double, double> > requestTimes;
+                bool isListed;
             };
             std::vector<Requester> requesters(nodes);
             size_t requesterCount = 0;
@@ -3045,7 +3079,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             }
             // seconds between two reads of the progress file of a node
             const double progressSeconds = std::max(BATCH_READ_SECONDS, 2.0 * requesterCount / PROGRESS_READS_PER_SECOND);
-            std::vector<const char *> requestColumns(nodes + 3);
+            std::vector<const char *> requestColumns(nodes + 4);
             bool isServedProgressChanged = false;
             std::vector<char> receivedEntries;
             std::vector<DBKeyType> servedKeys;
@@ -3142,11 +3176,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             request.receivedPieces.assign(nodes, 0);
                             request.receivedKeys.assign(nodes, 0);
                             request.isComplete = false;
+                            request.writtenTime = getWallSeconds();
+                            request.noticeSeconds = request.serveSeconds = request.detectSeconds = request.readSeconds = request.lastPieceTime = 0;
                             ownRequests.push_back(request);
                             size_t owedCount = 0;
                             for (unsigned int node = 0; node < nodes; node++) {
                                 owedCount += request.codeOffsets[node + 1] > request.codeOffsets[node];
                             }
+                            owedNodeSum += owedCount;
                             fastReadSeconds = std::max(0.01, 2.0 * owedCount / PROGRESS_READS_PER_SECOND);
                             fastReadEnd = serviceTimer.getTimediff() + BATCH_READ_SECONDS;
                             std::fill(servedProgressSeconds.begin(), servedProgressSeconds.end(), fastReadSeconds);
@@ -3178,14 +3215,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                     progressReadCount++;
                     bool hasProgress = MMseqsNode::readRunFile(served + "." + SSTR(node) + ".progress", content);
+                    const double progressTime = getWallSeconds();
                     pollingSeconds += pollTimer.getTimediff();
                     if (hasProgress) {
                         servedPieces[node].clear();
                         for (char *line = &content[0]; *line != '\0'; line = Util::skipLine(line)) {
-                            const char *columns[8];
-                            if (Util::getWordsOfLine(line, columns, 8) == 8 && Util::fast_atoi<size_t>(columns[0]) == rank) {
+                            const char *columns[11];
+                            if (Util::getWordsOfLine(line, columns, 11) == 11 && Util::fast_atoi<size_t>(columns[0]) == rank) {
                                 ServedPiece piece = { Util::fast_atoi<size_t>(columns[1]), Util::fast_atoi<size_t>(columns[2]), Util::fast_atoi<size_t>(columns[3]), Util::fast_atoi<size_t>(columns[4]),
-                                                      Util::fast_atoi<size_t>(columns[5]), Util::fast_atoi<size_t>(columns[6]), Util::fast_atoi<size_t>(columns[7]) };
+                                                      Util::fast_atoi<size_t>(columns[5]), Util::fast_atoi<size_t>(columns[6]), Util::fast_atoi<size_t>(columns[7]),
+                                                      Util::fast_atoi<size_t>(columns[8]) / 1e6, Util::fast_atoi<size_t>(columns[9]) / 1e6, Util::fast_atoi<size_t>(columns[10]) / 1e6 };
                                 servedPieces[node].push_back(piece);
                             }
                         }
@@ -3254,6 +3293,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             for (size_t key = firstKey; key < firstKey + piece.keyCount; key++) {
                                 receivedEntrySize += (sequences->entries[sequences->entryOffsets[key]] != '\0') ? sequences->entryOffsets[key + 1] - sequences->entryOffsets[key] : 0;
                             }
+                            request.noticeSeconds = piece.noticeTime - piece.requestTime;
+                            request.serveSeconds = piece.publishTime - piece.noticeTime;
+                            request.detectSeconds = progressTime - piece.publishTime;
+                            request.lastPieceTime = getWallSeconds();
+                            request.readSeconds = request.lastPieceTime - progressTime;
                             request.receivedKeys[node] += piece.keyCount;
                             request.receivedPieces[node]++;
                             receivedPieceCount++;
@@ -3272,6 +3316,17 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                     if (isComplete) {
                         request.isComplete = true;
+                        if (request.lastPieceTime > 0) {
+                            double roundTrip = getWallSeconds() - request.writtenTime;
+                            timedRequestCount++;
+                            requestRoundTripSeconds += roundTrip;
+                            maxRequestRoundTrip = std::max(maxRequestRoundTrip, roundTrip);
+                            requestNoticeSeconds += request.noticeSeconds;
+                            requestServeSeconds += request.serveSeconds;
+                            requestDetectSeconds += request.detectSeconds;
+                            requestReadSeconds += request.readSeconds;
+                            lastPieceTime = request.lastPieceTime;
+                        }
                         MMseqsNode::removeExchangeFile(requests + "/" + SSTR(rank) + "." + SSTR(request.number), request.number);
                         deleteCount++;
                         hasWorked = true;
@@ -3289,7 +3344,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         for (unsigned int node = 0; node <= nodes; node++) {
                             content += "\t" + SSTR(ownRequests[i].codeOffsets[node]);
                         }
-                        content += "\n";
+                        content += "\t" + SSTR(static_cast<size_t>(ownRequests[i].writtenTime * 1e6)) + "\n";
                     }
                     MMseqsNode::publishRunFile(requestProgress, content);
                     objectWriteCount++;
@@ -3332,6 +3387,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 }
                 // a fetch goes to the aligning threads once its request is received
                 if (requestedSequences != NULL && ownRequests.empty() && isLoaded) {
+                    if (lastPieceTime > 0) {
+                        afterLastPieceSeconds += getWallSeconds() - lastPieceTime;
+                        lastPieceTime = 0;
+                    }
                     {
                         std::lock_guard<std::mutex> lock(serviceMutex);
                         completedSequences = requestedSequences;
@@ -3351,6 +3410,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         size_t node = Util::fast_atoi<size_t>(name);
                         if (number != NULL && number != name && node < nodes && Util::fast_atoi<size_t>(number + 1) >= requesters[node].requestCount) {
                             requesters[node].nextProgressRead = 0;
+                            requesters[node].isListed = true;
                         }
                     }
                 }
@@ -3372,6 +3432,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         progressReadCount++;
                         requestProgressReadCount++;
                         bool hasProgress = MMseqsNode::readRunFile(requests + "." + SSTR(node) + ".progress", content);
+                        const double noticeTime = getWallSeconds();
+                        const bool isListed = requester.isListed;
+                        requester.isListed = false;
                         pollingSeconds += pollTimer.getTimediff();
                         if (hasProgress) {
                             char *line = &content[0];
@@ -3391,8 +3454,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             requester.servedCount = std::max(requester.servedCount, received);
                             // per open request: number, size and the codes of this node
                             requester.openRequests.clear();
+                            requester.requestTimes.erase(requester.requestTimes.begin(), requester.requestTimes.lower_bound(received));
                             for (line = Util::skipLine(line); *line != '\0'; line = Util::skipLine(line)) {
-                                Util::getWordsOfLine(line, requestColumns.data(), nodes + 3);
+                                Util::getWordsOfLine(line, requestColumns.data(), nodes + 4);
+                                size_t number = Util::fast_atoi<size_t>(requestColumns[0]);
+                                if (requester.requestTimes.find(number) == requester.requestTimes.end()) {
+                                    requester.requestTimes[number] = std::make_pair(Util::fast_atoi<size_t>(requestColumns[3 + nodes]) / 1e6, noticeTime);
+                                    noticedRequestCount++;
+                                    listedNoticeCount += isListed;
+                                }
                                 requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[0]));
                                 requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[1]));
                                 requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[2 + rank]));
@@ -3542,6 +3612,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         }
                         servingSeconds += servingTimer.getTimediff();
                         ServedPiece piece = { requester.servedCount, requester.piece, servedFileCount, 0, pieceOffset, pieceSize, keyCount };
+                        std::map<size_t, std::pair<double, double> >::const_iterator requestTime = requester.requestTimes.find(requester.servedCount);
+                        if (requestTime != requester.requestTimes.end()) {
+                            piece.requestTime = requestTime->second.first;
+                            piece.noticeTime = requestTime->second.second;
+                        }
                         passPieces.push_back(std::make_pair(node, piece));
                         servedSize += pieceSize;
                         servedPieceCount++;
@@ -3562,8 +3637,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     Timer writeTimer;
                     MMseqsNode::writeExchangeFile(getServedFile(rank, servedFileCount), servedFileCount, servedFileData.data(), servedFileData.size(), "", std::vector<uint64_t>(), serviceThreads);
                     servedFileWriteSeconds += writeTimer.getTimediff();
+                    const double publishTime = getWallSeconds();
                     for (size_t j = 0; j < passPieces.size(); j++) {
                         passPieces[j].second.fileSize = servedFileData.size();
+                        passPieces[j].second.publishTime = publishTime;
                         requesters[passPieces[j].first].pieces.push_back(passPieces[j].second);
                     }
                     filePieceCounts.push_back(passPieces.size());
@@ -3583,7 +3660,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         for (size_t i = 0; i < requesters[node].pieces.size(); i++) {
                             const ServedPiece &piece = requesters[node].pieces[i];
                             content += SSTR(node) + "\t" + SSTR(piece.request) + "\t" + SSTR(piece.piece) + "\t" + SSTR(piece.file) + "\t" + SSTR(piece.fileSize)
-                                       + "\t" + SSTR(piece.offset) + "\t" + SSTR(piece.size) + "\t" + SSTR(piece.keyCount) + "\n";
+                                       + "\t" + SSTR(piece.offset) + "\t" + SSTR(piece.size) + "\t" + SSTR(piece.keyCount) + "\t" + SSTR(static_cast<size_t>(piece.requestTime * 1e6))
+                                       + "\t" + SSTR(static_cast<size_t>(piece.noticeTime * 1e6)) + "\t" + SSTR(static_cast<size_t>(piece.publishTime * 1e6)) + "\n";
                         }
                     }
                     MMseqsNode::publishRunFile(servedProgress, content);
@@ -3615,6 +3693,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     const auto waitForSequences = [&](FetchedSequences &fetched, size_t doneRepOrderKey) {
         std::unique_lock<std::mutex> lock(serviceMutex);
         if (completedSequences == &fetched) {
+            sequenceWaitCounts[0]++;
             return;
         }
         lock.unlock();
@@ -3625,7 +3704,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         lock.lock();
         const bool waitsForMaster = isWaitingForMaster;
         serviceCondition.wait(lock, [&]() { return completedSequences == &fetched; });
-        (waitsForMaster ? waitSeconds : sequenceWaitSeconds) += waitTimer.getTimediff();
+        const double wait = waitTimer.getTimediff();
+        (waitsForMaster ? waitSeconds : sequenceWaitSeconds) += wait;
+        if (waitsForMaster == false) {
+            const size_t bucket = (wait < 0.01) ? 0 : ((wait < 0.1) ? 1 : ((wait < 1) ? 2 : 3));
+            sequenceWaitCounts[bucket]++;
+            sequenceWaitSums[bucket] += wait;
+        }
     };
     if (isAligningNode) {
         {
@@ -4267,6 +4352,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                   + SSTR(deleteCount) + " deletes in " + SSTR(static_cast<size_t>(serviceTimer.getTimediff())) + " s");
         MMseqsNode::addPhaseValue(phaseValues, "Request progress reads", SSTR(requestProgressReadCount) + ", unchanged: " + SSTR(requestProgressReadCount - requestProgressChangeCount)
                                   + ", changes: " + SSTR(requestProgressChangeCount) + ", request listings: " + SSTR(requestListingCount));
+        MMseqsNode::addPhaseValue(phaseValues, "Request round trips", SSTR(timedRequestCount) + " requests to " + SSTR(owedNodeSum) + " owing nodes in " + SSTR(requestRoundTripSeconds)
+                                  + " s, at most " + SSTR(maxRequestRoundTrip) + " s; last piece: notice " + SSTR(requestNoticeSeconds) + " s, serve " + SSTR(requestServeSeconds)
+                                  + " s, detect " + SSTR(requestDetectSeconds) + " s, read " + SSTR(requestReadSeconds) + " s; own keys after it " + SSTR(afterLastPieceSeconds)
+                                  + " s; requests noticed " + SSTR(noticedRequestCount) + ", after a listing " + SSTR(listedNoticeCount));
         MMseqsNode::addPhaseValue(phaseValues, "Served files", SSTR(servedFileCount) + ", at most " + SSTR(maxLiveServedSize) + " bytes not yet deleted, " + SSTR(servedPieceCount) + " pieces, at most "
                                   + SSTR(maxPassPieceCount) + " pieces a file");
     }
@@ -4282,6 +4371,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     if (isAligningNode) {
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the master", waitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences", sequenceWaitSeconds);
+        MMseqsNode::addPhaseValue(phaseValues, "Sequence waits", "below 10 ms " + SSTR(sequenceWaitCounts[0]) + " (" + SSTR(sequenceWaitSums[0]) + " s), below 100 ms " + SSTR(sequenceWaitCounts[1])
+                                  + " (" + SSTR(sequenceWaitSums[1]) + " s), below 1 s " + SSTR(sequenceWaitCounts[2]) + " (" + SSTR(sequenceWaitSums[2]) + " s), longer "
+                                  + SSTR(sequenceWaitCounts[3]) + " (" + SSTR(sequenceWaitSums[3]) + " s)");
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the prefilter", prefilterWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "aligning the fetches", alignSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Fetches with fewer SWIPE batches", SSTR(fewerBatchFetchCount) + " of " + SSTR(fetchCount));
