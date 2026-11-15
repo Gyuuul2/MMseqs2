@@ -2910,6 +2910,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t requestProgressReadCount = 0;
     size_t requestProgressChangeCount = 0;
     size_t requestListingCount = 0;
+    size_t servedListingCount = 0;
+    size_t servedListingReadCount = 0;
     size_t objectReadCount = 0;
     size_t objectWriteCount = 0;
     size_t deleteCount = 0;
@@ -3018,9 +3020,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             double fastReadSeconds = BATCH_READ_SECONDS;
             double fastReadEnd = 0;
             double nextRequestListing = 0;
+            double nextServedListing = 0;
             // the master progress while the gate is closed, about as often as before the faster polls
             double nextGateRead = 0;
             std::vector<std::string> requestNames;
+            std::vector<std::string> servedNames;
+            // one past the newest served file of a node in the last listing and in its progress
+            std::vector<size_t> listedServedFileCounts(nodes, 0);
+            std::vector<size_t> progressServedFileCounts(nodes, 0);
             std::vector<std::vector<ServedPiece> > servedPieces(nodes);
             // requesting node: progress, code range of this node per open request, codes served so far, pieces not yet deleted
             struct Requester {
@@ -3066,7 +3073,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             std::string requestProgress = requests + "." + SSTR(rank) + ".progress";
             std::string servedProgress = served + "." + SSTR(rank) + ".progress";
             const auto getServedFile = [&](unsigned int alignNode, size_t file) {
-                return served + "." + SSTR(alignNode) + "." + SSTR(file);
+                return served + "/" + SSTR(alignNode) + "." + SSTR(file);
             };
             MMseqsNode::WaitWarning waitWarning;
             time_t assignedKeysReadTime = 0;
@@ -3161,11 +3168,31 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         hasWorked = true;
                     }
                 }
+                // the progress of an owed node is read at once when the names hold a served file it did not show yet
+                bool isServedListed = ownRequests.empty() == false && serviceTimer.getTimediff() >= nextServedListing;
+                if (isServedListed) {
+                    nextServedListing = serviceTimer.getTimediff() + std::max(BATCH_READ_SECONDS, (nodes - 1.0) / PROGRESS_READS_PER_SECOND) / 4.0;
+                    MMseqsNode::listDirectory(served, servedNames);
+                    servedListingCount++;
+                    std::fill(listedServedFileCounts.begin(), listedServedFileCounts.end(), 0);
+                    for (size_t i = 0; i < servedNames.size(); i++) {
+                        const char *name = servedNames[i].c_str();
+                        const char *number = strchr(name, '.');
+                        size_t node = Util::fast_atoi<size_t>(name);
+                        if (number != NULL && number != name && node < nodes) {
+                            listedServedFileCounts[node] = std::max(listedServedFileCounts[node], Util::fast_atoi<size_t>(number + 1) + 1);
+                        }
+                    }
+                }
                 // receive from the nodes that owe a request
                 for (unsigned int node = 0; node < nodes; node++) {
                     bool isOwed = false;
                     for (size_t i = 0; i < ownRequests.size() && isOwed == false; i++) {
                         isOwed = node != rank && ownRequests[i].receivedKeys[node] < ownRequests[i].sequences->fetchSourceKeyOffsets[node + 1] - ownRequests[i].sequences->fetchSourceKeyOffsets[node];
+                    }
+                    if (isOwed && isServedListed && listedServedFileCounts[node] > progressServedFileCounts[node] && serviceTimer.getTimediff() < nextServedProgressReads[node]) {
+                        nextServedProgressReads[node] = 0;
+                        servedListingReadCount++;
                     }
                     if (isOwed == false || serviceTimer.getTimediff() < nextServedProgressReads[node]) {
                         continue;
@@ -3183,7 +3210,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         servedPieces[node].clear();
                         for (char *line = &content[0]; *line != '\0'; line = Util::skipLine(line)) {
                             const char *columns[8];
-                            if (Util::getWordsOfLine(line, columns, 8) == 8 && Util::fast_atoi<size_t>(columns[0]) == rank) {
+                            if (Util::getWordsOfLine(line, columns, 8) != 8) {
+                                continue;
+                            }
+                            // the files of all requesters, a listed file without a piece of this node moves up one read only
+                            progressServedFileCounts[node] = std::max(progressServedFileCounts[node], Util::fast_atoi<size_t>(columns[3]) + 1);
+                            if (Util::fast_atoi<size_t>(columns[0]) == rank) {
                                 ServedPiece piece = { Util::fast_atoi<size_t>(columns[1]), Util::fast_atoi<size_t>(columns[2]), Util::fast_atoi<size_t>(columns[3]), Util::fast_atoi<size_t>(columns[4]),
                                                       Util::fast_atoi<size_t>(columns[5]), Util::fast_atoi<size_t>(columns[6]), Util::fast_atoi<size_t>(columns[7]) };
                                 servedPieces[node].push_back(piece);
@@ -4267,6 +4299,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                   + SSTR(deleteCount) + " deletes in " + SSTR(static_cast<size_t>(serviceTimer.getTimediff())) + " s");
         MMseqsNode::addPhaseValue(phaseValues, "Request progress reads", SSTR(requestProgressReadCount) + ", unchanged: " + SSTR(requestProgressReadCount - requestProgressChangeCount)
                                   + ", changes: " + SSTR(requestProgressChangeCount) + ", request listings: " + SSTR(requestListingCount));
+        MMseqsNode::addPhaseValue(phaseValues, "Served progress reads", SSTR(progressReadCount - requestProgressReadCount) + ", moved up by a listing: " + SSTR(servedListingReadCount)
+                                  + ", served listings: " + SSTR(servedListingCount));
         MMseqsNode::addPhaseValue(phaseValues, "Served files", SSTR(servedFileCount) + ", at most " + SSTR(maxLiveServedSize) + " bytes not yet deleted, " + SSTR(servedPieceCount) + " pieces, at most "
                                   + SSTR(maxPassPieceCount) + " pieces a file");
     }
@@ -5301,10 +5335,13 @@ int align2clustLinfinity(Parameters &par) {
     if (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode() && alignNodeCount > 1) {
         sequenceIndexes.push_back(requests + "." + SSTR(MMseqsNode::rank) + ".progress");
         sequenceIndexes.push_back(served + "." + SSTR(MMseqsNode::rank) + ".progress");
-        // the request files of all nodes share a directory, one listing shows the new requests
-        if (FileUtil::makeDir(requests.c_str()) == false && FileUtil::directoryExists(requests.c_str()) == false) {
-            Debug(Debug::ERROR) << "Cannot create " << requests << "\n";
-            EXIT(EXIT_FAILURE);
+        // the request files and the served files of all nodes share a directory each, one listing shows the new files
+        const std::string exchangeDirs[] = { requests, served };
+        for (size_t i = 0; i < 2; i++) {
+            if (FileUtil::makeDir(exchangeDirs[i].c_str()) == false && FileUtil::directoryExists(exchangeDirs[i].c_str()) == false) {
+                Debug(Debug::ERROR) << "Cannot create " << exchangeDirs[i] << "\n";
+                EXIT(EXIT_FAILURE);
+            }
         }
     }
     // every node serves the members of its own cluster part, the aligning nodes ask for them
@@ -5570,6 +5607,7 @@ int align2clustLinfinity(Parameters &par) {
         }
     }
     rmdir(requests.c_str());
+    rmdir(served.c_str());
     MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", phaseValueTimer);
     if (memberDbr != NULL) {
         // every reader, the serving ones too, has added its lookups by now
