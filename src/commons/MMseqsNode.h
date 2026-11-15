@@ -5,7 +5,6 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <cmath>
 #include <ctime>
 #include <string>
 #include <vector>
@@ -49,13 +48,6 @@ public:
         return (count > 1) ? 1 : 0;
     }
 
-    // align groups of align2clust in target split mode from --align2clust-split, 0 is floor(sqrt(align nodes))
-    static inline size_t getAlignGroupCount(int align2clustSplit) {
-        const size_t alignNodeCount = count - getFirstAlignNode();
-        const size_t groups = (align2clustSplit > 0) ? align2clustSplit : static_cast<size_t>(std::sqrt(static_cast<double>(alignNodeCount)));
-        return std::min(alignNodeCount, std::max((size_t) 1, groups));
-    }
-
     static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
     // a --local-tmp that cannot be used is reported and the run goes on in the shared folder
     static void reportUnusableLocalTmp(const std::string &problem);
@@ -82,13 +74,11 @@ public:
     // the names in a directory, none if it cannot be opened; aws backend: the object names below it
     static void listDirectory(const std::string &directory, std::vector<std::string> &names);
 
-    // aws backend: the bytes since the last sync go up as the object <log>.<n>, returns the object count
-    static size_t syncLog(FILE *file, const std::string &log, size_t size);
-    static void publishLog(FILE *file, const std::string &log, size_t key, size_t size, size_t claimsSize = 0, size_t homeWindow = 0);
-    static bool readLogProgress(const std::string &log, size_t &key, size_t &size, size_t *claimsSize = NULL, size_t *homeWindow = NULL);
+    static void publishLog(FILE *file, const std::string &log, size_t key, size_t size);
+    static bool readLogProgress(const std::string &log, size_t &key, size_t &size);
     static void waitForLog(const std::string &log, size_t &key, size_t &size);
     static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true);
-    static void removeLog(const std::string &log, bool hasProgress = true);
+    static void removeLog(const std::string &log);
 
     static void publishExchangeFile(FILE *file, const std::string &fileName, size_t size, const std::string &indexFile, const std::vector<uint64_t> &line,
                                     const std::vector<size_t> *segmentOffsets = NULL);
@@ -117,8 +107,6 @@ public:
         size_t takeNextItem();
         void removeTakenItemFiles();
         bool takeItem(size_t item);
-        // isTaken[i] for the items firstItem + i with isTried[i]
-        void takeItems(size_t firstItem, const std::vector<unsigned char> &isTried, std::vector<unsigned char> &isTaken);
 
     private:
         const std::string name;
