@@ -137,8 +137,9 @@ static std::string readPolledFile(const std::string &file) {
         fd = openFile(file, flags);
         openError = (fd < 0) ? errno : 0;
     }
+    // NFS can fail a name that a rename just replaced with ESTALE or EIO, the next poll reads it again
     if (fd < 0) {
-        if (openError == ESTALE || openError == ENOENT) {
+        if (openError == ESTALE || openError == EIO || openError == ENOENT) {
             return std::string();
         }
         Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(openError) << "\n";
@@ -148,7 +149,7 @@ static std::string readPolledFile(const std::string &file) {
     bool isStale = false;
     if (fstat(fd, &sb) != 0) {
         int statError = errno;
-        isStale = statError == ESTALE;
+        isStale = statError == ESTALE || statError == EIO;
         if (isStale == false) {
             Debug(Debug::ERROR) << "Cannot read " << file << ": " << strerror(statError) << "\n";
             EXIT(EXIT_FAILURE);
@@ -157,7 +158,7 @@ static std::string readPolledFile(const std::string &file) {
     std::string content(isStale ? 0 : sb.st_size, '\0');
     int readError;
     if (MMseqsNode::tryPreadAll(fd, &content[0], content.size(), 0, readError) == false) {
-        if (readError != 0 && readError != ESTALE) {
+        if (readError != 0 && readError != ESTALE && readError != EIO) {
             Debug(Debug::ERROR) << "Cannot read " << file << ": " << strerror(readError) << "\n";
             EXIT(EXIT_FAILURE);
         }
