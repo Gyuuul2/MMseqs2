@@ -1854,12 +1854,11 @@ struct TargetSplitReader {
         bufferFetchSize = 0;
         bufferAlignmentCells = 0;
         while (records.size() * sizeof(RepTargetsRecord) + targets.size() * sizeof(DBKeyType) < maxPrefilterBufferSize) {
-            // a buffer ends at a window end
-            if (prefReadPos < prefReads.size() || (records.empty() && takeWindow())) {
-                // keep a pass of several size classes in one buffer
-                if (records.empty() == false && (passClasses & (passClasses - 1)) == 0 && (bufferFetchSize >= maxReadSize || bufferAlignmentCells >= maxBufferAlignmentCells)) {
-                    break;
-                }
+            // keep a pass of several size classes in one buffer; a buffer goes on into the next window
+            if (records.empty() == false && (passClasses & (passClasses - 1)) == 0 && (bufferFetchSize >= maxReadSize || bufferAlignmentCells >= maxBufferAlignmentCells)) {
+                break;
+            }
+            if (prefReadPos < prefReads.size() || takeWindow()) {
                 loadPrefRead(records, targets);
             } else if (records.empty() == false || startPass() == false) {
                 break;

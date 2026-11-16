@@ -3130,24 +3130,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     size_t partitionCount = exchange.sendSplitCount * exchange.partitionsPerRange;
     size_t partitionsPerGroup = (partitionCount + kmerGroups.count - 1) / kmerGroups.count;
     initFileGroups(pairGroups, par.db2 + ".pairs", partitionCount, partitionsPerGroup, 4 + partitionsPerGroup);
-    if (localNodes > 0) {
-        size_t freeSize = FileUtil::getFreeSpace(par.localTmp.c_str());
-        size_t share = (freeSize == SIZE_MAX) ? 0 : freeSize / localNodes;
-        size_t kmerGroupSize = std::max((size_t) 1, totalKmerCount * receiverKmerSize / (MMseqsNode::count * kmerGroups.count));
-        size_t pairGroupSize = std::max((size_t) 1, totalKmerCount * ((exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT) / (MMseqsNode::count * pairGroups.count));
-        kmerGroups.localCount = std::min(kmerGroups.count, share / (3 * kmerGroupSize));
-        pairGroups.localCount = std::min(pairGroups.count, share / (3 * pairGroupSize));
-        if (kmerGroups.localCount < kmerGroups.count || pairGroups.localCount < pairGroups.count) {
-            MMseqsNode::reportUnusableLocalTmp("Cannot keep all exchange file groups in --local-tmp " + par.localTmp + ": its " + ((freeSize == SIZE_MAX) ? std::string("unknown free space holds ") : SSTR(share) + " free bytes per node hold ")
-                                               + SSTR(kmerGroups.localCount) + " of " + SSTR(kmerGroups.count) + " k-mer and " + SSTR(pairGroups.localCount) + " of "
-                                               + SSTR(pairGroups.count) + " pair file groups");
-        }
-    }
-    // aws backend: other nodes read the exchange file groups from S3 only
-    if (S3Client::isEnabled()) {
-        kmerGroups.localCount = 0;
-        pairGroups.localCount = 0;
-    }
+    // the exchange file groups go to the shared folder at once, a local copy only delays the merging nodes
     kmerGroups.localTmp = par.localTmp;
     pairGroups.localTmp = par.localTmp;
     kmerGroups.localNodes = localNodes;
