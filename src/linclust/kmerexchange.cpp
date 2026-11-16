@@ -653,9 +653,9 @@ struct KmerExchange {
     unsigned int kmerHashShift;
     unsigned int globalIdBits;
     size_t maxRepSeqCount;
-    size_t pairTargetCount;
     size_t selfMergedSendSplitCount;
     bool hasTargetSplits;
+    size_t alignGroupCount;
     size_t hashRangeCount;
     size_t hashSubRangesPerRange;
     size_t hashSubRangeCount;
@@ -1441,8 +1441,7 @@ struct TargetSplitFiles {
     // the cells of the window being written
     std::vector<size_t> cellOffsets;
     std::vector<size_t> cellCosts;
-    // a window ends before an entry once it has this cost and size
-    size_t rowCost;
+    // a window ends before an entry once it has this size
     size_t rowSize;
 };
 
@@ -1469,13 +1468,11 @@ static void writeTargetSplits(const PrefFiles &prefFiles, TargetSplitFiles &file
                               const DBKeyType *targets, int threads, size_t &windowFirstKey, std::string &partitionsData) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     size_t splitCount = files.dataSizes.size();
-    size_t windowCost = 0;
     size_t windowSize = 0;
     for (size_t split = 0; split < splitCount; split++) {
-        windowCost += files.cellCosts[split];
         windowSize += files.dataSizes[split] - files.cellOffsets[split];
     }
-    if (keyCount > 0 && windowCost >= files.rowCost && windowSize >= files.rowSize) {
+    if (keyCount > 0 && windowSize >= files.rowSize) {
         addTargetSplitRows(files, windowFirstKey, partitionsData);
         windowFirstKey = firstKey;
     }
@@ -2543,17 +2540,10 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     PrefFiles prefFiles;
     TargetSplitFiles targetSplitFiles;
     if (exchange.hasTargetSplits) {
-        // runs of whole blocks, fewer for few targets per rep
-        size_t representativeCount = 0;
-        for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {
-            representativeCount += seqDbr.getRangeRepresentativeCount(range);
-        }
-        // an align group shares the target splits of a window
-        size_t alignGroupCount = MMseqsNode::getAlignGroupCount(par.align2clustSplit);
-        size_t alignNodeCount = (MMseqsNode::count - MMseqsNode::getFirstAlignNode() + alignGroupCount - 1) / alignGroupCount;
-        size_t targetsPerRep = exchange.pairTargetCount / std::max((size_t) 1, representativeCount);
+        // runs of whole blocks, an align group shares the target splits of a window
+        size_t alignNodeCount = (MMseqsNode::count - MMseqsNode::getFirstAlignNode() + exchange.alignGroupCount - 1) / exchange.alignGroupCount;
         size_t blockCount = seqDbr.getBlockKeyOffsets().size() - 1;
-        size_t targetSplitCount = std::min(blockCount, std::max(2 * alignNodeCount, std::min(MAX_TARGET_SPLITS_PER_NODE * alignNodeCount, targetsPerRep / 4)));
+        size_t targetSplitCount = std::min(blockCount, MAX_TARGET_SPLITS_PER_NODE * alignNodeCount);
         targetSplitBlockOffsets.resize(targetSplitCount + 1);
         targetSplitFiles.keyOffsets.resize(targetSplitCount + 1);
         for (size_t split = 0; split <= targetSplitCount; split++) {
@@ -2592,6 +2582,7 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     size_t pairPassTargetsSize = 0;
     std::vector<size_t> partitionCosts(partitionCount, 0);
     size_t globalCost = 0;
+    size_t pairBytes = 0;
     for (size_t partition = 0; partition < partitionCount; partition++) {
         size_t sendSplit = partition / exchange.partitionsPerRange;
         size_t rangePartition = partition % exchange.partitionsPerRange;
@@ -2599,30 +2590,12 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             partitionCosts[partition] = partitionPairSizes[partition] + getPartitionFirstKey(exchange, sendSplit, rangePartition + 1) - getPartitionFirstKey(exchange, sendSplit, rangePartition);
         }
         globalCost += partitionCosts[partition];
+        pairBytes += partitionPairSizes[partition];
     }
     size_t mergeSplitCount = exchange.sendSplitCount;
     size_t mergeSplitCost = std::max((size_t) 1, (globalCost + mergeSplitCount - 1) / mergeSplitCount);
-    if (exchange.hasTargetSplits) {
-        // about a merge split of alignment cost per window: pair bytes times the squared rep length
-        double estimatedCost = 0;
-        size_t pairBytes = 0;
-        for (size_t partition = 0; partition < partitionCount; partition++) {
-            size_t sendSplit = partition / exchange.partitionsPerRange;
-            size_t keyBegin = getPartitionFirstKey(exchange, sendSplit, partition % exchange.partitionsPerRange);
-            size_t keyEnd = getPartitionFirstKey(exchange, sendSplit, partition % exchange.partitionsPerRange + 1);
-            double squaredLengths = 0;
-            for (size_t range = seqDbr.findIdRange(keyBegin); keyBegin < keyEnd && range < seqDbr.getIndexSize() && static_cast<size_t>(index[range].id) < keyEnd; range++) {
-                size_t rangeEnd = (range + 1 < seqDbr.getIndexSize()) ? static_cast<size_t>(index[range + 1].id) : seqDbr.getSize();
-                double length = index[range].length - 2;
-                squaredLengths += (std::min(keyEnd, rangeEnd) - std::max(keyBegin, static_cast<size_t>(index[range].id))) * length * length;
-            }
-            estimatedCost += (keyEnd > keyBegin) ? partitionPairSizes[partition] * squaredLengths / (keyEnd - keyBegin) : 0;
-            pairBytes += partitionPairSizes[partition];
-        }
-        // every align group gets as many windows
-        targetSplitFiles.rowCost = std::max((size_t) 1, static_cast<size_t>(estimatedCost * exchange.pairTargetCount / std::max((size_t) 1, pairBytes) / mergeSplitCount / MMseqsNode::getAlignGroupCount(par.align2clustSplit)));
-        targetSplitFiles.rowSize = 1024 * 1024;
-    }
+    // a window holds at least 4 MiB and 1/1024 of the pair bytes
+    targetSplitFiles.rowSize = std::max((size_t) 4 * 1024 * 1024, pairBytes / 1024);
     std::vector<size_t> splitPartitionOffsets(mergeSplitCount + 1, partitionCount);
     splitPartitionOffsets[0] = 0;
     size_t costBefore = 0;
@@ -3094,7 +3067,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
 
     struct rlimit openFileLimit = {0, 0};
     getrlimit(RLIMIT_NOFILE, &openFileLimit);
-    size_t minOpenFiles = seqDbr.getDataFileCnt() + 64 + kmerGroups.count + 2 * MMseqsNode::count + 2 * (exchange.hasTargetSplits ? MAX_TARGET_SPLITS_PER_NODE * (MMseqsNode::count - MMseqsNode::getFirstAlignNode()) : 1);
+    // align2clust opens three files per target split
+    size_t minOpenFiles = seqDbr.getDataFileCnt() + 64 + kmerGroups.count + 2 * MMseqsNode::count + 3 * (exchange.hasTargetSplits ? MAX_TARGET_SPLITS_PER_NODE * (MMseqsNode::count - MMseqsNode::getFirstAlignNode()) : 1);
     if (minOpenFiles > openFileLimit.rlim_cur) {
         Debug(Debug::ERROR) << "Raise the open file limit (ulimit -n) to at least " << minOpenFiles << "\n";
         EXIT(EXIT_FAILURE);
@@ -3129,7 +3103,12 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         }
     }
     size_t localNodes = 0;
-    size_t minPassLimit = std::max((size_t) 1, getPassLimit(MMseqsNode::getSmallestMemoryLimit(par.db2 + ".memory", memoryLimit, par.threads, par.localTmp, &localNodes)));
+    size_t smallestMemoryLimit = MMseqsNode::getSmallestMemoryLimit(par.db2 + ".memory", memoryLimit, par.threads, par.localTmp, &localNodes);
+    size_t minPassLimit = std::max((size_t) 1, getPassLimit(smallestMemoryLimit));
+    // --align2clust-split 0: floor(sqrt(align nodes)), fewer if a group node's share of the sequences does not fit a quarter of the smallest memory limit
+    size_t alignNodeCount = MMseqsNode::count - MMseqsNode::getFirstAlignNode();
+    exchange.alignGroupCount = (par.align2clustSplit > 0) ? par.align2clustSplit : std::min(static_cast<size_t>(std::sqrt(static_cast<double>(alignNodeCount))), alignNodeCount * (smallestMemoryLimit / 4) / seqDbr.getDataSize());
+    exchange.alignGroupCount = std::min(alignNodeCount, std::max((size_t) 1, exchange.alignGroupCount));
     // localNodes counts this node too when its --local-tmp is local flash
     if (par.localTmp.empty() == false && localNodes == 0) {
         MMseqsNode::reportUnusableLocalTmp("Cannot keep the last exchange file groups in --local-tmp " + par.localTmp + ": it is not local flash");
@@ -3151,24 +3130,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     size_t partitionCount = exchange.sendSplitCount * exchange.partitionsPerRange;
     size_t partitionsPerGroup = (partitionCount + kmerGroups.count - 1) / kmerGroups.count;
     initFileGroups(pairGroups, par.db2 + ".pairs", partitionCount, partitionsPerGroup, 4 + partitionsPerGroup);
-    if (localNodes > 0) {
-        size_t freeSize = FileUtil::getFreeSpace(par.localTmp.c_str());
-        size_t share = (freeSize == SIZE_MAX) ? 0 : freeSize / localNodes;
-        size_t kmerGroupSize = std::max((size_t) 1, totalKmerCount * receiverKmerSize / (MMseqsNode::count * kmerGroups.count));
-        size_t pairGroupSize = std::max((size_t) 1, totalKmerCount * ((exchange.globalIdBits + CHAR_BIT - 1) / CHAR_BIT) / (MMseqsNode::count * pairGroups.count));
-        kmerGroups.localCount = std::min(kmerGroups.count, share / (3 * kmerGroupSize));
-        pairGroups.localCount = std::min(pairGroups.count, share / (3 * pairGroupSize));
-        if (kmerGroups.localCount < kmerGroups.count || pairGroups.localCount < pairGroups.count) {
-            MMseqsNode::reportUnusableLocalTmp("Cannot keep all exchange file groups in --local-tmp " + par.localTmp + ": its " + ((freeSize == SIZE_MAX) ? std::string("unknown free space holds ") : SSTR(share) + " free bytes per node hold ")
-                                               + SSTR(kmerGroups.localCount) + " of " + SSTR(kmerGroups.count) + " k-mer and " + SSTR(pairGroups.localCount) + " of "
-                                               + SSTR(pairGroups.count) + " pair file groups");
-        }
-    }
-    // aws backend: other nodes read the exchange file groups from S3 only
-    if (S3Client::isEnabled()) {
-        kmerGroups.localCount = 0;
-        pairGroups.localCount = 0;
-    }
+    // the exchange file groups go to the shared folder at once, a local copy only delays the merging nodes
     kmerGroups.localTmp = par.localTmp;
     pairGroups.localTmp = par.localTmp;
     kmerGroups.localNodes = localNodes;
@@ -3237,12 +3199,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     MMseqsNode::addPhaseValue(receiveValues, "Hash ranges", SSTR(receivedHashRangeCount));
     MMseqsNode::printPhaseValues(receiveValues);
     kmerFollow.join();
-    // sum the pair targets of all nodes
-    exchange.pairTargetCount = 0;
-    std::string nodePairTargetCounts = MMseqsNode::barrier(par.db2 + ".pairs.done", SSTR(pairTargetCount) + "\n");
-    for (char *line = (char *) nodePairTargetCounts.c_str(); *line != '\0'; line = Util::skipLine(line)) {
-        exchange.pairTargetCount += Util::fast_atoi<size_t>(line);
-    }
+    MMseqsNode::barrier(par.db2 + ".pairs.done");
     std::string mergeValues;
     MMseqsNode::addPhaseTime(mergeValues, "waiting for the other nodes to receive k-mers", phaseTimer);
     // every node has passed the hash ranges
@@ -3289,8 +3246,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
             partitionRows.push_back(std::make_pair(Util::fast_atoi<size_t>(row), row));
         }
         SORT_SERIAL(partitionRows.begin(), partitionRows.end());
-        // first line: first block of every target split
-        std::string sortedPartitions;
+        // first line: the align group count, second line: first block of every target split
+        std::string sortedPartitions = SSTR(exchange.alignGroupCount) + "\n";
         for (size_t i = 0; i < targetSplitBlockOffsets.size(); i++) {
             sortedPartitions += SSTR(targetSplitBlockOffsets[i]) + ((i + 1 < targetSplitBlockOffsets.size()) ? "\t" : "\n");
         }
