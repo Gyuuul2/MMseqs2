@@ -608,6 +608,8 @@ static std::vector<size_t> targetSplitBlockOffsets;
 static std::vector<unsigned int> targetSplitAlignNodes;
 // a window belongs to one align group, a node holds the target split table of its own group
 static std::vector<unsigned int> windowAlignGroups;
+// the first key of every window, the database size last
+static std::vector<size_t> windowKeyOffsets;
 static unsigned int alignGroup;
 // the nodes of the align group share its target split table, so only they request sequences from each other
 static size_t alignGroupNodeBegin;
@@ -663,9 +665,23 @@ static std::string describeServedFile(size_t size, size_t observedSize, uint64_t
            + "; error " + SSTR(error) + ")\n";
 }
 
+// the own keys [firstKey, keyEnd) of a window that an align node wrote once: per 64 keys the empty bits, slot offset and raw offset, then the packed slots and the raw entries
+struct WindowRepFile {
+    size_t firstKey;
+    size_t keyEnd;
+    size_t number;
+    size_t slotSize;
+    size_t fileSize;
+};
+
+static const WindowRepFile *findWindowRepFile(const std::vector<WindowRepFile> &files, size_t key) {
+    std::vector<WindowRepFile>::const_iterator it = std::upper_bound(files.begin(), files.end(), key, [](size_t first, const WindowRepFile &file) { return first < file.firstKey; });
+    return (it != files.begin() && key < (it - 1)->keyEnd) ? &*(it - 1) : NULL;
+}
+
 // linfinity: records [begin, end) of a prefilter buffer and their fetched entries
 struct FetchedSequences {
-    FetchedSequences() : prefilterBuffer(0), begin(0), end(0), targetCount(0), pendingPairCount(0), firstPendingRepKey(0), isLast(false), entries(NULL), allocatedSize(0) {}
+    FetchedSequences() : prefilterBuffer(0), begin(0), end(0), targetCount(0), pendingPairCount(0), firstPendingRepKey(0), isLast(false), entries(NULL), allocatedSize(0), windowRepsReadEnd(0) {}
     size_t prefilterBuffer;
     size_t begin;
     size_t end;
@@ -675,11 +691,15 @@ struct FetchedSequences {
     // the first rep of the pairs that wait for their member checks when it was selected
     size_t firstPendingRepKey;
     bool isLast;
+    // per node, then the previous fetch, the window rep files per node and the assigned keys
     std::vector<DBKeyType> keys;
     std::vector<size_t> fetchSourceKeyOffsets;
     char *entries;
     size_t allocatedSize;
     std::vector<size_t> entryOffsets;
+    // the window rep files of each node when the keys were selected
+    std::vector<std::vector<WindowRepFile> > windowRepFiles;
+    double windowRepsReadEnd;
 };
 
 // per thread, where the last keys were found per fetch source and the block of the last key
@@ -2583,7 +2603,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         return ((memberLookup != NULL) ? memberLookup->memorySize() + (par.threads + 1) * memberLookup->getEntryReaderSize() : 0) + 3 * 2 * (memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)
                + ((memberDbr != NULL) ? 2 * memberSplitSize : 0)
                + 2 * std::max(fetchSize, repTargetsReader.maxRecordSize) + fetchSize
-               + ((isAligningNode && alignNodeCount > 1) ? 3 * maxServedFileSize + 6 * maxServedKeys * sizeof(size_t) : 0);
+               + ((isAligningNode && alignNodeCount > 1) ? 3 * maxServedFileSize + 8 * maxServedKeys * sizeof(size_t) : 0);
     };
     // largest fetch that leaves a block cache for the coverable sequences
     const bool canCache = isCacheTooSmall(memoryLimit - std::min(memoryLimit, getReservedMemory(0))) == false;
@@ -2613,6 +2633,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         Debug(Debug::WARNING) << "Node " << rank << " holds " << servedSequenceSize << " sequence bytes but its block cache has " << blockCacheSize
                               << " bytes, the other sequences are read one by one. Use more nodes or increase --split-memory-limit\n";
     }
+    // greedy: the align node of a block writes the keys of a window once, the other nodes read them from its files
+    const bool isWritingWindowReps = targetSplitReader != NULL && targetSplitReader->isClaiming;
+    const bool isReadingWindowReps = isWritingWindowReps && isReadingDirectly == false;
+    const std::string windowReps = par.db3 + "_window_reps";
+    std::mutex windowRepsMutex;
+    std::vector<std::vector<WindowRepFile> > publishedWindowRepFiles(nodes);
     // the first fetch is small, then they double
     size_t fetchBytesLimit = std::min<size_t>(maxFetchSize / 64, 64 * 1024 * 1024);
     const auto getFetchedEntry = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL, FetchedKeyCursor *cursor = NULL) -> const char * {
@@ -2621,6 +2647,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             return data;
         }
         size_t fetchSource = isReadingDirectly ? rank : getKeyAlignNode(seqDbr, key, (cursor != NULL) ? &cursor->block : NULL);
+        data = findFetchedKey(sequences, fetchSource, key, seqLen, (cursor != NULL) ? &cursor->positions[fetchSource] : NULL);
+        if (data != NULL) {
+            return data;
+        }
+        fetchSource += nodes + 1;
         return findFetchedKey(sequences, fetchSource, key, seqLen, (cursor != NULL) ? &cursor->positions[fetchSource] : NULL);
     };
     const auto getFetchedSequence = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL, FetchedKeyCursor *cursor = NULL) -> const char * {
@@ -2715,22 +2746,38 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         uniqueKeys.erase(std::unique(uniqueKeys.begin(), uniqueKeys.end()), uniqueKeys.end());
         keyFetchSources.resize(uniqueKeys.size());
         sequences.keys.resize(uniqueKeys.size());
+        // greedy reps ascend; the node publishes no done rep key above the first rep before the fetch is complete, so the files of its reps stay
+        const RepTargetsRecord *recordsBegin = prefilterRecords[sequences.prefilterBuffer].data() + sequences.begin;
+        const RepTargetsRecord *recordsEnd = prefilterRecords[sequences.prefilterBuffer].data() + sequences.end;
+        const auto isFetchRep = [&](size_t key) {
+            const RepTargetsRecord *record = std::lower_bound(recordsBegin, recordsEnd, key, [](const RepTargetsRecord &first, size_t value) { return first.repOrderKeyFirstTarget.repKey < value; });
+            return record != recordsEnd && record->repOrderKeyFirstTarget.repKey == key;
+        };
+        if (isReadingWindowReps) {
+            std::lock_guard<std::mutex> lock(windowRepsMutex);
+            sequences.windowRepFiles = publishedWindowRepFiles;
+        }
         // sort the keys by fetch source; assigned keys go last and are dropped
-        threadFetchSourceKeyOffsets.assign((nodes + 2) * par.threads + 1, 0);
+        const unsigned int assignedSource = 2 * nodes + 1;
+        threadFetchSourceKeyOffsets.assign((assignedSource + 1) * par.threads + 1, 0);
 #pragma omp parallel
         {
             unsigned int thread_idx = 0;
 #ifdef OPENMP
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-            std::vector<size_t> fetchSourceOffsets(nodes + 2, 0);
-            FetchedKeyCursor keyCursor(nodes + 1);
+            std::vector<size_t> fetchSourceOffsets(assignedSource + 1, 0);
+            FetchedKeyCursor keyCursor(assignedSource);
 #pragma omp for schedule(static)
             for (size_t i = 0; i < uniqueKeys.size(); i++) {
-                keyFetchSources[i] = isAssigned(uniqueKeys[i]) ? nodes + 1 : ((getFetchedEntry(previous, uniqueKeys[i], NULL, &keyCursor) != NULL) ? nodes : (isReadingDirectly ? rank : getKeyAlignNode(seqDbr, uniqueKeys[i], &keyCursor.block)));
+                keyFetchSources[i] = isAssigned(uniqueKeys[i]) ? assignedSource : ((getFetchedEntry(previous, uniqueKeys[i], NULL, &keyCursor) != NULL) ? nodes : (isReadingDirectly ? rank : getKeyAlignNode(seqDbr, uniqueKeys[i], &keyCursor.block)));
+                if (keyFetchSources[i] < nodes && keyFetchSources[i] != rank && isReadingWindowReps && isFetchRep(uniqueKeys[i])
+                    && findWindowRepFile(sequences.windowRepFiles[keyFetchSources[i]], uniqueKeys[i]) != NULL) {
+                    keyFetchSources[i] += nodes + 1;
+                }
                 fetchSourceOffsets[keyFetchSources[i]]++;
             }
-            for (unsigned int node = 0; node <= nodes + 1; node++) {
+            for (unsigned int node = 0; node <= assignedSource; node++) {
                 threadFetchSourceKeyOffsets[node * par.threads + thread_idx + 1] = fetchSourceOffsets[node];
             }
 #pragma omp barrier
@@ -2738,7 +2785,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             for (size_t i = 0; i + 1 < threadFetchSourceKeyOffsets.size(); i++) {
                 threadFetchSourceKeyOffsets[i + 1] += threadFetchSourceKeyOffsets[i];
             }
-            for (unsigned int node = 0; node <= nodes + 1; node++) {
+            for (unsigned int node = 0; node <= assignedSource; node++) {
                 fetchSourceOffsets[node] = threadFetchSourceKeyOffsets[node * par.threads + thread_idx];
             }
 #pragma omp for schedule(static)
@@ -2746,11 +2793,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 sequences.keys[fetchSourceOffsets[keyFetchSources[i]]++] = uniqueKeys[i];
             }
         }
-        sequences.fetchSourceKeyOffsets.resize(nodes + 2);
-        for (unsigned int node = 0; node <= nodes + 1; node++) {
+        sequences.fetchSourceKeyOffsets.resize(assignedSource + 1);
+        for (unsigned int node = 0; node <= assignedSource; node++) {
             sequences.fetchSourceKeyOffsets[node] = threadFetchSourceKeyOffsets[node * par.threads];
         }
-        const size_t keyCount = sequences.fetchSourceKeyOffsets[nodes + 1];
+        const size_t keyCount = sequences.fetchSourceKeyOffsets[assignedSource];
         sequences.keys.resize(keyCount);
         sequences.entryOffsets.resize(keyCount + 1);
         sequences.entryOffsets[0] = 0;
@@ -2773,9 +2820,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
 #pragma omp parallel
         {
-            FetchedKeyCursor keyCursor(nodes + 1);
+            FetchedKeyCursor keyCursor(assignedSource);
 #pragma omp for schedule(dynamic, 1024)
-            for (size_t i = sequences.fetchSourceKeyOffsets[nodes]; i < keyCount; i++) {
+            for (size_t i = sequences.fetchSourceKeyOffsets[nodes]; i < sequences.fetchSourceKeyOffsets[nodes + 1]; i++) {
                 memcpy(sequences.entries + sequences.entryOffsets[i], getFetchedEntry(previous, sequences.keys[i], NULL, &keyCursor), sequences.entryOffsets[i + 1] - sequences.entryOffsets[i]);
             }
         }
@@ -2798,7 +2845,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 
     FetchedSequences currentSequences;
     FetchedSequences nextSequences;
-    nextSequences.fetchSourceKeyOffsets.assign(nodes + 2, 0);
+    nextSequences.fetchSourceKeyOffsets.assign(2 * nodes + 2, 0);
     // the service thread and the loader use a quarter of the threads
     const int serviceThreads = std::max(1, par.threads / 4);
     std::atomic<double> alignedCellsPerSecond(0);
@@ -2869,6 +2916,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<MemberAligners *> threadMemberAligners(par.threads, NULL);
     double waitSeconds = 0;
     double sequenceWaitSeconds = 0;
+    double windowRepWaitSeconds = 0;
     double alignedCells = 0;
     double alignSeconds = 0;
     // wall time of the lookup blocks, not the sum of the thread times
@@ -2917,6 +2965,20 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t deleteCount = 0;
     size_t liveServedSize = 0;
     size_t maxLiveServedSize = 0;
+    size_t requestedTargetSize = 0;
+    size_t windowRepFileCount = 0;
+    size_t windowRepWrittenSize = 0;
+    size_t windowRepEntrySize = 0;
+    size_t windowRepFileReadCount = 0;
+    size_t windowRepReadSize = 0;
+    size_t windowRepSlotCount = 0;
+    size_t windowRepKeyCount = 0;
+    size_t liveWindowRepSize = 0;
+    size_t maxLiveWindowRepSize = 0;
+    size_t windowsAheadSum = 0;
+    size_t maxWindowsAhead = 0;
+    double windowRepWriteSeconds = 0;
+    double windowRepReadSeconds = 0;
     double servingSeconds = 0;
     double readingSeconds = 0;
     double pollingSeconds = 0;
@@ -3075,6 +3137,32 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             const auto getServedFile = [&](unsigned int alignNode, size_t file) {
                 return served + "/" + SSTR(alignNode) + "." + SSTR(file);
             };
+            // own keys of the windows: the window and key to write next, the first key of the window before, the files not yet deleted
+            size_t windowRepWindow = 0;
+            size_t windowRepKey = 0;
+            size_t previousWindowFirstKey = 0;
+            std::deque<WindowRepFile> windowRepFiles;
+            std::vector<uint64_t> windowTable;
+            std::vector<size_t> windowSlotOffsets;
+            // 0, an errno or -1 for a short read
+            const auto readWindowRepBytes = [&](int fd, char *data, size_t size, size_t offset) {
+                size_t partCount = (size + BatchReader::MAX_READ_REQUEST_SIZE - 1) / BatchReader::MAX_READ_REQUEST_SIZE;
+                std::vector<int> readErrors(partCount, 0);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(serviceThreads)
+                for (size_t part = 0; part < partCount; part++) {
+                    size_t partOffset = part * BatchReader::MAX_READ_REQUEST_SIZE;
+                    int partError;
+                    if (MMseqsNode::tryPreadAll(fd, data + partOffset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, size - partOffset), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + offset + partOffset, partError) == false) {
+                        readErrors[part] = (partError != 0) ? partError : -1;
+                    }
+                }
+                int readError = 0;
+                for (size_t part = 0; part < partCount; part++) {
+                    readError = (readErrors[part] != 0) ? readErrors[part] : readError;
+                }
+                windowRepReadSize += size;
+                return readError;
+            };
             MMseqsNode::WaitWarning waitWarning;
             time_t assignedKeysReadTime = 0;
             for (unsigned int polls = 0;;) {
@@ -3130,15 +3218,22 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         request.number = requestCount;
                         request.codeOffsets.assign(nodes + 1, 0);
                         requestCodes.clear();
+                        const std::vector<RepTargetsRecord> &records = prefilterRecords[nextRequest->prefilterBuffer];
                         for (unsigned int node = 0; node < nodes; node++) {
                             request.codeOffsets[node] = requestCodes.size();
                             size_t keyBegin = nextRequest->fetchSourceKeyOffsets[node];
                             size_t keyEnd = (node != rank) ? nextRequest->fetchSourceKeyOffsets[node + 1] : keyBegin;
+                            size_t record = nextRequest->begin;
                             for (size_t i = keyBegin; i < keyEnd; i++) {
                                 char code[10];
                                 size_t codeSize = Util::putPrefKey(code, nextRequest->keys[i] - ((i > keyBegin) ? nextRequest->keys[i - 1] : 0));
                                 requestCodes.insert(requestCodes.end(), code, code + codeSize);
                                 requestedEntrySize += nextRequest->entryOffsets[i + 1] - nextRequest->entryOffsets[i];
+                                // greedy reps ascend: the targets of stolen cells and the members
+                                for (; record < nextRequest->end && records[record].repOrderKeyFirstTarget.repKey < nextRequest->keys[i]; record++) {}
+                                if (sizeClassCount == 1 && (record == nextRequest->end || records[record].repOrderKeyFirstTarget.repKey != nextRequest->keys[i])) {
+                                    requestedTargetSize += nextRequest->entryOffsets[i + 1] - nextRequest->entryOffsets[i];
+                                }
                             }
                         }
                         request.codeOffsets[nodes] = requestCodes.size();
@@ -3162,6 +3257,94 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             objectWriteCount++;
                             isRequestProgressChanged = true;
                         }
+                        // the keys of the window rep files while the other nodes serve the request, before the request progress shows the last fetch
+                        Timer windowReadTimer;
+                        for (unsigned int node = 0; node < nodes; node++) {
+                            const DBKeyType *keys = nextRequest->keys.data();
+                            const size_t keyEnd = nextRequest->fetchSourceKeyOffsets[nodes + 2 + node];
+                            for (size_t first = nextRequest->fetchSourceKeyOffsets[nodes + 1 + node]; first < keyEnd;) {
+                                const WindowRepFile &file = *findWindowRepFile(nextRequest->windowRepFiles[node], keys[first]);
+                                size_t end = first + 1;
+                                for (; end < keyEnd && keys[end] < file.keyEnd; end++) {}
+                                // the slots from the group of the first key to the last key
+                                const size_t tableSize = 3 * ((file.keyEnd - file.firstKey + 63) / 64) * sizeof(uint64_t);
+                                const size_t firstGroup = (keys[first] - file.firstKey) / 64;
+                                const size_t walkFirstKey = file.firstKey + 64 * firstGroup;
+                                const size_t walkKeyEnd = keys[end - 1] + 1;
+                                windowTable.resize(3 * ((walkKeyEnd - 1 - walkFirstKey) / 64 + 1));
+                                const std::string fileName = windowReps + "/" + SSTR(node) + "." + SSTR(file.number);
+                                for (int error = 1; error != 0;) {
+                                    int fd = MMseqsNode::waitForExchangeFile(fileName, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + file.fileSize, file.number);
+                                    error = readWindowRepBytes(fd, (char *) windowTable.data(), windowTable.size() * sizeof(uint64_t), 3 * sizeof(uint64_t) * firstGroup);
+                                    size_t range = SIZE_MAX;
+                                    if (error == 0) {
+                                        windowSlotOffsets.resize(walkKeyEnd - walkFirstKey + 1);
+                                        windowSlotOffsets[0] = windowTable[1];
+                                        for (size_t slot = 0; slot < walkKeyEnd - walkFirstKey; slot++) {
+                                            const bool isEmpty = (windowTable[3 * (slot / 64)] >> (slot % 64)) & 1;
+                                            windowSlotOffsets[slot + 1] = windowSlotOffsets[slot] + (isEmpty ? 0 : getPackedEntrySize(seqDbr.getSeqLenFromRange(range, walkFirstKey + slot) + 2));
+                                        }
+                                        if (receivedEntries.size() < windowSlotOffsets.back() - windowSlotOffsets[0]) {
+                                            receivedEntries.resize(windowSlotOffsets.back() - windowSlotOffsets[0]);
+                                        }
+                                        error = readWindowRepBytes(fd, receivedEntries.data(), windowSlotOffsets.back() - windowSlotOffsets[0], tableSize + windowSlotOffsets[0]);
+                                    }
+                                    bool hasRaw = false;
+                                    if (error == 0) {
+                                        Timer unpackTimer;
+#pragma omp parallel for schedule(static) num_threads(serviceThreads) reduction(||:hasRaw)
+                                        for (size_t i = first; i < end; i++) {
+                                            const size_t slot = keys[i] - walkFirstKey;
+                                            const char *packedEntry = receivedEntries.data() + windowSlotOffsets[slot] - windowSlotOffsets[0];
+                                            char *entry = nextRequest->entries + nextRequest->entryOffsets[i];
+                                            const size_t entryLen = nextRequest->entryOffsets[i + 1] - nextRequest->entryOffsets[i];
+                                            if (windowSlotOffsets[slot + 1] == windowSlotOffsets[slot]) {
+                                                memset(entry, 0, entryLen);
+                                            } else if ((static_cast<unsigned char>(packedEntry[0]) & 31) == PACKED_RAW_CODE) {
+                                                entry[0] = PACKED_RAW_CODE;
+                                                hasRaw = true;
+                                            } else {
+                                                unpackEntry(packedEntry, entryLen, entry);
+                                            }
+                                        }
+                                        unpackSeconds += unpackTimer.getTimediff();
+                                    }
+                                    // the raw entries follow the slots in key order, a group knows the raw bytes before it
+                                    size_t rawOffset = 0;
+                                    range = SIZE_MAX;
+                                    for (size_t slot = 0, i = first; hasRaw && error == 0 && slot < walkKeyEnd - walkFirstKey; slot++) {
+                                        rawOffset = (slot % 64 == 0) ? windowTable[3 * (slot / 64) + 2] : rawOffset;
+                                        const size_t entryLen = seqDbr.getSeqLenFromRange(range, walkFirstKey + slot) + 2;
+                                        if (windowSlotOffsets[slot + 1] == windowSlotOffsets[slot] || (static_cast<unsigned char>(receivedEntries[windowSlotOffsets[slot] - windowSlotOffsets[0]]) & 31) != PACKED_RAW_CODE) {
+                                            continue;
+                                        }
+                                        for (; keys[i] < walkFirstKey + slot; i++) {}
+                                        if (keys[i] == walkFirstKey + slot) {
+                                            error = readWindowRepBytes(fd, nextRequest->entries + nextRequest->entryOffsets[i], entryLen, tableSize + file.slotSize + rawOffset);
+                                        }
+                                        rawOffset += entryLen;
+                                    }
+                                    MMseqsNode::releaseExchangeCopy(fd);
+                                    int closeError = (close(fd) != 0) ? errno : 0;
+                                    error = (error != 0) ? error : closeError;
+                                    if (error > 0 && error != ESTALE && error != EINTR) {
+                                        Debug(Debug::ERROR) << "Cannot read window rep file " << fileName << ": " << strerror(error) << "\n";
+                                        EXIT(EXIT_FAILURE);
+                                    }
+                                    if (error != 0) {
+                                        failIfMissingTooLong(missingFileSince[node], missingFileAttempts[node], "Cannot read complete window rep file " + fileName + " (error " + SSTR(error) + ")\n");
+                                    }
+                                }
+                                missingFileAttempts[node] = 0;
+                                objectReadCount++;
+                                windowRepFileReadCount++;
+                                windowRepSlotCount += walkKeyEnd - walkFirstKey;
+                                windowRepKeyCount += end - first;
+                                first = end;
+                            }
+                        }
+                        nextRequest->windowRepsReadEnd = startTimer.getTimediff();
+                        windowRepReadSeconds += windowReadTimer.getTimediff();
                         isRequestProgressChanged |= isLast;
                         isLastRequested = isLast;
                         requestedSequences = nextRequest;
@@ -3194,12 +3377,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         nextServedProgressReads[node] = 0;
                         servedListingReadCount++;
                     }
-                    if (isOwed == false || serviceTimer.getTimediff() < nextServedProgressReads[node]) {
+                    // the window rep files of the group nodes are read without a request too
+                    const bool isPolled = isOwed || (isReadingWindowReps && node != rank && node >= alignGroupNodeBegin && node < alignGroupNodeEnd);
+                    if (isPolled == false || serviceTimer.getTimediff() < nextServedProgressReads[node]) {
                         continue;
                     }
                     Timer pollTimer;
                     std::string content;
-                    nextServedProgressReads[node] = serviceTimer.getTimediff() + servedProgressSeconds[node];
+                    nextServedProgressReads[node] = serviceTimer.getTimediff() + (isOwed ? servedProgressSeconds[node] : progressSeconds);
                     if (serviceTimer.getTimediff() >= fastReadEnd) {
                         servedProgressSeconds[node] = std::min(2.0 * servedProgressSeconds[node], progressSeconds);
                     }
@@ -3208,9 +3393,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     pollingSeconds += pollTimer.getTimediff();
                     if (hasProgress) {
                         servedPieces[node].clear();
+                        std::vector<WindowRepFile> files;
                         for (char *line = &content[0]; *line != '\0'; line = Util::skipLine(line)) {
                             const char *columns[8];
-                            if (Util::getWordsOfLine(line, columns, 8) != 8) {
+                            const size_t columnCount = Util::getWordsOfLine(line, columns, 8);
+                            if (columnCount == 5) {
+                                WindowRepFile file = { Util::fast_atoi<size_t>(columns[0]), Util::fast_atoi<size_t>(columns[1]), Util::fast_atoi<size_t>(columns[2]), Util::fast_atoi<size_t>(columns[3]),
+                                                       Util::fast_atoi<size_t>(columns[4]) };
+                                files.push_back(file);
+                            }
+                            if (columnCount != 8) {
                                 continue;
                             }
                             // the files of all requesters, a listed file without a piece of this node moves up one read only
@@ -3221,6 +3413,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 servedPieces[node].push_back(piece);
                             }
                         }
+                        std::lock_guard<std::mutex> lock(windowRepsMutex);
+                        publishedWindowRepFiles[node].swap(files);
                     }
                     for (size_t i = 0; i < ownRequests.size(); i++) {
                         SequenceRequest &request = ownRequests[i];
@@ -3608,9 +3802,107 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     objectWriteCount++;
                     isServedProgressChanged = true;
                 }
-                // the pieces not yet deleted, per requester
+                if (isWritingWindowReps) {
+                    size_t doneRepKey = SIZE_MAX;
+                    for (size_t node = alignGroupNodeBegin; node < alignGroupNodeEnd; node++) {
+                        doneRepKey = std::min(doneRepKey, __atomic_load_n(&targetSplitReader->doneRepKeys[node], __ATOMIC_RELAXED));
+                    }
+                    // a file goes once every node of the group is done with its keys
+                    for (; windowRepFiles.empty() == false && doneRepKey >= windowRepFiles.front().keyEnd; windowRepFiles.pop_front()) {
+                        MMseqsNode::removeExchangeFile(windowReps + "/" + SSTR(rank) + "." + SSTR(windowRepFiles.front().number), windowRepFiles.front().number);
+                        deleteCount++;
+                        liveWindowRepSize -= windowRepFiles.front().fileSize;
+                        isServedProgressChanged = true;
+                    }
+                    for (; windowRepWindow + 1 < windowKeyOffsets.size() && windowAlignGroups[windowRepWindow] != alignGroup; windowRepWindow++) {}
+                    // a window once the slowest node of the group has started the window before
+                    if (windowRepWindow + 1 < windowKeyOffsets.size() && doneRepKey >= previousWindowFirstKey) {
+                        Timer windowWriteTimer;
+                        const size_t windowEnd = windowKeyOffsets[windowRepWindow + 1];
+                        size_t firstKey = std::max(windowRepKey, windowKeyOffsets[windowRepWindow]);
+                        for (; firstKey < windowEnd && getKeyAlignNode(seqDbr, firstKey) != rank; firstKey = blockKeyOffsets[seqDbr.getKeyBlock(firstKey) + 1]) {}
+                        size_t ownKeyEnd = firstKey;
+                        for (; ownKeyEnd < windowEnd && getKeyAlignNode(seqDbr, ownKeyEnd) == rank; ownKeyEnd = std::min(windowEnd, blockKeyOffsets[seqDbr.getKeyBlock(ownKeyEnd) + 1])) {}
+                        if (firstKey >= windowEnd) {
+                            previousWindowFirstKey = windowKeyOffsets[windowRepWindow];
+                            windowRepWindow++;
+                            windowRepKey = windowEnd;
+                        } else {
+                            // a file fits a served file
+                            size_t keyEnd = firstKey;
+                            size_t range = SIZE_MAX;
+                            for (size_t size = 0; keyEnd < ownKeyEnd; keyEnd++) {
+                                const size_t keySize = seqDbr.getSeqLenFromRange(range, keyEnd) + 2 + FETCHED_KEY_SIZE;
+                                if (keyEnd > firstKey && size + keySize > servedFileEntrySize) {
+                                    break;
+                                }
+                                size += keySize;
+                            }
+                            const size_t keyCount = keyEnd - firstKey;
+                            const size_t tableSize = 3 * ((keyCount + 63) / 64) * sizeof(uint64_t);
+                            servedKeys.resize(keyCount);
+                            requestOffsets.resize(keyCount + 1);
+                            requestOffsets[0] = 0;
+                            range = SIZE_MAX;
+                            for (size_t j = 0; j < keyCount; j++) {
+                                servedKeys[j] = firstKey + j;
+                                const size_t entryLen = isAssigned(firstKey + j) ? 0 : seqDbr.getSeqLenFromRange(range, firstKey + j) + 2;
+                                requestOffsets[j + 1] = requestOffsets[j] + ((entryLen > 0) ? getPackedEntrySize(entryLen) : 0);
+                                windowRepEntrySize += entryLen;
+                            }
+                            servedFileData.reserve(maxServedFileSize);
+                            servedFileData.resize(tableSize + requestOffsets[keyCount]);
+                            windowTable.assign(tableSize / sizeof(uint64_t), 0);
+                            for (size_t j = 0; j < keyCount; j++) {
+                                windowTable[3 * (j / 64) + 1] = (j % 64 == 0) ? requestOffsets[j] : windowTable[3 * (j / 64) + 1];
+                                windowTable[3 * (j / 64)] |= static_cast<uint64_t>(requestOffsets[j + 1] == requestOffsets[j]) << (j % 64);
+                            }
+                            rawKeys.clear();
+                            copyEntries(servedKeys.data(), keyCount, requestOffsets.data(), servedFileData.data() + tableSize, &rawKeys);
+                            const size_t slotSize = requestOffsets[keyCount];
+                            requestOffsets.resize(rawKeys.size() + 1);
+                            requestOffsets[0] = 0;
+                            range = SIZE_MAX;
+                            for (size_t j = 0; j < rawKeys.size(); j++) {
+                                requestOffsets[j + 1] = requestOffsets[j] + seqDbr.getSeqLenFromRange(range, rawKeys[j]) + 2;
+                            }
+                            for (size_t group = 0, raw = 0; group < tableSize / (3 * sizeof(uint64_t)); group++) {
+                                for (; raw < rawKeys.size() && rawKeys[raw] < firstKey + 64 * group; raw++) {}
+                                windowTable[3 * group + 2] = requestOffsets[raw];
+                            }
+                            memcpy(servedFileData.data(), windowTable.data(), tableSize);
+                            servedFileData.resize(tableSize + slotSize + requestOffsets[rawKeys.size()]);
+                            copyEntries(rawKeys.data(), rawKeys.size(), requestOffsets.data(), servedFileData.data() + tableSize + slotSize, NULL);
+                            WindowRepFile file = { firstKey, keyEnd, windowRepFileCount, slotSize, servedFileData.size() };
+                            MMseqsNode::writeExchangeFile(windowReps + "/" + SSTR(rank) + "." + SSTR(file.number), file.number, servedFileData.data(), servedFileData.size(), "", std::vector<uint64_t>(), serviceThreads);
+                            servedFileData.clear();
+                            windowRepFiles.push_back(file);
+                            windowRepFileCount++;
+                            objectWriteCount++;
+                            windowRepWrittenSize += file.fileSize;
+                            liveWindowRepSize += file.fileSize;
+                            maxLiveWindowRepSize = std::max(maxLiveWindowRepSize, liveWindowRepSize);
+                            // the windows of the group from the one of the slowest node to this one
+                            size_t windowsAhead = 0;
+                            for (size_t window = std::upper_bound(windowKeyOffsets.begin(), windowKeyOffsets.end(), doneRepKey) - windowKeyOffsets.begin() - 1; window < windowRepWindow; window++) {
+                                windowsAhead += windowAlignGroups[window] == alignGroup;
+                            }
+                            windowsAheadSum += windowsAhead;
+                            maxWindowsAhead = std::max(maxWindowsAhead, windowsAhead);
+                            windowRepKey = keyEnd;
+                            isServedProgressChanged = true;
+                        }
+                        windowRepWriteSeconds += windowWriteTimer.getTimediff();
+                        hasWorked = true;
+                    }
+                }
+                // the pieces not yet deleted, per requester, and the window rep files
                 if (isServedProgressChanged) {
                     std::string content;
+                    for (size_t i = 0; i < windowRepFiles.size(); i++) {
+                        content += SSTR(windowRepFiles[i].firstKey) + "\t" + SSTR(windowRepFiles[i].keyEnd) + "\t" + SSTR(windowRepFiles[i].number) + "\t" + SSTR(windowRepFiles[i].slotSize)
+                                   + "\t" + SSTR(windowRepFiles[i].fileSize) + "\n";
+                    }
                     for (unsigned int node = 0; node < nodes; node++) {
                         for (size_t i = 0; i < requesters[node].pieces.size(); i++) {
                             const ServedPiece &piece = requesters[node].pieces[i];
@@ -3623,6 +3915,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     isServedProgressChanged = false;
                 }
                 if (isLastRequested && ownRequests.empty() && requestedSequences == NULL && isServing == false) {
+                    // every node of the group has read its last keys
+                    for (size_t i = 0; i < windowRepFiles.size(); i++) {
+                        MMseqsNode::removeExchangeFile(windowReps + "/" + SSTR(rank) + "." + SSTR(windowRepFiles[i].number), windowRepFiles[i].number);
+                        deleteCount++;
+                    }
                     break;
                 }
                 // sleep longer while no node waits
@@ -3654,10 +3951,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         publishedSize = acceptedSize;
         publishTime = startTimer.getTimediff();
         Timer waitTimer;
+        const double waitStart = startTimer.getTimediff();
         lock.lock();
         const bool waitsForMaster = isWaitingForMaster;
         serviceCondition.wait(lock, [&]() { return completedSequences == &fetched; });
-        (waitsForMaster ? waitSeconds : sequenceWaitSeconds) += waitTimer.getTimediff();
+        const double waited = waitTimer.getTimediff();
+        // the part of the wait while the service thread read the window rep files
+        const double windowRepWait = waitsForMaster ? 0 : std::min(waited, std::max(0.0, fetched.windowRepsReadEnd - waitStart));
+        (waitsForMaster ? waitSeconds : sequenceWaitSeconds) += waited - windowRepWait;
+        windowRepWaitSeconds += windowRepWait;
     };
     if (isAligningNode) {
         {
@@ -3753,7 +4055,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #ifdef OPENMP
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-            FetchedKeyCursor targetCursor(nodes + 1);
+            FetchedKeyCursor targetCursor(2 * nodes + 1);
             std::vector<ClusterPair> pairs;
 #pragma omp for schedule(dynamic, 1)
             for (size_t batch = 0; batch < batchCount; batch++) {
@@ -4303,6 +4605,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                   + ", served listings: " + SSTR(servedListingCount));
         MMseqsNode::addPhaseValue(phaseValues, "Served files", SSTR(servedFileCount) + ", at most " + SSTR(maxLiveServedSize) + " bytes not yet deleted, " + SSTR(servedPieceCount) + " pieces, at most "
                                   + SSTR(maxPassPieceCount) + " pieces a file");
+        MMseqsNode::addPhaseValue(phaseValues, "Requested entry bytes of no rep of the fetch", SSTR(requestedTargetSize) + " for the targets of stolen cells and the members");
+        MMseqsNode::addPhaseValue(phaseValues, "Window rep bytes", SSTR(windowRepWrittenSize) + " written for " + SSTR(windowRepEntrySize) + " entry bytes in " + SSTR(windowRepFileCount) + " files, "
+                                  + SSTR(windowRepReadSize) + " read in " + SSTR(windowRepFileReadCount) + " file reads, " + SSTR(windowRepSlotCount) + " slots read for " + SSTR(windowRepKeyCount) + " keys");
+        MMseqsNode::addPhaseValue(phaseValues, "Window rep files", "written " + SSTR(windowsAheadSum * 100 / std::max<size_t>(1, windowRepFileCount)) + " / 100 windows ahead on average, at most "
+                                  + SSTR(maxWindowsAhead) + ", at most " + SSTR(maxLiveWindowRepSize) + " bytes not yet deleted");
+        MMseqsNode::addPhaseSeconds(phaseValues, "service: writing the window reps", windowRepWriteSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "service: reading the window reps", windowRepReadSeconds);
     }
     delete[] currentSequences.entries;
     delete[] nextSequences.entries;
@@ -4316,6 +4625,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     if (isAligningNode) {
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the master", waitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences", sequenceWaitSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the window reps", windowRepWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the prefilter", prefilterWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "aligning the fetches", alignSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Fetches with fewer SWIPE batches", SSTR(fewerBatchFetchCount) + " of " + SSTR(fetchCount));
@@ -5140,6 +5450,7 @@ int align2clustLinfinity(Parameters &par) {
         std::vector<size_t> groupWindows(alignGroupCount, 0);
         windowAlignGroups.resize(partitions.size() / targetSplitCount);
         for (size_t window = 0; window < windowAlignGroups.size(); window++) {
+            windowKeyOffsets.push_back(partitions[window * targetSplitCount].windowFirstKey);
             size_t windowGroup = 0;
             for (size_t group = 1; group < alignGroupCount; group++) {
                 if (groupWindows[group] * (groupNodeOffsets[windowGroup + 1] - groupNodeOffsets[windowGroup]) < groupWindows[windowGroup] * (groupNodeOffsets[group + 1] - groupNodeOffsets[group])) {
@@ -5152,6 +5463,7 @@ int align2clustLinfinity(Parameters &par) {
                 groupCosts[windowGroup] += partitions[window * targetSplitCount + split].alignmentCells;
             }
         }
+        windowKeyOffsets.push_back(blockDbr.getSize());
         if (alignGroup < alignGroupCount) {
             alignGroupNodeBegin = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[alignGroup];
             alignGroupNodeEnd = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[alignGroup + 1];
@@ -5329,6 +5641,7 @@ int align2clustLinfinity(Parameters &par) {
     const std::string served = par.db3 + "_served_sequences";
     const std::string memberRequests = par.db3 + "_member_requests";
     const std::string servedMembers = par.db3 + "_members";
+    const std::string windowReps = par.db3 + "_window_reps";
     std::vector<std::string> sequenceIndexes;
     std::vector<std::string> sequenceFiles;
     // an empty progress file has no requests and no served files
@@ -5336,8 +5649,8 @@ int align2clustLinfinity(Parameters &par) {
         sequenceIndexes.push_back(requests + "." + SSTR(MMseqsNode::rank) + ".progress");
         sequenceIndexes.push_back(served + "." + SSTR(MMseqsNode::rank) + ".progress");
         // the request files and the served files of all nodes share a directory each, one listing shows the new files
-        const std::string exchangeDirs[] = { requests, served };
-        for (size_t i = 0; i < 2; i++) {
+        const std::string exchangeDirs[] = { requests, served, windowReps };
+        for (size_t i = 0; i < 3; i++) {
             if (FileUtil::makeDir(exchangeDirs[i].c_str()) == false && FileUtil::directoryExists(exchangeDirs[i].c_str()) == false) {
                 Debug(Debug::ERROR) << "Cannot create " << exchangeDirs[i] << "\n";
                 EXIT(EXIT_FAILURE);
@@ -5608,6 +5921,7 @@ int align2clustLinfinity(Parameters &par) {
     }
     rmdir(requests.c_str());
     rmdir(served.c_str());
+    rmdir(windowReps.c_str());
     MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", phaseValueTimer);
     if (memberDbr != NULL) {
         // every reader, the serving ones too, has added its lookups by now
