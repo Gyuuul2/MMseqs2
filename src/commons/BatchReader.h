@@ -54,6 +54,7 @@ public:
 private:
     void startRead(const std::vector<ReadRequest> &requests, bool callingThreadReads);
     void readWithPread();
+    bool retryRead(const ReadRequest &request, int &error);
 
     StorageKind storage;
     int maxInflightRequests;

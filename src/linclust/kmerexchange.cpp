@@ -3067,8 +3067,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
 
     struct rlimit openFileLimit = {0, 0};
     getrlimit(RLIMIT_NOFILE, &openFileLimit);
-    // align2clust opens three files per target split
-    size_t minOpenFiles = seqDbr.getDataFileCnt() + 64 + kmerGroups.count + 2 * MMseqsNode::count + 3 * (exchange.hasTargetSplits ? MAX_TARGET_SPLITS_PER_NODE * (MMseqsNode::count - MMseqsNode::getFirstAlignNode()) : 1);
+    // align2clust opens up to five files per target split
+    size_t minOpenFiles = 2 * seqDbr.getDataFileCnt() + 64 + kmerGroups.count + 2 * MMseqsNode::count + 5 * (exchange.hasTargetSplits ? MAX_TARGET_SPLITS_PER_NODE * (MMseqsNode::count - MMseqsNode::getFirstAlignNode()) : 1);
     if (minOpenFiles > openFileLimit.rlim_cur) {
         Debug(Debug::ERROR) << "Raise the open file limit (ulimit -n) to at least " << minOpenFiles << "\n";
         EXIT(EXIT_FAILURE);

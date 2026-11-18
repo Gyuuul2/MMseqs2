@@ -650,11 +650,7 @@ static size_t getSizeClass(size_t targetCount, size_t sizeClassCount) {
 
 // retry a missing or short file in later passes, then fail
 static void failIfMissingTooLong(time_t &missingSince, unsigned int &attempts, const std::string &error) {
-    time_t now = time(NULL);
-    if (attempts++ == 0) {
-        missingSince = now;
-    }
-    if (attempts >= 100 && now - missingSince >= 60) {
+    if (MMseqsNode::hasFailedTooLong(missingSince, attempts)) {
         Debug(Debug::ERROR) << error;
         EXIT(EXIT_FAILURE);
     }
@@ -5558,10 +5554,10 @@ int align2clustLinfinity(Parameters &par) {
     blockDbr.close();
     DBReader<DBKeyType> seqDbr(seqDb.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
     seqDbr.open(DBReader<DBKeyType>::NOSORT);
-    // seqDbr and repDbr open the data files, a node reads its own target splits, three files each
+    // seqDbr, repDbr and the member DB of iteration 2 open each data file, O_DIRECT doubles the fds, up to five fds per own target split
     struct rlimit openFileLimit = {0, 0};
     getrlimit(RLIMIT_NOFILE, &openFileLimit);
-    size_t minOpenFiles = 2 * seqDbr.getDataFileCnt() + 64 + 2 * MMseqsNode::count + 3 * std::count(targetSplitAlignNodes.begin(), targetSplitAlignNodes.end(), MMseqsNode::rank);
+    size_t minOpenFiles = (par.filterCluDBFile.empty() ? 4 : 6) * seqDbr.getDataFileCnt() + 64 + 2 * MMseqsNode::count + 5 * std::count(targetSplitAlignNodes.begin(), targetSplitAlignNodes.end(), MMseqsNode::rank);
     if (minOpenFiles > openFileLimit.rlim_cur) {
         Debug(Debug::ERROR) << "Raise the open file limit (ulimit -n) to at least " << minOpenFiles << "\n";
         EXIT(EXIT_FAILURE);
