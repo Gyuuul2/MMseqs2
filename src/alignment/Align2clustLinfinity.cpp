@@ -1343,10 +1343,8 @@ struct ClusterMemberExchange {
                 nodeCodes[node].resize(line[3]);
                 FileUtil::preadAll(fd, memberFile.c_str(), &nodeCodes[node][0], nodeCodes[node].size(), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES);
                 MMseqsNode::releaseExchangeCopy(fd);
-                if (close(fd) != 0) {
-                    Debug(Debug::ERROR) << "Cannot close " << memberFile << "\n";
-                    EXIT(EXIT_FAILURE);
-                }
+                // another node wrote it, its close has no error of this node
+                close(fd);
                 // only this node reads it
                 MMseqsNode::removeExchangeFile(memberFile, line[0]);
                 nodeConsumedBytes[node] = line[4];
@@ -1463,10 +1461,8 @@ struct ClusterMemberExchange {
                         section.resize(sectionEnd - sectionBegin);
                         FileUtil::preadAll(fd, requestFile.c_str(), section.data(), section.size(), sectionBegin);
                         MMseqsNode::releaseExchangeCopy(fd);
-                        if (close(fd) != 0) {
-                            Debug(Debug::ERROR) << "Cannot close " << requestFile << "\n";
-                            EXIT(EXIT_FAILURE);
-                        }
+                        // another node wrote it, its close has no error of this node
+                        close(fd);
                         requestedKeys.clear();
                         requestedOffsets.clear();
                         requestedBytes.clear();
@@ -3172,8 +3168,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             // a thread loads the keys of this node while the service thread serves and receives
             std::thread ownKeyLoader;
             std::deque<FetchedSequences *> ownKeyRequests;
-            std::vector<time_t> missingFileSince(nodes, 0);
-            std::vector<unsigned int> missingFileAttempts(nodes, 0);
+            // the served files of an align node and the requests of a requester fail on their own
+            std::vector<time_t> missingServedSince(nodes, 0);
+            std::vector<unsigned int> missingServedAttempts(nodes, 0);
+            std::vector<time_t> missingRequestSince(nodes, 0);
+            std::vector<unsigned int> missingRequestAttempts(nodes, 0);
             std::string requestProgress = requests + "." + SSTR(rank) + ".progress";
             std::string servedProgress = served + "." + SSTR(rank) + ".progress";
             const auto getServedFile = [&](unsigned int alignNode, size_t file) {
@@ -3414,7 +3413,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                     Debug(Debug::ERROR) << "Cannot open served sequence file " << fileName << ": " << strerror(lastError) << "\n";
                                     EXIT(EXIT_FAILURE);
                                 }
-                                failIfMissingTooLong(missingFileSince[node], missingFileAttempts[node], "Cannot open complete served sequence file " + fileName
+                                failIfMissingTooLong(missingServedSince[node], missingServedAttempts[node], "Cannot open complete served sequence file " + fileName
                                                      + describeServedFile(MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.fileSize, observedSize, piece.file, observedNumber, lastError));
                                 break;
                             }
@@ -3445,10 +3444,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 EXIT(EXIT_FAILURE);
                             }
                             if (readError != 0 || closeError != 0) {
-                                failIfMissingTooLong(missingFileSince[node], missingFileAttempts[node], "Cannot read complete served sequence file " + fileName + " (error " + SSTR(error) + ")\n");
+                                failIfMissingTooLong(missingServedSince[node], missingServedAttempts[node], "Cannot read complete served sequence file " + fileName + " (error " + SSTR(error) + ")\n");
                                 break;
                             }
-                            missingFileAttempts[node] = 0;
+                            missingServedAttempts[node] = 0;
                             FetchedSequences *sequences = request.sequences;
                             size_t firstKey = sequences->fetchSourceKeyOffsets[node] + request.receivedKeys[node];
                             Timer unpackTimer;
@@ -3671,11 +3670,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 Debug(Debug::ERROR) << "Cannot read sequence request " << requestFile << ": " << strerror(lastError) << "\n";
                                 EXIT(EXIT_FAILURE);
                             }
-                            failIfMissingTooLong(missingFileSince[node], missingFileAttempts[node], "Cannot read complete sequence request " + requestFile
+                            failIfMissingTooLong(missingRequestSince[node], missingRequestAttempts[node], "Cannot read complete sequence request " + requestFile
                                                  + describeServedFile(requestSize, observedSize, requester.servedCount, observedNumber, lastError));
                             break;
                         }
-                        missingFileAttempts[node] = 0;
+                        missingRequestAttempts[node] = 0;
                         // only the last byte of a code is below 0x80
                         const char *codesEnd = requestCodes.data() + requestCodes.size();
                         while (codesEnd > requestCodes.data() && static_cast<unsigned char>(codesEnd[-1]) >= 0x80) {
@@ -5933,14 +5932,20 @@ int align2clustLinfinity(Parameters &par) {
     } else {
         std::vector<uint64_t> clusteredBits(clusteredSize / sizeof(uint64_t));
         MMseqsNode::readLog(clusteredLogFile, 0, clusteredBits.size() * sizeof(uint64_t), reinterpret_cast<char *>(clusteredBits.data()));
-        FILE *acceptedHandle = FileUtil::openFileOrDie(acceptedFile.c_str(), "r", true);
+        // the last progress of the accepted log has its size
+        size_t acceptedKey;
+        size_t acceptedBytes;
+        MMseqsNode::waitForLog(acceptedFile, acceptedKey, acceptedBytes);
+        const size_t acceptedWordCount = acceptedBytes / sizeof(uint64_t);
         // a read takes whole words of clustered bits
         const size_t readWordCount = std::min(clusterPairWriter.pairCapacity, std::max<size_t>(1, clusteredBits.size()) * 64) / 64 * 64;
         std::vector<uint64_t> acceptedWords(readWordCount);
         std::vector<std::vector<size_t> > threadRepWordPositions(par.threads);
         std::vector<size_t> repWordPositions;
         uint64_t previousRepWord = 0;
-        for (size_t wordCount, firstWord = 0; (wordCount = fread(acceptedWords.data(), sizeof(uint64_t), readWordCount, acceptedHandle)) > 0; firstWord += readWordCount / 64) {
+        for (size_t firstWord = 0; firstWord * 64 < acceptedWordCount; firstWord += readWordCount / 64) {
+            const size_t wordCount = std::min(readWordCount, acceptedWordCount - firstWord * 64);
+            MMseqsNode::readLog(acceptedFile, firstWord * 64 * sizeof(uint64_t), (firstWord * 64 + wordCount) * sizeof(uint64_t), reinterpret_cast<char *>(acceptedWords.data()));
             const size_t clusteredWordCount = (wordCount + 63) / 64;
             const uint64_t *clusteredWords = clusteredBits.data() + firstWord;
             size_t clusteredCount = 0;
@@ -5988,10 +5993,6 @@ int align2clustLinfinity(Parameters &par) {
             if (repWordPositions.empty() == false) {
                 previousRepWord = acceptedWords[repWordPositions.back()];
             }
-        }
-        if (fclose(acceptedHandle) != 0) {
-            Debug(Debug::ERROR) << "Cannot close " << acceptedFile << "\n";
-            EXIT(EXIT_FAILURE);
         }
     }
     MMseqsNode::removeLog(clusteredLogFile);
