@@ -106,9 +106,10 @@ public:
         WorkQueue(const std::string &name, size_t itemCount);
         size_t takeNextItem();
         void removeTakenItemFiles();
-        bool takeItem(size_t item);
 
     private:
+        bool takeItem(size_t item);
+
         const std::string name;
         const size_t itemCount;
         size_t nextItem;

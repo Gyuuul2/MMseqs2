@@ -601,18 +601,6 @@ struct RepTargetsRecord {
     }
 };
 
-// stolen share per window behind
-static const double STEAL_SHARE_STEP = 1.0 / 8;
-
-// MMSEQS_ALIGN_STEAL=0: an align node takes only its own cells, for measurements
-static bool isStealingEnabled() {
-    const char *steal = getenv("MMSEQS_ALIGN_STEAL");
-    if (steal != NULL && strcmp(steal, "0") != 0 && strcmp(steal, "1") != 0) {
-        Debug(Debug::WARNING) << "Ignoring MMSEQS_ALIGN_STEAL=" << steal << ", it must be 0 or 1\n";
-    }
-    return steal == NULL || strcmp(steal, "0") != 0;
-}
-
 // target split mode
 static std::vector<size_t> targetSplitBlockOffsets;
 static std::vector<unsigned int> targetSplitAlignNodes;
@@ -829,7 +817,7 @@ static size_t getRepOrderKey(uint64_t word) {
     return word & ~ACCEPTED_REP_BIT;
 }
 static size_t getAssignedKeysHeaderWords() {
-    return 2 * MMseqsNode::count + 5;
+    return MMseqsNode::count + 5;
 }
 
 static const size_t PREFILTER_BUFFER_MEMORY_DIVISOR = 32;
@@ -1884,35 +1872,24 @@ struct TargetSplitPiece {
 
 // target split mode: join the pieces of a rep entry by entry
 struct TargetSplitReader {
-    TargetSplitReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &cells, MMseqsNode::WorkQueue &cellQueue, size_t maxRecordSize, size_t memoryLimit,
+    TargetSplitReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &cells, size_t maxRecordSize, size_t memoryLimit,
                       size_t paddedDbSize, size_t sizeClassCount)
-        : readSize(0), prefSize(0), homeCellCount(0), stolenCellCount(0), lostCellCount(0), stolenCost(0), takenCost(0), stolenTargetBytes(0), targetBytes(0),
-          stealShares(MMseqsNode::count, 0), doneRepKeys(MMseqsNode::count, 0), stolenCostSignChanges(0), stealWindowCount(0), windowCells(cells.size() / (targetSplitBlockOffsets.size() - 1), 0),
-          isClaiming(sizeClassCount == 1 && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()), isStealing(isStealingEnabled()), par(par), seqDbr(seqDbr), cells(cells), cellQueue(cellQueue),
+        : readSize(0), prefSize(0), windowCells(cells.size() / (targetSplitBlockOffsets.size() - 1), 0), par(par), seqDbr(seqDbr), cells(cells),
           targetSplitCount(targetSplitBlockOffsets.size() - 1), paddedDbSize(paddedDbSize), sizeClassCount(sizeClassCount),
           maxPrefilterBufferSize(std::max((size_t) 1, memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)),
           maxRecordTargetCount(std::min((size_t) UINT_MAX, std::max((size_t) 1, maxRecordSize / std::max(seqDbr.getMaxSeqLen() + 2, Util::getPageSize())))),
-          idleShares(MMseqsNode::count, 0), stealCarries(MMseqsNode::count, 0), cellsPerSecond(0), waitSeconds(0), usedWaitSeconds(0),
-          lastStolenCost(0), lastStolenCostChange(0), cellPos(0), prefReadPos(0), passClasses(1), endClass(0), classSize(sizeClassCount, 0), prefNode(SIZE_MAX), bufferFetchSize(0), bufferAlignmentCells(0) {
-        // greedy claims its splits per window
-        for (size_t split = 0; isClaiming == false && split < targetSplitCount; split++) {
+          cellPos(0), prefReadPos(0), passClasses(1), endClass(0), classSize(sizeClassCount, 0), prefNode(SIZE_MAX), bufferFetchSize(0), bufferAlignmentCells(0) {
+        for (size_t split = 0; split < targetSplitCount; split++) {
             if (targetSplitAlignNodes[split] == MMseqsNode::rank) {
                 targetSplits.push_back(split);
                 targetSplitFirstKeys.push_back(seqDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[split]]);
-                targetSplitIsStolen.push_back(0);
             }
         }
-        for (size_t i = 0; isClaiming == false && i < cells.size(); i++) {
+        for (size_t i = 0; i < cells.size(); i++) {
             prefSize += (windowAlignGroups[i / targetSplitCount] == alignGroup && targetSplitAlignNodes[cells[i].targetSplit] == MMseqsNode::rank) ? cells[i].prefSize : 0;
         }
         prefOffsets.resize(MMseqsNode::count * targetSplitCount);
         prefKeys.resize(MMseqsNode::count);
-    }
-
-    // cells per second and master wait so far
-    void setWindowWork(double rate, double idle) {
-        cellsPerSecond = rate;
-        waitSeconds = idle;
     }
 
     // load every window once and mark its size classes
@@ -1972,43 +1949,20 @@ struct TargetSplitReader {
 
     size_t readSize;
     size_t prefSize;
-    size_t homeCellCount;
-    size_t stolenCellCount;
-    size_t lostCellCount;
-    double stolenCost;
-    double takenCost;
-    size_t stolenTargetBytes;
-    size_t targetBytes;
-    std::vector<double> stealShares;
-    std::vector<size_t> doneRepKeys;
-    size_t stolenCostSignChanges;
-    size_t stealWindowCount;
     // the cells this node took per window
     std::vector<size_t> windowCells;
-    const bool isClaiming;
-    const bool isStealing;
 
 private:
     Parameters &par;
     DBReader<DBKeyType> &seqDbr;
     const std::vector<PrefPartition> &cells;
-    MMseqsNode::WorkQueue &cellQueue;
     const size_t targetSplitCount;
     const size_t paddedDbSize;
     const size_t sizeClassCount;
     const size_t maxPrefilterBufferSize;
     const size_t maxRecordTargetCount;
-    std::vector<double> idleShares;
-    std::vector<double> stealCarries;
-    std::vector<size_t> windowDoneRepKeys;
-    double cellsPerSecond;
-    double waitSeconds;
-    double usedWaitSeconds;
-    double lastStolenCost;
-    int lastStolenCostChange;
     std::vector<size_t> targetSplits;
     std::vector<DBKeyType> targetSplitFirstKeys;
-    std::vector<unsigned char> targetSplitIsStolen;
     size_t cellPos;
     std::vector<PrefRead> prefReads;
     size_t prefReadPos;
@@ -2062,9 +2016,6 @@ private:
                 // only the windows of the own align group
                 if (windowAlignGroups[firstCell / targetSplitCount] != alignGroup) {
                     continue;
-                }
-                if (isClaiming) {
-                    claimWindowCells(firstCell / targetSplitCount);
                 }
             }
             if (firstCell == cells.size()) {
@@ -2125,103 +2076,6 @@ private:
             }
         }
         return prefReads.size() > prefReadsBefore;
-    }
-
-    // take the own cells, then the cells of nodes behind
-    void claimWindowCells(size_t window) {
-        size_t firstCell = window * targetSplitCount;
-        size_t firstAlignNode = MMseqsNode::getFirstAlignNode();
-        size_t alignNodeCount = MMseqsNode::count - firstAlignNode;
-        std::vector<size_t> nodeCosts(MMseqsNode::count, 0);
-        std::vector<size_t> nodeCells(MMseqsNode::count, 0);
-        for (size_t split = 0; split < targetSplitCount; split++) {
-            size_t cost = cells[firstCell + split].alignmentCells;
-            nodeCosts[targetSplitAlignNodes[split]] += cost;
-            nodeCells[targetSplitAlignNodes[split]] += cost > 0;
-        }
-        std::vector<unsigned char> isNodeTaken(MMseqsNode::count, 0);
-        isNodeTaken[MMseqsNode::rank] = nodeCosts[MMseqsNode::rank] > 0 && cellQueue.takeItem(window * alignNodeCount + MMseqsNode::rank - firstAlignNode);
-        homeCellCount += isNodeTaken[MMseqsNode::rank] ? nodeCells[MMseqsNode::rank] : 0;
-        __atomic_fetch_add(&lostCellCount, isNodeTaken[MMseqsNode::rank] ? 0 : nodeCells[MMseqsNode::rank], __ATOMIC_RELAXED);
-        double windowTakenCost = isNodeTaken[MMseqsNode::rank] ? nodeCosts[MMseqsNode::rank] : 0;
-
-        // a node is behind by the windows since this node had its done rep key
-        std::vector<unsigned char> isBehind(MMseqsNode::count, 0);
-        std::vector<size_t> behindWindows(MMseqsNode::count, 0);
-        size_t behindNodes = 0;
-        size_t aheadNodes = 1;
-        for (size_t node = firstAlignNode; node < MMseqsNode::count; node++) {
-            if (node == MMseqsNode::rank || nodeCosts[node] == 0) {
-                continue;
-            }
-            size_t doneRepKey = __atomic_load_n(&doneRepKeys[node], __ATOMIC_RELAXED);
-            size_t behind = windowDoneRepKeys.end() - std::upper_bound(windowDoneRepKeys.begin(), windowDoneRepKeys.end(), doneRepKey);
-            if (behind == 0) {
-                idleShares[node] /= 2;
-                aheadNodes++;
-                continue;
-            }
-            isBehind[node] = 1;
-            behindNodes++;
-            behindWindows[node] = std::min(behind - 1, (size_t) (0.5 / STEAL_SHARE_STEP));
-        }
-        // a done key once, so behind counts the master steps and not the claims between them
-        size_t ownDoneRepKey = __atomic_load_n(&doneRepKeys[MMseqsNode::rank], __ATOMIC_RELAXED);
-        if (windowDoneRepKeys.empty() || windowDoneRepKeys.back() != ownDoneRepKey) {
-            windowDoneRepKeys.push_back(ownDoneRepKey);
-        }
-
-        double idleCells = cellsPerSecond * std::max(0.0, waitSeconds - usedWaitSeconds);
-        usedWaitSeconds = waitSeconds;
-        double windowStolenCost = 0;
-        for (size_t i = 1; isStealing && i < alignNodeCount; i++) {
-            size_t node = firstAlignNode + (MMseqsNode::rank - firstAlignNode + i) % alignNodeCount;
-            if (isBehind[node] == 0) {
-                continue;
-            }
-            // idle seconds add up, windows behind add the cost difference
-            double cost = static_cast<double>(nodeCosts[node]);
-            idleShares[node] = std::min(0.5, idleShares[node] + idleCells / (2.0 * cost * behindNodes));
-            double balanceShare = (behindWindows[node] > 0) ? std::max(0.0, cost - windowTakenCost) / (2.0 * cost) : 0.0;
-            stealShares[node] = std::min(0.5, idleShares[node] + (balanceShare + behindWindows[node] * STEAL_SHARE_STEP) / aheadNodes);
-            stealCarries[node] = std::min(stealCarries[node] + stealShares[node] * cost, cost);
-            if (cost <= stealCarries[node] && cellQueue.takeItem(window * alignNodeCount + node - firstAlignNode)) {
-                isNodeTaken[node] = 1;
-                stealCarries[node] -= cost;
-                windowTakenCost += cost;
-                windowStolenCost += cost;
-                __atomic_fetch_add(&stolenCellCount, nodeCells[node], __ATOMIC_RELAXED);
-            }
-        }
-
-        stolenCost += windowStolenCost;
-        stealWindowCount += windowStolenCost > 0;
-        if (windowStolenCost != lastStolenCost) {
-            int change = (windowStolenCost > lastStolenCost) ? 1 : -1;
-            stolenCostSignChanges += lastStolenCostChange != 0 && change != lastStolenCostChange;
-            lastStolenCostChange = change;
-            lastStolenCost = windowStolenCost;
-        }
-
-        std::vector<size_t> splits;
-        targetSplitIsStolen.clear();
-        for (size_t split = 0; split < targetSplitCount; split++) {
-            if (isNodeTaken[targetSplitAlignNodes[split]] && cells[firstCell + split].alignmentCells > 0) {
-                splits.push_back(split);
-                targetSplitIsStolen.push_back(targetSplitAlignNodes[split] != MMseqsNode::rank);
-                prefSize += cells[firstCell + split].prefSize;
-                takenCost += cells[firstCell + split].alignmentCells;
-            }
-        }
-        // reopen the pref readers for new splits
-        if (splits != targetSplits) {
-            closePrefDbs();
-            targetSplits.swap(splits);
-            targetSplitFirstKeys.clear();
-            for (size_t i = 0; i < targetSplits.size(); i++) {
-                targetSplitFirstKeys.push_back(seqDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[targetSplits[i]]]);
-            }
-        }
     }
 
     size_t findPassPrefRead(size_t prefRead) {
@@ -2325,12 +2179,9 @@ private:
         targets.resize(firstTarget + entryTargetOffsets[entryCount]);
         size_t fetchSize = 0;
         size_t alignCells = 0;
-        size_t targetSize = 0;
-        size_t stolenSize = 0;
-#pragma omp parallel reduction(+:fetchSize, alignCells, targetSize, stolenSize)
+#pragma omp parallel reduction(+:fetchSize, alignCells)
         {
             std::vector<TargetSplitPiece> pieces(prefDbs.size());
-            size_t stolenRange = SIZE_MAX;
 #pragma omp for schedule(dynamic, 1)
             for (size_t entry = 0; entry < entryCount; entry++) {
                 if (entryTargetOffsets[entry + 1] == entryTargetOffsets[entry]) {
@@ -2353,7 +2204,6 @@ private:
                             for (size_t k = 0; k < targetCount; k++) {
                                 target += Util::getPrefKey(data);
                                 repTargets[repTargetCount++] = target;
-                                stolenSize += targetSplitIsStolen[i] ? getSeqLenFromCursor(seqDbr, stolenRange, target) + 2 : 0;
                             }
                             pieces[i].next();
                         }
@@ -2374,7 +2224,6 @@ private:
                             size_t targetLength = seqDbr.getSeqLenFromRange(targetRange, repTargets[first + i]);
                             record.readSize += targetLength + 2 + FETCHED_KEY_SIZE;
                             alignCells += (repSize - FETCHED_KEY_SIZE - 2) * targetLength;
-                            targetSize += targetLength + 2;
                         }
                         fetchSize += record.readSize;
                     }
@@ -2384,8 +2233,6 @@ private:
         }
         bufferFetchSize += fetchSize;
         bufferAlignmentCells += alignCells;
-        targetBytes += targetSize;
-        stolenTargetBytes += stolenSize;
     }
 };
 
@@ -2574,9 +2421,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             size_t key = step[2 + MMseqsNode::count];
             unsigned int keyDiffLowBits = step[3 + MMseqsNode::count];
             size_t codeWords = step[4 + MMseqsNode::count];
-            for (size_t node = 0; targetSplitReader != NULL && node < MMseqsNode::count; node++) {
-                __atomic_store_n(&targetSplitReader->doneRepKeys[node], step[5 + MMseqsNode::count + node], __ATOMIC_RELAXED);
-            }
             step += headerWords;
             KmerCodeReader codeRead = { (char *) step, 0, 0, 0, -1, assignedKeysLog.c_str(), codeWords * sizeof(uint64_t), 0, codeWords * sizeof(uint64_t) };
             // only the thread that holds assignedKeysMutex adds pages
@@ -2796,7 +2640,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<unsigned char> keyUses;
     size_t requestedRepSize = 0;
     size_t requestedPendingSize = 0;
-    size_t requestedTargetSize = 0;
     // take records while they fit, at least one
     const auto selectRecordKeys = [&](FetchedSequences &sequences, const FetchedSequences &previous) {
         // an empty prefilter buffer is the last one
@@ -2898,7 +2741,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         SORT_PARALLEL(uniqueKeys.begin(), uniqueKeys.end());
         uniqueKeys.erase(std::unique(uniqueKeys.begin(), uniqueKeys.end()), uniqueKeys.end());
         sequences.unassignedRecordSize = unassignedRecordSize;
-        // a requested key counts for a rep first, then for a member or pending pair, else for a target
+        // a requested key counts for a rep first, then for a member or pending pair
         if (isCountingRequests) {
             keyUses.assign(uniqueKeys.size(), 0);
 #pragma omp parallel
@@ -2927,7 +2770,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         threadFetchSourceKeyOffsets.assign((nodes + 2) * par.threads + 1, 0);
         size_t repRequestSize = 0;
         size_t pendingRequestSize = 0;
-        size_t targetRequestSize = 0;
 #pragma omp parallel
         {
             unsigned int thread_idx = 0;
@@ -2937,7 +2779,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             std::vector<size_t> fetchSourceOffsets(nodes + 2, 0);
             FetchedKeyCursor keyCursor(nodes + 1);
             size_t requestRange = SIZE_MAX;
-#pragma omp for schedule(static) reduction(+:repRequestSize, pendingRequestSize, targetRequestSize)
+#pragma omp for schedule(static) reduction(+:repRequestSize, pendingRequestSize)
             for (size_t i = 0; i < uniqueKeys.size(); i++) {
                 keyFetchSources[i] = isAssigned(uniqueKeys[i]) ? nodes + 1 : ((getFetchedEntry(previous, uniqueKeys[i], NULL, &keyCursor) != NULL) ? nodes : getFetchSource(sequences, uniqueKeys[i], keyCursor.block));
                 fetchSourceOffsets[keyFetchSources[i]]++;
@@ -2945,7 +2787,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     const size_t entrySize = getSeqLenFromCursor(seqDbr, requestRange, uniqueKeys[i]) + 2;
                     repRequestSize += (keyUses[i] & 1) ? entrySize : 0;
                     pendingRequestSize += (keyUses[i] == 2) ? entrySize : 0;
-                    targetRequestSize += (keyUses[i] == 0) ? entrySize : 0;
                 }
             }
             for (unsigned int node = 0; node <= nodes + 1; node++) {
@@ -2966,7 +2807,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
         requestedRepSize += repRequestSize;
         requestedPendingSize += pendingRequestSize;
-        requestedTargetSize += targetRequestSize;
         sequences.fetchSourceKeyOffsets.resize(nodes + 2);
         for (unsigned int node = 0; node <= nodes + 1; node++) {
             sequences.fetchSourceKeyOffsets[node] = threadFetchSourceKeyOffsets[node * par.threads];
@@ -3021,10 +2861,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     FetchedSequences nextSequences;
     nextSequences.fetchSourceKeyOffsets.assign(nodes + 2, 0);
     std::atomic<double> alignedCellsPerSecond(0);
-    std::atomic<double> masterWaitSeconds(0);
     const auto fillPrefilterBuffer = [&](size_t buffer, size_t maxBufferAlignmentCells) {
         if (targetSplitReader != NULL) {
-            targetSplitReader->setWindowWork(alignedCellsPerSecond.load(), masterWaitSeconds.load());
             targetSplitReader->fillPrefilterBuffer(prefilterRecords[buffer], prefilterTargets[buffer], maxFetchSize, maxBufferAlignmentCells);
         } else {
             repTargetsReader.fillPrefilterBuffer(prefilterRecords[buffer], prefilterTargets[buffer], maxFetchSize, maxBufferAlignmentCells);
@@ -3357,9 +3195,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 }
                 value += "; service: serving " + formatSeconds(servingSeconds) + ", packing " + formatSeconds(statusPackSeconds) + ", writing served files " + formatSeconds(servedFileWriteSeconds)
                          + ", reading served entries " + formatSeconds(readingSeconds) + ", polling " + formatSeconds(pollingSeconds);
-                if (targetSplitReader != NULL) {
-                    value += "; stolen cells " + SSTR(__atomic_load_n(&targetSplitReader->stolenCellCount, __ATOMIC_RELAXED)) + " taken, " + SSTR(__atomic_load_n(&targetSplitReader->lostCellCount, __ATOMIC_RELAXED)) + " lost";
-                }
                 value += "; gate slack " + SSTR(gateSlackKeys) + " keys and " + SSTR(gateSlackWindows) + " windows, at most " + SSTR(maxGateSlackKeys) + " keys and " + SSTR(maxGateSlackWindows) + " windows";
                 size_t processThreads;
                 size_t ringWorkers;
@@ -4631,7 +4466,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         alignedCells += static_cast<double>(fetchAlignmentCells);
         alignSeconds += fetchAlignSeconds;
         alignedCellsPerSecond.store(alignedCells / std::max(alignSeconds, 1e-3));
-        masterWaitSeconds.store(waitSeconds);
 
         // the seconds of a fetch go to its windows by their cells, a fetch without records to the window of its first rep
         fetchWindowCells.clear();
@@ -4750,8 +4584,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
         MMseqsNode::addPhaseValue(phaseValues, "Served bytes per requesting node", "at most " + SSTR(maxRequesterServedSize) + ", mean " + SSTR(servedSizeSum / std::max<size_t>(1, requesterCount))
                                   + " over " + SSTR(requesterCount) + " nodes");
-        MMseqsNode::addPhaseValue(phaseValues, "Requested entry bytes by use", SSTR(requestedRepSize) + " for reps, " + SSTR(requestedTargetSize) + " for targets of stolen cells, "
-                                  + SSTR(requestedPendingSize) + " for members and pending pairs");
+        MMseqsNode::addPhaseValue(phaseValues, "Requested entry bytes by use", SSTR(requestedRepSize) + " for reps, " + SSTR(requestedPendingSize) + " for members and pending pairs");
         MMseqsNode::addPhaseValue(phaseValues, "Received rep bytes assigned before they aligned", SSTR(staleRepSize.load()));
         for (size_t bucket = 0; bucket < 64; bucket++) {
             const FetchSizeCounters &fetchSize = fetchSizeCounters[bucket];
@@ -5381,9 +5214,6 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
         assignedKeyWords[stepStart + 2 + MMseqsNode::count] = stepKeys.empty() ? 0 : stepKeys.front();
         assignedKeyWords[stepStart + 3 + MMseqsNode::count] = keyDiffLowBits;
         assignedKeyWords[stepStart + 4 + MMseqsNode::count] = codeWords;
-        for (size_t node = 0; node < MMseqsNode::count; node++) {
-            assignedKeyWords[stepStart + 5 + MMseqsNode::count + node] = nodeHasProgress[node] ? nodeRepOrderKeys[node] : 0;
-        }
         KmerCodeWriter codeWrite((char *) (assignedKeyWords.data() + stepStart + headerWords), codeWords * sizeof(uint64_t), 0);
         for (size_t i = 1; i < stepKeys.size(); i++) {
             putRice(codeWrite, stepKeys[i] - stepKeys[i - 1] - 1, keyDiffLowBits);
@@ -5728,10 +5558,10 @@ int align2clustLinfinity(Parameters &par) {
     blockDbr.close();
     DBReader<DBKeyType> seqDbr(seqDb.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
     seqDbr.open(DBReader<DBKeyType>::NOSORT);
-    // seqDbr and repDbr open the data files, a claiming node may read every target split, three files each
+    // seqDbr and repDbr open the data files, a node reads its own target splits, three files each
     struct rlimit openFileLimit = {0, 0};
     getrlimit(RLIMIT_NOFILE, &openFileLimit);
-    size_t minOpenFiles = 2 * seqDbr.getDataFileCnt() + 64 + 2 * MMseqsNode::count + 3 * (hasTargetSplits ? targetSplitBlockOffsets.size() - 1 : 0);
+    size_t minOpenFiles = 2 * seqDbr.getDataFileCnt() + 64 + 2 * MMseqsNode::count + 3 * std::count(targetSplitAlignNodes.begin(), targetSplitAlignNodes.end(), MMseqsNode::rank);
     if (minOpenFiles > openFileLimit.rlim_cur) {
         Debug(Debug::ERROR) << "Raise the open file limit (ulimit -n) to at least " << minOpenFiles << "\n";
         EXIT(EXIT_FAILURE);
@@ -5765,8 +5595,6 @@ int align2clustLinfinity(Parameters &par) {
         }
     }
     alignmentSplitPartitionOffsets.push_back(partitions.size());
-    // an item is the cells of an align node in a window
-    MMseqsNode::WorkQueue cellQueue(par.db3 + "_cells", windowAlignGroups.size() * alignNodeCount);
 
     // builds the block table of getKeyBlock
     seqDbr.setBlockCacheSize(0);
@@ -5839,8 +5667,6 @@ int align2clustLinfinity(Parameters &par) {
         }
     }
 
-    // remove the item files a killed run left
-    cellQueue.removeTakenItemFiles();
     // all nodes use the smallest memory limit
     const size_t smallestMemoryLimit = MMseqsNode::getSmallestMemoryLimit(par.db3 + ".memory", nodeMemoryLimit - std::min(nodeMemoryLimit, assignedMemorySize));
     const size_t paddedDbSize = (dbSize + 63) / 64 * 64;
@@ -5851,7 +5677,7 @@ int align2clustLinfinity(Parameters &par) {
     const size_t servedFileEntrySize = std::max(BatchReader::MAX_READ_REQUEST_SIZE, smallestMemoryLimit / 512);
 
     RepTargetsReader repTargetsReader(par, seqDbr, partitions, alignmentSplitPartitionOffsets, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount);
-    TargetSplitReader *targetSplitReader = hasTargetSplits ? new TargetSplitReader(par, seqDbr, partitions, cellQueue, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount) : NULL;
+    TargetSplitReader *targetSplitReader = hasTargetSplits ? new TargetSplitReader(par, seqDbr, partitions, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount) : NULL;
     if (sizeClassCount > 1 && targetSplitReader != NULL) {
         targetSplitReader->countSizeClasses();
     } else if (sizeClassCount > 1) {
@@ -5932,20 +5758,6 @@ int align2clustLinfinity(Parameters &par) {
         if (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) {
             MMseqsNode::addPhaseValue(phaseValues, "Target split prefilter bytes", SSTR(targetSplitReader->readSize) + " read of " + SSTR(targetSplitReader->prefSize));
         }
-        if (targetSplitReader->isClaiming && targetSplitReader->isStealing == false) {
-            MMseqsNode::addPhaseValue(phaseValues, "Stealing", "off by MMSEQS_ALIGN_STEAL");
-        }
-        if (targetSplitReader->isClaiming) {
-            std::string stealShares;
-            for (size_t node = MMseqsNode::getFirstAlignNode(); node < MMseqsNode::count; node++) {
-                stealShares += ((stealShares.empty()) ? "" : " ") + ((node == MMseqsNode::rank) ? std::string("-") : SSTR(static_cast<int>(targetSplitReader->stealShares[node] * 1000)));
-            }
-            MMseqsNode::addPhaseValue(phaseValues, "Target split cells", SSTR(targetSplitReader->homeCellCount) + " home, " + SSTR(targetSplitReader->stolenCellCount) + " stolen, "
-                                      + SSTR(targetSplitReader->lostCellCount) + " lost; stolen cost " + SSTR(static_cast<size_t>(1000 * targetSplitReader->stolenCost / std::max(1.0, targetSplitReader->takenCost)))
-                                      + " per mille of the cost in " + SSTR(targetSplitReader->stealWindowCount) + " windows, "
-                                      + SSTR(targetSplitReader->stolenCostSignChanges) + " sign changes of its difference; steal shares per mille " + stealShares);
-            MMseqsNode::addPhaseValue(phaseValues, "Stolen target bytes", SSTR(targetSplitReader->stolenTargetBytes) + " of " + SSTR(targetSplitReader->targetBytes) + " target bytes");
-        }
         delete targetSplitReader;
     }
     if (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) {
@@ -5975,8 +5787,6 @@ int align2clustLinfinity(Parameters &par) {
     size_t clusteredKey;
     size_t clusteredSize;
     MMseqsNode::waitForLog(clusteredLogFile, clusteredKey, clusteredSize);
-    // every node took its last cell
-    cellQueue.removeTakenItemFiles();
     if (MMseqsNode::isMaster()) {
         clusterThread.join();
         Debug(Debug::INFO) << "Number of clusters: " << representativeCount - memberCount << "\n";
