@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
+#include <ctime>
+#include <fcntl.h>
+#include <unistd.h>
 
 #ifdef __linux__
 #include <sys/stat.h>
@@ -16,7 +19,6 @@
 #endif
 
 #ifdef HAVE_IO_URING
-#include <fcntl.h>
 #include <linux/io_uring.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -247,6 +249,25 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
     }
 }
 
+// error is the errno, -1 for an unexpected end of file
+static bool preadRequest(const BatchReader::ReadRequest &request, size_t pageSize, int &error) {
+    for (size_t done = 0; done < request.minBytesToRead;) {
+        ssize_t count = pread(request.fileToRead, request.destination + done, request.bytesToRead - done, request.fileOffset + done);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < static_cast<ssize_t>(std::min(pageSize, request.minBytesToRead - done))) {
+            error = (count < 0) ? errno : -1;
+            return false;
+        }
+        done += count;
+        if (done < request.minBytesToRead) {
+            done -= done % pageSize;
+        }
+    }
+    return true;
+}
+
 void BatchReader::readWithPread() {
     size_t pageSize = Util::getPageSize();
     while (__atomic_load_n(&readError, __ATOMIC_RELAXED) == 0) {
@@ -262,23 +283,46 @@ void BatchReader::readWithPread() {
             }
             continue;
         }
-        for (size_t done = 0; done < request.minBytesToRead;) {
-            ssize_t count = pread(request.fileToRead, request.destination + done, request.bytesToRead - done, request.fileOffset + done);
-            if (count < 0 && errno == EINTR) {
-                continue;
+        int error = 0;
+        if (preadRequest(request, pageSize, error) == false && retryRead(request, error) == false) {
+            if (__sync_bool_compare_and_swap(&readError, 0, error)) {
+                readErrorFileName = request.fileName;
             }
-            if (count < static_cast<ssize_t>(std::min(pageSize, request.minBytesToRead - done))) {
-                if (__sync_bool_compare_and_swap(&readError, 0, count < 0 ? errno : -1)) {
-                    readErrorFileName = request.fileName;
-                }
-                return;
-            }
-            done += count;
-            if (done < request.minBytesToRead) {
-                done -= done % pageSize;
-            }
+            return;
         }
     }
+}
+
+// shared file systems can fail reads for a while, then a file opened again can be read
+bool BatchReader::retryRead(const ReadRequest &request, int &error) {
+    time_t failedSince = 0;
+    unsigned int attempts = 0;
+    while (error == EIO || error == ESTALE || error == EAGAIN || error == -1) {
+        if (MMseqsNode::hasFailedTooLong(failedSince, attempts) || __atomic_load_n(&readError, __ATOMIC_RELAXED) != 0) {
+            return false;
+        }
+        // the first attempt only reads again, another request may have opened the file again already
+        if (attempts > 1) {
+            if (attempts == 2) {
+                Debug(Debug::WARNING) << "Cannot read " << request.fileName << ": " << (error > 0 ? strerror(error) : "unexpected end of file") << ", retrying\n";
+            }
+            MMseqsNode::sleepBeforePoll(attempts - 1, 7);
+            if (error == EIO || error == ESTALE) {
+                int fileFlags = fcntl(request.fileToRead, F_GETFL);
+                int fdFlags = fcntl(request.fileToRead, F_GETFD);
+                int fd = (fileFlags < 0 || fdFlags < 0) ? -1 : open(request.fileName, fileFlags);
+                if (fd >= 0) {
+                    dup2(fd, request.fileToRead);
+                    fcntl(request.fileToRead, F_SETFD, fdFlags);
+                    close(fd);
+                }
+            }
+        }
+        if (preadRequest(request, Util::getPageSize(), error)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 #ifdef HAVE_IO_URING
@@ -313,8 +357,9 @@ void BatchReader::readWithRing(bool waitForAll) {
                 continue;
             }
             if (cqe.res < static_cast<int>(std::min(pageSize, rest.minBytesToRead))) {
-                if (readError == 0) {
-                    readError = (cqe.res < 0) ? -cqe.res : -1;
+                int error = (cqe.res < 0) ? -cqe.res : -1;
+                if (readError == 0 && retryRead(rest, error) == false) {
+                    readError = error;
                     readErrorFileName = rest.fileName;
                 }
                 continue;

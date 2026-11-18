@@ -73,6 +73,14 @@ void MMseqsNode::sleepBeforePoll(unsigned int polls, unsigned int maxShift) {
     usleep(10000u << std::min(polls, maxShift));
 }
 
+bool MMseqsNode::hasFailedTooLong(time_t &failedSince, unsigned int &attempts) {
+    time_t now = time(NULL);
+    if (attempts++ == 0) {
+        failedSince = now;
+    }
+    return attempts >= 100 && now - failedSince >= 60;
+}
+
 // NFS caches a missing name for up to 60 s
 static bool isListed(const std::string &file) {
     if (FileUtil::needsDirectoryRefresh(file) == false) {
