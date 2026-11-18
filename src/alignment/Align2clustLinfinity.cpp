@@ -2591,7 +2591,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         Debug(Debug::WARNING) << "Node " << rank << " holds " << servedSequenceSize << " sequence bytes but its block cache has " << blockCacheSize
                               << " bytes, the other sequences are read one by one. Use more nodes or increase --split-memory-limit\n";
     }
-    // the first fetch is small, then they double; MMSEQS_ALIGN_FETCH_BYTES=<n> fixes the limit for measurements
+    // the first fetch is small, then they double up to 128 MiB; MMSEQS_ALIGN_FETCH_BYTES=<n> fixes the limit for measurements
     size_t fetchBytesLimit = std::min<size_t>(maxFetchSize / 64, 64 * 1024 * 1024);
     const char *fixedFetchBytes = getenv("MMSEQS_ALIGN_FETCH_BYTES");
     char *fetchBytesEnd = NULL;
@@ -2606,6 +2606,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             MMseqsNode::addPhaseValue(phaseValues, "Fetch bytes limit", SSTR(fetchBytesLimit) + " fixed by MMSEQS_ALIGN_FETCH_BYTES, the largest fetch is " + SSTR(maxFetchSize) + " bytes");
         }
     }
+    const size_t maxFetchBytesLimit = isFetchBytesFixed ? fetchBytesLimit : std::min<size_t>(maxFetchSize, 128 * 1024 * 1024);
     const auto getFetchSource = [&](const FetchedSequences &sequences, size_t key, size_t &block) -> size_t {
         if (isReadingDirectly) {
             return rank;
@@ -2636,7 +2637,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<unsigned char> keyUses;
     size_t requestedRepSize = 0;
     size_t requestedPendingSize = 0;
-    // take records while they fit, at least one
+    // take records while they fit, at least one that is fetched; records whose rep is assigned take no bytes
     const auto selectRecordKeys = [&](FetchedSequences &sequences, const FetchedSequences &previous) {
         // an empty prefilter buffer is the last one
         if (prefilterRecordPos[prefilterBuffer] == prefilterRecords[prefilterBuffer].size() && prefilterRecords[prefilterBuffer].empty() == false) {
@@ -2666,17 +2667,19 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         // the accepted pairs and the targets of previous and this fetch fit memberKeyBudget, a record goes alone once no pair waits
         size_t acceptablePairCount = acceptedPairs.size() + previous.targetCount;
         sequences.targetCount = 0;
+        const size_t pendingFetchSize = fetchSize;
         for (; sequences.end < prefilterRecords[prefilterBuffer].size(); sequences.end++) {
             const RepTargetsRecord &record = prefilterRecords[prefilterBuffer][sequences.end];
-            fetchSize += record.readSize;
-            if ((sequences.end > sequences.begin && fetchSize > fetchBytesLimit)
+            const size_t recordSize = isAssigned(record.repOrderKeyFirstTarget.repKey) ? 0 : record.readSize;
+            if ((fetchSize > pendingFetchSize && fetchSize + recordSize > fetchBytesLimit)
                 || (memberDbr != NULL && acceptablePairCount > 0 && acceptablePairCount + record.targetCount > memberKeyBudget)) {
                 break;
             }
+            fetchSize += recordSize;
             acceptablePairCount += record.targetCount;
             sequences.targetCount += record.targetCount;
         }
-        sequences.plannedSize = fetchSize - ((sequences.end < prefilterRecords[prefilterBuffer].size()) ? prefilterRecords[prefilterBuffer][sequences.end].readSize : 0);
+        sequences.plannedSize = fetchSize;
         prefilterRecordPos[prefilterBuffer] = sequences.end;
         // the records of a fetch ascend by rep
         sequences.repKeyBegin = 0;
@@ -2687,7 +2690,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
         // previous may still add pending pairs
         sequences.isLast = sequences.end == sequences.begin && sequences.pendingPairCount == 0 && (memberDbr == NULL || previous.end == previous.begin) && acceptedPairs.empty();
-        fetchBytesLimit = isFetchBytesFixed ? fetchBytesLimit : std::min(2 * fetchBytesLimit, maxFetchSize);
+        fetchBytesLimit = std::min(2 * fetchBytesLimit, maxFetchBytesLimit);
         size_t unassignedRecordSize = 0;
 #pragma omp parallel
         {
