@@ -643,6 +643,11 @@ static size_t getKeyAlignNode(const DBReader<DBKeyType> &seqDbr, size_t key, siz
     return getBlockAlignNode(*block);
 }
 
+// the blocks of a window's reps go round the align group
+static size_t getBlockRepServingNode(size_t block) {
+    return alignGroupNodeBegin + block % (alignGroupNodeEnd - alignGroupNodeBegin);
+}
+
 // getSeqLenFromRange only moves its range forward, a smaller key searches again
 static size_t getSeqLenFromCursor(DBReader<DBKeyType> &seqDbr, size_t &range, size_t key) {
     if (range != SIZE_MAX && key < seqDbr.getIndex()[range].id) {
@@ -748,12 +753,15 @@ struct FetchSizeCounters {
 
 // linfinity: records [begin, end) of a prefilter buffer and their fetched entries
 struct FetchedSequences {
-    FetchedSequences() : prefilterBuffer(0), prefilterBufferNumber(0), begin(0), end(0), targetCount(0), pendingPairCount(0), firstPendingRepKey(0), plannedSize(0), unassignedRecordSize(0),
-                         isLast(false), entries(NULL), allocatedSize(0) {}
+    FetchedSequences() : prefilterBuffer(0), prefilterBufferNumber(0), begin(0), end(0), repKeyBegin(0), repKeyEnd(0), targetCount(0), pendingPairCount(0), firstPendingRepKey(0), plannedSize(0),
+                         unassignedRecordSize(0), isLast(false), entries(NULL), allocatedSize(0) {}
     size_t prefilterBuffer;
     size_t prefilterBufferNumber;
     size_t begin;
     size_t end;
+    // first and end of its rep keys, other nodes' blocks between them come from their rep serving node
+    size_t repKeyBegin;
+    size_t repKeyEnd;
     size_t targetCount;
     // pending pairs whose members it brings
     size_t pendingPairCount;
@@ -2661,6 +2669,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     const std::vector<size_t> &blockKeyOffsets = seqDbr.getBlockKeyOffsets();
     std::vector<size_t> rangeByteOffsets(rangeCount + 1, 0);
     std::vector<size_t> nodeRangeByteOffsets(rangeCount + 1, 0);
+    size_t nodeBlockCount = 0;
     for (size_t range = 0, block = 0; range < rangeCount; range++) {
         const size_t keyEnd = (range + 1 < rangeCount) ? static_cast<size_t>(index[range + 1].id) : dbSize;
         rangeByteOffsets[range + 1] = rangeByteOffsets[range] + (keyEnd - index[range].id) * index[range].length;
@@ -2668,6 +2677,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         for (size_t key = index[range].id; key < keyEnd; key = std::min(keyEnd, blockKeyOffsets[block + 1])) {
             for (; blockKeyOffsets[block + 1] <= key; block++) {}
             nodeRangeByteOffsets[range + 1] += (getBlockAlignNode(block) == rank) ? (std::min(keyEnd, blockKeyOffsets[block + 1]) - key) * index[range].length : 0;
+            nodeBlockCount += getBlockAlignNode(block) == rank;
         }
     }
     double coverableBytesSum = 0;
@@ -2716,8 +2726,23 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     const size_t blockCacheSize = memoryLimit - getReservedMemory(maxFetchSize);
     seqDbr.setBlockCacheSize(blockCacheSize);
     const size_t maxPendingPairSize = std::min(memberSplitSize, maxFetchSize);
-    // a --local-tmp copy holds only the blocks this rank serves, the keys of other nodes come from them
+    // a --local-tmp copy holds only the blocks of the target splits of this rank
     const bool isReadingDirectly = hasLocalServedBlocks == false && isCacheTooSmall(blockCacheSize);
+    // the service thread and the loader use a quarter of the threads
+    const int serviceThreads = std::max(1, par.threads / 4);
+    // the blocks of other align nodes are read from the shared database, in a block cache of their own
+    DBReader<DBKeyType> *repDbr = NULL;
+    size_t repBlockCacheSize = 0;
+    if (isAligningNode && alignGroupNodeEnd - alignGroupNodeBegin > 1 && sizeClassCount == 1 && isReadingDirectly == false) {
+        repDbr = new DBReader<DBKeyType>(par.db1.c_str(), par.db1Index.c_str(), serviceThreads,
+                                         DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
+        repDbr->open(DBReader<DBKeyType>::NOSORT);
+        // its cache is what the blocks of this node leave free of the block cache, a block read is rounded to pages at both ends
+        const size_t nodeCacheSize = servedSequenceSize + 2 * pageSize * nodeBlockCount;
+        repBlockCacheSize = std::min(maxFetchSize, blockCacheSize - std::min(blockCacheSize, nodeCacheSize));
+        repDbr->setBlockCacheSize(repBlockCacheSize);
+        seqDbr.setBlockCacheSize(blockCacheSize - repBlockCacheSize);
+    }
     if (isAligningNode) {
         MMseqsNode::addPhaseValue(phaseValues, "Block cache", SSTR(blockCacheSize) + " bytes for " + SSTR(static_cast<size_t>(alignNodeCoverableSize)) + " coverable bytes and " + SSTR(servedSequenceSize) + " sequence bytes of the align node"
                                  + (isReadingDirectly ? ", the sequences are read directly" : ""));
@@ -2741,12 +2766,23 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             MMseqsNode::addPhaseValue(phaseValues, "Fetch bytes limit", SSTR(fetchBytesLimit) + " fixed by MMSEQS_ALIGN_FETCH_BYTES, the largest fetch is " + SSTR(maxFetchSize) + " bytes");
         }
     }
+    const auto getFetchSource = [&](const FetchedSequences &sequences, size_t key, size_t &block) -> size_t {
+        if (isReadingDirectly) {
+            return rank;
+        }
+        size_t alignNode = getKeyAlignNode(seqDbr, key, &block);
+        if (alignNode == rank || key < sequences.repKeyBegin || key >= sequences.repKeyEnd) {
+            return alignNode;
+        }
+        return getBlockRepServingNode(block);
+    };
     const auto getFetchedEntry = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL, FetchedKeyCursor *cursor = NULL) -> const char * {
         const char *data = findFetchedKey(sequences, nodes, key, seqLen, (cursor != NULL) ? &cursor->positions[nodes] : NULL);
         if (data != NULL) {
             return data;
         }
-        size_t fetchSource = isReadingDirectly ? rank : getKeyAlignNode(seqDbr, key, (cursor != NULL) ? &cursor->block : NULL);
+        size_t block = SIZE_MAX;
+        size_t fetchSource = getFetchSource(sequences, key, (cursor != NULL) ? cursor->block : block);
         return findFetchedKey(sequences, fetchSource, key, seqLen, (cursor != NULL) ? &cursor->positions[fetchSource] : NULL);
     };
     const auto getFetchedSequence = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL, FetchedKeyCursor *cursor = NULL) -> const char * {
@@ -2803,6 +2839,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
         sequences.plannedSize = fetchSize - ((sequences.end < prefilterRecords[prefilterBuffer].size()) ? prefilterRecords[prefilterBuffer][sequences.end].readSize : 0);
         prefilterRecordPos[prefilterBuffer] = sequences.end;
+        // the records of a fetch ascend by rep
+        sequences.repKeyBegin = 0;
+        sequences.repKeyEnd = 0;
+        if (repDbr != NULL && sequences.end > sequences.begin) {
+            sequences.repKeyBegin = prefilterRecords[prefilterBuffer][sequences.begin].repOrderKeyFirstTarget.repKey % paddedDbSize;
+            sequences.repKeyEnd = prefilterRecords[prefilterBuffer][sequences.end - 1].repOrderKeyFirstTarget.repKey % paddedDbSize + 1;
+        }
         // previous may still add pending pairs
         sequences.isLast = sequences.end == sequences.begin && sequences.pendingPairCount == 0 && (memberDbr == NULL || previous.end == previous.begin) && acceptedPairs.empty();
         fetchBytesLimit = isFetchBytesFixed ? fetchBytesLimit : std::min(2 * fetchBytesLimit, maxFetchSize);
@@ -2896,7 +2939,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             size_t requestRange = SIZE_MAX;
 #pragma omp for schedule(static) reduction(+:repRequestSize, pendingRequestSize, targetRequestSize)
             for (size_t i = 0; i < uniqueKeys.size(); i++) {
-                keyFetchSources[i] = isAssigned(uniqueKeys[i]) ? nodes + 1 : ((getFetchedEntry(previous, uniqueKeys[i], NULL, &keyCursor) != NULL) ? nodes : (isReadingDirectly ? rank : getKeyAlignNode(seqDbr, uniqueKeys[i], &keyCursor.block)));
+                keyFetchSources[i] = isAssigned(uniqueKeys[i]) ? nodes + 1 : ((getFetchedEntry(previous, uniqueKeys[i], NULL, &keyCursor) != NULL) ? nodes : getFetchSource(sequences, uniqueKeys[i], keyCursor.block));
                 fetchSourceOffsets[keyFetchSources[i]]++;
                 if (isCountingRequests && keyFetchSources[i] < nodes && keyFetchSources[i] != rank) {
                     const size_t entrySize = getSeqLenFromCursor(seqDbr, requestRange, uniqueKeys[i]) + 2;
@@ -2977,8 +3020,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     FetchedSequences currentSequences;
     FetchedSequences nextSequences;
     nextSequences.fetchSourceKeyOffsets.assign(nodes + 2, 0);
-    // the service thread and the loader use a quarter of the threads
-    const int serviceThreads = std::max(1, par.threads / 4);
     std::atomic<double> alignedCellsPerSecond(0);
     std::atomic<double> masterWaitSeconds(0);
     const auto fillPrefilterBuffer = [&](size_t buffer, size_t maxBufferAlignmentCells) {
@@ -3069,9 +3110,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     bool isWaitingForMaster = false;
     // wakes the service thread: a pending fetch or the loaded keys of this node
     bool hasServiceWork = false;
-    // one load of seqDbr at a time
+    // one load of seqDbr and repDbr at a time
     std::mutex sourceMutex;
     std::vector<DBKeyType> loadKeys;
+    std::vector<DBKeyType> repLoadKeys;
     std::vector<std::vector<size_t> > threadRawEntries(serviceThreads);
     size_t servedFileCount = 0;
     size_t servedPieceCount = 0;
@@ -3115,25 +3157,36 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     // copy, or pack with rawKeys, the entries of keys; assigned keys get zeros
     const auto copyEntries = [&](const DBKeyType *keys, size_t keyCount, const size_t *offsets, char *data, std::vector<DBKeyType> *rawKeys) {
         size_t loadRange = SIZE_MAX;
+        const size_t maxLoadSize = (repDbr != NULL) ? maxFetchSize / 2 : maxFetchSize;
         for (size_t first = 0; first < keyCount;) {
             const size_t loadFirst = first;
-            // a load fits maxFetchSize
+            // a load fits maxLoadSize, the buffers of both readers fit maxFetchSize
             for (size_t loadSize = 0; first < keyCount; first++) {
                 const size_t entrySize = seqDbr.getSeqLenFromRange(loadRange, keys[first]) + 2 + 2 * pageSize;
-                if (first > loadFirst && loadSize + entrySize > maxFetchSize) {
+                if (first > loadFirst && loadSize + entrySize > maxLoadSize) {
                     break;
                 }
                 loadSize += entrySize;
             }
             std::lock_guard<std::mutex> sourceLock(sourceMutex);
             loadKeys.clear();
+            repLoadKeys.clear();
+            size_t loadBlock = SIZE_MAX;
             for (size_t i = loadFirst; i < first; i++) {
-                if (isAssigned(keys[i]) == false) {
+                if (isAssigned(keys[i])) {
+                    continue;
+                }
+                if (repDbr == NULL || getKeyAlignNode(seqDbr, keys[i], &loadBlock) == rank) {
                     loadKeys.push_back(keys[i]);
+                } else {
+                    repLoadKeys.push_back(keys[i]);
                 }
             }
             Timer copyTimer;
             seqDbr.loadData(loadKeys);
+            if (repDbr != NULL) {
+                repDbr->loadData(repLoadKeys);
+            }
             sourceLoadSeconds += copyTimer.getTimediff();
             copyTimer.reset();
             for (int thread = 0; thread < serviceThreads; thread++) {
@@ -3148,14 +3201,20 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 // the static chunks give a thread ascending keys
                 size_t packRange = SIZE_MAX;
                 DBReader<DBKeyType>::LoadedBufferCursor cursor;
+                DBReader<DBKeyType>::LoadedBufferCursor repCursor;
+                size_t block = SIZE_MAX;
 #pragma omp for schedule(static)
                 for (size_t i = loadFirst; i < first; i++) {
                     // bits are never cleared
                     if (isAssigned(keys[i])) {
                         memset(data + offsets[i], 0, offsets[i + 1] - offsets[i]);
-                    } else if (rawKeys == NULL) {
-                        memcpy(data + offsets[i], seqDbr.getDataFromLoadedBuffer(keys[i], cursor), offsets[i + 1] - offsets[i]);
-                    } else if (packEntry(seqDbr.getDataFromLoadedBuffer(keys[i], cursor), seqDbr.getSeqLenFromRange(packRange, keys[i]) + 2, data + offsets[i]) == false) {
+                        continue;
+                    }
+                    const char *entry = (repDbr == NULL || getKeyAlignNode(seqDbr, keys[i], &block) == rank) ? seqDbr.getDataFromLoadedBuffer(keys[i], cursor)
+                                                                                                             : repDbr->getDataFromLoadedBuffer(keys[i], repCursor);
+                    if (rawKeys == NULL) {
+                        memcpy(data + offsets[i], entry, offsets[i + 1] - offsets[i]);
+                    } else if (packEntry(entry, seqDbr.getSeqLenFromRange(packRange, keys[i]) + 2, data + offsets[i]) == false) {
                         data[offsets[i]] = PACKED_RAW_CODE;
                         threadRawEntries[thread_idx].push_back(i);
                     }
@@ -4060,7 +4119,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         // a rep another node served for this fetch, at its first record
                         if (isCountingRequests && firstTarget == 0 && (i == currentSequences.begin || records[i - 1].repOrderKeyFirstTarget.repKey != record.repOrderKeyFirstTarget.repKey)
                             && findFetchedKey(currentSequences, nodes, repKey) == NULL) {
-                            const size_t repSource = getKeyAlignNode(seqDbr, repKey);
+                            size_t repBlock = SIZE_MAX;
+                            const size_t repSource = getFetchSource(currentSequences, repKey, repBlock);
                             size_t repLength = 0;
                             const char *repData = (repSource != rank) ? findFetchedKey(currentSequences, repSource, repKey, &repLength) : NULL;
                             staleSize += (repData != NULL && repData[0] != '\0') ? repLength + 2 : 0;
@@ -4659,6 +4719,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     }
     MMseqsNode::addPhaseValue(phaseValues, "Block read bytes", SSTR(seqDbr.getBlockReadSize()));
     MMseqsNode::addPhaseValue(phaseValues, "Key read bytes", SSTR(seqDbr.getKeyReadSize()));
+    if (repDbr != NULL) {
+        MMseqsNode::addPhaseValue(phaseValues, "Rep block read bytes", SSTR(repDbr->getBlockReadSize()));
+        MMseqsNode::addPhaseValue(phaseValues, "Rep key read bytes", SSTR(repDbr->getKeyReadSize()));
+        MMseqsNode::addPhaseValue(phaseValues, "Rep block cache", SSTR(repBlockCacheSize) + " bytes");
+        repDbr->close();
+        delete repDbr;
+    }
     // the master still finds the nodes of keys in the blocks of seqDbr
     seqDbr.releaseDataPages();
     if (isAligningNode) {
@@ -5661,10 +5728,10 @@ int align2clustLinfinity(Parameters &par) {
     blockDbr.close();
     DBReader<DBKeyType> seqDbr(seqDb.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
     seqDbr.open(DBReader<DBKeyType>::NOSORT);
-    // a claiming node may read every target split, three files each
+    // seqDbr and repDbr open the data files, a claiming node may read every target split, three files each
     struct rlimit openFileLimit = {0, 0};
     getrlimit(RLIMIT_NOFILE, &openFileLimit);
-    size_t minOpenFiles = seqDbr.getDataFileCnt() + 64 + 2 * MMseqsNode::count + 3 * (hasTargetSplits ? targetSplitBlockOffsets.size() - 1 : 0);
+    size_t minOpenFiles = 2 * seqDbr.getDataFileCnt() + 64 + 2 * MMseqsNode::count + 3 * (hasTargetSplits ? targetSplitBlockOffsets.size() - 1 : 0);
     if (minOpenFiles > openFileLimit.rlim_cur) {
         Debug(Debug::ERROR) << "Raise the open file limit (ulimit -n) to at least " << minOpenFiles << "\n";
         EXIT(EXIT_FAILURE);
