@@ -3,6 +3,7 @@
 #include "FastSort.h"
 #include "FileUtil.h"
 #include "MMseqsNode.h"
+#include "Timer.h"
 #include "Util.h"
 
 #include <algorithm>
@@ -383,7 +384,7 @@ const size_t BatchReader::MAX_INFLIGHT_READ_SIZE;
 const size_t BatchWriter::BUFFER_SIZE;
 
 BatchWriter::BatchWriter(size_t memorySize, int maxIoThreads, int fdToDetectStorage)
-    : bufferSize(std::min(BUFFER_SIZE, std::max((size_t) 1, memorySize / 3))), currentBuffer(NULL), busyBufferCount(0), isClosing(false) {
+    : bufferSize(std::min(BUFFER_SIZE, std::max((size_t) 1, memorySize / 3))), currentBuffer(NULL), busyBufferCount(0), isClosing(false), waitSeconds(0) {
     // each thread has a buffer to join writes, so threads take at most half
     size_t threads = std::max((size_t) 1, std::min((size_t) std::min(getStorageMaxInflightRequests(getStorageKind(fdToDetectStorage), maxIoThreads), maxIoThreads), memorySize / bufferSize / 2));
     size_t bufferCount = std::max((size_t) 2, memorySize / bufferSize - std::min(memorySize / bufferSize, threads));
@@ -425,9 +426,11 @@ void BatchWriter::queueCopiedBuffer(Buffer *buffer) {
 void BatchWriter::write(int fd, const char *fileName, const char *data, size_t size, size_t fileOffset) {
     for (size_t done = 0; done < size;) {
         std::unique_lock<std::mutex> lock(bufferMutex);
+        Timer timer;
         while (currentBuffer == NULL && freeBuffers.empty()) {
             freeCondition.wait(lock);
         }
+        waitSeconds += timer.getTimediff();
         if (currentBuffer == NULL) {
             currentBuffer = freeBuffers.back();
             freeBuffers.pop_back();
@@ -459,9 +462,11 @@ void BatchWriter::waitWrites() {
         currentBuffer = NULL;
         queueCopiedBuffer(buffer);
     }
+    Timer timer;
     while (busyBufferCount != 0) {
         freeCondition.wait(lock);
     }
+    waitSeconds += timer.getTimediff();
 }
 
 void BatchWriter::writeBuffers(char *joinedWrites) {

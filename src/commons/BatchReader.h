@@ -96,6 +96,10 @@ public:
     void write(int fd, const char *fileName, const char *data, size_t size, size_t fileOffset);
     // no caller may be in write
     void waitWrites();
+    // summed over the calling threads
+    double getWaitSeconds() const {
+        return waitSeconds;
+    }
 
 private:
     static const size_t BUFFER_SIZE = 64 * 1024 * 1024;
@@ -127,6 +131,7 @@ private:
     Buffer *currentBuffer;
     size_t busyBufferCount;
     bool isClosing;
+    double waitSeconds;
     std::mutex bufferMutex;
     std::condition_variable freeCondition;
     std::condition_variable fullCondition;
