@@ -115,6 +115,8 @@ void FileUtil::preadAll(int fd, const char *fileName, char *data, size_t size, s
         }
         return;
     }
+    time_t failedSince = 0;
+    unsigned int attempts = 0;
     for (size_t done = 0; done < size;) {
         const ssize_t count = pread(fd, data + done, size - done, offset + done);
         if (count < 0 && errno == EINTR) {
@@ -122,12 +124,37 @@ void FileUtil::preadAll(int fd, const char *fileName, char *data, size_t size, s
         }
         if (count <= 0) {
             const int readError = (count < 0) ? errno : 0;
+            // shared file systems can fail reads for a while, then a file opened again can be read
+            if ((readError == 0 || readError == EIO || readError == ESTALE || readError == EAGAIN) && MMseqsNode::hasFailedTooLong(failedSince, attempts) == false) {
+                if (attempts > 1) {
+                    if (attempts == 2) {
+                        Debug(Debug::WARNING) << "Cannot read " << fileName << ": " << (readError == 0 ? "end of file" : strerror(readError)) << ", retrying\n";
+                    }
+                    MMseqsNode::sleepBeforePoll(attempts - 1, 7);
+                    if (readError == EIO || readError == ESTALE) {
+                        reopenFile(fd, fileName);
+                    }
+                }
+                continue;
+            }
             Debug(Debug::ERROR) << "Cannot read " << fileName << " at offset " << offset + done
                                 << " (" << size - done << " bytes remaining): "
                                 << (readError == 0 ? "end of file" : strerror(readError)) << "\n";
             EXIT(EXIT_FAILURE);
         }
         done += count;
+        attempts = 0;
+    }
+}
+
+void FileUtil::reopenFile(int fd, const char *fileName) {
+    int fileFlags = fcntl(fd, F_GETFL);
+    int fdFlags = fcntl(fd, F_GETFD);
+    int reopenedFd = (fileFlags < 0 || fdFlags < 0) ? -1 : open(fileName, fileFlags);
+    if (reopenedFd >= 0) {
+        dup2(reopenedFd, fd);
+        fcntl(fd, F_SETFD, fdFlags);
+        close(reopenedFd);
     }
 }
 

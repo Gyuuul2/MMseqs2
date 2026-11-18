@@ -124,6 +124,7 @@ public:
 
     struct ExchangeReader {
         FILE *file;
+        std::string fileName;
         size_t pos;
         size_t end;
         std::vector<char> buffer;

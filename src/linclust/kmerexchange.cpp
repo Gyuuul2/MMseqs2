@@ -302,20 +302,21 @@ static std::string getLocalFileGroupName(const ExchangeFileGroups &groups, size_
 
 static FILE *copyLocalFileGroup(const ExchangeFileGroups &groups, size_t group, FILE *local, size_t size) {
     std::string name = getFileGroupName(groups, MMseqsNode::rank, group);
+    std::string localName = getLocalFileGroupName(groups, group);
     FILE *shared = FileUtil::openAndDelete(name.c_str(), "w");
     char *buffer = new(std::nothrow) char[KMER_FILE_BUFFER_SIZE];
     Util::checkAllocation(buffer, "Can not allocate buffer memory in copyLocalFileGroup");
     for (size_t offset = 0; offset < size; offset += KMER_FILE_BUFFER_SIZE) {
         size_t copySize = std::min(KMER_FILE_BUFFER_SIZE, size - offset);
-        FileUtil::preadAll(fileno(local), "local file group", buffer, copySize, offset);
+        FileUtil::preadAll(fileno(local), localName.c_str(), buffer, copySize, offset);
         FileUtil::pwriteAll(fileno(shared), name.c_str(), buffer, copySize, offset);
     }
     delete[] buffer;
     if (fclose(local) != 0) {
-        Debug(Debug::ERROR) << "Cannot close " << getLocalFileGroupName(groups, group) << "\n";
+        Debug(Debug::ERROR) << "Cannot close " << localName << "\n";
         EXIT(EXIT_FAILURE);
     }
-    FileUtil::remove(getLocalFileGroupName(groups, group).c_str());
+    FileUtil::remove(localName.c_str());
     return shared;
 }
 
