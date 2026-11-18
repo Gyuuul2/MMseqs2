@@ -738,7 +738,7 @@ struct FetchSizeCounters {
 // linfinity: records [begin, end) of a prefilter buffer and their fetched entries
 struct FetchedSequences {
     FetchedSequences() : prefilterBuffer(0), prefilterBufferNumber(0), begin(0), end(0), repKeyBegin(0), repKeyEnd(0), targetCount(0), pendingPairCount(0), firstPendingRepKey(0), plannedSize(0),
-                         unassignedRecordSize(0), isLast(false), entries(NULL), allocatedSize(0) {}
+                         unassignedRecordSize(0), isLast(false), entries(NULL), allocatedSize(0), acceptedSize(0), isOwnKeysLoaded(false), isReady(false) {}
     size_t prefilterBuffer;
     size_t prefilterBufferNumber;
     size_t begin;
@@ -760,6 +760,14 @@ struct FetchedSequences {
     char *entries;
     size_t allocatedSize;
     std::vector<size_t> entryOffsets;
+    // the accepted bytes at its hand-off, for the master gate
+    size_t acceptedSize;
+    bool isOwnKeysLoaded;
+    bool isReady;
+
+    size_t memorySize() const {
+        return allocatedSize + keys.capacity() * sizeof(DBKeyType) + entryOffsets.capacity() * sizeof(size_t);
+    }
 };
 
 // per thread, where the last keys were found per fetch source and the block of the last key
@@ -2607,6 +2615,18 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
     }
     const size_t maxFetchBytesLimit = isFetchBytesFixed ? fetchBytesLimit : std::min<size_t>(maxFetchSize, 128 * 1024 * 1024);
+    // the fetches in flight share the two fetches of getReservedMemory; a fetch holds pending pairs up to the limit and a record on top
+    const size_t fetchBudget = 2 * std::max(maxFetchSize, repTargetsReader.maxRecordSize);
+    const size_t maxLimitedFetchSize = (memberDbr != NULL) ? std::max(maxFetchBytesLimit, maxPendingPairSize) + repTargetsReader.maxRecordSize
+                                                           : std::max(maxFetchBytesLimit, repTargetsReader.maxRecordSize);
+    std::vector<FetchedSequences> fetchSlots(1 + fetchBudget / std::max(maxFetchBytesLimit, minFetchSize));
+    // the slot released last is taken first, so few slots get buffers
+    std::vector<FetchedSequences *> idleFetches;
+    for (size_t i = fetchSlots.size(); i > 0; i--) {
+        fetchSlots[i - 1].fetchSourceKeyOffsets.assign(nodes + 2, 0);
+        idleFetches.push_back(&fetchSlots[i - 1]);
+    }
+    std::deque<FetchedSequences *> fetchesInFlight;
     const auto getFetchSource = [&](const FetchedSequences &sequences, size_t key, size_t &block) -> size_t {
         if (isReadingDirectly) {
             return rank;
@@ -2654,18 +2674,26 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         sequences.prefilterBufferNumber = usedPrefilterBufferCount - 1;
         sequences.begin = prefilterRecordPos[prefilterBuffer];
         sequences.end = sequences.begin;
+        size_t aheadPendingPairCount = previous.pendingPairCount;
+        size_t aheadTargetCount = previous.targetCount;
+        bool hasRecordsAhead = previous.end > previous.begin;
+        for (size_t i = 0; i < fetchesInFlight.size(); i++) {
+            aheadPendingPairCount += fetchesInFlight[i]->pendingPairCount;
+            aheadTargetCount += fetchesInFlight[i]->targetCount;
+            hasRecordsAhead |= fetchesInFlight[i]->end > fetchesInFlight[i]->begin;
+        }
         // pending pairs first, at least one
         size_t fetchSize = 0;
         sequences.pendingPairCount = 0;
-        for (size_t i = previous.pendingPairCount; i < pendingPairs.size() && (sequences.pendingPairCount == 0 || fetchSize + pendingPairSize[i] <= fetchBytesLimit); i++) {
+        for (size_t i = aheadPendingPairCount; i < pendingPairs.size() && (sequences.pendingPairCount == 0 || fetchSize + pendingPairSize[i] <= fetchBytesLimit); i++) {
             fetchSize += pendingPairSize[i];
             sequences.pendingPairCount++;
         }
         // the accepted pairs follow the pending pairs in log order
-        sequences.firstPendingRepKey = (sequences.pendingPairCount > 0) ? static_cast<size_t>(pendingPairs[previous.pendingPairCount].repKey)
+        sequences.firstPendingRepKey = (sequences.pendingPairCount > 0) ? static_cast<size_t>(pendingPairs[aheadPendingPairCount].repKey)
                                        : (acceptedPairs.empty() ? orderKeyEnd : static_cast<size_t>(acceptedPairs[0].repKey));
-        // the accepted pairs and the targets of previous and this fetch fit memberKeyBudget, a record goes alone once no pair waits
-        size_t acceptablePairCount = acceptedPairs.size() + previous.targetCount;
+        // the accepted pairs and the targets of the fetches ahead and this fetch fit memberKeyBudget, a record goes alone once no pair waits
+        size_t acceptablePairCount = acceptedPairs.size() + aheadTargetCount;
         sequences.targetCount = 0;
         const size_t pendingFetchSize = fetchSize;
         for (; sequences.end < prefilterRecords[prefilterBuffer].size(); sequences.end++) {
@@ -2688,8 +2716,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             sequences.repKeyBegin = prefilterRecords[prefilterBuffer][sequences.begin].repOrderKeyFirstTarget.repKey % paddedDbSize;
             sequences.repKeyEnd = prefilterRecords[prefilterBuffer][sequences.end - 1].repOrderKeyFirstTarget.repKey % paddedDbSize + 1;
         }
-        // previous may still add pending pairs
-        sequences.isLast = sequences.end == sequences.begin && sequences.pendingPairCount == 0 && (memberDbr == NULL || previous.end == previous.begin) && acceptedPairs.empty();
+        // the fetches ahead may still add pending pairs
+        sequences.isLast = sequences.end == sequences.begin && sequences.pendingPairCount == 0 && (memberDbr == NULL || hasRecordsAhead == false) && acceptedPairs.empty();
         fetchBytesLimit = std::min(2 * fetchBytesLimit, maxFetchBytesLimit);
         size_t unassignedRecordSize = 0;
 #pragma omp parallel
@@ -2726,7 +2754,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             }
             // members share the keys and data files of the sequence database
 #pragma omp for schedule(dynamic, 100)
-            for (size_t i = previous.pendingPairCount; i < previous.pendingPairCount + sequences.pendingPairCount; i++) {
+            for (size_t i = aheadPendingPairCount; i < aheadPendingPairCount + sequences.pendingPairCount; i++) {
                 if (isAssigned(pendingPairs[i].repKey) == false && isAssigned(pendingPairs[i].memberKey) == false) {
                     threadKeys[thread_idx].push_back(pendingPairs[i].repKey % paddedDbSize);
                     threadKeys[thread_idx].insert(threadKeys[thread_idx].end(), pendingMembers.begin() + pendingMemberOffsets[i], pendingMembers.begin() + pendingMemberOffsets[i + 1]);
@@ -2753,7 +2781,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     __atomic_fetch_or(&keyUses[std::lower_bound(uniqueKeys.begin(), uniqueKeys.end(), threadRepKeys[thread_idx][i]) - uniqueKeys.begin()], 1, __ATOMIC_RELAXED);
                 }
 #pragma omp for schedule(dynamic, 100)
-                for (size_t i = previous.pendingPairCount; i < previous.pendingPairCount + sequences.pendingPairCount; i++) {
+                for (size_t i = aheadPendingPairCount; i < aheadPendingPairCount + sequences.pendingPairCount; i++) {
                     if (isAssigned(pendingPairs[i].repKey) == false && isAssigned(pendingPairs[i].memberKey) == false) {
                         __atomic_fetch_or(&keyUses[std::lower_bound(uniqueKeys.begin(), uniqueKeys.end(), pendingPairs[i].repKey % paddedDbSize) - uniqueKeys.begin()], 2, __ATOMIC_RELAXED);
                         for (size_t member = pendingMemberOffsets[i]; member < pendingMemberOffsets[i + 1]; member++) {
@@ -2857,8 +2885,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     };
 
     FetchedSequences currentSequences;
-    FetchedSequences nextSequences;
-    nextSequences.fetchSourceKeyOffsets.assign(nodes + 2, 0);
     std::atomic<double> alignedCellsPerSecond(0);
     const auto fillPrefilterBuffer = [&](size_t buffer, size_t maxBufferAlignmentCells) {
         if (targetSplitReader != NULL) {
@@ -2892,7 +2918,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             }
         }
     });
-    selectRecordKeys(currentSequences, nextSequences);
+    selectRecordKeys(currentSequences, fetchSlots[0]);
     publishAccepted(getFirstRepKey(currentSequences), 0);
     size_t publishedSize = 0;
     double publishTime = startTimer.getTimediff();
@@ -2939,11 +2965,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 
     std::mutex serviceMutex;
     std::condition_variable serviceCondition;
-    FetchedSequences *pendingSequences = NULL;
+    // the fetches handed to the service thread and not requested yet, in selection order
+    std::deque<FetchedSequences *> handedOffFetches;
     // a node aligns ahead of the master by at most its share of a master step
-    size_t requestAcceptedSize = 0;
     const size_t maxUnclusteredAcceptedSize = std::max<size_t>(1, getStepWords(masterMemoryLimit) / nodes) * sizeof(uint64_t);
-    FetchedSequences *completedSequences = NULL;
     bool isWaitingForMaster = false;
     // wakes the service thread: a pending fetch or the loaded keys of this node
     bool hasServiceWork = false;
@@ -3085,7 +3110,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             std::deque<SequenceRequest> ownRequests;
             size_t receivedRequestCount = 0;
             bool isLastRequested = false;
-            FetchedSequences *requestedSequences = NULL;
+            // the requested fetches become ready in selection order
+            std::deque<FetchedSequences *> requestedFetches;
             std::vector<char> requestCodes;
             // piece of a served file: request, piece of the request, served file and its size, offset, bytes, keys
             struct ServedPiece {
@@ -3150,8 +3176,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             unsigned int firstRequester = rank + 1;
             // a thread loads the keys of this node while the service thread serves and receives
             std::thread ownKeyLoader;
-            FetchedSequences *ownKeyRequest = NULL;
-            bool isOwnKeysLoaded = false;
+            std::deque<FetchedSequences *> ownKeyRequests;
             std::vector<time_t> missingFileSince(nodes, 0);
             std::vector<unsigned int> missingFileAttempts(nodes, 0);
             std::string requestProgress = requests + "." + SSTR(rank) + ".progress";
@@ -3231,20 +3256,26 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                 }
                 bool isRequestProgressChanged = false;
-                // request once the master is close enough behind
-                FetchedSequences *nextRequest = NULL;
-                size_t nextAcceptedSize = 0;
-                bool isLoaded;
                 {
                     std::lock_guard<std::mutex> lock(serviceMutex);
                     hasServiceWork = false;
-                    isLoaded = isOwnKeysLoaded;
-                    if (requestedSequences == NULL) {
-                        nextRequest = pendingSequences;
-                        nextAcceptedSize = requestAcceptedSize;
-                    }
                 }
-                if (nextRequest != NULL) {
+                // request the handed-off fetches in order while the master is close enough behind
+                size_t passRequestCount = 0;
+                bool isGated = false;
+                while (isGated == false) {
+                    FetchedSequences *nextRequest = NULL;
+                    size_t nextAcceptedSize = 0;
+                    {
+                        std::lock_guard<std::mutex> lock(serviceMutex);
+                        if (handedOffFetches.empty() == false) {
+                            nextRequest = handedOffFetches.front();
+                            nextAcceptedSize = nextRequest->acceptedSize;
+                        }
+                    }
+                    if (nextRequest == NULL) {
+                        break;
+                    }
                     bool isLast = nextRequest->isLast;
                     // a fetch without records and pending pairs logs nothing, so it never waits; the pairs the aligning fetch adds come from it
                     bool canWait = isLast == false && (nextRequest->end > nextRequest->begin || nextRequest->pendingPairCount > 0);
@@ -3263,9 +3294,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         std::lock_guard<std::mutex> lock(serviceMutex);
                         isWaitingForMaster = isAhead;
                         if (isAhead == false) {
-                            pendingSequences = NULL;
+                            handedOffFetches.pop_front();
                         }
                     }
+                    isGated = isAhead;
                     if (isAhead == false) {
                         // the keys of a node ascend, so a request holds their gaps
                         SequenceRequest request;
@@ -3307,7 +3339,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         }
                         isRequestProgressChanged |= isLast;
                         isLastRequested = isLast;
-                        requestedSequences = nextRequest;
+                        requestedFetches.push_back(nextRequest);
+                        passRequestCount++;
                         hasWorked = true;
                     }
                 }
@@ -3469,13 +3502,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     MMseqsNode::publishRunFile(requestProgress, content);
                     objectWriteCount++;
                 }
-                // the keys of this node while the other nodes serve the new request
-                if (nextRequest != NULL && requestedSequences == nextRequest) {
-                    isLoaded = false;
+                // the keys of this node while the other nodes serve the new requests, in fetch order
+                if (passRequestCount > 0) {
                     {
                         std::lock_guard<std::mutex> lock(serviceMutex);
-                        isOwnKeysLoaded = false;
-                        ownKeyRequest = nextRequest;
+                        ownKeyRequests.insert(ownKeyRequests.end(), requestedFetches.end() - passRequestCount, requestedFetches.end());
                     }
                     serviceCondition.notify_all();
                     // one loader for all fetches: a thread that read with io_uring takes seconds to exit
@@ -3488,16 +3519,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                 FetchedSequences *request;
                                 {
                                     std::unique_lock<std::mutex> lock(serviceMutex);
-                                    serviceCondition.wait(lock, [&]() { return ownKeyRequest != NULL; });
-                                    request = ownKeyRequest;
+                                    serviceCondition.wait(lock, [&]() { return ownKeyRequests.empty() == false; });
+                                    request = ownKeyRequests.front();
                                 }
                                 size_t ownKey = request->fetchSourceKeyOffsets[rank];
                                 copyEntries(request->keys.data() + ownKey, request->fetchSourceKeyOffsets[rank + 1] - ownKey, request->entryOffsets.data() + ownKey, request->entries, NULL);
                                 isLast = request->isLast;
                                 {
                                     std::lock_guard<std::mutex> lock(serviceMutex);
-                                    ownKeyRequest = NULL;
-                                    isOwnKeysLoaded = true;
+                                    ownKeyRequests.pop_front();
+                                    request->isOwnKeysLoaded = true;
                                     hasServiceWork = true;
                                 }
                                 serviceCondition.notify_all();
@@ -3505,14 +3536,17 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         });
                     }
                 }
-                // a fetch goes to the aligning threads once its request is received
-                if (requestedSequences != NULL && ownRequests.empty() && isLoaded) {
+                // a fetch goes to the aligning threads once its keys are loaded and its request is received; the requests of the earlier fetches are gone
+                while (requestedFetches.empty() == false && (ownRequests.empty() || ownRequests.front().sequences != requestedFetches.front())) {
                     {
                         std::lock_guard<std::mutex> lock(serviceMutex);
-                        completedSequences = requestedSequences;
+                        if (requestedFetches.front()->isOwnKeysLoaded == false) {
+                            break;
+                        }
+                        requestedFetches.front()->isReady = true;
                     }
                     serviceCondition.notify_all();
-                    requestedSequences = NULL;
+                    requestedFetches.pop_front();
                     completedFetchCount++;
                     hasWorked = true;
                 }
@@ -3767,7 +3801,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     objectWriteCount++;
                     isServedProgressChanged = false;
                 }
-                if (isLastRequested && ownRequests.empty() && requestedSequences == NULL && isServing == false) {
+                if (isLastRequested && ownRequests.empty() && requestedFetches.empty() && isServing == false) {
                     printStatus();
                     break;
                 }
@@ -3775,9 +3809,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 if (hasWorked) {
                     polls = 0;
                 } else {
-                    unsigned int maxShift = (requestedSequences != NULL || nextRequest != NULL) ? 4 : 7;
+                    unsigned int maxShift = (requestedFetches.empty() == false || isGated) ? 4 : 7;
                     maxShift = (alignNodeCount > 1) ? 1 : maxShift;
-                    const size_t reason = (requestedSequences == NULL) ? ((nextRequest != NULL) ? 1 : 2) : ((ownRequests.empty() == false) ? 0 : 3);
+                    const size_t reason = requestedFetches.empty() ? (isGated ? 1 : 2) : ((ownRequests.empty() == false) ? 0 : 3);
                     Timer idleTimer;
                     std::unique_lock<std::mutex> lock(serviceMutex);
                     serviceCondition.wait_for(lock, std::chrono::microseconds(10000u << std::min(polls++, maxShift)), [&]() { return hasServiceWork; });
@@ -3789,10 +3823,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     printStatus();
                 }
                 // aligning without a request is no wait
-                if (hasWorked || (requestedSequences == NULL && nextRequest == NULL && isLastRequested == false)) {
+                if (hasWorked || (requestedFetches.empty() && isGated == false && isLastRequested == false)) {
                     waitWarning.reset();
                 } else {
-                    waitWarning.check(requestedSequences != NULL ? served + " of other nodes" : (nextRequest != NULL ? assignedKeysLog : requests + " of other nodes"));
+                    waitWarning.check(requestedFetches.empty() == false ? served + " of other nodes" : (isGated ? assignedKeysLog : requests + " of other nodes"));
                 }
             }
             ownKeyLoader.join();
@@ -3800,7 +3834,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     }
     const auto waitForSequences = [&](FetchedSequences &fetched, size_t doneRepOrderKey) {
         std::unique_lock<std::mutex> lock(serviceMutex);
-        if (completedSequences == &fetched) {
+        if (fetched.isReady) {
             return;
         }
         lock.unlock();
@@ -3809,17 +3843,17 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         publishTime = startTimer.getTimediff();
         Timer waitTimer;
         lock.lock();
-        const bool waitsForMaster = isWaitingForMaster;
-        serviceCondition.wait(lock, [&]() { return completedSequences == &fetched; });
+        // a later fetch at the gate is no wait for the master
+        const bool waitsForMaster = isWaitingForMaster && handedOffFetches.empty() == false && handedOffFetches.front() == &fetched;
+        serviceCondition.wait(lock, [&]() { return fetched.isReady; });
         (waitsForMaster ? waitSeconds : sequenceWaitSeconds) += waitTimer.getTimediff();
     };
     if (isAligningNode) {
         {
             std::lock_guard<std::mutex> lock(serviceMutex);
-            completedSequences = NULL;
-            pendingSequences = &currentSequences;
+            currentSequences.acceptedSize = acceptedSize;
+            handedOffFetches.push_back(&currentSequences);
             hasServiceWork = true;
-            requestAcceptedSize = acceptedSize;
         }
         serviceCondition.notify_all();
         waitForSequences(currentSequences, getFirstRepKey(currentSequences));
@@ -3830,18 +3864,69 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t alignedFetchCount = 0;
     std::vector<std::pair<size_t, double> > fetchWindowCells;
     std::atomic<size_t> staleRepSize(0);
+    size_t alignedPlannedSize = 0;
+    size_t maxFetchesInFlight = 0;
+    size_t fetchesInFlightSum = 0;
     while (currentSequences.isLast == false) {
         Timer otherTimer;
-        selectRecordKeys(nextSequences, currentSequences);
-        double nextOtherSeconds = otherTimer.getTimediff();
-        {
-            std::lock_guard<std::mutex> lock(serviceMutex);
-            completedSequences = NULL;
-            pendingSequences = &nextSequences;
-            hasServiceWork = true;
-            requestAcceptedSize = acceptedSize;
+        // one fetch ahead always; more while those in flight align in READ_SECONDS, fit the fetch memory and keep the prefilter buffer of current
+        for (;;) {
+            const bool isFirstAhead = fetchesInFlight.empty();
+            if (isFirstAhead == false) {
+                const FetchedSequences &newest = *fetchesInFlight.back();
+                size_t inFlightPlannedSize = 0;
+                for (size_t i = 0; i < fetchesInFlight.size(); i++) {
+                    inFlightPlannedSize += fetchesInFlight[i]->plannedSize;
+                }
+                // more pending pairs come only after aligning
+                if (newest.isLast || (newest.end == newest.begin && newest.pendingPairCount == 0) || idleFetches.empty()
+                    || inFlightPlannedSize * alignSeconds >= READ_SECONDS * static_cast<double>(alignedPlannedSize)) {
+                    break;
+                }
+            }
+            // idle slots free their buffers until the next fetch fits, but the slot taken next keeps them
+            size_t fetchMemory = currentSequences.memorySize();
+            for (size_t i = 0; i < fetchSlots.size(); i++) {
+                fetchMemory += fetchSlots[i].memorySize();
+            }
+            for (size_t i = 0; i + 1 < idleFetches.size() && fetchMemory + maxLimitedFetchSize > fetchBudget; i++) {
+                FetchedSequences &idle = *idleFetches[i];
+                fetchMemory -= idle.memorySize();
+                delete[] idle.entries;
+                idle.entries = NULL;
+                idle.allocatedSize = 0;
+                std::vector<DBKeyType>().swap(idle.keys);
+                std::vector<size_t>().swap(idle.entryOffsets);
+            }
+            if (isFirstAhead == false && fetchMemory + maxLimitedFetchSize > fetchBudget) {
+                break;
+            }
+            // the next prefilter buffer must be filled, and the loader then refills the one before the buffer of current
+            if (isFirstAhead == false && prefilterRecordPos[prefilterBuffer] == prefilterRecords[prefilterBuffer].size() && prefilterRecords[prefilterBuffer].empty() == false) {
+                std::lock_guard<std::mutex> lock(prefilterBufferMutex);
+                if (filledPrefilterBufferCount <= usedPrefilterBufferCount || currentSequences.prefilterBufferNumber + 1 < usedPrefilterBufferCount) {
+                    break;
+                }
+            }
+            FetchedSequences &selected = *idleFetches.back();
+            idleFetches.pop_back();
+            selectRecordKeys(selected, currentSequences);
+            {
+                std::lock_guard<std::mutex> lock(serviceMutex);
+                // a reused slot holds the state of its last fetch
+                selected.isReady = false;
+                selected.isOwnKeysLoaded = false;
+                selected.acceptedSize = acceptedSize;
+                handedOffFetches.push_back(&selected);
+                hasServiceWork = true;
+            }
+            serviceCondition.notify_all();
+            fetchesInFlight.push_back(&selected);
         }
-        serviceCondition.notify_all();
+        maxFetchesInFlight = std::max(maxFetchesInFlight, fetchesInFlight.size());
+        fetchesInFlightSum += fetchesInFlight.size();
+        double nextOtherSeconds = otherTimer.getTimediff();
+        FetchedSequences &nextSequences = *fetchesInFlight.front();
         Timer alignTimer;
         const size_t nextRepKey = getFirstRepKey(nextSequences);
         const std::vector<RepTargetsRecord> &records = prefilterRecords[currentSequences.prefilterBuffer];
@@ -4464,6 +4549,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         const double fetchAlignSeconds = alignTimer.getTimediff();
         alignedCells += static_cast<double>(fetchAlignmentCells);
         alignSeconds += fetchAlignSeconds;
+        alignedPlannedSize += currentSequences.plannedSize;
         alignedCellsPerSecond.store(alignedCells / std::max(alignSeconds, 1e-3));
 
         // the seconds of a fetch go to its windows by their cells, a fetch without records to the window of its first rep
@@ -4506,6 +4592,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         waitForSequences(nextSequences, getFirstUndoneRepKey(nextRepKey));
         fetchOtherSeconds = nextOtherSeconds + otherTimer.getTimediff();
         std::swap(currentSequences, nextSequences);
+        fetchesInFlight.pop_front();
+        idleFetches.push_back(&nextSequences);
     }
     for (int thread = 0; thread < par.threads; thread++) {
         delete threadTargetAligners[thread];
@@ -4546,7 +4634,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                   + SSTR(maxPassPieceCount) + " pieces a file");
     }
     delete[] currentSequences.entries;
-    delete[] nextSequences.entries;
+    for (size_t i = 0; i < fetchSlots.size(); i++) {
+        delete[] fetchSlots[i].entries;
+    }
     for (size_t page = 0; page < assignedPages.size(); page++) {
         delete[] assignedPages[page];
     }
@@ -4567,6 +4657,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the prefilter", prefilterWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "aligning the fetches", alignSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Fetches with fewer SWIPE batches", SSTR(fewerBatchFetchCount) + " of " + SSTR(fetchCount));
+        MMseqsNode::addPhaseValue(phaseValues, "Fetches in flight", "at most " + SSTR(maxFetchesInFlight) + ", mean " + SSTR(static_cast<float>(fetchesInFlightSum) / std::max<size_t>(1, alignedFetchCount), 2));
         MMseqsNode::addPhaseValue(phaseValues, "Assigned keys read", SSTR(assignedKeyCount) + " in " + SSTR(assignedKeysSize) + " bytes");
         MMseqsNode::addPhaseSeconds(phaseValues, "the first fetch", firstFetchSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Gate slack", "at most " + SSTR(maxGateSlackKeys) + " keys and " + SSTR(maxGateSlackWindows) + " windows, mean "
