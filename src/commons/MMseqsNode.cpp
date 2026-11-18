@@ -81,9 +81,10 @@ bool MMseqsNode::hasFailedTooLong(time_t &failedSince, unsigned int &attempts) {
     return attempts >= 100 && now - failedSince >= 60;
 }
 
-// shared file systems can fail an existing file for a while, then it can be opened and read again
+// shared file systems can fail an existing file for a while, then it can be opened and read again; NFS caches a missing name for up to 60 s
 static bool canRetryRead(const std::string &file, int error, time_t &failedSince, unsigned int &attempts) {
-    if ((error != EIO && error != ESTALE) || MMseqsNode::hasFailedTooLong(failedSince, attempts)) {
+    bool isCachedMissing = error == ENOENT && FileUtil::needsDirectoryRefresh(file);
+    if ((error != EIO && error != ESTALE && isCachedMissing == false) || MMseqsNode::hasFailedTooLong(failedSince, attempts)) {
         return false;
     }
     if (attempts > 1) {
@@ -135,6 +136,52 @@ static int openListedFile(const std::string &file, int flags = O_RDONLY) {
     }
     errno = openError;
     return fd;
+}
+
+// a file that exists: written by another node before a barrier, by this node, or the input
+int MMseqsNode::openSharedFd(const std::string &file, int flags) {
+    time_t failedSince = 0;
+    unsigned int attempts = 0;
+    for (;;) {
+        int fd = openListedFile(file, flags | O_CLOEXEC);
+        if (fd >= 0) {
+            return fd;
+        }
+        int openError = errno;
+        if (canRetryRead(file, openError, failedSince, attempts) == false) {
+            Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(openError) << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+}
+
+// for the modes r, rb and r+
+FILE *MMseqsNode::openSharedFile(const std::string &file, const char *mode) {
+    FILE *handle = fdopen(openSharedFd(file, (strchr(mode, '+') != NULL) ? O_RDWR : O_RDONLY), mode);
+    if (handle == NULL) {
+        Debug(Debug::ERROR) << "Cannot open " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return handle;
+}
+
+// ENOENT and ENOTDIR at once, a missing name ends the list of findDatafiles
+bool MMseqsNode::statSharedFile(const std::string &file, struct stat &sb) {
+    time_t failedSince = 0;
+    unsigned int attempts = 0;
+    for (;;) {
+        if (stat(file.c_str(), &sb) == 0) {
+            return true;
+        }
+        int statError = errno;
+        if (statError == ENOENT || statError == ENOTDIR) {
+            return false;
+        }
+        if (canRetryRead(file, statError, failedSince, attempts) == false) {
+            Debug(Debug::ERROR) << "Cannot stat " << file << ": " << strerror(statError) << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
 }
 
 // NFS caches a missing name, so poll on an empty file
@@ -232,7 +279,19 @@ std::string MMseqsNode::readFile(const std::string &file) {
         }
         return content;
     }
-    return FileUtil::readFile(file);
+    int fd = openSharedFd(file, O_RDONLY);
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) {
+        Debug(Debug::ERROR) << "Cannot read " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    std::string content(sb.st_size, '\0');
+    FileUtil::preadAll(fd, file.c_str(), &content[0], content.size(), 0);
+    if (close(fd) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return content;
 }
 
 std::string MMseqsNode::waitForRunFile(const std::string &file) {
@@ -564,18 +623,18 @@ void MMseqsNode::publishExchangeFile(FILE *file, const std::string &fileName, si
     if (indexFile.empty()) {
         return;
     }
-    FILE *handle = FileUtil::openFileOrDie(indexFile.c_str(), "a", true);
-    uint64_t magic = getExchangeFileMagic();
-    if (fwrite(line.data(), sizeof(uint64_t), line.size() - 1, handle) != line.size() - 1
-        || fwrite(&magic, sizeof(magic), 1, handle) != 1 || fflush(handle) != 0 || fclose(handle) != 0) {
+    std::vector<uint64_t> words(line.begin(), line.end() - 1);
+    words.push_back(getExchangeFileMagic());
+    size_t lineSize = words.size() * sizeof(uint64_t);
+    // a failed append is not retried: readers find a line at its offset
+    int fd = openSharedFd(indexFile, O_WRONLY | O_APPEND);
+    if (write(fd, words.data(), lineSize) != static_cast<ssize_t>(lineSize) || close(fd) != 0) {
         Debug(Debug::ERROR) << "Cannot write " << indexFile << "\n";
         EXIT(EXIT_FAILURE);
     }
     // aws backend: line n of an index is the object <index>.<n>
     if (S3Client::isEnabled()) {
-        std::vector<uint64_t> words(line.begin(), line.end() - 1);
-        words.push_back(magic);
-        S3Client::put(S3Client::getObjectName(indexFile) + "." + SSTR(line[0]), (const char *) words.data(), words.size() * sizeof(uint64_t));
+        S3Client::put(S3Client::getObjectName(indexFile) + "." + SSTR(line[0]), (const char *) words.data(), lineSize);
     }
 }
 
@@ -1007,7 +1066,7 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
             continue;
         }
         // writable to punch holes
-        files[node] = FileUtil::openFileOrDie(file.c_str(), "r+", true);
+        files[node] = openSharedFile(file, "r+");
         readExchangeTableColumns(fileno(files[node]), file, writtenSizes[node], flushCounts[node], rank, flushOffsets[node]);
     }
     for (size_t node = 0; node < count; node++) {
@@ -1713,7 +1772,7 @@ uint64_t *MMseqsNode::readRepresentativeBits(const std::string &db, const std::v
         }
         std::string bitsFile = db + ".bits." + SSTR(node);
         addRemoteDatabaseFile(bitsFile);
-        FILE *file = FileUtil::openFileOrDie(bitsFile.c_str(), "r", true);
+        FILE *file = openSharedFile(bitsFile, "r");
         uint64_t keyRange[2];
         FileUtil::preadAll(fileno(file), bitsFile.c_str(), (char *) keyRange, sizeof(keyRange), 0);
         if (keyRange[0] > from || keyRange[0] + keyRange[1] < to) {
@@ -1830,7 +1889,7 @@ void MMseqsNode::readClusterKeys(const std::string &clu, const std::vector<size_
         size_t entryBegin = cluDb.findEntryByKey(from);
         size_t entryEnd = cluDb.findEntryByKey(to);
         cluDb.close();
-        FILE *cluIndexFile = FileUtil::openFileOrDie(cluIndex.c_str(), "r", true);
+        FILE *cluIndexFile = openSharedFile(cluIndex, "r");
         size_t nodeKeysBegin = keys.size();
         keys.resize(nodeKeysBegin + entryEnd - entryBegin);
 #pragma omp parallel
@@ -2126,22 +2185,6 @@ bool MMseqsNode::readRemoteFile(int fd, char *data, size_t size, size_t offset, 
         pos = end;
     }
     return true;
-}
-
-// for the few fread readers: the bytes go into the placeholder until releaseStagedReads
-void MMseqsNode::stageRead(int fd, size_t offset, size_t size) {
-    RemoteFile *remote = findRemoteFile(fd);
-    if (remote == NULL || remote->path.empty() || offset >= remote->size) {
-        return;
-    }
-    S3Client::getRanges(remote->object, std::vector<std::pair<size_t, size_t> >(1, std::make_pair(offset, std::min(size, remote->size - offset))), remote->path);
-}
-
-void MMseqsNode::releaseStagedReads(int fd) {
-    RemoteFile *remote = findRemoteFile(fd);
-    if (remote != NULL && remote->path.empty() == false) {
-        FileUtil::punchHole(remote->fd, 0, remote->size);
-    }
 }
 
 // <file>.staged holds the object and its size, so later steps know the placeholder; a local file without it was written by this node

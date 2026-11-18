@@ -8,6 +8,7 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 
 class Timer;
 class Parameters;
@@ -93,6 +94,11 @@ public:
                                    size_t &observedSize, uint64_t &observedNumber, int &lastError, int openFlags = 0);
     static int waitForExchangeFile(const std::string &file, size_t size, uint64_t exchangeFileNumber);
     static bool tryPreadAll(int fd, char *data, size_t size, size_t offset, int &readError);
+    // opens a file that exists: EIO, ESTALE and an NFS name cached as missing are retried by the rule of hasFailedTooLong, then ERROR
+    static int openSharedFd(const std::string &file, int flags);
+    static FILE *openSharedFile(const std::string &file, const char *mode);
+    // false for a missing file, EIO and ESTALE are retried like in openSharedFd
+    static bool statSharedFile(const std::string &file, struct stat &sb);
 
     static std::string barrier(const std::string &file, const std::string &content = "");
     static void removeOnceRead(const std::string &file);
@@ -225,8 +231,6 @@ public:
     static void addRemoteDatabaseFile(const std::string &file);
     static bool isRemoteFile(int fd);
     static bool readRemoteFile(int fd, char *data, size_t size, size_t offset, size_t &readSize);
-    static void stageRead(int fd, size_t offset, size_t size);
-    static void releaseStagedReads(int fd);
     static void stageDatabase(const std::string &dataFile, const char *indexFile);
     static void publishDatabase(const std::string &db, size_t filesPerNode = 1);
 };
