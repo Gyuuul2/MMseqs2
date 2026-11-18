@@ -51,7 +51,7 @@ public:
 
     template <typename Less, typename Prefetch, typename Take>
     void merge(const std::string &fileName, size_t recordElementCount, size_t readSize, Less less, Prefetch prefetch, Take take) {
-        FILE *reader = FileUtil::openFileOrDie(fileName.c_str(), "rb", true);
+        FILE *reader = MMseqsNode::openSharedFile(fileName, "rb");
         const size_t recordsPerRead = std::max<size_t>(1, readSize / (recordElementCount * sizeof(T)) / runs.size());
         const auto headLess = [&](const Head &first, const Head &second) { return less(first.record, second.record); };
         std::priority_queue<Head, std::vector<Head>, decltype(headLess)> heads(headLess);
@@ -526,7 +526,7 @@ private:
                     oldest.reader = NULL;
                     openRuns.pop_front();
                 }
-                source.reader = FileUtil::openFileOrDie(source.path.c_str(), "rb", true);
+                source.reader = MMseqsNode::openSharedFile(source.path, "rb");
                 openRuns.push_back(run);
                 source.openPosition = --openRuns.end();
             } else {
@@ -5685,7 +5685,8 @@ int align2clustLinfinity(Parameters &par) {
     const int clusterThreads = isMasterAligning ? std::min(par.threads, 4) : par.threads;
 
     // a clusthashfast subset has bits; its sixth index column counts the representatives for the e-values
-    const bool hasRepresentativeBits = FileUtil::fileExists((par.db1 + ".bits." + SSTR(MMseqsNode::rank)).c_str());
+    struct stat sb;
+    const bool hasRepresentativeBits = MMseqsNode::statSharedFile(par.db1 + ".bits." + SSTR(MMseqsNode::rank), sb);
     size_t representativeCount = 0;
     size_t representativeResidues = 0;
     for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {

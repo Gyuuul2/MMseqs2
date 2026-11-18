@@ -3053,7 +3053,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         maxSendSplitKeys = std::max(maxSendSplitKeys, sendSplitKeyOffsets[sendSplit + 1] - sendSplitKeyOffsets[sendSplit]);
     }
     exchange.fileKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
-    exchange.hasRepresentativeBits = FileUtil::fileExists((par.db1 + ".bits." + SSTR(MMseqsNode::rank)).c_str());
+    struct stat sb;
+    exchange.hasRepresentativeBits = MMseqsNode::statSharedFile(par.db1 + ".bits." + SSTR(MMseqsNode::rank), sb);
     // write the pref by target split for two or more align nodes
     exchange.hasTargetSplits = MMseqsNode::count - MMseqsNode::getFirstAlignNode() > 1;
     if (exchange.hasTargetSplits) {

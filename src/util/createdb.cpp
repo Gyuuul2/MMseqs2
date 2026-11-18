@@ -1107,7 +1107,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                                        (char *) nodeSentRows[node].data());
                 } else {
                     // r+ to punch read bytes
-                    exchangeFiles[node] = FileUtil::openFileOrDie(file.c_str(), "r+", true);
+                    exchangeFiles[node] = MMseqsNode::openSharedFile(file, "r+");
                     FileUtil::preadAll(fileno(exchangeFiles[node]), file.c_str(), (char *) nodeSentRows[node].data(),
                                        nodeSentRows[node].size() * sizeof(SentLengthRow), tableOffsets[node] + firstRow * sizeof(SentLengthRow));
                 }
@@ -1217,11 +1217,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             }
             sequenceFileNames[file] = dataFile + "." + SSTR(file);
             // write only, NFS may read partial pages of files open for reading
-            sequenceFds[file] = (file == MMseqsNode::rank) ? fileno(dataFiles[SEQUENCE_DATA]) : open(sequenceFileNames[file].c_str(), O_WRONLY | O_CLOEXEC);
-            if (sequenceFds[file] < 0) {
-                Debug(Debug::ERROR) << "Cannot open " << sequenceFileNames[file] << " for writing: " << strerror(errno) << "\n";
-                EXIT(EXIT_FAILURE);
-            }
+            sequenceFds[file] = (file == MMseqsNode::rank) ? fileno(dataFiles[SEQUENCE_DATA]) : MMseqsNode::openSharedFd(sequenceFileNames[file], O_WRONLY);
         }
 
         std::vector<std::pair<size_t, size_t> > compressionUnits;
@@ -1381,7 +1377,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     chunkOffsets.push_back(i + 1);
                 }
                 if (edgeFiles[edgeRuns[i].node] == NULL) {
-                    edgeFiles[edgeRuns[i].node] = FileUtil::openFileOrDie((edges + "." + SSTR(edgeRuns[i].node)).c_str(), "r", true);
+                    edgeFiles[edgeRuns[i].node] = MMseqsNode::openSharedFile(edges + "." + SSTR(edgeRuns[i].node), "r");
                 }
             }
             size_t chunkCount = chunkOffsets.size() - 1;
