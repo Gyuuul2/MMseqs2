@@ -31,7 +31,8 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), indexSize(0), index(NULL), id2local(NULL), local2id(NULL),
         index2dbfile(NULL), hasBinaryIndex(false), batchReader(NULL), loadedBuffer(), prefetchBuffer(), readStepKeyEnd(0), readStepSize(0),
-        blockCacheSize(0), cachedBlockSize(0), blockReadSize(0), keyReadSize(0), dataMapped(false), accessType(0), externalData(false), didMlock(false)
+        blockCacheSize(0), cachedBlockSize(0), blockReadSize(0), keyReadSize(0), localBlockCacheSize(0), cachedLocalBlockSize(0), localBlockReadSize(0), localKeyReadSize(0),
+        dataMapped(false), accessType(0), externalData(false), didMlock(false)
 {}
 
 template <typename T>
@@ -41,8 +42,8 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         size(size), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), indexSize(size), index(index), sortedByOffset(true),
         id2local(NULL), local2id(NULL), index2dbfile(NULL), hasBinaryIndex(false), batchReader(NULL), loadedBuffer(), prefetchBuffer(),
-        readStepKeyEnd(0), readStepSize(0), blockCacheSize(0), cachedBlockSize(0), blockReadSize(0), keyReadSize(0), dataMapped(false),
-        accessType(NOSORT), externalData(true), didMlock(false)
+        readStepKeyEnd(0), readStepSize(0), blockCacheSize(0), cachedBlockSize(0), blockReadSize(0), keyReadSize(0), localBlockCacheSize(0), cachedLocalBlockSize(0),
+        localBlockReadSize(0), localKeyReadSize(0), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
 {}
 
 template <typename T>
@@ -335,29 +336,13 @@ template <typename T> bool DBReader<T>::open(int accessType){
     }
 
     if (externalData == false && isLinfinity && (dataMode & USE_DATA)) {
-        // O_DIRECT only for large files on local devices
-        size_t pageCacheLimit = static_cast<size_t>(Util::getTotalSystemMemory() * 0.1);
-        IoMode ioMode = getIoMode();
         size_t directFiles = 0;
         for (size_t fileIdx = 0; fileIdx < dataFileNames.size() + entryOffsetsFileNames.size(); fileIdx++) {
             const std::string &fileName = (fileIdx < dataFileNames.size()) ? dataFileNames[fileIdx] : entryOffsetsFileNames[fileIdx - dataFileNames.size()];
-            // key loads and index searches use bufferedFd
-            int bufferedFd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC);
-            if (bufferedFd < 0) {
-                Debug(Debug::ERROR) << "Cannot open data file " << fileName << "!\n";
-                EXIT(EXIT_FAILURE);
-            }
-            int fd = -1;
-#ifdef O_DIRECT
-            StorageKind storage = getStorageKind(bufferedFd);
-            bool isLocal = storage == STORAGE_LOCAL_FLASH || storage == STORAGE_LOCAL_DISK;
-            if (ioMode == IO_MODE_DIRECT || (ioMode == IO_MODE_AUTO && isLocal && fileSizes[fileIdx] > pageCacheLimit)) {
-                fd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-                directFiles += (fd >= 0);
-            }
-#endif
-            dataFds.push_back((fd < 0) ? bufferedFd : fd);
+            int bufferedFd;
+            dataFds.push_back(openDataFile(fileName, fileSizes[fileIdx], bufferedFd));
             bufferedFds.push_back(bufferedFd);
+            directFiles += dataFds.back() != bufferedFd;
         }
 
         batchReader = new BatchReader(threads, dataFds[0]);
@@ -523,6 +508,15 @@ template <typename T> void DBReader<T>::close(){
     }
     dataFds.clear();
     bufferedFds.clear();
+    for (size_t fileIdx = 0; fileIdx < localDataFds.size(); fileIdx++) {
+        if (localDataFds[fileIdx] != localBufferedFds[fileIdx]) {
+            ::close(localDataFds[fileIdx]);
+        }
+        ::close(localBufferedFds[fileIdx]);
+    }
+    localDataFds.clear();
+    localBufferedFds.clear();
+    localBlocks.clear();
     entryOffsetsFileNames.clear();
     rangeRepresentativeCounts.clear();
     decrementMemory(blockKeyOffsets.size() * sizeof(size_t));
@@ -1210,17 +1204,25 @@ template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<
     size_t pageSize = Util::getPageSize();
     size_t bytes = 0;
     // merge entries less than a page apart
+    size_t block = SIZE_MAX;
     for (size_t i = 0; i < keys.size(); i++) {
         size_t range = findIdRange(keys[i]);
         size_t begin = index[range].offset + (keys[i] - indexIdToNum(&index[range].id)) * index[range].length;
         size_t end = begin + index[range].length;
         int fd = bufferedFds[index2dbfile[range]];
+        if (localBlocks.empty() == false) {
+            if (block == SIZE_MAX || keys[i] < blockKeyOffsets[block] || keys[i] >= blockKeyOffsets[block + 1]) {
+                block = getKeyBlock(keys[i]);
+            }
+            fd = localBlocks[block] ? localBufferedFds[index2dbfile[range]] : fd;
+        }
         size_t gap = readRequests.empty() ? 0 : begin - std::min(begin, readRequests.back().fileOffset + readRequests.back().minBytesToRead);
         if (readRequests.empty() || readRequests.back().fileToRead != fd || begin < readRequests.back().fileOffset
             || gap > pageSize) {
             if (readRequests.empty() == false) {
                 bytes += readRequests.back().bytesToRead;
             }
+            // a local read that keeps failing is opened again from the data file, see BatchReader::retryRead
             BatchReader::ReadRequest request = { fd, dataFileNames[index2dbfile[range]].c_str(), NULL, begin / pageSize * pageSize, 0, 0 };
             readRequests.push_back(request);
             requestFirstKeys.push_back(keys[i]);
@@ -1263,8 +1265,16 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &buf
                     readRequests.clear();
                     planReadRequests(blockKeyOffsets[block], blockKeyOffsets[block + 1], false, readRequests, entryOffsets, clusterKeys, compressedReadRequests, requestFirstKeys);
                     BatchReader::ReadRequest &request = readRequests[0];
-                    freeBlocks(std::min(loadedBuffer.keyBegin, static_cast<size_t>(keys->front())), request.bytesToRead);
-                    isCached = request.bytesToRead <= blockCacheSize - cachedBlockSize;
+                    const bool isLocal = isLocalBlock(block);
+                    if (isLocal) {
+                        request.fileToRead = localDataFds[index2dbfile[findIdRange(blockKeyOffsets[block])]];
+                    }
+                    if (isLocal == false || request.bytesToRead <= localBlockCacheSize) {
+                        freeBlocks(std::min(loadedBuffer.keyBegin, static_cast<size_t>(keys->front())), request.bytesToRead, isLocal);
+                    }
+                    // local blocks leave the cache room for the other blocks
+                    isCached = request.bytesToRead <= blockCacheSize - cachedBlockSize
+                               && (isLocal == false || request.bytesToRead <= localBlockCacheSize - std::min(localBlockCacheSize, cachedLocalBlockSize));
                     if (isCached) {
                         if (posix_memalign((void **) &request.destination, Util::getPageSize(), request.bytesToRead) != 0) {
                             Debug(Debug::ERROR) << "Cannot allocate " << request.bytesToRead << " bytes to read " << dataFileName << "\n";
@@ -1273,6 +1283,8 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &buf
                         incrementMemory(request.bytesToRead);
                         cachedBlockSize += request.bytesToRead;
                         blockReadSize += request.bytesToRead;
+                        cachedLocalBlockSize += isLocal ? request.bytesToRead : 0;
+                        localBlockReadSize += isLocal ? request.bytesToRead : 0;
                         blocks.push_back(block);
                         blockReadRequests.push_back(request);
                     }
@@ -1291,6 +1303,11 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &buf
         if (keys != NULL) {
             bytes = planKeyReadRequests(*keysToRead, readRequests, requestFirstKeys);
             keyReadSize += bytes;
+            if (localBlocks.empty() == false) {
+                for (size_t i = 0; i < readRequests.size(); i++) {
+                    localKeyReadSize += localBlocks[getKeyBlock(requestFirstKeys[i])] ? readRequests[i].bytesToRead : 0;
+                }
+            }
         } else {
             bytes = planReadRequests(keyBegin, keyEnd, isReadingOffsets, readRequests, entryOffsets, clusterKeys, compressedReadRequests, requestFirstKeys);
         }
@@ -1453,6 +1470,45 @@ template <typename T> void DBReader<T>::cacheBlocks(EntryReadBuffer &buffer) {
     buffer.blocks.clear();
 }
 
+template <typename T> int DBReader<T>::openDataFile(const std::string &fileName, size_t fileSize, int &bufferedFd) {
+    // O_DIRECT only for large files on local devices
+    size_t pageCacheLimit = static_cast<size_t>(Util::getTotalSystemMemory() * 0.1);
+    IoMode ioMode = getIoMode();
+    // key loads and index searches use bufferedFd
+    bufferedFd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC);
+    if (bufferedFd < 0) {
+        Debug(Debug::ERROR) << "Cannot open data file " << fileName << "!\n";
+        EXIT(EXIT_FAILURE);
+    }
+    int fd = -1;
+#ifdef O_DIRECT
+    StorageKind storage = getStorageKind(bufferedFd);
+    bool isLocal = storage == STORAGE_LOCAL_FLASH || storage == STORAGE_LOCAL_DISK;
+    if (ioMode == IO_MODE_DIRECT || (ioMode == IO_MODE_AUTO && isLocal && fileSize > pageCacheLimit)) {
+        fd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
+    }
+#endif
+    return (fd < 0) ? bufferedFd : fd;
+}
+
+template <typename T> void DBReader<T>::setLocalBlocks(const std::string &localDataFileName, const std::vector<char> &blocks) {
+    size_t directFiles = 0;
+    for (size_t fileIdx = 0; fileIdx < dataFileNames.size(); fileIdx++) {
+        // the copy keeps the suffix of the data file
+        const std::string fileName = localDataFileName + dataFileNames[fileIdx].substr(strlen(dataFileName));
+        struct stat st;
+        // the copy has the size of the data file, so a full copy is opened like it would be today
+        const size_t fileSize = (stat(fileName.c_str(), &st) == 0) ? static_cast<size_t>(st.st_size) : 0;
+        int bufferedFd;
+        localDataFds.push_back(openDataFile(fileName, fileSize, bufferedFd));
+        localBufferedFds.push_back(bufferedFd);
+        directFiles += localDataFds.back() != bufferedFd;
+    }
+    localBlocks = blocks;
+    Debug(Debug::INFO) << "Reading " << std::count(blocks.begin(), blocks.end(), 1) << " of " << blocks.size() << " blocks of " << dataFileName << " from "
+                       << localDataFileName << ": " << directFiles << " of " << localDataFds.size() << " files with O_DIRECT\n";
+}
+
 template <typename T> void DBReader<T>::setBlockCacheSize(size_t cacheSize) {
     blockCacheSize = cacheSize;
     if (blockKeyOffsets.empty() == false) {
@@ -1482,13 +1538,16 @@ template <typename T> size_t DBReader<T>::getKeyBlock(size_t key) const {
     return std::upper_bound(blockKeyOffsets.begin(), blockKeyOffsets.end(), key) - blockKeyOffsets.begin() - 1;
 }
 
-// free blocks below keyEnd until neededSize fit
-template <typename T> void DBReader<T>::freeBlocks(size_t keyEnd, size_t neededSize) {
+// free blocks below keyEnd until neededSize fit, for a local block also the room of the local blocks
+template <typename T> void DBReader<T>::freeBlocks(size_t keyEnd, size_t neededSize, bool isLocal) {
     for (std::map<size_t, BatchReader::ReadRequest>::iterator cached = cachedBlocks.begin();
-         cached != cachedBlocks.end() && blockKeyOffsets[cached->first + 1] <= keyEnd && neededSize > blockCacheSize - cachedBlockSize;) {
+         cached != cachedBlocks.end() && blockKeyOffsets[cached->first + 1] <= keyEnd
+         && (neededSize > blockCacheSize - cachedBlockSize
+             || (isLocal && neededSize > localBlockCacheSize - std::min(localBlockCacheSize, cachedLocalBlockSize)));) {
         free(cached->second.destination);
         decrementMemory(cached->second.bytesToRead);
         cachedBlockSize -= cached->second.bytesToRead;
+        cachedLocalBlockSize -= isLocalBlock(cached->first) ? cached->second.bytesToRead : 0;
         cached = cachedBlocks.erase(cached);
     }
 }
@@ -1551,7 +1610,7 @@ template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key, Loa
             fileOffset = loadedBuffer.entryOffsets[pos];
             length = loadedBuffer.entryOffsets[pos + 1] - fileOffset;
         }
-        if (cachedBlocks.empty() == false) {
+        if (cachedBlocks.empty() == false || localBlocks.empty() == false) {
             if (cursor.block == SIZE_MAX || key < blockKeyOffsets[cursor.block] || key >= blockKeyOffsets[cursor.block + 1]) {
                 cursor.block = getKeyBlock(key);
                 const std::map<size_t, BatchReader::ReadRequest>::const_iterator cached = cachedBlocks.find(cursor.block);
@@ -1561,7 +1620,7 @@ template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key, Loa
                 return cursor.cachedBlock->destination + (fileOffset - cursor.cachedBlock->fileOffset);
             }
         }
-        const std::vector<int> &fds = loadedBuffer.isKeyLoad ? bufferedFds : dataFds;
+        const std::vector<int> &fds = loadedBuffer.isKeyLoad ? ((localBlocks.empty() == false && localBlocks[cursor.block]) ? localBufferedFds : bufferedFds) : dataFds;
         int fd = fds[index2dbfile[range]];
         const std::vector<size_t> &firstKeys = loadedBuffer.requestFirstKeys;
         size_t &requestEnd = cursor.requestEnd;

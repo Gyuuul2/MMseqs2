@@ -296,6 +296,12 @@ public:
     const std::vector<size_t> &getBlockKeyOffsets() const { return blockKeyOffsets; }
     size_t getBlockReadSize() { return blockReadSize; }
     size_t getKeyReadSize() { return keyReadSize; }
+    // a sparse local copy holds the blocks of localBlocks at the offsets of the data files
+    void setLocalBlocks(const std::string &localDataFileName, const std::vector<char> &blocks);
+    void setLocalBlockCacheSize(size_t cacheSize) { localBlockCacheSize = cacheSize; }
+    bool isLocalBlock(size_t block) const { return localBlocks.empty() == false && localBlocks[block]; }
+    size_t getLocalBlockReadSize() { return localBlockReadSize; }
+    size_t getLocalKeyReadSize() { return localKeyReadSize; }
     size_t getLoadBufferSize(size_t keyBegin, size_t keyEnd);
 
     // linfinity headers
@@ -650,6 +656,7 @@ private:
     std::vector<int> dataFds;
     // without O_DIRECT for key loads and index searches
     std::vector<int> bufferedFds;
+    int openDataFile(const std::string &fileName, size_t fileSize, int &bufferedFd);
     BatchReader * batchReader;
     struct EntryReadBuffer {
         char *buffer;
@@ -674,13 +681,20 @@ private:
 
     // block cache
     void cacheBlocks(EntryReadBuffer &buffer);
-    void freeBlocks(size_t keyEnd, size_t neededSize);
+    void freeBlocks(size_t keyEnd, size_t neededSize, bool isLocal = false);
     std::vector<size_t> blockKeyOffsets;
     std::map<size_t, BatchReader::ReadRequest> cachedBlocks;
     size_t blockCacheSize;
     size_t cachedBlockSize;
     size_t blockReadSize;
     size_t keyReadSize;
+    std::vector<char> localBlocks;
+    std::vector<int> localDataFds;
+    std::vector<int> localBufferedFds;
+    size_t localBlockCacheSize;
+    size_t cachedLocalBlockSize;
+    size_t localBlockReadSize;
+    size_t localKeyReadSize;
     bool prepareBufferToLoad(EntryReadBuffer &bufferToLoadInto, size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
 
     bool dataMapped;

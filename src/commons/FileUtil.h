@@ -70,10 +70,10 @@ public:
 
     static bool isSameDbData(const std::string &firstDb, const std::string &secondDb);
 
-    // copies the given byte ranges of each data file of db into the directory localDir as sparse copies and returns the name of the copy
-    // memoryBytes: the bytes of the copy if it is on tmpfs
-    static std::string copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &memoryBytes,
-                                      const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges);
+    // copies the given byte ranges of each data file of db, in their order while they fit maxBytes and the device, into sparse copies in localDir;
+    // copiedBytes is the copied prefix of the ranges
+    static std::string copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &copiedBytes,
+                                      const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges, size_t maxBytes);
 
     static FILE *openAndDelete(const char *fileName, const char *mode);
 
