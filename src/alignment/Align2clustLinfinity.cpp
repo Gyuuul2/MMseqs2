@@ -3415,7 +3415,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             int fd = MMseqsNode::tryOpenExchangeFile(fileName, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.fileSize, piece.file, observedSize, observedNumber, lastError);
                             if (fd < 0) {
                                 readingSeconds += readTimer.getTimediff();
-                                if (lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
+                                if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EIO) {
                                     Debug(Debug::ERROR) << "Cannot open served sequence file " << fileName << ": " << strerror(lastError) << "\n";
                                     EXIT(EXIT_FAILURE);
                                 }
@@ -3445,7 +3445,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             int closeError = (close(fd) != 0) ? errno : 0;
                             readingSeconds += readTimer.getTimediff();
                             int error = (readError > 0) ? readError : closeError;
-                            if (error != 0 && error != ESTALE && error != EINTR) {
+                            if (error != 0 && error != ESTALE && error != EINTR && error != EIO) {
                                 Debug(Debug::ERROR) << "Cannot read served sequence file " << fileName << ": " << strerror(error) << "\n";
                                 EXIT(EXIT_FAILURE);
                             }
@@ -3656,7 +3656,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         int lastError;
                         objectReadCount++;
                         int requestFd = MMseqsNode::tryOpenExchangeFile(requestFile, requestSize, requester.servedCount, observedSize, observedNumber, lastError);
-                        if (requestFd < 0 && lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
+                        if (requestFd < 0 && lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EIO) {
                             Debug(Debug::ERROR) << "Cannot open sequence request " << requestFile << ": " << strerror(lastError) << "\n";
                             EXIT(EXIT_FAILURE);
                         }
@@ -3672,7 +3672,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         // a missing or short request is tried again in the next pass
                         if (isRequestRead == false) {
                             servingSeconds += servingTimer.getTimediff();
-                            if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EINTR) {
+                            if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EINTR && lastError != EIO) {
                                 Debug(Debug::ERROR) << "Cannot read sequence request " << requestFile << ": " << strerror(lastError) << "\n";
                                 EXIT(EXIT_FAILURE);
                             }

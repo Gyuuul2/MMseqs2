@@ -309,14 +309,7 @@ bool BatchReader::retryRead(const ReadRequest &request, int &error) {
             }
             MMseqsNode::sleepBeforePoll(attempts - 1, 7);
             if (error == EIO || error == ESTALE) {
-                int fileFlags = fcntl(request.fileToRead, F_GETFL);
-                int fdFlags = fcntl(request.fileToRead, F_GETFD);
-                int fd = (fileFlags < 0 || fdFlags < 0) ? -1 : open(request.fileName, fileFlags);
-                if (fd >= 0) {
-                    dup2(fd, request.fileToRead);
-                    fcntl(request.fileToRead, F_SETFD, fdFlags);
-                    close(fd);
-                }
+                FileUtil::reopenFile(request.fileToRead, request.fileName);
             }
         }
         if (preadRequest(request, Util::getPageSize(), error)) {

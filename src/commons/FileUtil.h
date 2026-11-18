@@ -37,6 +37,8 @@ public:
     static void publishFile(const std::string &file, const std::string &content);
 
     static void preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset);
+    // replaces the file of fd with fileName opened again with the same flags, keeps fd if that fails; the file position starts at 0 again, so only for pread and pwrite
+    static void reopenFile(int fd, const char *fileName);
     static void pwriteAll(int fd, const char *fileName, const char *data, size_t size, size_t offset);
     // frees the disk blocks of a read range nobody needs again; the fd must be open for writing;
     // the aws backend frees only ranges of this node's own files that are in S3 already (isUploaded)

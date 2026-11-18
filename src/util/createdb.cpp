@@ -1133,7 +1133,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 bool isFlushStart = i == 0 || rows[i - 1].flush != rows[i].flush;
                 for (size_t fileType = isSpooled ? HEADER_DATA : SEQUENCE_DATA; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
                     if (isFlushStart) {
-                        MMseqsNode::ExchangeReader reader = { exchangeFiles[node], rows[i].starts[fileType], rows[i].ends[fileType],
+                        MMseqsNode::ExchangeReader reader = { exchangeFiles[node], exchange + "." + SSTR(node), rows[i].starts[fileType], rows[i].ends[fileType],
                                                                std::vector<char>(), 0, 0, 0, 0, NULL, rows[i].starts[fileType], exchangeObjects[node] };
                         readers[fileType].push_back(reader);
                         readerLengthOffsets[fileType].push_back(std::vector<std::pair<size_t, size_t> >());
@@ -1155,7 +1155,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         SORT_SERIAL(sentRows.begin(), sentRows.end(), SentLengthRow::compareByFlush);
         for (size_t i = 0; i < sentRows.size(); i++) {
             if (i == 0 || sentRows[i - 1].flush != sentRows[i].flush) {
-                MMseqsNode::ExchangeReader reader = { spoolHandle, sentRows[i].starts[SEQUENCE_DATA], sentRows[i].ends[SEQUENCE_DATA],
+                MMseqsNode::ExchangeReader reader = { spoolHandle, spoolFile, sentRows[i].starts[SEQUENCE_DATA], sentRows[i].ends[SEQUENCE_DATA],
                                                        std::vector<char>(), 0, 0, 0, 0, NULL, sentRows[i].starts[SEQUENCE_DATA], std::string() };
                 readers[SEQUENCE_DATA].push_back(reader);
                 readerLengthOffsets[SEQUENCE_DATA].push_back(std::vector<std::pair<size_t, size_t> >());
@@ -1394,7 +1394,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     const SequenceRun &last = edgeRuns[chunkOffsets[chunk + 1] - 1];
                     size_t size = last.edgeOffset + (last.directStart - last.start) + (last.end - last.directEnd) - first.edgeOffset;
                     edgeBuffer.resize(size);
-                    FileUtil::preadAll(fileno(edgeFiles[first.node]), edges.c_str(), edgeBuffer.data(), size, first.edgeOffset);
+                    FileUtil::preadAll(fileno(edgeFiles[first.node]), (edges + "." + SSTR(first.node)).c_str(), edgeBuffer.data(), size, first.edgeOffset);
                     for (size_t i = chunkOffsets[chunk]; i < chunkOffsets[chunk + 1]; i++) {
                         const SequenceRun &run = edgeRuns[i];
                         const char *data = edgeBuffer.data() + (run.edgeOffset - first.edgeOffset);
