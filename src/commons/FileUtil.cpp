@@ -673,8 +673,8 @@ static const size_t LOCAL_COPY_IO_BYTES = 64 * 1024 * 1024;
 // shared storage serves this many large reads of a copy at once
 static const int LOCAL_COPY_THREADS = 64;
 
-std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &memoryBytes,
-                                     const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges) {
+std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &copiedBytes,
+                                     const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges, size_t maxBytes) {
     const std::vector<std::string> dataFiles = findDatafiles(db.c_str());
     if (dataFiles.empty()) {
         Debug(Debug::ERROR) << "No datafile could be found for " << db << "\n";
@@ -683,21 +683,6 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
     if (directoryExists(localDir.c_str()) == false && makeDir(localDir.c_str()) == false) {
         Debug(Debug::ERROR) << "Cannot create " << localDir << "\n";
         EXIT(EXIT_FAILURE);
-    }
-    const int localFd = open(localDir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (localFd < 0) {
-        Debug(Debug::ERROR) << "Cannot open local database dir " << localDir << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    const StorageKind localStorage = getStorageKind(localFd);
-    struct stat localStat, dbStat;
-    const bool isDbDevice = fstat(localFd, &localStat) == 0 && stat((db + ".index").c_str(), &dbStat) == 0 && localStat.st_dev == dbStat.st_dev;
-    close(localFd);
-    if (localStorage != STORAGE_LOCAL_FLASH && localStorage != STORAGE_MEMORY) {
-        Debug(Debug::WARNING) << localDir << " is on " << getStorageName(localStorage) << ", not local flash\n";
-    }
-    if (isDbDevice) {
-        Debug(Debug::WARNING) << localDir << " is on the device of the database\n";
     }
     const std::string localDb = localDir + "/" + baseName(db);
     if (isSameDbData(db, localDb)) {
@@ -710,7 +695,6 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
     std::vector<size_t> fileBytes(dataFiles.size());
     std::vector<std::pair<size_t, size_t> > chunks;
     std::vector<size_t> chunkBytes;
-    size_t totalBytes = 0;
     for (size_t i = 0; i < dataFiles.size(); i++) {
         fileBytes[i] = getFileSize(dataFiles[i]);
         const std::vector<std::pair<size_t, size_t> > &ranges = fileRanges[i];
@@ -718,12 +702,12 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
             for (size_t offset = ranges[range].first; offset < ranges[range].second; offset += LOCAL_COPY_IO_BYTES) {
                 chunks.emplace_back(i, offset);
                 chunkBytes.push_back(std::min(LOCAL_COPY_IO_BYTES, ranges[range].second - offset));
-                totalBytes += chunkBytes.back();
             }
         }
     }
     std::vector<int> sourceFds(dataFiles.size());
     std::vector<int> copyFds(dataFiles.size());
+    const size_t firstCopy = copies.size();
     for (size_t i = 0; i < dataFiles.size(); i++) {
         // the copy keeps the suffix of the data file, so DBReader finds it next to localDb
         copies.push_back(localDb + dataFiles[i].substr(db.size()));
@@ -734,30 +718,7 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
             EXIT(EXIT_FAILURE);
         }
     }
-    // after O_TRUNC, so a copy left by a killed run does not take the free space; the copies are still sparse
-    struct statvfs fs;
-    if (statvfs(localDir.c_str(), &fs) != 0 || static_cast<size_t>(fs.f_bavail) * fs.f_frsize < totalBytes) {
-        Debug(Debug::ERROR) << localDir << " needs " << totalBytes << " free bytes for the sequences of " << db << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    const int copyThreads = std::max(1, std::min(std::min(threads, LOCAL_COPY_THREADS), (int) chunks.size()));
-#pragma omp parallel num_threads(copyThreads)
-    {
-        std::vector<char> buffer(LOCAL_COPY_IO_BYTES);
-#pragma omp for schedule(dynamic, 1)
-        for (size_t i = 0; i < chunks.size(); i++) {
-            const size_t file = chunks[i].first;
-            preadAll(sourceFds[file], dataFiles[file].c_str(), buffer.data(), chunkBytes[i], chunks[i].second);
-            pwriteAll(copyFds[file], copies[file].c_str(), buffer.data(), chunkBytes[i], chunks[i].second);
-        }
-    }
-    for (size_t i = 0; i < dataFiles.size(); i++) {
-        if (::close(sourceFds[i]) != 0 || ::close(copyFds[i]) != 0) {
-            Debug(Debug::ERROR) << "Cannot copy " << dataFiles[i] << " to " << copies[i] << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-    }
-    memoryBytes = (localStorage == STORAGE_MEMORY) ? totalBytes : 0;
+    // before the reservations, publishFile exits if a full device fails its flush
     const std::string dbtype = readFile(db + ".dbtype");
     if (dbtype.size() != sizeof(int)) {
         Debug(Debug::ERROR) << "Invalid database type file: " << db << ".dbtype\n";
@@ -765,6 +726,82 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
     }
     publishFile(localDb + ".dbtype", dbtype);
     copies.push_back(localDb + ".dbtype");
+    // reserve the chunks in order, a chunk that does not fit ends the copy
+    size_t totalBytes = 0;
+    size_t chunkCount = 0;
+    for (; chunkCount < chunks.size() && chunkBytes[chunkCount] <= maxBytes - totalBytes; chunkCount++) {
+#ifdef __linux__
+        const int fd = copyFds[chunks[chunkCount].first];
+        int failed;
+        do {
+            failed = fallocate(fd, 0, chunks[chunkCount].second, chunkBytes[chunkCount]);
+        } while (failed != 0 && errno == EINTR);
+        const int reserveError = errno;
+        if (failed != 0 && reserveError != EOPNOTSUPP && reserveError != ENOSYS) {
+            Debug(Debug::INFO) << "Cannot reserve " << copies[firstCopy + chunks[chunkCount].first] << " at offset " << chunks[chunkCount].second << ": " << strerror(reserveError)
+                               << ", the copy ends there\n";
+            punchHole(fd, chunks[chunkCount].second, chunkBytes[chunkCount]);
+            break;
+        }
+#endif
+        totalBytes += chunkBytes[chunkCount];
+    }
+    chunks.resize(chunkCount);
+    // without a reservation the device can still fill up, then the copy ends at the first chunk it could not write
+    size_t failedChunk = chunks.size();
+    const int copyThreads = std::max(1, std::min(std::min(threads, LOCAL_COPY_THREADS), (int) chunks.size()));
+#pragma omp parallel num_threads(copyThreads)
+    {
+        std::vector<char> buffer(LOCAL_COPY_IO_BYTES);
+#pragma omp for schedule(dynamic, 1)
+        for (size_t i = 0; i < chunks.size(); i++) {
+            if (i > __atomic_load_n(&failedChunk, __ATOMIC_RELAXED)) {
+                continue;
+            }
+            const size_t file = chunks[i].first;
+            preadAll(sourceFds[file], dataFiles[file].c_str(), buffer.data(), chunkBytes[i], chunks[i].second);
+            for (size_t done = 0; done < chunkBytes[i];) {
+                const ssize_t count = pwrite(copyFds[file], buffer.data() + done, chunkBytes[i] - done, chunks[i].second + done);
+                if (count < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (count < 0 && (errno == ENOSPC || errno == EDQUOT)) {
+                    const int writeError = errno;
+                    Debug(Debug::INFO) << "Cannot write " << copies[firstCopy + file] << " at offset " << chunks[i].second + done << ": " << strerror(writeError) << ", the copy ends there\n";
+                    size_t failed = __atomic_load_n(&failedChunk, __ATOMIC_RELAXED);
+                    while (i < failed && __atomic_compare_exchange_n(&failedChunk, &failed, i, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED) == false) {}
+                    break;
+                }
+                if (count <= 0) {
+                    const int writeError = (count < 0) ? errno : 0;
+                    Debug(Debug::ERROR) << "Cannot write " << copies[firstCopy + file] << " at offset " << chunks[i].second + done << ": " << (writeError == 0 ? "no bytes written" : strerror(writeError)) << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                done += count;
+            }
+        }
+    }
+    // cut off everything from the failed chunk on
+    if (failedChunk < chunks.size()) {
+        totalBytes = 0;
+        for (size_t i = 0; i < failedChunk; i++) {
+            totalBytes += chunkBytes[i];
+        }
+        for (size_t file = chunks[failedChunk].first; file < dataFiles.size(); file++) {
+            const size_t keptBytes = (file == chunks[failedChunk].first) ? chunks[failedChunk].second : 0;
+            if (ftruncate(copyFds[file], keptBytes) != 0 || ftruncate(copyFds[file], fileBytes[file]) != 0) {
+                Debug(Debug::ERROR) << "Cannot truncate " << copies[firstCopy + file] << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+    }
+    for (size_t i = 0; i < dataFiles.size(); i++) {
+        if (::close(sourceFds[i]) != 0 || ::close(copyFds[i]) != 0) {
+            Debug(Debug::ERROR) << "Cannot copy " << dataFiles[i] << " to " << copies[firstCopy + i] << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+    copiedBytes = totalBytes;
     Debug(Debug::INFO) << "Copied " << totalBytes << " bytes of " << db << " to " << localDb << "\n";
     return localDb;
 }

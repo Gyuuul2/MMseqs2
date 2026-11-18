@@ -2334,7 +2334,7 @@ struct ScalarMembers {
 static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTargetsReader &repTargetsReader, TargetSplitReader *targetSplitReader,
                             const std::vector<PrefPartition> &partitions, size_t memoryLimit, size_t masterMemoryLimit, size_t servedFileEntrySize, size_t representativeResidues,
                             size_t paddedDbSize, size_t sizeClassCount, const ClusterMemberLookup *memberLookup, ClusterMemberExchange *memberExchange,
-                            size_t memberKeyBudget, DBReader<DBKeyType> *memberDbr, bool hasLocalServedBlocks, std::string &phaseValues) {
+                            size_t memberKeyBudget, DBReader<DBKeyType> *memberDbr, std::string &phaseValues) {
     Timer startTimer;
     const unsigned int nodes = MMseqsNode::count;
     const unsigned int rank = MMseqsNode::rank;
@@ -2518,14 +2518,19 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     std::vector<size_t> rangeByteOffsets(rangeCount + 1, 0);
     std::vector<size_t> nodeRangeByteOffsets(rangeCount + 1, 0);
     size_t nodeBlockCount = 0;
+    size_t localBlockSize = 0;
+    size_t localBlockCount = 0;
     for (size_t range = 0, block = 0; range < rangeCount; range++) {
         const size_t keyEnd = (range + 1 < rangeCount) ? static_cast<size_t>(index[range + 1].id) : dbSize;
         rangeByteOffsets[range + 1] = rangeByteOffsets[range] + (keyEnd - index[range].id) * index[range].length;
         nodeRangeByteOffsets[range + 1] = nodeRangeByteOffsets[range];
         for (size_t key = index[range].id; key < keyEnd; key = std::min(keyEnd, blockKeyOffsets[block + 1])) {
             for (; blockKeyOffsets[block + 1] <= key; block++) {}
-            nodeRangeByteOffsets[range + 1] += (getBlockAlignNode(block) == rank) ? (std::min(keyEnd, blockKeyOffsets[block + 1]) - key) * index[range].length : 0;
+            const size_t blockBytes = (getBlockAlignNode(block) == rank) ? (std::min(keyEnd, blockKeyOffsets[block + 1]) - key) * index[range].length : 0;
+            nodeRangeByteOffsets[range + 1] += blockBytes;
             nodeBlockCount += getBlockAlignNode(block) == rank;
+            localBlockSize += seqDbr.isLocalBlock(block) ? blockBytes : 0;
+            localBlockCount += seqDbr.isLocalBlock(block);
         }
     }
     double coverableBytesSum = 0;
@@ -2574,8 +2579,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     const size_t blockCacheSize = memoryLimit - getReservedMemory(maxFetchSize);
     seqDbr.setBlockCacheSize(blockCacheSize);
     const size_t maxPendingPairSize = std::min(memberSplitSize, maxFetchSize);
-    // a --local-tmp copy holds only the blocks of the target splits of this rank
-    const bool isReadingDirectly = hasLocalServedBlocks == false && isCacheTooSmall(blockCacheSize);
+    // the blocks in --local-tmp count like the block cache
+    const bool isReadingDirectly = isCacheTooSmall(blockCacheSize + localBlockSize);
     // the service thread and the loader use a quarter of the threads
     const int serviceThreads = std::max(1, par.threads / 4);
     // the blocks of other align nodes are read from the shared database, in a block cache of their own
@@ -2591,12 +2596,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         repDbr->setBlockCacheSize(repBlockCacheSize);
         seqDbr.setBlockCacheSize(blockCacheSize - repBlockCacheSize);
     }
+    // local blocks leave the block cache room for the other blocks of this node, a block read is rounded to pages at both ends
+    const size_t seqBlockCacheSize = blockCacheSize - repBlockCacheSize;
+    const size_t sharedBlockSize = servedSequenceSize - localBlockSize + 2 * pageSize * (nodeBlockCount - localBlockCount);
+    seqDbr.setLocalBlockCacheSize(seqBlockCacheSize - std::min(seqBlockCacheSize, sharedBlockSize));
     if (isAligningNode) {
         MMseqsNode::addPhaseValue(phaseValues, "Block cache", SSTR(blockCacheSize) + " bytes for " + SSTR(static_cast<size_t>(alignNodeCoverableSize)) + " coverable bytes and " + SSTR(servedSequenceSize) + " sequence bytes of the align node"
-                                 + (isReadingDirectly ? ", the sequences are read directly" : ""));
+                                 + ", " + SSTR(localBlockSize) + " of them in --local-tmp" + (isReadingDirectly ? ", the sequences are read directly" : ""));
     }
-    if (isAligningNode && blockCacheSize < servedSequenceSize) {
-        Debug(Debug::WARNING) << "Node " << rank << " holds " << servedSequenceSize << " sequence bytes but its block cache has " << blockCacheSize
+    if (isAligningNode && blockCacheSize + localBlockSize < servedSequenceSize) {
+        Debug(Debug::WARNING) << "Node " << rank << " holds " << servedSequenceSize << " sequence bytes, --local-tmp holds " << localBlockSize << " of them and its block cache has " << blockCacheSize
                               << " bytes, the other sequences are read one by one. Use more nodes or increase --split-memory-limit\n";
     }
     // the first fetch is small, then they double up to 128 MiB; MMSEQS_ALIGN_FETCH_BYTES=<n> fixes the limit for measurements
@@ -4642,6 +4651,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     }
     MMseqsNode::addPhaseValue(phaseValues, "Block read bytes", SSTR(seqDbr.getBlockReadSize()));
     MMseqsNode::addPhaseValue(phaseValues, "Key read bytes", SSTR(seqDbr.getKeyReadSize()));
+    MMseqsNode::addPhaseValue(phaseValues, "Local block read bytes", SSTR(seqDbr.getLocalBlockReadSize()));
+    MMseqsNode::addPhaseValue(phaseValues, "Local key read bytes", SSTR(seqDbr.getLocalKeyReadSize()));
     if (repDbr != NULL) {
         MMseqsNode::addPhaseValue(phaseValues, "Rep block read bytes", SSTR(repDbr->getBlockReadSize()));
         MMseqsNode::addPhaseValue(phaseValues, "Rep key read bytes", SSTR(repDbr->getKeyReadSize()));
@@ -5560,21 +5571,31 @@ int align2clustLinfinity(Parameters &par) {
                                       + SSTR(static_cast<size_t>(groupCosts[alignGroup] * 1000 / std::max((uint128) 1, totalAlignmentCells))) + " per mille of the cost");
         }
     }
-    std::string seqDb = par.db1;
+    // a master that only clusters reads no sequences; with S3 the local sparse copies replace the copies
+    const bool isCopyingServedBlocks = par.localTmp.empty() == false && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode() && S3Client::isEnabled() == false;
+    const std::vector<std::string> dataFiles = FileUtil::findDatafiles(par.db1.c_str());
+    // seqDbr, its local copy, repDbr and the member DB of iteration 2 open each data file, O_DIRECT doubles the fds, up to five fds per own target split
+    struct rlimit openFileLimit = {0, 0};
+    getrlimit(RLIMIT_NOFILE, &openFileLimit);
+    size_t minOpenFiles = ((par.filterCluDBFile.empty() ? 4 : 6) + (isCopyingServedBlocks ? 2 : 0)) * dataFiles.size() + 64 + 2 * MMseqsNode::count + 5 * std::count(targetSplitAlignNodes.begin(), targetSplitAlignNodes.end(), MMseqsNode::rank);
+    if (minOpenFiles > openFileLimit.rlim_cur) {
+        Debug(Debug::ERROR) << "Raise the open file limit (ulimit -n) to at least " << minOpenFiles << "\n";
+        EXIT(EXIT_FAILURE);
+    }
     std::string cluPartDb = par.filterCluDBFile;
     std::vector<std::string> localCopies;
-    size_t localCopySize = 0;
-    bool hasLocalServedBlocks = false;
-    // a master that only clusters reads no sequences; with S3 the local sparse copies replace the copies
-    if (par.localTmp.empty() == false && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode() && S3Client::isEnabled() == false) {
+    std::string localDir;
+    std::string localSeqDb;
+    std::vector<char> localBlocks;
+    if (isCopyingServedBlocks) {
         std::string localTmpProblem = getLocalTmpProblem(par);
         if (localTmpProblem.empty()) {
-            // copy only the served blocks
+            // the blocks of this rank in key order
             const std::vector<size_t> &blockKeyOffsets = blockDbr.getBlockKeyOffsets();
             const DBReader<DBKeyType>::Index *blockIndex = blockDbr.getIndex();
-            const std::vector<std::string> dataFiles = FileUtil::findDatafiles(par.db1.c_str());
             std::vector<std::vector<std::pair<size_t, size_t> > > servedFileRanges(dataFiles.size());
-            size_t servedSize = 0;
+            std::vector<size_t> servedBlocks;
+            std::vector<size_t> servedBlockOffsets(1, 0);
             for (size_t block = 0; block + 1 < blockKeyOffsets.size(); block++) {
                 if (getBlockAlignNode(block) != MMseqsNode::rank) {
                     continue;
@@ -5589,10 +5610,12 @@ int align2clustLinfinity(Parameters &par) {
                 } else {
                     ranges.emplace_back(begin, end);
                 }
-                servedSize += end - begin;
+                servedBlocks.push_back(block);
+                servedBlockOffsets.push_back(servedBlockOffsets.back() + end - begin);
             }
+            const size_t servedSize = servedBlockOffsets.back();
             // a copy left by a killed run does not take the free space
-            const std::string localDir = par.localTmp + "/" + FileUtil::baseName(par.db3) + ".served." + SSTR(MMseqsNode::rank);
+            localDir = par.localTmp + "/" + FileUtil::baseName(par.db3) + ".served." + SSTR(MMseqsNode::rank);
             std::vector<std::string> oldCopies = FileUtil::findDatafiles((localDir + "/" + FileUtil::baseName(par.db1)).c_str());
             // and the own cluster part
             std::vector<std::vector<std::pair<size_t, size_t> > > cluFileRanges(par.filterCluDBFile.empty() ? 0 : MMseqsNode::count);
@@ -5600,34 +5623,85 @@ int align2clustLinfinity(Parameters &par) {
                 std::vector<std::string> oldCluCopies = FileUtil::findDatafiles((localDir + "/" + FileUtil::baseName(par.filterCluDBFile)).c_str());
                 oldCopies.insert(oldCopies.end(), oldCluCopies.begin(), oldCluCopies.end());
                 cluFileRanges[MMseqsNode::rank].emplace_back(0, FileUtil::getFileSize(par.filterCluDBFile + "." + SSTR(MMseqsNode::rank)));
-                servedSize += cluFileRanges[MMseqsNode::rank][0].second;
             }
             for (size_t i = 0; i < oldCopies.size(); i++) {
                 FileUtil::remove(oldCopies[i].c_str());
             }
-            struct statvfs fs;
-            const size_t freeSize = (statvfs(par.localTmp.c_str(), &fs) == 0) ? static_cast<size_t>(fs.f_bavail) * fs.f_frsize : 0;
-            if (freeSize < servedSize) {
-                localTmpProblem = "it has " + SSTR(freeSize) + " free bytes, the copies need " + SSTR(servedSize);
-            } else {
-                seqDb = FileUtil::copyToLocalDir(par.db1, localDir, par.threads, localCopies, localCopySize, servedFileRanges);
-                if (cluFileRanges.empty() == false) {
-                    size_t cluCopySize = 0;
-                    cluPartDb = FileUtil::copyToLocalDir(par.filterCluDBFile, localDir, par.threads, localCopies, cluCopySize, cluFileRanges);
-                    localCopySize += cluCopySize;
+            const size_t cluSize = cluFileRanges.empty() ? 0 : cluFileRanges[MMseqsNode::rank][0].second;
+            // SIZE_MAX if statvfs failed
+            const size_t freeSize = FileUtil::getFreeSpace(par.localTmp.c_str());
+            size_t localTmpSize = (freeSize == SIZE_MAX) ? 0 : freeSize;
+            // MMSEQS_LOCAL_COPY_BYTES=<n> limits the copies for measurements
+            const char *localCopyBytes = getenv("MMSEQS_LOCAL_COPY_BYTES");
+            char *localCopyBytesEnd = NULL;
+            const size_t maxLocalCopySize = (localCopyBytes != NULL) ? strtoull(localCopyBytes, &localCopyBytesEnd, 10) : 0;
+            if (localCopyBytes != NULL && (localCopyBytesEnd == localCopyBytes || *localCopyBytesEnd != '\0')) {
+                Debug(Debug::WARNING) << "Ignoring MMSEQS_LOCAL_COPY_BYTES=" << localCopyBytes << ", it must be a number of bytes\n";
+            } else if (localCopyBytes != NULL) {
+                localTmpSize = std::min(localTmpSize, maxLocalCopySize);
+            }
+            // the open sets of the master and the files of the run need what the copies leave
+            struct stat localTmpStat, tmpStat;
+            const bool isTmpDevice = stat(par.localTmp.c_str(), &localTmpStat) == 0 && stat(FileUtil::dirName(par.db3).c_str(), &tmpStat) == 0 && localTmpStat.st_dev == tmpStat.st_dev;
+            const size_t maxCopySize = localTmpSize;
+            if (((MMseqsNode::isMaster() && par.clusteringMode == Parameters::SET_COVER) || isTmpDevice) && localTmpSize < cluSize + servedSize) {
+                localTmpSize = 0;
+            }
+            // the cluster part whole or not at all, then the blocks while they fit
+            size_t cluCopySize = 0;
+            if (cluSize > 0 && cluSize <= localTmpSize) {
+                const size_t firstCopy = localCopies.size();
+                cluPartDb = FileUtil::copyToLocalDir(par.filterCluDBFile, localDir, par.threads, localCopies, cluCopySize, cluFileRanges, localTmpSize);
+                if (cluCopySize < cluSize) {
+                    for (size_t i = firstCopy; i < localCopies.size(); i++) {
+                        FileUtil::remove(localCopies[i].c_str());
+                    }
+                    localCopies.resize(firstCopy);
+                    cluPartDb = par.filterCluDBFile;
+                    cluCopySize = 0;
                 }
-                hasLocalServedBlocks = true;
-                MMseqsNode::addPhaseTime(phaseValues, "copying the served blocks to --local-tmp", phaseValueTimer);
+            }
+            size_t seqCopySize = 0;
+            const size_t firstSeqCopy = localCopies.size();
+            if (servedBlocks.empty() == false && localTmpSize - cluCopySize >= servedBlockOffsets[1]) {
+                localSeqDb = FileUtil::copyToLocalDir(par.db1, localDir, par.threads, localCopies, seqCopySize, servedFileRanges, localTmpSize - cluCopySize);
+            }
+            // a block is local once all its bytes are
+            const size_t localBlockCount = std::upper_bound(servedBlockOffsets.begin(), servedBlockOffsets.end(), seqCopySize) - servedBlockOffsets.begin() - 1;
+            if (localBlockCount == 0) {
+                // less than a block was copied
+                for (size_t i = firstSeqCopy; i < localCopies.size(); i++) {
+                    FileUtil::remove(localCopies[i].c_str());
+                }
+                localCopies.resize(firstSeqCopy);
+                if (localCopies.empty()) {
+                    rmdir(localDir.c_str());
+                }
+            } else {
+                localBlocks.assign(blockKeyOffsets.size() - 1, 0);
+                for (size_t i = 0; i < localBlockCount; i++) {
+                    localBlocks[servedBlocks[i]] = 1;
+                }
+            }
+            MMseqsNode::addPhaseTime(phaseValues, "copying the served blocks to --local-tmp", phaseValueTimer);
+            if (localBlockCount == 0 && cluCopySize == 0 && cluSize + servedSize > 0) {
+                localTmpProblem = (freeSize == SIZE_MAX) ? std::string("its free space is unknown")
+                                  : "it has " + SSTR(freeSize) + " free bytes" + ((maxCopySize < freeSize) ? ", MMSEQS_LOCAL_COPY_BYTES leaves " + SSTR(maxCopySize) : "")
+                                    + ", the copies need " + SSTR(cluSize + servedSize);
+            } else {
+                MMseqsNode::addPhaseValue(phaseValues, "Local tmp", "holds " + SSTR(servedBlockOffsets[localBlockCount]) + " of " + SSTR(servedSize) + " sequence bytes in "
+                                          + SSTR(localBlockCount) + " of " + SSTR(servedBlocks.size()) + " blocks"
+                                          + (par.filterCluDBFile.empty() ? "" : (cluCopySize > 0 ? " and the cluster part" : ", the cluster part is read from the shared folder")));
             }
         }
-        if (hasLocalServedBlocks == false) {
+        if (localTmpProblem.empty() == false) {
             if (par.localTmpFallback == false) {
                 Debug(Debug::ERROR) << "Cannot copy the served blocks to --local-tmp " << par.localTmp << ": " << localTmpProblem << ". Please choose another --local-tmp or set --local-tmp-fallback 1 to read them from the shared folder.\n";
                 EXIT(EXIT_FAILURE);
             }
             MMseqsNode::reportUnusableLocalTmp("Cannot copy the served blocks to --local-tmp " + par.localTmp + ": " + localTmpProblem);
+            MMseqsNode::addPhaseValue(phaseValues, "Local tmp", "not used, " + localTmpProblem);
         }
-        MMseqsNode::addPhaseValue(phaseValues, "Local tmp", hasLocalServedBlocks ? (par.filterCluDBFile.empty() ? "holds the served blocks" : "holds the served blocks and the cluster part") : "not used, " + localTmpProblem);
     }
 
     // only the master writes and reads the open sets of set cover
@@ -5646,21 +5720,12 @@ int align2clustLinfinity(Parameters &par) {
     }
 
     blockDbr.close();
-    DBReader<DBKeyType> seqDbr(seqDb.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
+    DBReader<DBKeyType> seqDbr(par.db1.c_str(), par.db1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
     seqDbr.open(DBReader<DBKeyType>::NOSORT);
-    // seqDbr, repDbr and the member DB of iteration 2 open each data file, O_DIRECT doubles the fds, up to five fds per own target split
-    struct rlimit openFileLimit = {0, 0};
-    getrlimit(RLIMIT_NOFILE, &openFileLimit);
-    size_t minOpenFiles = (par.filterCluDBFile.empty() ? 4 : 6) * seqDbr.getDataFileCnt() + 64 + 2 * MMseqsNode::count + 5 * std::count(targetSplitAlignNodes.begin(), targetSplitAlignNodes.end(), MMseqsNode::rank);
-    if (minOpenFiles > openFileLimit.rlim_cur) {
-        Debug(Debug::ERROR) << "Raise the open file limit (ulimit -n) to at least " << minOpenFiles << "\n";
-        EXIT(EXIT_FAILURE);
-    }
     const std::vector<size_t> nodeKeyOffsets = seqDbr.getEvenNodeKeyOffsets(MMseqsNode::count);
     const size_t dbSize = seqDbr.getSize();
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
-    // a copy on tmpfs holds the sequences in memory
-    const size_t nodeMemoryLimit = MMseqsNode::getMemoryLimit(par, localCopySize);
+    const size_t nodeMemoryLimit = MMseqsNode::getMemoryLimit(par);
     const bool isMasterAligning = MMseqsNode::getFirstAlignNode() == 0;
     const size_t masterMemoryLimit = nodeMemoryLimit / (isMasterAligning ? 2 : 1);
     // the master holds the assigned bits and a log buffer per node in both clustering modes
@@ -5688,6 +5753,9 @@ int align2clustLinfinity(Parameters &par) {
 
     // builds the block table of getKeyBlock
     seqDbr.setBlockCacheSize(0);
+    if (localBlocks.empty() == false) {
+        seqDbr.setLocalBlocks(localSeqDb, localBlocks);
+    }
     const std::vector<size_t> &blockKeyOffsets = seqDbr.getBlockKeyOffsets();
     // the master keeps the align node of every page of assigned bits
     const size_t pageCount = (dbSize + ASSIGNED_PAGE_KEYS - 1) / ASSIGNED_PAGE_KEYS;
@@ -5825,7 +5893,7 @@ int align2clustLinfinity(Parameters &par) {
     // a member key, a pending part and an accepted pair take 41 words and 5 flags of the 2 * memberSplitSize in getReservedMemory
     const size_t memberKeyBudget = std::max<size_t>(1, 2 * std::min(memoryLimit, smallestMemoryLimit) / MEMBER_SPLIT_MEMORY_DIVISOR / ((7 + 9 + 25) * sizeof(uint64_t) + 5));
     alignRepTargets(par, seqDbr, repTargetsReader, targetSplitReader, partitions, memoryLimit, masterMemoryLimit, servedFileEntrySize, representativeResidues, paddedDbSize, sizeClassCount,
-                    memberLookup, memberExchange, memberKeyBudget, memberDbr, hasLocalServedBlocks, phaseValues);
+                    memberLookup, memberExchange, memberKeyBudget, memberDbr, phaseValues);
     // serve until every aligning node has its members
     if (memberServer.joinable()) {
         memberServer.join();
@@ -5889,7 +5957,7 @@ int align2clustLinfinity(Parameters &par) {
         FileUtil::remove(localCopies[i].c_str());
     }
     if (localCopies.empty() == false) {
-        rmdir(FileUtil::dirName(seqDb).c_str());
+        rmdir(localDir.c_str());
     }
     MMseqsNode::addPhaseTime(phaseValues, "waiting for the clustering", phaseValueTimer);
     const size_t nodeFirstKey = nodeKeyOffsets[MMseqsNode::rank];
