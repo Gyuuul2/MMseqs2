@@ -15,6 +15,7 @@
 #include <sys/statvfs.h>
 #include <sys/stat.h>
 #include <sys/resource.h>
+#include <dirent.h>
 #include <cstring>
 #include <thread>
 #include <ctime>
@@ -603,6 +604,15 @@ struct RepTargetsRecord {
 // stolen share per window behind
 static const double STEAL_SHARE_STEP = 1.0 / 8;
 
+// MMSEQS_ALIGN_STEAL=0: an align node takes only its own cells, for measurements
+static bool isStealingEnabled() {
+    const char *steal = getenv("MMSEQS_ALIGN_STEAL");
+    if (steal != NULL && strcmp(steal, "0") != 0 && strcmp(steal, "1") != 0) {
+        Debug(Debug::WARNING) << "Ignoring MMSEQS_ALIGN_STEAL=" << steal << ", it must be 0 or 1\n";
+    }
+    return steal == NULL || strcmp(steal, "0") != 0;
+}
+
 // target split mode
 static std::vector<size_t> targetSplitBlockOffsets;
 static std::vector<unsigned int> targetSplitAlignNodes;
@@ -663,10 +673,85 @@ static std::string describeServedFile(size_t size, size_t observedSize, uint64_t
            + "; error " + SSTR(error) + ")\n";
 }
 
+static std::string formatSeconds(double seconds) {
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%.1f s", seconds);
+    return buffer;
+}
+
+// windowFirstKeys starts with 0; a cursor searches again only once key leaves its window
+static size_t findWindow(const std::vector<size_t> &windowFirstKeys, size_t key, size_t &window) {
+    if (window == SIZE_MAX || key < windowFirstKeys[window] || (window + 1 < windowFirstKeys.size() && key >= windowFirstKeys[window + 1])) {
+        window = std::upper_bound(windowFirstKeys.begin() + 1, windowFirstKeys.end(), key) - windowFirstKeys.begin() - 1;
+    }
+    return window;
+}
+
+// the windows of the set cover passes follow each other
+static size_t getWindowPosition(const std::vector<size_t> &windowFirstKeys, size_t paddedDbSize, size_t orderKey) {
+    size_t window = SIZE_MAX;
+    return orderKey / paddedDbSize * windowFirstKeys.size() + findWindow(windowFirstKeys, orderKey % paddedDbSize, window);
+}
+
+// the threads of this process, io_uring workers included, and the io_uring workers
+static void countProcessThreads(size_t &threads, size_t &ringWorkers) {
+    threads = 0;
+    ringWorkers = 0;
+    DIR *tasks = opendir("/proc/self/task");
+    if (tasks == NULL) {
+        return;
+    }
+    for (struct dirent *entry; (entry = readdir(tasks)) != NULL;) {
+        if (entry->d_name[0] == '.') {
+            continue;
+        }
+        threads++;
+        FILE *comm = fopen(("/proc/self/task/" + std::string(entry->d_name) + "/comm").c_str(), "r");
+        char name[32] = "";
+        if (comm != NULL) {
+            ringWorkers += fgets(name, sizeof(name), comm) != NULL && strncmp(name, "iou-", 4) == 0;
+            fclose(comm);
+        }
+    }
+    closedir(tasks);
+}
+
+// per window of an align node, for the decile table at the end
+struct WindowCounters {
+    WindowCounters() : examinedPairs(0), alignedPairs(0), targetSkippedPairs(0), repSkippedRecords(0), alignmentCells(0), fetchCount(0), prefilterBufferCount(0),
+                       alignSeconds(0), otherSeconds(0), lastFetch(SIZE_MAX), lastPrefilterBuffer(SIZE_MAX) {}
+    // added by the aligning threads
+    size_t examinedPairs;
+    size_t alignedPairs;
+    size_t targetSkippedPairs;
+    size_t repSkippedRecords;
+    // the .partitions cells the node took
+    size_t alignmentCells;
+    size_t fetchCount;
+    size_t prefilterBufferCount;
+    double alignSeconds;
+    // fetch work and waits
+    double otherSeconds;
+    size_t lastFetch;
+    size_t lastPrefilterBuffer;
+};
+
+// per log2 bucket of the planned fetch bytes
+struct FetchSizeCounters {
+    FetchSizeCounters() : fetchCount(0), plannedSize(0), unassignedRecordSize(0), alignedPairs(0), alignSeconds(0) {}
+    size_t fetchCount;
+    size_t plannedSize;
+    size_t unassignedRecordSize;
+    size_t alignedPairs;
+    double alignSeconds;
+};
+
 // linfinity: records [begin, end) of a prefilter buffer and their fetched entries
 struct FetchedSequences {
-    FetchedSequences() : prefilterBuffer(0), begin(0), end(0), targetCount(0), pendingPairCount(0), firstPendingRepKey(0), isLast(false), entries(NULL), allocatedSize(0) {}
+    FetchedSequences() : prefilterBuffer(0), prefilterBufferNumber(0), begin(0), end(0), targetCount(0), pendingPairCount(0), firstPendingRepKey(0), plannedSize(0), unassignedRecordSize(0),
+                         isLast(false), entries(NULL), allocatedSize(0) {}
     size_t prefilterBuffer;
+    size_t prefilterBufferNumber;
     size_t begin;
     size_t end;
     size_t targetCount;
@@ -674,6 +759,9 @@ struct FetchedSequences {
     size_t pendingPairCount;
     // the first rep of the pairs that wait for their member checks when it was selected
     size_t firstPendingRepKey;
+    // the bytes of the fetch size rule and those of its records whose rep was not assigned
+    size_t plannedSize;
+    size_t unassignedRecordSize;
     bool isLast;
     std::vector<DBKeyType> keys;
     std::vector<size_t> fetchSourceKeyOffsets;
@@ -725,6 +813,8 @@ static const double BATCH_READ_SECONDS = PUBLISH_SECONDS / 4.0;
 static const double LOG_COST_FACTOR = 16;
 static const double MIN_PUBLISH_SECONDS = 0.1;
 static const double MIN_READ_SECONDS = 0.05;
+// an align node prints its counters so far once a minute
+static const double STATUS_SECONDS = 60;
 static const uint64_t ACCEPTED_REP_BIT = 1ULL << 63;
 
 static size_t getRepOrderKey(uint64_t word) {
@@ -1789,8 +1879,8 @@ struct TargetSplitReader {
     TargetSplitReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &cells, MMseqsNode::WorkQueue &cellQueue, size_t maxRecordSize, size_t memoryLimit,
                       size_t paddedDbSize, size_t sizeClassCount)
         : readSize(0), prefSize(0), homeCellCount(0), stolenCellCount(0), lostCellCount(0), stolenCost(0), takenCost(0), stolenTargetBytes(0), targetBytes(0),
-          stealShares(MMseqsNode::count, 0), doneRepKeys(MMseqsNode::count, 0), stolenCostSignChanges(0), stealWindowCount(0),
-          isClaiming(sizeClassCount == 1 && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()), par(par), seqDbr(seqDbr), cells(cells), cellQueue(cellQueue),
+          stealShares(MMseqsNode::count, 0), doneRepKeys(MMseqsNode::count, 0), stolenCostSignChanges(0), stealWindowCount(0), windowCells(cells.size() / (targetSplitBlockOffsets.size() - 1), 0),
+          isClaiming(sizeClassCount == 1 && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()), isStealing(isStealingEnabled()), par(par), seqDbr(seqDbr), cells(cells), cellQueue(cellQueue),
           targetSplitCount(targetSplitBlockOffsets.size() - 1), paddedDbSize(paddedDbSize), sizeClassCount(sizeClassCount),
           maxPrefilterBufferSize(std::max((size_t) 1, memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)),
           maxRecordTargetCount(std::min((size_t) UINT_MAX, std::max((size_t) 1, maxRecordSize / std::max(seqDbr.getMaxSeqLen() + 2, Util::getPageSize())))),
@@ -1885,7 +1975,10 @@ struct TargetSplitReader {
     std::vector<size_t> doneRepKeys;
     size_t stolenCostSignChanges;
     size_t stealWindowCount;
+    // the cells this node took per window
+    std::vector<size_t> windowCells;
     const bool isClaiming;
+    const bool isStealing;
 
 private:
     Parameters &par;
@@ -1976,6 +2069,7 @@ private:
             if (windowCost == 0) {
                 continue;
             }
+            windowCells[firstCell / targetSplitCount] += windowCost;
             const PrefPartition &cell = cells[firstCell + targetSplits[0]];
             // read each index once
             std::vector<uint64_t> *offsets = prefOffsets.data() + cell.node * targetSplitCount;
@@ -2040,7 +2134,7 @@ private:
         std::vector<unsigned char> isNodeTaken(MMseqsNode::count, 0);
         isNodeTaken[MMseqsNode::rank] = nodeCosts[MMseqsNode::rank] > 0 && cellQueue.takeItem(window * alignNodeCount + MMseqsNode::rank - firstAlignNode);
         homeCellCount += isNodeTaken[MMseqsNode::rank] ? nodeCells[MMseqsNode::rank] : 0;
-        lostCellCount += isNodeTaken[MMseqsNode::rank] ? 0 : nodeCells[MMseqsNode::rank];
+        __atomic_fetch_add(&lostCellCount, isNodeTaken[MMseqsNode::rank] ? 0 : nodeCells[MMseqsNode::rank], __ATOMIC_RELAXED);
         double windowTakenCost = isNodeTaken[MMseqsNode::rank] ? nodeCosts[MMseqsNode::rank] : 0;
 
         // a node is behind by the windows since this node had its done rep key
@@ -2072,7 +2166,7 @@ private:
         double idleCells = cellsPerSecond * std::max(0.0, waitSeconds - usedWaitSeconds);
         usedWaitSeconds = waitSeconds;
         double windowStolenCost = 0;
-        for (size_t i = 1; i < alignNodeCount; i++) {
+        for (size_t i = 1; isStealing && i < alignNodeCount; i++) {
             size_t node = firstAlignNode + (MMseqsNode::rank - firstAlignNode + i) % alignNodeCount;
             if (isBehind[node] == 0) {
                 continue;
@@ -2088,7 +2182,7 @@ private:
                 stealCarries[node] -= cost;
                 windowTakenCost += cost;
                 windowStolenCost += cost;
-                stolenCellCount += nodeCells[node];
+                __atomic_fetch_add(&stolenCellCount, nodeCells[node], __ATOMIC_RELAXED);
             }
         }
 
@@ -2379,7 +2473,7 @@ struct ScalarMembers {
 };
 
 static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTargetsReader &repTargetsReader, TargetSplitReader *targetSplitReader,
-                            size_t memoryLimit, size_t masterMemoryLimit, size_t servedFileEntrySize, size_t representativeResidues,
+                            const std::vector<PrefPartition> &partitions, size_t memoryLimit, size_t masterMemoryLimit, size_t servedFileEntrySize, size_t representativeResidues,
                             size_t paddedDbSize, size_t sizeClassCount, const ClusterMemberLookup *memberLookup, ClusterMemberExchange *memberExchange,
                             size_t memberKeyBudget, DBReader<DBKeyType> *memberDbr, bool hasLocalServedBlocks, std::string &phaseValues) {
     Timer startTimer;
@@ -2408,10 +2502,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t publishCount = 0;
     double publishCostSeconds = 0;
     std::atomic<double> publishPeriod(MIN_PUBLISH_SECONDS);
+    std::atomic<size_t> publishedDoneRepKey(0);
     const auto publishAccepted = [&](size_t repKey, size_t bytes) {
         Timer publishTimer;
         publishCount++;
         MMseqsNode::publishLog(acceptedHandle, acceptedFile, repKey, bytes);
+        publishedDoneRepKey.store(repKey);
         publishCostSeconds += publishTimer.getTimediff();
         publishPeriod.store(std::min<double>(PUBLISH_SECONDS, std::max(MIN_PUBLISH_SECONDS, LOG_COST_FACTOR * publishCostSeconds / publishCount)));
     };
@@ -2489,10 +2585,27 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             step += codeWords;
             assignedKeysSize += (headerWords + codeWords) * sizeof(uint64_t);
             assignedKeyCount += keyCount;
-            clusteredOrderKey = stepClusteredKey;
+            // the service thread reads it for the gate slack
+            __atomic_store_n(&clusteredOrderKey, stepClusteredKey, __ATOMIC_RELAXED);
             clusteredAcceptedSize = stepClusteredSize;
         }
     };
+
+    // the windows in key order for the counters
+    std::vector<size_t> windowFirstKeys(1, 0);
+    for (size_t i = 0; i < partitions.size(); i++) {
+        windowFirstKeys.push_back(partitions[i].windowFirstKey);
+    }
+    std::sort(windowFirstKeys.begin(), windowFirstKeys.end());
+    windowFirstKeys.erase(std::unique(windowFirstKeys.begin(), windowFirstKeys.end()), windowFirstKeys.end());
+    std::vector<WindowCounters> windowCounters(windowFirstKeys.size());
+    FetchSizeCounters fetchSizeCounters[64];
+    // MMSEQS_ALIGNED_PAIR_LOG=<dir>: the (rep key, target key) pairs the node aligns, for offline counts
+    const char *alignedPairDir = getenv("MMSEQS_ALIGNED_PAIR_LOG");
+    const std::string alignedPairFile = (alignedPairDir != NULL) ? std::string(alignedPairDir) + "/" + FileUtil::baseName(par.db3) + "." + SSTR(rank) : "";
+    const bool isLoggingAlignedPairs = alignedPairDir != NULL && isAligningNode;
+    FILE *alignedPairLog = isLoggingAlignedPairs ? FileUtil::openFileOrDie(alignedPairFile.c_str(), "w", false) : NULL;
+    std::mutex alignedPairLogMutex;
 
     // the loader fills buffer n once the fetches use buffer n - 1
     std::vector<RepTargetsRecord> prefilterRecords[3];
@@ -2613,8 +2726,21 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         Debug(Debug::WARNING) << "Node " << rank << " holds " << servedSequenceSize << " sequence bytes but its block cache has " << blockCacheSize
                               << " bytes, the other sequences are read one by one. Use more nodes or increase --split-memory-limit\n";
     }
-    // the first fetch is small, then they double
+    // the first fetch is small, then they double; MMSEQS_ALIGN_FETCH_BYTES=<n> fixes the limit for measurements
     size_t fetchBytesLimit = std::min<size_t>(maxFetchSize / 64, 64 * 1024 * 1024);
+    const char *fixedFetchBytes = getenv("MMSEQS_ALIGN_FETCH_BYTES");
+    char *fetchBytesEnd = NULL;
+    const size_t fetchBytes = (fixedFetchBytes != NULL) ? strtoull(fixedFetchBytes, &fetchBytesEnd, 10) : 0;
+    const bool isFetchBytesFixed = fixedFetchBytes != NULL && fetchBytesEnd != fixedFetchBytes && *fetchBytesEnd == '\0';
+    if (fixedFetchBytes != NULL && isFetchBytesFixed == false) {
+        Debug(Debug::WARNING) << "Ignoring MMSEQS_ALIGN_FETCH_BYTES=" << fixedFetchBytes << ", it must be a number of bytes\n";
+    }
+    if (isFetchBytesFixed) {
+        fetchBytesLimit = std::min(fetchBytes, maxFetchSize);
+        if (isAligningNode) {
+            MMseqsNode::addPhaseValue(phaseValues, "Fetch bytes limit", SSTR(fetchBytesLimit) + " fixed by MMSEQS_ALIGN_FETCH_BYTES, the largest fetch is " + SSTR(maxFetchSize) + " bytes");
+        }
+    }
     const auto getFetchedEntry = [&](const FetchedSequences &sequences, size_t key, size_t *seqLen = NULL, FetchedKeyCursor *cursor = NULL) -> const char * {
         const char *data = findFetchedKey(sequences, nodes, key, seqLen, (cursor != NULL) ? &cursor->positions[nodes] : NULL);
         if (data != NULL) {
@@ -2628,6 +2754,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         // assigned keys are served as zeros
         return (data != NULL && data[0] != '\0') ? data : NULL;
     };
+    // the entry bytes requested from other nodes by their use
+    const bool isCountingRequests = isAligningNode && alignNodeCount > 1 && isReadingDirectly == false;
+    std::vector<std::vector<DBKeyType> > threadRepKeys(par.threads);
+    std::vector<unsigned char> keyUses;
+    size_t requestedRepSize = 0;
+    size_t requestedPendingSize = 0;
+    size_t requestedTargetSize = 0;
     // take records while they fit, at least one
     const auto selectRecordKeys = [&](FetchedSequences &sequences, const FetchedSequences &previous) {
         // an empty prefilter buffer is the last one
@@ -2642,6 +2775,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             prefilterRecordPos[prefilterBuffer] = 0;
         }
         sequences.prefilterBuffer = prefilterBuffer;
+        sequences.prefilterBufferNumber = usedPrefilterBufferCount - 1;
         sequences.begin = prefilterRecordPos[prefilterBuffer];
         sequences.end = sequences.begin;
         // pending pairs first, at least one
@@ -2667,10 +2801,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             acceptablePairCount += record.targetCount;
             sequences.targetCount += record.targetCount;
         }
+        sequences.plannedSize = fetchSize - ((sequences.end < prefilterRecords[prefilterBuffer].size()) ? prefilterRecords[prefilterBuffer][sequences.end].readSize : 0);
         prefilterRecordPos[prefilterBuffer] = sequences.end;
         // previous may still add pending pairs
         sequences.isLast = sequences.end == sequences.begin && sequences.pendingPairCount == 0 && (memberDbr == NULL || previous.end == previous.begin) && acceptedPairs.empty();
-        fetchBytesLimit = std::min(2 * fetchBytesLimit, maxFetchSize);
+        fetchBytesLimit = isFetchBytesFixed ? fetchBytesLimit : std::min(2 * fetchBytesLimit, maxFetchSize);
+        size_t unassignedRecordSize = 0;
 #pragma omp parallel
         {
             unsigned int thread_idx = 0;
@@ -2678,7 +2814,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
             threadKeys[thread_idx].clear();
-#pragma omp for schedule(dynamic, 100)
+            threadRepKeys[thread_idx].clear();
+#pragma omp for schedule(dynamic, 100) reduction(+:unassignedRecordSize)
             for (size_t i = sequences.begin; i < sequences.end; i++) {
                 const RepTargetsRecord &record = prefilterRecords[sequences.prefilterBuffer][i];
                 const size_t repKey = record.repOrderKeyFirstTarget.repKey % paddedDbSize;
@@ -2686,6 +2823,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 if (isAssigned(record.repOrderKeyFirstTarget.repKey) || (previousRep != NULL && previousRep[0] == '\0')) {
                     continue;
                 }
+                unassignedRecordSize += record.readSize;
                 const size_t targetsBegin = threadKeys[thread_idx].size();
                 const DBKeyType *targets = prefilterTargets[sequences.prefilterBuffer].data() + record.targetOffset;
                 for (unsigned int j = 0; j < record.targetCount; j++) {
@@ -2696,6 +2834,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 // a rep without targets left is not fetched
                 if (threadKeys[thread_idx].size() > targetsBegin) {
                     threadKeys[thread_idx].push_back(repKey);
+                    if (isCountingRequests) {
+                        threadRepKeys[thread_idx].push_back(repKey);
+                    }
                 }
             }
             // members share the keys and data files of the sequence database
@@ -2713,10 +2854,37 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
         SORT_PARALLEL(uniqueKeys.begin(), uniqueKeys.end());
         uniqueKeys.erase(std::unique(uniqueKeys.begin(), uniqueKeys.end()), uniqueKeys.end());
+        sequences.unassignedRecordSize = unassignedRecordSize;
+        // a requested key counts for a rep first, then for a member or pending pair, else for a target
+        if (isCountingRequests) {
+            keyUses.assign(uniqueKeys.size(), 0);
+#pragma omp parallel
+            {
+                unsigned int thread_idx = 0;
+#ifdef OPENMP
+                thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+                for (size_t i = 0; i < threadRepKeys[thread_idx].size(); i++) {
+                    __atomic_fetch_or(&keyUses[std::lower_bound(uniqueKeys.begin(), uniqueKeys.end(), threadRepKeys[thread_idx][i]) - uniqueKeys.begin()], 1, __ATOMIC_RELAXED);
+                }
+#pragma omp for schedule(dynamic, 100)
+                for (size_t i = previous.pendingPairCount; i < previous.pendingPairCount + sequences.pendingPairCount; i++) {
+                    if (isAssigned(pendingPairs[i].repKey) == false && isAssigned(pendingPairs[i].memberKey) == false) {
+                        __atomic_fetch_or(&keyUses[std::lower_bound(uniqueKeys.begin(), uniqueKeys.end(), pendingPairs[i].repKey % paddedDbSize) - uniqueKeys.begin()], 2, __ATOMIC_RELAXED);
+                        for (size_t member = pendingMemberOffsets[i]; member < pendingMemberOffsets[i + 1]; member++) {
+                            __atomic_fetch_or(&keyUses[std::lower_bound(uniqueKeys.begin(), uniqueKeys.end(), pendingMembers[member]) - uniqueKeys.begin()], 2, __ATOMIC_RELAXED);
+                        }
+                    }
+                }
+            }
+        }
         keyFetchSources.resize(uniqueKeys.size());
         sequences.keys.resize(uniqueKeys.size());
         // sort the keys by fetch source; assigned keys go last and are dropped
         threadFetchSourceKeyOffsets.assign((nodes + 2) * par.threads + 1, 0);
+        size_t repRequestSize = 0;
+        size_t pendingRequestSize = 0;
+        size_t targetRequestSize = 0;
 #pragma omp parallel
         {
             unsigned int thread_idx = 0;
@@ -2725,10 +2893,17 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #endif
             std::vector<size_t> fetchSourceOffsets(nodes + 2, 0);
             FetchedKeyCursor keyCursor(nodes + 1);
-#pragma omp for schedule(static)
+            size_t requestRange = SIZE_MAX;
+#pragma omp for schedule(static) reduction(+:repRequestSize, pendingRequestSize, targetRequestSize)
             for (size_t i = 0; i < uniqueKeys.size(); i++) {
                 keyFetchSources[i] = isAssigned(uniqueKeys[i]) ? nodes + 1 : ((getFetchedEntry(previous, uniqueKeys[i], NULL, &keyCursor) != NULL) ? nodes : (isReadingDirectly ? rank : getKeyAlignNode(seqDbr, uniqueKeys[i], &keyCursor.block)));
                 fetchSourceOffsets[keyFetchSources[i]]++;
+                if (isCountingRequests && keyFetchSources[i] < nodes && keyFetchSources[i] != rank) {
+                    const size_t entrySize = getSeqLenFromCursor(seqDbr, requestRange, uniqueKeys[i]) + 2;
+                    repRequestSize += (keyUses[i] & 1) ? entrySize : 0;
+                    pendingRequestSize += (keyUses[i] == 2) ? entrySize : 0;
+                    targetRequestSize += (keyUses[i] == 0) ? entrySize : 0;
+                }
             }
             for (unsigned int node = 0; node <= nodes + 1; node++) {
                 threadFetchSourceKeyOffsets[node * par.threads + thread_idx + 1] = fetchSourceOffsets[node];
@@ -2746,6 +2921,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 sequences.keys[fetchSourceOffsets[keyFetchSources[i]]++] = uniqueKeys[i];
             }
         }
+        requestedRepSize += repRequestSize;
+        requestedPendingSize += pendingRequestSize;
+        requestedTargetSize += targetRequestSize;
         sequences.fetchSourceKeyOffsets.resize(nodes + 2);
         for (unsigned int node = 0; node <= nodes + 1; node++) {
             sequences.fetchSourceKeyOffsets[node] = threadFetchSourceKeyOffsets[node * par.threads];
@@ -2924,6 +3102,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     double packSeconds = 0;
     double servedFileWriteSeconds = 0;
     double unpackSeconds = 0;
+    std::vector<size_t> requesterServedSizes(nodes, 0);
+    // the own front rep key ahead of the clustered order key, over the seconds of the service passes
+    double gateSlackSeconds = 0;
+    double gateSlackKeySeconds = 0;
+    double gateSlackWindowSeconds = 0;
+    size_t maxGateSlackKeys = 0;
+    size_t maxGateSlackWindows = 0;
+    size_t threadSampleCount = 0;
+    size_t maxProcessThreads = 0;
+    size_t maxThreadsBesidesRingWorkers = 0;
     // copy, or pack with rawKeys, the entries of keys; assigned keys get zeros
     const auto copyEntries = [&](const DBKeyType *keys, size_t keyCount, const size_t *offsets, char *data, std::vector<DBKeyType> *rawKeys) {
         size_t loadRange = SIZE_MAX;
@@ -3077,8 +3265,69 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             };
             MMseqsNode::WaitWarning waitWarning;
             time_t assignedKeysReadTime = 0;
+            // the sleeps by their one reason: an owed request, the master gate, no fetch of the aligning threads, else
+            const char *idleReasons[] = { "owed", "gate", "no request", "other" };
+            double idleSeconds[4] = { 0, 0, 0, 0 };
+            size_t idleCounts[4] = { 0, 0, 0, 0 };
+            size_t completedFetchCount = 0;
+            double statusPackSeconds = 0;
+            double nextStatusTime = STATUS_SECONDS;
+            // the gate key of the newest fetch
+            size_t frontRepKey = orderKeyEnd;
+            size_t gateSlackKeys = 0;
+            size_t gateSlackWindows = 0;
+            double gateSlackTime = 0;
+            const auto printStatus = [&]() {
+                const double now = serviceTimer.getTimediff();
+                std::string value = "done rep key " + SSTR(publishedDoneRepKey.load()) + ", " + SSTR(completedFetchCount) + " fetches, " + SSTR(requestCount) + " requests";
+                {
+                    std::lock_guard<std::mutex> lock(serviceMutex);
+                    value += "; waiting for the sequences " + formatSeconds(sequenceWaitSeconds) + ", the master " + formatSeconds(waitSeconds);
+                }
+                double idleSum = 0;
+                std::string idle;
+                for (size_t i = 0; i < 4; i++) {
+                    idleSum += idleSeconds[i];
+                    idle += std::string((i > 0) ? ", " : "") + idleReasons[i] + " " + formatSeconds(idleSeconds[i]) + " in " + SSTR(idleCounts[i]) + " sleeps";
+                }
+                value += "; service idle " + formatSeconds(idleSum) + " of " + formatSeconds(now) + ": " + idle;
+                // the own key loader packs too, a status does not wait for it
+                {
+                    std::unique_lock<std::mutex> sourceLock(sourceMutex, std::try_to_lock);
+                    statusPackSeconds = sourceLock.owns_lock() ? packSeconds : statusPackSeconds;
+                }
+                value += "; service: serving " + formatSeconds(servingSeconds) + ", packing " + formatSeconds(statusPackSeconds) + ", writing served files " + formatSeconds(servedFileWriteSeconds)
+                         + ", reading served entries " + formatSeconds(readingSeconds) + ", polling " + formatSeconds(pollingSeconds);
+                if (targetSplitReader != NULL) {
+                    value += "; stolen cells " + SSTR(__atomic_load_n(&targetSplitReader->stolenCellCount, __ATOMIC_RELAXED)) + " taken, " + SSTR(__atomic_load_n(&targetSplitReader->lostCellCount, __ATOMIC_RELAXED)) + " lost";
+                }
+                value += "; gate slack " + SSTR(gateSlackKeys) + " keys and " + SSTR(gateSlackWindows) + " windows, at most " + SSTR(maxGateSlackKeys) + " keys and " + SSTR(maxGateSlackWindows) + " windows";
+                size_t processThreads;
+                size_t ringWorkers;
+                countProcessThreads(processThreads, ringWorkers);
+                threadSampleCount++;
+                maxProcessThreads = std::max(maxProcessThreads, processThreads);
+                maxThreadsBesidesRingWorkers = std::max(maxThreadsBesidesRingWorkers, processThreads - ringWorkers);
+                value += "; process threads (incl. io_uring workers) " + SSTR(processThreads) + ", " + SSTR(ringWorkers) + " io_uring workers, --threads " + SSTR(par.threads);
+                std::string status;
+                MMseqsNode::addPhaseValue(status, "Align node status after " + SSTR(static_cast<size_t>(now)) + " s", value);
+                MMseqsNode::printPhaseValues(status);
+            };
             for (unsigned int polls = 0;;) {
                 bool hasWorked = false;
+                // the slack since the last pass
+                const double slackTime = serviceTimer.getTimediff();
+                if (frontRepKey < orderKeyEnd) {
+                    const size_t clusteredKey = std::min<size_t>(frontRepKey, __atomic_load_n(&clusteredOrderKey, __ATOMIC_RELAXED));
+                    gateSlackKeys = frontRepKey - clusteredKey;
+                    gateSlackWindows = getWindowPosition(windowFirstKeys, paddedDbSize, frontRepKey) - getWindowPosition(windowFirstKeys, paddedDbSize, clusteredKey);
+                    maxGateSlackKeys = std::max(maxGateSlackKeys, gateSlackKeys);
+                    maxGateSlackWindows = std::max(maxGateSlackWindows, gateSlackWindows);
+                    gateSlackSeconds += slackTime - gateSlackTime;
+                    gateSlackKeySeconds += (slackTime - gateSlackTime) * gateSlackKeys;
+                    gateSlackWindowSeconds += (slackTime - gateSlackTime) * gateSlackWindows;
+                }
+                gateSlackTime = slackTime;
                 // keep the bits of the served keys current
                 time_t passTime = time(NULL);
                 if (passTime - assignedKeysReadTime >= READ_SECONDS) {
@@ -3110,6 +3359,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     {
                         std::lock_guard<std::mutex> assignedKeysLock(assignedKeysMutex);
                         size_t repKey = std::min(nextRequest->firstPendingRepKey, getFirstRepKey(*nextRequest));
+                        frontRepKey = repKey;
                         if (canWait && repKey > clusteredOrderKey && nextAcceptedSize >= clusteredAcceptedSize + maxUnclusteredAcceptedSize && serviceTimer.getTimediff() >= nextGateRead) {
                             nextGateRead = serviceTimer.getTimediff() + BATCH_READ_SECONDS / 2;
                             readAssignedKeys(true);
@@ -3370,6 +3620,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                     serviceCondition.notify_all();
                     requestedSequences = NULL;
+                    completedFetchCount++;
                     hasWorked = true;
                 }
                 // the progress of a node is read at once when the names hold a request it did not show yet
@@ -3576,6 +3827,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         ServedPiece piece = { requester.servedCount, requester.piece, servedFileCount, 0, pieceOffset, pieceSize, keyCount };
                         passPieces.push_back(std::make_pair(node, piece));
                         servedSize += pieceSize;
+                        requesterServedSizes[node] += pieceSize;
                         servedPieceCount++;
                         requester.piece++;
                         if (requester.codePos == codeEnd - codeBegin) {
@@ -3623,6 +3875,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     isServedProgressChanged = false;
                 }
                 if (isLastRequested && ownRequests.empty() && requestedSequences == NULL && isServing == false) {
+                    printStatus();
                     break;
                 }
                 // sleep longer while no node waits
@@ -3631,8 +3884,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 } else {
                     unsigned int maxShift = (requestedSequences != NULL || nextRequest != NULL) ? 4 : 7;
                     maxShift = (alignNodeCount > 1) ? 1 : maxShift;
+                    const size_t reason = (requestedSequences == NULL) ? ((nextRequest != NULL) ? 1 : 2) : ((ownRequests.empty() == false) ? 0 : 3);
+                    Timer idleTimer;
                     std::unique_lock<std::mutex> lock(serviceMutex);
                     serviceCondition.wait_for(lock, std::chrono::microseconds(10000u << std::min(polls++, maxShift)), [&]() { return hasServiceWork; });
+                    idleSeconds[reason] += idleTimer.getTimediff();
+                    idleCounts[reason]++;
+                }
+                if (serviceTimer.getTimediff() >= nextStatusTime) {
+                    nextStatusTime = serviceTimer.getTimediff() + STATUS_SECONDS;
+                    printStatus();
                 }
                 // aligning without a request is no wait
                 if (hasWorked || (requestedSequences == NULL && nextRequest == NULL && isLastRequested == false)) {
@@ -3671,8 +3932,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         waitForSequences(currentSequences, getFirstRepKey(currentSequences));
     }
     const double firstFetchSeconds = startTimer.getTimediff();
+    // the fetch work and waits before a fetch aligns
+    double fetchOtherSeconds = firstFetchSeconds;
+    size_t alignedFetchCount = 0;
+    std::vector<std::pair<size_t, double> > fetchWindowCells;
+    std::atomic<size_t> staleRepSize(0);
     while (currentSequences.isLast == false) {
+        Timer otherTimer;
         selectRecordKeys(nextSequences, currentSequences);
+        double nextOtherSeconds = otherTimer.getTimediff();
         {
             std::lock_guard<std::mutex> lock(serviceMutex);
             completedSequences = NULL;
@@ -3747,6 +4015,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         batchDone.assign(batchCount, 0);
         batchPairs.assign(batchCount, std::vector<ClusterPair>());
         size_t firstUnfinishedBatch = 0;
+        const size_t fetchFirstAlignedPairs = alignedTargetPairCount.load();
 #pragma omp parallel
         {
             unsigned int thread_idx = 0;
@@ -3755,6 +4024,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #endif
             FetchedKeyCursor targetCursor(nodes + 1);
             std::vector<ClusterPair> pairs;
+            std::vector<uint64_t> alignedPairWords;
+            size_t windowCursor = SIZE_MAX;
 #pragma omp for schedule(dynamic, 1)
             for (size_t batch = 0; batch < batchCount; batch++) {
                 {
@@ -3775,6 +4046,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 size_t repSlotSkippedCount = 0;
                 size_t targetSkippedCount = 0;
                 size_t uncoverableCount = 0;
+                size_t repSkippedRecordCount = 0;
+                size_t staleSize = 0;
                 for (size_t i = batchOffsets[batch]; i < batchOffsets[batch + 1] + (batchFirstTargets[batch + 1] > 0); i++) {
                     const RepTargetsRecord &record = records[i];
                     unsigned int firstTarget = (i == batchOffsets[batch]) ? batchFirstTargets[batch] : 0;
@@ -3783,6 +4056,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     const size_t repKey = record.repOrderKeyFirstTarget.repKey % paddedDbSize;
                     if (isAssigned(record.repOrderKeyFirstTarget.repKey)) {
                         repSkippedCount += endTarget - firstTarget;
+                        repSkippedRecordCount++;
+                        // a rep another node served for this fetch, at its first record
+                        if (isCountingRequests && firstTarget == 0 && (i == currentSequences.begin || records[i - 1].repOrderKeyFirstTarget.repKey != record.repOrderKeyFirstTarget.repKey)
+                            && findFetchedKey(currentSequences, nodes, repKey) == NULL) {
+                            const size_t repSource = getKeyAlignNode(seqDbr, repKey);
+                            size_t repLength = 0;
+                            const char *repData = (repSource != rank) ? findFetchedKey(currentSequences, repSource, repKey, &repLength) : NULL;
+                            staleSize += (repData != NULL && repData[0] != '\0') ? repLength + 2 : 0;
+                        }
                         continue;
                     }
                     size_t repLength = 0;
@@ -3790,6 +4072,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     if (repData == NULL) {
                         repSkippedCount += endTarget - firstTarget;
                         repSlotSkippedCount += endTarget - firstTarget;
+                        repSkippedRecordCount++;
                         continue;
                     }
                     bool isRepMapped = false;
@@ -3824,6 +4107,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                             isRepMapped = true;
                         }
                         aligners->target.mapSequence(targetKey, targetKey, targetData, targetLength);
+                        if (isLoggingAlignedPairs) {
+                            alignedPairWords.push_back(repKey);
+                            alignedPairWords.push_back(targetKey);
+                        }
                         unsigned short diagonal = 0;
                         if (alignTarget(par, aligners->blockAligner, blockAlignerInitialized, aligners->query, aligners->target, scoring.scorePerColThreshold, diagonal, NULL, 0, NULL,
                                         isSwipeEnabled ? &aligners->swipeTargets : NULL)) {
@@ -3833,12 +4120,31 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                     repSkippedCount += endTarget - j;
                 }
+                staleRepSize += staleSize;
+                if (alignedPairWords.empty() == false) {
+                    std::lock_guard<std::mutex> lock(alignedPairLogMutex);
+                    if (alignedPairLog != NULL && fwrite(alignedPairWords.data(), sizeof(uint64_t), alignedPairWords.size(), alignedPairLog) != alignedPairWords.size()) {
+                        Debug(Debug::WARNING) << "Cannot write " << alignedPairFile << ", the aligned pairs are not logged any more\n";
+                        fclose(alignedPairLog);
+                        alignedPairLog = NULL;
+                    }
+                    alignedPairWords.clear();
+                }
                 examinedTargetPairCount += examinedCount;
                 repSkippedTargetPairCount += repSkippedCount;
                 repSlotSkippedTargetPairCount += repSlotSkippedCount;
                 targetSkippedTargetPairCount += targetSkippedCount;
                 uncoverableTargetPairCount += uncoverableCount;
-                alignedTargetPairCount += examinedCount - repSkippedCount - targetSkippedCount - uncoverableCount;
+                const size_t alignedCount = examinedCount - repSkippedCount - targetSkippedCount - uncoverableCount;
+                alignedTargetPairCount += alignedCount;
+                // a batch counts for the window of its first rep
+                if (batchOffsets[batch] < currentSequences.end) {
+                    WindowCounters &counters = windowCounters[findWindow(windowFirstKeys, records[batchOffsets[batch]].repOrderKeyFirstTarget.repKey % paddedDbSize, windowCursor)];
+                    __atomic_fetch_add(&counters.examinedPairs, examinedCount, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&counters.alignedPairs, alignedCount, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&counters.targetSkippedPairs, targetSkippedCount, __ATOMIC_RELAXED);
+                    __atomic_fetch_add(&counters.repSkippedRecords, repSkippedRecordCount, __ATOMIC_RELAXED);
+                }
                 if (aligners != NULL) {
                     alignTargetsSwipe(par, aligners->swipeTargets, isAssigned, pairs);
                     aligners->swipeTargets.clearTargets();
@@ -4261,12 +4567,51 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 readAssignedKeys(true);
             }
         }
+        const double fetchAlignSeconds = alignTimer.getTimediff();
         alignedCells += static_cast<double>(fetchAlignmentCells);
-        alignSeconds += alignTimer.getTimediff();
+        alignSeconds += fetchAlignSeconds;
         alignedCellsPerSecond.store(alignedCells / std::max(alignSeconds, 1e-3));
         masterWaitSeconds.store(waitSeconds);
+
+        // the seconds of a fetch go to its windows by their cells, a fetch without records to the window of its first rep
+        fetchWindowCells.clear();
+        size_t window = SIZE_MAX;
+        for (size_t i = 0; i < recordCount; i++) {
+            findWindow(windowFirstKeys, records[currentSequences.begin + i].repOrderKeyFirstTarget.repKey % paddedDbSize, window);
+            if (fetchWindowCells.empty() || fetchWindowCells.back().first != window) {
+                fetchWindowCells.emplace_back(window, 0);
+            }
+            fetchWindowCells.back().second += recordAlignmentCells[i];
+        }
+        if (fetchAlignmentCells == 0) {
+            const size_t frontKey = std::min(currentSequences.firstPendingRepKey, getFirstRepKey(currentSequences));
+            fetchWindowCells.assign(1, std::make_pair((frontKey < orderKeyEnd) ? findWindow(windowFirstKeys, frontKey % paddedDbSize, window) : windowFirstKeys.size() - 1, 1.0));
+        }
+        double fetchCells = 0;
+        for (size_t j = 0; j < fetchWindowCells.size(); j++) {
+            fetchCells += fetchWindowCells[j].second;
+        }
+        for (size_t j = 0; j < fetchWindowCells.size(); j++) {
+            WindowCounters &counters = windowCounters[fetchWindowCells[j].first];
+            counters.alignSeconds += fetchAlignSeconds * fetchWindowCells[j].second / fetchCells;
+            counters.otherSeconds += fetchOtherSeconds * fetchWindowCells[j].second / fetchCells;
+            counters.fetchCount += counters.lastFetch != alignedFetchCount;
+            counters.lastFetch = alignedFetchCount;
+            counters.prefilterBufferCount += recordCount > 0 && counters.lastPrefilterBuffer != currentSequences.prefilterBufferNumber;
+            counters.lastPrefilterBuffer = (recordCount > 0) ? currentSequences.prefilterBufferNumber : counters.lastPrefilterBuffer;
+        }
+        alignedFetchCount++;
+        FetchSizeCounters &fetchSize = fetchSizeCounters[(currentSequences.plannedSize > 0) ? 63 - __builtin_clzll(currentSequences.plannedSize) : 0];
+        fetchSize.fetchCount++;
+        fetchSize.plannedSize += currentSequences.plannedSize;
+        fetchSize.unassignedRecordSize += currentSequences.unassignedRecordSize;
+        fetchSize.alignedPairs += alignedTargetPairCount.load() - fetchFirstAlignedPairs;
+        fetchSize.alignSeconds += fetchAlignSeconds;
+
         // the reps of pending pairs are not done
+        otherTimer.reset();
         waitForSequences(nextSequences, getFirstUndoneRepKey(nextRepKey));
+        fetchOtherSeconds = nextOtherSeconds + otherTimer.getTimediff();
         std::swap(currentSequences, nextSequences);
     }
     for (int thread = 0; thread < par.threads; thread++) {
@@ -4281,6 +4626,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     if (fclose(acceptedHandle) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << acceptedFile << "\n";
         EXIT(EXIT_FAILURE);
+    }
+    if (alignedPairLog != NULL && fclose(alignedPairLog) != 0) {
+        Debug(Debug::WARNING) << "Cannot close " << alignedPairFile << ", the aligned pair log may be incomplete\n";
     }
     // serve until every aligning node is done
     if (isAligningNode) {
@@ -4321,6 +4669,71 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         MMseqsNode::addPhaseValue(phaseValues, "Fetches with fewer SWIPE batches", SSTR(fewerBatchFetchCount) + " of " + SSTR(fetchCount));
         MMseqsNode::addPhaseValue(phaseValues, "Assigned keys read", SSTR(assignedKeyCount) + " in " + SSTR(assignedKeysSize) + " bytes");
         MMseqsNode::addPhaseSeconds(phaseValues, "the first fetch", firstFetchSeconds);
+        MMseqsNode::addPhaseValue(phaseValues, "Gate slack", "at most " + SSTR(maxGateSlackKeys) + " keys and " + SSTR(maxGateSlackWindows) + " windows, mean "
+                                  + SSTR(static_cast<size_t>(gateSlackKeySeconds / std::max(gateSlackSeconds, 1e-9))) + " keys and " + SSTR(static_cast<size_t>(gateSlackWindowSeconds / std::max(gateSlackSeconds, 1e-9))) + " windows over " + formatSeconds(gateSlackSeconds));
+        MMseqsNode::addPhaseValue(phaseValues, "Process threads", "at most " + SSTR(maxProcessThreads) + " incl. io_uring workers, " + SSTR(maxThreadsBesidesRingWorkers)
+                                  + " besides them (BatchReader read threads included) in " + SSTR(threadSampleCount) + " status samples, --threads " + SSTR(par.threads));
+        size_t requesterCount = 0;
+        size_t servedSizeSum = 0;
+        size_t maxRequesterServedSize = 0;
+        for (size_t node = alignGroupNodeBegin; node < alignGroupNodeEnd; node++) {
+            requesterCount += node != rank;
+            servedSizeSum += (node != rank) ? requesterServedSizes[node] : 0;
+            maxRequesterServedSize = std::max(maxRequesterServedSize, (node != rank) ? requesterServedSizes[node] : 0);
+        }
+        MMseqsNode::addPhaseValue(phaseValues, "Served bytes per requesting node", "at most " + SSTR(maxRequesterServedSize) + ", mean " + SSTR(servedSizeSum / std::max<size_t>(1, requesterCount))
+                                  + " over " + SSTR(requesterCount) + " nodes");
+        MMseqsNode::addPhaseValue(phaseValues, "Requested entry bytes by use", SSTR(requestedRepSize) + " for reps, " + SSTR(requestedTargetSize) + " for targets of stolen cells, "
+                                  + SSTR(requestedPendingSize) + " for members and pending pairs");
+        MMseqsNode::addPhaseValue(phaseValues, "Received rep bytes assigned before they aligned", SSTR(staleRepSize.load()));
+        for (size_t bucket = 0; bucket < 64; bucket++) {
+            const FetchSizeCounters &fetchSize = fetchSizeCounters[bucket];
+            if (fetchSize.fetchCount > 0) {
+                MMseqsNode::addPhaseValue(phaseValues, "Fetches from " + SSTR(1ULL << bucket) + " planned bytes", SSTR(fetchSize.fetchCount) + " fetches, " + SSTR(fetchSize.plannedSize) + " planned bytes, "
+                                          + SSTR(fetchSize.unassignedRecordSize) + " bytes of unassigned records, " + SSTR(fetchSize.alignedPairs) + " aligned pairs, " + formatSeconds(fetchSize.alignSeconds) + " aligning");
+            }
+        }
+        // the cells the node took from .partitions
+        if (targetSplitReader != NULL) {
+            const size_t targetSplitCount = targetSplitBlockOffsets.size() - 1;
+            for (size_t i = 0, window = SIZE_MAX; i < targetSplitReader->windowCells.size(); i++) {
+                windowCounters[findWindow(windowFirstKeys, partitions[i * targetSplitCount].windowFirstKey, window)].alignmentCells += targetSplitReader->windowCells[i];
+            }
+        } else {
+            for (size_t i = 0, window = SIZE_MAX; i < partitions.size(); i++) {
+                windowCounters[findWindow(windowFirstKeys, partitions[i].windowFirstKey, window)].alignmentCells += partitions[i].alignmentCells;
+            }
+        }
+        // deciles of the windows of this node in key order
+        std::vector<size_t> nodeWindows;
+        for (size_t window = 0; window < windowCounters.size(); window++) {
+            if (windowCounters[window].alignmentCells > 0 || windowCounters[window].examinedPairs > 0 || windowCounters[window].fetchCount > 0) {
+                nodeWindows.push_back(window);
+            }
+        }
+        for (size_t decile = 0; decile < 10; decile++) {
+            const size_t first = decile * nodeWindows.size() / 10;
+            const size_t end = (decile + 1) * nodeWindows.size() / 10;
+            WindowCounters sum;
+            for (size_t i = first; i < end; i++) {
+                const WindowCounters &counters = windowCounters[nodeWindows[i]];
+                sum.examinedPairs += counters.examinedPairs;
+                sum.alignedPairs += counters.alignedPairs;
+                sum.targetSkippedPairs += counters.targetSkippedPairs;
+                sum.repSkippedRecords += counters.repSkippedRecords;
+                sum.alignmentCells += counters.alignmentCells;
+                sum.fetchCount += counters.fetchCount;
+                sum.prefilterBufferCount += counters.prefilterBufferCount;
+                sum.alignSeconds += counters.alignSeconds;
+                sum.otherSeconds += counters.otherSeconds;
+            }
+            if (end > first) {
+                MMseqsNode::addPhaseValue(phaseValues, "Window decile " + SSTR(decile + 1), SSTR(end - first) + " windows, " + SSTR(sum.alignmentCells) + " estimated cells, "
+                                          + SSTR(sum.examinedPairs) + " examined pairs, " + SSTR(sum.alignedPairs) + " aligned, " + SSTR(sum.targetSkippedPairs) + " skipped by target, "
+                                          + SSTR(sum.repSkippedRecords) + " records skipped by rep, " + formatSeconds(sum.alignSeconds) + " aligning, " + formatSeconds(sum.otherSeconds)
+                                          + " not aligning, " + SSTR(sum.fetchCount) + " fetches, " + SSTR(sum.prefilterBufferCount) + " prefilter buffers");
+            }
+        }
     }
     if (memberLookup != NULL) {
         MMseqsNode::addPhaseValue(phaseValues, "Cluster member pairs", SSTR(multiFetchPairCount) + " over several fetches, " + SSTR(slicedPairCount) + " in slices");
@@ -5428,7 +5841,7 @@ int align2clustLinfinity(Parameters &par) {
     }
     // a member key, a pending part and an accepted pair take 41 words and 5 flags of the 2 * memberSplitSize in getReservedMemory
     const size_t memberKeyBudget = std::max<size_t>(1, 2 * std::min(memoryLimit, smallestMemoryLimit) / MEMBER_SPLIT_MEMORY_DIVISOR / ((7 + 9 + 25) * sizeof(uint64_t) + 5));
-    alignRepTargets(par, seqDbr, repTargetsReader, targetSplitReader, memoryLimit, masterMemoryLimit, servedFileEntrySize, representativeResidues, paddedDbSize, sizeClassCount,
+    alignRepTargets(par, seqDbr, repTargetsReader, targetSplitReader, partitions, memoryLimit, masterMemoryLimit, servedFileEntrySize, representativeResidues, paddedDbSize, sizeClassCount,
                     memberLookup, memberExchange, memberKeyBudget, memberDbr, hasLocalServedBlocks, phaseValues);
     // serve until every aligning node has its members
     if (memberServer.joinable()) {
@@ -5451,6 +5864,9 @@ int align2clustLinfinity(Parameters &par) {
         targetSplitReader->close();
         if (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) {
             MMseqsNode::addPhaseValue(phaseValues, "Target split prefilter bytes", SSTR(targetSplitReader->readSize) + " read of " + SSTR(targetSplitReader->prefSize));
+        }
+        if (targetSplitReader->isClaiming && targetSplitReader->isStealing == false) {
+            MMseqsNode::addPhaseValue(phaseValues, "Stealing", "off by MMSEQS_ALIGN_STEAL");
         }
         if (targetSplitReader->isClaiming) {
             std::string stealShares;
