@@ -579,15 +579,22 @@ private:
 
 __extension__ typedef unsigned __int128 uint128;
 
+// a .partitions row of one align node: pref bytes [prefOffset, prefOffset + prefSize) of node
 struct PrefPartition {
-    size_t windowFirstKey;
+    size_t firstKey;
     size_t prefOffset;
     size_t prefSize;
     size_t alignmentCells;
     size_t node;
-    size_t targetSplit;
-    // a part of a window has its reps below repKeyEnd
-    size_t repKeyEnd;
+};
+
+// target split mode: the entries [firstEntry, endEntry) of the target split files of node
+struct PrefWindow {
+    size_t firstKey;
+    size_t node;
+    size_t firstEntry;
+    size_t endEntry;
+    uint128 alignmentCells;
 };
 
 struct RepTargetsRecord {
@@ -714,7 +721,7 @@ struct WindowCounters {
     size_t alignedPairs;
     size_t targetSkippedPairs;
     size_t repSkippedRecords;
-    // the .partitions cells the node took
+    // the cells the node loaded for the window
     size_t alignmentCells;
     size_t fetchCount;
     size_t prefilterBufferCount;
@@ -825,6 +832,11 @@ static size_t getAssignedKeysHeaderWords() {
 }
 
 static const size_t PREFILTER_BUFFER_MEMORY_DIVISOR = 32;
+// pref bytes that fill a prefilter buffer: 10 bytes per pref byte, 48 bytes and a record per piece
+static size_t getMaxPrefReadSize(size_t prefilterBufferSize) {
+    return std::max((size_t) 1, prefilterBufferSize / (10 + (48 + sizeof(RepTargetsRecord)) / 4));
+}
+
 static const size_t MEMBER_SPLIT_MEMORY_DIVISOR = 16;
 static const size_t CLUSTERED_LOG_BUFFER_SIZE = 16 * 1024 * 1024;
 static const size_t MEMBER_READ_SIZE = 1024 * 1024;
@@ -1600,9 +1612,8 @@ struct PrefRead {
     size_t firstEntry;
     size_t endEntry;
     uint64_t sizeClasses;
-    // the reps of the entries in [firstRepKey, repKeyEnd)
-    size_t firstRepKey;
-    size_t repKeyEnd;
+    // target split mode: the window of the entries
+    size_t window;
 };
 
 // one align node: the prefilter of the alignment splits in key order
@@ -1641,7 +1652,7 @@ struct RepTargetsReader {
                 for (size_t offset = prefBegin; offset < prefEnd; offset += maxPrefReadSize) {
                     const size_t entry = prefDb->findEntryByOffset(offset);
                     if (prefReads.size() == firstPrefRead || prefReads.back().firstEntry != entry) {
-                        const PrefRead prefRead = { node, entry, entry, ~0ULL, 0, SIZE_MAX };
+                        const PrefRead prefRead = { node, entry, entry, ~0ULL, 0 };
                         prefReads.push_back(prefRead);
                     }
                 }
@@ -1876,24 +1887,20 @@ struct TargetSplitPiece {
 
 // target split mode: join the pieces of a rep entry by entry
 struct TargetSplitReader {
-    TargetSplitReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefPartition> &cells, size_t maxRecordSize, size_t memoryLimit,
+    TargetSplitReader(Parameters &par, DBReader<DBKeyType> &seqDbr, const std::vector<PrefWindow> &windows, size_t maxRecordSize, size_t memoryLimit,
                       size_t paddedDbSize, size_t sizeClassCount)
-        : readSize(0), prefSize(0), windowCells(cells.size() / (targetSplitBlockOffsets.size() - 1), 0), par(par), seqDbr(seqDbr), cells(cells),
+        : readSize(0), prefSize(0), maxEntrySize(0), windowCells(windows.size(), 0), par(par), seqDbr(seqDbr), windows(windows),
           targetSplitCount(targetSplitBlockOffsets.size() - 1), paddedDbSize(paddedDbSize), sizeClassCount(sizeClassCount),
           maxPrefilterBufferSize(std::max((size_t) 1, memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)),
           maxRecordTargetCount(std::min((size_t) UINT_MAX, std::max((size_t) 1, maxRecordSize / std::max(seqDbr.getMaxSeqLen() + 2, Util::getPageSize())))),
-          cellPos(0), prefReadPos(0), passClasses(1), endClass(0), classSize(sizeClassCount, 0), prefNode(SIZE_MAX), bufferFetchSize(0), bufferAlignmentCells(0) {
+          windowPos(0), prefReadPos(0), passClasses(1), endClass(0), classSize(sizeClassCount, 0), prefNode(SIZE_MAX), bufferFetchSize(0), bufferAlignmentCells(0) {
         for (size_t split = 0; split < targetSplitCount; split++) {
             if (targetSplitAlignNodes[split] == MMseqsNode::rank) {
                 targetSplits.push_back(split);
                 targetSplitFirstKeys.push_back(seqDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[split]]);
             }
         }
-        for (size_t i = 0; i < cells.size(); i++) {
-            prefSize += (windowAlignGroups[i / targetSplitCount] == alignGroup && targetSplitAlignNodes[cells[i].targetSplit] == MMseqsNode::rank) ? cells[i].prefSize : 0;
-        }
         prefOffsets.resize(MMseqsNode::count * targetSplitCount);
-        prefKeys.resize(MMseqsNode::count);
     }
 
     // load every window once and mark its size classes
@@ -1939,7 +1946,10 @@ struct TargetSplitReader {
                 if (records.empty() == false && (passClasses & (passClasses - 1)) == 0 && (bufferFetchSize >= maxReadSize || bufferAlignmentCells >= maxBufferAlignmentCells)) {
                     break;
                 }
+                const size_t window = prefReads[prefReadPos].window;
+                const size_t cellsBefore = bufferAlignmentCells;
                 loadPrefRead(records, targets);
+                windowCells[window] += bufferAlignmentCells - cellsBefore;
             } else if (records.empty() == false || startPass() == false) {
                 break;
             }
@@ -1953,13 +1963,15 @@ struct TargetSplitReader {
 
     size_t readSize;
     size_t prefSize;
-    // the cells this node took per window
+    // this node's bytes of its largest entry
+    size_t maxEntrySize;
+    // the cells this node loaded per window
     std::vector<size_t> windowCells;
 
 private:
     Parameters &par;
     DBReader<DBKeyType> &seqDbr;
-    const std::vector<PrefPartition> &cells;
+    const std::vector<PrefWindow> &windows;
     const size_t targetSplitCount;
     const size_t paddedDbSize;
     const size_t sizeClassCount;
@@ -1967,7 +1979,7 @@ private:
     const size_t maxRecordTargetCount;
     std::vector<size_t> targetSplits;
     std::vector<DBKeyType> targetSplitFirstKeys;
-    size_t cellPos;
+    size_t windowPos;
     std::vector<PrefRead> prefReads;
     size_t prefReadPos;
     uint64_t passClasses;
@@ -1977,8 +1989,6 @@ private:
     size_t prefNode;
     // per node and target split
     std::vector<std::vector<uint64_t> > prefOffsets;
-    // per node, the entry keys are the same in every target split
-    std::vector<std::vector<uint64_t> > prefKeys;
     std::vector<size_t> entrySizes;
     size_t bufferFetchSize;
     size_t bufferAlignmentCells;
@@ -2008,75 +2018,49 @@ private:
         prefNode = SIZE_MAX;
     }
 
-    // a window has a cell per target split
+    // a window has the same entries in every target split of its node
     bool takeWindow() {
-        // 10 bytes per pref byte, 48 bytes and a record per piece
-        size_t maxPrefReadSize = std::max((size_t) 1, maxPrefilterBufferSize / (10 + (48 + sizeof(RepTargetsRecord)) / 4));
-        size_t prefReadsBefore = prefReads.size();
-        while (prefReads.size() == prefReadsBefore) {
-            size_t firstCell = cellPos;
-            if (cellPos < cells.size()) {
-                cellPos += targetSplitCount;
-                // only the windows of the own align group
-                if (windowAlignGroups[firstCell / targetSplitCount] != alignGroup) {
-                    continue;
-                }
-            }
-            if (firstCell == cells.size()) {
-                break;
-            }
-            size_t windowCost = 0;
-            for (size_t i = 0; i < targetSplits.size(); i++) {
-                windowCost += cells[firstCell + targetSplits[i]].alignmentCells;
-            }
-            if (windowCost == 0) {
+        const size_t maxPrefReadSize = getMaxPrefReadSize(maxPrefilterBufferSize);
+        const size_t prefReadsBefore = prefReads.size();
+        for (; prefReads.size() == prefReadsBefore && windowPos < windows.size(); windowPos++) {
+            const PrefWindow &window = windows[windowPos];
+            // only the windows of the own align group
+            if (windowAlignGroups[windowPos] != alignGroup || window.alignmentCells == 0) {
                 continue;
             }
-            windowCells[firstCell / targetSplitCount] += windowCost;
-            const PrefPartition &cell = cells[firstCell + targetSplits[0]];
             // read each index once
-            std::vector<uint64_t> *offsets = prefOffsets.data() + cell.node * targetSplitCount;
+            std::vector<uint64_t> *offsets = prefOffsets.data() + window.node * targetSplitCount;
             for (size_t i = 0; i < targetSplits.size(); i++) {
                 std::vector<uint64_t> &splitOffsets = offsets[targetSplits[i]];
                 if (splitOffsets.empty()) {
-                    std::string index = MMseqsNode::readFile(par.db2 + ".index." + SSTR(cell.node * targetSplitCount + targetSplits[i]));
+                    std::string index = MMseqsNode::readFile(par.db2 + ".index." + SSTR(window.node * targetSplitCount + targetSplits[i]));
                     splitOffsets.resize(index.size() / (2 * sizeof(uint64_t)));
-                    std::vector<uint64_t> &keys = prefKeys[cell.node];
-                    keys.resize(splitOffsets.size());
                     for (size_t entry = 0; entry < splitOffsets.size(); entry++) {
-                        memcpy(&keys[entry], index.data() + 2 * entry * sizeof(uint64_t), sizeof(uint64_t));
                         memcpy(&splitOffsets[entry], index.data() + (2 * entry + 1) * sizeof(uint64_t), sizeof(uint64_t));
                     }
                 }
             }
-
-            const std::vector<uint64_t> &firstOffsets = offsets[targetSplits[0]];
-            size_t firstEntry = std::lower_bound(firstOffsets.begin(), firstOffsets.end(), cell.prefOffset) - firstOffsets.begin();
-            size_t entryCount = std::lower_bound(firstOffsets.begin(), firstOffsets.end(), cell.prefOffset + cell.prefSize) - firstOffsets.begin() - firstEntry;
-            // a part reads the entries of its reps, its first and last entry can hold reps of the parts next to it
-            const std::vector<uint64_t> &keys = prefKeys[cell.node];
-            const size_t endEntry = std::lower_bound(keys.begin() + firstEntry, keys.begin() + firstEntry + entryCount, cell.repKeyEnd) - keys.begin();
-            firstEntry = std::upper_bound(keys.begin() + firstEntry + 1, keys.begin() + endEntry, cell.windowFirstKey) - keys.begin() - 1;
-            entryCount = endEntry - firstEntry;
+            const size_t entryCount = window.endEntry - window.firstEntry;
             entrySizes.assign(entryCount, 0);
             for (size_t i = 0; i < targetSplits.size(); i++) {
                 const std::vector<uint64_t> &splitOffsets = offsets[targetSplits[i]];
                 for (size_t entry = 0; entry < entryCount; entry++) {
-                    entrySizes[entry] += splitOffsets[firstEntry + entry + 1] - splitOffsets[firstEntry + entry];
+                    entrySizes[entry] += splitOffsets[window.firstEntry + entry + 1] - splitOffsets[window.firstEntry + entry];
                 }
             }
-
             // cut the window into pref reads
             size_t size = 0;
             for (size_t entry = 0; entry < entryCount; entry++) {
                 if (entry == 0 || size + entrySizes[entry] > maxPrefReadSize) {
-                    PrefRead prefRead = { cell.node, firstEntry + entry, firstEntry + entry + 1, ~0ULL, cell.windowFirstKey, cell.repKeyEnd };
+                    PrefRead prefRead = { window.node, window.firstEntry + entry, window.firstEntry + entry + 1, ~0ULL, windowPos };
                     prefReads.push_back(prefRead);
                     size = 0;
                 } else {
                     prefReads.back().endEntry++;
                 }
                 size += entrySizes[entry];
+                prefSize += entrySizes[entry];
+                maxEntrySize = std::max(maxEntrySize, entrySizes[entry]);
             }
         }
         return prefReads.size() > prefReadsBefore;
@@ -2160,7 +2144,7 @@ private:
                             pieces[i].next();
                         }
                     }
-                    if (((passClasses >> sizeClass) & 1) != 0 && repKey >= prefRead.firstRepKey && repKey < prefRead.repKeyEnd) {
+                    if (((passClasses >> sizeClass) & 1) != 0) {
                         targetCount += repTargetCount;
                         recordCount += (repTargetCount + maxRecordTargetCount - 1) / maxRecordTargetCount;
                     }
@@ -2198,12 +2182,11 @@ private:
                     // pieces in target split order, so targets ascend
                     size_t repTargetCount = 0;
                     size_t sizeClass = 0;
-                    const bool isInPrefRead = repKey >= prefRead.firstRepKey && repKey < prefRead.repKeyEnd;
                     for (size_t i = 0; i < pieces.size(); i++) {
                         if (pieces[i].repKey == repKey) {
                             sizeClass = std::min(sizeClassCount - 1, pieces[i].sizeClass);
                             const char *data = pieces[i].targets;
-                            size_t targetCount = (((passClasses >> sizeClass) & 1) != 0 && isInPrefRead) ? pieces[i].targetCount : 0;
+                            size_t targetCount = (((passClasses >> sizeClass) & 1) != 0) ? pieces[i].targetCount : 0;
                             DBKeyType target = targetSplitFirstKeys[i] - 1;
                             for (size_t k = 0; k < targetCount; k++) {
                                 target += Util::getPrefKey(data);
@@ -2332,7 +2315,7 @@ struct ScalarMembers {
 };
 
 static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTargetsReader &repTargetsReader, TargetSplitReader *targetSplitReader,
-                            const std::vector<PrefPartition> &partitions, size_t memoryLimit, size_t masterMemoryLimit, size_t servedFileEntrySize, size_t representativeResidues,
+                            const std::vector<PrefPartition> &partitions, const std::vector<PrefWindow> &windows, size_t memoryLimit, size_t masterMemoryLimit, size_t servedFileEntrySize, size_t representativeResidues,
                             size_t paddedDbSize, size_t sizeClassCount, const ClusterMemberLookup *memberLookup, ClusterMemberExchange *memberExchange,
                             size_t memberKeyBudget, DBReader<DBKeyType> *memberDbr, std::string &phaseValues) {
     Timer startTimer;
@@ -2450,7 +2433,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     // the windows in key order for the counters
     std::vector<size_t> windowFirstKeys(1, 0);
     for (size_t i = 0; i < partitions.size(); i++) {
-        windowFirstKeys.push_back(partitions[i].windowFirstKey);
+        windowFirstKeys.push_back(partitions[i].firstKey);
+    }
+    for (size_t i = 0; i < windows.size(); i++) {
+        windowFirstKeys.push_back(windows[i].firstKey);
     }
     std::sort(windowFirstKeys.begin(), windowFirstKeys.end());
     windowFirstKeys.erase(std::unique(windowFirstKeys.begin(), windowFirstKeys.end()), windowFirstKeys.end());
@@ -4694,15 +4680,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                                           + SSTR(fetchSize.unassignedRecordSize) + " bytes of unassigned records, " + SSTR(fetchSize.alignedPairs) + " aligned pairs, " + formatSeconds(fetchSize.alignSeconds) + " aligning");
             }
         }
-        // the cells the node took from .partitions
+        // the cells the node loaded, with one align node the cells of .partitions
         if (targetSplitReader != NULL) {
-            const size_t targetSplitCount = targetSplitBlockOffsets.size() - 1;
-            for (size_t i = 0, window = SIZE_MAX; i < targetSplitReader->windowCells.size(); i++) {
-                windowCounters[findWindow(windowFirstKeys, partitions[i * targetSplitCount].windowFirstKey, window)].alignmentCells += targetSplitReader->windowCells[i];
+            for (size_t i = 0, window = SIZE_MAX; i < windows.size(); i++) {
+                windowCounters[findWindow(windowFirstKeys, windows[i].firstKey, window)].alignmentCells += targetSplitReader->windowCells[i];
             }
         } else {
             for (size_t i = 0, window = SIZE_MAX; i < partitions.size(); i++) {
-                windowCounters[findWindow(windowFirstKeys, partitions[i].windowFirstKey, window)].alignmentCells += partitions[i].alignmentCells;
+                windowCounters[findWindow(windowFirstKeys, partitions[i].firstKey, window)].alignmentCells += partitions[i].alignmentCells;
             }
         }
         // deciles of the windows of this node in key order
@@ -4729,7 +4714,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 sum.otherSeconds += counters.otherSeconds;
             }
             if (end > first) {
-                MMseqsNode::addPhaseValue(phaseValues, "Window decile " + SSTR(decile + 1), SSTR(end - first) + " windows, " + SSTR(sum.alignmentCells) + " estimated cells, "
+                MMseqsNode::addPhaseValue(phaseValues, "Window decile " + SSTR(decile + 1), SSTR(end - first) + " windows, " + SSTR(sum.alignmentCells) + " cells, "
                                           + SSTR(sum.examinedPairs) + " examined pairs, " + SSTR(sum.alignedPairs) + " aligned, " + SSTR(sum.targetSkippedPairs) + " skipped by target, "
                                           + SSTR(sum.repSkippedRecords) + " records skipped by rep, " + formatSeconds(sum.alignSeconds) + " aligning, " + formatSeconds(sum.otherSeconds)
                                           + " not aligning, " + SSTR(sum.fetchCount) + " fetches, " + SSTR(sum.prefilterBufferCount) + " prefilter buffers");
@@ -5423,34 +5408,35 @@ int align2clustLinfinity(Parameters &par) {
         partitionLine += Util::skipNoneWhitespace(partitionLine);
     }
     std::vector<PrefPartition> partitions;
+    std::vector<PrefWindow> windows;
     uint128 totalAlignmentCells = 0;
     size_t totalPrefSize = 0;
     for (char *line = partitionLine + (hasTargetSplits ? 1 : 0); *line != '\0'; line = Util::skipLine(line)) {
-        const char *columns[6];
-        Util::getWordsOfLine(line, columns, 6);
-        PrefPartition partition;
-        partition.windowFirstKey = Util::fast_atoi<size_t>(columns[0]);
-        partition.prefOffset = Util::fast_atoi<size_t>(columns[1]);
-        partition.prefSize = Util::fast_atoi<size_t>(columns[2]);
-        partition.alignmentCells = Util::fast_atoi<size_t>(columns[3]);
-        partition.node = Util::fast_atoi<size_t>(columns[4]);
-        partition.targetSplit = hasTargetSplits ? Util::fast_atoi<size_t>(columns[5]) : 0;
-        partition.repKeyEnd = SIZE_MAX;
-        partitions.push_back(partition);
-        totalAlignmentCells += partition.alignmentCells;
-        totalPrefSize += partition.prefSize;
+        const char *columns[5];
+        Util::getWordsOfLine(line, columns, 5);
+        const size_t prefSize = Util::fast_atoi<size_t>(columns[2]);
+        const size_t alignmentCells = Util::fast_atoi<size_t>(columns[3]);
+        const size_t node = Util::fast_atoi<size_t>(columns[4]);
+        if (hasTargetSplits) {
+            // a window of one entry until the windows are cut
+            const size_t entry = Util::fast_atoi<size_t>(columns[1]);
+            const PrefWindow window = { Util::fast_atoi<size_t>(columns[0]), node, entry, entry + 1, alignmentCells };
+            windows.push_back(window);
+        } else {
+            const PrefPartition partition = { Util::fast_atoi<size_t>(columns[0]), Util::fast_atoi<size_t>(columns[1]), prefSize, alignmentCells, node };
+            partitions.push_back(partition);
+        }
+        totalAlignmentCells += alignmentCells;
+        totalPrefSize += prefSize;
     }
     // block table for the target splits and the local copy
     DBReader<DBKeyType> blockDbr(par.db1.c_str(), par.db1Index.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
     blockDbr.open(DBReader<DBKeyType>::NOSORT);
     blockDbr.setBlockCacheSize(0);
+    std::vector<size_t> groupNodeOffsets(alignGroupCount + 1);
     if (hasTargetSplits) {
         size_t targetSplitCount = targetSplitBlockOffsets.size() - 1;
         const DBReader<DBKeyType>::Index *blockIndex = blockDbr.getIndex();
-        std::vector<uint128> splitCosts(targetSplitCount, 0);
-        for (size_t i = 0; i < partitions.size(); i++) {
-            splitCosts[partitions[i].targetSplit] += partitions[i].alignmentCells;
-        }
         std::vector<size_t> splitSizes(targetSplitCount, 0);
         size_t totalSize = 0;
         for (size_t split = 0; split < targetSplitCount; split++) {
@@ -5464,7 +5450,6 @@ int align2clustLinfinity(Parameters &par) {
         }
 
         // the align nodes in groups, the master is in no group
-        std::vector<size_t> groupNodeOffsets(alignGroupCount + 1);
         for (size_t group = 0; group <= alignGroupCount; group++) {
             groupNodeOffsets[group] = group * alignNodeCount / alignGroupCount;
         }
@@ -5475,11 +5460,9 @@ int align2clustLinfinity(Parameters &par) {
         targetSplitAlignNodes.resize(targetSplitCount);
         for (size_t group = 0; group < alignGroupCount; group++) {
             const size_t groupNodeCount = groupNodeOffsets[group + 1] - groupNodeOffsets[group];
-            std::vector<uint128> nodeCosts(groupNodeCount, 0);
             std::vector<size_t> nodeSizes(groupNodeCount, 0);
             for (size_t split = 0; split < targetSplitCount; split++) {
                 const size_t groupNode = ((split / groupNodeCount) % 2 == 0) ? split % groupNodeCount : groupNodeCount - 1 - split % groupNodeCount;
-                nodeCosts[groupNode] += splitCosts[split];
                 nodeSizes[groupNode] += splitSizes[split];
                 if (group == ((alignGroup < alignGroupCount) ? alignGroup : split % alignGroupCount)) {
                     targetSplitAlignNodes[split] = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[group] + groupNode;
@@ -5488,87 +5471,12 @@ int align2clustLinfinity(Parameters &par) {
             if (group == alignGroup) {
                 const size_t groupNode = alignNode - groupNodeOffsets[group];
                 MMseqsNode::addPhaseValue(phaseValues, "Target splits", SSTR(std::count(targetSplitAlignNodes.begin(), targetSplitAlignNodes.end(), MMseqsNode::rank)) + " of " + SSTR(targetSplitCount)
-                                          + " with " + SSTR(nodeSizes[groupNode]) + " of " + SSTR(totalSize) + " sequence bytes and "
-                                          + SSTR(static_cast<size_t>(nodeCosts[groupNode] * 1000 / std::max((uint128) 1, totalAlignmentCells))) + " per mille of the cost");
-            }
-        }
-        // a window above the mean cost becomes rep key parts of about the mean cost, a key costs its squared length
-        const size_t windowCount = partitions.size() / targetSplitCount;
-        std::vector<PrefPartition> parts;
-        std::vector<size_t> cutKeys;
-        std::vector<uint128> cutWeights;
-        for (size_t window = 0; window < windowCount; window++) {
-            const PrefPartition *cells = partitions.data() + window * targetSplitCount;
-            const size_t keyBegin = cells[0].windowFirstKey;
-            const size_t keyEnd = (window + 1 < windowCount) ? cells[targetSplitCount].windowFirstKey : blockDbr.getSize();
-            uint128 windowCost = 0;
-            for (size_t split = 0; split < targetSplitCount; split++) {
-                windowCost += cells[split].alignmentCells;
-            }
-            const size_t partCount = std::min<uint128>(keyEnd - keyBegin, (windowCost * windowCount + totalAlignmentCells - 1) / std::max((uint128) 1, totalAlignmentCells));
-            if (partCount <= 1) {
-                parts.insert(parts.end(), cells, cells + targetSplitCount);
-                continue;
-            }
-            uint128 windowWeight = 0;
-            for (int pass = 0; pass < 2; pass++) {
-                cutKeys.assign(1, keyBegin);
-                cutWeights.assign(1, 0);
-                uint128 weight = 0;
-                for (size_t range = blockDbr.findIdRange(keyBegin); range < blockDbr.getIndexSize() && static_cast<size_t>(blockIndex[range].id) < keyEnd; range++) {
-                    const size_t first = std::max(keyBegin, static_cast<size_t>(blockIndex[range].id));
-                    const size_t end = std::min(keyEnd, (range + 1 < blockDbr.getIndexSize()) ? static_cast<size_t>(blockIndex[range + 1].id) : blockDbr.getSize());
-                    const uint128 keyWeight = static_cast<uint128>(blockIndex[range].length) * blockIndex[range].length;
-                    // the first key of part p has at least p / partCount of the window weight before it
-                    while (pass == 1 && cutKeys.size() < partCount) {
-                        const uint128 cut = windowWeight * cutKeys.size() / partCount;
-                        const size_t key = std::max(cutKeys.back() + 1, first + static_cast<size_t>((std::max(cut, weight) - weight + keyWeight - 1) / keyWeight));
-                        if (key >= end) {
-                            break;
-                        }
-                        cutKeys.push_back(key);
-                        cutWeights.push_back(weight + keyWeight * (key - first));
-                    }
-                    weight += keyWeight * (end - first);
-                }
-                windowWeight = weight;
-            }
-            for (size_t part = 0; part < cutKeys.size(); part++) {
-                const uint128 partWeight = ((part + 1 < cutKeys.size()) ? cutWeights[part + 1] : windowWeight) - cutWeights[part];
-                for (size_t split = 0; split < targetSplitCount; split++) {
-                    PrefPartition cell = cells[split];
-                    cell.windowFirstKey = cutKeys[part];
-                    cell.repKeyEnd = (part + 1 < cutKeys.size()) ? cutKeys[part + 1] : cells[split].repKeyEnd;
-                    cell.alignmentCells = (cell.alignmentCells > 0) ? std::max<size_t>(1, static_cast<size_t>(cell.alignmentCells * partWeight / windowWeight)) : 0;
-                    parts.push_back(cell);
-                }
-            }
-        }
-        partitions.swap(parts);
-
-        // windows and parts in key order to the align group with the fewest windows per node, so that the groups pass the keys side by side
-        std::vector<uint128> groupCosts(alignGroupCount, 0);
-        std::vector<size_t> groupWindows(alignGroupCount, 0);
-        windowAlignGroups.resize(partitions.size() / targetSplitCount);
-        for (size_t window = 0; window < windowAlignGroups.size(); window++) {
-            size_t windowGroup = 0;
-            for (size_t group = 1; group < alignGroupCount; group++) {
-                if (groupWindows[group] * (groupNodeOffsets[windowGroup + 1] - groupNodeOffsets[windowGroup]) < groupWindows[windowGroup] * (groupNodeOffsets[group + 1] - groupNodeOffsets[group])) {
-                    windowGroup = group;
-                }
-            }
-            windowAlignGroups[window] = windowGroup;
-            groupWindows[windowGroup]++;
-            for (size_t split = 0; split < targetSplitCount; split++) {
-                groupCosts[windowGroup] += partitions[window * targetSplitCount + split].alignmentCells;
+                                          + " with " + SSTR(nodeSizes[groupNode]) + " of " + SSTR(totalSize) + " sequence bytes");
             }
         }
         if (alignGroup < alignGroupCount) {
             alignGroupNodeBegin = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[alignGroup];
             alignGroupNodeEnd = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[alignGroup + 1];
-            MMseqsNode::addPhaseValue(phaseValues, "Align group", SSTR(alignGroup) + " of " + SSTR(alignGroupCount) + " with " + SSTR(groupNodeOffsets[alignGroup + 1] - groupNodeOffsets[alignGroup]) + " nodes, "
-                                      + SSTR(groupWindows[alignGroup]) + " of " + SSTR(windowAlignGroups.size()) + " windows and "
-                                      + SSTR(static_cast<size_t>(groupCosts[alignGroup] * 1000 / std::max((uint128) 1, totalAlignmentCells))) + " per mille of the cost");
         }
     }
     // a master that only clusters reads no sequences; with S3 the local sparse copies replace the copies
@@ -5833,9 +5741,56 @@ int align2clustLinfinity(Parameters &par) {
     const size_t maxRecordSize = std::max<size_t>(1, smallestMemoryLimit / 32);
     // all nodes cut served files at the same size
     const size_t servedFileEntrySize = std::max(BatchReader::MAX_READ_REQUEST_SIZE, smallestMemoryLimit / 512);
+    if (hasTargetSplits) {
+        // windows of about equal cost; a window holds consecutive entries of one node
+        const size_t groupPrefReadSize = alignNodeCount / alignGroupCount * getMaxPrefReadSize(smallestMemoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR);
+        const size_t windowCount = std::max((size_t) 1, (totalPrefSize + groupPrefReadSize - 1) / groupPrefReadSize);
+        const uint128 windowCost = std::max((uint128) 1, (totalAlignmentCells + windowCount - 1) / windowCount);
+        uint128 costBefore = 0;
+        uint128 nextCut = windowCost;
+        size_t window = 0;
+        for (size_t i = 0; i < windows.size(); i++) {
+            const PrefWindow row = windows[i];
+            const bool isCostCut = costBefore >= nextCut;
+            if (isCostCut) {
+                nextCut = (costBefore / windowCost + 1) * windowCost;
+            }
+            if (i > 0 && (isCostCut || row.node != windows[window].node || row.firstEntry != windows[window].endEntry)) {
+                windows[++window] = row;
+            } else if (i > 0) {
+                windows[window].endEntry = row.endEntry;
+                windows[window].alignmentCells += row.alignmentCells;
+            }
+            costBefore += row.alignmentCells;
+        }
+        const size_t prefEntryCount = windows.size();
+        windows.resize(std::min(windows.size(), window + 1));
+        MMseqsNode::addPhaseValue(phaseValues, "Target split entries", SSTR(prefEntryCount) + " in " + SSTR(windows.size()) + " windows");
+
+        // windows in key order to the align group with the least cost per node, so that the groups pass the keys side by side
+        std::vector<uint128> groupCosts(alignGroupCount, 0);
+        std::vector<size_t> groupWindows(alignGroupCount, 0);
+        windowAlignGroups.resize(windows.size());
+        for (size_t w = 0; w < windows.size(); w++) {
+            size_t windowGroup = 0;
+            for (size_t group = 1; group < alignGroupCount; group++) {
+                if (groupCosts[group] * (groupNodeOffsets[windowGroup + 1] - groupNodeOffsets[windowGroup]) < groupCosts[windowGroup] * (groupNodeOffsets[group + 1] - groupNodeOffsets[group])) {
+                    windowGroup = group;
+                }
+            }
+            windowAlignGroups[w] = windowGroup;
+            groupWindows[windowGroup]++;
+            groupCosts[windowGroup] += windows[w].alignmentCells;
+        }
+        if (alignGroup < alignGroupCount) {
+            MMseqsNode::addPhaseValue(phaseValues, "Align group", SSTR(alignGroup) + " of " + SSTR(alignGroupCount) + " with " + SSTR(groupNodeOffsets[alignGroup + 1] - groupNodeOffsets[alignGroup]) + " nodes, "
+                                      + SSTR(groupWindows[alignGroup]) + " of " + SSTR(windowAlignGroups.size()) + " windows and "
+                                      + SSTR(static_cast<size_t>(groupCosts[alignGroup] * 1000 / std::max((uint128) 1, totalAlignmentCells))) + " per mille of the cost");
+        }
+    }
 
     RepTargetsReader repTargetsReader(par, seqDbr, partitions, alignmentSplitPartitionOffsets, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount);
-    TargetSplitReader *targetSplitReader = hasTargetSplits ? new TargetSplitReader(par, seqDbr, partitions, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount) : NULL;
+    TargetSplitReader *targetSplitReader = hasTargetSplits ? new TargetSplitReader(par, seqDbr, windows, maxRecordSize, memoryLimit, paddedDbSize, sizeClassCount) : NULL;
     if (sizeClassCount > 1 && targetSplitReader != NULL) {
         targetSplitReader->countSizeClasses();
     } else if (sizeClassCount > 1) {
@@ -5892,7 +5847,7 @@ int align2clustLinfinity(Parameters &par) {
     }
     // a member key, a pending part and an accepted pair take 41 words and 5 flags of the 2 * memberSplitSize in getReservedMemory
     const size_t memberKeyBudget = std::max<size_t>(1, 2 * std::min(memoryLimit, smallestMemoryLimit) / MEMBER_SPLIT_MEMORY_DIVISOR / ((7 + 9 + 25) * sizeof(uint64_t) + 5));
-    alignRepTargets(par, seqDbr, repTargetsReader, targetSplitReader, partitions, memoryLimit, masterMemoryLimit, servedFileEntrySize, representativeResidues, paddedDbSize, sizeClassCount,
+    alignRepTargets(par, seqDbr, repTargetsReader, targetSplitReader, partitions, windows, memoryLimit, masterMemoryLimit, servedFileEntrySize, representativeResidues, paddedDbSize, sizeClassCount,
                     memberLookup, memberExchange, memberKeyBudget, memberDbr, phaseValues);
     // serve until every aligning node has its members
     if (memberServer.joinable()) {
@@ -5914,7 +5869,8 @@ int align2clustLinfinity(Parameters &par) {
     if (targetSplitReader != NULL) {
         targetSplitReader->close();
         if (MMseqsNode::rank >= MMseqsNode::getFirstAlignNode()) {
-            MMseqsNode::addPhaseValue(phaseValues, "Target split prefilter bytes", SSTR(targetSplitReader->readSize) + " read of " + SSTR(targetSplitReader->prefSize));
+            MMseqsNode::addPhaseValue(phaseValues, "Target split prefilter bytes", SSTR(targetSplitReader->readSize) + " read of " + SSTR(targetSplitReader->prefSize) + ", largest entry "
+                                      + SSTR(targetSplitReader->maxEntrySize) + " bytes");
         }
         delete targetSplitReader;
     }
