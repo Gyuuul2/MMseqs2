@@ -563,11 +563,16 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         size_t totalSize = 0;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+:totalSize)
         for (size_t i = 0; i < filenames.size(); i++) {
-            fileSizes[i] = FileUtil::getFileSize(filenames[i]);
-            if (fileSizes[i] == SIZE_MAX) {
+            struct stat sb;
+            if (MMseqsNode::statSharedFile(filenames[i], sb) == false) {
                 Debug(Debug::ERROR) << "File " << filenames[i] << " does not exist\n";
                 EXIT(EXIT_FAILURE);
             }
+            if (S_ISREG(sb.st_mode) == false) {
+                Debug(Debug::ERROR) << "Input " << filenames[i] << " is not a regular file. Linfinity createdb splits its input by size\n";
+                EXIT(EXIT_FAILURE);
+            }
+            fileSizes[i] = sb.st_size;
             totalSize += fileSizes[i];
         }
 
