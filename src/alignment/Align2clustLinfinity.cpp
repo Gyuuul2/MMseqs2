@@ -745,7 +745,7 @@ struct FetchSizeCounters {
 // linfinity: records [begin, end) of a prefilter buffer and their fetched entries
 struct FetchedSequences {
     FetchedSequences() : prefilterBuffer(0), prefilterBufferNumber(0), begin(0), end(0), repKeyBegin(0), repKeyEnd(0), targetCount(0), pendingPairCount(0), firstPendingRepKey(0), plannedSize(0),
-                         unassignedRecordSize(0), isLast(false), entries(NULL), allocatedSize(0), acceptedSize(0), isReady(false) {}
+                         unassignedRecordSize(0), isLast(false), entries(NULL), allocatedSize(0), acceptedSize(0), ownKeyCopyEnd(0), isReady(false) {}
     size_t prefilterBuffer;
     size_t prefilterBufferNumber;
     size_t begin;
@@ -769,6 +769,8 @@ struct FetchedSequences {
     std::vector<size_t> entryOffsets;
     // the accepted bytes at its hand-off, for the master gate
     size_t acceptedSize;
+    // the own keys before it are copied
+    size_t ownKeyCopyEnd;
     bool isReady;
 
     size_t memorySize() const {
@@ -2947,6 +2949,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         for (unsigned int node = 0; node <= nodes + 1; node++) {
             sequences.fetchSourceKeyOffsets[node] = threadFetchSourceKeyOffsets[node * par.threads];
         }
+        sequences.ownKeyCopyEnd = sequences.fetchSourceKeyOffsets[rank];
         const size_t keyCount = sequences.fetchSourceKeyOffsets[nodes + 1];
         sequences.keys.resize(keyCount);
         sequences.entryOffsets.resize(keyCount + 1);
@@ -3045,6 +3048,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 
     // the fetches handed to the I/O threads and not requested yet, in selection order
     std::deque<FetchedSequences *> handedOffFetches;
+    // the handed-off fetches the main thread has not taken yet, the I/O threads copy their own keys ahead in this order
+    std::deque<FetchedSequences *> ownKeyFetches;
     // a node aligns ahead of the master by at most its share of a master step
     const size_t maxUnclusteredAcceptedSize = std::max<size_t>(1, getStepWords(masterMemoryLimit) / nodes) * sizeof(uint64_t);
     bool isWaitingForMaster = false;
@@ -3910,27 +3915,72 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     };
     double ownKeyCopySeconds = 0;
     size_t ownKeyCopySize = 0;
-    // the own keys of a fetch the main thread takes, copied by its idle aligning team
+    std::mutex ownKeyCopyMutex;
+    size_t ownKeyAheadSize = 0;
+    // the own keys of a fetch the main thread takes that the I/O threads did not copy ahead, copied by its idle aligning team
     const auto copyOwnKeys = [&](FetchedSequences &sequences) {
         Timer copyTimer;
-        const size_t ownKey = sequences.fetchSourceKeyOffsets[rank];
+        {
+            std::lock_guard<std::mutex> lock(serviceMutex);
+            ownKeyFetches.erase(std::remove(ownKeyFetches.begin(), ownKeyFetches.end(), &sequences), ownKeyFetches.end());
+        }
+        size_t ownKey;
+        {
+            // a chunk copied ahead ends before the fetch aligns
+            std::lock_guard<std::mutex> copyLock(ownKeyCopyMutex);
+            ownKey = sequences.ownKeyCopyEnd;
+        }
         const size_t ownKeyEnd = sequences.fetchSourceKeyOffsets[rank + 1];
         copyEntries(sequences.keys.data() + ownKey, ownKeyEnd - ownKey, sequences.entryOffsets.data() + ownKey, sequences.entries, NULL, (repDbr != NULL) ? maxFetchSize / 2 : maxFetchSize);
         ownKeyCopySeconds += copyTimer.getTimediff();
         ownKeyCopySize += sequences.entryOffsets[ownKeyEnd] - sequences.entryOffsets[ownKey];
+    };
+    // copies the own keys of the next block of the queued fetches, the main thread copies what is left when it takes a fetch
+    const auto copyOwnKeysAhead = [&]() {
+        std::unique_lock<std::mutex> taskLock(ownKeyCopyMutex, std::try_to_lock);
+        if (taskLock.owns_lock() == false) {
+            return false;
+        }
+        FetchedSequences *sequences = NULL;
+        size_t first = 0;
+        size_t end = 0;
+        {
+            std::lock_guard<std::mutex> lock(serviceMutex);
+            while (ownKeyFetches.empty() == false && sequences == NULL) {
+                FetchedSequences &front = *ownKeyFetches.front();
+                const size_t ownKeyEnd = front.fetchSourceKeyOffsets[rank + 1];
+                if (front.ownKeyCopyEnd < ownKeyEnd) {
+                    sequences = &front;
+                    first = front.ownKeyCopyEnd;
+                    const DBKeyType *keys = front.keys.data();
+                    end = std::lower_bound(keys + first, keys + ownKeyEnd, blockKeyOffsets[seqDbr.getKeyBlock(keys[first]) + 1]) - keys;
+                    front.ownKeyCopyEnd = end;
+                }
+                if (front.ownKeyCopyEnd == ownKeyEnd) {
+                    ownKeyFetches.pop_front();
+                }
+            }
+        }
+        if (sequences == NULL) {
+            return false;
+        }
+        copyEntries(sequences->keys.data() + first, end - first, sequences->entryOffsets.data() + first, sequences->entries, NULL, (repDbr != NULL) ? maxFetchSize / 2 : maxFetchSize);
+        ownKeyAheadSize += sequences->entryOffsets[end] - sequences->entryOffsets[first];
+        return true;
     };
     // a pass of an I/O thread, in window order
     const auto runIoTasks = [&]() {
         bool hasWorked = memberExchange != NULL && memberExchange->serveRequests();
         hasWorked |= serveSequences();
         hasWorked |= receiveSequences();
+        hasWorked |= copyOwnKeysAhead();
         hasWorked |= memberExchange != NULL && memberExchange->preloadNextRange();
         hasWorked |= fillNextPrefilterBuffer();
         return hasWorked;
     };
     // a piece of the work the waiting main thread waits for, else of the work other nodes wait for
     const auto runWaitTasks = [&]() {
-        return receiveSequences() || (memberExchange != NULL && memberExchange->serveRequests()) || serveSequences();
+        return receiveSequences() || copyOwnKeysAhead() || (memberExchange != NULL && memberExchange->serveRequests()) || serveSequences();
     };
     // under serviceMutex
     const auto isIoDone = [&]() {
@@ -4078,6 +4128,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 selected.isReady = false;
                 selected.acceptedSize = acceptedSize;
                 handedOffFetches.push_back(&selected);
+                ownKeyFetches.push_back(&selected);
                 ioWork++;
             }
             serviceCondition.notify_all();
@@ -4844,7 +4895,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the prefilter", prefilterWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "aligning the fetches", alignSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "copying the own keys", ownKeyCopySeconds);
-        MMseqsNode::addPhaseValue(phaseValues, "Own key bytes", SSTR(ownKeyCopySize) + " copied by the main thread");
+        MMseqsNode::addPhaseValue(phaseValues, "Own key bytes", SSTR(ownKeyCopySize) + " copied by the main thread, " + SSTR(ownKeyAheadSize) + " ahead");
         MMseqsNode::addPhaseSeconds(phaseValues, "filling the prefilter buffers", prefilterFillSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Fetches with fewer SWIPE batches", SSTR(fewerBatchFetchCount) + " of " + SSTR(fetchCount));
         MMseqsNode::addPhaseValue(phaseValues, "Fetches in flight", "at most " + SSTR(maxFetchesInFlight) + ", mean " + SSTR(static_cast<float>(fetchesInFlightSum) / std::max<size_t>(1, alignedFetchCount), 2));
