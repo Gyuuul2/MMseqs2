@@ -3082,719 +3082,732 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             packSeconds += copyTimer.getTimediff();
         }
     };
+    // own request: code offsets per node, pieces and keys received per node
+    struct SequenceRequest {
+        FetchedSequences *sequences;
+        size_t number;
+        size_t size;
+        std::vector<size_t> codeOffsets;
+        std::vector<size_t> receivedPieces;
+        std::vector<size_t> receivedKeys;
+        bool isComplete;
+    };
+    std::deque<SequenceRequest> ownRequests;
+    size_t receivedRequestCount = 0;
+    bool isLastRequested = false;
+    // the requested fetches become ready in selection order
+    std::deque<FetchedSequences *> requestedFetches;
+    std::vector<char> requestCodes;
+    // piece of a served file: request, piece of the request, served file and its size, offset, bytes, keys
+    struct ServedPiece {
+        size_t request;
+        size_t piece;
+        size_t file;
+        size_t fileSize;
+        size_t offset;
+        size_t size;
+        size_t keyCount;
+    };
+    std::vector<double> nextServedProgressReads(nodes, 0);
+    // seconds to the next read of a node that owes a request, doubled up to progressSeconds while it has not served
+    std::vector<double> servedProgressSeconds(nodes, BATCH_READ_SECONDS);
+    // the nodes that owe are read at half of PROGRESS_READS_PER_SECOND until fastReadEnd
+    double fastReadSeconds = BATCH_READ_SECONDS;
+    double fastReadEnd = 0;
+    double nextRequestListing = 0;
+    double nextServedListing = 0;
+    // the master progress while the gate is closed, about as often as before the faster polls
+    double nextGateRead = 0;
+    std::vector<std::string> requestNames;
+    std::vector<std::string> servedNames;
+    // one past the newest served file of a node in the last listing and in its progress
+    std::vector<size_t> listedServedFileCounts(nodes, 0);
+    std::vector<size_t> progressServedFileCounts(nodes, 0);
+    std::vector<std::vector<ServedPiece> > servedPieces(nodes);
+    // requesting node: progress, code range of this node per open request, codes served so far, pieces not yet deleted
+    struct Requester {
+        Requester() : requestCount(0), receivedCount(0), isLast(false), isDone(false), nextProgressRead(0), servedCount(0), codePos(0), lastKey(0), piece(0) {}
+        size_t requestCount;
+        size_t receivedCount;
+        bool isLast;
+        bool isDone;
+        double nextProgressRead;
+        std::vector<size_t> openRequests;
+        size_t servedCount;
+        size_t codePos;
+        DBKeyType lastKey;
+        size_t piece;
+        std::vector<ServedPiece> pieces;
+    };
+    std::vector<Requester> requesters(nodes);
+    size_t requesterCount = 0;
+    for (unsigned int node = 0; node < nodes; node++) {
+        requesters[node].isDone = node == rank || node < alignGroupNodeBegin || node >= alignGroupNodeEnd;
+        requesterCount += requesters[node].isDone == false;
+    }
+    // seconds between two reads of the progress file of a node
+    const double progressSeconds = std::max(BATCH_READ_SECONDS, 2.0 * requesterCount / PROGRESS_READS_PER_SECOND);
+    std::vector<const char *> requestColumns(nodes + 3);
+    bool isServedProgressChanged = false;
+    std::vector<char> receivedEntries;
+    std::vector<DBKeyType> servedKeys;
+    std::vector<DBKeyType> rawKeys;
+    std::vector<size_t> requestOffsets;
+    // the pieces of a pass in one served file
+    std::vector<char> servedFileData;
+    std::vector<std::pair<unsigned int, ServedPiece> > passPieces;
+    std::vector<size_t> filePieceCounts;
+    // the next pass starts with the first requester left out of a full served file
+    unsigned int firstRequester = rank + 1;
+    // a thread loads the keys of this node while the service thread serves and receives
+    std::thread ownKeyLoader;
+    std::deque<FetchedSequences *> ownKeyRequests;
+    // the served files of an align node and the requests of a requester fail on their own
+    std::vector<time_t> missingServedSince(nodes, 0);
+    std::vector<unsigned int> missingServedAttempts(nodes, 0);
+    std::vector<time_t> missingRequestSince(nodes, 0);
+    std::vector<unsigned int> missingRequestAttempts(nodes, 0);
+    std::string requestProgress = requests + "." + SSTR(rank) + ".progress";
+    std::string servedProgress = served + "." + SSTR(rank) + ".progress";
+    const auto getServedFile = [&](unsigned int alignNode, size_t file) {
+        return served + "/" + SSTR(alignNode) + "." + SSTR(file);
+    };
+    MMseqsNode::WaitWarning waitWarning;
+    time_t assignedKeysReadTime = 0;
+    // the sleeps by their one reason: an owed request, the master gate, no fetch of the aligning threads, else
+    const char *idleReasons[] = { "owed", "gate", "no request", "other" };
+    double idleSeconds[4] = { 0, 0, 0, 0 };
+    size_t idleCounts[4] = { 0, 0, 0, 0 };
+    size_t completedFetchCount = 0;
+    double statusPackSeconds = 0;
+    double nextStatusTime = STATUS_SECONDS;
+    // the gate key of the newest fetch
+    size_t frontRepKey = orderKeyEnd;
+    size_t gateSlackKeys = 0;
+    size_t gateSlackWindows = 0;
+    double gateSlackTime = 0;
+    const auto printStatus = [&]() {
+        const double now = serviceTimer.getTimediff();
+        std::string value = "done rep key " + SSTR(publishedDoneRepKey.load()) + ", " + SSTR(completedFetchCount) + " fetches, " + SSTR(requestCount) + " requests";
+        {
+            std::lock_guard<std::mutex> lock(serviceMutex);
+            value += "; waiting for the sequences " + formatSeconds(sequenceWaitSeconds) + ", the master " + formatSeconds(waitSeconds);
+        }
+        double idleSum = 0;
+        std::string idle;
+        for (size_t i = 0; i < 4; i++) {
+            idleSum += idleSeconds[i];
+            idle += std::string((i > 0) ? ", " : "") + idleReasons[i] + " " + formatSeconds(idleSeconds[i]) + " in " + SSTR(idleCounts[i]) + " sleeps";
+        }
+        value += "; service idle " + formatSeconds(idleSum) + " of " + formatSeconds(now) + ": " + idle;
+        // the own key loader packs too, a status does not wait for it
+        {
+            std::unique_lock<std::mutex> sourceLock(sourceMutex, std::try_to_lock);
+            statusPackSeconds = sourceLock.owns_lock() ? packSeconds : statusPackSeconds;
+        }
+        value += "; service: serving " + formatSeconds(servingSeconds) + ", packing " + formatSeconds(statusPackSeconds) + ", writing served files " + formatSeconds(servedFileWriteSeconds)
+                 + ", reading served entries " + formatSeconds(readingSeconds) + ", polling " + formatSeconds(pollingSeconds);
+        value += "; gate slack " + SSTR(gateSlackKeys) + " keys and " + SSTR(gateSlackWindows) + " windows, at most " + SSTR(maxGateSlackKeys) + " keys and " + SSTR(maxGateSlackWindows) + " windows";
+        size_t processThreads;
+        size_t ringWorkers;
+        countProcessThreads(processThreads, ringWorkers);
+        threadSampleCount++;
+        maxProcessThreads = std::max(maxProcessThreads, processThreads);
+        maxThreadsBesidesRingWorkers = std::max(maxThreadsBesidesRingWorkers, processThreads - ringWorkers);
+        value += "; process threads (incl. io_uring workers) " + SSTR(processThreads) + ", " + SSTR(ringWorkers) + " io_uring workers, --threads " + SSTR(par.threads);
+        std::string status;
+        MMseqsNode::addPhaseValue(status, "Align node status after " + SSTR(static_cast<size_t>(now)) + " s", value);
+        MMseqsNode::printPhaseValues(status);
+    };
+    bool isGated = false;
+    bool isServing = false;
+    // a pass over the requests of this node and the pieces served for them
+    const auto receiveSequences = [&]() {
+        bool hasWorked = false;
+        // the slack since the last pass
+        const double slackTime = serviceTimer.getTimediff();
+        if (frontRepKey < orderKeyEnd) {
+            const size_t clusteredKey = std::min<size_t>(frontRepKey, __atomic_load_n(&clusteredOrderKey, __ATOMIC_RELAXED));
+            gateSlackKeys = frontRepKey - clusteredKey;
+            gateSlackWindows = getWindowPosition(windowFirstKeys, paddedDbSize, frontRepKey) - getWindowPosition(windowFirstKeys, paddedDbSize, clusteredKey);
+            maxGateSlackKeys = std::max(maxGateSlackKeys, gateSlackKeys);
+            maxGateSlackWindows = std::max(maxGateSlackWindows, gateSlackWindows);
+            gateSlackSeconds += slackTime - gateSlackTime;
+            gateSlackKeySeconds += (slackTime - gateSlackTime) * gateSlackKeys;
+            gateSlackWindowSeconds += (slackTime - gateSlackTime) * gateSlackWindows;
+        }
+        gateSlackTime = slackTime;
+        // keep the bits of the served keys current
+        time_t passTime = time(NULL);
+        if (passTime - assignedKeysReadTime >= READ_SECONDS) {
+            std::unique_lock<std::mutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
+            if (assignedKeysLock.owns_lock()) {
+                readAssignedKeys(false);
+                assignedKeysReadTime = passTime;
+            }
+        }
+        bool isRequestProgressChanged = false;
+        // request the handed-off fetches in order while the master is close enough behind
+        size_t passRequestCount = 0;
+        isGated = false;
+        while (isGated == false) {
+            FetchedSequences *nextRequest = NULL;
+            size_t nextAcceptedSize = 0;
+            {
+                std::lock_guard<std::mutex> lock(serviceMutex);
+                if (handedOffFetches.empty() == false) {
+                    nextRequest = handedOffFetches.front();
+                    nextAcceptedSize = nextRequest->acceptedSize;
+                }
+            }
+            if (nextRequest == NULL) {
+                break;
+            }
+            bool isLast = nextRequest->isLast;
+            // a fetch without records and pending pairs logs nothing, so it never waits; the pairs the aligning fetch adds come from it
+            bool canWait = isLast == false && (nextRequest->end > nextRequest->begin || nextRequest->pendingPairCount > 0);
+            bool isAhead;
+            {
+                std::lock_guard<std::mutex> assignedKeysLock(assignedKeysMutex);
+                size_t repKey = std::min(nextRequest->firstPendingRepKey, getFirstRepKey(*nextRequest));
+                frontRepKey = repKey;
+                if (canWait && repKey > clusteredOrderKey && nextAcceptedSize >= clusteredAcceptedSize + maxUnclusteredAcceptedSize && serviceTimer.getTimediff() >= nextGateRead) {
+                    nextGateRead = serviceTimer.getTimediff() + BATCH_READ_SECONDS / 2;
+                    readAssignedKeys(true);
+                }
+                isAhead = canWait && repKey > clusteredOrderKey && nextAcceptedSize >= clusteredAcceptedSize + maxUnclusteredAcceptedSize;
+            }
+            {
+                std::lock_guard<std::mutex> lock(serviceMutex);
+                isWaitingForMaster = isAhead;
+                if (isAhead == false) {
+                    handedOffFetches.pop_front();
+                }
+            }
+            isGated = isAhead;
+            if (isAhead == false) {
+                // the keys of a node ascend, so a request holds their gaps
+                SequenceRequest request;
+                request.sequences = nextRequest;
+                request.number = requestCount;
+                request.codeOffsets.assign(nodes + 1, 0);
+                requestCodes.clear();
+                for (unsigned int node = 0; node < nodes; node++) {
+                    request.codeOffsets[node] = requestCodes.size();
+                    size_t keyBegin = nextRequest->fetchSourceKeyOffsets[node];
+                    size_t keyEnd = (node != rank) ? nextRequest->fetchSourceKeyOffsets[node + 1] : keyBegin;
+                    for (size_t i = keyBegin; i < keyEnd; i++) {
+                        char code[10];
+                        size_t codeSize = Util::putPrefKey(code, nextRequest->keys[i] - ((i > keyBegin) ? nextRequest->keys[i - 1] : 0));
+                        requestCodes.insert(requestCodes.end(), code, code + codeSize);
+                        requestedEntrySize += nextRequest->entryOffsets[i + 1] - nextRequest->entryOffsets[i];
+                    }
+                }
+                request.codeOffsets[nodes] = requestCodes.size();
+                // a fetch without keys of other nodes has no request
+                if (requestCodes.empty() == false) {
+                    MMseqsNode::writeExchangeFile(requests + "/" + SSTR(rank) + "." + SSTR(request.number), request.number, requestCodes.data(), requestCodes.size(), "", std::vector<uint64_t>(), 1);
+                    request.size = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + requestCodes.size();
+                    request.receivedPieces.assign(nodes, 0);
+                    request.receivedKeys.assign(nodes, 0);
+                    request.isComplete = false;
+                    ownRequests.push_back(request);
+                    size_t owedCount = 0;
+                    for (unsigned int node = 0; node < nodes; node++) {
+                        owedCount += request.codeOffsets[node + 1] > request.codeOffsets[node];
+                    }
+                    fastReadSeconds = std::max(0.01, 2.0 * owedCount / PROGRESS_READS_PER_SECOND);
+                    fastReadEnd = serviceTimer.getTimediff() + BATCH_READ_SECONDS;
+                    std::fill(servedProgressSeconds.begin(), servedProgressSeconds.end(), fastReadSeconds);
+                    std::fill(nextServedProgressReads.begin(), nextServedProgressReads.end(), serviceTimer.getTimediff() + fastReadSeconds);
+                    requestCount++;
+                    objectWriteCount++;
+                    isRequestProgressChanged = true;
+                }
+                isRequestProgressChanged |= isLast;
+                isLastRequested = isLast;
+                requestedFetches.push_back(nextRequest);
+                passRequestCount++;
+                hasWorked = true;
+            }
+        }
+        // the progress of an owed node is read at once when the names hold a served file it did not show yet
+        bool isServedListed = ownRequests.empty() == false && serviceTimer.getTimediff() >= nextServedListing;
+        if (isServedListed) {
+            nextServedListing = serviceTimer.getTimediff() + std::max(BATCH_READ_SECONDS, (nodes - 1.0) / PROGRESS_READS_PER_SECOND) / 4.0;
+            MMseqsNode::listDirectory(served, servedNames);
+            servedListingCount++;
+            std::fill(listedServedFileCounts.begin(), listedServedFileCounts.end(), 0);
+            for (size_t i = 0; i < servedNames.size(); i++) {
+                const char *name = servedNames[i].c_str();
+                const char *number = strchr(name, '.');
+                size_t node = Util::fast_atoi<size_t>(name);
+                if (number != NULL && number != name && node < nodes) {
+                    listedServedFileCounts[node] = std::max(listedServedFileCounts[node], Util::fast_atoi<size_t>(number + 1) + 1);
+                }
+            }
+        }
+        // receive from the nodes that owe a request
+        for (unsigned int node = 0; node < nodes; node++) {
+            bool isOwed = false;
+            for (size_t i = 0; i < ownRequests.size() && isOwed == false; i++) {
+                isOwed = node != rank && ownRequests[i].receivedKeys[node] < ownRequests[i].sequences->fetchSourceKeyOffsets[node + 1] - ownRequests[i].sequences->fetchSourceKeyOffsets[node];
+            }
+            if (isOwed && isServedListed && listedServedFileCounts[node] > progressServedFileCounts[node] && serviceTimer.getTimediff() < nextServedProgressReads[node]) {
+                nextServedProgressReads[node] = 0;
+                servedListingReadCount++;
+            }
+            if (isOwed == false || serviceTimer.getTimediff() < nextServedProgressReads[node]) {
+                continue;
+            }
+            Timer pollTimer;
+            std::string content;
+            nextServedProgressReads[node] = serviceTimer.getTimediff() + servedProgressSeconds[node];
+            if (serviceTimer.getTimediff() >= fastReadEnd) {
+                servedProgressSeconds[node] = std::min(2.0 * servedProgressSeconds[node], progressSeconds);
+            }
+            progressReadCount++;
+            bool hasProgress = MMseqsNode::readRunFile(served + "." + SSTR(node) + ".progress", content);
+            pollingSeconds += pollTimer.getTimediff();
+            if (hasProgress) {
+                servedPieces[node].clear();
+                for (char *line = &content[0]; *line != '\0'; line = Util::skipLine(line)) {
+                    const char *columns[8];
+                    if (Util::getWordsOfLine(line, columns, 8) != 8) {
+                        continue;
+                    }
+                    // the files of all requesters, a listed file without a piece of this node moves up one read only
+                    progressServedFileCounts[node] = std::max(progressServedFileCounts[node], Util::fast_atoi<size_t>(columns[3]) + 1);
+                    if (Util::fast_atoi<size_t>(columns[0]) == rank) {
+                        ServedPiece piece = { Util::fast_atoi<size_t>(columns[1]), Util::fast_atoi<size_t>(columns[2]), Util::fast_atoi<size_t>(columns[3]), Util::fast_atoi<size_t>(columns[4]),
+                                              Util::fast_atoi<size_t>(columns[5]), Util::fast_atoi<size_t>(columns[6]), Util::fast_atoi<size_t>(columns[7]) };
+                        servedPieces[node].push_back(piece);
+                    }
+                }
+            }
+            for (size_t i = 0; i < ownRequests.size(); i++) {
+                SequenceRequest &request = ownRequests[i];
+                for (size_t j = 0; j < servedPieces[node].size(); j++) {
+                    const ServedPiece &piece = servedPieces[node][j];
+                    if (piece.request != request.number || piece.piece != request.receivedPieces[node]) {
+                        continue;
+                    }
+                    // the next piece from its served file, a failed read is tried again after the next progress read
+                    std::string fileName = getServedFile(node, piece.file);
+                    size_t observedSize;
+                    uint64_t observedNumber;
+                    int lastError;
+                    Timer readTimer;
+                    objectReadCount++;
+                    int fd = MMseqsNode::tryOpenExchangeFile(fileName, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.fileSize, piece.file, observedSize, observedNumber, lastError);
+                    if (fd < 0) {
+                        readingSeconds += readTimer.getTimediff();
+                        if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EIO) {
+                            Debug(Debug::ERROR) << "Cannot open served sequence file " << fileName << ": " << strerror(lastError) << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        failIfMissingTooLong(missingServedSince[node], missingServedAttempts[node], "Cannot open complete served sequence file " + fileName
+                                             + describeServedFile(MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.fileSize, observedSize, piece.file, observedNumber, lastError));
+                        break;
+                    }
+                    if (receivedEntries.size() < piece.size) {
+                        receivedEntries.resize(piece.size);
+                    }
+                    // the parts keep their errors
+                    size_t partCount = (piece.size + BatchReader::MAX_READ_REQUEST_SIZE - 1) / BatchReader::MAX_READ_REQUEST_SIZE;
+                    std::vector<int> readErrors(partCount, 0);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(serviceThreads)
+                    for (size_t part = 0; part < partCount; part++) {
+                        size_t offset = part * BatchReader::MAX_READ_REQUEST_SIZE;
+                        int partError;
+                        if (MMseqsNode::tryPreadAll(fd, receivedEntries.data() + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, piece.size - offset), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.offset + offset, partError) == false) {
+                            readErrors[part] = (partError != 0) ? partError : -1;
+                        }
+                    }
+                    int readError = 0;
+                    for (size_t part = 0; part < partCount; part++) {
+                        readError = (readErrors[part] != 0) ? readErrors[part] : readError;
+                    }
+                    MMseqsNode::releaseExchangeCopy(fd);
+                    int closeError = (close(fd) != 0) ? errno : 0;
+                    readingSeconds += readTimer.getTimediff();
+                    int error = (readError > 0) ? readError : closeError;
+                    if (error != 0 && error != ESTALE && error != EINTR && error != EIO) {
+                        Debug(Debug::ERROR) << "Cannot read served sequence file " << fileName << ": " << strerror(error) << "\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    if (readError != 0 || closeError != 0) {
+                        failIfMissingTooLong(missingServedSince[node], missingServedAttempts[node], "Cannot read complete served sequence file " + fileName + " (error " + SSTR(error) + ")\n");
+                        break;
+                    }
+                    missingServedAttempts[node] = 0;
+                    FetchedSequences *sequences = request.sequences;
+                    size_t firstKey = sequences->fetchSourceKeyOffsets[node] + request.receivedKeys[node];
+                    Timer unpackTimer;
+                    unpackEntries(receivedEntries.data(), piece.keyCount, sequences->entryOffsets.data() + firstKey, sequences->entries, serviceThreads);
+                    unpackSeconds += unpackTimer.getTimediff();
+                    for (size_t key = firstKey; key < firstKey + piece.keyCount; key++) {
+                        receivedEntrySize += (sequences->entries[sequences->entryOffsets[key]] != '\0') ? sequences->entryOffsets[key + 1] - sequences->entryOffsets[key] : 0;
+                    }
+                    request.receivedKeys[node] += piece.keyCount;
+                    request.receivedPieces[node]++;
+                    receivedPieceCount++;
+                    receivedServedEntriesSize += piece.size;
+                    servedProgressSeconds[node] = fastReadSeconds;
+                    nextServedProgressReads[node] = serviceTimer.getTimediff() + fastReadSeconds;
+                    hasWorked = true;
+                }
+            }
+        }
+        for (size_t i = 0; i < ownRequests.size(); i++) {
+            SequenceRequest &request = ownRequests[i];
+            bool isComplete = request.isComplete == false;
+            for (unsigned int node = 0; node < nodes && isComplete; node++) {
+                isComplete = node == rank || request.receivedKeys[node] == request.sequences->fetchSourceKeyOffsets[node + 1] - request.sequences->fetchSourceKeyOffsets[node];
+            }
+            if (isComplete) {
+                request.isComplete = true;
+                MMseqsNode::removeExchangeFile(requests + "/" + SSTR(rank) + "." + SSTR(request.number), request.number);
+                deleteCount++;
+                hasWorked = true;
+            }
+        }
+        for (; ownRequests.empty() == false && ownRequests.front().isComplete; receivedRequestCount++) {
+            ownRequests.pop_front();
+            isRequestProgressChanged = true;
+        }
+        // the requests not received yet with the code offsets of all nodes
+        if (isRequestProgressChanged && alignNodeCount > 1) {
+            std::string content = SSTR(requestCount) + "\t" + SSTR(receivedRequestCount) + "\t" + SSTR(isLastRequested ? 1 : 0) + "\n";
+            for (size_t i = 0; i < ownRequests.size(); i++) {
+                content += SSTR(ownRequests[i].number) + "\t" + SSTR(ownRequests[i].size);
+                for (unsigned int node = 0; node <= nodes; node++) {
+                    content += "\t" + SSTR(ownRequests[i].codeOffsets[node]);
+                }
+                content += "\n";
+            }
+            MMseqsNode::publishRunFile(requestProgress, content);
+            objectWriteCount++;
+        }
+        // the keys of this node while the other nodes serve the new requests, in fetch order
+        if (passRequestCount > 0) {
+            {
+                std::lock_guard<std::mutex> lock(serviceMutex);
+                ownKeyRequests.insert(ownKeyRequests.end(), requestedFetches.end() - passRequestCount, requestedFetches.end());
+            }
+            serviceCondition.notify_all();
+            // one loader for all fetches: a thread that read with io_uring takes seconds to exit
+            if (ownKeyLoader.joinable() == false) {
+                ownKeyLoader = std::thread([&]() {
+#ifdef OPENMP
+                    omp_set_num_threads(1);
+#endif
+                    for (bool isLast = false; isLast == false;) {
+                        FetchedSequences *request;
+                        {
+                            std::unique_lock<std::mutex> lock(serviceMutex);
+                            serviceCondition.wait(lock, [&]() { return ownKeyRequests.empty() == false; });
+                            request = ownKeyRequests.front();
+                        }
+                        size_t ownKey = request->fetchSourceKeyOffsets[rank];
+                        copyEntries(request->keys.data() + ownKey, request->fetchSourceKeyOffsets[rank + 1] - ownKey, request->entryOffsets.data() + ownKey, request->entries, NULL);
+                        isLast = request->isLast;
+                        {
+                            std::lock_guard<std::mutex> lock(serviceMutex);
+                            ownKeyRequests.pop_front();
+                            request->isOwnKeysLoaded = true;
+                            hasServiceWork = true;
+                        }
+                        serviceCondition.notify_all();
+                    }
+                });
+            }
+        }
+        // a fetch goes to the aligning threads once its keys are loaded and its request is received; the requests of the earlier fetches are gone
+        while (requestedFetches.empty() == false && (ownRequests.empty() || ownRequests.front().sequences != requestedFetches.front())) {
+            {
+                std::lock_guard<std::mutex> lock(serviceMutex);
+                if (requestedFetches.front()->isOwnKeysLoaded == false) {
+                    break;
+                }
+                requestedFetches.front()->isReady = true;
+            }
+            serviceCondition.notify_all();
+            requestedFetches.pop_front();
+            completedFetchCount++;
+            hasWorked = true;
+        }
+        return hasWorked;
+    };
+    // a pass over the requests of the other nodes
+    const auto serveSequences = [&]() {
+        bool hasWorked = false;
+        // the progress of a node is read at once when the names hold a request it did not show yet
+        if (serviceTimer.getTimediff() >= nextRequestListing) {
+            nextRequestListing = serviceTimer.getTimediff() + std::max(BATCH_READ_SECONDS, (nodes - 1.0) / PROGRESS_READS_PER_SECOND) / 4.0;
+            MMseqsNode::listDirectory(requests, requestNames);
+            requestListingCount++;
+            for (size_t i = 0; i < requestNames.size(); i++) {
+                const char *name = requestNames[i].c_str();
+                const char *number = strchr(name, '.');
+                size_t node = Util::fast_atoi<size_t>(name);
+                if (number != NULL && number != name && node < nodes && Util::fast_atoi<size_t>(number + 1) >= requesters[node].requestCount) {
+                    requesters[node].nextProgressRead = 0;
+                }
+            }
+        }
+        // a piece a pass for each requesting node
+        isServing = false;
+        size_t passEntrySize = 0;
+        size_t passKeyCount = 0;
+        unsigned int deferredRequester = UINT_MAX;
+        for (unsigned int i = 0; i < nodes; i++) {
+            unsigned int node = (firstRequester + i) % nodes;
+            Requester &requester = requesters[node];
+            if (requester.isDone) {
+                continue;
+            }
+            if (serviceTimer.getTimediff() >= requester.nextProgressRead) {
+                Timer pollTimer;
+                std::string content;
+                requester.nextProgressRead = serviceTimer.getTimediff() + progressSeconds;
+                progressReadCount++;
+                requestProgressReadCount++;
+                bool hasProgress = MMseqsNode::readRunFile(requests + "." + SSTR(node) + ".progress", content);
+                pollingSeconds += pollTimer.getTimediff();
+                if (hasProgress) {
+                    char *line = &content[0];
+                    const char *columns[3];
+                    if (Util::getWordsOfLine(line, columns, 3) < 3) {
+                        Debug(Debug::ERROR) << "Cannot read " << requests << "." << node << ".progress\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    size_t count = Util::fast_atoi<size_t>(columns[0]);
+                    size_t received = Util::fast_atoi<size_t>(columns[1]);
+                    bool isLast = Util::fast_atoi<size_t>(columns[2]) != 0;
+                    requestProgressChangeCount += count != requester.requestCount || received != requester.receivedCount || isLast != requester.isLast;
+                    requester.requestCount = count;
+                    requester.receivedCount = received;
+                    requester.isLast = isLast;
+                    // a received request was served, also one without keys of this node
+                    requester.servedCount = std::max(requester.servedCount, received);
+                    // per open request: number, size and the codes of this node
+                    requester.openRequests.clear();
+                    for (line = Util::skipLine(line); *line != '\0'; line = Util::skipLine(line)) {
+                        Util::getWordsOfLine(line, requestColumns.data(), nodes + 3);
+                        requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[0]));
+                        requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[1]));
+                        requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[2 + rank]));
+                        requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[3 + rank]));
+                    }
+                    // the pieces of the received requests go, a served file with its last piece
+                    size_t keptPieces = 0;
+                    for (size_t j = 0; j < requester.pieces.size(); j++) {
+                        const ServedPiece &piece = requester.pieces[j];
+                        if (piece.request < received) {
+                            if (--filePieceCounts[piece.file] == 0) {
+                                MMseqsNode::removeExchangeFile(getServedFile(rank, piece.file), piece.file);
+                                deleteCount++;
+                                liveServedSize -= piece.fileSize;
+                            }
+                            isServedProgressChanged = true;
+                        } else {
+                            requester.pieces[keptPieces++] = piece;
+                        }
+                    }
+                    requester.pieces.resize(keptPieces);
+                    requester.isDone = isLast && received == count;
+                }
+            }
+            // one piece of the next open request
+            while (requester.servedCount < requester.requestCount) {
+                size_t request = 0;
+                while (request < requester.openRequests.size() && requester.openRequests[request] != requester.servedCount) {
+                    request += 4;
+                }
+                if (request == requester.openRequests.size()) {
+                    break;
+                }
+                size_t requestSize = requester.openRequests[request + 1];
+                size_t codeBegin = requester.openRequests[request + 2];
+                size_t codeEnd = requester.openRequests[request + 3];
+                if (codeBegin == codeEnd) {
+                    requester.servedCount++;
+                    continue;
+                }
+                // a full pass leaves the rest to the next pass
+                if (passEntrySize >= servedFileEntrySize || passKeyCount >= maxServedKeys) {
+                    deferredRequester = (deferredRequester == UINT_MAX) ? node : deferredRequester;
+                    break;
+                }
+                Timer servingTimer;
+                // the codes of the next keys, a request is read in pieces
+                std::string requestFile = requests + "/" + SSTR(node) + "." + SSTR(requester.servedCount);
+                size_t observedSize;
+                uint64_t observedNumber;
+                int lastError;
+                objectReadCount++;
+                int requestFd = MMseqsNode::tryOpenExchangeFile(requestFile, requestSize, requester.servedCount, observedSize, observedNumber, lastError);
+                if (requestFd < 0 && lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EIO) {
+                    Debug(Debug::ERROR) << "Cannot open sequence request " << requestFile << ": " << strerror(lastError) << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                requestCodes.resize(std::min(codeEnd - codeBegin - requester.codePos, maxServedKeys * sizeof(DBKeyType)));
+                bool isRequestRead = requestFd >= 0 && MMseqsNode::tryPreadAll(requestFd, requestCodes.data(), requestCodes.size(), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + codeBegin + requester.codePos, lastError);
+                if (requestFd >= 0) {
+                    MMseqsNode::releaseExchangeCopy(requestFd);
+                }
+                if (requestFd >= 0 && close(requestFd) != 0 && isRequestRead) {
+                    lastError = errno;
+                    isRequestRead = false;
+                }
+                // a missing or short request is tried again in the next pass
+                if (isRequestRead == false) {
+                    servingSeconds += servingTimer.getTimediff();
+                    if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EINTR && lastError != EIO) {
+                        Debug(Debug::ERROR) << "Cannot read sequence request " << requestFile << ": " << strerror(lastError) << "\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    failIfMissingTooLong(missingRequestSince[node], missingRequestAttempts[node], "Cannot read complete sequence request " + requestFile
+                                         + describeServedFile(requestSize, observedSize, requester.servedCount, observedNumber, lastError));
+                    break;
+                }
+                missingRequestAttempts[node] = 0;
+                // only the last byte of a code is below 0x80
+                const char *codesEnd = requestCodes.data() + requestCodes.size();
+                while (codesEnd > requestCodes.data() && static_cast<unsigned char>(codesEnd[-1]) >= 0x80) {
+                    codesEnd--;
+                }
+                // the unassigned entries of at least one key, up to servedFileEntrySize bytes and maxServedKeys keys a pass
+                servedKeys.clear();
+                const char *code = requestCodes.data();
+                size_t keyRange = SIZE_MAX;
+                while (passKeyCount + servedKeys.size() < maxServedKeys && code < codesEnd) {
+                    const char *nextCode = code;
+                    DBKeyType key = requester.lastKey + Util::getPrefKey(nextCode);
+                    size_t keySize = isAssigned(key) ? 0 : seqDbr.getSeqLenFromRange(keyRange, key) + 2;
+                    if (servedKeys.empty() == false && passEntrySize + keySize > servedFileEntrySize) {
+                        break;
+                    }
+                    servedKeys.push_back(key);
+                    requester.lastKey = key;
+                    code = nextCode;
+                    passEntrySize += keySize;
+                }
+                requester.codePos += code - requestCodes.data();
+                const DBKeyType *keys = servedKeys.data();
+                size_t keyCount = servedKeys.size();
+                // the bitmap of a piece takes whole bytes
+                passKeyCount += (keyCount + 7) / 8 * 8;
+                requestOffsets.resize(keyCount + 1);
+                requestOffsets[0] = (keyCount + 7) / 8;
+#pragma omp parallel num_threads(serviceThreads)
+                {
+                    size_t servedKeyRange = SIZE_MAX;
+#pragma omp for schedule(static)
+                    for (size_t j = 0; j < keyCount; j++) {
+                        size_t packedSize = getPackedEntrySize(seqDbr.getSeqLenFromRange(servedKeyRange, keys[j]) + 2);
+                        requestOffsets[j + 1] = isAssigned(keys[j]) ? 0 : packedSize;
+                    }
+                }
+                for (size_t j = 0; j < keyCount; j++) {
+                    requestOffsets[j + 1] += requestOffsets[j];
+                }
+                size_t pieceOffset = servedFileData.size();
+                // the served file of a pass fits maxServedFileSize
+                servedFileData.reserve(maxServedFileSize);
+                servedFileData.resize(pieceOffset + requestOffsets[keyCount]);
+                // an empty slot marks an assigned key
+#pragma omp parallel for schedule(static) num_threads(serviceThreads)
+                for (size_t byte = 0; byte < requestOffsets[0]; byte++) {
+                    unsigned char bits = 0;
+                    for (size_t j = 8 * byte; j < std::min(keyCount, 8 * byte + 8); j++) {
+                        bits |= static_cast<unsigned char>(requestOffsets[j + 1] == requestOffsets[j]) << (j % 8);
+                    }
+                    servedFileData[pieceOffset + byte] = static_cast<char>(bits);
+                }
+                rawKeys.clear();
+                copyEntries(keys, keyCount, requestOffsets.data(), servedFileData.data() + pieceOffset, &rawKeys);
+                size_t pieceSize = requestOffsets[keyCount];
+                requestOffsets.resize(rawKeys.size() + 1);
+                requestOffsets[0] = 0;
+                size_t rawKeyRange = SIZE_MAX;
+                for (size_t j = 0; j < rawKeys.size(); j++) {
+                    requestOffsets[j + 1] = requestOffsets[j] + seqDbr.getSeqLenFromRange(rawKeyRange, rawKeys[j]) + 2;
+                }
+                servedFileData.resize(pieceOffset + pieceSize + requestOffsets[rawKeys.size()]);
+                copyEntries(rawKeys.data(), rawKeys.size(), requestOffsets.data(), servedFileData.data() + pieceOffset + pieceSize, NULL);
+                pieceSize += requestOffsets[rawKeys.size()];
+                size_t entryRange = SIZE_MAX;
+                for (size_t j = 0; j < keyCount; j++) {
+                    servedEntrySize += isAssigned(keys[j]) ? 0 : seqDbr.getSeqLenFromRange(entryRange, keys[j]) + 2;
+                }
+                servingSeconds += servingTimer.getTimediff();
+                ServedPiece piece = { requester.servedCount, requester.piece, servedFileCount, 0, pieceOffset, pieceSize, keyCount };
+                passPieces.push_back(std::make_pair(node, piece));
+                servedSize += pieceSize;
+                requesterServedSizes[node] += pieceSize;
+                servedPieceCount++;
+                requester.piece++;
+                if (requester.codePos == codeEnd - codeBegin) {
+                    requester.codePos = 0;
+                    requester.lastKey = 0;
+                    requester.piece = 0;
+                    requester.servedCount++;
+                }
+                hasWorked = true;
+                break;
+            }
+            isServing |= requester.isDone == false;
+        }
+        firstRequester = (deferredRequester == UINT_MAX) ? firstRequester : deferredRequester;
+        if (passPieces.empty() == false) {
+            Timer writeTimer;
+            MMseqsNode::writeExchangeFile(getServedFile(rank, servedFileCount), servedFileCount, servedFileData.data(), servedFileData.size(), "", std::vector<uint64_t>(), serviceThreads);
+            servedFileWriteSeconds += writeTimer.getTimediff();
+            for (size_t j = 0; j < passPieces.size(); j++) {
+                passPieces[j].second.fileSize = servedFileData.size();
+                requesters[passPieces[j].first].pieces.push_back(passPieces[j].second);
+            }
+            filePieceCounts.push_back(passPieces.size());
+            maxPassPieceCount = std::max(maxPassPieceCount, passPieces.size());
+            liveServedSize += servedFileData.size();
+            maxLiveServedSize = std::max(maxLiveServedSize, liveServedSize);
+            passPieces.clear();
+            servedFileData.clear();
+            servedFileCount++;
+            objectWriteCount++;
+            isServedProgressChanged = true;
+        }
+        // the pieces not yet deleted, per requester
+        if (isServedProgressChanged) {
+            std::string content;
+            for (unsigned int node = 0; node < nodes; node++) {
+                for (size_t i = 0; i < requesters[node].pieces.size(); i++) {
+                    const ServedPiece &piece = requesters[node].pieces[i];
+                    content += SSTR(node) + "\t" + SSTR(piece.request) + "\t" + SSTR(piece.piece) + "\t" + SSTR(piece.file) + "\t" + SSTR(piece.fileSize)
+                               + "\t" + SSTR(piece.offset) + "\t" + SSTR(piece.size) + "\t" + SSTR(piece.keyCount) + "\n";
+                }
+            }
+            MMseqsNode::publishRunFile(servedProgress, content);
+            objectWriteCount++;
+            isServedProgressChanged = false;
+        }
+        return hasWorked;
+    };
     std::thread serviceThread;
     if (isAligningNode) {
         serviceThread = std::thread([&]() {
 #ifdef OPENMP
             omp_set_num_threads(1);
 #endif
-            // own request: code offsets per node, pieces and keys received per node
-            struct SequenceRequest {
-                FetchedSequences *sequences;
-                size_t number;
-                size_t size;
-                std::vector<size_t> codeOffsets;
-                std::vector<size_t> receivedPieces;
-                std::vector<size_t> receivedKeys;
-                bool isComplete;
-            };
-            std::deque<SequenceRequest> ownRequests;
-            size_t receivedRequestCount = 0;
-            bool isLastRequested = false;
-            // the requested fetches become ready in selection order
-            std::deque<FetchedSequences *> requestedFetches;
-            std::vector<char> requestCodes;
-            // piece of a served file: request, piece of the request, served file and its size, offset, bytes, keys
-            struct ServedPiece {
-                size_t request;
-                size_t piece;
-                size_t file;
-                size_t fileSize;
-                size_t offset;
-                size_t size;
-                size_t keyCount;
-            };
-            std::vector<double> nextServedProgressReads(nodes, 0);
-            // seconds to the next read of a node that owes a request, doubled up to progressSeconds while it has not served
-            std::vector<double> servedProgressSeconds(nodes, BATCH_READ_SECONDS);
-            // the nodes that owe are read at half of PROGRESS_READS_PER_SECOND until fastReadEnd
-            double fastReadSeconds = BATCH_READ_SECONDS;
-            double fastReadEnd = 0;
-            double nextRequestListing = 0;
-            double nextServedListing = 0;
-            // the master progress while the gate is closed, about as often as before the faster polls
-            double nextGateRead = 0;
-            std::vector<std::string> requestNames;
-            std::vector<std::string> servedNames;
-            // one past the newest served file of a node in the last listing and in its progress
-            std::vector<size_t> listedServedFileCounts(nodes, 0);
-            std::vector<size_t> progressServedFileCounts(nodes, 0);
-            std::vector<std::vector<ServedPiece> > servedPieces(nodes);
-            // requesting node: progress, code range of this node per open request, codes served so far, pieces not yet deleted
-            struct Requester {
-                Requester() : requestCount(0), receivedCount(0), isLast(false), isDone(false), nextProgressRead(0), servedCount(0), codePos(0), lastKey(0), piece(0) {}
-                size_t requestCount;
-                size_t receivedCount;
-                bool isLast;
-                bool isDone;
-                double nextProgressRead;
-                std::vector<size_t> openRequests;
-                size_t servedCount;
-                size_t codePos;
-                DBKeyType lastKey;
-                size_t piece;
-                std::vector<ServedPiece> pieces;
-            };
-            std::vector<Requester> requesters(nodes);
-            size_t requesterCount = 0;
-            for (unsigned int node = 0; node < nodes; node++) {
-                requesters[node].isDone = node == rank || node < alignGroupNodeBegin || node >= alignGroupNodeEnd;
-                requesterCount += requesters[node].isDone == false;
-            }
-            // seconds between two reads of the progress file of a node
-            const double progressSeconds = std::max(BATCH_READ_SECONDS, 2.0 * requesterCount / PROGRESS_READS_PER_SECOND);
-            std::vector<const char *> requestColumns(nodes + 3);
-            bool isServedProgressChanged = false;
-            std::vector<char> receivedEntries;
-            std::vector<DBKeyType> servedKeys;
-            std::vector<DBKeyType> rawKeys;
-            std::vector<size_t> requestOffsets;
-            // the pieces of a pass in one served file
-            std::vector<char> servedFileData;
-            std::vector<std::pair<unsigned int, ServedPiece> > passPieces;
-            std::vector<size_t> filePieceCounts;
-            // the next pass starts with the first requester left out of a full served file
-            unsigned int firstRequester = rank + 1;
-            // a thread loads the keys of this node while the service thread serves and receives
-            std::thread ownKeyLoader;
-            std::deque<FetchedSequences *> ownKeyRequests;
-            // the served files of an align node and the requests of a requester fail on their own
-            std::vector<time_t> missingServedSince(nodes, 0);
-            std::vector<unsigned int> missingServedAttempts(nodes, 0);
-            std::vector<time_t> missingRequestSince(nodes, 0);
-            std::vector<unsigned int> missingRequestAttempts(nodes, 0);
-            std::string requestProgress = requests + "." + SSTR(rank) + ".progress";
-            std::string servedProgress = served + "." + SSTR(rank) + ".progress";
-            const auto getServedFile = [&](unsigned int alignNode, size_t file) {
-                return served + "/" + SSTR(alignNode) + "." + SSTR(file);
-            };
-            MMseqsNode::WaitWarning waitWarning;
-            time_t assignedKeysReadTime = 0;
-            // the sleeps by their one reason: an owed request, the master gate, no fetch of the aligning threads, else
-            const char *idleReasons[] = { "owed", "gate", "no request", "other" };
-            double idleSeconds[4] = { 0, 0, 0, 0 };
-            size_t idleCounts[4] = { 0, 0, 0, 0 };
-            size_t completedFetchCount = 0;
-            double statusPackSeconds = 0;
-            double nextStatusTime = STATUS_SECONDS;
-            // the gate key of the newest fetch
-            size_t frontRepKey = orderKeyEnd;
-            size_t gateSlackKeys = 0;
-            size_t gateSlackWindows = 0;
-            double gateSlackTime = 0;
-            const auto printStatus = [&]() {
-                const double now = serviceTimer.getTimediff();
-                std::string value = "done rep key " + SSTR(publishedDoneRepKey.load()) + ", " + SSTR(completedFetchCount) + " fetches, " + SSTR(requestCount) + " requests";
-                {
-                    std::lock_guard<std::mutex> lock(serviceMutex);
-                    value += "; waiting for the sequences " + formatSeconds(sequenceWaitSeconds) + ", the master " + formatSeconds(waitSeconds);
-                }
-                double idleSum = 0;
-                std::string idle;
-                for (size_t i = 0; i < 4; i++) {
-                    idleSum += idleSeconds[i];
-                    idle += std::string((i > 0) ? ", " : "") + idleReasons[i] + " " + formatSeconds(idleSeconds[i]) + " in " + SSTR(idleCounts[i]) + " sleeps";
-                }
-                value += "; service idle " + formatSeconds(idleSum) + " of " + formatSeconds(now) + ": " + idle;
-                // the own key loader packs too, a status does not wait for it
-                {
-                    std::unique_lock<std::mutex> sourceLock(sourceMutex, std::try_to_lock);
-                    statusPackSeconds = sourceLock.owns_lock() ? packSeconds : statusPackSeconds;
-                }
-                value += "; service: serving " + formatSeconds(servingSeconds) + ", packing " + formatSeconds(statusPackSeconds) + ", writing served files " + formatSeconds(servedFileWriteSeconds)
-                         + ", reading served entries " + formatSeconds(readingSeconds) + ", polling " + formatSeconds(pollingSeconds);
-                value += "; gate slack " + SSTR(gateSlackKeys) + " keys and " + SSTR(gateSlackWindows) + " windows, at most " + SSTR(maxGateSlackKeys) + " keys and " + SSTR(maxGateSlackWindows) + " windows";
-                size_t processThreads;
-                size_t ringWorkers;
-                countProcessThreads(processThreads, ringWorkers);
-                threadSampleCount++;
-                maxProcessThreads = std::max(maxProcessThreads, processThreads);
-                maxThreadsBesidesRingWorkers = std::max(maxThreadsBesidesRingWorkers, processThreads - ringWorkers);
-                value += "; process threads (incl. io_uring workers) " + SSTR(processThreads) + ", " + SSTR(ringWorkers) + " io_uring workers, --threads " + SSTR(par.threads);
-                std::string status;
-                MMseqsNode::addPhaseValue(status, "Align node status after " + SSTR(static_cast<size_t>(now)) + " s", value);
-                MMseqsNode::printPhaseValues(status);
-            };
             for (unsigned int polls = 0;;) {
-                bool hasWorked = false;
-                // the slack since the last pass
-                const double slackTime = serviceTimer.getTimediff();
-                if (frontRepKey < orderKeyEnd) {
-                    const size_t clusteredKey = std::min<size_t>(frontRepKey, __atomic_load_n(&clusteredOrderKey, __ATOMIC_RELAXED));
-                    gateSlackKeys = frontRepKey - clusteredKey;
-                    gateSlackWindows = getWindowPosition(windowFirstKeys, paddedDbSize, frontRepKey) - getWindowPosition(windowFirstKeys, paddedDbSize, clusteredKey);
-                    maxGateSlackKeys = std::max(maxGateSlackKeys, gateSlackKeys);
-                    maxGateSlackWindows = std::max(maxGateSlackWindows, gateSlackWindows);
-                    gateSlackSeconds += slackTime - gateSlackTime;
-                    gateSlackKeySeconds += (slackTime - gateSlackTime) * gateSlackKeys;
-                    gateSlackWindowSeconds += (slackTime - gateSlackTime) * gateSlackWindows;
-                }
-                gateSlackTime = slackTime;
-                // keep the bits of the served keys current
-                time_t passTime = time(NULL);
-                if (passTime - assignedKeysReadTime >= READ_SECONDS) {
-                    std::unique_lock<std::mutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
-                    if (assignedKeysLock.owns_lock()) {
-                        readAssignedKeys(false);
-                        assignedKeysReadTime = passTime;
-                    }
-                }
-                bool isRequestProgressChanged = false;
                 {
                     std::lock_guard<std::mutex> lock(serviceMutex);
                     hasServiceWork = false;
                 }
-                // request the handed-off fetches in order while the master is close enough behind
-                size_t passRequestCount = 0;
-                bool isGated = false;
-                while (isGated == false) {
-                    FetchedSequences *nextRequest = NULL;
-                    size_t nextAcceptedSize = 0;
-                    {
-                        std::lock_guard<std::mutex> lock(serviceMutex);
-                        if (handedOffFetches.empty() == false) {
-                            nextRequest = handedOffFetches.front();
-                            nextAcceptedSize = nextRequest->acceptedSize;
-                        }
-                    }
-                    if (nextRequest == NULL) {
-                        break;
-                    }
-                    bool isLast = nextRequest->isLast;
-                    // a fetch without records and pending pairs logs nothing, so it never waits; the pairs the aligning fetch adds come from it
-                    bool canWait = isLast == false && (nextRequest->end > nextRequest->begin || nextRequest->pendingPairCount > 0);
-                    bool isAhead;
-                    {
-                        std::lock_guard<std::mutex> assignedKeysLock(assignedKeysMutex);
-                        size_t repKey = std::min(nextRequest->firstPendingRepKey, getFirstRepKey(*nextRequest));
-                        frontRepKey = repKey;
-                        if (canWait && repKey > clusteredOrderKey && nextAcceptedSize >= clusteredAcceptedSize + maxUnclusteredAcceptedSize && serviceTimer.getTimediff() >= nextGateRead) {
-                            nextGateRead = serviceTimer.getTimediff() + BATCH_READ_SECONDS / 2;
-                            readAssignedKeys(true);
-                        }
-                        isAhead = canWait && repKey > clusteredOrderKey && nextAcceptedSize >= clusteredAcceptedSize + maxUnclusteredAcceptedSize;
-                    }
-                    {
-                        std::lock_guard<std::mutex> lock(serviceMutex);
-                        isWaitingForMaster = isAhead;
-                        if (isAhead == false) {
-                            handedOffFetches.pop_front();
-                        }
-                    }
-                    isGated = isAhead;
-                    if (isAhead == false) {
-                        // the keys of a node ascend, so a request holds their gaps
-                        SequenceRequest request;
-                        request.sequences = nextRequest;
-                        request.number = requestCount;
-                        request.codeOffsets.assign(nodes + 1, 0);
-                        requestCodes.clear();
-                        for (unsigned int node = 0; node < nodes; node++) {
-                            request.codeOffsets[node] = requestCodes.size();
-                            size_t keyBegin = nextRequest->fetchSourceKeyOffsets[node];
-                            size_t keyEnd = (node != rank) ? nextRequest->fetchSourceKeyOffsets[node + 1] : keyBegin;
-                            for (size_t i = keyBegin; i < keyEnd; i++) {
-                                char code[10];
-                                size_t codeSize = Util::putPrefKey(code, nextRequest->keys[i] - ((i > keyBegin) ? nextRequest->keys[i - 1] : 0));
-                                requestCodes.insert(requestCodes.end(), code, code + codeSize);
-                                requestedEntrySize += nextRequest->entryOffsets[i + 1] - nextRequest->entryOffsets[i];
-                            }
-                        }
-                        request.codeOffsets[nodes] = requestCodes.size();
-                        // a fetch without keys of other nodes has no request
-                        if (requestCodes.empty() == false) {
-                            MMseqsNode::writeExchangeFile(requests + "/" + SSTR(rank) + "." + SSTR(request.number), request.number, requestCodes.data(), requestCodes.size(), "", std::vector<uint64_t>(), 1);
-                            request.size = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + requestCodes.size();
-                            request.receivedPieces.assign(nodes, 0);
-                            request.receivedKeys.assign(nodes, 0);
-                            request.isComplete = false;
-                            ownRequests.push_back(request);
-                            size_t owedCount = 0;
-                            for (unsigned int node = 0; node < nodes; node++) {
-                                owedCount += request.codeOffsets[node + 1] > request.codeOffsets[node];
-                            }
-                            fastReadSeconds = std::max(0.01, 2.0 * owedCount / PROGRESS_READS_PER_SECOND);
-                            fastReadEnd = serviceTimer.getTimediff() + BATCH_READ_SECONDS;
-                            std::fill(servedProgressSeconds.begin(), servedProgressSeconds.end(), fastReadSeconds);
-                            std::fill(nextServedProgressReads.begin(), nextServedProgressReads.end(), serviceTimer.getTimediff() + fastReadSeconds);
-                            requestCount++;
-                            objectWriteCount++;
-                            isRequestProgressChanged = true;
-                        }
-                        isRequestProgressChanged |= isLast;
-                        isLastRequested = isLast;
-                        requestedFetches.push_back(nextRequest);
-                        passRequestCount++;
-                        hasWorked = true;
-                    }
-                }
-                // the progress of an owed node is read at once when the names hold a served file it did not show yet
-                bool isServedListed = ownRequests.empty() == false && serviceTimer.getTimediff() >= nextServedListing;
-                if (isServedListed) {
-                    nextServedListing = serviceTimer.getTimediff() + std::max(BATCH_READ_SECONDS, (nodes - 1.0) / PROGRESS_READS_PER_SECOND) / 4.0;
-                    MMseqsNode::listDirectory(served, servedNames);
-                    servedListingCount++;
-                    std::fill(listedServedFileCounts.begin(), listedServedFileCounts.end(), 0);
-                    for (size_t i = 0; i < servedNames.size(); i++) {
-                        const char *name = servedNames[i].c_str();
-                        const char *number = strchr(name, '.');
-                        size_t node = Util::fast_atoi<size_t>(name);
-                        if (number != NULL && number != name && node < nodes) {
-                            listedServedFileCounts[node] = std::max(listedServedFileCounts[node], Util::fast_atoi<size_t>(number + 1) + 1);
-                        }
-                    }
-                }
-                // receive from the nodes that owe a request
-                for (unsigned int node = 0; node < nodes; node++) {
-                    bool isOwed = false;
-                    for (size_t i = 0; i < ownRequests.size() && isOwed == false; i++) {
-                        isOwed = node != rank && ownRequests[i].receivedKeys[node] < ownRequests[i].sequences->fetchSourceKeyOffsets[node + 1] - ownRequests[i].sequences->fetchSourceKeyOffsets[node];
-                    }
-                    if (isOwed && isServedListed && listedServedFileCounts[node] > progressServedFileCounts[node] && serviceTimer.getTimediff() < nextServedProgressReads[node]) {
-                        nextServedProgressReads[node] = 0;
-                        servedListingReadCount++;
-                    }
-                    if (isOwed == false || serviceTimer.getTimediff() < nextServedProgressReads[node]) {
-                        continue;
-                    }
-                    Timer pollTimer;
-                    std::string content;
-                    nextServedProgressReads[node] = serviceTimer.getTimediff() + servedProgressSeconds[node];
-                    if (serviceTimer.getTimediff() >= fastReadEnd) {
-                        servedProgressSeconds[node] = std::min(2.0 * servedProgressSeconds[node], progressSeconds);
-                    }
-                    progressReadCount++;
-                    bool hasProgress = MMseqsNode::readRunFile(served + "." + SSTR(node) + ".progress", content);
-                    pollingSeconds += pollTimer.getTimediff();
-                    if (hasProgress) {
-                        servedPieces[node].clear();
-                        for (char *line = &content[0]; *line != '\0'; line = Util::skipLine(line)) {
-                            const char *columns[8];
-                            if (Util::getWordsOfLine(line, columns, 8) != 8) {
-                                continue;
-                            }
-                            // the files of all requesters, a listed file without a piece of this node moves up one read only
-                            progressServedFileCounts[node] = std::max(progressServedFileCounts[node], Util::fast_atoi<size_t>(columns[3]) + 1);
-                            if (Util::fast_atoi<size_t>(columns[0]) == rank) {
-                                ServedPiece piece = { Util::fast_atoi<size_t>(columns[1]), Util::fast_atoi<size_t>(columns[2]), Util::fast_atoi<size_t>(columns[3]), Util::fast_atoi<size_t>(columns[4]),
-                                                      Util::fast_atoi<size_t>(columns[5]), Util::fast_atoi<size_t>(columns[6]), Util::fast_atoi<size_t>(columns[7]) };
-                                servedPieces[node].push_back(piece);
-                            }
-                        }
-                    }
-                    for (size_t i = 0; i < ownRequests.size(); i++) {
-                        SequenceRequest &request = ownRequests[i];
-                        for (size_t j = 0; j < servedPieces[node].size(); j++) {
-                            const ServedPiece &piece = servedPieces[node][j];
-                            if (piece.request != request.number || piece.piece != request.receivedPieces[node]) {
-                                continue;
-                            }
-                            // the next piece from its served file, a failed read is tried again after the next progress read
-                            std::string fileName = getServedFile(node, piece.file);
-                            size_t observedSize;
-                            uint64_t observedNumber;
-                            int lastError;
-                            Timer readTimer;
-                            objectReadCount++;
-                            int fd = MMseqsNode::tryOpenExchangeFile(fileName, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.fileSize, piece.file, observedSize, observedNumber, lastError);
-                            if (fd < 0) {
-                                readingSeconds += readTimer.getTimediff();
-                                if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EIO) {
-                                    Debug(Debug::ERROR) << "Cannot open served sequence file " << fileName << ": " << strerror(lastError) << "\n";
-                                    EXIT(EXIT_FAILURE);
-                                }
-                                failIfMissingTooLong(missingServedSince[node], missingServedAttempts[node], "Cannot open complete served sequence file " + fileName
-                                                     + describeServedFile(MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.fileSize, observedSize, piece.file, observedNumber, lastError));
-                                break;
-                            }
-                            if (receivedEntries.size() < piece.size) {
-                                receivedEntries.resize(piece.size);
-                            }
-                            // the parts keep their errors
-                            size_t partCount = (piece.size + BatchReader::MAX_READ_REQUEST_SIZE - 1) / BatchReader::MAX_READ_REQUEST_SIZE;
-                            std::vector<int> readErrors(partCount, 0);
-#pragma omp parallel for schedule(dynamic, 1) num_threads(serviceThreads)
-                            for (size_t part = 0; part < partCount; part++) {
-                                size_t offset = part * BatchReader::MAX_READ_REQUEST_SIZE;
-                                int partError;
-                                if (MMseqsNode::tryPreadAll(fd, receivedEntries.data() + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, piece.size - offset), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.offset + offset, partError) == false) {
-                                    readErrors[part] = (partError != 0) ? partError : -1;
-                                }
-                            }
-                            int readError = 0;
-                            for (size_t part = 0; part < partCount; part++) {
-                                readError = (readErrors[part] != 0) ? readErrors[part] : readError;
-                            }
-                            MMseqsNode::releaseExchangeCopy(fd);
-                            int closeError = (close(fd) != 0) ? errno : 0;
-                            readingSeconds += readTimer.getTimediff();
-                            int error = (readError > 0) ? readError : closeError;
-                            if (error != 0 && error != ESTALE && error != EINTR && error != EIO) {
-                                Debug(Debug::ERROR) << "Cannot read served sequence file " << fileName << ": " << strerror(error) << "\n";
-                                EXIT(EXIT_FAILURE);
-                            }
-                            if (readError != 0 || closeError != 0) {
-                                failIfMissingTooLong(missingServedSince[node], missingServedAttempts[node], "Cannot read complete served sequence file " + fileName + " (error " + SSTR(error) + ")\n");
-                                break;
-                            }
-                            missingServedAttempts[node] = 0;
-                            FetchedSequences *sequences = request.sequences;
-                            size_t firstKey = sequences->fetchSourceKeyOffsets[node] + request.receivedKeys[node];
-                            Timer unpackTimer;
-                            unpackEntries(receivedEntries.data(), piece.keyCount, sequences->entryOffsets.data() + firstKey, sequences->entries, serviceThreads);
-                            unpackSeconds += unpackTimer.getTimediff();
-                            for (size_t key = firstKey; key < firstKey + piece.keyCount; key++) {
-                                receivedEntrySize += (sequences->entries[sequences->entryOffsets[key]] != '\0') ? sequences->entryOffsets[key + 1] - sequences->entryOffsets[key] : 0;
-                            }
-                            request.receivedKeys[node] += piece.keyCount;
-                            request.receivedPieces[node]++;
-                            receivedPieceCount++;
-                            receivedServedEntriesSize += piece.size;
-                            servedProgressSeconds[node] = fastReadSeconds;
-                            nextServedProgressReads[node] = serviceTimer.getTimediff() + fastReadSeconds;
-                            hasWorked = true;
-                        }
-                    }
-                }
-                for (size_t i = 0; i < ownRequests.size(); i++) {
-                    SequenceRequest &request = ownRequests[i];
-                    bool isComplete = request.isComplete == false;
-                    for (unsigned int node = 0; node < nodes && isComplete; node++) {
-                        isComplete = node == rank || request.receivedKeys[node] == request.sequences->fetchSourceKeyOffsets[node + 1] - request.sequences->fetchSourceKeyOffsets[node];
-                    }
-                    if (isComplete) {
-                        request.isComplete = true;
-                        MMseqsNode::removeExchangeFile(requests + "/" + SSTR(rank) + "." + SSTR(request.number), request.number);
-                        deleteCount++;
-                        hasWorked = true;
-                    }
-                }
-                for (; ownRequests.empty() == false && ownRequests.front().isComplete; receivedRequestCount++) {
-                    ownRequests.pop_front();
-                    isRequestProgressChanged = true;
-                }
-                // the requests not received yet with the code offsets of all nodes
-                if (isRequestProgressChanged && alignNodeCount > 1) {
-                    std::string content = SSTR(requestCount) + "\t" + SSTR(receivedRequestCount) + "\t" + SSTR(isLastRequested ? 1 : 0) + "\n";
-                    for (size_t i = 0; i < ownRequests.size(); i++) {
-                        content += SSTR(ownRequests[i].number) + "\t" + SSTR(ownRequests[i].size);
-                        for (unsigned int node = 0; node <= nodes; node++) {
-                            content += "\t" + SSTR(ownRequests[i].codeOffsets[node]);
-                        }
-                        content += "\n";
-                    }
-                    MMseqsNode::publishRunFile(requestProgress, content);
-                    objectWriteCount++;
-                }
-                // the keys of this node while the other nodes serve the new requests, in fetch order
-                if (passRequestCount > 0) {
-                    {
-                        std::lock_guard<std::mutex> lock(serviceMutex);
-                        ownKeyRequests.insert(ownKeyRequests.end(), requestedFetches.end() - passRequestCount, requestedFetches.end());
-                    }
-                    serviceCondition.notify_all();
-                    // one loader for all fetches: a thread that read with io_uring takes seconds to exit
-                    if (ownKeyLoader.joinable() == false) {
-                        ownKeyLoader = std::thread([&]() {
-#ifdef OPENMP
-                            omp_set_num_threads(1);
-#endif
-                            for (bool isLast = false; isLast == false;) {
-                                FetchedSequences *request;
-                                {
-                                    std::unique_lock<std::mutex> lock(serviceMutex);
-                                    serviceCondition.wait(lock, [&]() { return ownKeyRequests.empty() == false; });
-                                    request = ownKeyRequests.front();
-                                }
-                                size_t ownKey = request->fetchSourceKeyOffsets[rank];
-                                copyEntries(request->keys.data() + ownKey, request->fetchSourceKeyOffsets[rank + 1] - ownKey, request->entryOffsets.data() + ownKey, request->entries, NULL);
-                                isLast = request->isLast;
-                                {
-                                    std::lock_guard<std::mutex> lock(serviceMutex);
-                                    ownKeyRequests.pop_front();
-                                    request->isOwnKeysLoaded = true;
-                                    hasServiceWork = true;
-                                }
-                                serviceCondition.notify_all();
-                            }
-                        });
-                    }
-                }
-                // a fetch goes to the aligning threads once its keys are loaded and its request is received; the requests of the earlier fetches are gone
-                while (requestedFetches.empty() == false && (ownRequests.empty() || ownRequests.front().sequences != requestedFetches.front())) {
-                    {
-                        std::lock_guard<std::mutex> lock(serviceMutex);
-                        if (requestedFetches.front()->isOwnKeysLoaded == false) {
-                            break;
-                        }
-                        requestedFetches.front()->isReady = true;
-                    }
-                    serviceCondition.notify_all();
-                    requestedFetches.pop_front();
-                    completedFetchCount++;
-                    hasWorked = true;
-                }
-                // the progress of a node is read at once when the names hold a request it did not show yet
-                if (serviceTimer.getTimediff() >= nextRequestListing) {
-                    nextRequestListing = serviceTimer.getTimediff() + std::max(BATCH_READ_SECONDS, (nodes - 1.0) / PROGRESS_READS_PER_SECOND) / 4.0;
-                    MMseqsNode::listDirectory(requests, requestNames);
-                    requestListingCount++;
-                    for (size_t i = 0; i < requestNames.size(); i++) {
-                        const char *name = requestNames[i].c_str();
-                        const char *number = strchr(name, '.');
-                        size_t node = Util::fast_atoi<size_t>(name);
-                        if (number != NULL && number != name && node < nodes && Util::fast_atoi<size_t>(number + 1) >= requesters[node].requestCount) {
-                            requesters[node].nextProgressRead = 0;
-                        }
-                    }
-                }
-                // a piece a pass for each requesting node
-                bool isServing = false;
-                size_t passEntrySize = 0;
-                size_t passKeyCount = 0;
-                unsigned int deferredRequester = UINT_MAX;
-                for (unsigned int i = 0; i < nodes; i++) {
-                    unsigned int node = (firstRequester + i) % nodes;
-                    Requester &requester = requesters[node];
-                    if (requester.isDone) {
-                        continue;
-                    }
-                    if (serviceTimer.getTimediff() >= requester.nextProgressRead) {
-                        Timer pollTimer;
-                        std::string content;
-                        requester.nextProgressRead = serviceTimer.getTimediff() + progressSeconds;
-                        progressReadCount++;
-                        requestProgressReadCount++;
-                        bool hasProgress = MMseqsNode::readRunFile(requests + "." + SSTR(node) + ".progress", content);
-                        pollingSeconds += pollTimer.getTimediff();
-                        if (hasProgress) {
-                            char *line = &content[0];
-                            const char *columns[3];
-                            if (Util::getWordsOfLine(line, columns, 3) < 3) {
-                                Debug(Debug::ERROR) << "Cannot read " << requests << "." << node << ".progress\n";
-                                EXIT(EXIT_FAILURE);
-                            }
-                            size_t count = Util::fast_atoi<size_t>(columns[0]);
-                            size_t received = Util::fast_atoi<size_t>(columns[1]);
-                            bool isLast = Util::fast_atoi<size_t>(columns[2]) != 0;
-                            requestProgressChangeCount += count != requester.requestCount || received != requester.receivedCount || isLast != requester.isLast;
-                            requester.requestCount = count;
-                            requester.receivedCount = received;
-                            requester.isLast = isLast;
-                            // a received request was served, also one without keys of this node
-                            requester.servedCount = std::max(requester.servedCount, received);
-                            // per open request: number, size and the codes of this node
-                            requester.openRequests.clear();
-                            for (line = Util::skipLine(line); *line != '\0'; line = Util::skipLine(line)) {
-                                Util::getWordsOfLine(line, requestColumns.data(), nodes + 3);
-                                requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[0]));
-                                requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[1]));
-                                requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[2 + rank]));
-                                requester.openRequests.push_back(Util::fast_atoi<size_t>(requestColumns[3 + rank]));
-                            }
-                            // the pieces of the received requests go, a served file with its last piece
-                            size_t keptPieces = 0;
-                            for (size_t j = 0; j < requester.pieces.size(); j++) {
-                                const ServedPiece &piece = requester.pieces[j];
-                                if (piece.request < received) {
-                                    if (--filePieceCounts[piece.file] == 0) {
-                                        MMseqsNode::removeExchangeFile(getServedFile(rank, piece.file), piece.file);
-                                        deleteCount++;
-                                        liveServedSize -= piece.fileSize;
-                                    }
-                                    isServedProgressChanged = true;
-                                } else {
-                                    requester.pieces[keptPieces++] = piece;
-                                }
-                            }
-                            requester.pieces.resize(keptPieces);
-                            requester.isDone = isLast && received == count;
-                        }
-                    }
-                    // one piece of the next open request
-                    while (requester.servedCount < requester.requestCount) {
-                        size_t request = 0;
-                        while (request < requester.openRequests.size() && requester.openRequests[request] != requester.servedCount) {
-                            request += 4;
-                        }
-                        if (request == requester.openRequests.size()) {
-                            break;
-                        }
-                        size_t requestSize = requester.openRequests[request + 1];
-                        size_t codeBegin = requester.openRequests[request + 2];
-                        size_t codeEnd = requester.openRequests[request + 3];
-                        if (codeBegin == codeEnd) {
-                            requester.servedCount++;
-                            continue;
-                        }
-                        // a full pass leaves the rest to the next pass
-                        if (passEntrySize >= servedFileEntrySize || passKeyCount >= maxServedKeys) {
-                            deferredRequester = (deferredRequester == UINT_MAX) ? node : deferredRequester;
-                            break;
-                        }
-                        Timer servingTimer;
-                        // the codes of the next keys, a request is read in pieces
-                        std::string requestFile = requests + "/" + SSTR(node) + "." + SSTR(requester.servedCount);
-                        size_t observedSize;
-                        uint64_t observedNumber;
-                        int lastError;
-                        objectReadCount++;
-                        int requestFd = MMseqsNode::tryOpenExchangeFile(requestFile, requestSize, requester.servedCount, observedSize, observedNumber, lastError);
-                        if (requestFd < 0 && lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EIO) {
-                            Debug(Debug::ERROR) << "Cannot open sequence request " << requestFile << ": " << strerror(lastError) << "\n";
-                            EXIT(EXIT_FAILURE);
-                        }
-                        requestCodes.resize(std::min(codeEnd - codeBegin - requester.codePos, maxServedKeys * sizeof(DBKeyType)));
-                        bool isRequestRead = requestFd >= 0 && MMseqsNode::tryPreadAll(requestFd, requestCodes.data(), requestCodes.size(), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + codeBegin + requester.codePos, lastError);
-                        if (requestFd >= 0) {
-                            MMseqsNode::releaseExchangeCopy(requestFd);
-                        }
-                        if (requestFd >= 0 && close(requestFd) != 0 && isRequestRead) {
-                            lastError = errno;
-                            isRequestRead = false;
-                        }
-                        // a missing or short request is tried again in the next pass
-                        if (isRequestRead == false) {
-                            servingSeconds += servingTimer.getTimediff();
-                            if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EINTR && lastError != EIO) {
-                                Debug(Debug::ERROR) << "Cannot read sequence request " << requestFile << ": " << strerror(lastError) << "\n";
-                                EXIT(EXIT_FAILURE);
-                            }
-                            failIfMissingTooLong(missingRequestSince[node], missingRequestAttempts[node], "Cannot read complete sequence request " + requestFile
-                                                 + describeServedFile(requestSize, observedSize, requester.servedCount, observedNumber, lastError));
-                            break;
-                        }
-                        missingRequestAttempts[node] = 0;
-                        // only the last byte of a code is below 0x80
-                        const char *codesEnd = requestCodes.data() + requestCodes.size();
-                        while (codesEnd > requestCodes.data() && static_cast<unsigned char>(codesEnd[-1]) >= 0x80) {
-                            codesEnd--;
-                        }
-                        // the unassigned entries of at least one key, up to servedFileEntrySize bytes and maxServedKeys keys a pass
-                        servedKeys.clear();
-                        const char *code = requestCodes.data();
-                        size_t keyRange = SIZE_MAX;
-                        while (passKeyCount + servedKeys.size() < maxServedKeys && code < codesEnd) {
-                            const char *nextCode = code;
-                            DBKeyType key = requester.lastKey + Util::getPrefKey(nextCode);
-                            size_t keySize = isAssigned(key) ? 0 : seqDbr.getSeqLenFromRange(keyRange, key) + 2;
-                            if (servedKeys.empty() == false && passEntrySize + keySize > servedFileEntrySize) {
-                                break;
-                            }
-                            servedKeys.push_back(key);
-                            requester.lastKey = key;
-                            code = nextCode;
-                            passEntrySize += keySize;
-                        }
-                        requester.codePos += code - requestCodes.data();
-                        const DBKeyType *keys = servedKeys.data();
-                        size_t keyCount = servedKeys.size();
-                        // the bitmap of a piece takes whole bytes
-                        passKeyCount += (keyCount + 7) / 8 * 8;
-                        requestOffsets.resize(keyCount + 1);
-                        requestOffsets[0] = (keyCount + 7) / 8;
-#pragma omp parallel num_threads(serviceThreads)
-                        {
-                            size_t servedKeyRange = SIZE_MAX;
-#pragma omp for schedule(static)
-                            for (size_t j = 0; j < keyCount; j++) {
-                                size_t packedSize = getPackedEntrySize(seqDbr.getSeqLenFromRange(servedKeyRange, keys[j]) + 2);
-                                requestOffsets[j + 1] = isAssigned(keys[j]) ? 0 : packedSize;
-                            }
-                        }
-                        for (size_t j = 0; j < keyCount; j++) {
-                            requestOffsets[j + 1] += requestOffsets[j];
-                        }
-                        size_t pieceOffset = servedFileData.size();
-                        // the served file of a pass fits maxServedFileSize
-                        servedFileData.reserve(maxServedFileSize);
-                        servedFileData.resize(pieceOffset + requestOffsets[keyCount]);
-                        // an empty slot marks an assigned key
-#pragma omp parallel for schedule(static) num_threads(serviceThreads)
-                        for (size_t byte = 0; byte < requestOffsets[0]; byte++) {
-                            unsigned char bits = 0;
-                            for (size_t j = 8 * byte; j < std::min(keyCount, 8 * byte + 8); j++) {
-                                bits |= static_cast<unsigned char>(requestOffsets[j + 1] == requestOffsets[j]) << (j % 8);
-                            }
-                            servedFileData[pieceOffset + byte] = static_cast<char>(bits);
-                        }
-                        rawKeys.clear();
-                        copyEntries(keys, keyCount, requestOffsets.data(), servedFileData.data() + pieceOffset, &rawKeys);
-                        size_t pieceSize = requestOffsets[keyCount];
-                        requestOffsets.resize(rawKeys.size() + 1);
-                        requestOffsets[0] = 0;
-                        size_t rawKeyRange = SIZE_MAX;
-                        for (size_t j = 0; j < rawKeys.size(); j++) {
-                            requestOffsets[j + 1] = requestOffsets[j] + seqDbr.getSeqLenFromRange(rawKeyRange, rawKeys[j]) + 2;
-                        }
-                        servedFileData.resize(pieceOffset + pieceSize + requestOffsets[rawKeys.size()]);
-                        copyEntries(rawKeys.data(), rawKeys.size(), requestOffsets.data(), servedFileData.data() + pieceOffset + pieceSize, NULL);
-                        pieceSize += requestOffsets[rawKeys.size()];
-                        size_t entryRange = SIZE_MAX;
-                        for (size_t j = 0; j < keyCount; j++) {
-                            servedEntrySize += isAssigned(keys[j]) ? 0 : seqDbr.getSeqLenFromRange(entryRange, keys[j]) + 2;
-                        }
-                        servingSeconds += servingTimer.getTimediff();
-                        ServedPiece piece = { requester.servedCount, requester.piece, servedFileCount, 0, pieceOffset, pieceSize, keyCount };
-                        passPieces.push_back(std::make_pair(node, piece));
-                        servedSize += pieceSize;
-                        requesterServedSizes[node] += pieceSize;
-                        servedPieceCount++;
-                        requester.piece++;
-                        if (requester.codePos == codeEnd - codeBegin) {
-                            requester.codePos = 0;
-                            requester.lastKey = 0;
-                            requester.piece = 0;
-                            requester.servedCount++;
-                        }
-                        hasWorked = true;
-                        break;
-                    }
-                    isServing |= requester.isDone == false;
-                }
-                firstRequester = (deferredRequester == UINT_MAX) ? firstRequester : deferredRequester;
-                if (passPieces.empty() == false) {
-                    Timer writeTimer;
-                    MMseqsNode::writeExchangeFile(getServedFile(rank, servedFileCount), servedFileCount, servedFileData.data(), servedFileData.size(), "", std::vector<uint64_t>(), serviceThreads);
-                    servedFileWriteSeconds += writeTimer.getTimediff();
-                    for (size_t j = 0; j < passPieces.size(); j++) {
-                        passPieces[j].second.fileSize = servedFileData.size();
-                        requesters[passPieces[j].first].pieces.push_back(passPieces[j].second);
-                    }
-                    filePieceCounts.push_back(passPieces.size());
-                    maxPassPieceCount = std::max(maxPassPieceCount, passPieces.size());
-                    liveServedSize += servedFileData.size();
-                    maxLiveServedSize = std::max(maxLiveServedSize, liveServedSize);
-                    passPieces.clear();
-                    servedFileData.clear();
-                    servedFileCount++;
-                    objectWriteCount++;
-                    isServedProgressChanged = true;
-                }
-                // the pieces not yet deleted, per requester
-                if (isServedProgressChanged) {
-                    std::string content;
-                    for (unsigned int node = 0; node < nodes; node++) {
-                        for (size_t i = 0; i < requesters[node].pieces.size(); i++) {
-                            const ServedPiece &piece = requesters[node].pieces[i];
-                            content += SSTR(node) + "\t" + SSTR(piece.request) + "\t" + SSTR(piece.piece) + "\t" + SSTR(piece.file) + "\t" + SSTR(piece.fileSize)
-                                       + "\t" + SSTR(piece.offset) + "\t" + SSTR(piece.size) + "\t" + SSTR(piece.keyCount) + "\n";
-                        }
-                    }
-                    MMseqsNode::publishRunFile(servedProgress, content);
-                    objectWriteCount++;
-                    isServedProgressChanged = false;
-                }
+                bool hasWorked = receiveSequences();
+                hasWorked |= serveSequences();
                 if (isLastRequested && ownRequests.empty() && requestedFetches.empty() && isServing == false) {
                     printStatus();
                     break;
