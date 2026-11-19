@@ -825,11 +825,6 @@ static const double MIN_READ_SECONDS = 0.05;
 static const double STATUS_SECONDS = 60;
 static const uint64_t ACCEPTED_REP_BIT = 1ULL << 63;
 
-// a node runs at most --threads threads, the aligning or clustering team and these I/O threads
-static int getIoThreadCount(int threads) {
-    return std::min(2, threads - 1);
-}
-
 static size_t getRepOrderKey(uint64_t word) {
     return word & ~ACCEPTED_REP_BIT;
 }
@@ -3094,7 +3089,7 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
 static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTargetsReader &repTargetsReader, TargetSplitReader *targetSplitReader,
                             const std::vector<PrefPartition> &partitions, const std::vector<PrefWindow> &windows, size_t memoryLimit, size_t masterMemoryLimit, size_t servedFileEntrySize, size_t representativeResidues,
                             size_t paddedDbSize, size_t sizeClassCount, const ClusterMemberLookup *memberLookup, ClusterMemberExchange *memberExchange,
-                            size_t memberKeyBudget, DBReader<DBKeyType> *memberDbr, AcceptedPairClustering *clustering, std::string &phaseValues) {
+                            size_t memberKeyBudget, DBReader<DBKeyType> *memberDbr, int ioThreadCount, AcceptedPairClustering *clustering, std::string &phaseValues) {
     Timer startTimer;
     const unsigned int nodes = MMseqsNode::count;
     const unsigned int rank = MMseqsNode::rank;
@@ -4766,7 +4761,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         }
     };
     std::vector<std::thread> ioThreads;
-    for (int i = 0; isAligningNode && i < getIoThreadCount(par.threads); i++) {
+    for (int i = 0; isAligningNode && i < ioThreadCount; i++) {
         ioThreads.emplace_back([&]() {
 #ifdef OPENMP
             omp_set_num_threads(1);
@@ -4945,7 +4940,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     }
                 }
                 // without I/O threads the main thread serves the other nodes, requests and receives the next fetches and, on a single node, clusters between the batches
-                if (getIoThreadCount(par.threads) == 0 && assignedKeysTimer.getTimediff() - lastServeTime >= BATCH_READ_SECONDS) {
+                if (ioThreadCount == 0 && assignedKeysTimer.getTimediff() - lastServeTime >= BATCH_READ_SECONDS) {
                     lastServeTime = assignedKeysTimer.getTimediff();
                     if (memberExchange != NULL) {
                         memberExchange->serveRequests();
@@ -5556,7 +5551,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             ioWork++;
         }
         serviceCondition.notify_all();
-        runIoLoop(getIoThreadCount(par.threads) == 0);
+        runIoLoop(ioThreadCount == 0);
         // the I/O threads may sleep before they see the end
         {
             std::lock_guard<std::mutex> lock(serviceMutex);
@@ -5729,10 +5724,6 @@ static uint64_t *readSingletonBits(const std::string &assignedBits, size_t first
 
 int align2clustLinfinity(Parameters &par) {
     Timer timer;
-    // the teams leave room for the I/O threads from the start, so that no idle pool thread of a larger team stays
-#ifdef OPENMP
-    omp_set_num_threads(par.threads - getIoThreadCount(par.threads));
-#endif
     std::string phaseValues;
     Timer phaseValueTimer;
     size_t alignNodeCount = MMseqsNode::count - MMseqsNode::getFirstAlignNode();
@@ -5820,6 +5811,16 @@ int align2clustLinfinity(Parameters &par) {
             alignGroupNodeEnd = MMseqsNode::getFirstAlignNode() + groupNodeOffsets[alignGroup + 1];
         }
     }
+    // a node runs at most --threads threads, the aligning or clustering team and its I/O threads: two where the sequences go to and come from
+    // the other nodes of the align group or where the node serves members to the align nodes besides its other I/O, else one
+    const bool isExchangingSequences = MMseqsNode::rank >= MMseqsNode::getFirstAlignNode() && alignGroupNodeEnd - alignGroupNodeBegin > 1;
+    // member requests cross the align groups, every align node but the node itself asks
+    const bool isServingMembers = par.filterCluDBFile.empty() == false && MMseqsNode::count > 1 && (MMseqsNode::isMaster() || alignNodeCount > 1);
+    const int ioThreadCount = std::min((isExchangingSequences || isServingMembers) ? 2 : 1, par.threads - 1);
+    // the teams leave room for the I/O threads from the start, so that no idle pool thread of a larger team stays
+#ifdef OPENMP
+    omp_set_num_threads(par.threads - ioThreadCount);
+#endif
     // a master that only clusters reads no sequences; with S3 the local sparse copies replace the copies
     const bool isCopyingServedBlocks = par.localTmp.empty() == false && MMseqsNode::rank >= MMseqsNode::getFirstAlignNode() && S3Client::isEnabled() == false;
     const std::vector<std::string> dataFiles = FileUtil::findDatafiles(par.db1.c_str());
@@ -5900,7 +5901,7 @@ int align2clustLinfinity(Parameters &par) {
             size_t cluCopySize = 0;
             if (cluSize > 0 && cluSize <= localTmpSize) {
                 const size_t firstCopy = localCopies.size();
-                cluPartDb = FileUtil::copyToLocalDir(par.filterCluDBFile, localDir, par.threads - getIoThreadCount(par.threads), localCopies, cluCopySize, cluFileRanges, localTmpSize);
+                cluPartDb = FileUtil::copyToLocalDir(par.filterCluDBFile, localDir, par.threads - ioThreadCount, localCopies, cluCopySize, cluFileRanges, localTmpSize);
                 if (cluCopySize < cluSize) {
                     for (size_t i = firstCopy; i < localCopies.size(); i++) {
                         FileUtil::remove(localCopies[i].c_str());
@@ -5913,7 +5914,7 @@ int align2clustLinfinity(Parameters &par) {
             size_t seqCopySize = 0;
             const size_t firstSeqCopy = localCopies.size();
             if (servedBlocks.empty() == false && localTmpSize - cluCopySize >= servedBlockOffsets[1]) {
-                localSeqDb = FileUtil::copyToLocalDir(par.db1, localDir, par.threads - getIoThreadCount(par.threads), localCopies, seqCopySize, servedFileRanges, localTmpSize - cluCopySize);
+                localSeqDb = FileUtil::copyToLocalDir(par.db1, localDir, par.threads - ioThreadCount, localCopies, seqCopySize, servedFileRanges, localTmpSize - cluCopySize);
             }
             // a block is local once all its bytes are
             const size_t localBlockCount = std::upper_bound(servedBlockOffsets.begin(), servedBlockOffsets.end(), seqCopySize) - servedBlockOffsets.begin() - 1;
@@ -6178,7 +6179,7 @@ int align2clustLinfinity(Parameters &par) {
     }
     phaseValueTimer.reset();
     // the align nodes serve the members in their I/O tasks, the master on one thread of --threads or while it waits for the align nodes
-    const bool hasMemberServer = memberExchange != NULL && MMseqsNode::count > 1 && MMseqsNode::isMaster() && getIoThreadCount(par.threads) > 0;
+    const bool hasMemberServer = memberExchange != NULL && MMseqsNode::count > 1 && MMseqsNode::isMaster() && ioThreadCount > 0;
     std::thread memberServer;
     if (hasMemberServer) {
         memberServer = std::thread([&]() {
@@ -6191,7 +6192,7 @@ int align2clustLinfinity(Parameters &par) {
     // a member key, a pending part and an accepted pair take 41 words and 5 flags of the 2 * memberSplitSize in getReservedMemory
     const size_t memberKeyBudget = std::max<size_t>(1, 2 * std::min(memoryLimit, smallestMemoryLimit) / MEMBER_SPLIT_MEMORY_DIVISOR / ((7 + 9 + 25) * sizeof(uint64_t) + 5));
     alignRepTargets(par, seqDbr, repTargetsReader, targetSplitReader, partitions, windows, memoryLimit, masterMemoryLimit, servedFileEntrySize, representativeResidues, paddedDbSize, sizeClassCount,
-                    memberLookup, memberExchange, memberKeyBudget, memberDbr, clustering, phaseValues);
+                    memberLookup, memberExchange, memberKeyBudget, memberDbr, ioThreadCount, clustering, phaseValues);
     if (clustering != NULL) {
         memberCount = clustering->finish(clusterPhaseValues);
         delete clustering;
@@ -6200,7 +6201,7 @@ int align2clustLinfinity(Parameters &par) {
     if (MMseqsNode::isMaster() && isMasterAligning == false) {
         memberCount = clusterAcceptedPairs(par.threads, dbSize, masterMemoryLimit, seqDbr, pageAlignNodes, par.clusteringMode, paddedDbSize, sizeClassCount,
                                            accepted, assignedKeysLog, clusteredLogPrefix, setCoverPrefix, assignedBits, hasMemberServer ? NULL : memberExchange,
-                                           getIoThreadCount(par.threads) - (hasMemberServer ? 1 : 0) > 0, clusterPhaseValues);
+                                           ioThreadCount - (hasMemberServer ? 1 : 0) > 0, clusterPhaseValues);
     }
     // serve until every aligning node has its members
     if (memberServer.joinable()) {
