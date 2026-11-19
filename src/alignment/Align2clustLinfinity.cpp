@@ -5013,7 +5013,7 @@ struct ClusteredLog {
 static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimit, const DBReader<DBKeyType> &seqDbr,
                                    const std::vector<unsigned int> &pageAlignNodes, int mode, size_t paddedDbSize, size_t sizeClassCount,
                                    const std::string &accepted, const std::string &assignedKeysLog, const std::string &clusteredLogPrefix, const std::string &setCoverPrefix,
-                                   const std::string &assignedBits, std::string &phaseValues) {
+                                   const std::string &assignedBits, ClusterMemberExchange *idleMemberExchange, bool hasWriterThread, std::string &phaseValues) {
     const size_t assignedWords = (dbSize + 63) / 64;
     const size_t orderKeyEnd = (sizeClassCount - 1) * paddedDbSize + dbSize;
     uint64_t *assigned = static_cast<uint64_t *>(mem_align(2 * 1024 * 1024, assignedWords * sizeof(uint64_t)));
@@ -5109,7 +5109,11 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             assignedKeyWords.swap(writtenAssignedKeys);
             assignedKeyWords.clear();
             isWritingAssignedKeys = true;
-            assignedKeysWriter = std::thread(writeAssignedKeys, clusteredOrderKey);
+            if (hasWriterThread) {
+                assignedKeysWriter = std::thread(writeAssignedKeys, clusteredOrderKey);
+            } else {
+                writeAssignedKeys(clusteredOrderKey);
+            }
         }
         Timer pollTimer;
 #pragma omp parallel for schedule(dynamic, 1)
@@ -5138,8 +5142,10 @@ static size_t clusterAcceptedPairs(int threads, size_t dbSize, size_t memoryLimi
             }
         }
         if (doneRepOrderKey <= clusteredOrderKey) {
-            // only the slowest node gates the step
-            usleep(static_cast<useconds_t>(1000000 * std::min(0.16, std::max(0.01, LOG_COST_FACTOR * pollCostSeconds))));
+            // only the slowest node gates the step; without a member server thread the members are served here
+            if (idleMemberExchange == NULL || idleMemberExchange->serveRequests() == false) {
+                usleep(static_cast<useconds_t>(1000000 * std::min(0.16, std::max(0.01, LOG_COST_FACTOR * pollCostSeconds))));
+            }
             waitWarning.check(accepted + "." + SSTR(slowestNode) + ".progress");
             waitSeconds += pollTimer.getTimediff();
             continue;
@@ -5930,7 +5936,6 @@ int align2clustLinfinity(Parameters &par) {
     size_t assignedPageCount = (MMseqsNode::rank < MMseqsNode::getFirstAlignNode()) ? 0 : pageCount;
     size_t assignedMemorySize = assignedPageCount * (ASSIGNED_PAGE_KEYS / 8) + ((assignedPageCount > 0) ? pageCount * sizeof(uint64_t *) : 0) + pageAlignNodes.size() * sizeof(unsigned int);
     const size_t memoryLimit = nodeMemoryLimit - std::min(nodeMemoryLimit, (isMasterAligning ? std::min(masterMemoryLimit, masterMemorySize) : 0) + assignedMemorySize);
-    const int clusterThreads = isMasterAligning ? std::min(par.threads, 4) : par.threads;
 
     // a clusthashfast subset has bits; its sixth index column counts the representatives for the e-values
     struct stat sb;
@@ -6076,23 +6081,24 @@ int align2clustLinfinity(Parameters &par) {
         MMseqsNode::addPhaseTime(phaseValues, "sampling the cluster index keys", phaseValueTimer);
     }
 
-    // the master clusters while the nodes align
+    // a single node clusters while it aligns
     size_t memberCount = 0;
     std::string clusterPhaseValues;
     std::thread clusterThread;
-    if (MMseqsNode::isMaster()) {
+    if (MMseqsNode::isMaster() && isMasterAligning) {
         clusterThread = std::thread([&]() {
 #ifdef OPENMP
-            omp_set_num_threads(clusterThreads);
+            omp_set_num_threads(std::min(par.threads, 4));
 #endif
-            memberCount = clusterAcceptedPairs(clusterThreads, dbSize, masterMemoryLimit, seqDbr, pageAlignNodes, par.clusteringMode, paddedDbSize, sizeClassCount,
-                                               accepted, assignedKeysLog, clusteredLogPrefix, setCoverPrefix, assignedBits, clusterPhaseValues);
+            memberCount = clusterAcceptedPairs(std::min(par.threads, 4), dbSize, masterMemoryLimit, seqDbr, pageAlignNodes, par.clusteringMode, paddedDbSize, sizeClassCount,
+                                               accepted, assignedKeysLog, clusteredLogPrefix, setCoverPrefix, assignedBits, NULL, true, clusterPhaseValues);
         });
     }
     phaseValueTimer.reset();
-    // the align nodes serve the members in their I/O tasks
+    // the align nodes serve the members in their I/O tasks, the master on one thread of --threads or while it waits for the align nodes
+    const bool hasMemberServer = memberExchange != NULL && MMseqsNode::count > 1 && MMseqsNode::isMaster() && getIoThreadCount(par.threads) > 0;
     std::thread memberServer;
-    if (memberExchange != NULL && MMseqsNode::count > 1 && MMseqsNode::isMaster()) {
+    if (hasMemberServer) {
         memberServer = std::thread([&]() {
 #ifdef OPENMP
             omp_set_num_threads(1);
@@ -6104,6 +6110,12 @@ int align2clustLinfinity(Parameters &par) {
     const size_t memberKeyBudget = std::max<size_t>(1, 2 * std::min(memoryLimit, smallestMemoryLimit) / MEMBER_SPLIT_MEMORY_DIVISOR / ((7 + 9 + 25) * sizeof(uint64_t) + 5));
     alignRepTargets(par, seqDbr, repTargetsReader, targetSplitReader, partitions, windows, memoryLimit, masterMemoryLimit, servedFileEntrySize, representativeResidues, paddedDbSize, sizeClassCount,
                     memberLookup, memberExchange, memberKeyBudget, memberDbr, phaseValues);
+    // the master of several nodes clusters with the teams of its main thread, the writer runs on a thread of --threads if one is left
+    if (MMseqsNode::isMaster() && isMasterAligning == false) {
+        memberCount = clusterAcceptedPairs(par.threads, dbSize, masterMemoryLimit, seqDbr, pageAlignNodes, par.clusteringMode, paddedDbSize, sizeClassCount,
+                                           accepted, assignedKeysLog, clusteredLogPrefix, setCoverPrefix, assignedBits, hasMemberServer ? NULL : memberExchange,
+                                           getIoThreadCount(par.threads) - (hasMemberServer ? 1 : 0) > 0, clusterPhaseValues);
+    }
     // serve until every aligning node has its members
     if (memberServer.joinable()) {
         memberServer.join();
@@ -6161,7 +6173,9 @@ int align2clustLinfinity(Parameters &par) {
     size_t clusteredSize;
     MMseqsNode::waitForLog(clusteredLogFile, clusteredKey, clusteredSize);
     if (MMseqsNode::isMaster()) {
-        clusterThread.join();
+        if (clusterThread.joinable()) {
+            clusterThread.join();
+        }
         Debug(Debug::INFO) << "Number of clusters: " << representativeCount - memberCount << "\n";
         phaseValues += clusterPhaseValues;
         std::vector<unsigned int>().swap(pageAlignNodes);
