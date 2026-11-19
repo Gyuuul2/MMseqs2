@@ -34,7 +34,6 @@ set(TESTS
         TestKsw2.cpp
         TestBestAlphabet.cpp
         TestUngappedCpuPerf.cpp
-        TestS3Client.cpp
         )
 
 

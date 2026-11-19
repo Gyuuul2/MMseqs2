@@ -110,7 +110,7 @@ static int getStorageMaxInflightRequests(StorageKind storage, int maxIoThreads) 
     }
 }
 
-BatchReader::BatchReader(int maxIoThreads, int fdToDetectStorage) : nextSplitReadRequest(0), hasRemoteReads(false), readError(0), readErrorFileName(NULL) {
+BatchReader::BatchReader(int maxIoThreads, int fdToDetectStorage) : nextSplitReadRequest(0), readError(0), readErrorFileName(NULL) {
     storage = getStorageKind(fdToDetectStorage);
     maxInflightRequests = std::max(1, std::min(getStorageMaxInflightRequests(storage, maxIoThreads), maxIoThreads));
 #ifdef HAVE_IO_URING
@@ -191,7 +191,7 @@ void BatchReader::waitAsyncRead() {
     if (ringThread.joinable()) {
         ringThread.join();
     }
-    if (ringFd >= 0 && hasRemoteReads == false) {
+    if (ringFd >= 0) {
         readWithRing(true);
     }
 #endif
@@ -210,10 +210,8 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
     waitAsyncRead();
     splitReadRequests.clear();
     nextSplitReadRequest = 0;
-    hasRemoteReads = false;
     for (size_t i = 0; i < requests.size(); i++) {
         const ReadRequest &request = requests[i];
-        hasRemoteReads = hasRemoteReads || MMseqsNode::isRemoteFile(request.fileToRead);
         size_t end = request.fileOffset + request.bytesToRead;
         size_t minEnd = request.fileOffset + request.minBytesToRead;
         for (size_t at = request.fileOffset; at < minEnd;) {
@@ -228,7 +226,7 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
         }
     }
 #ifdef HAVE_IO_URING
-    if (ringFd >= 0 && hasRemoteReads == false) {
+    if (ringFd >= 0) {
         if (isRingWorkerCountLimited == false) {
             unsigned int maxWorkers[2] = { static_cast<unsigned int>(maxInflightRequests), static_cast<unsigned int>(maxInflightRequests) };
             // no cap before Linux 5.15
@@ -276,13 +274,6 @@ void BatchReader::readWithPread() {
             return;
         }
         const ReadRequest &request = splitReadRequests[i];
-        size_t remoteSize;
-        if (MMseqsNode::readRemoteFile(request.fileToRead, request.destination, request.bytesToRead, request.fileOffset, remoteSize)) {
-            if (remoteSize < request.minBytesToRead && __sync_bool_compare_and_swap(&readError, 0, -1)) {
-                readErrorFileName = request.fileName;
-            }
-            continue;
-        }
         int error = 0;
         if (preadRequest(request, pageSize, error) == false && retryRead(request, error) == false) {
             if (__sync_bool_compare_and_swap(&readError, 0, error)) {

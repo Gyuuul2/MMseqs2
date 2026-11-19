@@ -6,7 +6,6 @@
 #include "Util.h"
 #include "FileUtil.h"
 #include "MMseqsNode.h"
-#include "S3Client.h"
 #include "Timer.h"
 
 #ifdef OPENMP
@@ -206,9 +205,6 @@ int result2flat(int argc, const char **argv, const Command &command) {
         EXIT(EXIT_FAILURE);
     }
     if (isLinfinity) {
-        if (S3Client::isEnabled()) {
-            MMseqsNode::uploadFile(fastaFile);
-        }
         writeSeconds += timer.getTimediff();
         std::string phaseValues;
         MMseqsNode::addPhaseSeconds(phaseValues, "loading sequences", loadSeconds);

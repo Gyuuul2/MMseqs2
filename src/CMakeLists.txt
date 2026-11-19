@@ -1,5 +1,4 @@
 set(HAVE_MPI 0 CACHE BOOL "Have MPI")
-set(HAVE_S3 0 CACHE BOOL "Have S3 backend through libcurl and OpenSSL crypto")
 set(HAVE_TESTS 0 CACHE BOOL "Have Tests")
 set(HAVE_SHELLCHECK 1 CACHE BOOL "Have ShellCheck")
 set(HAVE_GPROF 0 CACHE BOOL "Have GPROF Profiler")
@@ -254,16 +253,6 @@ if (BZIP2_FOUND)
 else ()
     message("-- Could not find BZLIB")
 endif ()
-endif ()
-
-# S3 backend
-if (HAVE_S3)
-    find_package(CURL REQUIRED)
-    find_package(OpenSSL REQUIRED COMPONENTS Crypto)
-    message("-- Found CURL and OpenSSL crypto")
-    target_include_directories(mmseqs-framework PUBLIC ${CURL_INCLUDE_DIRS} ${OPENSSL_INCLUDE_DIR})
-    target_compile_definitions(mmseqs-framework PUBLIC -DHAVE_S3=1)
-    target_link_libraries(mmseqs-framework ${CURL_LIBRARIES} ${OPENSSL_CRYPTO_LIBRARY})
 endif ()
 
 # MPI

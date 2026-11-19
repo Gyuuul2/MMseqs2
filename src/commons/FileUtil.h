@@ -40,9 +40,8 @@ public:
     // for pread/pwrite only, the file position starts at 0 again
     static void reopenFile(int fd, const char *fileName);
     static void pwriteAll(int fd, const char *fileName, const char *data, size_t size, size_t offset);
-    // frees the disk blocks of a read range nobody needs again; the fd must be open for writing;
-    // the aws backend frees only ranges of this node's own files that are in S3 already (isUploaded)
-    static void punchHole(int fd, size_t offset, size_t size, bool isUploaded = false);
+    // frees the disk blocks of a read range nobody needs again; the fd must be open for writing
+    static void punchHole(int fd, size_t offset, size_t size);
 
     static std::string dirName(const std::string &file);
 

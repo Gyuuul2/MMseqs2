@@ -466,8 +466,6 @@ public:
     std::string spacedKmerPattern;       // User-specified kmer pattern
     std::string localTmp;                // Local temporary path
     bool localTmpFallback;               // warn instead of stopping when align2clust cannot use --local-tmp
-    std::string backend;                 // how linfinity nodes share files: posix or aws
-    std::string awsBucket;               // S3 bucket[/prefix] of the aws backend
 
 
     // ALIGNMENT
@@ -873,8 +871,6 @@ public:
     PARAMETER(PARAM_SPACED_KMER_PATTERN)
     PARAMETER(PARAM_LOCAL_TMP)
     PARAMETER(PARAM_LOCAL_TMP_FALLBACK)
-    PARAMETER(PARAM_BACKEND)
-    PARAMETER(PARAM_AWS_BUCKET)
     std::vector<MMseqsParameter*> prefilter;
     std::vector<MMseqsParameter*> ungappedprefilter;
     std::vector<MMseqsParameter*> gappedprefilter;

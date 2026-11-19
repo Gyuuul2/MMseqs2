@@ -74,7 +74,7 @@ public:
     static bool readRunFile(const std::string &file, std::string &content);
     static void waitForRunFilesChange(const std::string &prefix, std::string &content);
     static std::string gatherRunFiles(const std::string &prefix);
-    // the names in a directory, none if it cannot be opened; aws backend: the object names below it
+    // the names in a directory, none if it cannot be opened
     static void listDirectory(const std::string &directory, std::vector<std::string> &names);
 
     static void publishLog(FILE *file, const std::string &log, size_t key, size_t size);
@@ -83,8 +83,7 @@ public:
     static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true);
     static void removeLog(const std::string &log);
 
-    static void publishExchangeFile(FILE *file, const std::string &fileName, size_t size, const std::string &indexFile, const std::vector<uint64_t> &line,
-                                    const std::vector<size_t> *segmentOffsets = NULL);
+    static void publishExchangeFile(FILE *file, const std::string &fileName, size_t size, const std::string &indexFile, const std::vector<uint64_t> &line);
     static size_t readExchangeIndexLines(const std::string &indexFile, size_t firstLine, size_t lineWords, std::vector<uint64_t> &lines);
     static size_t waitForExchangeIndexLines(const std::string &indexFile, size_t &nextLine, size_t lineWords, std::vector<uint64_t> &lines, bool wait);
     static const size_t EXCHANGE_FILE_HEADER_BYTES = 2 * sizeof(uint64_t);
@@ -138,8 +137,6 @@ public:
         size_t lastRecord;
         char *ownRecords;
         size_t punchEnd;
-        // aws backend: the object of another node's file, read with ranged GETs
-        std::string object;
     };
 
     static size_t writeExchangeTable(int fd, const std::string &fileName, const std::vector<size_t> &flushOffsets, size_t columns, const std::vector<size_t> &tail, size_t tableOffset);
@@ -216,21 +213,6 @@ public:
                                           std::vector<std::string> &threadData, std::vector<std::vector<uint64_t> > &threadEntries, size_t &dataSize, size_t &indexSize);
     static void closeClusterFiles(FILE *dataFile, const std::string &dataFileName, FILE *indexFile, const std::string &indexFileName, size_t dataSize, size_t indexSize);
     static void writeClusterPairs(const std::string &index, const std::string &prefix, const std::string &clu, const uint64_t *singletonBits, size_t firstKey, size_t keyCount);
-
-    // aws backend: a node uploads the files it wrote; another node's file is an empty placeholder whose reads go to S3
-    static void uploadFile(const std::string &file, const std::string &object = "");
-    static void removeFile(const std::string &file);
-    static void removeExchangeFile(const std::string &file, uint64_t exchangeFileNumber, bool isSegmented = false);
-    static void releaseExchangeCopy(int fd);
-    // aws backend: a file written in flushes goes up as one object per flush segment, the segment offsets as <object>.segments
-    static void uploadExchangeSegment(const std::string &file, int fd, uint64_t exchangeFileNumber, size_t segment, size_t begin, size_t end);
-    static int openSegmentedExchangeFile(const std::string &file, uint64_t exchangeFileNumber, size_t size);
-    static bool fetchFile(const std::string &file, bool mustExist = true);
-    static void addRemoteDatabaseFile(const std::string &file);
-    static bool isRemoteFile(int fd);
-    static bool readRemoteFile(int fd, char *data, size_t size, size_t offset, size_t &readSize);
-    static void stageDatabase(const std::string &dataFile, const char *indexFile);
-    static void publishDatabase(const std::string &db, size_t filesPerNode = 1);
 };
 
 #endif

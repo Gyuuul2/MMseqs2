@@ -67,7 +67,9 @@ How the code keeps it:
   limit (`getSmallestMemoryLimit`), per-node buffers use the node's own `--split-memory-limit`
   (`MMseqsNode::getMemoryLimit` = `Util::computeMemory`, default 90 % of RAM; set it when several ranks share a
   machine or a cgroup).
-- Nodes communicate only through files in the shared tmp folder:
+- Nodes communicate only through files in the shared tmp folder, so all nodes must mount one POSIX file system
+  (NFS, Lustre, GPFS; on AWS e.g. FSx for Lustre, EFS or an EBS volume exported over NFS, since an EBS volume alone
+  is attached to one instance):
   - Run files: `publishRunFile` writes `<file>.tmp`, fsync, rename. The content starts with a run id built from
     `SLURM_JOB_ID`, `SLURM_STEP_ID`, `SLURM_RESTART_COUNT`, `OMPI_MCA_ess_base_jobid`, `PMIX_NAMESPACE`,
     `MMSEQS_RUN_ID`, `MMSEQS_STEP_ID`; a reader ignores files of other runs, so leftovers of a killed run are
@@ -91,22 +93,6 @@ How the code keeps it:
   exists; `easylin8clust.sh` uses `createtsv.done` / `result2flat.done`, because these outputs have no dbtype.
   The master writes the `.dbtype` last. Output names carry no job id.
 - `SLURM_KILL_BAD_EXIT=1` is exported by the scripts: one failed rank ends the whole step.
-
-### aws backend
-
-`--backend aws --aws-bucket bucket[/prefix]` (or `--aws-bucket` alone) replaces the shared folder by S3
-(`S3Client`, built when libcurl and OpenSSL are found, `HAVE_S3`). Objects go below `<prefix>/<run id>`,
-the run id is `MMSEQS_RUN_ID`, else `SLURM_JOB_ID`. Credentials and `AWS_REGION`, `AWS_ENDPOINT_URL` come from
-the environment or `AWS_SHARED_CREDENTIALS_FILE`.
-- Each node keeps the files it wrote in its own folder and uploads them (`MMseqsNode::uploadFile`; large
-  files as 256 MiB segment objects, exchange files as one object per flush segment). Another node's file is an empty sparse placeholder of the object size; reads of it go to S3
-  ranged GETs (`readRemoteFile`, `stageDatabase`, `addRemoteDatabaseFile`).
-- Run files and progress are objects; claims use a conditional PUT (`putIfAbsent`).
-- Transport errors and timeouts are retried up to 10 attempts, 5xx and 429 answers for up to 300 s; then the
-  node stops.
-- `MMSEQS_S3_FAULT_RATE` and `MMSEQS_S3_LATENCY_MS` inject faults and latency for tests.
-- A waiting node checks once a minute for an object `failed` below the run prefix and stops if it exists. The
-  launcher writes it when the run fails (unverified: no launcher in this repository writes it).
 
 ## 3. Data formats
 
@@ -280,7 +266,7 @@ is too small to beat two packed copies per miss, keys are read one by one ("read
   written. A write error stops copying, the rest is read from the shared folder.
 - `--local-tmp` must be local flash on another device than the DB, else `--local-tmp-fallback 0` stops and 1
   (default) warns and reads from the shared folder. Iteration 2 first copies the node's cluster part, whole or
-  not at all. Not used with the aws backend.
+  not at all.
 
 ### 5.6 Clustering by the master, and the gate
 
@@ -339,7 +325,7 @@ alignment.
   `FileUtil::preadAll` (EIO, ESTALE, EAGAIN, short read; reopens the fd), `BatchReader::retryRead`, log reads,
   polled run files, exchange index lines.
 - Fatal: write errors (`pwriteAll`, no space), close errors of written files, corrupt formats (wrong magic,
-  bad seek table, incomplete index), memory or fd limits found at setup, a failed S3 request after its retries.
+  bad seek table, incomplete index), memory or fd limits found at setup.
 - Waits: `WaitWarning` prints an ERROR after 600 s of one wait and again at doubling intervals ("Check that no
   node has died…"). `MMSEQS_WAIT_TIMEOUT=<s>` stops the node after one wait of that length. A dead node is
   normally handled by the runner (`--kill-on-bad-exit`).
@@ -377,7 +363,7 @@ kmermatcher: `sending k-mers`, `receiving k-mers`, `merging pairs` with byte cou
 Environment variables for measurement: `MMSEQS_IO_MODE` (auto|buffered|direct), `MMSEQS_IO_CONCURRENCY`
 (reads in flight; defaults: parallel FS 128, NFS 16, local disk 1, flash T), `MMSEQS_ALIGN_FETCH_BYTES`,
 `MMSEQS_LOCAL_COPY_BYTES` (caps the local copy), `MMSEQS_ALIGNED_PAIR_LOG=<dir>` (aligned pairs per node),
-`MMSEQS_WAIT_TIMEOUT`, `MMSEQS_S3_FAULT_RATE`, `MMSEQS_S3_LATENCY_MS`. O_DIRECT is used automatically only for
+`MMSEQS_WAIT_TIMEOUT`. O_DIRECT is used automatically only for
 files larger than 10 % of RAM on local devices.
 
 ## 8. Verifying a change
@@ -407,9 +393,7 @@ Expected md5 on `uniprot_64.fasta` (3,956,337 TSV lines), `--min-seq-id 0.5 --km
 | `--cov-mode 0 --cluster-mode 0` (set cover) | `0adb403f73d9` |
 
 The same md5 must come out for 1, 3, 5 and 17 ranks, for several `--threads`, with `--align2clust-split 1`
-and with a small `--split-memory-limit`. The aws smoke test (LocalStack, 3 ranks × 2 threads, `--min-seq-id 0.3 -c
-0.8 --cov-mode 1 --cluster-mode 2 --kmer-per-seq 80`) expects the POSIX md5 of the same options
-(`47377d03c35a`, recorded on a 2026-11-11 tree, not rerun on this tree).
+and with a small `--split-memory-limit`.
 A change that cannot change results needs one md5 run of the combined tree; a change that can needs the set.
 
 ## 9. Known limits and open measurements
@@ -423,8 +407,6 @@ A change that cannot change results needs one md5 run of the combined tree; a ch
 - The master's assigned bits are `N / 8` bytes regardless of P (125 GB at 1 T); the master's clustering
   rate is a serial ceiling (measure before 1 T).
 - File-size limits (16 TiB on ext4/Lustre defaults) for `db.<f>` at small P; createdb fails at `ftruncate`.
-- The aws backend has only a local LocalStack smoke test; reads of linfinity binary indexes through
-  placeholders are untested on real S3 (unverified).
 - Without fsync, a successful close on Lustre/GPFS does not prove the data reached disk; zeros inside a file
   of the expected size are not detected.
 - `openAndDelete` and `FileUtil::remove` are not retried.
