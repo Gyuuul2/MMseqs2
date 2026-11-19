@@ -71,9 +71,12 @@ public:
     static bool isSameDbData(const std::string &firstDb, const std::string &secondDb);
 
     // copies the given byte ranges of each data file of db, in their order while they fit maxBytes and the device, into sparse copies in localDir;
-    // copiedBytes is the copied prefix of the ranges
+    // copiedBytes is the copied prefix of the ranges, with isReservingOnly the reserved prefix that copyRange fills later
     static std::string copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &copiedBytes,
-                                      const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges, size_t maxBytes);
+                                      const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges, size_t maxBytes, bool isReservingOnly = false);
+
+    // copies bytes at offset of sourceFd to the same offset of copyFd through buffer, returns 0 or the errno of the failed write
+    static int copyRange(int sourceFd, const char *sourceName, int copyFd, char *buffer, size_t bytes, size_t offset);
 
     static FILE *openAndDelete(const char *fileName, const char *mode);
 

@@ -298,6 +298,8 @@ public:
     size_t getKeyReadSize() { return keyReadSize; }
     // a sparse local copy holds the blocks of localBlocks at the offsets of the data files
     void setLocalBlocks(const std::string &localDataFileName, const std::vector<char> &blocks);
+    // a block of the local copy once all its bytes are written; not while a loaded buffer is read
+    void setLocalBlock(size_t block);
     void setLocalBlockCacheSize(size_t cacheSize) { localBlockCacheSize = cacheSize; }
     bool isLocalBlock(size_t block) const { return localBlocks.empty() == false && localBlocks[block]; }
     size_t getLocalBlockReadSize() { return localBlockReadSize; }

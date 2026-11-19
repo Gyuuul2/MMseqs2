@@ -1510,6 +1510,13 @@ template <typename T> void DBReader<T>::setLocalBlocks(const std::string &localD
                        << localDataFileName << ": " << directFiles << " of " << localDataFds.size() << " files with O_DIRECT\n";
 }
 
+template <typename T> void DBReader<T>::setLocalBlock(size_t block) {
+    localBlocks[block] = 1;
+    // a cached block takes the room of the local blocks from now on, freeBlocks gives it back
+    const std::map<size_t, BatchReader::ReadRequest>::const_iterator cached = cachedBlocks.find(block);
+    cachedLocalBlockSize += (cached != cachedBlocks.end()) ? cached->second.bytesToRead : 0;
+}
+
 template <typename T> void DBReader<T>::setBlockCacheSize(size_t cacheSize) {
     blockCacheSize = cacheSize;
     if (blockKeyOffsets.empty() == false) {
