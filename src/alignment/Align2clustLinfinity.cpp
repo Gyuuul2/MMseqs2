@@ -2127,8 +2127,8 @@ struct TargetSplitReader {
           targetSplitCount(targetSplitBlockOffsets.size() - 1), paddedDbSize(paddedDbSize), sizeClassCount(sizeClassCount),
           maxPrefilterBufferSize(std::max((size_t) 1, memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)),
           maxRecordTargetCount(std::min((size_t) UINT_MAX, std::max((size_t) 1, maxRecordSize / std::max(seqDbr.getMaxSeqLen() + 2, Util::getPageSize())))),
-          windowPos(0), prefReadPos(0), passClasses(1), endClass(0), classSize(sizeClassCount, 0), prefNode(SIZE_MAX), bufferFetchSize(0), bufferAlignmentCells(0), isFilling(false),
-          isLoaded(false), fillMaxReadSize(0), fillMaxAlignmentCells(0) {
+          windowPos(0), prefReadPos(0), passClasses(1), endClass(0), classSize(sizeClassCount, 0), prefNode(SIZE_MAX), bufferFetchSize(0), bufferAlignmentCells(0),
+          isFilling(false), isLoaded(false), fillMaxReadSize(0), fillMaxAlignmentCells(0) {
         for (size_t split = 0; split < targetSplitCount; split++) {
             if (targetSplitAlignNodes[split] == MMseqsNode::rank) {
                 targetSplits.push_back(split);
@@ -2144,7 +2144,8 @@ struct TargetSplitReader {
         std::vector<DBKeyType> targets;
         passClasses = ~0ULL;
         for (prefReadPos = 0; prefReadPos < prefReads.size() || takeWindow();) {
-            PrefRead &prefRead = prefReads[prefReadPos];
+            // loading takes the next window ahead
+            const size_t prefRead = prefReadPos;
             records.clear();
             targets.clear();
             loadPrefRead(records, targets);
@@ -2164,7 +2165,7 @@ struct TargetSplitReader {
                     classSize[sizeClass] += threadClassSize[sizeClass];
                 }
             }
-            prefRead.sizeClasses = sizeClasses;
+            prefReads[prefRead].sizeClasses = sizeClasses;
         }
         endClass = sizeClassCount;
     }
@@ -2194,8 +2195,7 @@ struct TargetSplitReader {
             } else if (isLoaded == false) {
                 fillCounters.lastStepKind = PrefilterFillCounters::READ_STEP;
                 for (isLoaded = true; records.size() * sizeof(RepTargetsRecord) + targets.size() * sizeof(DBKeyType) < maxPrefilterBufferSize;) {
-                    // a buffer ends at a window end
-                    if (prefReadPos < prefReads.size() || (records.empty() && takeWindow())) {
+                    if (prefReadPos < prefReads.size() || takeWindow()) {
                         // keep a pass of several size classes in one buffer
                         if (records.empty() == false && (passClasses & (passClasses - 1)) == 0 && (bufferFetchSize >= fillMaxReadSize || bufferAlignmentCells >= fillMaxAlignmentCells)) {
                             break;
@@ -2384,7 +2384,7 @@ private:
 
     // reads the next pref read of the pass in every target split, prefetches the one behind it and sizes the entry offsets
     void startPrefRead() {
-        const PrefRead &prefRead = prefReads[prefReadPos];
+        const PrefRead prefRead = prefReads[prefReadPos];
         parse = PrefReadParse();
         parse.prefRead = prefReadPos;
         parse.firstEntry = prefRead.firstEntry;
@@ -2394,6 +2394,10 @@ private:
             prefDbs[i]->loadData(prefRead.firstEntry, prefRead.endEntry);
         }
         prefReadPos = findPassPrefRead(prefReadPos + 1);
+        // the last pref read of a window takes the next window, so that its first read is prefetched
+        if (prefReadPos == prefReads.size()) {
+            takeWindow();
+        }
         // prefetch here, io_uring reads can fail once their thread ends
         if (prefReadPos < prefReads.size() && prefReads[prefReadPos].prefNode == prefRead.prefNode) {
             for (size_t i = 0; i < prefDbs.size(); i++) {
