@@ -6,7 +6,6 @@
 #include "BatchReader.h"
 #include "S3Client.h"
 
-#include <sys/resource.h>
 #include <sys/stat.h>
 
 #include <thread>
@@ -3053,8 +3052,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         maxSendSplitKeys = std::max(maxSendSplitKeys, sendSplitKeyOffsets[sendSplit + 1] - sendSplitKeyOffsets[sendSplit]);
     }
     exchange.fileKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
-    struct stat sb;
-    exchange.hasRepresentativeBits = MMseqsNode::statSharedFile(par.db1 + ".bits." + SSTR(MMseqsNode::rank), sb);
+    exchange.hasRepresentativeBits = MMseqsNode::statSharedFile(par.db1 + ".bits." + SSTR(MMseqsNode::rank));
     // write the pref by target split for two or more align nodes
     exchange.hasTargetSplits = MMseqsNode::count - MMseqsNode::getFirstAlignNode() > 1;
     if (exchange.hasTargetSplits) {
@@ -3075,14 +3073,8 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     ExchangeFileGroups pairGroups;
     initFileGroups(kmerGroups, par.db2 + ".kmers", exchange.hashRangeCount, MMseqsNode::count, 4);
 
-    struct rlimit openFileLimit = {0, 0};
-    getrlimit(RLIMIT_NOFILE, &openFileLimit);
     // align2clust opens up to five files per target split
-    size_t minOpenFiles = 2 * seqDbr.getDataFileCnt() + 64 + kmerGroups.count + 2 * MMseqsNode::count + 5 * (exchange.hasTargetSplits ? MAX_TARGET_SPLITS_PER_NODE * (MMseqsNode::count - MMseqsNode::getFirstAlignNode()) : 1);
-    if (minOpenFiles > openFileLimit.rlim_cur) {
-        Debug(Debug::ERROR) << "Raise the open file limit (ulimit -n) to at least " << minOpenFiles << "\n";
-        EXIT(EXIT_FAILURE);
-    }
+    FileUtil::checkRlimitNoFile(2 * seqDbr.getDataFileCnt() + 64 + kmerGroups.count + 2 * MMseqsNode::count + 5 * (exchange.hasTargetSplits ? MAX_TARGET_SPLITS_PER_NODE * (MMseqsNode::count - MMseqsNode::getFirstAlignNode()) : 1));
     exchange.globalIdBits = getBitWidth(seqDbr.getSize() - 1);
     exchange.maxRepSeqCount = 1 + (includeAdjacency ? par.adjIteration : 0);
     exchange.selfMergedSendSplitCount = exchange.sendSplitCount / MMseqsNode::count * MMseqsNode::count / (2 * MMseqsNode::count - 1);

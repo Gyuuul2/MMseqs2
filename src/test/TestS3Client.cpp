@@ -80,16 +80,6 @@ static void testRoundtrip(const std::string &localFile) {
         S3Client::getRange(base + "/file", ranges[i].first, ranges[i].second, &remote[0]);
         check(remote == readLocal(fd, ranges[i].first, ranges[i].second), "getRange " + SSTR(ranges[i].first));
     }
-    std::string copy = localFile + ".copy";
-    FILE *copyHandle = FileUtil::openAndDelete(copy.c_str(), "w");
-    check(ftruncate(fileno(copyHandle), fileSize) == 0 && fclose(copyHandle) == 0, "sparse copy");
-    S3Client::getRanges(base + "/file", ranges, copy);
-    int copyFd = open(copy.c_str(), O_RDONLY);
-    for (size_t i = 0; i < ranges.size(); i++) {
-        check(readLocal(copyFd, ranges[i].first, ranges[i].second) == readLocal(fd, ranges[i].first, ranges[i].second), "getRanges " + SSTR(ranges[i].first));
-    }
-    close(copyFd);
-    FileUtil::remove(copy.c_str());
     check(S3Client::get(base + "/file", data) && data == readLocal(fd, 0, fileSize), "get of a segmented file");
     close(fd);
 

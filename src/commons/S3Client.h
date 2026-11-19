@@ -26,7 +26,6 @@ public:
     static void putFile(const std::string &path, const std::string &localFile, size_t offset = 0, size_t size = SIZE_MAX);
     // segmented or plain objects; any error including 404 is fatal
     static void getRange(const std::string &path, size_t offset, size_t size, char *destination);
-    static void getRanges(const std::string &path, const std::vector<std::pair<size_t, size_t> > &ranges, const std::string &localFile);
     static size_t getSize(const std::string &path);
 
     // SigV4 Authorization; headers hold host, x-amz-date and x-amz-content-sha256, query is the canonical query string

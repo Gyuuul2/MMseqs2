@@ -22,7 +22,7 @@ static int openInput(const char *fileName, size_t &size) {
 }
 
 namespace KSEQFILE {
-    // a file is read at its offset with the retries of preadAll, a pipe as it comes
+    // pread with retries, a pipe with read
     static ssize_t readInput(KSeqFile::InputFile *file, char *buffer, int length) {
         if (file->size == SIZE_MAX) {
             return read(file->fd, buffer, length);
@@ -211,7 +211,6 @@ namespace KSEQZSTD {
                 } else if (file->decompressedEndOffset == SIZE_MAX) {
                     readSize = 0;
                 }
-                // preadAll retries a shared file system that fails for a while
                 readSize = std::min(readSize, file->fileSize - file->compressedOffset);
                 FileUtil::preadAll(file->fd, file->fileName.c_str(), (char *) file->input.src, readSize, file->compressedOffset);
                 file->input.size = readSize;

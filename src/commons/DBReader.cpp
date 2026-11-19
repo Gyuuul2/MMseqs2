@@ -116,9 +116,8 @@ template <typename T> bool DBReader<T>::open(int accessType){
         // <clu>.<node> of a linfinity cluster db uses <clu>.dbtype
         std::string dbtypeName(dataFileName);
         size_t nodePos = dbtypeName.find_last_of('.');
-        struct stat sb;
         if ((dataMode & USE_LINFINITY) && nodePos != std::string::npos && Util::isNumber(dbtypeName.substr(nodePos + 1))
-            && MMseqsNode::statSharedFile(dbtypeName + ".dbtype", sb) == false) {
+            && MMseqsNode::statSharedFile(dbtypeName + ".dbtype") == false) {
             dbtypeName.resize(nodePos);
         }
         dbtype = FileUtil::parseDbType(dbtypeName.c_str());
@@ -216,23 +215,18 @@ template <typename T> bool DBReader<T>::open(int accessType){
     std::vector<size_t> fileSizes;
     if (externalData == false && hasBinaryIndex) {
         // read only entry count and data size
-        FILE *indexFile = MMseqsNode::openSharedFile(indexFileName, "r");
+        size_t indexFileSize;
+        int indexFd = MMseqsNode::openSharedFd(indexFileName, O_RDONLY, &indexFileSize);
         uint64_t lastIndexPair[2] = { 0, 0 };
-        struct stat sb;
-        if (fstat(fileno(indexFile), &sb) != 0) {
-            Debug(Debug::ERROR) << "Cannot read index file " << indexFileName << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        size_t indexFileSize = sb.st_size;
         if (indexFileSize >= sizeof(lastIndexPair)) {
-            FileUtil::preadAll(fileno(indexFile), indexFileName, (char *) lastIndexPair, sizeof(lastIndexPair), indexFileSize - sizeof(lastIndexPair));
+            FileUtil::preadAll(indexFd, indexFileName, (char *) lastIndexPair, sizeof(lastIndexPair), indexFileSize - sizeof(lastIndexPair));
         }
         // last pair is (DB_KEY_INVALID, data size)
         if (indexFileSize % sizeof(lastIndexPair) != 0 || lastIndexPair[0] != static_cast<uint64_t>(DB_KEY_INVALID)) {
             Debug(Debug::ERROR) << "Index file " << indexFileName << " is incomplete\n";
             EXIT(EXIT_FAILURE);
         }
-        if (fclose(indexFile) != 0) {
+        if (::close(indexFd) != 0) {
             Debug(Debug::ERROR) << "Cannot close index file " << indexFileName << "\n";
             EXIT(EXIT_FAILURE);
         }
@@ -341,10 +335,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
         size_t directFiles = 0;
         for (size_t fileIdx = 0; fileIdx < dataFileNames.size() + entryOffsetsFileNames.size(); fileIdx++) {
             const std::string &fileName = (fileIdx < dataFileNames.size()) ? dataFileNames[fileIdx] : entryOffsetsFileNames[fileIdx - dataFileNames.size()];
-            int bufferedFd;
-            dataFds.push_back(openDataFile(fileName, fileSizes[fileIdx], bufferedFd));
-            bufferedFds.push_back(bufferedFd);
-            directFiles += dataFds.back() != bufferedFd;
+            directFiles += openDataFile(fileName, fileSizes[fileIdx], dataFds, bufferedFds);
         }
 
         batchReader = new BatchReader(threads, dataFds[0]);
@@ -460,6 +451,17 @@ template <typename T> void DBReader<T>::remapData(){
     }
 }
 
+static void closeDataFiles(std::vector<int> &fds, std::vector<int> &bufferedFds) {
+    for (size_t i = 0; i < fds.size(); i++) {
+        if (fds[i] != bufferedFds[i]) {
+            ::close(fds[i]);
+        }
+        ::close(bufferedFds[i]);
+    }
+    fds.clear();
+    bufferedFds.clear();
+}
+
 template <typename T> void DBReader<T>::close(){
     if (dataMode & USE_LOOKUP || dataMode & USE_LOOKUP_REV) {
         delete[] lookup;
@@ -504,22 +506,8 @@ template <typename T> void DBReader<T>::close(){
     }
     delete batchReader;
     batchReader = NULL;
-    for (size_t fileIdx = 0; fileIdx < dataFds.size(); fileIdx++) {
-        if (dataFds[fileIdx] != bufferedFds[fileIdx]) {
-            ::close(dataFds[fileIdx]);
-        }
-        ::close(bufferedFds[fileIdx]);
-    }
-    dataFds.clear();
-    bufferedFds.clear();
-    for (size_t fileIdx = 0; fileIdx < localDataFds.size(); fileIdx++) {
-        if (localDataFds[fileIdx] != localBufferedFds[fileIdx]) {
-            ::close(localDataFds[fileIdx]);
-        }
-        ::close(localBufferedFds[fileIdx]);
-    }
-    localDataFds.clear();
-    localBufferedFds.clear();
+    closeDataFiles(dataFds, bufferedFds);
+    closeDataFiles(localDataFds, localBufferedFds);
     localBlocks.clear();
     entryOffsetsFileNames.clear();
     rangeRepresentativeCounts.clear();
@@ -1106,20 +1094,15 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
         int fd = dataFds[fileIdx];
         bool isCompressedNames = frameOffsets.empty() == false && isReadingOffsets == false;
         if (isCompressedNames && frameOffsets[fileIdx].empty()) {
-            FILE *file = MMseqsNode::openSharedFile(dataFileNames[fileIdx], "r");
-            struct stat sb;
-            if (fstat(fileno(file), &sb) != 0) {
-                Debug(Debug::ERROR) << "Cannot read " << dataFileNames[fileIdx] << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            size_t fileSize = sb.st_size;
+            size_t fileSize;
+            int nameFd = MMseqsNode::openSharedFd(dataFileNames[fileIdx], O_RDONLY, &fileSize);
             const size_t footerSize = ZSTD_seekTableFooterSize;
             char footer[footerSize];
             bool isValid = fileSize >= footerSize;
             uint32_t frameCount = 0;
             uint32_t magic = 0;
             if (isValid) {
-                FileUtil::preadAll(fileno(file), dataFileNames[fileIdx].c_str(), footer, footerSize, fileSize - footerSize);
+                FileUtil::preadAll(nameFd, dataFileNames[fileIdx].c_str(), footer, footerSize, fileSize - footerSize);
                 memcpy(&frameCount, footer, sizeof(uint32_t));
                 memcpy(&magic, footer + 5, sizeof(uint32_t));
             }
@@ -1127,10 +1110,10 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
             isValid = isValid && magic == ZSTD_SEEKABLE_MAGICNUMBER && (footer[4] & 0xFC) == 0 && seekTableSize <= fileSize;
             std::vector<uint32_t> seekTable(isValid ? 2 + 2 * static_cast<size_t>(frameCount) : 0);
             if (isValid) {
-                FileUtil::preadAll(fileno(file), dataFileNames[fileIdx].c_str(), (char *) seekTable.data(), seekTable.size() * sizeof(uint32_t), fileSize - seekTableSize);
+                FileUtil::preadAll(nameFd, dataFileNames[fileIdx].c_str(), (char *) seekTable.data(), seekTable.size() * sizeof(uint32_t), fileSize - seekTableSize);
             }
             isValid = isValid && seekTable[0] == (ZSTD_MAGIC_SKIPPABLE_START | 0xE) && seekTable[1] == seekTableSize - 8;
-            if (fclose(file) != 0) {
+            if (::close(nameFd) != 0) {
                 Debug(Debug::ERROR) << "Cannot close file " << dataFileNames[fileIdx] << "\n";
                 EXIT(EXIT_FAILURE);
             }
@@ -1475,21 +1458,22 @@ template <typename T> void DBReader<T>::cacheBlocks(EntryReadBuffer &buffer) {
     buffer.blocks.clear();
 }
 
-template <typename T> int DBReader<T>::openDataFile(const std::string &fileName, size_t fileSize, int &bufferedFd) {
+template <typename T> bool DBReader<T>::openDataFile(const std::string &fileName, size_t fileSize, std::vector<int> &fds, std::vector<int> &bufferedFds) {
     // O_DIRECT only for large files on local devices
     size_t pageCacheLimit = static_cast<size_t>(Util::getTotalSystemMemory() * 0.1);
     IoMode ioMode = getIoMode();
-    // key loads and index searches use bufferedFd
-    bufferedFd = MMseqsNode::openSharedFd(fileName, O_RDONLY);
+    // key loads and index searches use the buffered fd
+    bufferedFds.push_back(MMseqsNode::openSharedFd(fileName, O_RDONLY));
     int fd = -1;
 #ifdef O_DIRECT
-    StorageKind storage = getStorageKind(bufferedFd);
+    StorageKind storage = getStorageKind(bufferedFds.back());
     bool isLocal = storage == STORAGE_LOCAL_FLASH || storage == STORAGE_LOCAL_DISK;
     if (ioMode == IO_MODE_DIRECT || (ioMode == IO_MODE_AUTO && isLocal && fileSize > pageCacheLimit)) {
         fd = ::open(fileName.c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
     }
 #endif
-    return (fd < 0) ? bufferedFd : fd;
+    fds.push_back((fd < 0) ? bufferedFds.back() : fd);
+    return fd >= 0;
 }
 
 template <typename T> void DBReader<T>::setLocalBlocks(const std::string &localDataFileName, const std::vector<char> &blocks) {
@@ -1498,12 +1482,9 @@ template <typename T> void DBReader<T>::setLocalBlocks(const std::string &localD
         // the copy keeps the suffix of the data file
         const std::string fileName = localDataFileName + dataFileNames[fileIdx].substr(strlen(dataFileName));
         struct stat st;
-        // the copy has the size of the data file, so a full copy is opened like it would be today
+        // the copy has the size of the data file
         const size_t fileSize = (stat(fileName.c_str(), &st) == 0) ? static_cast<size_t>(st.st_size) : 0;
-        int bufferedFd;
-        localDataFds.push_back(openDataFile(fileName, fileSize, bufferedFd));
-        localBufferedFds.push_back(bufferedFd);
-        directFiles += localDataFds.back() != bufferedFd;
+        directFiles += openDataFile(fileName, fileSize, localDataFds, localBufferedFds);
     }
     localBlocks = blocks;
     Debug(Debug::INFO) << "Reading " << std::count(blocks.begin(), blocks.end(), 1) << " of " << blocks.size() << " blocks of " << dataFileName << " from "
@@ -1628,7 +1609,7 @@ template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key, Loa
                 return cursor.cachedBlock->destination + (fileOffset - cursor.cachedBlock->fileOffset);
             }
         }
-        const std::vector<int> &fds = loadedBuffer.isKeyLoad ? ((localBlocks.empty() == false && localBlocks[cursor.block]) ? localBufferedFds : bufferedFds) : dataFds;
+        const std::vector<int> &fds = loadedBuffer.isKeyLoad ? (isLocalBlock(cursor.block) ? localBufferedFds : bufferedFds) : dataFds;
         int fd = fds[index2dbfile[range]];
         const std::vector<size_t> &firstKeys = loadedBuffer.requestFirstKeys;
         size_t &requestEnd = cursor.requestEnd;

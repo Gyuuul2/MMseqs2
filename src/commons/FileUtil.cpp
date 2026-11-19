@@ -124,16 +124,10 @@ void FileUtil::preadAll(int fd, const char *fileName, char *data, size_t size, s
         }
         if (count <= 0) {
             const int readError = (count < 0) ? errno : 0;
-            // shared file systems can fail reads for a while, then a file opened again can be read
-            if ((readError == 0 || readError == EIO || readError == ESTALE || readError == EAGAIN) && MMseqsNode::hasFailedTooLong(failedSince, attempts) == false) {
-                if (attempts > 1) {
-                    if (attempts == 2) {
-                        Debug(Debug::WARNING) << "Cannot read " << fileName << ": " << (readError == 0 ? "end of file" : strerror(readError)) << ", retrying\n";
-                    }
-                    MMseqsNode::sleepBeforePoll(attempts - 1, 7);
-                    if (readError == EIO || readError == ESTALE) {
-                        reopenFile(fd, fileName);
-                    }
+            if ((readError == 0 || readError == EIO || readError == ESTALE || readError == EAGAIN)
+                && MMseqsNode::waitBeforeRetry(fileName, (readError == 0) ? "end of file" : strerror(readError), failedSince, attempts)) {
+                if (attempts > 1 && (readError == EIO || readError == ESTALE)) {
+                    reopenFile(fd, fileName);
                 }
                 continue;
             }
@@ -506,14 +500,13 @@ std::vector<std::string> FileUtil::findDatafiles(const char * datafiles){
     std::string checkName = baseName + ".0";
     std::vector<std::string> filenames;
     size_t cnt = 0;
-    struct stat sb;
-    while(MMseqsNode::statSharedFile(checkName, sb) == true){
+    while(MMseqsNode::statSharedFile(checkName) == true){
         filenames.push_back(checkName);
         cnt++;
         checkName = baseName + "." + SSTR(cnt);
     }
     if(cnt == 0){
-        if(MMseqsNode::statSharedFile(baseName, sb)){
+        if(MMseqsNode::statSharedFile(baseName)){
             filenames.push_back(baseName);
         }
     }
@@ -566,7 +559,7 @@ void FileUtil::move(const char * src, const char * dst) {
 int FileUtil::parseDbType(const char *name) {
     std::string dbTypeFile = std::string(name) + ".dbtype";
     struct stat sb;
-    if (MMseqsNode::statSharedFile(dbTypeFile, sb) == false) {
+    if (MMseqsNode::statSharedFile(dbTypeFile, &sb) == false) {
         return Parameters::DBTYPE_GENERIC_DB;
     }
 
@@ -628,6 +621,15 @@ void FileUtil::fixRlimitNoFile() {
     }
 }
 
+void FileUtil::checkRlimitNoFile(size_t minOpenFiles) {
+    struct rlimit limit = {0, 0};
+    getrlimit(RLIMIT_NOFILE, &limit);
+    if (minOpenFiles > limit.rlim_cur) {
+        Debug(Debug::ERROR) << "Raise the open file limit (ulimit -n) to at least " << minOpenFiles << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
 std::string FileUtil::sanitizeFilename(std::string name){
     static const std::vector<std::pair<char, char>> symbolTable =
             {{'\\', '@'},
@@ -664,8 +666,6 @@ bool FileUtil::isSameDbData(const std::string &firstDb, const std::string &secon
 
 // the bytes copied at once by a thread
 static const size_t LOCAL_COPY_IO_BYTES = 64 * 1024 * 1024;
-// shared storage serves this many large reads of a copy at once
-static const int LOCAL_COPY_THREADS = 64;
 
 int FileUtil::copyRange(int sourceFd, const char *sourceName, int copyFd, char *buffer, size_t bytes, size_t offset) {
     preadAll(sourceFd, sourceName, buffer, bytes, offset);
@@ -755,13 +755,11 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
 #endif
         totalBytes += chunkBytes[chunkCount];
     }
-    chunks.resize(chunkCount);
-    if (isReservingOnly) {
-        chunks.clear();
-    }
-    // without a reservation the device can still fill up, then the copy ends at the first chunk it could not write
+    chunks.resize(isReservingOnly ? 0 : chunkCount);
+    // without fallocate the copy ends at the first chunk that hits a full device
     size_t failedChunk = chunks.size();
-    const int copyThreads = std::max(1, std::min(std::min(threads, LOCAL_COPY_THREADS), (int) chunks.size()));
+    // shared storage serves up to 64 large reads of a copy at once
+    const int copyThreads = std::max(1, std::min(std::min(threads, 64), (int) chunks.size()));
 #pragma omp parallel num_threads(copyThreads)
     {
         std::vector<char> buffer(chunks.empty() ? 0 : LOCAL_COPY_IO_BYTES);

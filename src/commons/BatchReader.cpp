@@ -10,7 +10,6 @@
 #include <cerrno>
 #include <cstdlib>
 #include <ctime>
-#include <fcntl.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -20,6 +19,7 @@
 #endif
 
 #ifdef HAVE_IO_URING
+#include <fcntl.h>
 #include <linux/io_uring.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -250,7 +250,6 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
     }
 }
 
-// error is the errno, -1 for an unexpected end of file
 static bool preadRequest(const BatchReader::ReadRequest &request, size_t pageSize, int &error) {
     for (size_t done = 0; done < request.minBytesToRead;) {
         ssize_t count = pread(request.fileToRead, request.destination + done, request.bytesToRead - done, request.fileOffset + done);
@@ -294,23 +293,14 @@ void BatchReader::readWithPread() {
     }
 }
 
-// shared file systems can fail reads for a while, then a file opened again can be read
 bool BatchReader::retryRead(const ReadRequest &request, int &error) {
     time_t failedSince = 0;
     unsigned int attempts = 0;
-    while (error == EIO || error == ESTALE || error == EAGAIN || error == -1) {
-        if (MMseqsNode::hasFailedTooLong(failedSince, attempts) || __atomic_load_n(&readError, __ATOMIC_RELAXED) != 0) {
-            return false;
-        }
+    while ((error == EIO || error == ESTALE || error == EAGAIN || error == -1) && __atomic_load_n(&readError, __ATOMIC_RELAXED) == 0
+           && MMseqsNode::waitBeforeRetry(request.fileName, (error > 0) ? strerror(error) : "unexpected end of file", failedSince, attempts)) {
         // the first attempt only reads again, another request may have opened the file again already
-        if (attempts > 1) {
-            if (attempts == 2) {
-                Debug(Debug::WARNING) << "Cannot read " << request.fileName << ": " << (error > 0 ? strerror(error) : "unexpected end of file") << ", retrying\n";
-            }
-            MMseqsNode::sleepBeforePoll(attempts - 1, 7);
-            if (error == EIO || error == ESTALE) {
-                FileUtil::reopenFile(request.fileToRead, request.fileName);
-            }
+        if (attempts > 1 && (error == EIO || error == ESTALE)) {
+            FileUtil::reopenFile(request.fileToRead, request.fileName);
         }
         if (preadRequest(request, Util::getPageSize(), error)) {
             return true;

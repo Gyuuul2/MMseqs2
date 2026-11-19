@@ -51,6 +51,7 @@ public:
 
     static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
     static bool hasFailedTooLong(time_t &failedSince, unsigned int &attempts);
+    static bool waitBeforeRetry(const char *file, const char *error, time_t &failedSince, unsigned int &attempts);
     // a --local-tmp that cannot be used is reported and the run goes on in the shared folder
     static void reportUnusableLocalTmp(const std::string &problem);
 
@@ -94,11 +95,9 @@ public:
                                    size_t &observedSize, uint64_t &observedNumber, int &lastError, int openFlags = 0);
     static int waitForExchangeFile(const std::string &file, size_t size, uint64_t exchangeFileNumber);
     static bool tryPreadAll(int fd, char *data, size_t size, size_t offset, int &readError);
-    // opens a file that exists: EIO, ESTALE and an NFS name cached as missing are retried by the rule of hasFailedTooLong, then ERROR
-    static int openSharedFd(const std::string &file, int flags);
+    static int openSharedFd(const std::string &file, int flags, size_t *size = NULL);
     static FILE *openSharedFile(const std::string &file, const char *mode);
-    // false for a missing file, EIO and ESTALE are retried like in openSharedFd
-    static bool statSharedFile(const std::string &file, struct stat &sb);
+    static bool statSharedFile(const std::string &file, struct stat *sb = NULL);
 
     static std::string barrier(const std::string &file, const std::string &content = "");
     static void removeOnceRead(const std::string &file);
@@ -125,8 +124,7 @@ public:
     };
 
     static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0, const std::string &localDirectory = "", size_t *localNodes = NULL);
-    // Reserve tmpfs sequence copies only in linfinity paths; localCopyBytes is for a module-owned copy.
-    static size_t getMemoryLimit(const Parameters &par, size_t localCopyBytes = 0);
+    static size_t getMemoryLimit(const Parameters &par);
 
     struct ExchangeReader {
         FILE *file;

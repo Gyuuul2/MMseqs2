@@ -564,12 +564,12 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+:totalSize)
         for (size_t i = 0; i < filenames.size(); i++) {
             struct stat sb;
-            if (MMseqsNode::statSharedFile(filenames[i], sb) == false) {
+            if (MMseqsNode::statSharedFile(filenames[i], &sb) == false) {
                 Debug(Debug::ERROR) << "File " << filenames[i] << " does not exist\n";
                 EXIT(EXIT_FAILURE);
             }
             if (S_ISREG(sb.st_mode) == false) {
-                Debug(Debug::ERROR) << "Input " << filenames[i] << " is not a regular file. Linfinity createdb splits its input by size\n";
+                Debug(Debug::ERROR) << "Cannot split " << filenames[i] << ": linfinity createdb needs a regular file\n";
                 EXIT(EXIT_FAILURE);
             }
             fileSizes[i] = sb.st_size;
@@ -590,7 +590,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     delete kseq;
                 }
                 // pzstd files start with a skippable frame
-                if (isSplittable && Util::endsWith(".zst", filenames[i]) == true) {
+                if (isSplittable && (Util::endsWith(".zst", filenames[i]) || Util::endsWith(".zstd", filenames[i]))) {
                     FILE *handle = FileUtil::openFileOrDie(filenames[i].c_str(), "r", true);
                     uint32_t header[3];
                     isSplittable = fread(header, sizeof(uint32_t), 3, handle) == 3 && header[0] == ZSTD_MAGIC_SKIPPABLE_START && header[1] == 4;
@@ -678,7 +678,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     for (size_t i = 0; i < nodeInputSplits.size(); i++) {
         size_t splitBytes = nodeInputSplits[i].end - nodeInputSplits[i].start;
         const std::string &name = filenames[nodeInputSplits[i].file];
-        bool isCompressed = Util::endsWith(".gz", name) || Util::endsWith(".bz2", name) || Util::endsWith(".zst", name);
+        bool isCompressed = Util::endsWith(".gz", name) || Util::endsWith(".bz2", name) || Util::endsWith(".zst", name) || Util::endsWith(".zstd", name);
         inputBytes += splitBytes;
         spoolSize += isCompressed ? splitBytes : splitBytes / 5 * 3;
     }
@@ -935,7 +935,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             for (size_t fileIdx = 0; fileIdx < filenames.size(); fileIdx++) {
                 Debug(Debug::ERROR) << " - " << filenames[fileIdx] << "\n";
             }
-            Debug(Debug::ERROR) << "Please check your input files. Only files in fasta/fastq[.gz|bz2|zst] are supported\n";
+            Debug(Debug::ERROR) << "Please check your input files. Only files in fasta/fastq[.gz|.bz2|.zst] are supported\n";
         }
         EXIT(EXIT_FAILURE);
     }

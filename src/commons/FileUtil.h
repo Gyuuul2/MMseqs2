@@ -37,7 +37,7 @@ public:
     static void publishFile(const std::string &file, const std::string &content);
 
     static void preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset);
-    // replaces the file of fd with fileName opened again with the same flags, keeps fd if that fails; the file position starts at 0 again, so only for pread and pwrite
+    // for pread/pwrite only, the file position starts at 0 again
     static void reopenFile(int fd, const char *fileName);
     static void pwriteAll(int fd, const char *fileName, const char *data, size_t size, size_t offset);
     // frees the disk blocks of a read range nobody needs again; the fd must be open for writing;
@@ -70,12 +70,11 @@ public:
 
     static bool isSameDbData(const std::string &firstDb, const std::string &secondDb);
 
-    // copies the given byte ranges of each data file of db, in their order while they fit maxBytes and the device, into sparse copies in localDir;
-    // copiedBytes is the copied prefix of the ranges, with isReservingOnly the reserved prefix that copyRange fills later
+    // sparse copies of fileRanges in order while they fit maxBytes and the device, copiedBytes is the copied or reserved prefix
     static std::string copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &copiedBytes,
                                       const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges, size_t maxBytes, bool isReservingOnly = false);
 
-    // copies bytes at offset of sourceFd to the same offset of copyFd through buffer, returns 0 or the errno of the failed write
+    // 0 or the errno of the failed write
     static int copyRange(int sourceFd, const char *sourceName, int copyFd, char *buffer, size_t bytes, size_t offset);
 
     static FILE *openAndDelete(const char *fileName, const char *mode);
@@ -91,6 +90,8 @@ public:
     static std::string createTemporaryDirectory(const std::string& basePath, const std::string& subDirectory);
 
     static void fixRlimitNoFile();
+
+    static void checkRlimitNoFile(size_t minOpenFiles);
 
     // remove forbidden symbols in from filenames
     static std::string sanitizeFilename(std::string name);

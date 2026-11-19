@@ -224,7 +224,7 @@ struct CurlHandle {
 
 struct Request {
     Request(const char *method, const std::string &path) : method(method), path(path), upload(NULL), uploadFd(-1), uploadOffset(0), uploadSize(0),
-                                                           download(NULL), downloadFd(-1), downloadOffset(0), downloadSize(0) {}
+                                                           download(NULL), downloadSize(0) {}
     std::string method;
     std::string path;
     std::vector<std::pair<std::string, std::string> > headers;
@@ -235,10 +235,8 @@ struct Request {
     int uploadFd;
     size_t uploadOffset;
     size_t uploadSize;
-    // a GET body into memory or a file, else into the response
+    // a GET body into memory, else into the response
     char *download;
-    int downloadFd;
-    size_t downloadOffset;
     size_t downloadSize;
 };
 
@@ -264,7 +262,7 @@ static size_t onBody(char *data, size_t size, size_t count, void *pointer) {
     size_t bytes = size * count;
     long status = 0;
     curl_easy_getinfo(transfer.curl, CURLINFO_RESPONSE_CODE, &status);
-    if (status < 200 || status >= 300 || (request.download == NULL && request.downloadFd < 0)) {
+    if (status < 200 || status >= 300 || request.download == NULL) {
         response.body.append(data, bytes);
         return bytes;
     }
@@ -272,11 +270,7 @@ static size_t onBody(char *data, size_t size, size_t count, void *pointer) {
         transfer.isTooLong = true;
         return 0;
     }
-    if (request.download != NULL) {
-        memcpy(request.download + response.received, data, bytes);
-    } else {
-        FileUtil::pwriteAll(request.downloadFd, request.path.c_str(), data, bytes, request.downloadOffset + response.received);
-    }
+    memcpy(request.download + response.received, data, bytes);
     response.received += bytes;
     return bytes;
 }
@@ -380,7 +374,7 @@ static long perform(const Request &request, Response &response, bool *isAmbiguou
     const size_t verb = (request.query.empty() == false) ? 5 : (request.method == "GET") ? 0 : (request.method == "HEAD") ? 1 : (request.method == "DELETE") ? 4 : (isConditional ? 3 : 2);
     const time_t firstAttempt = time(NULL);
     unsigned int failures = 0;
-    const bool isFixedDownload = request.download != NULL || request.downloadFd >= 0;
+    const bool isFixedDownload = request.download != NULL;
     const std::string uriPath = encodePath(request.query.empty() ? (isPathStyle ? "/" + bucket : "") + "/" + keyPrefix + "/" + request.path : (isPathStyle ? "/" + bucket : "/"));
     std::vector<std::pair<std::string, std::string> > sortedQuery = request.query;
     std::sort(sortedQuery.begin(), sortedQuery.end());
@@ -566,8 +560,8 @@ static void deleteObject(const std::string &path) {
     }
 }
 
-// pieces of at most one segment, in parallel, into memory or a file at the same offsets
-static void readRange(const std::string &path, const std::pair<size_t, size_t> &layout, size_t offset, size_t size, char *destination, int fd) {
+// pieces of at most one segment, in parallel, into memory
+static void readRange(const std::string &path, const std::pair<size_t, size_t> &layout, size_t offset, size_t size, char *destination) {
     if (offset > layout.first || size > layout.first - offset) {
         Debug(Debug::ERROR) << "Cannot read bytes " << offset << " to " << offset + size << " of s3://" << bucket << "/" << keyPrefix << "/" << path << " with " << layout.first << " bytes\n";
         EXIT(EXIT_FAILURE);
@@ -587,9 +581,7 @@ static void readRange(const std::string &path, const std::pair<size_t, size_t> &
         size_t bytes = pieceOffsets[i + 1] - pos;
         Request request("GET", (layout.second > 0) ? path + "/" + SSTR(pos / layout.second) : path);
         request.headers.push_back(std::make_pair("range", "bytes=" + SSTR(pos - segmentBegin) + "-" + SSTR(pos - segmentBegin + bytes - 1)));
-        request.download = (destination != NULL) ? destination + done : NULL;
-        request.downloadFd = fd;
-        request.downloadOffset = pos;
+        request.download = destination + done;
         request.downloadSize = bytes;
         Response response;
         long status = perform(request, response);
@@ -711,7 +703,7 @@ bool S3Client::get(const std::string &path, std::string &data) {
         return true;
     }
     data.assign(layout.first, '\0');
-    readRange(path, layout, 0, layout.first, &data[0], -1);
+    readRange(path, layout, 0, layout.first, &data[0]);
     return true;
 }
 
@@ -807,27 +799,7 @@ void S3Client::putFile(const std::string &path, const std::string &localFile, si
 
 void S3Client::getRange(const std::string &path, size_t offset, size_t size, char *destination) {
     if (size > 0) {
-        readRange(path, getLayout(path), offset, size, destination, -1);
-    }
-}
-
-void S3Client::getRanges(const std::string &path, const std::vector<std::pair<size_t, size_t> > &ranges, const std::string &localFile) {
-    if (ranges.empty()) {
-        return;
-    }
-    std::pair<size_t, size_t> layout = getLayout(path);
-    int fd = open(localFile.c_str(), O_WRONLY | O_CLOEXEC);
-    if (fd < 0) {
-        Debug(Debug::ERROR) << "Cannot open " << localFile << ": " << strerror(errno) << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-#pragma omp parallel for schedule(dynamic, 1) if (omp_in_parallel() == 0)
-    for (size_t i = 0; i < ranges.size(); i++) {
-        readRange(path, layout, ranges[i].first, ranges[i].second, NULL, fd);
-    }
-    if (close(fd) != 0) {
-        Debug(Debug::ERROR) << "Cannot close " << localFile << "\n";
-        EXIT(EXIT_FAILURE);
+        readRange(path, getLayout(path), offset, size, destination);
     }
 }
 
@@ -877,10 +849,6 @@ void S3Client::putFile(const std::string &, const std::string &, size_t, size_t)
 }
 
 void S3Client::getRange(const std::string &, size_t, size_t, char *) {
-    notBuilt();
-}
-
-void S3Client::getRanges(const std::string &, const std::vector<std::pair<size_t, size_t> > &, const std::string &) {
     notBuilt();
 }
 

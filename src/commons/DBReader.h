@@ -296,9 +296,9 @@ public:
     const std::vector<size_t> &getBlockKeyOffsets() const { return blockKeyOffsets; }
     size_t getBlockReadSize() { return blockReadSize; }
     size_t getKeyReadSize() { return keyReadSize; }
-    // a sparse local copy holds the blocks of localBlocks at the offsets of the data files
+    // linfinity local copy
     void setLocalBlocks(const std::string &localDataFileName, const std::vector<char> &blocks);
-    // a block of the local copy once all its bytes are written; not while a loaded buffer is read
+    // not while a loaded buffer is read
     void setLocalBlock(size_t block);
     void setLocalBlockCacheSize(size_t cacheSize) { localBlockCacheSize = cacheSize; }
     bool isLocalBlock(size_t block) const { return localBlocks.empty() == false && localBlocks[block]; }
@@ -658,7 +658,7 @@ private:
     std::vector<int> dataFds;
     // without O_DIRECT for key loads and index searches
     std::vector<int> bufferedFds;
-    int openDataFile(const std::string &fileName, size_t fileSize, int &bufferedFd);
+    bool openDataFile(const std::string &fileName, size_t fileSize, std::vector<int> &fds, std::vector<int> &bufferedFds);
     BatchReader * batchReader;
     struct EntryReadBuffer {
         char *buffer;

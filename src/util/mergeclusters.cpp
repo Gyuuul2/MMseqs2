@@ -25,8 +25,7 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         // clusthashfast keeps its singletons in representative bits
         std::string representativeDb = par.filenames[2] + "_redundancy";
         MMseqsNode::fetchFile(representativeDb + ".dbtype", false);
-        struct stat sb;
-        bool hasRepBits = MMseqsNode::statSharedFile(representativeDb + ".dbtype", sb);
+        bool hasRepBits = MMseqsNode::statSharedFile(representativeDb + ".dbtype");
         std::vector<size_t> firstCluKeyOffsets;
         if (hasSecondClu || hasRepBits) {
             std::string firstKeyFile = hasRepBits ? representativeDb + ".bits." + SSTR(MMseqsNode::rank) : "";
