@@ -1687,7 +1687,7 @@ struct PrefRead {
     size_t window;
 };
 
-// a started pref read whose entries are counted, then decoded, in chunks; prefRead SIZE_MAX: none
+// a started pref read whose entries are counted, then decoded by entry parts; nextEntry is the next entry or part; prefRead SIZE_MAX: none
 struct PrefReadParse {
     PrefReadParse() : prefRead(SIZE_MAX), firstEntry(0), entryCount(0), nextEntry(0), isCounted(false), firstRecord(0), firstTarget(0), size(0), maxEntrySize(0), fetchSize(0), alignCells(0) {}
     size_t prefRead;
@@ -2123,7 +2123,7 @@ struct TargetSplitReader {
           maxPrefilterBufferSize(std::max((size_t) 1, memoryLimit / PREFILTER_BUFFER_MEMORY_DIVISOR)),
           maxRecordTargetCount(std::min((size_t) UINT_MAX, std::max((size_t) 1, maxRecordSize / std::max(seqDbr.getMaxSeqLen() + 2, Util::getPageSize())))),
           windowPos(0), prefReadPos(0), passClasses(1), endClass(0), classSize(sizeClassCount, 0), prefNode(SIZE_MAX), bufferFetchSize(0), bufferAlignmentCells(0),
-          isFilling(false), isLoaded(false), fillMaxAlignmentCells(0) {
+          partSize(0), isFilling(false), isLoaded(false), fillMaxAlignmentCells(0) {
         for (size_t split = 0; split < targetSplitCount; split++) {
             if (targetSplitAlignNodes[split] == MMseqsNode::rank) {
                 targetSplits.push_back(split);
@@ -2149,7 +2149,7 @@ struct TargetSplitReader {
         endClass = sizeClassCount;
     }
 
-    // one step with isOneStep, else all steps with the caller's team; true once the buffer is complete
+    // one step with isOneStep (a pref read start, an entry, an entry part or the sort), else all steps with the caller's team; true once the buffer is complete
     bool fillPrefilterBuffer(std::vector<RepTargetsRecord> &records, std::vector<DBKeyType> &targets, size_t maxReadSize, size_t maxBufferAlignmentCells, bool isOneStep) {
         if (isFilling == false) {
             records.clear();
@@ -2237,8 +2237,12 @@ private:
     std::vector<size_t> entrySizes;
     size_t bufferFetchSize;
     size_t bufferAlignmentCells;
-    std::vector<size_t> entryTargetOffsets;
-    std::vector<size_t> entryRecordOffsets;
+    // an entry is cut at reps into parts, a part starts from the pieces as they were at its first rep
+    size_t partSize;
+    std::vector<size_t> entryPartOffsets;
+    std::vector<size_t> partTargetOffsets;
+    std::vector<size_t> partRecordOffsets;
+    std::vector<TargetSplitPiece> partPieces;
     // a fill resumed in later calls
     bool isFilling;
     bool isLoaded;
@@ -2381,6 +2385,8 @@ private:
                 prefDbs[i]->prefetchData(prefReads[prefReadPos].firstEntry, prefReads[prefReadPos].endEntry);
             }
         }
+        entryPartOffsets.resize(parse.entryCount + 1);
+        entryPartOffsets[0] = 0;
         for (size_t entry = parse.firstEntry; entry < parse.firstEntry + parse.entryCount; entry++) {
             size_t entrySize = 0;
             for (size_t i = 0; i < prefDbs.size(); i++) {
@@ -2388,15 +2394,20 @@ private:
             }
             parse.size += entrySize;
             parse.maxEntrySize = std::max(parse.maxEntrySize, entrySize);
+            entryPartOffsets[entry - parse.firstEntry + 1] = entrySize;
         }
         readSize += parse.size;
-        entryTargetOffsets.resize(parse.entryCount + 1);
-        entryRecordOffsets.resize(parse.entryCount + 1);
-        entryTargetOffsets[0] = 0;
-        entryRecordOffsets[0] = 0;
+        // parts of about 1 / threads of the pref read, fewer than entries + 2 * threads
+        partSize = std::max((size_t) 1, parse.size / par.threads);
+        for (size_t entry = 0; entry < parse.entryCount; entry++) {
+            entryPartOffsets[entry + 1] = entryPartOffsets[entry] + entryPartOffsets[entry + 1] / partSize + 1;
+        }
+        partTargetOffsets.assign(entryPartOffsets[parse.entryCount] + 1, 0);
+        partRecordOffsets.assign(entryPartOffsets[parse.entryCount] + 1, 0);
+        partPieces.resize(entryPartOffsets[parse.entryCount] * prefDbs.size());
     }
 
-    // counts the targets and records of every entry, then writes the records of an entry at its offsets, a chunk a call with isOneStep; true once they are in the buffer
+    // counts the targets and records of every entry part, then writes the records of a part at its offsets, an entry or a part a call with isOneStep; true once they are in the buffer
     bool parsePrefRead(std::vector<RepTargetsRecord> &records, std::vector<DBKeyType> &targets, bool isOneStep) {
         const size_t firstEntry = parse.firstEntry;
         const size_t entryCount = parse.entryCount;
@@ -2405,15 +2416,28 @@ private:
                 std::vector<TargetSplitPiece> pieces(prefDbs.size());
                 for (size_t entry = begin; entry < end; entry++) {
                     startEntry(firstEntry + entry, pieces);
+                    size_t part = entryPartOffsets[entry];
+                    std::copy(pieces.begin(), pieces.end(), partPieces.begin() + part * pieces.size());
                     size_t targetCount = 0;
                     size_t recordCount = 0;
+                    size_t partEntrySize = 0;
                     for (DBKeyType repKey = getNextRepKey(pieces); repKey != DB_KEY_INVALID; repKey = getNextRepKey(pieces)) {
+                        if (partEntrySize >= partSize) {
+                            partTargetOffsets[part + 1] = targetCount;
+                            partRecordOffsets[part + 1] = recordCount;
+                            part++;
+                            std::copy(pieces.begin(), pieces.end(), partPieces.begin() + part * pieces.size());
+                            targetCount = 0;
+                            recordCount = 0;
+                            partEntrySize = 0;
+                        }
                         size_t repTargetCount = 0;
                         size_t sizeClass = 0;
                         for (size_t i = 0; i < pieces.size(); i++) {
                             if (pieces[i].repKey == repKey) {
                                 repTargetCount += pieces[i].targetCount;
                                 sizeClass = std::min(sizeClassCount - 1, pieces[i].sizeClass);
+                                partEntrySize += pieces[i].data - pieces[i].targets;
                                 pieces[i].next();
                             }
                         }
@@ -2422,8 +2446,8 @@ private:
                             recordCount += (repTargetCount + maxRecordTargetCount - 1) / maxRecordTargetCount;
                         }
                     }
-                    entryTargetOffsets[entry + 1] = targetCount;
-                    entryRecordOffsets[entry + 1] = recordCount;
+                    partTargetOffsets[part + 1] = targetCount;
+                    partRecordOffsets[part + 1] = recordCount;
                 }
             });
             if (parse.nextEntry < entryCount) {
@@ -2435,28 +2459,30 @@ private:
                 return false;
             }
         }
+        const size_t partCount = entryPartOffsets[entryCount];
         if (parse.nextEntry == 0) {
-            sumOffsets(entryTargetOffsets.data(), entryCount, par.threads);
-            sumOffsets(entryRecordOffsets.data(), entryCount, par.threads);
+            sumOffsets(partTargetOffsets.data(), partCount, par.threads);
+            sumOffsets(partRecordOffsets.data(), partCount, par.threads);
             parse.firstRecord = records.size();
             parse.firstTarget = targets.size();
-            records.resize(parse.firstRecord + entryRecordOffsets[entryCount]);
-            targets.resize(parse.firstTarget + entryTargetOffsets[entryCount]);
+            records.resize(parse.firstRecord + partRecordOffsets[partCount]);
+            targets.resize(parse.firstTarget + partTargetOffsets[partCount]);
         }
         const size_t firstRecord = parse.firstRecord;
         const size_t firstTarget = parse.firstTarget;
-        parse.nextEntry = forEachEntryChunk(parse.nextEntry, entryCount, 1, isOneStep, [&](size_t begin, size_t end) {
+        parse.nextEntry = forEachEntryChunk(parse.nextEntry, partCount, 1, isOneStep, [&](size_t begin, size_t end) {
             std::vector<TargetSplitPiece> pieces(prefDbs.size());
             size_t fetchSize = 0;
             size_t alignCells = 0;
-            for (size_t entry = begin; entry < end; entry++) {
-                if (entryTargetOffsets[entry + 1] == entryTargetOffsets[entry]) {
+            for (size_t part = begin; part < end; part++) {
+                if (partTargetOffsets[part + 1] == partTargetOffsets[part]) {
                     continue;
                 }
-                startEntry(firstEntry + entry, pieces);
-                DBKeyType *repTargets = targets.data() + firstTarget + entryTargetOffsets[entry];
-                size_t j = firstRecord + entryRecordOffsets[entry];
-                for (DBKeyType repKey = getNextRepKey(pieces); repKey != DB_KEY_INVALID; repKey = getNextRepKey(pieces)) {
+                std::copy(partPieces.begin() + part * pieces.size(), partPieces.begin() + (part + 1) * pieces.size(), pieces.begin());
+                DBKeyType *repTargets = targets.data() + firstTarget + partTargetOffsets[part];
+                const DBKeyType *partTargetsEnd = targets.data() + firstTarget + partTargetOffsets[part + 1];
+                size_t j = firstRecord + partRecordOffsets[part];
+                for (DBKeyType repKey = getNextRepKey(pieces); repTargets != partTargetsEnd; repKey = getNextRepKey(pieces)) {
                     // pieces in target split order, so targets ascend
                     size_t repTargetCount = 0;
                     size_t sizeClass = 0;
@@ -2498,7 +2524,7 @@ private:
             __sync_fetch_and_add(&parse.fetchSize, fetchSize);
             __sync_fetch_and_add(&parse.alignCells, alignCells);
         });
-        if (parse.nextEntry < entryCount) {
+        if (parse.nextEntry < partCount) {
             return false;
         }
         bufferFetchSize += parse.fetchSize;
