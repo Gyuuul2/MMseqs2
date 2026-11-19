@@ -3605,7 +3605,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         Debug(Debug::WARNING) << "Node " << rank << " holds " << servedSequenceSize << " sequence bytes, --local-tmp holds " << localBlockSize << " of them and its block cache has " << blockCacheSize
                               << " bytes, the other sequences are read one by one. Use more nodes or increase --split-memory-limit\n";
     }
-    // the first fetch is small, then they double up to 128 MiB; MMSEQS_ALIGN_FETCH_BYTES=<n> fixes the limit for measurements
+    // the first fetch is small, then they double up to half of READ_SECONDS of aligning at the rate of the last fetch; MMSEQS_ALIGN_FETCH_BYTES=<n> fixes the limit for measurements
     size_t fetchBytesLimit = std::min<size_t>(maxFetchSize / 64, 64 * 1024 * 1024);
     const char *fixedFetchBytes = getenv("MMSEQS_ALIGN_FETCH_BYTES");
     char *fetchBytesEnd = NULL;
@@ -3620,12 +3620,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             MMseqsNode::addPhaseValue(phaseValues, "Fetch bytes limit", SSTR(fetchBytesLimit) + " fixed by MMSEQS_ALIGN_FETCH_BYTES, the largest fetch is " + SSTR(maxFetchSize) + " bytes");
         }
     }
-    const size_t maxFetchBytesLimit = isFetchBytesFixed ? fetchBytesLimit : std::min<size_t>(maxFetchSize, 128 * 1024 * 1024);
-    // the fetches in flight share the two fetches of getReservedMemory; a fetch holds pending pairs up to the limit and a record on top
+    size_t maxFetchBytesLimit = isFetchBytesFixed ? fetchBytesLimit : maxFetchSize;
+    // the fetches in flight share the two fetches of getReservedMemory, the slots hold as many as fit at the first limit
     const size_t fetchBudget = 2 * std::max(maxFetchSize, repTargetsReader.maxRecordSize);
-    const size_t maxLimitedFetchSize = (memberDbr != NULL) ? std::max(maxFetchBytesLimit, maxPendingPairSize) + repTargetsReader.maxRecordSize
-                                                           : std::max(maxFetchBytesLimit, repTargetsReader.maxRecordSize);
-    std::vector<FetchedSequences> fetchSlots(1 + fetchBudget / std::max(maxFetchBytesLimit, minFetchSize));
+    std::vector<FetchedSequences> fetchSlots(1 + fetchBudget / std::max(fetchBytesLimit, minFetchSize));
     // the slot released last is taken first, so few slots get buffers
     std::vector<FetchedSequences *> idleFetches;
     for (size_t i = fetchSlots.size(); i > 0; i--) {
@@ -5056,9 +5054,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t alignedFetchCount = 0;
     std::vector<std::pair<size_t, double> > fetchWindowCells;
     std::atomic<size_t> staleRepSize(0);
-    size_t alignedPlannedSize = 0;
+    // the planned bytes per aligning second of the last fetch with planned bytes
+    double plannedBytesPerSecond = 0;
     size_t maxFetchesInFlight = 0;
     size_t fetchesInFlightSum = 0;
+    const size_t alignThreadCount = par.threads - ioThreadCount;
     while (currentSequences.isLast == false) {
         Timer otherTimer;
         // one fetch ahead always; more while those in flight align in READ_SECONDS, fit the fetch memory and keep the prefilter buffer of current
@@ -5072,16 +5072,19 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 }
                 // more pending pairs come only after aligning
                 if (newest.isLast || (newest.end == newest.begin && newest.pendingPairCount == 0) || idleFetches.empty()
-                    || inFlightPlannedSize * alignSeconds >= READ_SECONDS * static_cast<double>(alignedPlannedSize)) {
+                    || inFlightPlannedSize >= READ_SECONDS * plannedBytesPerSecond) {
                     break;
                 }
             }
+            // the next fetch holds pending pairs up to the limit and a record on top
+            const size_t limitedFetchSize = (memberDbr != NULL) ? std::max(fetchBytesLimit, maxPendingPairSize) + repTargetsReader.maxRecordSize
+                                                                : std::max(fetchBytesLimit, repTargetsReader.maxRecordSize);
             // idle slots free their buffers until the next fetch fits, but the slot taken next keeps them
             size_t fetchMemory = currentSequences.memorySize();
             for (size_t i = 0; i < fetchSlots.size(); i++) {
                 fetchMemory += fetchSlots[i].memorySize();
             }
-            for (size_t i = 0; i + 1 < idleFetches.size() && fetchMemory + maxLimitedFetchSize > fetchBudget; i++) {
+            for (size_t i = 0; i + 1 < idleFetches.size() && fetchMemory + limitedFetchSize > fetchBudget; i++) {
                 FetchedSequences &idle = *idleFetches[i];
                 fetchMemory -= idle.memorySize();
                 delete[] idle.entries;
@@ -5090,7 +5093,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 std::vector<DBKeyType>().swap(idle.keys);
                 std::vector<size_t>().swap(idle.entryOffsets);
             }
-            if (isFirstAhead == false && fetchMemory + maxLimitedFetchSize > fetchBudget) {
+            if (isFirstAhead == false && fetchMemory + limitedFetchSize > fetchBudget) {
                 break;
             }
             // the next prefilter buffer must be filled, and the fill then refills the one before the buffer of current
@@ -5124,7 +5127,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         const std::vector<RepTargetsRecord> &records = prefilterRecords[currentSequences.prefilterBuffer];
         const size_t recordCount = currentSequences.end - currentSequences.begin;
         // batches of about equal alignment cells; a large rep spans several
-        size_t maxBatches = par.threads * (isSwipeEnabled ? 64 * 16 / SwipeExtender::LANES : 64);
+        size_t maxBatches = alignThreadCount * (isSwipeEnabled ? 64 * 16 / SwipeExtender::LANES : 64);
         if (isSwipeEnabled) {
             // estimate the SWIPE jobs of this fetch
             size_t swipeJobCount = 0;
@@ -5132,7 +5135,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 swipeJobCount += (threadTargetAligners[thread] != NULL) ? threadTargetAligners[thread]->swipeTargets.targetPairs : 0;
             }
             size_t fetchSwipeJobs = static_cast<size_t>(static_cast<uint128>(currentSequences.targetCount) * swipeJobCount / std::max((size_t) 1, examinedTargetPairCount.load()));
-            size_t swipeBatches = std::max((size_t) 8 * par.threads, fetchSwipeJobs / (64 * SwipeExtender::LANES));
+            size_t swipeBatches = std::max(8 * alignThreadCount, fetchSwipeJobs / (64 * SwipeExtender::LANES));
             fetchCount++;
             fewerBatchFetchCount += swipeBatches < maxBatches;
             maxBatches = std::min(maxBatches, swipeBatches);
@@ -5751,8 +5754,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         const double fetchAlignSeconds = alignTimer.getTimediff();
         alignedCells += static_cast<double>(fetchAlignmentCells);
         alignSeconds += fetchAlignSeconds;
-        alignedPlannedSize += currentSequences.plannedSize;
         alignedCellsPerSecond.store(alignedCells / std::max(alignSeconds, 1e-3));
+        // a fetch aligns in about half of READ_SECONDS at the rate of the last fetch, so that the fetches in flight hold two
+        if (currentSequences.plannedSize > 0) {
+            plannedBytesPerSecond = currentSequences.plannedSize / std::max(fetchAlignSeconds, 1e-3);
+            if (isFetchBytesFixed == false) {
+                maxFetchBytesLimit = std::max(minFetchSize, std::min(maxFetchSize, static_cast<size_t>(READ_SECONDS / 2.0 * plannedBytesPerSecond)));
+                fetchBytesLimit = std::min(fetchBytesLimit, maxFetchBytesLimit);
+            }
+        }
 
         // the seconds of a fetch go to its windows by their cells, a fetch without records to the window of its first rep
         fetchWindowCells.clear();
