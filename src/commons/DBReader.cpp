@@ -23,6 +23,10 @@
 #include <omp.h>
 #endif
 
+static size_t roundUp(size_t bytes, size_t alignment) {
+    return (bytes + alignment - 1) / alignment * alignment;
+}
+
 template <typename T>
 DBReader<T>::DBReader(const char* dataFileName_, const char* indexFileName_, int threads, int dataMode) :
 threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
@@ -961,7 +965,7 @@ template <typename T> void DBReader<T>::readSampledKeys(size_t entryStep, size_t
             size_t begin = end * entryStep * 2 * sizeof(uint64_t);
             bool isJoined = readRequests.empty() == false && begin - (readRequests.back().fileOffset + readRequests.back().minBytesToRead) <= pageSize;
             size_t requestBegin = isJoined ? readRequests.back().fileOffset : begin / pageSize * pageSize;
-            size_t requestBytes = (begin + sizeof(uint64_t) + pageSize - 1) / pageSize * pageSize - requestBegin;
+            size_t requestBytes = roundUp(begin + sizeof(uint64_t), pageSize) - requestBegin;
             size_t nextBytes = bytes + requestBytes - (isJoined ? readRequests.back().bytesToRead : 0);
             if (end > first && nextBytes > bufferSize) {
                 break;
@@ -999,10 +1003,6 @@ template <typename T> void DBReader<T>::readData(size_t offset, size_t bytes, ch
 }
 
 template <typename T> size_t DBReader<T>::getNamesSize(size_t keyBegin, size_t keyEnd) {
-    if (hasBinaryIndex || entryOffsetsFileNames.empty() || bufferedFds.empty()) {
-        Debug(Debug::ERROR) << "Call of getNamesSize is only allowed for the headers of a linfinity database opened with data " << dataFileName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
     size_t namesSize = 0;
     for (size_t range = findIdRange(keyBegin); range < indexSize && indexIdToNum(&index[range].id) < keyEnd; range++) {
         size_t firstId = indexIdToNum(&index[range].id);
@@ -1057,8 +1057,8 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
     for (size_t range = firstRange; range < indexSize && indexIdToNum(&index[range].id) < keyEnd; range++) {
         size_t firstId = indexIdToNum(&index[range].id);
         size_t endId = (range + 1 < indexSize) ? indexIdToNum(&index[range + 1].id) : size;
-        size_t begin = index[range].offset + (std::max(keyBegin, firstId) - firstId) * index[range].length;
-        size_t end = index[range].offset + (std::min(keyEnd, endId) - firstId) * index[range].length;
+        size_t begin = getKeyOffset(range, std::max(keyBegin, firstId));
+        size_t end = getKeyOffset(range, std::min(keyEnd, endId));
         size_t fileIdx = index2dbfile[range];
         if (isReadingOffsets) {
             begin = (std::max(keyBegin, firstId) - firstId) * offsetSize;
@@ -1136,7 +1136,7 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
         }
         BatchReader::ReadRequest &request = readRequests.back();
         request.minBytesToRead = end - request.fileOffset;
-        request.bytesToRead = ((end + alignment - 1) / alignment * alignment - request.fileOffset + pageSize - 1) / pageSize * pageSize;
+        request.bytesToRead = roundUp(roundUp(end, alignment) - request.fileOffset, pageSize);
         if (isCompressedNames) {
             size_t endFrame = (end + alignment - 1) / alignment;
             if (endFrame >= frameOffsets[fileIdx].size()) {
@@ -1146,7 +1146,7 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
             size_t compressedEnd = frameOffsets[fileIdx][endFrame];
             BatchReader::ReadRequest compressedRequest = { fd, request.fileName, NULL, frameOffsets[fileIdx][request.fileOffset / alignment] / pageSize * pageSize, 0, 0 };
             compressedRequest.minBytesToRead = compressedEnd - compressedRequest.fileOffset;
-            compressedRequest.bytesToRead = (compressedEnd + pageSize - 1) / pageSize * pageSize - compressedRequest.fileOffset;
+            compressedRequest.bytesToRead = roundUp(compressedEnd, pageSize) - compressedRequest.fileOffset;
             compressedReadRequests.push_back(compressedRequest);
         }
     }
@@ -1162,10 +1162,6 @@ template <typename T> size_t DBReader<T>::planReadRequests(size_t keyBegin, size
 }
 
 template <typename T> size_t DBReader<T>::getLoadBufferSize(size_t keyBegin, size_t keyEnd) {
-    if (entryOffsetsFileNames.empty() == false) {
-        Debug(Debug::ERROR) << "Call of getLoadBufferSize is not allowed for the headers or clusters of a linfinity database " << dataFileName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
     std::vector<BatchReader::ReadRequest> readRequests;
     std::vector<size_t> entryOffsets;
     std::vector<size_t> keys;
@@ -1177,10 +1173,6 @@ template <typename T> size_t DBReader<T>::getLoadBufferSize(size_t keyBegin, siz
 template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys) {
     readRequests.clear();
     requestFirstKeys.clear();
-    if (entryOffsetsFileNames.empty() == false || hasBinaryIndex) {
-        Debug(Debug::ERROR) << "Call of loadData with keys is not allowed for the headers or clusters of a linfinity database " << dataFileName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
     if (batchReader == NULL) {
         return 0;
     }
@@ -1191,7 +1183,7 @@ template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<
     size_t block = SIZE_MAX;
     for (size_t i = 0; i < keys.size(); i++) {
         size_t range = findIdRange(keys[i]);
-        size_t begin = index[range].offset + (keys[i] - indexIdToNum(&index[range].id)) * index[range].length;
+        size_t begin = getKeyOffset(range, keys[i]);
         size_t end = begin + index[range].length;
         int fd = bufferedFds[index2dbfile[range]];
         if (localBlocks.empty() == false) {
@@ -1213,7 +1205,7 @@ template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<
         }
         BatchReader::ReadRequest &request = readRequests.back();
         request.minBytesToRead = std::max(request.minBytesToRead, end - request.fileOffset);
-        request.bytesToRead = (request.fileOffset + request.minBytesToRead + pageSize - 1) / pageSize * pageSize - request.fileOffset;
+        request.bytesToRead = roundUp(request.fileOffset + request.minBytesToRead, pageSize) - request.fileOffset;
     }
     if (readRequests.empty() == false) {
         bytes += readRequests.back().bytesToRead;
@@ -1260,11 +1252,7 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &buf
                     isCached = request.bytesToRead <= blockCacheSize - cachedBlockSize
                                && (isLocal == false || request.bytesToRead <= localBlockCacheSize - std::min(localBlockCacheSize, cachedLocalBlockSize));
                     if (isCached) {
-                        if (posix_memalign((void **) &request.destination, Util::getPageSize(), request.bytesToRead) != 0) {
-                            Debug(Debug::ERROR) << "Cannot allocate " << request.bytesToRead << " bytes to read " << dataFileName << "\n";
-                            EXIT(EXIT_FAILURE);
-                        }
-                        incrementMemory(request.bytesToRead);
+                        request.destination = allocateReadBuffer(request.bytesToRead);
                         cachedBlockSize += request.bytesToRead;
                         blockReadSize += request.bytesToRead;
                         cachedLocalBlockSize += isLocal ? request.bytesToRead : 0;
@@ -1305,12 +1293,7 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &buf
             Util::releasePages(bufferToLoadInto.buffer, bufferToLoadInto.allocatedSize);
             free(bufferToLoadInto.buffer);
             decrementMemory(bufferToLoadInto.allocatedSize);
-            // O_DIRECT reads need a page aligned buffer
-            if (posix_memalign((void **) &bufferToLoadInto.buffer, Util::getPageSize(), bytes) != 0) {
-                Debug(Debug::ERROR) << "Cannot allocate " << bytes << " bytes to read " << dataFileName << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-            incrementMemory(bytes);
+            bufferToLoadInto.buffer = allocateReadBuffer(bytes);
             bufferToLoadInto.allocatedSize = bytes;
         }
         char *destination = bufferToLoadInto.buffer;
@@ -1366,10 +1349,6 @@ template <typename T> void DBReader<T>::prefetchData(size_t keyBegin, size_t key
 }
 
 template <typename T> void DBReader<T>::startLoadData(size_t keyBegin, size_t keyEnd, size_t readSize) {
-    if (entryOffsetsFileNames.empty() == false) {
-        Debug(Debug::ERROR) << "Call of startLoadData is not allowed for the headers or clusters of a linfinity database " << dataFileName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
     readStepKeyEnd = keyEnd;
     readStepSize = readSize;
     if (prefetchBuffer.isPrefetched && prefetchBuffer.keyBegin == keyBegin && prefetchBuffer.keyEnd == keyEnd) {
@@ -1402,11 +1381,9 @@ template <typename T> size_t DBReader<T>::waitForLoadedData() {
     // end read steps on pages for O_DIRECT
     size_t pageSize = Util::getPageSize();
     size_t beginRange = findIdRange(keyBegin);
-    size_t beginOffset = index[beginRange].offset + (keyBegin - indexIdToNum(&index[beginRange].id)) * index[beginRange].length;
-    beginOffset = (beginOffset + pageSize - 1) / pageSize * pageSize;
+    size_t beginOffset = roundUp(getKeyOffset(beginRange, keyBegin), pageSize);
     size_t endRange = (keyEnd < loadedBuffer.keyEnd) ? findIdRange(keyEnd) : beginRange;
-    size_t endOffset = index[endRange].offset + (keyEnd - indexIdToNum(&index[endRange].id)) * index[endRange].length;
-    endOffset = (endOffset + pageSize - 1) / pageSize * pageSize;
+    size_t endOffset = roundUp(getKeyOffset(endRange, keyEnd), pageSize);
 
     std::vector<BatchReader::ReadRequest> readStepRequests;
     for (size_t i = 0; i < loadedBuffer.readRequests.size(); i++) {
@@ -1588,7 +1565,7 @@ template <typename T> char* DBReader<T>::getDataFromLoadedBuffer(size_t key, Loa
         if (range >= indexSize || key < indexIdToNum(&index[range].id) || (range + 1 < indexSize && indexIdToNum(&index[range + 1].id) <= key)) {
             range = findIdRange(key);
         }
-        size_t fileOffset = index[range].offset + (key - indexIdToNum(&index[range].id)) * index[range].length;
+        size_t fileOffset = getKeyOffset(range, key);
         size_t length = index[range].length;
         if (entryOffsetsFileNames.empty() == false) {
             size_t pos = findLoadedEntryOffsetsPos(key);
@@ -1711,6 +1688,21 @@ DBKeyType DBReader<std::string>::indexIdToNum(std::string * id){
 template<>
 DBKeyType DBReader<DBKeyType>::indexIdToNum(DBKeyType * id) {
     return *id;
+}
+
+template <typename T> size_t DBReader<T>::getKeyOffset(size_t range, size_t key) {
+    return index[range].offset + (key - indexIdToNum(&index[range].id)) * index[range].length;
+}
+
+template <typename T> char *DBReader<T>::allocateReadBuffer(size_t bytes) {
+    char *buffer;
+    // O_DIRECT reads need a page aligned buffer
+    if (posix_memalign((void **) &buffer, Util::getPageSize(), bytes) != 0) {
+        Debug(Debug::ERROR) << "Cannot allocate " << bytes << " bytes to read " << dataFileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    incrementMemory(bytes);
+    return buffer;
 }
 
 template <typename T> void DBReader<T>::unmapData() {
@@ -2130,10 +2122,6 @@ std::vector<size_t> DBReader<T>::getEvenNodeKeyOffsets(size_t nodeCount) {
 
 template<typename T>
 std::vector<size_t> DBReader<T>::getSplitKeyOffsets(size_t keyBegin, size_t keyEnd, size_t splitSize, size_t keySize) {
-    if (entryOffsetsFileNames.empty() == false) {
-        Debug(Debug::ERROR) << "Call of getSplitKeyOffsets is not allowed for the headers or clusters of a linfinity database " << dataFileName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
     std::vector<size_t> offsets(1, keyBegin);
     size_t splitFill = 0;
     for (size_t key = keyBegin; key < keyEnd;) {

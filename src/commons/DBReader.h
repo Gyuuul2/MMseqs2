@@ -596,6 +596,9 @@ private:
     size_t planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys);
     void loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
     void decompressLoadedBuffer();
+    // the offset of a key in the data file of its range
+    size_t getKeyOffset(size_t range, size_t key);
+    char *allocateReadBuffer(size_t bytes);
 
     int threads;
 
