@@ -850,7 +850,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             par.filterCluDBFile.c_str(), cluIndex.c_str(), par.threads, 
             DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
         );
-        cluDbr->open(DBReader<DBKeyType>::LINEAR_ACCCESS);
+        cluDbr->open(DBReader<DBKeyType>::NOSORT);
 
         std::string cluSeqIndex = par.filterSeqDBFile + ".index";
         cluSeqDbr = new DBReader<DBKeyType>(
@@ -858,7 +858,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
         );
             
-        cluSeqDbr->open(DBReader<DBKeyType>::LINEAR_ACCCESS);
+        cluSeqDbr->open(DBReader<DBKeyType>::NOSORT);
     }
 
     size_t dbSize = seqDbr->getSize();
@@ -1256,7 +1256,7 @@ int align2clust(int argc, const char **argv, const Command &command) {
     
     DBReader<DBKeyType> alnDbr(par.db2.c_str(), par.db2Index.c_str(), par.threads,
                                   DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
-    alnDbr.open(DBReader<DBKeyType>::LINEAR_ACCCESS);
+    alnDbr.open(DBReader<DBKeyType>::NOSORT);
     int dbtype =  Parameters::DBTYPE_CLUSTER_RES;
 
     DBWriter resultWriter(par.db3.c_str(), par.db3Index.c_str(), 1, par.compressed, dbtype);

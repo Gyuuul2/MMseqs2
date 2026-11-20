@@ -1154,8 +1154,10 @@ SeqPairType *doComputation(
     SeqPairType *writeSeqPair = NULL;
 
     size_t elementsToSort = totalKmers;
+    Timer timer;
     if (phase == ComputationPhase::Main || countTableKmerArray == NULL) {
         hashSeqPair = initKmerPositionArray<KmerPositionType>(totalKmers);
+        timer.reset();
         if (Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)) {
             std::pair<size_t, size_t> ret =
                 fillKmerPositionArray<Parameters::DBTYPE_NUCLEOTIDES, T, includeAdjacency, L>(
@@ -1171,6 +1173,7 @@ SeqPairType *doComputation(
                     subMat, true, hashStartRange, hashEndRange, NULL, countTableKmerArray, countTableKmers, countTableEndRange);
             elementsToSort = ret.first;
         }
+        Debug(Debug::INFO) << "Time for fill k-mers: " << timer.lap() << "\n";
 
         if (hashEndRange == SIZE_T_MAX) {
             seqDbr.unmapData();
@@ -1182,7 +1185,7 @@ SeqPairType *doComputation(
     }
 
     Debug(Debug::INFO) << "Sort kmer ";
-    Timer timer;
+    timer.reset();
     sortKmersByRepSequence(hashSeqPair, elementsToSort, Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES));
     Debug(Debug::INFO) << timer.lap() << "\n";
 
@@ -1579,14 +1582,16 @@ static KmerPositionType *doComputationWithoutDiagonal(size_t totalKmers, size_t 
                                            Parameters &par, BaseMatrix *subMat, size_t &kmerCount, KmerGroupRepSeq *&groupRepSeqs, size_t &groupRepSeqCount) {
     KmerPositionType *hashSeqPair = new(std::nothrow) KmerPositionType[totalKmers];
     Util::checkAllocation(hashSeqPair, "Can not allocate hashSeqPair memory in doComputationWithoutDiagonal");
+    Timer timer;
     size_t elementsToSort = fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, L>(
         hashSeqPair, totalKmers, seqDbr, par, subMat, true, hashStartRange, hashEndRange, NULL).first;
+    Debug(Debug::INFO) << "Time for fill k-mers: " << timer.lap() << "\n";
     if (hashEndRange == SIZE_T_MAX) {
         seqDbr.unmapData();
     }
 
     Debug(Debug::INFO) << "Sort kmer ";
-    Timer timer;
+    timer.reset();
     sortKmers(hashSeqPair, elementsToSort);
     Debug(Debug::INFO) << timer.lap() << "\n";
     kmerCount = elementsToSort;
@@ -1673,6 +1678,7 @@ std::vector<std::pair<size_t, size_t>> setupCountTable(
     Parameters &par,
     BaseMatrix *subMat,
     DBReader<DBKeyType> &seqDbr,
+    size_t *hashDist,
     size_t splits,
     size_t totalKmersPerSplit,
     size_t totalKmersCountTable
@@ -1680,8 +1686,6 @@ std::vector<std::pair<size_t, size_t>> setupCountTable(
     std::vector<std::pair<size_t, size_t>> hashRanges;
     Debug(Debug::INFO) << "Initiating count table\n";
     // fill hashDist 
-    size_t * hashDist = new(std::nothrow) size_t[USHRT_MAX+1];
-    Util::checkAllocation(hashDist, "Can not allocate hashDist memory");
     memset(hashDist, 0 , sizeof(size_t) * (USHRT_MAX+1));
     if(Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)){
         fillKmerPositionArray<Parameters::DBTYPE_NUCLEOTIDES, T, includeAdjacency, L>((KmerPosition<T, includeAdjacency, L> *) NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
@@ -1724,7 +1728,6 @@ std::vector<std::pair<size_t, size_t>> setupCountTable(
         currBucketSize+=hashDist[i];
         totalBucketSize+=hashDist[i];
     }
-    delete [] hashDist;
     return hashRanges;
 }
 
@@ -1885,6 +1888,7 @@ static void kmermatcherWithDiagonalInner(Parameters &par, DBReader<DBKeyType> &s
     KmerPositionType *countTableKmerArray = NULL;
     size_t countTableKmers = 0;
     size_t countTableEndRange = 0;
+    size_t *hashDist = NULL;
     if (par.includeCountTable) {
         countTable.assign(dbKeySize, 0);
         size_t countTableTotalKmers = static_cast<size_t>(totalKmers * par.countTableScale);
@@ -1902,9 +1906,11 @@ static void kmermatcherWithDiagonalInner(Parameters &par, DBReader<DBKeyType> &s
             ) + 1
         );
 
+        hashDist = new(std::nothrow) size_t[USHRT_MAX+1];
+        Util::checkAllocation(hashDist, "Can not allocate hashDist memory");
         std::vector<std::pair<size_t, size_t>> countTableHashRanges;
         countTableHashRanges = setupCountTable<T, false, L>( 
-            par, subMat, seqDbr,
+            par, subMat, seqDbr, hashDist,
             countTableSplits, countTableKmersPerSplit,
             static_cast<size_t>(totalKmers * par.countTableScale)
         );
@@ -1937,7 +1943,10 @@ static void kmermatcherWithDiagonalInner(Parameters &par, DBReader<DBKeyType> &s
         assignGroupMask |= AssignGroupFeature::CountTable;
     }
 
-    std::vector<std::pair<size_t, size_t>> hashRanges = setupKmerSplits<T, includeAdjacency, L>(par, subMat, seqDbr, totalKmersPerSplit, splits, kmerMemory);
+    // nucleotide count table fills can change par.kmerSize
+    std::vector<std::pair<size_t, size_t>> hashRanges = setupKmerSplits<T, includeAdjacency, L>(par, subMat, seqDbr, totalKmersPerSplit, splits, kmerMemory,
+                                                                                               Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES) ? NULL : hashDist);
+    delete[] hashDist;
     if(splits > 1){
         Debug(Debug::INFO) << "Process file into " << hashRanges.size() << " parts\n";
     }
@@ -2117,19 +2126,23 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
 }
 
 template <typename T, bool includeAdjacency, typename L>
-std::vector<std::pair<size_t, size_t>> setupKmerSplits(Parameters &par, BaseMatrix * subMat, DBReader<DBKeyType> &seqDbr, size_t totalKmers, size_t splits, size_t kmerMemory){
+std::vector<std::pair<size_t, size_t>> setupKmerSplits(Parameters &par, BaseMatrix * subMat, DBReader<DBKeyType> &seqDbr, size_t totalKmers, size_t splits, size_t kmerMemory,
+                                                       size_t *filledHashDist){
     std::vector<std::pair<size_t, size_t>> hashRanges;
     if (splits > 1) {
         Debug(Debug::INFO) << "Not enough memory to process at once need to split\n";
-        size_t * hashDist = new(std::nothrow) size_t[USHRT_MAX+1];
-        Util::checkAllocation(hashDist, "Can not allocate hashDist memory");
-        memset(hashDist, 0 , sizeof(size_t) * (USHRT_MAX+1));
-        if(Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)){
-            fillKmerPositionArray<Parameters::DBTYPE_NUCLEOTIDES, T, includeAdjacency, L>((KmerPosition<T, includeAdjacency, L> *) NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
-        }else{
-            fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, L>((KmerPosition<T, includeAdjacency, L> *) NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
+        size_t * hashDist = filledHashDist;
+        if (hashDist == NULL) {
+            hashDist = new(std::nothrow) size_t[USHRT_MAX+1];
+            Util::checkAllocation(hashDist, "Can not allocate hashDist memory");
+            memset(hashDist, 0 , sizeof(size_t) * (USHRT_MAX+1));
+            if(Parameters::isEqualDbtype(seqDbr.getDbtype(), Parameters::DBTYPE_NUCLEOTIDES)){
+                fillKmerPositionArray<Parameters::DBTYPE_NUCLEOTIDES, T, includeAdjacency, L>((KmerPosition<T, includeAdjacency, L> *) NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
+            }else{
+                fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, L>((KmerPosition<T, includeAdjacency, L> *) NULL, SIZE_T_MAX, seqDbr, par, subMat, true, 0, SIZE_T_MAX, hashDist);
+            }
+            seqDbr.releaseDataPages();
         }
-        seqDbr.releaseDataPages();
         size_t maxBucketSize = 0;
         for(size_t i = 0; i < (USHRT_MAX+1); i++) {
             if(maxBucketSize < hashDist[i]){
@@ -2151,7 +2164,9 @@ std::vector<std::pair<size_t, size_t>> setupKmerSplits(Parameters &par, BaseMatr
             currBucketSize+=hashDist[i];
         }
         hashRanges.emplace_back(currBucketStart, (USHRT_MAX+1));
-        delete [] hashDist;
+        if (filledHashDist == NULL) {
+            delete [] hashDist;
+        }
     }else{
         hashRanges.emplace_back(0, SIZE_T_MAX);
     }
@@ -2935,10 +2950,10 @@ template size_t computeMemoryNeededLinearfilter<short, false, short>(size_t tota
 template size_t computeMemoryNeededLinearfilter<int, true, int>(size_t totalKmer);
 template size_t computeMemoryNeededLinearfilter<int, false, int>(size_t totalKmer);
 
-template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<short, true, short>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t, size_t);
-template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<short, false, short>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t, size_t);
-template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<int, true, int>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t, size_t);
-template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<int, false, int>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t, size_t);
+template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<short, true, short>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t, size_t, size_t *);
+template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<short, false, short>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t, size_t, size_t *);
+template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<int, true, int>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t, size_t, size_t *);
+template std::vector<std::pair<size_t, size_t>>  setupKmerSplits<int, false, int>(Parameters &, BaseMatrix *, DBReader<DBKeyType> &, size_t, size_t, size_t, size_t *);
 
 template void writeKmersToDisk<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev, short>(std::string, KmerPosition<short, true> *, size_t, int, std::vector<size_t> *, int);
 template void writeKmersToDisk<Parameters::DBTYPE_NUCLEOTIDES, KmerEntryRev, int>(std::string, KmerPosition<int, true> *, size_t, int, std::vector<size_t> *, int);

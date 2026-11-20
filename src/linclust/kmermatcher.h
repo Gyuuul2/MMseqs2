@@ -431,7 +431,7 @@ size_t computeMemoryNeededLinearfilter(size_t totalKmer);
 
 template <typename T, bool includeAdjacency = false, typename L = T>
 std::vector<std::pair<size_t, size_t>> setupKmerSplits(Parameters &par, BaseMatrix * subMat, DBReader<DBKeyType> &seqDbr, size_t totalKmers, size_t splits,
-                                                       size_t kmerMemory = sizeof(KmerPosition<T, includeAdjacency, L>));
+                                                       size_t kmerMemory = sizeof(KmerPosition<T, includeAdjacency, L>), size_t *filledHashDist = NULL);
 size_t computeKmerCount(DBReader<DBKeyType> &reader, size_t KMER_SIZE, size_t chooseTopKmer,
                         float chooseTopKmerScale = 0.0);
 
