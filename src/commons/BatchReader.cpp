@@ -2,7 +2,6 @@
 #include "Debug.h"
 #include "FastSort.h"
 #include "FileUtil.h"
-#include "MMseqsNode.h"
 #include "Timer.h"
 #include "Util.h"
 
@@ -287,12 +286,8 @@ void BatchReader::readWithPread() {
 bool BatchReader::retryRead(const ReadRequest &request, int &error) {
     time_t failedSince = 0;
     unsigned int attempts = 0;
-    while ((error == EIO || error == ESTALE || error == EAGAIN || error == -1) && __atomic_load_n(&readError, __ATOMIC_RELAXED) == 0
-           && MMseqsNode::waitBeforeRetry(request.fileName, (error > 0) ? strerror(error) : "unexpected end of file", failedSince, attempts)) {
-        // the first attempt only reads again, another request may have opened the file again already
-        if (attempts > 1 && (error == EIO || error == ESTALE)) {
-            FileUtil::reopenFile(request.fileToRead, request.fileName);
-        }
+    while (__atomic_load_n(&readError, __ATOMIC_RELAXED) == 0
+           && FileUtil::waitBeforeReadRetry(request.fileToRead, request.fileName, error, (error > 0) ? strerror(error) : "unexpected end of file", failedSince, attempts)) {
         if (preadRequest(request, Util::getPageSize(), error)) {
             return true;
         }

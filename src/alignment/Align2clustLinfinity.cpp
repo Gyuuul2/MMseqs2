@@ -4659,7 +4659,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     int fd = MMseqsNode::tryOpenExchangeFile(fileName, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.fileSize, piece.file, observedSize, observedNumber, lastError);
                     if (fd < 0) {
                         readingSeconds += readTimer.getTimediff();
-                        if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EIO) {
+                        if (lastError != 0 && lastError != ENOENT && FileUtil::isTransientError(lastError) == false) {
                             Debug(Debug::ERROR) << "Cannot open served sequence file " << fileName << ": " << strerror(lastError) << "\n";
                             EXIT(EXIT_FAILURE);
                         }
@@ -4676,8 +4676,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
 #pragma omp parallel for schedule(dynamic, 1)
                     for (size_t part = 0; part < partCount; part++) {
                         size_t offset = part * BatchReader::MAX_READ_REQUEST_SIZE;
+                        size_t partSize = std::min(BatchReader::MAX_READ_REQUEST_SIZE, piece.size - offset);
                         int partError;
-                        if (MMseqsNode::tryPreadAll(fd, receivedEntries.data() + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, piece.size - offset), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.offset + offset, partError) == false) {
+                        if (FileUtil::tryPreadAll(fd, receivedEntries.data() + offset, partSize, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.offset + offset, partError) < partSize) {
                             readErrors[part] = (partError != 0) ? partError : -1;
                         }
                     }
@@ -4688,7 +4689,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     int closeError = (close(fd) != 0) ? errno : 0;
                     readingSeconds += readTimer.getTimediff();
                     int error = (readError > 0) ? readError : closeError;
-                    if (error != 0 && error != ESTALE && error != EINTR && error != EIO) {
+                    if (error != 0 && error != EINTR && FileUtil::isTransientError(error) == false) {
                         Debug(Debug::ERROR) << "Cannot read served sequence file " << fileName << ": " << strerror(error) << "\n";
                         EXIT(EXIT_FAILURE);
                     }
@@ -4895,12 +4896,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 int lastError;
                 fileReadCount++;
                 int requestFd = MMseqsNode::tryOpenExchangeFile(requestFile, requestSize, requester.servedCount, observedSize, observedNumber, lastError);
-                if (requestFd < 0 && lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EIO) {
+                if (requestFd < 0 && lastError != 0 && lastError != ENOENT && FileUtil::isTransientError(lastError) == false) {
                     Debug(Debug::ERROR) << "Cannot open sequence request " << requestFile << ": " << strerror(lastError) << "\n";
                     EXIT(EXIT_FAILURE);
                 }
                 requesterCodes.resize(std::min(codeEnd - codeBegin - requester.codePos, maxServedKeys * sizeof(DBKeyType)));
-                bool isRequestRead = requestFd >= 0 && MMseqsNode::tryPreadAll(requestFd, requesterCodes.data(), requesterCodes.size(), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + codeBegin + requester.codePos, lastError);
+                bool isRequestRead = requestFd >= 0 && FileUtil::tryPreadAll(requestFd, requesterCodes.data(), requesterCodes.size(), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + codeBegin + requester.codePos, lastError) == requesterCodes.size();
                 if (requestFd >= 0 && close(requestFd) != 0 && isRequestRead) {
                     lastError = errno;
                     isRequestRead = false;
@@ -4908,7 +4909,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 // a missing or short request is tried again in the next pass
                 if (isRequestRead == false) {
                     servingSeconds += servingTimer.getTimediff();
-                    if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EINTR && lastError != EIO) {
+                    if (lastError != 0 && lastError != ENOENT && lastError != EINTR && FileUtil::isTransientError(lastError) == false) {
                         Debug(Debug::ERROR) << "Cannot read sequence request " << requestFile << ": " << strerror(lastError) << "\n";
                         EXIT(EXIT_FAILURE);
                     }

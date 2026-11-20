@@ -92,7 +92,6 @@ public:
     static int tryOpenExchangeFile(const std::string &file, size_t expectedSize, uint64_t expectedNumber,
                                    size_t &observedSize, uint64_t &observedNumber, int &lastError, int openFlags = 0);
     static int waitForExchangeFile(const std::string &file, size_t size, uint64_t exchangeFileNumber);
-    static bool tryPreadAll(int fd, char *data, size_t size, size_t offset, int &readError);
     static int openSharedFd(const std::string &file, int flags, size_t *size = NULL);
     static FILE *openSharedFile(const std::string &file, const char *mode);
     static bool statSharedFile(const std::string &file, struct stat *sb = NULL);

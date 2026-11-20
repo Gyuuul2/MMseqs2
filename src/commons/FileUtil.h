@@ -1,7 +1,9 @@
 #ifndef MMSEQS_FILEUTIL_H
 #define MMSEQS_FILEUTIL_H
 
+#include <cerrno>
 #include <cstdio>
+#include <ctime>
 #include <list>
 #include <string>
 #include <vector>
@@ -35,6 +37,15 @@ public:
     static void writeFile(const std::string &pathToFile, const unsigned char *sh, size_t len);
     static void publishFile(const std::string &file, const std::string &content);
 
+    // NFS fails a replaced or briefly unreachable file with ESTALE or EIO, a later try can succeed
+    static bool isTransientError(int error) {
+        return error == EIO || error == ESTALE;
+    }
+    // return the bytes done, fewer than size after an error or an end of file (error 0)
+    static size_t tryPreadAll(int fd, char *data, size_t size, size_t offset, int &readError);
+    static size_t tryPwriteAll(int fd, const char *data, size_t size, size_t offset, int &writeError);
+    // a readError of 0 or less is an end of file
+    static bool waitBeforeReadRetry(int fd, const char *fileName, int readError, const char *reason, time_t &failedSince, unsigned int &attempts);
     static void preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset);
     // for pread/pwrite only, the file position starts at 0 again
     static void reopenFile(int fd, const char *fileName);

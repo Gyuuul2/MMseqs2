@@ -105,30 +105,48 @@ void FileUtil::deleteTempFiles(const std::list<std::string> &tmpFiles) {
     }
 }
 
-void FileUtil::preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset) {
-    time_t failedSince = 0;
-    unsigned int attempts = 0;
+size_t FileUtil::tryPreadAll(int fd, char *data, size_t size, size_t offset, int &readError) {
     for (size_t done = 0; done < size;) {
-        const ssize_t count = pread(fd, data + done, size - done, offset + done);
+        ssize_t count = pread(fd, data + done, size - done, offset + done);
         if (count < 0 && errno == EINTR) {
             continue;
         }
         if (count <= 0) {
-            const int readError = (count < 0) ? errno : 0;
-            if ((readError == 0 || readError == EIO || readError == ESTALE || readError == EAGAIN)
-                && MMseqsNode::waitBeforeRetry(fileName, (readError == 0) ? "end of file" : strerror(readError), failedSince, attempts)) {
-                if (attempts > 1 && (readError == EIO || readError == ESTALE)) {
-                    reopenFile(fd, fileName);
-                }
-                continue;
-            }
-            Debug(Debug::ERROR) << "Cannot read " << fileName << " at offset " << offset + done
-                                << " (" << size - done << " bytes remaining): "
-                                << (readError == 0 ? "end of file" : strerror(readError)) << "\n";
-            EXIT(EXIT_FAILURE);
+            readError = (count < 0) ? errno : 0;
+            return done;
         }
         done += count;
-        attempts = 0;
+    }
+    readError = 0;
+    return size;
+}
+
+bool FileUtil::waitBeforeReadRetry(int fd, const char *fileName, int readError, const char *reason, time_t &failedSince, unsigned int &attempts) {
+    if ((readError <= 0 || readError == EAGAIN || isTransientError(readError)) == false
+        || MMseqsNode::waitBeforeRetry(fileName, reason, failedSince, attempts) == false) {
+        return false;
+    }
+    // the first attempt only reads again, another reader may have opened the file again already
+    if (attempts > 1 && isTransientError(readError)) {
+        reopenFile(fd, fileName);
+    }
+    return true;
+}
+
+void FileUtil::preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset) {
+    time_t failedSince = 0;
+    unsigned int attempts = 0;
+    int readError;
+    for (size_t done = tryPreadAll(fd, data, size, offset, readError); done < size;) {
+        const char *reason = (readError == 0) ? "end of file" : strerror(readError);
+        if (waitBeforeReadRetry(fd, fileName, readError, reason, failedSince, attempts) == false) {
+            Debug(Debug::ERROR) << "Cannot read " << fileName << " at offset " << offset + done
+                                << " (" << size - done << " bytes remaining): " << reason << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        size_t count = tryPreadAll(fd, data + done, size - done, offset + done, readError);
+        attempts = (count > 0) ? 0 : attempts;
+        done += count;
     }
 }
 
@@ -143,18 +161,28 @@ void FileUtil::reopenFile(int fd, const char *fileName) {
     }
 }
 
-void FileUtil::pwriteAll(int fd, const char *fileName, const char *data, size_t size, size_t offset) {
+size_t FileUtil::tryPwriteAll(int fd, const char *data, size_t size, size_t offset, int &writeError) {
     for (size_t done = 0; done < size;) {
-        const ssize_t count = pwrite(fd, data + done, size - done, offset + done);
+        ssize_t count = pwrite(fd, data + done, size - done, offset + done);
         if (count < 0 && errno == EINTR) {
             continue;
         }
         if (count <= 0) {
-            const int writeError = (count < 0) ? errno : 0;
-            Debug(Debug::ERROR) << "Cannot write " << fileName << " at offset " << offset + done << ": " << (writeError == 0 ? "no bytes written" : strerror(writeError)) << "\n";
-            EXIT(EXIT_FAILURE);
+            writeError = (count < 0) ? errno : 0;
+            return done;
         }
         done += count;
+    }
+    writeError = 0;
+    return size;
+}
+
+void FileUtil::pwriteAll(int fd, const char *fileName, const char *data, size_t size, size_t offset) {
+    int writeError;
+    size_t done = tryPwriteAll(fd, data, size, offset, writeError);
+    if (done < size) {
+        Debug(Debug::ERROR) << "Cannot write " << fileName << " at offset " << offset + done << ": " << (writeError == 0 ? "no bytes written" : strerror(writeError)) << "\n";
+        EXIT(EXIT_FAILURE);
     }
 }
 
@@ -639,15 +667,9 @@ static const size_t LOCAL_COPY_IO_BYTES = 64 * 1024 * 1024;
 
 int FileUtil::copyRange(int sourceFd, const char *sourceName, int copyFd, char *buffer, size_t bytes, size_t offset) {
     preadAll(sourceFd, sourceName, buffer, bytes, offset);
-    for (size_t done = 0; done < bytes;) {
-        const ssize_t count = pwrite(copyFd, buffer + done, bytes - done, offset + done);
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        if (count <= 0) {
-            return (count < 0) ? errno : EIO;
-        }
-        done += count;
+    int writeError;
+    if (tryPwriteAll(copyFd, buffer, bytes, offset, writeError) < bytes) {
+        return (writeError != 0) ? writeError : EIO;
     }
     return 0;
 }

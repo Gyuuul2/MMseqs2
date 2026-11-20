@@ -90,7 +90,7 @@ bool MMseqsNode::waitBeforeRetry(const char *file, const char *error, time_t &fa
 // EIO, ESTALE or a name that NFS caches as missing
 static bool canRetryRead(const std::string &file, int error, time_t &failedSince, unsigned int &attempts) {
     bool isCachedMissing = error == ENOENT && FileUtil::needsDirectoryRefresh(file);
-    return (error == EIO || error == ESTALE || isCachedMissing) && MMseqsNode::waitBeforeRetry(file.c_str(), strerror(error), failedSince, attempts);
+    return (FileUtil::isTransientError(error) || isCachedMissing) && MMseqsNode::waitBeforeRetry(file.c_str(), strerror(error), failedSince, attempts);
 }
 
 // NFS caches a missing name for up to 60 s
@@ -208,7 +208,7 @@ static std::string readPolledFile(const std::string &file) {
     }
     // NFS can fail a name that a rename just replaced with ESTALE or EIO, the next poll reads it again
     if (fd < 0) {
-        if (openError == ESTALE || openError == EIO || openError == ENOENT) {
+        if (FileUtil::isTransientError(openError) || openError == ENOENT) {
             return std::string();
         }
         Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(openError) << "\n";
@@ -218,7 +218,7 @@ static std::string readPolledFile(const std::string &file) {
     bool isStale = false;
     if (fstat(fd, &sb) != 0) {
         int statError = errno;
-        isStale = statError == ESTALE || statError == EIO;
+        isStale = FileUtil::isTransientError(statError);
         if (isStale == false) {
             Debug(Debug::ERROR) << "Cannot read " << file << ": " << strerror(statError) << "\n";
             EXIT(EXIT_FAILURE);
@@ -226,8 +226,8 @@ static std::string readPolledFile(const std::string &file) {
     }
     std::string content(isStale ? 0 : sb.st_size, '\0');
     int readError;
-    if (MMseqsNode::tryPreadAll(fd, &content[0], content.size(), 0, readError) == false) {
-        if (readError != 0 && readError != ESTALE && readError != EIO) {
+    if (FileUtil::tryPreadAll(fd, &content[0], content.size(), 0, readError) < content.size()) {
+        if (readError != 0 && FileUtil::isTransientError(readError) == false) {
             Debug(Debug::ERROR) << "Cannot read " << file << ": " << strerror(readError) << "\n";
             EXIT(EXIT_FAILURE);
         }
@@ -277,14 +277,13 @@ std::string MMseqsNode::readFile(const std::string &file) {
 }
 
 std::string MMseqsNode::waitForRunFile(const std::string &file) {
-    std::string content = readPolledFile(file);
+    std::string content;
     WaitWarning warning;
-    for (unsigned int polls = 0; content.compare(0, runId.size(), runId) != 0; polls++) {
+    for (unsigned int polls = 0; readRunFile(file, content) == false; polls++) {
         sleepInWait(polls);
         warning.check(file);
-        content = readPolledFile(file);
     }
-    return content.substr(runId.size());
+    return content;
 }
 
 bool MMseqsNode::readRunFile(const std::string &file, std::string &content) {
@@ -305,9 +304,9 @@ void MMseqsNode::waitForRunFilesChange(const std::string &prefix, std::string &c
     for (unsigned int polls = 4;; polls++) {
         std::string nodeContents;
         for (unsigned int node = 0; node < count; node++) {
-            std::string nodeContent = readPolledFile(prefix + SSTR(node));
-            if (nodeContent.compare(0, runId.size(), runId) == 0) {
-                nodeContents.append(nodeContent, runId.size(), std::string::npos);
+            std::string nodeContent;
+            if (readRunFile(prefix + SSTR(node), nodeContent)) {
+                nodeContents += nodeContent;
             }
         }
         if (nodeContents != content) {
@@ -357,12 +356,12 @@ void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size
 
 bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &size) {
     std::string file = log + ".progress";
-    std::string content = readPolledFile(file);
-    if (content.compare(0, runId.size(), runId) != 0) {
+    std::string content;
+    if (readRunFile(file, content) == false) {
         return false;
     }
     const char *columns[2];
-    if (Util::getWordsOfLine((char *) content.c_str() + runId.size(), columns, 2) < 2) {
+    if (Util::getWordsOfLine((char *) content.c_str(), columns, 2) < 2) {
         Debug(Debug::ERROR) << "Cannot read " << file << "\n";
         EXIT(EXIT_FAILURE);
     }
@@ -389,34 +388,27 @@ bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
     unsigned int attempts = 0;
     for (unsigned int polls = 0; polls < MAX_READ_POLLS;) {
         int fd = openListedFile(log);
-        int openError = (fd < 0) ? errno : 0;
-        if (fd < 0) {
-            if (openError != ENOENT) {
-                if (canRetryRead(log, openError, failedSince, attempts) == false) {
-                    Debug(Debug::ERROR) << "Cannot open " << log << ": " << strerror(openError) << "\n";
-                    EXIT(EXIT_FAILURE);
-                }
-                if (wait) {
-                    continue;
-                }
-            }
-        } else {
+        int error = (fd < 0) ? errno : 0;
+        bool isRead = false;
+        if (fd >= 0) {
             int readError;
-            bool isRead = tryPreadAll(fd, data, size, from, readError);
+            isRead = FileUtil::tryPreadAll(fd, data, size, from, readError) == size;
             int closeError = (close(fd) != 0) ? errno : 0;
-            int error = (readError != 0) ? readError : ((closeError != EINTR) ? closeError : 0);
-            if (error != 0) {
-                if (canRetryRead(log, error, failedSince, attempts) == false) {
-                    Debug(Debug::ERROR) << "Cannot read " << log << ": " << strerror(error) << "\n";
-                    EXIT(EXIT_FAILURE);
-                }
-                if (wait) {
-                    continue;
-                }
+            error = (readError != 0) ? readError : ((closeError != EINTR) ? closeError : 0);
+            isRead = isRead && closeError == 0;
+        }
+        // a log that is not there yet is polled again
+        if (error != 0 && (fd >= 0 || error != ENOENT)) {
+            if (canRetryRead(log, error, failedSince, attempts) == false) {
+                Debug(Debug::ERROR) << "Cannot " << ((fd < 0) ? "open " : "read ") << log << ": " << strerror(error) << "\n";
+                EXIT(EXIT_FAILURE);
             }
-            if (isRead && closeError == 0) {
-                return true;
+            if (wait) {
+                continue;
             }
+        }
+        if (isRead) {
+            return true;
         }
         if (wait == false) {
             return false;
@@ -477,7 +469,7 @@ size_t MMseqsNode::readExchangeIndexLines(const std::string &indexFile, size_t f
     __sync_fetch_and_add(&exchangeIndexOpenCount, 1);
     int openError = (fd < 0) ? errno : 0;
     if (fd < 0) {
-        if (openError == ENOENT || openError == ESTALE || openError == EIO) {
+        if (openError == ENOENT || FileUtil::isTransientError(openError)) {
             return 0;
         }
         Debug(Debug::ERROR) << "Cannot open " << indexFile << ": " << strerror(openError) << "\n";
@@ -489,7 +481,7 @@ size_t MMseqsNode::readExchangeIndexLines(const std::string &indexFile, size_t f
     } while (readSize < 0 && errno == EINTR);
     int readError = (readSize < 0) ? errno : 0;
     int closeError = (close(fd) != 0) ? errno : 0;
-    if (readError == ESTALE || readError == EIO || closeError == ESTALE || closeError == EIO || closeError == EINTR) {
+    if (FileUtil::isTransientError(readError) || FileUtil::isTransientError(closeError) || closeError == EINTR) {
         return 0;
     }
     if (readError != 0 || closeError != 0) {
@@ -556,19 +548,12 @@ int MMseqsNode::tryOpenExchangeFile(const std::string &file, size_t expectedSize
         observedSize = static_cast<size_t>(fileStat.st_size);
         if (observedSize == expectedSize) {
             ExchangeFileHeader header;
-            ssize_t headerSize;
-            do {
-                headerSize = pread(fd, &header, sizeof(header), 0);
-            } while (headerSize < 0 && errno == EINTR);
-            if (headerSize == static_cast<ssize_t>(sizeof(header))) {
+            bool isRead = FileUtil::tryPreadAll(fd, (char *) &header, sizeof(header), 0, lastError) == sizeof(header);
+            if (isRead) {
                 observedNumber = header.exchangeFileNumber;
             }
-            if (headerSize == static_cast<ssize_t>(sizeof(header)) && header.magic == getExchangeFileMagic()
-                && header.exchangeFileNumber == expectedNumber) {
+            if (isRead && header.magic == getExchangeFileMagic() && header.exchangeFileNumber == expectedNumber) {
                 return fd;
-            }
-            if (headerSize < 0) {
-                lastError = errno;
             }
         }
     } else {
@@ -588,29 +573,13 @@ int MMseqsNode::waitForExchangeFile(const std::string &file, size_t size, uint64
         if (fd >= 0) {
             return fd;
         }
-        if (lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EIO) {
+        if (lastError != 0 && lastError != ENOENT && FileUtil::isTransientError(lastError) == false) {
             Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(lastError) << "\n";
             EXIT(EXIT_FAILURE);
         }
         sleepInWait(polls);
         warning.check(file);
     }
-}
-
-bool MMseqsNode::tryPreadAll(int fd, char *data, size_t size, size_t offset, int &readError) {
-    for (size_t done = 0; done < size;) {
-        ssize_t count = pread(fd, data + done, size - done, offset + done);
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        if (count <= 0) {
-            readError = (count < 0) ? errno : 0;
-            return false;
-        }
-        done += count;
-    }
-    readError = 0;
-    return true;
 }
 
 void MMseqsNode::removeOnceRead(const std::string &file) {
@@ -1638,8 +1607,6 @@ void MMseqsNode::readClusterKeys(const std::string &clu, const std::vector<size_
         cluDb.open(DBReader<DBKeyType>::NOSORT);
         size_t entryBegin = cluDb.findEntryByKey(from);
         size_t entryEnd = cluDb.findEntryByKey(to);
-        cluDb.close();
-        FILE *cluIndexFile = openSharedFile(cluIndex, "r");
         size_t nodeKeysBegin = keys.size();
         keys.resize(nodeKeysBegin + entryEnd - entryBegin);
 #pragma omp parallel
@@ -1648,16 +1615,13 @@ void MMseqsNode::readClusterKeys(const std::string &clu, const std::vector<size_
 #pragma omp for schedule(dynamic, 1)
             for (size_t entry = entryBegin; entry < entryEnd; entry += pairsPerRead) {
                 size_t pairCount = std::min(pairsPerRead, entryEnd - entry);
-                FileUtil::preadAll(fileno(cluIndexFile), cluIndex.c_str(), (char *) indexPairs.data(), pairCount * 2 * sizeof(uint64_t), entry * 2 * sizeof(uint64_t));
+                cluDb.readIndexPairs(entry, entry + pairCount, indexPairs.data());
                 for (size_t i = 0; i < pairCount; i++) {
                     keys[nodeKeysBegin + entry - entryBegin + i] = indexPairs[2 * i];
                 }
             }
         }
-        if (fclose(cluIndexFile) != 0) {
-            Debug(Debug::ERROR) << "Cannot close " << cluIndex << "\n";
-            EXIT(EXIT_FAILURE);
-        }
+        cluDb.close();
     }
 }
 
