@@ -2093,7 +2093,7 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
                    ? Parameters::CLUST_LINEAR_DIAG_COV_SCALE : 0.0f;
 
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(querySeqType) & Parameters::DBTYPE_EXTENDED_LINFINITY;
-    size_t memoryLimit = isLinfinity ? MMseqsNode::getMemoryLimit(par) : Util::computeMemory(par.splitMemoryLimit);
+    size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
 
     Debug(Debug::INFO) << "\n";
     float kmersPerSequenceScale = (Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES)) ?

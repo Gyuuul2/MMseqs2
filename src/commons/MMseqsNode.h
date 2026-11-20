@@ -66,7 +66,6 @@ public:
         size_t nextSeconds;
     };
 
-    static void publishFile(const std::string &file, const std::string &content);
     static std::string readFile(const std::string &file);
     static void publishRunFile(const std::string &file, const std::string &content);
     static std::string waitForRunFile(const std::string &file);
@@ -123,7 +122,6 @@ public:
     };
 
     static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0, const std::string &localDirectory = "", size_t *localNodes = NULL);
-    static size_t getMemoryLimit(const Parameters &par);
 
     struct ExchangeReader {
         FILE *file;

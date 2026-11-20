@@ -189,23 +189,6 @@ void FileUtil::writeFile(const std::string &pathToFile, const unsigned char *dat
     }
 }
 
-std::string FileUtil::readFile(const std::string &file) {
-    FILE *handle = openFileOrDie(file.c_str(), "r", true);
-    struct stat sb;
-    if (fstat(fileno(handle), &sb) != 0) {
-        Debug(Debug::ERROR) << "Cannot read " << file << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    std::string content(sb.st_size, '\0');
-    size_t readSize = content.empty() ? 0 : fread(&content[0], sizeof(char), content.size(), handle);
-    int closeResult = fclose(handle);
-    if (readSize != content.size() || closeResult != 0) {
-        Debug(Debug::ERROR) << "Cannot read " << file << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    return content;
-}
-
 void FileUtil::publishFile(const std::string &file, const std::string &content) {
     std::string tmpFile = file + ".tmp";
     FILE *handle = openAndDelete(tmpFile.c_str(), "w");
@@ -715,7 +698,7 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
         }
     }
     // before the reservations, publishFile exits if a full device fails its flush
-    const std::string dbtype = readFile(db + ".dbtype");
+    const std::string dbtype = MMseqsNode::readFile(db + ".dbtype");
     if (dbtype.size() != sizeof(int)) {
         Debug(Debug::ERROR) << "Invalid database type file: " << db << ".dbtype\n";
         EXIT(EXIT_FAILURE);

@@ -61,10 +61,6 @@ void MMseqsNode::init() {
     }
 }
 
-void MMseqsNode::publishFile(const std::string &file, const std::string &content) {
-    FileUtil::publishFile(file, content);
-}
-
 void MMseqsNode::sleepBeforePoll(unsigned int polls, unsigned int maxShift) {
     usleep(10000u << std::min(polls, maxShift));
 }
@@ -301,7 +297,7 @@ bool MMseqsNode::readRunFile(const std::string &file, std::string &content) {
 }
 
 void MMseqsNode::publishRunFile(const std::string &file, const std::string &content) {
-    publishFile(file, runId + content);
+    FileUtil::publishFile(file, runId + content);
 }
 
 void MMseqsNode::waitForRunFilesChange(const std::string &prefix, std::string &content) {
@@ -720,10 +716,6 @@ void MMseqsNode::WorkQueue::removeTakenItemFiles() {
     }
 }
 
-size_t MMseqsNode::getMemoryLimit(const Parameters &par) {
-    return Util::computeMemory(par.splitMemoryLimit);
-}
-
 void MMseqsNode::reportUnusableLocalTmp(const std::string &problem) {
     Debug(Debug::WARNING) << problem << "; using the shared folder instead\n";
 }
@@ -873,6 +865,7 @@ static const char *getReaderData(const MMseqsNode::ExchangeReader &reader) {
 }
 
 static const size_t PUNCH_HOLE_ALIGNMENT = 1024 * 1024;
+static const size_t PUNCH_HOLE_MIN_SIZE = 1024 * 1024 * 1024;
 static const size_t EXCHANGE_BUFFER_SIZE = 1024 * 1024;
 
 static void fillExchangeReader(MMseqsNode::ExchangeReader &reader, size_t size, size_t bufferSize) {
@@ -885,7 +878,7 @@ static void fillExchangeReader(MMseqsNode::ExchangeReader &reader, size_t size, 
         return;
     }
     size_t punchEnd = (reader.pos - reader.bufferEnd + reader.bufferPos) / PUNCH_HOLE_ALIGNMENT * PUNCH_HOLE_ALIGNMENT;
-    if (punchEnd >= reader.punchEnd + 1024 * 1024 * 1024) {
+    if (punchEnd >= reader.punchEnd + PUNCH_HOLE_MIN_SIZE) {
         FileUtil::punchHole(fileno(reader.file), reader.punchEnd, punchEnd - reader.punchEnd);
         reader.punchEnd = punchEnd;
     }
@@ -1343,7 +1336,7 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
     if (receivedPrefix.empty() == false) {
         openExchange(receivedIndex, receivedPrefix, receivedReaders, receivedFiles);
     }
-    size_t memoryLimit = getMemoryLimit(Parameters::getInstance());
+    size_t memoryLimit = Util::computeMemory(Parameters::getInstance().splitMemoryLimit);
     ClusterPairWriter pairWriter(exchange, memoryLimit / 4 / sizeof(ClusterPair), compare, nodeKeyOffsets, balancedKeyOffsets);
 
     std::vector<DBKeyType> repKeys;
@@ -1561,7 +1554,7 @@ void MMseqsNode::writeRepresentativeBits(const std::string &db, DBReader<DBKeyTy
     }
     publishRunFile(db + ".index." + SSTR(rank), representativeIndex);
     if (isMaster()) {
-        publishFile(db + ".index", gatherRunFiles(db + ".index."));
+        FileUtil::publishFile(db + ".index", gatherRunFiles(db + ".index."));
     }
 }
 
@@ -1730,7 +1723,7 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
     std::vector<ExchangeReader> repReaders;
     std::vector<FILE *> repFiles;
     openExchange(index, prefix, repReaders, repFiles);
-    size_t memoryLimit = getMemoryLimit(par);
+    size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
     std::string resultDb = clu + "." + SSTR(rank);
     std::string resultIndex = clu + ".index." + SSTR(rank);
     FILE *resultDataFile = FileUtil::openAndDelete(resultDb.c_str(), "w");

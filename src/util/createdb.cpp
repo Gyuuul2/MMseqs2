@@ -1003,8 +1003,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             Debug(Debug::ERROR) << FileUtil::dirName(dataFile) << " needs at least " << dataSize << " free bytes for the sequences of " << dataFile << ", but has " << freeSpace << "\n";
             EXIT(EXIT_FAILURE);
         }
-        MMseqsNode::publishFile(dataFile + ".index", indexData);
-        MMseqsNode::publishFile(dataFile + ".file_keys", fileKeysText);
+        FileUtil::publishFile(dataFile + ".index", indexData);
+        FileUtil::publishFile(dataFile + ".file_keys", fileKeysText);
     }
 
     // resize early to fail on file size limits
@@ -1443,7 +1443,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         for (size_t i = 0; i < filenames.size(); i++) {
             sourceData += SSTR(i) + "\t" + FileUtil::baseName(filenames[i]) + "\n";
         }
-        MMseqsNode::publishFile(dataFile + ".source", sourceData);
+        FileUtil::publishFile(dataFile + ".source", sourceData);
         int headerDbType = DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_GENERIC_DB, Parameters::DBTYPE_EXTENDED_LINFINITY);
         DBWriter::writeDbtypeFile((dataFile + "_h").c_str(), headerDbType, par.compressHeaders);
         int dbType = DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, Parameters::DBTYPE_EXTENDED_LINFINITY);

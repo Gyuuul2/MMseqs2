@@ -483,7 +483,7 @@ static void releaseFileGroups(const Parameters &par, ExchangeFileGroups &kmerGro
 
 template <typename Row>
 static void readPassRows(const std::vector<ReceivedFile> &receivedFiles, const std::vector<std::vector<Row> > &fileRows, std::vector<PassRow> &passRows, char *buffer, bool isAsync,
-                         BatchReader *&batchReader, int threads) {
+                         BatchReader &batchReader) {
     std::vector<size_t> readOrder(passRows.size());
     for (size_t i = 0; i < readOrder.size(); i++) {
         readOrder[i] = i;
@@ -515,13 +515,10 @@ static void readPassRows(const std::vector<ReceivedFile> &receivedFiles, const s
     if (readRequests.empty()) {
         return;
     }
-    if (batchReader == NULL) {
-        batchReader = new BatchReader(threads, readRequests[0].fileToRead);
-    }
     if (isAsync) {
-        batchReader->readAsync(readRequests);
+        batchReader.readAsync(readRequests);
     } else {
-        batchReader->readSync(readRequests);
+        batchReader.readSync(readRequests);
     }
 }
 
@@ -1661,23 +1658,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
             if (countRepresentatives(dbFrom, keySplitOffsets[keySplit], keySplitOffsets[keySplit + 1]) == 0) {
                 continue;
             }
-            std::vector<size_t> readChunkOffsets(1, keySplitOffsets[keySplit]);
-            size_t readChunkSize = 0;
-            size_t keySplitFirstRange = (keySplitOffsets[keySplit] < keySplitOffsets[keySplit + 1]) ? seqDbr.findIdRange(keySplitOffsets[keySplit]) : seqDbr.getIndexSize();
-            for (size_t range = keySplitFirstRange; range < seqDbr.getIndexSize() && index[range].id < keySplitOffsets[keySplit + 1]; range++) {
-                size_t rangeFrom = std::max(static_cast<size_t>(index[range].id), keySplitOffsets[keySplit]);
-                size_t rangeTo = std::min((range + 1 < seqDbr.getIndexSize()) ? static_cast<size_t>(index[range + 1].id) : seqDbr.getSize(), keySplitOffsets[keySplit + 1]);
-                for (size_t key = rangeFrom; key < rangeTo; ) {
-                    if (readChunkSize > 0 && readChunkSize + index[range].length > readChunkLimit) {
-                        readChunkOffsets.push_back(key);
-                        readChunkSize = 0;
-                    }
-                    size_t readChunkSeqCount = std::min(rangeTo - key, std::max((size_t) 1, (readChunkLimit - readChunkSize) / index[range].length));
-                    key += readChunkSeqCount;
-                    readChunkSize += readChunkSeqCount * index[range].length;
-                }
-            }
-            readChunkOffsets.push_back(keySplitOffsets[keySplit + 1]);
+            std::vector<size_t> readChunkOffsets = seqDbr.getSplitKeyOffsets(keySplitOffsets[keySplit], keySplitOffsets[keySplit + 1], readChunkLimit, 0);
             Timer timer;
             size_t kmerCount = fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, L>(
                 hashSeqPair, maxKeySplitKmers, seqDbr, par, subMat, true, 0, SIZE_MAX, NULL, readChunkOffsets).first;
@@ -2013,6 +1994,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     createFileGroups(pairGroups);
     pairFile.groups = &pairGroups;
     BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(pairGroups.files[0]));
+    BatchReader batchReader(par.threads, fileno(pairGroups.files[0]));
     pairFile.batchWriter = &batchWriter;
     pairFile.ownPairs = &ownPairs;
     pairFile.partitionSizes.assign(exchange.sendSplitCount * exchange.partitionsPerRange, 0);
@@ -2043,7 +2025,6 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     std::vector<PairOutputRegion> outputRegions(par.threads);
     char *passBuffer = NULL;
     size_t codeBufferSize = 0;
-    BatchReader *batchReader = NULL;
     std::vector<PassRow> passRows[2];
     std::vector<size_t> passRowOffsets[2];
 
@@ -2090,9 +2071,9 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
                 getPassRows(received.fileRows, received.rowOrder, passFirstHashSubRange, received.passHashSubRangeOffsets[pass + 1], passRows[passCodeBuffer], passRowOffsets[passCodeBuffer]);
             } else if (isPrefetched == false) {
                 getPassRows(received.fileRows, received.rowOrder, passFirstHashSubRange, received.passHashSubRangeOffsets[pass + 1], passRows[passCodeBuffer], passRowOffsets[passCodeBuffer]);
-                readPassRows(received.files, received.fileRows, passRows[passCodeBuffer], passBuffer + passCodeBuffer * codeBufferSize, false, batchReader, par.threads);
+                readPassRows(received.files, received.fileRows, passRows[passCodeBuffer], passBuffer + passCodeBuffer * codeBufferSize, false, batchReader);
             } else {
-                batchReader->waitAsyncRead();
+                batchReader.waitAsyncRead();
             }
             if (pass + 1 == passCount) {
                 nextHashRange = takeHashRange(ownKmers, ownHashRanges, hashQueue);
@@ -2105,7 +2086,7 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
             if (isPrefetched) {
                 getPassRows(prefetched->fileRows, prefetched->rowOrder, prefetched->passHashSubRangeOffsets[prefetchedPass], prefetched->passHashSubRangeOffsets[prefetchedPass + 1],
                             passRows[1 - passCodeBuffer], passRowOffsets[1 - passCodeBuffer]);
-                readPassRows(prefetched->files, prefetched->fileRows, passRows[1 - passCodeBuffer], passBuffer + (1 - passCodeBuffer) * codeBufferSize, true, batchReader, par.threads);
+                readPassRows(prefetched->files, prefetched->fileRows, passRows[1 - passCodeBuffer], passBuffer + (1 - passCodeBuffer) * codeBufferSize, true, batchReader);
             }
             const std::vector<PassRow> &hashSubRangeRows = passRows[passCodeBuffer];
             const std::vector<size_t> &hashSubRangeRowOffsets = passRowOffsets[passCodeBuffer];
@@ -2447,7 +2428,6 @@ static size_t receiveKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, const K
     }
     releaseOwnKmers(ownKmers, ownPairs, receivedHashRanges);
     flushPairOutput(exchange, pairFile, output, outputRegions, pairWriteBuffer, par.threads);
-    delete batchReader;
     batchWriter.waitWrites();
     pairGroups.writeWaitSeconds = batchWriter.getWaitSeconds();
     Util::releasePages(outputBuffer, outputSize);
@@ -2520,6 +2500,7 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
         prefFiles.indexFile = FileUtil::openAndDelete(prefFiles.indexName.c_str(), "w");
     }
     BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(exchange.hasTargetSplits ? targetSplitFiles.dataFiles[0] : prefFiles.dataFile));
+    BatchReader batchReader(par.threads, fileno(exchange.hasTargetSplits ? targetSplitFiles.dataFiles[0] : prefFiles.dataFile));
     prefFiles.batchWriter = &batchWriter;
     size_t prefDataSize = 0;
     size_t prefIndexSize = 0;
@@ -2629,8 +2610,7 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             for (size_t receiver = 1; receiver < rowReadRequests.size(); receiver++) {
                 rowReadRequests[0].insert(rowReadRequests[0].end(), rowReadRequests[receiver].begin(), rowReadRequests[receiver].end());
             }
-            BatchReader *batchReader = new BatchReader(par.threads, fileno(receivedPairFiles[0].file));
-            batchReader->readSync(rowReadRequests[0]);
+            batchReader.readSync(rowReadRequests[0]);
             openSeconds += timer.getTimediff();
             std::vector<size_t> partitionCodeSizes(exchange.partitionsPerRange, 0);
             std::vector<size_t> partitionTargets(exchange.partitionsPerRange, 0);
@@ -2725,16 +2705,16 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                     timer.reset();
                     if (isPrefetched == false) {
                         getPairPassRows(partitionRows, passFirstPartition, passPartitionOffsets[pass + 1], pairPassRows[pass % 2], pairPassRowOffsets[pass % 2]);
-                        readPassRows(receivedPairFiles, pairFileRows, pairPassRows[pass % 2], codeBuffer, false, batchReader, par.threads);
+                        readPassRows(receivedPairFiles, pairFileRows, pairPassRows[pass % 2], codeBuffer, false, batchReader);
                         passReadSeconds += timer.getTimediff();
                     } else {
-                        batchReader->waitAsyncRead();
+                        batchReader.waitAsyncRead();
                         passWaitSeconds += timer.getTimediff();
                     }
                     isPrefetched = pass + 1 < pairPassCount && pairPassSizes[pass + 1] <= pairPassLimit && pairPassCodeSizes[pass + 1] > 0;
                     if (isPrefetched) {
                         getPairPassRows(partitionRows, passPartitionOffsets[pass + 1], passPartitionOffsets[pass + 2], pairPassRows[(pass + 1) % 2], pairPassRowOffsets[(pass + 1) % 2]);
-                        readPassRows(receivedPairFiles, pairFileRows, pairPassRows[(pass + 1) % 2], pairPassBuffer + ((pass + 1) % 2) * maxPairPassCodeSize, true, batchReader, par.threads);
+                        readPassRows(receivedPairFiles, pairFileRows, pairPassRows[(pass + 1) % 2], pairPassBuffer + ((pass + 1) % 2) * maxPairPassCodeSize, true, batchReader);
                     }
                 }
                 const std::vector<PassRow> &partitionPassRows = pairPassRows[pass % 2];
@@ -2921,7 +2901,6 @@ static std::string mergePairFiles(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                     }
                 }
             }
-            delete batchReader;
             std::vector<PassRow> splitRows;
             std::vector<size_t> splitRowOffsets;
             getPairPassRows(partitionRows, firstPartition, endPartition, splitRows, splitRowOffsets);
@@ -3219,7 +3198,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         for (size_t i = 0; i < partitionRows.size(); i++) {
             sortedPartitions.append(partitionRows[i].second, Util::skipLine(partitionRows[i].second) - partitionRows[i].second);
         }
-        MMseqsNode::publishFile(par.db2 + ".partitions", sortedPartitions);
+        FileUtil::publishFile(par.db2 + ".partitions", sortedPartitions);
         MMseqsNode::removeOnceRead(par.db2 + ".merged");
         DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_PREFILTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
     } else {

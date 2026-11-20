@@ -33,7 +33,6 @@ public:
     static void munmapData(void * ptr, size_t dataSize);
 
     static void writeFile(const std::string &pathToFile, const unsigned char *sh, size_t len);
-    static std::string readFile(const std::string &file);
     static void publishFile(const std::string &file, const std::string &content);
 
     static void preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset);

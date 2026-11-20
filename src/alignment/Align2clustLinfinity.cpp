@@ -4179,9 +4179,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t requestListingCount = 0;
     size_t servedListingCount = 0;
     size_t servedListingReadCount = 0;
-    std::atomic<size_t> objectReadCount(0);
-    std::atomic<size_t> objectWriteCount(0);
-    std::atomic<size_t> deleteCount(0);
+    std::atomic<size_t> fileReadCount(0);
+    std::atomic<size_t> fileWriteCount(0);
+    std::atomic<size_t> fileRemoveCount(0);
     size_t liveServedSize = 0;
     size_t maxLiveServedSize = 0;
     double servingSeconds = 0;
@@ -4564,7 +4564,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     std::fill(servedProgressSeconds.begin(), servedProgressSeconds.end(), fastReadSeconds);
                     std::fill(nextServedProgressReads.begin(), nextServedProgressReads.end(), serviceTimer.getTimediff() + fastReadSeconds);
                     requestCount++;
-                    objectWriteCount++;
+                    fileWriteCount++;
                     isRequestProgressChanged = true;
                 }
                 isRequestProgressChanged |= isLast;
@@ -4640,7 +4640,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     uint64_t observedNumber;
                     int lastError;
                     Timer readTimer;
-                    objectReadCount++;
+                    fileReadCount++;
                     int fd = MMseqsNode::tryOpenExchangeFile(fileName, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.fileSize, piece.file, observedSize, observedNumber, lastError);
                     if (fd < 0) {
                         readingSeconds += readTimer.getTimediff();
@@ -4713,7 +4713,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             if (isComplete) {
                 request.isComplete = true;
                 FileUtil::remove((requests + "/" + SSTR(rank) + "." + SSTR(request.number)).c_str());
-                deleteCount++;
+                fileRemoveCount++;
                 hasWorked = true;
             }
         }
@@ -4732,7 +4732,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 content += "\n";
             }
             MMseqsNode::publishRunFile(requests + "." + SSTR(rank) + ".progress", content);
-            objectWriteCount++;
+            fileWriteCount++;
         }
         // a fetch goes to the aligning threads once its request is received, the main thread copies its own keys; the requests of the earlier fetches are gone
         while (requestedFetches.empty() == false && (ownRequests.empty() || ownRequests.front().sequences != requestedFetches.front())) {
@@ -4839,7 +4839,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                         if (piece.request < received) {
                             if (--filePieceCounts[piece.file] == 0) {
                                 FileUtil::remove(getServedFile(rank, piece.file).c_str());
-                                deleteCount++;
+                                fileRemoveCount++;
                                 liveServedSize -= piece.fileSize;
                             }
                             isServedProgressChanged = true;
@@ -4878,7 +4878,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 size_t observedSize;
                 uint64_t observedNumber;
                 int lastError;
-                objectReadCount++;
+                fileReadCount++;
                 int requestFd = MMseqsNode::tryOpenExchangeFile(requestFile, requestSize, requester.servedCount, observedSize, observedNumber, lastError);
                 if (requestFd < 0 && lastError != 0 && lastError != ENOENT && lastError != ESTALE && lastError != EIO) {
                     Debug(Debug::ERROR) << "Cannot open sequence request " << requestFile << ": " << strerror(lastError) << "\n";
@@ -5010,7 +5010,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             passPieces.clear();
             servedFileData.clear();
             servedFileCount++;
-            objectWriteCount++;
+            fileWriteCount++;
             isServedProgressChanged = true;
         }
         // the pieces not yet deleted, per requester
@@ -5024,7 +5024,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 }
             }
             MMseqsNode::publishRunFile(served + "." + SSTR(rank) + ".progress", content);
-            objectWriteCount++;
+            fileWriteCount++;
             isServedProgressChanged = false;
         }
         if (hasWorked) {
@@ -6111,8 +6111,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         MMseqsNode::addPhaseSeconds(phaseValues, "service: unpacking the served entries", unpackSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: polling", importPollingSeconds + exportPollingSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Requested entry bytes", SSTR(requestedEntrySize) + " requested, " + SSTR(receivedEntrySize) + " received not assigned, of " + SSTR(sequenceSize) + " sequence bytes");
-        MMseqsNode::addPhaseValue(phaseValues, "Sequence service requests", SSTR(progressReadCount.load()) + " polls, " + SSTR(objectReadCount.load()) + " object reads, " + SSTR(objectWriteCount.load()) + " object writes, "
-                                  + SSTR(deleteCount.load()) + " deletes in " + SSTR(static_cast<size_t>(serviceTimer.getTimediff())) + " s");
+        MMseqsNode::addPhaseValue(phaseValues, "Sequence service requests", SSTR(progressReadCount.load()) + " polls, " + SSTR(fileReadCount.load()) + " file reads, " + SSTR(fileWriteCount.load()) + " file writes, "
+                                  + SSTR(fileRemoveCount.load()) + " file removals in " + SSTR(static_cast<size_t>(serviceTimer.getTimediff())) + " s");
         MMseqsNode::addPhaseValue(phaseValues, "Request progress reads", SSTR(requestProgressReadCount) + ", unchanged: " + SSTR(requestProgressReadCount - requestProgressChangeCount)
                                   + ", changes: " + SSTR(requestProgressChangeCount) + ", request listings: " + SSTR(requestListingCount));
         MMseqsNode::addPhaseValue(phaseValues, "Served progress reads", SSTR(progressReadCount - requestProgressReadCount) + ", moved up by a listing: " + SSTR(servedListingReadCount)
@@ -6512,7 +6512,7 @@ int align2clustLinfinity(Parameters &par) {
     const std::vector<size_t> nodeKeyOffsets = seqDbr.getEvenNodeKeyOffsets(MMseqsNode::count);
     const size_t dbSize = seqDbr.getSize();
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
-    const size_t nodeMemoryLimit = MMseqsNode::getMemoryLimit(par);
+    const size_t nodeMemoryLimit = Util::computeMemory(par.splitMemoryLimit);
     const bool isMasterAligning = firstAlignNode == 0;
     const size_t masterMemoryLimit = nodeMemoryLimit / (isMasterAligning ? 2 : 1);
     // the master holds the assigned bits and a log buffer per node in both clustering modes

@@ -375,7 +375,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         representativeWriter.open();
     }
 
-    size_t memoryLimit = isLinfinity ? MMseqsNode::getMemoryLimit(par) : Util::computeMemory(par.splitMemoryLimit);
+    size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
     // linfinity: one representative bit per key
     size_t bitWords = isLinfinity ? (localKeyCount + 63) / 64 : 0;
     uint64_t *representativeBits = new(std::nothrow) uint64_t[bitWords]();
