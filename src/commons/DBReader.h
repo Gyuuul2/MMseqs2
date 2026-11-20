@@ -295,6 +295,7 @@ public:
     size_t getKeyBlock(size_t key) const;
     const std::vector<size_t> &getBlockKeyOffsets() const { return blockKeyOffsets; }
     size_t getBlockReadSize() { return blockReadSize; }
+    int getMaxInflightRequests() const { return batchReader->getMaxInflightRequests(); }
     size_t getKeyReadSize() { return keyReadSize; }
     // linfinity local copy
     void setLocalBlocks(const std::string &localDataFileName, const std::vector<char> &blocks);

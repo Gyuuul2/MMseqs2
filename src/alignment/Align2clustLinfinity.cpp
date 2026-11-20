@@ -737,7 +737,7 @@ struct FetchSizeCounters {
 // records [begin, end) of a prefilter buffer and their fetched entries
 struct FetchedSequences {
     FetchedSequences() : prefilterBuffer(0), prefilterBufferNumber(0), begin(0), end(0), repKeyBegin(0), repKeyEnd(0), targetCount(0), pendingPairCount(0), firstPendingRepKey(0), plannedSize(0),
-                         unassignedRecordSize(0), isLast(false), entries(NULL), allocatedSize(0), acceptedSize(0), ownKeyCopyEnd(0), isReady(false) {}
+                         unassignedRecordSize(0), isLast(false), entries(NULL), allocatedSize(0), acceptedSize(0), ownKeyCopyEnd(0), repAheadPos(0), isReady(false) {}
     size_t prefilterBuffer;
     size_t prefilterBufferNumber;
     size_t begin;
@@ -763,6 +763,8 @@ struct FetchedSequences {
     size_t acceptedSize;
     // the own keys before it are copied
     size_t ownKeyCopyEnd;
+    // the rep keys of the own section before it are read ahead
+    size_t repAheadPos;
     bool isReady;
 
     size_t memorySize() const {
@@ -886,7 +888,7 @@ static void unpackEntry(const char *packedEntry, size_t entryLen, char *entry) {
     }
 }
 
-static void unpackEntries(const char *servedEntries, size_t keyCount, const size_t *entryOffsets, char *data, int threads) {
+static void unpackEntries(const char *servedEntries, size_t keyCount, const size_t *entryOffsets, char *data, int threads, int unpackThreads) {
     const char *packedEntries = servedEntries + (keyCount + 7) / 8;
     std::vector<size_t> packedEntryOffsets(keyCount + 1, 0);
     for (size_t i = 0; i < keyCount; i++) {
@@ -894,7 +896,7 @@ static void unpackEntries(const char *servedEntries, size_t keyCount, const size
         packedEntryOffsets[i + 1] = packedEntryOffsets[i] + (isAssigned ? 0 : getPackedEntrySize(entryOffsets[i + 1] - entryOffsets[i]));
     }
     std::vector<std::vector<size_t> > threadRawEntries(threads);
-#pragma omp parallel
+#pragma omp parallel num_threads(unpackThreads)
     {
         unsigned int thread_idx = 0;
 #ifdef OPENMP
@@ -3344,7 +3346,7 @@ struct ServedBlockCopy {
 static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTargetsReader &repTargetsReader, TargetSplitReader *targetSplitReader,
                             const std::vector<PrefPartition> &partitions, const std::vector<PrefWindow> &windows, size_t memoryLimit, size_t masterMemoryLimit, size_t servedFileEntrySize, size_t representativeResidues,
                             size_t paddedDbSize, size_t sizeClassCount, const ClusterMemberLookup *memberLookup, ClusterMemberExchange *memberExchange,
-                            size_t memberKeyBudget, DBReader<DBKeyType> *memberDbr, int ioThreadCount, AcceptedPairClustering *clustering, ServedBlockCopy &servedBlockCopy,
+                            size_t memberKeyBudget, DBReader<DBKeyType> *memberDbr, int ioThreadCount, bool hasIoThreadsOutsideTeam, AcceptedPairClustering *clustering, ServedBlockCopy &servedBlockCopy,
                             std::string &phaseValues) {
     Timer startTimer;
     const unsigned int nodes = MMseqsNode::count;
@@ -3631,7 +3633,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             Timer copyTimer;
             firstBlockCopy = copies.size();
             size_t reservedSize = 0;
-            const std::string localSeqDb = FileUtil::copyToLocalDir(par.db1, servedBlockCopy.localDir, par.threads - ioThreadCount, copies, reservedSize, fileRanges, servedBlockCopy.maxBytes,
+            const std::string localSeqDb = FileUtil::copyToLocalDir(par.db1, servedBlockCopy.localDir, hasIoThreadsOutsideTeam ? par.threads : par.threads - ioThreadCount, copies, reservedSize, fileRanges, servedBlockCopy.maxBytes,
                                                                     ioThreadCount > 0);
             reservedBlockCount = std::upper_bound(blockOffsets.begin(), blockOffsets.end(), reservedSize) - blockOffsets.begin() - 1;
             if (reservedBlockCount == 0) {
@@ -3654,8 +3656,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     localBlockCount += seqDbr.findIdRange(blockKeyOffsets[block + 1] - 1) - seqDbr.findIdRange(blockKeyOffsets[block]) + 1;
                     const size_t file = servedBlockCopy.blockFiles[i];
                     if (ioThreadCount > 0 && blockCopyFds[file] < 0) {
-                        blockSourceFds[file] = open(dataFiles[file].c_str(), O_RDONLY | O_CLOEXEC);
-                        blockCopyFds[file] = open(copies[firstBlockCopy + file].c_str(), O_WRONLY | O_CLOEXEC);
+                        blockSourceFds[file] = MMseqsNode::openSharedFd(dataFiles[file], O_RDONLY | O_CLOEXEC);
+                        blockCopyFds[file] = MMseqsNode::openSharedFd(copies[firstBlockCopy + file], O_WRONLY | O_CLOEXEC);
                         if (blockSourceFds[file] < 0 || blockCopyFds[file] < 0) {
                             Debug(Debug::ERROR) << "Cannot copy " << dataFiles[file] << " to " << copies[firstBlockCopy + file] << "\n";
                             EXIT(EXIT_FAILURE);
@@ -3680,11 +3682,24 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     const size_t maxPendingPairSize = std::min(memberSplitSize, maxFetchSize);
     // the blocks in --local-tmp count like the block cache
     const bool isReadingDirectly = isCacheTooSmall(blockCacheSize + localBlockSize);
+    // A/B switches, 1 turns one on: MMSEQS_ALIGN_PRELOAD reads the own blocks before aligning, MMSEQS_ALIGN_DEEP_SERVE then serves in loads of up to maxFetchSize / 2,
+    // MMSEQS_ALIGN_REP_DEPTH reads the rep blocks with --threads, MMSEQS_ALIGN_REP_AHEAD then reads the rep keys of a fetch ahead of its copies,
+    // MMSEQS_ALIGN_IO_TEAM copies and unpacks on the I/O threads with a team of --threads
+    const char *preloadSwitch = getenv("MMSEQS_ALIGN_PRELOAD");
+    const char *deepServeSwitch = getenv("MMSEQS_ALIGN_DEEP_SERVE");
+    const char *repDepthSwitch = getenv("MMSEQS_ALIGN_REP_DEPTH");
+    const char *repAheadSwitch = getenv("MMSEQS_ALIGN_REP_AHEAD");
+    const char *ioTeamSwitch = getenv("MMSEQS_ALIGN_IO_TEAM");
+    const bool isPreloadOn = preloadSwitch != NULL && strcmp(preloadSwitch, "1") == 0;
+    const bool isDeepServeOn = deepServeSwitch != NULL && strcmp(deepServeSwitch, "1") == 0;
+    const bool isRepDepthOn = repDepthSwitch != NULL && strcmp(repDepthSwitch, "1") == 0;
+    const bool isRepAheadOn = repAheadSwitch != NULL && strcmp(repAheadSwitch, "1") == 0;
+    const bool isIoTeamOn = ioTeamSwitch != NULL && strcmp(ioTeamSwitch, "1") == 0;
     // the blocks of other align nodes are read from the shared database, in a block cache of their own
     DBReader<DBKeyType> *repDbr = NULL;
     size_t repBlockCacheSize = 0;
     if (isAligningNode && alignGroupNodeEnd - alignGroupNodeBegin > 1 && sizeClassCount == 1 && isReadingDirectly == false) {
-        repDbr = new DBReader<DBKeyType>(par.db1.c_str(), par.db1Index.c_str(), std::max(1, par.threads / 4),
+        repDbr = new DBReader<DBKeyType>(par.db1.c_str(), par.db1Index.c_str(), isRepDepthOn ? par.threads : std::max(1, par.threads / 4),
                                          DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
         repDbr->open(DBReader<DBKeyType>::NOSORT);
         // its cache is what the blocks of this node leave free of the block cache
@@ -3704,6 +3719,25 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         Debug(Debug::WARNING) << "Node " << rank << " holds " << servedSequenceSize << " sequence bytes, --local-tmp holds " << localBlockSize << " of them and its block cache has " << blockCacheSize
                               << " bytes, the other sequences are read one by one. Use more nodes or increase --split-memory-limit\n";
     }
+    // a block cache that holds the own blocks reads them in one load, the first fetch includes it
+    const bool isOwnShareLoaded = isPreloadOn && isAligningNode && isReadingDirectly == false && blockCacheSize > 0 && uncopiedCacheSize >= nodeCacheSize
+                                  && (repDbr != NULL || alignNodeCount == 1) && par.filterCluDBFile.empty();
+    if (isOwnShareLoaded) {
+        Timer preloadTimer;
+        std::vector<DBKeyType> blockFirstKeys;
+        for (size_t block = 0; block + 1 < blockKeyOffsets.size(); block++) {
+            if (getBlockAlignNode(block) == rank) {
+                blockFirstKeys.push_back(blockKeyOffsets[block]);
+            }
+        }
+        seqDbr.loadData(blockFirstKeys);
+        MMseqsNode::addPhaseTime(phaseValues, "reading the own sequences", preloadTimer);
+    }
+    // the serving loads go deep only when the own blocks are cached, then only rep blocks are read
+    const size_t serveLoadSize = (isDeepServeOn && isOwnShareLoaded && repDbr != NULL) ? maxFetchSize / 2 : BatchReader::MAX_READ_REQUEST_SIZE;
+    // a read-ahead load reads at most as many blocks as the rep reader has reads in flight
+    const bool isReadingRepsAhead = isRepAheadOn && isOwnShareLoaded && repDbr != NULL;
+    const size_t maxRepAheadBlocks = isReadingRepsAhead ? repDbr->getMaxInflightRequests() : 0;
     // small first fetch, then doubling up to READ_SECONDS / 2 of aligning; MMSEQS_ALIGN_FETCH_BYTES fixes the limit
     size_t fetchBytesLimit = std::min<size_t>(maxFetchSize / 64, 64 * 1024 * 1024);
     const char *fixedFetchBytes = getenv("MMSEQS_ALIGN_FETCH_BYTES");
@@ -4018,6 +4052,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             sequences.fetchSourceKeyOffsets[node] = threadFetchSourceKeyOffsets[node * par.threads];
         }
         sequences.ownKeyCopyEnd = sequences.fetchSourceKeyOffsets[rank];
+        sequences.repAheadPos = sequences.fetchSourceKeyOffsets[rank];
         const size_t keyCount = sequences.fetchSourceKeyOffsets[nodes + 1];
         sequences.keys.resize(keyCount);
         sequences.entryOffsets.resize(keyCount + 1);
@@ -4155,6 +4190,20 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     double exportPollingSeconds = 0;
     double sourceLoadSeconds = 0;
     double packSeconds = 0;
+    double entryPackSeconds = 0;
+    double entryCopySeconds = 0;
+    // the loads under sourceMutex by caller: waits for it, longest holds, seqDbr and repDbr seconds, repDbr loads
+    const int SERVE_CALLER = 0;
+    const int OWN_KEYS_AHEAD_CALLER = 1;
+    const int OWN_KEYS_CALLER = 2;
+    const int REP_AHEAD_CALLER = 3;
+    const char *sourceCallers[] = { "serve", "copy the own keys ahead", "copy the own keys", "read the rep keys ahead" };
+    double sourceWaitSeconds[4] = { 0, 0, 0, 0 };
+    double maxSourceHoldSeconds[4] = { 0, 0, 0, 0 };
+    double ownLoadSeconds[4] = { 0, 0, 0, 0 };
+    double repLoadSeconds[4] = { 0, 0, 0, 0 };
+    size_t repLoadCounts[4] = { 0, 0, 0, 0 };
+    size_t skippedRepAheadCount = 0;
     double servedFileWriteSeconds = 0;
     double unpackSeconds = 0;
     std::vector<size_t> requesterServedSizes(nodes, 0);
@@ -4168,7 +4217,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     size_t maxProcessThreads = 0;
     size_t maxThreadsBesidesRingWorkers = 0;
     // copy, or pack with rawKeys, the entries of keys; assigned keys get zeros
-    const auto copyEntries = [&](const DBKeyType *keys, size_t keyCount, const size_t *offsets, char *data, std::vector<DBKeyType> *rawKeys, size_t maxLoadSize) {
+    const auto copyEntries = [&](const DBKeyType *keys, size_t keyCount, const size_t *offsets, char *data, std::vector<DBKeyType> *rawKeys, size_t maxLoadSize, int caller) {
         size_t loadRange = SIZE_MAX;
         for (size_t first = 0; first < keyCount;) {
             const size_t loadFirst = first;
@@ -4182,7 +4231,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                 }
                 loadSize += entrySize;
             }
+            Timer sourceWaitTimer;
             std::lock_guard<std::mutex> sourceLock(sourceMutex);
+            sourceWaitSeconds[caller] += sourceWaitTimer.getTimediff();
+            Timer sourceHoldTimer;
             loadKeys.clear();
             repLoadKeys.clear();
             size_t loadBlock = SIZE_MAX;
@@ -4198,15 +4250,24 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
             }
             Timer copyTimer;
             seqDbr.loadData(loadKeys);
+            const double ownLoadTime = copyTimer.getTimediff();
             if (repDbr != NULL) {
                 repDbr->loadData(repLoadKeys);
+                repLoadCounts[caller] += repLoadKeys.empty() ? 0 : 1;
             }
-            sourceLoadSeconds += copyTimer.getTimediff();
+            const double loadTime = copyTimer.getTimediff();
+            ownLoadSeconds[caller] += ownLoadTime;
+            repLoadSeconds[caller] += loadTime - ownLoadTime;
+            sourceLoadSeconds += loadTime;
             copyTimer.reset();
             for (int thread = 0; thread < par.threads; thread++) {
                 threadRawEntries[thread].clear();
             }
-#pragma omp parallel
+            int copyThreads = 1;
+#ifdef OPENMP
+            copyThreads = isIoTeamOn ? par.threads : omp_get_max_threads();
+#endif
+#pragma omp parallel num_threads(copyThreads)
             {
                 unsigned int thread_idx = 0;
 #ifdef OPENMP
@@ -4240,7 +4301,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     rawKeys->push_back(keys[threadRawEntries[thread][j]]);
                 }
             }
-            packSeconds += copyTimer.getTimediff();
+            const double entrySeconds = copyTimer.getTimediff();
+            packSeconds += entrySeconds;
+            ((rawKeys != NULL) ? entryPackSeconds : entryCopySeconds) += entrySeconds;
+            maxSourceHoldSeconds[caller] = std::max(maxSourceHoldSeconds[caller], sourceHoldTimer.getTimediff());
         }
     };
     // own request: code offsets per node, pieces and keys received per node
@@ -4621,7 +4685,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     FetchedSequences *sequences = request.sequences;
                     size_t firstKey = sequences->fetchSourceKeyOffsets[node] + request.receivedKeys[node];
                     Timer unpackTimer;
-                    unpackEntries(receivedEntries.data(), piece.keyCount, sequences->entryOffsets.data() + firstKey, sequences->entries, par.threads);
+                    int unpackThreads = 1;
+#ifdef OPENMP
+                    unpackThreads = isIoTeamOn ? par.threads : omp_get_max_threads();
+#endif
+                    unpackEntries(receivedEntries.data(), piece.keyCount, sequences->entryOffsets.data() + firstKey, sequences->entries, par.threads, unpackThreads);
                     unpackSeconds += unpackTimer.getTimediff();
                     for (size_t key = firstKey; key < firstKey + piece.keyCount; key++) {
                         receivedEntrySize += (sequences->entries[sequences->entryOffsets[key]] != '\0') ? sequences->entryOffsets[key + 1] - sequences->entryOffsets[key] : 0;
@@ -4888,7 +4956,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     servedFileData[pieceOffset + byte] = static_cast<char>(bits);
                 }
                 rawKeys.clear();
-                copyEntries(keys, keyCount, requestOffsets.data(), servedFileData.data() + pieceOffset, &rawKeys, BatchReader::MAX_READ_REQUEST_SIZE);
+                copyEntries(keys, keyCount, requestOffsets.data(), servedFileData.data() + pieceOffset, &rawKeys, serveLoadSize, SERVE_CALLER);
                 size_t pieceSize = requestOffsets[keyCount];
                 requestOffsets.resize(rawKeys.size() + 1);
                 requestOffsets[0] = 0;
@@ -4897,7 +4965,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
                     requestOffsets[j + 1] = requestOffsets[j] + seqDbr.getSeqLenFromRange(rawKeyRange, rawKeys[j]) + 2;
                 }
                 servedFileData.resize(pieceOffset + pieceSize + requestOffsets[rawKeys.size()]);
-                copyEntries(rawKeys.data(), rawKeys.size(), requestOffsets.data(), servedFileData.data() + pieceOffset + pieceSize, NULL, BatchReader::MAX_READ_REQUEST_SIZE);
+                copyEntries(rawKeys.data(), rawKeys.size(), requestOffsets.data(), servedFileData.data() + pieceOffset + pieceSize, NULL, serveLoadSize, SERVE_CALLER);
                 pieceSize += requestOffsets[rawKeys.size()];
                 size_t entryRange = SIZE_MAX;
                 for (size_t j = 0; j < keyCount; j++) {
@@ -4977,6 +5045,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         return hasWorked;
     };
     double ownKeyCopySeconds = 0;
+    double ownKeyCopyWaitSeconds = 0;
     size_t ownKeyCopySize = 0;
     std::mutex ownKeyCopyMutex;
     size_t ownKeyAheadSize = 0;
@@ -4990,19 +5059,73 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         size_t ownKey;
         {
             // a chunk copied ahead ends before the fetch aligns
+            Timer ownKeyWaitTimer;
             std::lock_guard<std::mutex> copyLock(ownKeyCopyMutex);
+            ownKeyCopyWaitSeconds += ownKeyWaitTimer.getTimediff();
             ownKey = sequences.ownKeyCopyEnd;
         }
         const size_t ownKeyEnd = sequences.fetchSourceKeyOffsets[rank + 1];
-        copyEntries(sequences.keys.data() + ownKey, ownKeyEnd - ownKey, sequences.entryOffsets.data() + ownKey, sequences.entries, NULL, (repDbr != NULL) ? maxFetchSize / 2 : maxFetchSize);
+        copyEntries(sequences.keys.data() + ownKey, ownKeyEnd - ownKey, sequences.entryOffsets.data() + ownKey, sequences.entries, NULL, (repDbr != NULL) ? maxFetchSize / 2 : maxFetchSize, OWN_KEYS_CALLER);
         ownKeyCopySeconds += copyTimer.getTimediff();
         ownKeyCopySize += sequences.entryOffsets[ownKeyEnd] - sequences.entryOffsets[ownKey];
     };
+    std::vector<DBKeyType> repAheadKeys;
     // copies the own keys of the next block of the queued fetches, the main thread copies what is left when it takes a fetch
     const auto copyOwnKeysAhead = [&]() {
         std::unique_lock<std::mutex> taskLock(ownKeyCopyMutex, std::try_to_lock);
         if (taskLock.owns_lock() == false) {
             return false;
+        }
+        // first the rep keys of the front fetch's own section into the rep block cache, one load per call while they fit
+        if (isReadingRepsAhead) {
+            FetchedSequences *aheadSequences = NULL;
+            {
+                std::lock_guard<std::mutex> lock(serviceMutex);
+                if (ownKeyFetches.empty() == false && ownKeyFetches.front()->repAheadPos < ownKeyFetches.front()->fetchSourceKeyOffsets[rank + 1]) {
+                    aheadSequences = ownKeyFetches.front();
+                }
+            }
+            if (aheadSequences != NULL) {
+                const DBKeyType *keys = aheadSequences->keys.data();
+                const size_t ownKeyEnd = aheadSequences->fetchSourceKeyOffsets[rank + 1];
+                repAheadKeys.clear();
+                size_t block = SIZE_MAX;
+                size_t repBlock = SIZE_MAX;
+                size_t blockCount = 0;
+                size_t i = aheadSequences->repAheadPos;
+                for (; i < ownKeyEnd; i++) {
+                    if (isAssigned(keys[i]) || getKeyAlignNode(seqDbr, keys[i], &block) == rank) {
+                        continue;
+                    }
+                    if (block != repBlock) {
+                        if (blockCount == maxRepAheadBlocks) {
+                            break;
+                        }
+                        repBlock = block;
+                        blockCount++;
+                    }
+                    repAheadKeys.push_back(keys[i]);
+                }
+                aheadSequences->repAheadPos = i;
+                if (repAheadKeys.empty() == false) {
+                    Timer sourceWaitTimer;
+                    std::lock_guard<std::mutex> sourceLock(sourceMutex);
+                    sourceWaitSeconds[REP_AHEAD_CALLER] += sourceWaitTimer.getTimediff();
+                    Timer sourceHoldTimer;
+                    // blockReadSize only grows, so a load that fits it fits the rep block cache without freeing blocks
+                    if (repDbr->getBlockReadSize() + blockCount * (BatchReader::MAX_READ_REQUEST_SIZE + 2 * pageSize) <= repBlockCacheSize) {
+                        repDbr->loadData(repAheadKeys);
+                        repLoadCounts[REP_AHEAD_CALLER]++;
+                        repLoadSeconds[REP_AHEAD_CALLER] += sourceHoldTimer.getTimediff();
+                        sourceLoadSeconds += sourceHoldTimer.getTimediff();
+                    } else {
+                        aheadSequences->repAheadPos = ownKeyEnd;
+                        skippedRepAheadCount++;
+                    }
+                    maxSourceHoldSeconds[REP_AHEAD_CALLER] = std::max(maxSourceHoldSeconds[REP_AHEAD_CALLER], sourceHoldTimer.getTimediff());
+                    return true;
+                }
+            }
         }
         FetchedSequences *sequences = NULL;
         size_t first = 0;
@@ -5027,7 +5150,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         if (sequences == NULL) {
             return false;
         }
-        copyEntries(sequences->keys.data() + first, end - first, sequences->entryOffsets.data() + first, sequences->entries, NULL, (repDbr != NULL) ? maxFetchSize / 2 : maxFetchSize);
+        copyEntries(sequences->keys.data() + first, end - first, sequences->entryOffsets.data() + first, sequences->entries, NULL, (repDbr != NULL) ? maxFetchSize / 2 : maxFetchSize, OWN_KEYS_AHEAD_CALLER);
         ownKeyAheadSize += sequences->entryOffsets[end] - sequences->entryOffsets[first];
         return true;
     };
@@ -5160,6 +5283,17 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         serviceCondition.notify_all();
         copyOwnKeys(currentSequences);
         waitForSequences(currentSequences, getFirstRepKey(currentSequences));
+        size_t firstFetchOwnReadSize;
+        size_t firstFetchRepReadSize;
+        {
+            // the loads write the read bytes under sourceMutex
+            Timer sourceWaitTimer;
+            std::lock_guard<std::mutex> sourceLock(sourceMutex);
+            sourceWaitSeconds[OWN_KEYS_CALLER] += sourceWaitTimer.getTimediff();
+            firstFetchOwnReadSize = seqDbr.getBlockReadSize();
+            firstFetchRepReadSize = (repDbr != NULL) ? repDbr->getBlockReadSize() : 0;
+        }
+        MMseqsNode::addPhaseValue(phaseValues, "Read bytes when the first fetch is ready", SSTR(firstFetchOwnReadSize) + " own, " + SSTR(firstFetchRepReadSize) + " rep");
     }
     const double firstFetchSeconds = startTimer.getTimediff();
     // the fetch work and waits before a fetch aligns
@@ -5171,7 +5305,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
     double plannedBytesPerSecond = 0;
     size_t maxFetchesInFlight = 0;
     size_t fetchesInFlightSum = 0;
-    const size_t alignThreadCount = par.threads - ioThreadCount;
+    const size_t alignThreadCount = hasIoThreadsOutsideTeam ? par.threads : par.threads - ioThreadCount;
     while (currentSequences.isLast == false) {
         Timer otherTimer;
         // one fetch ahead, more while they align within READ_SECONDS, fit memory and keep the buffer of current
@@ -5959,6 +6093,19 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, RepTar
         MMseqsNode::addPhaseSeconds(phaseValues, "service: serving the requests", servingSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: loading the source sequences", sourceLoadSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: packing the served entries", packSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "service: packing entries for other nodes", entryPackSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "service: copying entries", entryCopySeconds);
+        std::string repLoads;
+        for (int caller = SERVE_CALLER; caller <= REP_AHEAD_CALLER; caller++) {
+            MMseqsNode::addPhaseSeconds(phaseValues, std::string("service: waiting for the source lock to ") + sourceCallers[caller], sourceWaitSeconds[caller]);
+            MMseqsNode::addPhaseSeconds(phaseValues, std::string("service: longest source lock hold to ") + sourceCallers[caller], maxSourceHoldSeconds[caller]);
+            MMseqsNode::addPhaseSeconds(phaseValues, std::string("service: loading own blocks to ") + sourceCallers[caller], ownLoadSeconds[caller]);
+            MMseqsNode::addPhaseSeconds(phaseValues, std::string("service: loading rep blocks to ") + sourceCallers[caller], repLoadSeconds[caller]);
+            repLoads += std::string((caller > SERVE_CALLER) ? ", " : "") + SSTR(repLoadCounts[caller]) + " to " + sourceCallers[caller];
+        }
+        MMseqsNode::addPhaseValue(phaseValues, "service: rep block loads", repLoads);
+        MMseqsNode::addPhaseValue(phaseValues, "service: rep loads read ahead / skipped", SSTR(repLoadCounts[REP_AHEAD_CALLER]) + " / " + SSTR(skippedRepAheadCount));
+        MMseqsNode::addPhaseSeconds(phaseValues, "service: waiting for the own key copy ahead", ownKeyCopyWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: writing the served files", servedFileWriteSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: reading the served entries", readingSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "service: unpacking the served entries", unpackSeconds);
@@ -6229,10 +6376,16 @@ int align2clustLinfinity(Parameters &par) {
     const bool isExchangingSequences = isAligningNode && alignGroupNodeEnd - alignGroupNodeBegin > 1;
     // member requests cross the align groups, every align node but the node itself asks
     const bool isServingMembers = par.filterCluDBFile.empty() == false && MMseqsNode::count > 1 && (MMseqsNode::isMaster() || alignNodeCount > 1);
-    const int ioThreadCount = std::min((isExchangingSequences || isServingMembers) ? 2 : 1, par.threads - 1);
+    // A/B switch MMSEQS_ALIGN_IO_THREADS=1: an align node runs an I/O thread per task group that can run at once beside a team of --threads, always serving with
+    // the own key copies and the prefilter fill, where they run receiving, the member service, the member preload and the clustering steps of a single node
+    const char *ioThreadsSwitch = getenv("MMSEQS_ALIGN_IO_THREADS");
+    const bool hasIoThreadsOutsideTeam = isAligningNode && ioThreadsSwitch != NULL && strcmp(ioThreadsSwitch, "1") == 0;
+    const int ioThreadCount = hasIoThreadsOutsideTeam ? 2 + isExchangingSequences + isServingMembers + (par.filterCluDBFile.empty() == false && MMseqsNode::count > 1) + MMseqsNode::isMaster()
+                                                      : std::min((isExchangingSequences || isServingMembers) ? 2 : 1, par.threads - 1);
+    const int alignThreadCount = hasIoThreadsOutsideTeam ? par.threads : par.threads - ioThreadCount;
     // leave room for the I/O threads from the start
 #ifdef OPENMP
-    omp_set_num_threads(par.threads - ioThreadCount);
+    omp_set_num_threads(alignThreadCount);
 #endif
     // a master that only clusters reads no sequences
     const bool isCopyingServedBlocks = par.localTmp.empty() == false && isAligningNode;
@@ -6303,7 +6456,7 @@ int align2clustLinfinity(Parameters &par) {
             size_t cluCopySize = 0;
             if (cluSize > 0 && cluSize <= localTmpSize) {
                 const size_t firstCopy = localCopies.size();
-                cluPartDb = FileUtil::copyToLocalDir(par.filterCluDBFile, localDir, par.threads - ioThreadCount, localCopies, cluCopySize, cluFileRanges, localTmpSize);
+                cluPartDb = FileUtil::copyToLocalDir(par.filterCluDBFile, localDir, alignThreadCount, localCopies, cluCopySize, cluFileRanges, localTmpSize);
                 if (cluCopySize < cluSize) {
                     for (size_t i = firstCopy; i < localCopies.size(); i++) {
                         FileUtil::remove(localCopies[i].c_str());
@@ -6572,7 +6725,7 @@ int align2clustLinfinity(Parameters &par) {
     // a member key, a pending part and an accepted pair take 41 words and 5 flags of the 2 * memberSplitSize in getReservedMemory
     const size_t memberKeyBudget = std::max<size_t>(1, 2 * std::min(memoryLimit, smallestMemoryLimit) / MEMBER_SPLIT_MEMORY_DIVISOR / ((7 + 9 + 25) * sizeof(uint64_t) + 5));
     alignRepTargets(par, seqDbr, repTargetsReader, targetSplitReader, partitions, windows, memoryLimit, masterMemoryLimit, servedFileEntrySize, representativeResidues, paddedDbSize, sizeClassCount,
-                    memberLookup, memberExchange, memberKeyBudget, memberDbr, ioThreadCount, clustering, servedBlockCopy, phaseValues);
+                    memberLookup, memberExchange, memberKeyBudget, memberDbr, ioThreadCount, hasIoThreadsOutsideTeam, clustering, servedBlockCopy, phaseValues);
     // master of several nodes: clusters with the main thread's teams, writer on a spare thread
     if (MMseqsNode::isMaster() && isMasterAligning == false) {
         clustering = new AcceptedPairClustering(par.threads, dbSize, masterMemoryLimit, seqDbr, pageAlignNodes, par.clusteringMode, paddedDbSize, sizeClassCount,
