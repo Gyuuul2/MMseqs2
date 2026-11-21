@@ -458,8 +458,8 @@ struct KmerCodeWriter {
     KmerCodeWriter() {}
     KmerCodeWriter(int fd, const char *fileName, char *buffer, size_t bufferSize, size_t writePos, BatchWriter *batchWriter)
         : fd(fd), fileName(fileName), buffer(buffer), bufferSize(bufferSize), bufferPos(0), writePos(writePos), bitBuffer(0), bitCount(0), batchWriter(batchWriter) {}
-    KmerCodeWriter(char *data, size_t size, size_t writePos)
-        : fd(-1), fileName(NULL), buffer(data + writePos), bufferSize(size - writePos), bufferPos(0), writePos(writePos), bitBuffer(0), bitCount(0), batchWriter(NULL) {}
+    KmerCodeWriter(char *data, size_t end, size_t writePos)
+        : fd(-1), fileName(NULL), buffer(data + writePos), bufferSize(end - writePos), bufferPos(0), writePos(writePos), bitBuffer(0), bitCount(0), batchWriter(NULL) {}
 
     int fd;
     const char *fileName;
@@ -496,7 +496,7 @@ static void refillKmerCodeBuffer(KmerCodeReader &reader, size_t fileOffset) {
     reader.bufferPos = 0;
 }
 
-// at most KMER_FILE_STEP_BITS bits; the writer may write up to bufferSize, bytes after its position are written again later
+// writes 8 bytes when they fit, the bytes past bufferPos are written again
 static inline void putStepBits(KmerCodeWriter &writer, uint64_t value, unsigned int bits) {
     writer.bitBuffer |= (value & ((1ULL << bits) - 1)) << writer.bitCount;
     writer.bitCount += bits;
@@ -549,7 +549,7 @@ static inline size_t getPrefKeySize(uint64_t key) {
     return (std::max(1u, getBitWidth(key)) + 6) / 7;
 }
 
-// whole bytes up to 63 bits at once when the buffer has 8 more bytes
+// up to 63 bits of whole bytes
 static inline void loadKmerCodeBytes(KmerCodeReader &reader) {
     uint64_t word = 0;
     for (unsigned int i = 0; i < sizeof(uint64_t); i++) {
@@ -642,7 +642,7 @@ static inline void putRice(KmerCodeWriter &writer, uint64_t value, unsigned int 
         putBits(writer, ((value & ((1ULL << bits) - 1)) << (quotient + 1)) | (1ULL << quotient), quotient + 1 + bits);
         return;
     }
-    for (; quotient > 0;) {
+    while (quotient > 0) {
         unsigned int zeros = std::min(quotient, (uint64_t) KMER_FILE_STEP_BITS);
         putBits(writer, 0, zeros);
         quotient -= zeros;
