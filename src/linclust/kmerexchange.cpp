@@ -2996,16 +2996,17 @@ struct PrefExchangeFile {
     size_t flushCount;
 };
 
-// cost = rep length * target residues
 struct PieceCount {
     DBKeyType rep;
     size_t targetSplit;
     size_t targetCount;
-    size_t cost;
-    size_t pieceSize;
 
     static bool compareByRep(const PieceCount &first, const PieceCount &second) {
         return first.rep < second.rep || (first.rep == second.rep && first.targetSplit < second.targetSplit);
+    }
+
+    static bool compareBySplit(const PieceCount &first, const PieceCount &second) {
+        return first.targetSplit < second.targetSplit || (first.targetSplit == second.targetSplit && first.rep < second.rep);
     }
 };
 
@@ -3410,9 +3411,9 @@ struct PrefRowRead {
 // an owner reads the rows of its hash ranges from all units in batches and answers every row; answerBits bounds the answer of a row,
 // with hasRowSizes an answer to a row with groups starts with its size. A batch and its rows take half of memoryLimit, the answers the rest
 template <typename AnswerBits, typename AnswerHashRange>
-static std::string answerHashRanges(const Parameters &par, const TargetPref &pref, const std::string &sentPrefix, const std::vector<PrefExchangeFile> &sentFiles,
+static std::string answerHashRanges(const Parameters &par, const KmerExchange &exchange, const TargetPref &pref, const std::string &sentPrefix, const std::vector<PrefExchangeFile> &sentFiles,
                                     const std::string &answerPrefix, bool hasRowSizes, size_t memoryLimit, AnswerBits answerBits, AnswerHashRange answerHashRange,
-                                    size_t &receivedSize) {
+                                    size_t &receivedSize, std::string &phaseValues) {
     size_t firstHashRange = pref.hashRangeNodeOffsets[MMseqsNode::rank];
     size_t ownHashRanges = pref.hashRangeNodeOffsets[MMseqsNode::rank + 1] - firstHashRange;
     size_t unitCount = pref.units.size();
@@ -3449,6 +3450,12 @@ static std::string answerHashRanges(const Parameters &par, const TargetPref &pre
     size_t fileSize = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
     std::vector<size_t> flushOffsets;
     BatchReader batchReader(par.threads, fds.empty() ? fileno(file) : fds[0]);
+    // a sub pass is answered while the previous one is written
+    BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(file));
+    double readSeconds = 0;
+    double answerSeconds = 0;
+    double writeSeconds = 0;
+    Timer timer;
     for (size_t pass = 0; pass + 1 < passOffsets.size(); pass++) {
         size_t passFirst = passOffsets[pass];
         size_t passEnd = passOffsets[pass + 1];
@@ -3459,6 +3466,7 @@ static std::string answerHashRanges(const Parameters &par, const TargetPref &pre
             const size_t *offsets = rowOffsets.data() + unit * (ownHashRanges + 1);
             unitDataOffsets[unit + 1] = unitDataOffsets[unit] + offsets[passEnd] - offsets[passFirst];
         }
+        timer.reset();
         std::vector<char> rowData(unitDataOffsets[unitCount] + sizeof(uint64_t));
         std::vector<BatchReader::ReadRequest> readRequests;
         for (size_t node = 0; node < fds.size(); node++) {
@@ -3474,6 +3482,7 @@ static std::string answerHashRanges(const Parameters &par, const TargetPref &pre
         if (readRequests.empty() == false) {
             batchReader.readSync(readRequests);
         }
+        readSeconds += timer.getTimediff();
         receivedSize += unitDataOffsets[unitCount];
         // every row answers at most answerBits
         std::vector<PrefRowRead> rows(unitCount * passHashRanges);
@@ -3503,6 +3512,7 @@ static std::string answerHashRanges(const Parameters &par, const TargetPref &pre
         std::vector<size_t> subPassSizes;
         planPasses(hashRangeAnswerSizes, ownerMemory - std::min(ownerMemory, passSizes[pass]), subPassOffsets, subPassSizes);
         for (size_t subPass = 0; subPass + 1 < subPassOffsets.size(); subPass++) {
+            timer.reset();
             size_t subPassFirst = subPassOffsets[subPass];
             size_t subPassHashRanges = subPassOffsets[subPass + 1] - subPassFirst;
             // answers unit by unit
@@ -3538,24 +3548,42 @@ static std::string answerHashRanges(const Parameters &par, const TargetPref &pre
                     }
                 }
             }
-            // the answers of a unit to the hash ranges of the sub pass are adjacent, moved down in place
-            size_t answerSize = 0;
+            answerSeconds += timer.getTimediff();
+            timer.reset();
+            // the answers of a unit to the hash ranges of the sub pass are adjacent in the file, moved down in the space of the unit and written behind
+            size_t flushStart = flushOffsets.size();
             for (size_t unit = 0; unit < unitCount; unit++) {
-                flushOffsets.push_back(fileSize + answerSize);
+                flushOffsets.push_back(fileSize);
+                for (size_t i = 0; i < subPassHashRanges; i++) {
+                    size_t row = unit * passHashRanges + subPassFirst + i;
+                    fileSize += answerSizeBytes[row] + rows[row].answer.bufferPos;
+                }
+            }
+            flushOffsets.push_back(fileSize);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+            for (size_t unit = 0; unit < unitCount; unit++) {
+                char *unitAnswers = answers + answerOffsets[unit * subPassHashRanges];
+                size_t answerSize = 0;
                 for (size_t i = 0; i < subPassHashRanges; i++) {
                     size_t row = unit * passHashRanges + subPassFirst + i;
                     size_t size = answerSizeBytes[row] + rows[row].answer.bufferPos;
-                    memmove(answers + answerSize, answers + answerOffsets[unit * subPassHashRanges + i], size);
+                    memmove(unitAnswers + answerSize, answers + answerOffsets[unit * subPassHashRanges + i], size);
                     answerSize += size;
                 }
+                batchWriter.write(fileno(file), fileName.c_str(), unitAnswers, answerSize, flushOffsets[flushStart + unit]);
             }
-            flushOffsets.push_back(fileSize + answerSize);
-            FileUtil::pwriteAll(fileno(file), fileName.c_str(), answers, answerSize, fileSize);
-            fileSize += answerSize;
             delete[] answers;
+            writeSeconds += timer.getTimediff();
         }
     }
+    timer.reset();
+    batchWriter.waitWrites();
+    writeSeconds += timer.getTimediff();
     closePrefExchangeFiles(sentPrefix, fds);
+    std::string sent = sentPrefix.substr(par.db2.size() + 1);
+    MMseqsNode::addPhaseSeconds(phaseValues, "reading " + sent, readSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "answering " + sent, answerSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "writing " + answerPrefix.substr(par.db2.size() + 1), writeSeconds);
     return publishPrefExchangeFile(file, fileName, flushOffsets, unitCount + 1, fileSize);
 }
 
@@ -4100,13 +4128,16 @@ static void pickReps(const KmerExchange &exchange, const TargetPref &pref, size_
     }
 }
 
-// encodes whole rep cells of a unit file: per cell a 0 terminated entry, per rep the rep gap, the size class (0, the class files hold it), the target gaps and 0
+// encodes whole rep cells of a unit file: per cell a 0 terminated entry, per rep the rep gap, the size class (0, the class files hold it), the target gaps and 0;
+// pieces holds the piece counts of the cells, pieceCells their cells and starts
 struct CellWriter {
     std::vector<char> data;
     std::vector<uint64_t> indexCells;
     size_t nextCell;
     bool isOpen;
     DBKeyType prevRep;
+    std::vector<char> pieces;
+    std::vector<std::pair<size_t, size_t> > pieceCells;
 };
 
 static void putPrefKey(std::vector<char> &data, uint64_t key) {
@@ -4149,17 +4180,46 @@ static bool isSameClusterPair(const ClusterPair &first, const ClusterPair &secon
     return first.repKey == second.repKey && first.memberKey == second.memberKey;
 }
 
-// the sorted unique pairs of a task, the writer continues its cells
-static void writeTaskCells(const TargetPref &pref, DBReader<DBKeyType> &seqDbr, const PrefUnit &unit, const ClusterPair *pairs, size_t pairCount,
-                             CellWriter &writer, std::vector<PieceCount> &pieceCounts) {
+// a part of a piece counts column: the piece bytes, the cost (rep length * target residues), the target split and the rep count, then per rep the rep gap and the target count
+static void putPieceCounts(CellWriter &writer, size_t cell, size_t targetSplit, size_t pieceSize, size_t cost, size_t repCount, const std::vector<char> &repCounts) {
+    writer.pieceCells.push_back(std::make_pair(cell, writer.pieces.size()));
+    putPrefKey(writer.pieces, pieceSize);
+    putPrefKey(writer.pieces, cost);
+    putPrefKey(writer.pieces, targetSplit);
+    putPrefKey(writer.pieces, repCount);
+    writer.pieces.insert(writer.pieces.end(), repCounts.begin(), repCounts.end());
+}
+
+// the sorted unique pairs of a task, the writer continues its cells and adds a piece counts part per cell
+static void writeTaskCells(const TargetPref &pref, DBReader<DBKeyType> &seqDbr, const PrefUnit &unit, const ClusterPair *pairs, size_t pairCount, CellWriter &writer) {
     writer.data.clear();
     writer.indexCells.clear();
+    writer.pieces.clear();
+    writer.pieceCells.clear();
     size_t targetSplit = std::upper_bound(pref.targetSplitKeyOffsets.begin(), pref.targetSplitKeyOffsets.end(), unit.firstKey) - pref.targetSplitKeyOffsets.begin() - 1;
+    std::vector<char> repCounts;
+    size_t countCell = SIZE_MAX;
+    size_t pieceSize = 0;
+    size_t cost = 0;
+    size_t repCount = 0;
+    DBKeyType prevCountRep = 0;
     for (size_t repStart = 0, repEnd = 0; repStart < pairCount; repStart = repEnd) {
         DBKeyType rep = pairs[repStart].repKey;
         for (repEnd = repStart + 1; repEnd < pairCount && pairs[repEnd].repKey == rep; repEnd++) {
         }
-        startCell(pref, writer, getCell(pref, rep));
+        size_t cell = getCell(pref, rep);
+        if (cell != countCell) {
+            if (repCount > 0) {
+                putPieceCounts(writer, countCell, targetSplit, pieceSize, cost, repCount, repCounts);
+            }
+            countCell = cell;
+            pieceSize = 0;
+            cost = 0;
+            repCount = 0;
+            repCounts.clear();
+            prevCountRep = pref.cellFirstKeys[cell];
+        }
+        startCell(pref, writer, cell);
         size_t pieceStart = writer.data.size();
         putPrefKey(writer.data, rep - writer.prevRep);
         putPrefKey(writer.data, 0);
@@ -4173,8 +4233,15 @@ static void writeTaskCells(const TargetPref &pref, DBReader<DBKeyType> &seqDbr, 
         }
         writer.data.push_back('\0');
         writer.prevRep = rep;
-        PieceCount pieceCount = { rep, targetSplit, repEnd - repStart, (seqDbr.getIndex()[seqDbr.findIdRange(rep)].length - 2) * targetResidues, writer.data.size() - pieceStart };
-        pieceCounts.push_back(pieceCount);
+        pieceSize += writer.data.size() - pieceStart;
+        cost += (seqDbr.getIndex()[seqDbr.findIdRange(rep)].length - 2) * targetResidues;
+        repCount++;
+        putPrefKey(repCounts, rep - prevCountRep);
+        putPrefKey(repCounts, repEnd - repStart);
+        prevCountRep = rep;
+    }
+    if (repCount > 0) {
+        putPieceCounts(writer, countCell, targetSplit, pieceSize, cost, repCount, repCounts);
     }
 }
 
@@ -4187,50 +4254,12 @@ static void appendCells(BatchWriter &batchWriter, FILE *dataFile, const std::str
     dataSize += writer.data.size();
 }
 
-// a column per rep cell, empty or the piece bytes and the cost of the cell, then per rep and target split the rep gap, the split and the target count
-static void flushPieceCounts(const TargetPref &pref, std::vector<PieceCount> &pieceCounts, std::vector<char> &compacted, FILE *file, const std::string &fileName, size_t &fileSize,
-                             std::vector<size_t> &flushOffsets) {
-    SORT_PARALLEL(pieceCounts.begin(), pieceCounts.end(), PieceCount::compareByRep);
-    compacted.clear();
-    for (size_t cell = 0, pos = 0; cell + 1 < pref.cellFirstKeys.size(); cell++) {
-        flushOffsets.push_back(fileSize + compacted.size());
-        size_t cellEnd = pos;
-        size_t pieceSize = 0;
-        size_t cost = 0;
-        for (; cellEnd < pieceCounts.size() && pieceCounts[cellEnd].rep < pref.cellFirstKeys[cell + 1]; cellEnd++) {
-            pieceSize += pieceCounts[cellEnd].pieceSize;
-            cost += pieceCounts[cellEnd].cost;
-        }
-        if (pos == cellEnd) {
-            continue;
-        }
-        putPrefKey(compacted, pieceSize);
-        putPrefKey(compacted, cost);
-        DBKeyType prevRep = pref.cellFirstKeys[cell];
-        while (pos < cellEnd) {
-            const PieceCount &first = pieceCounts[pos];
-            size_t targetCount = 0;
-            for (; pos < cellEnd && pieceCounts[pos].rep == first.rep && pieceCounts[pos].targetSplit == first.targetSplit; pos++) {
-                targetCount += pieceCounts[pos].targetCount;
-            }
-            putPrefKey(compacted, first.rep - prevRep);
-            putPrefKey(compacted, first.targetSplit);
-            putPrefKey(compacted, targetCount);
-            prevRep = first.rep;
-        }
-    }
-    flushOffsets.push_back(fileSize + compacted.size());
-    FileUtil::pwriteAll(fileno(file), fileName.c_str(), compacted.data(), compacted.size(), fileSize);
-    fileSize += compacted.size();
-    pieceCounts.clear();
-}
-
 // pass 3: the reps of every group, from the owner if its fingerprint is in another unit, else from the unit; every member a target of its reps.
 // Every thread keeps a run of pairs; tasks of rep cells merge the runs and encode in parallel; past the pair capacity a sweep ends at a cell and the unit is walked again
 template <typename T, bool includeAdjacency, typename L>
 static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, TargetPref &pref,
                                   const std::vector<PrefExchangeFile> &markFiles, const std::vector<PrefExchangeFile> &repFiles,
-                                  double &extractSeconds, size_t &prefSize, size_t &pairCount, size_t &sweepCount) {
+                                  double &extractSeconds, size_t &prefSize, size_t &pairCount, size_t &sweepCount, std::string &phaseValues) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     const std::string fileName = par.db2 + ".piece_counts." + SSTR(MMseqsNode::rank);
     FILE *file = MMseqsNode::createExchangeFile(fileName, 0, "w");
@@ -4242,13 +4271,16 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     UnitMarks marks;
     std::vector<char> repAnswers;
     std::vector<size_t> repRowOffsets(pref.hashRangeCount);
-    std::vector<PieceCount> pieceCounts;
-    std::vector<char> compactedCounts;
-    size_t pieceCountLimit = exchange.keySplitMemoryLimit / 16;
     size_t cellCount = pref.cellFirstKeys.size() - 1;
     std::vector<std::vector<ClusterPair> > threadRecentPairs(par.threads, std::vector<ClusterPair>(RECENT_PAIR_SLOTS));
     std::vector<CellWriter> taskWriters;
-    std::vector<std::vector<PieceCount> > taskPieceCounts;
+    double prepareSeconds = 0;
+    double emitSeconds = 0;
+    double sortSeconds = 0;
+    double encodeSeconds = 0;
+    double appendSeconds = 0;
+    double waitSeconds = 0;
+    Timer timer;
     BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(file));
     // the units with their needed groups in memory first, then the spilled ones, then those extracted again, which need the memory of the others
     std::vector<std::pair<size_t, size_t> > unitOrder;
@@ -4266,6 +4298,7 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     for (size_t order = 0; order < unitOrder.size(); order++) {
         size_t ownUnit = unitOrder[order].second;
         setSendSplit(par, exchange, pref.sendSplits[unitSendSplits[ownUnit]]);
+        timer.reset();
         {
             size_t unitIndex = getOwnUnit(pref, ownUnit);
             const PrefUnit &unit = pref.units[unitIndex];
@@ -4331,9 +4364,9 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             FILE *dataFile = FileUtil::openAndDelete(dataName.c_str(), "w");
             size_t dataSize = 0;
             std::vector<uint64_t> unitIndexCells;
-            // the memory the passes do not hold takes the pairs of a sweep with their pieces and unit file bytes, the cells of a sweep and the piece counts
-            size_t usedMemory = getHeldMemory(pref) + ((unitOrder[order].first == 0) ? 0 : needed.data.size()) + repAnswers.size() + 2 * pieceCountLimit + cellCount * (2 * sizeof(uint64_t) + 1);
-            size_t pairBytes = sizeof(ClusterPair) + sizeof(PieceCount) + 2 * getPrefKeySize(seqDbr.getSize()) + 2;
+            // the memory the passes do not hold takes the pairs of a sweep with their unit file bytes and piece counts, and the cells of a sweep with their piece count parts
+            size_t usedMemory = getHeldMemory(pref) + ((unitOrder[order].first == 0) ? 0 : needed.data.size()) + repAnswers.size() + cellCount * (3 * sizeof(uint64_t) + 1 + 4 * getPrefKeySize(SIZE_MAX));
+            size_t pairBytes = sizeof(ClusterPair) + 4 * getPrefKeySize(seqDbr.getSize()) + 2;
             // a rep keeps all its pairs of the unit in one sweep
             size_t pairCapacity = std::max((exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, usedMemory)) / pairBytes, 2 * (unit.endKey - unit.firstKey));
             // chunks of hash ranges whose groups cannot add more than half of the capacity
@@ -4358,6 +4391,9 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             unitWriter.nextCell = 0;
             unitWriter.isOpen = false;
             unitWriter.prevRep = 0;
+            // the unit's piece counts are a flush, its parts are appended in cell order
+            size_t countColumns = 0;
+            prepareSeconds += timer.getTimediff();
             for (DBKeyType repBegin = unitRepBegin; repBegin < unitRepEnd; sweepCount++) {
                 // a pair dropped at the end of a sweep may come again in the next
                 for (size_t thread = 0; thread < threadRecentPairs.size(); thread++) {
@@ -4367,6 +4403,7 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                 size_t pairEnd = 0;
                 for (size_t chunk = 0; chunk + 1 < chunkHashRanges.size(); chunk++) {
                     if (pairEnd + chunkPairBounds[chunk + 1] + par.threads * PAIR_BLOCK_SIZE > arraySize) {
+                        timer.reset();
                         SORT_PARALLEL(pairs, pairs + pairEnd, compareClusterPairs);
                         pairEnd = std::unique(pairs, std::lower_bound(pairs, pairs + pairEnd, sentinel, compareClusterPairs), isSameClusterPair) - pairs;
                         // the sweep ends at the rep where its pairs reach half of the capacity, but keeps one rep
@@ -4377,7 +4414,9 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                             ClusterPair end = { repEnd, 0 };
                             pairEnd = std::lower_bound(pairs, pairs + pairEnd, end, compareClusterPairs) - pairs;
                         }
+                        sortSeconds += timer.getTimediff();
                     }
+                    timer.reset();
                     size_t chunkStart = chunkHashRanges[chunk];
                     size_t chunkEnd = chunkHashRanges[chunk + 1];
 #pragma omp parallel num_threads(par.threads)
@@ -4463,7 +4502,9 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                         }
                         std::fill(pairs + blockPos, pairs + blockEnd, sentinel);
                     }
+                    emitSeconds += timer.getTimediff();
                 }
+                timer.reset();
                 SORT_PARALLEL(pairs, pairs + pairEnd, compareClusterPairs);
                 pairEnd = std::lower_bound(pairs, pairs + pairEnd, sentinel, compareClusterPairs) - pairs;
                 // tasks of whole cells with about equal pairs, the first may continue and the last end inside a cell
@@ -4490,8 +4531,10 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                 taskReps.push_back(repEnd);
                 taskCount = taskReps.size() - 1;
                 taskWriters.resize(taskCount);
-                taskPieceCounts.resize(taskCount);
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+                sortSeconds += timer.getTimediff();
+                timer.reset();
+                size_t sweepPairCount = 0;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+:sweepPairCount)
                 for (size_t task = 0; task < taskCount; task++) {
                     ClusterPair first = { taskReps[task], 0 };
                     ClusterPair end = { taskReps[task + 1], 0 };
@@ -4501,8 +4544,8 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                     writer.nextCell = (task == 0) ? unitWriter.nextCell : getCell(pref, taskReps[task]);
                     writer.isOpen = (task == 0) ? unitWriter.isOpen : false;
                     writer.prevRep = (task == 0) ? unitWriter.prevRep : taskReps[task];
-                    taskPieceCounts[task].clear();
-                    writeTaskCells(pref, seqDbr, unit, taskPairs, taskPairCount, writer, taskPieceCounts[task]);
+                    writeTaskCells(pref, seqDbr, unit, taskPairs, taskPairCount, writer);
+                    sweepPairCount += taskPairCount;
                     size_t taskEndCell = std::lower_bound(pref.cellFirstKeys.begin(), pref.cellFirstKeys.end(), static_cast<size_t>(taskReps[task + 1])) - pref.cellFirstKeys.begin();
                     if (pref.cellFirstKeys[taskEndCell] == taskReps[task + 1]) {
                         closeCells(pref, writer, taskEndCell);
@@ -4510,30 +4553,54 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                         startCell(pref, writer, taskEndCell - 1);
                     }
                 }
+                pairCount += sweepPairCount;
+                encodeSeconds += timer.getTimediff();
+                timer.reset();
+                // the tasks follow each other in the unit file and the piece counts, the threads copy them to the writer
+                std::vector<size_t> taskDataOffsets(taskCount);
+                std::vector<size_t> taskPieceOffsets(taskCount);
                 for (size_t task = 0; task < taskCount; task++) {
-                    appendCells(batchWriter, dataFile, dataName, taskWriters[task], unitIndexCells, dataSize);
-                    std::vector<char>().swap(taskWriters[task].data);
-                    pieceCounts.insert(pieceCounts.end(), taskPieceCounts[task].begin(), taskPieceCounts[task].end());
-                    for (size_t j = 0; j < taskPieceCounts[task].size(); j++) {
-                        pairCount += taskPieceCounts[task][j].targetCount;
+                    const CellWriter &writer = taskWriters[task];
+                    for (size_t i = 0; i < writer.indexCells.size(); i += 2) {
+                        unitIndexCells.push_back(writer.indexCells[i]);
+                        unitIndexCells.push_back(dataSize + writer.indexCells[i + 1]);
                     }
-                    std::vector<PieceCount>().swap(taskPieceCounts[task]);
+                    for (size_t i = 0; i < writer.pieceCells.size(); i++) {
+                        for (; countColumns <= writer.pieceCells[i].first; countColumns++) {
+                            flushOffsets.push_back(fileSize + writer.pieceCells[i].second);
+                        }
+                    }
+                    taskDataOffsets[task] = dataSize;
+                    taskPieceOffsets[task] = fileSize;
+                    dataSize += writer.data.size();
+                    fileSize += writer.pieces.size();
                 }
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+                for (size_t task = 0; task < taskCount; task++) {
+                    CellWriter &writer = taskWriters[task];
+                    batchWriter.write(fileno(dataFile), dataName.c_str(), writer.data.data(), writer.data.size(), taskDataOffsets[task]);
+                    batchWriter.write(fileno(file), fileName.c_str(), writer.pieces.data(), writer.pieces.size(), taskPieceOffsets[task]);
+                    std::vector<char>().swap(writer.data);
+                    std::vector<char>().swap(writer.pieces);
+                }
+                appendSeconds += timer.getTimediff();
                 unitWriter.nextCell = taskWriters[taskCount - 1].nextCell;
                 unitWriter.isOpen = taskWriters[taskCount - 1].isOpen;
                 unitWriter.prevRep = taskWriters[taskCount - 1].prevRep;
                 repBegin = repEnd;
-                if (pieceCounts.size() * sizeof(PieceCount) > pieceCountLimit) {
-                    flushPieceCounts(pref, pieceCounts, compactedCounts, file, fileName, fileSize, flushOffsets);
-                }
             }
             delete[] pairs;
+            for (; countColumns <= cellCount; countColumns++) {
+                flushOffsets.push_back(fileSize);
+            }
             unitWriter.data.clear();
             unitWriter.indexCells.clear();
             closeCells(pref, unitWriter, cellCount);
             appendCells(batchWriter, dataFile, dataName, unitWriter, unitIndexCells, dataSize);
             // the unit file is closed once its writes are done
+            timer.reset();
             batchWriter.waitWrites();
+            waitSeconds += timer.getTimediff();
             std::string indexName = par.db2 + ".index." + SSTR(pref.unitFiles[unitIndex]);
             FILE *indexFile = FileUtil::openAndDelete(indexName.c_str(), "w");
             size_t indexSize = unitIndexCells.size() * sizeof(uint64_t);
@@ -4544,16 +4611,24 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             std::vector<char>().swap(needed.data);
         }
     }
-    if (pieceCounts.empty() == false || flushOffsets.empty()) {
-        flushPieceCounts(pref, pieceCounts, compactedCounts, file, fileName, fileSize, flushOffsets);
+    if (flushOffsets.empty()) {
+        flushOffsets.assign(cellCount + 1, fileSize);
     }
     closePrefExchangeFiles(par.db2 + ".marks", markFds);
     closePrefExchangeFiles(par.db2 + ".reps", repFds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 preparing units", prepareSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 emitting pairs", emitSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 sorting pairs", sortSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 encoding cells", encodeSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 appending cells and piece counts", appendSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 waiting for writes", waitSeconds);
     return publishPrefExchangeFile(file, fileName, flushOffsets, pref.cellFirstKeys.size(), fileSize);
 }
 
-// the owner of rep cells sums the piece counts: per target split a class file with an entry per own cell and a piece per rep with targets in the split, and a .partitions row per cell
-static std::string writeSizeClasses(const Parameters &par, const TargetPref &pref, const std::vector<PrefExchangeFile> &countFiles, size_t &classSize) {
+// the owner of rep cells sums the piece counts: per target split a class file with an entry per own cell and a piece per rep with targets in the split, and a .partitions row per cell.
+// The cells of a pass are decoded, sorted and encoded in parallel, their class pieces split by split
+static std::string writeSizeClasses(const Parameters &par, const KmerExchange &exchange, const TargetPref &pref, const std::vector<PrefExchangeFile> &countFiles, size_t &classSize,
+                                    std::string &phaseValues) {
     const std::string prefix = par.db2 + ".piece_counts";
     size_t firstCell = pref.cellNodeOffsets[MMseqsNode::rank];
     size_t ownCells = pref.cellNodeOffsets[MMseqsNode::rank + 1] - firstCell;
@@ -4574,9 +4649,9 @@ static std::string writeSizeClasses(const Parameters &par, const TargetPref &pre
             }
         }
     }
-    // a count takes at least 3 bytes, decoded a PieceCount and a class piece of at most 12 bytes
+    // a rep count takes at least 2 bytes, decoded a PieceCount and a class piece of at most 12 bytes; per target split an entry end, its offset and its index cell
     for (size_t cell = 0; cell < ownCells; cell++) {
-        cellSizes[cell] += cellSizes[cell] / 3 * (sizeof(PieceCount) + 12);
+        cellSizes[cell] += cellSizes[cell] / 2 * (sizeof(PieceCount) + 12) + targetSplitCount * (1 + 3 * sizeof(size_t));
     }
     std::vector<size_t> passOffsets;
     std::vector<size_t> passSizes;
@@ -4589,105 +4664,151 @@ static std::string writeSizeClasses(const Parameters &par, const TargetPref &pre
         dataNames[split] = par.db2 + "." + SSTR(pref.units.size() + MMseqsNode::rank * targetSplitCount + split);
         dataFiles[split] = FileUtil::openAndDelete(dataNames[split].c_str(), "w");
     }
-    BatchWriter batchWriter(KMER_FILE_BUFFER_SIZE, 1, fileno(dataFiles[0]));
-    BatchReader batchReader(1, fileno(dataFiles[0]));
+    BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(dataFiles[0]));
+    BatchReader batchReader(par.threads, fileno(dataFiles[0]));
     std::vector<char> counts;
-    std::vector<PieceCount> pieceCounts;
-    std::vector<CellWriter> writers(targetSplitCount);
     std::string rows;
+    double readSeconds = 0;
+    double decodeSeconds = 0;
+    double sortSeconds = 0;
+    double encodeSeconds = 0;
+    double writeSeconds = 0;
+    Timer timer;
     for (size_t pass = 0; pass + 1 < passOffsets.size(); pass++) {
         size_t passFirst = passOffsets[pass];
         size_t passEnd = passOffsets[pass + 1];
+        size_t passCells = passEnd - passFirst;
+        timer.reset();
+        // per node and flush its start in counts
+        std::vector<size_t> flushStarts;
         size_t readSize = 0;
         for (size_t node = 0; node < fds.size(); node++) {
             size_t flushCount = countFiles[node].flushCount;
             for (size_t flush = 0; flush < flushCount; flush++) {
+                flushStarts.push_back(readSize);
                 readSize += tables[node][passEnd * flushCount + flush] - tables[node][passFirst * flushCount + flush];
             }
         }
         counts.resize(readSize);
         std::vector<BatchReader::ReadRequest> readRequests;
-        char *bufferPos = counts.data();
-        for (size_t node = 0; node < fds.size(); node++) {
+        for (size_t node = 0, k = 0; node < fds.size(); node++) {
             size_t flushCount = countFiles[node].flushCount;
-            for (size_t flush = 0; flush < flushCount; flush++) {
+            for (size_t flush = 0; flush < flushCount; flush++, k++) {
                 size_t start = tables[node][passFirst * flushCount + flush];
                 size_t size = tables[node][passEnd * flushCount + flush] - start;
                 if (size > 0) {
-                    BatchReader::ReadRequest readRequest = {fds[node], names[node].c_str(), bufferPos, start, size, size};
+                    BatchReader::ReadRequest readRequest = {fds[node], names[node].c_str(), counts.data() + flushStarts[k], start, size, size};
                     readRequests.push_back(readRequest);
                 }
-                bufferPos += size;
             }
         }
         if (readRequests.empty() == false) {
             batchReader.readSync(readRequests);
         }
-        std::vector<size_t> cellPrefSizes(passEnd - passFirst, 0);
-        std::vector<size_t> cellCosts(passEnd - passFirst, 0);
-        pieceCounts.clear();
-        const char *data = counts.data();
-        for (size_t node = 0; node < fds.size(); node++) {
-            size_t flushCount = countFiles[node].flushCount;
-            for (size_t flush = 0; flush < flushCount; flush++) {
-                for (size_t cell = passFirst; cell < passEnd; cell++) {
-                    const char *columnEnd = data + tables[node][(cell + 1) * flushCount + flush] - tables[node][cell * flushCount + flush];
-                    if (data == columnEnd) {
-                        continue;
-                    }
-                    cellPrefSizes[cell - passFirst] += Util::getPrefKey(data);
-                    cellCosts[cell - passFirst] += Util::getPrefKey(data);
-                    PieceCount pieceCount = { static_cast<DBKeyType>(pref.cellFirstKeys[firstCell + cell]), 0, 0, 0, 0 };
-                    while (data < columnEnd) {
-                        pieceCount.rep += Util::getPrefKey(data);
-                        pieceCount.targetSplit = Util::getPrefKey(data);
-                        pieceCount.targetCount = Util::getPrefKey(data);
-                        pieceCounts.push_back(pieceCount);
+        readSeconds += timer.getTimediff();
+        timer.reset();
+        std::vector<size_t> cellPrefSizes(passCells, 0);
+        std::vector<size_t> cellCosts(passCells, 0);
+        // per cell its class pieces in split order, an entry per split
+        std::vector<std::vector<char> > cellClasses(passCells);
+        std::vector<size_t> splitOffsets(passCells * (targetSplitCount + 1));
+        double threadDecodeSeconds = 0;
+        double threadSortSeconds = 0;
+        double threadEncodeSeconds = 0;
+#pragma omp parallel num_threads(par.threads) reduction(+:threadDecodeSeconds, threadSortSeconds, threadEncodeSeconds)
+        {
+            std::vector<PieceCount> pieceCounts;
+            Timer threadTimer;
+#pragma omp for schedule(dynamic, 1)
+            for (size_t cell = 0; cell < passCells; cell++) {
+                threadTimer.reset();
+                pieceCounts.clear();
+                for (size_t node = 0, k = 0; node < fds.size(); node++) {
+                    size_t flushCount = countFiles[node].flushCount;
+                    const size_t *table = tables[node].data();
+                    for (size_t flush = 0; flush < flushCount; flush++, k++) {
+                        const char *data = counts.data() + flushStarts[k] + table[(passFirst + cell) * flushCount + flush] - table[passFirst * flushCount + flush];
+                        const char *columnEnd = data + table[(passFirst + cell + 1) * flushCount + flush] - table[(passFirst + cell) * flushCount + flush];
+                        while (data < columnEnd) {
+                            cellPrefSizes[cell] += Util::getPrefKey(data);
+                            cellCosts[cell] += Util::getPrefKey(data);
+                            size_t targetSplit = Util::getPrefKey(data);
+                            size_t repCount = Util::getPrefKey(data);
+                            PieceCount pieceCount = { static_cast<DBKeyType>(pref.cellFirstKeys[firstCell + passFirst + cell]), targetSplit, 0 };
+                            for (size_t i = 0; i < repCount; i++) {
+                                pieceCount.rep += Util::getPrefKey(data);
+                                pieceCount.targetCount = Util::getPrefKey(data);
+                                pieceCounts.push_back(pieceCount);
+                            }
+                        }
                     }
                 }
-            }
-        }
-        SORT_PARALLEL(pieceCounts.begin(), pieceCounts.end(), PieceCount::compareByRep);
-        for (size_t split = 0; split < targetSplitCount; split++) {
-            writers[split].data.clear();
-            writers[split].indexCells.clear();
-            writers[split].nextCell = firstCell + passFirst;
-            writers[split].isOpen = false;
-        }
-        // the size class of a rep from its targets in all splits, its piece in every split it has targets in
-        for (size_t pos = 0, repEnd = 0; pos < pieceCounts.size(); pos = repEnd) {
-            DBKeyType rep = pieceCounts[pos].rep;
-            size_t targetCount = 0;
-            for (repEnd = pos; repEnd < pieceCounts.size() && pieceCounts[repEnd].rep == rep; repEnd++) {
-                targetCount += pieceCounts[repEnd].targetCount;
-            }
-            size_t cell = getCell(pref, rep);
-            for (size_t i = pos; i < repEnd; i++) {
-                if (i > pos && pieceCounts[i].targetSplit == pieceCounts[i - 1].targetSplit) {
-                    continue;
+                threadDecodeSeconds += threadTimer.getTimediff();
+                threadTimer.reset();
+                SORT_SERIAL(pieceCounts.begin(), pieceCounts.end(), PieceCount::compareByRep);
+                // the size class of a rep from its targets in all splits, kept once per split it has targets in
+                size_t kept = 0;
+                for (size_t pos = 0, repEnd = 0; pos < pieceCounts.size(); pos = repEnd) {
+                    size_t targetCount = 0;
+                    for (repEnd = pos; repEnd < pieceCounts.size() && pieceCounts[repEnd].rep == pieceCounts[pos].rep; repEnd++) {
+                        targetCount += pieceCounts[repEnd].targetCount;
+                    }
+                    for (size_t i = pos; i < repEnd; i++) {
+                        if (i == pos || pieceCounts[i].targetSplit != pieceCounts[i - 1].targetSplit) {
+                            pieceCounts[kept] = pieceCounts[i];
+                            pieceCounts[kept++].targetCount = targetCount;
+                        }
+                    }
                 }
-                CellWriter &writer = writers[pieceCounts[i].targetSplit];
-                startCell(pref, writer, cell);
-                putPrefKey(writer.data, rep - writer.prevRep);
-                putPrefKey(writer.data, getBitWidth(targetCount) - 1);
-                writer.data.push_back('\0');
-                writer.prevRep = rep;
+                pieceCounts.resize(kept);
+                SORT_SERIAL(pieceCounts.begin(), pieceCounts.end(), PieceCount::compareBySplit);
+                threadSortSeconds += threadTimer.getTimediff();
+                threadTimer.reset();
+                std::vector<char> &data = cellClasses[cell];
+                size_t *offsets = splitOffsets.data() + cell * (targetSplitCount + 1);
+                for (size_t split = 0, pos = 0; split < targetSplitCount; split++) {
+                    offsets[split] = data.size();
+                    DBKeyType prevRep = pref.cellFirstKeys[firstCell + passFirst + cell];
+                    for (; pos < pieceCounts.size() && pieceCounts[pos].targetSplit == split; pos++) {
+                        putPrefKey(data, pieceCounts[pos].rep - prevRep);
+                        putPrefKey(data, getBitWidth(pieceCounts[pos].targetCount) - 1);
+                        data.push_back('\0');
+                        prevRep = pieceCounts[pos].rep;
+                    }
+                    data.push_back('\0');
+                }
+                offsets[targetSplitCount] = data.size();
+                cellPrefSizes[cell] += data.size();
+                threadEncodeSeconds += threadTimer.getTimediff();
             }
         }
+        decodeSeconds += threadDecodeSeconds;
+        sortSeconds += threadSortSeconds;
+        encodeSeconds += threadEncodeSeconds;
+        timer.reset();
         for (size_t split = 0; split < targetSplitCount; split++) {
-            CellWriter &writer = writers[split];
-            closeCells(pref, writer, firstCell + passEnd);
-            for (size_t cell = 0; cell < passEnd - passFirst; cell++) {
-                size_t cellEnd = (cell + 1 < passEnd - passFirst) ? writer.indexCells[2 * cell + 3] : writer.data.size();
-                cellPrefSizes[cell] += cellEnd - writer.indexCells[2 * cell + 1];
+            for (size_t cell = 0; cell < passCells; cell++) {
+                const size_t *offsets = splitOffsets.data() + cell * (targetSplitCount + 1);
+                indexCells[split].push_back(pref.cellFirstKeys[firstCell + passFirst + cell]);
+                indexCells[split].push_back(dataSizes[split]);
+                dataSizes[split] += offsets[split + 1] - offsets[split];
             }
-            appendCells(batchWriter, dataFiles[split], dataNames[split], writer, indexCells[split], dataSizes[split]);
         }
-        for (size_t cell = passFirst; cell < passEnd; cell++) {
-            rows += SSTR(pref.cellFirstKeys[firstCell + cell]) + "\t" + SSTR(firstCell + cell) + "\t" + SSTR(cellPrefSizes[cell - passFirst]) + "\t" + SSTR(cellCosts[cell - passFirst])
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+        for (size_t cell = 0; cell < passCells; cell++) {
+            const size_t *offsets = splitOffsets.data() + cell * (targetSplitCount + 1);
+            for (size_t split = 0; split < targetSplitCount; split++) {
+                batchWriter.write(fileno(dataFiles[split]), dataNames[split].c_str(), cellClasses[cell].data() + offsets[split], offsets[split + 1] - offsets[split],
+                                  indexCells[split][2 * (passFirst + cell) + 1]);
+            }
+        }
+        for (size_t cell = 0; cell < passCells; cell++) {
+            rows += SSTR(pref.cellFirstKeys[firstCell + passFirst + cell]) + "\t" + SSTR(firstCell + passFirst + cell) + "\t" + SSTR(cellPrefSizes[cell]) + "\t" + SSTR(cellCosts[cell])
                     + "\t" + SSTR(MMseqsNode::rank) + "\n";
         }
+        writeSeconds += timer.getTimediff();
     }
+    timer.reset();
     batchWriter.waitWrites();
     classSize = 0;
     for (size_t split = 0; split < targetSplitCount; split++) {
@@ -4699,6 +4820,12 @@ static std::string writeSizeClasses(const Parameters &par, const TargetPref &pre
         classSize += dataSizes[split] + indexSize + 2 * sizeof(uint64_t);
     }
     closePrefExchangeFiles(prefix, fds);
+    writeSeconds += timer.getTimediff();
+    MMseqsNode::addPhaseSeconds(phaseValues, "size classes reading piece counts", readSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "size classes decoding summed over threads", decodeSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "size classes sorting summed over threads", sortSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "size classes encoding summed over threads", encodeSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "size classes writing", writeSeconds);
     return rows;
 }
 
@@ -4811,13 +4938,15 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     MMseqsNode::addPhaseTime(values, "waiting for the other nodes to send fingerprints", phaseTimer);
 
     size_t receivedSize = 0;
-    std::string answer = answerHashRanges(par, pref, par.db2 + ".fingerprints", fingerprintFiles, par.db2 + ".marks", false,
+    std::string ownerValues;
+    std::string answer = answerHashRanges(par, exchange, pref, par.db2 + ".fingerprints", fingerprintFiles, par.db2 + ".marks", false,
                                           exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, getHeldMemory(pref)), [](const PrefUnit &, const size_t *groupCounts) {
         return groupCounts[KMER_GROUPS] + groupCounts[WHOLE_SEQUENCE_GROUPS];
     }, [&](size_t hashRange, std::vector<PrefRowRead *> &rows) {
         markFingerprints(pref, hashRange, rows);
-    }, receivedSize);
+    }, receivedSize, ownerValues);
     MMseqsNode::addPhaseTime(values, "marking fingerprints", phaseTimer);
+    values += ownerValues;
     MMseqsNode::addPhaseValue(values, "Fingerprint bytes received", SSTR(receivedSize));
     std::vector<PrefExchangeFile> markFiles = readPrefExchangeFiles(MMseqsNode::barrier(par.db2 + ".marks.done", answer));
     FileUtil::remove((par.db2 + ".fingerprints." + SSTR(MMseqsNode::rank)).c_str());
@@ -4847,13 +4976,15 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     MMseqsNode::addPhaseTime(values, "waiting for the other nodes to send candidates", phaseTimer);
 
     receivedSize = 0;
-    answer = answerHashRanges(par, pref, par.db2 + ".candidates", candidateFiles, par.db2 + ".reps", true,
+    ownerValues.clear();
+    answer = answerHashRanges(par, exchange, pref, par.db2 + ".candidates", candidateFiles, par.db2 + ".reps", true,
                               exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, getHeldMemory(pref)), [&](const PrefUnit &, const size_t *groupCounts) {
         return getRepAnswerBits(exchange, groupCounts);
     }, [&](size_t hashRange, std::vector<PrefRowRead *> &rows) {
         pickReps(exchange, pref, hashRange, rows);
-    }, receivedSize);
+    }, receivedSize, ownerValues);
     MMseqsNode::addPhaseTime(values, "picking reps", phaseTimer);
+    values += ownerValues;
     MMseqsNode::addPhaseValue(values, "Candidate bytes received", SSTR(receivedSize));
     std::vector<PrefExchangeFile> repFiles = readPrefExchangeFiles(MMseqsNode::barrier(par.db2 + ".reps.done", answer));
     FileUtil::remove((par.db2 + ".candidates." + SSTR(MMseqsNode::rank)).c_str());
@@ -4865,7 +4996,8 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     size_t prefSize = 0;
     size_t pairCount = 0;
     size_t sweepCount = 0;
-    sent = writeUnitPrefs<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, markFiles, repFiles, extractSeconds, prefSize, pairCount, sweepCount);
+    std::string prefValues;
+    sent = writeUnitPrefs<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, markFiles, repFiles, extractSeconds, prefSize, pairCount, sweepCount, prefValues);
     freeKeptUnits(pref);
     delete[] pref.extractedUnit.kmers;
     if (pref.spillFile != NULL) {
@@ -4877,6 +5009,7 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     }
     delete[] pref.writeBuffers;
     MMseqsNode::addPhaseTime(values, "writing unit prefilters", phaseTimer);
+    values += prefValues;
     MMseqsNode::addPhaseSeconds(values, "reading sequences and extracting k-mers", extractSeconds);
     MMseqsNode::addPhaseValue(values, "Prefilter pairs", SSTR(pairCount) + " in " + SSTR(sweepCount) + " sweeps");
     std::vector<PrefExchangeFile> countFiles = readPrefExchangeFiles(MMseqsNode::barrier(par.db2 + ".piece_counts.done", sent));
@@ -4888,8 +5021,10 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     MMseqsNode::addPhaseTime(values, "waiting for the other nodes to write unit prefilters", phaseTimer);
 
     size_t classSize = 0;
-    std::string rows = writeSizeClasses(par, pref, countFiles, classSize);
+    std::string classValues;
+    std::string rows = writeSizeClasses(par, exchange, pref, countFiles, classSize, classValues);
     MMseqsNode::addPhaseTime(values, "writing size classes", phaseTimer);
+    values += classValues;
     MMseqsNode::addPhaseValue(values, "Prefilter bytes written", SSTR(prefSize + classSize));
     MMseqsNode::printPhaseValues(values);
     MMseqsNode::publishRunFile(par.db2 + ".partitions." + SSTR(MMseqsNode::rank), rows);
