@@ -2989,11 +2989,120 @@ struct PrefUnit {
     unsigned int idBits;
 };
 
-// a node's exchange file of a step, as published at the barrier
+// a node's exchange file of a step, as published at the barrier: value is the sender's for all nodes, part p starts at partStarts[p] behind its header
 struct PrefExchangeFile {
     size_t size;
     size_t tableOffset;
     size_t flushCount;
+    size_t value;
+    std::vector<size_t> partStarts;
+};
+
+// a part stays well below the 16 TiB file size limit of ext4 and Lustre ldiskfs, a node's file of 1 T sequences has a few
+static const size_t EXCHANGE_PART_SIZE = 1ULL << 40;
+
+// a node's exchange file of a step in parts <name>.<part>, a flush stays in one part and offsets count on over the parts
+struct PrefExchangeWriter {
+    PrefExchangeWriter(const std::string &name) : name(name), file(NULL), size(MMseqsNode::EXCHANGE_FILE_HEADER_BYTES) {
+        startFlush(0, NULL);
+    }
+
+    size_t getPartOffset(size_t offset) const {
+        return offset - partStarts.back() + MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
+    }
+
+    // a flush that would pass EXCHANGE_PART_SIZE starts the next part once the writes of the current one are done
+    void startFlush(size_t flushSize, BatchWriter *batchWriter) {
+        if (file != NULL && (size == partStarts.back() || getPartOffset(size) + flushSize <= EXCHANGE_PART_SIZE)) {
+            return;
+        }
+        if (file != NULL) {
+            if (batchWriter != NULL) {
+                batchWriter->waitWrites();
+            }
+            MMseqsNode::publishExchangeFile(file, partName, getPartOffset(size), "", std::vector<uint64_t>(1, 0));
+        }
+        partStarts.push_back(size);
+        partName = name + "." + SSTR(partStarts.size() - 1);
+        file = MMseqsNode::createExchangeFile(partName, partStarts.size() - 1, "w");
+    }
+
+    // the table of the flush offsets ends the last part
+    std::string publish(size_t columns, size_t value) {
+        size_t flushCount = flushOffsets.size() / columns;
+        startFlush(flushOffsets.size() * sizeof(size_t), NULL);
+        size_t tableOffset = size;
+        size_t partSize = MMseqsNode::writeExchangeTable(fileno(file), partName, flushOffsets, columns, std::vector<size_t>(), getPartOffset(tableOffset));
+        size = tableOffset + flushOffsets.size() * sizeof(size_t);
+        MMseqsNode::publishExchangeFile(file, partName, partSize, "", std::vector<uint64_t>(1, 0));
+        file = NULL;
+        std::string line = SSTR(size) + "\t" + SSTR(tableOffset) + "\t" + SSTR(flushCount) + "\t" + SSTR(value) + "\t" + SSTR(partStarts.size());
+        for (size_t part = 0; part < partStarts.size(); part++) {
+            line += "\t" + SSTR(partStarts[part]);
+        }
+        return line + "\n";
+    }
+
+    std::string name;
+    std::string partName;
+    FILE *file;
+    size_t size;
+    std::vector<size_t> partStarts;
+    std::vector<size_t> flushOffsets;
+};
+
+// the open parts of the exchange files of all nodes
+struct PrefExchangeParts {
+    std::vector<std::vector<int> > fds;
+    std::vector<std::vector<std::string> > names;
+
+    BatchReader::ReadRequest getRead(const PrefExchangeFile &file, size_t node, char *destination, size_t offset, size_t size) const {
+        size_t part = std::upper_bound(file.partStarts.begin(), file.partStarts.end(), offset) - file.partStarts.begin() - 1;
+        BatchReader::ReadRequest read = {fds[node][part], names[node][part].c_str(), destination, offset - file.partStarts[part] + MMseqsNode::EXCHANGE_FILE_HEADER_BYTES, size, size};
+        return read;
+    }
+};
+
+// punching read ranges and removing files run in threads next to the work, the fds of a punch stay open until wait()
+struct BackgroundRemoval {
+    ~BackgroundRemoval() {
+        wait();
+    }
+
+    template <typename Removal>
+    void run(Removal removal) {
+        threads.push_back(std::thread(removal));
+    }
+
+    void removeFile(const std::string &file) {
+        run([file]() { FileUtil::remove(file.c_str()); });
+    }
+
+    // in whole MiB, the bytes around a range belong to other readers
+    void punch(const std::vector<BatchReader::ReadRequest> &readRequests) {
+        if (readRequests.empty()) {
+            return;
+        }
+        run([readRequests]() {
+            const size_t alignment = 1024 * 1024;
+            for (size_t i = 0; i < readRequests.size(); i++) {
+                size_t start = (readRequests[i].fileOffset + alignment - 1) / alignment * alignment;
+                size_t end = (readRequests[i].fileOffset + readRequests[i].bytesToRead) / alignment * alignment;
+                if (end > start) {
+                    FileUtil::punchHole(readRequests[i].fileToRead, start, end - start);
+                }
+            }
+        });
+    }
+
+    void wait() {
+        for (size_t i = 0; i < threads.size(); i++) {
+            threads[i].join();
+        }
+        threads.clear();
+    }
+
+    std::vector<std::thread> threads;
 };
 
 // cost = rep length * target residues
@@ -3018,10 +3127,23 @@ struct UnitKmers {
 // the groups of a unit that pass 3 needs, per hash range the sent k-mer and whole sequence groups, then those with another member in the unit
 enum { SENT_KMER_GROUPS, SENT_WHOLE_SEQUENCE_GROUPS, LOCAL_KMER_GROUPS, LOCAL_WHOLE_SEQUENCE_GROUPS, GROUP_SEGMENTS };
 
-// the needed groups of an own unit, a bit row per hash range (see putNeededRow), in memory, in the spill file in --local-tmp or else extracted again in pass 3
+// the spill files of the needed groups: in --local-tmp, then in the shared folder with MMSEQS_KMER_SHARED_SPILL=1
+enum { LOCAL_SPILL, SHARED_SPILL, SPILL_KINDS };
+
+// nodes: the nodes that spill to the device of directory, none if the spill file cannot be used
+struct NeededSpill {
+    std::string name;
+    std::string directory;
+    size_t nodes;
+    FILE *file;
+    size_t size;
+};
+
+// the needed groups of an own unit, a bit row per hash range (see putNeededRow), in memory, in a spill file or else extracted again in pass 3
 struct NeededGroups {
-    NeededGroups() : spillOffset(SIZE_MAX) {}
+    NeededGroups() : spill(SPILL_KINDS), spillOffset(SIZE_MAX) {}
     std::vector<char> data;
+    size_t spill;
     size_t spillOffset;
     std::vector<size_t> rowOffsets;
 };
@@ -3056,11 +3178,9 @@ struct TargetPref {
     std::vector<NeededGroups> neededGroups;
     size_t neededSize;
     size_t neededLimit;
-    // the spill file of the needed groups in --local-tmp, no spilling with localNodes 0
-    std::string spillName;
-    FILE *spillFile;
-    size_t spillSize;
-    size_t localNodes;
+    // keySplitMemoryLimit without the read buffers
+    size_t unitMemory;
+    NeededSpill spills[SPILL_KINDS];
     size_t readChunkLimit;
     size_t passLimit;
     char *writeBuffers;
@@ -3131,50 +3251,69 @@ static void endCodeBits(KmerCodeWriter &writer) {
     putBits(writer, 0, (CHAR_BIT - writer.bitCount) % CHAR_BIT);
 }
 
-static std::string publishPrefExchangeFile(FILE *file, const std::string &fileName, std::vector<size_t> &flushOffsets, size_t columns, size_t size) {
-    size_t flushCount = flushOffsets.size() / columns;
-    size_t fileSize = MMseqsNode::writeExchangeTable(fileno(file), fileName, flushOffsets, columns, std::vector<size_t>(), size);
-    MMseqsNode::publishExchangeFile(file, fileName, fileSize, "", std::vector<uint64_t>(1, 0));
-    return SSTR(fileSize) + "\t" + SSTR(size) + "\t" + SSTR(flushCount) + "\n";
+static PrefExchangeFile readPrefExchangeLine(const char *line) {
+    const char *columns[5];
+    Util::getWordsOfLine(line, columns, 5);
+    PrefExchangeFile file = { Util::fast_atoi<size_t>(columns[0]), Util::fast_atoi<size_t>(columns[1]), Util::fast_atoi<size_t>(columns[2]), Util::fast_atoi<size_t>(columns[3]),
+                              std::vector<size_t>() };
+    const char *word = columns[4];
+    for (size_t part = Util::fast_atoi<size_t>(columns[4]); part > 0; part--) {
+        word += Util::skipNoneWhitespace(word);
+        word += Util::skipWhitespace(word);
+        file.partStarts.push_back(Util::fast_atoi<size_t>(word));
+    }
+    return file;
 }
 
 static std::vector<PrefExchangeFile> readPrefExchangeFiles(const std::string &barrierContent) {
     std::vector<PrefExchangeFile> files;
     for (char *line = (char *) barrierContent.c_str(); *line != '\0'; line = Util::skipLine(line)) {
-        const char *columns[3];
-        Util::getWordsOfLine(line, columns, 3);
-        PrefExchangeFile file = { Util::fast_atoi<size_t>(columns[0]), Util::fast_atoi<size_t>(columns[1]), Util::fast_atoi<size_t>(columns[2]) };
-        files.push_back(file);
+        files.push_back(readPrefExchangeLine(line));
     }
     return files;
 }
 
-static std::vector<int> openPrefExchangeFiles(const std::string &prefix, const std::vector<PrefExchangeFile> &files) {
-    std::vector<int> fds(files.size());
+static PrefExchangeParts openPrefExchangeFiles(const std::string &prefix, const std::vector<PrefExchangeFile> &files) {
+    PrefExchangeParts parts;
+    parts.fds.resize(files.size());
+    parts.names.resize(files.size());
     for (size_t node = 0; node < files.size(); node++) {
-        fds[node] = MMseqsNode::waitForExchangeFile(prefix + "." + SSTR(node), files[node].size, 0);
+        const std::vector<size_t> &partStarts = files[node].partStarts;
+        for (size_t part = 0; part < partStarts.size(); part++) {
+            size_t partEnd = (part + 1 < partStarts.size()) ? partStarts[part + 1] : files[node].size;
+            parts.names[node].push_back(prefix + "." + SSTR(node) + "." + SSTR(part));
+            parts.fds[node].push_back(MMseqsNode::waitForExchangeFile(parts.names[node].back(), partEnd - partStarts[part] + MMseqsNode::EXCHANGE_FILE_HEADER_BYTES, part));
+        }
     }
-    return fds;
+    return parts;
 }
 
-static void closePrefExchangeFiles(const std::string &prefix, std::vector<int> &fds) {
-    for (size_t node = 0; node < fds.size(); node++) {
-        if (close(fds[node]) != 0) {
-            Debug(Debug::ERROR) << "Cannot close " << prefix << "." << node << "\n";
-            EXIT(EXIT_FAILURE);
+static void closePrefExchangeFiles(PrefExchangeParts &parts) {
+    for (size_t node = 0; node < parts.fds.size(); node++) {
+        for (size_t part = 0; part < parts.fds[node].size(); part++) {
+            if (close(parts.fds[node][part]) != 0) {
+                Debug(Debug::ERROR) << "Cannot close " << parts.names[node][part] << "\n";
+                EXIT(EXIT_FAILURE);
+            }
         }
     }
 }
 
-// the answers of all owners to an own unit, in hash range order
-static void readUnitAnswers(const std::string &prefix, const std::vector<PrefExchangeFile> &files, const std::vector<int> &fds, size_t unit,
-                            std::vector<char> &answers, BatchReader &batchReader) {
-    std::vector<std::string> names(files.size());
+// the writer removes the parts of its exchange file
+static void removePrefExchangeFile(BackgroundRemoval &removal, const std::string &prefix, const std::vector<PrefExchangeFile> &files) {
+    for (size_t part = 0; part < files[MMseqsNode::rank].partStarts.size(); part++) {
+        removal.removeFile(prefix + "." + SSTR(MMseqsNode::rank) + "." + SSTR(part));
+    }
+}
+
+// the answers of all owners to an own unit, in hash range order; returns the reads for punching
+static std::vector<BatchReader::ReadRequest> readUnitAnswers(const std::vector<PrefExchangeFile> &files, const PrefExchangeParts &parts, size_t unit,
+                                                             std::vector<char> &answers, BatchReader &batchReader) {
     std::vector<std::vector<size_t> > offsets(files.size());
     size_t size = 0;
     for (size_t node = 0; node < files.size(); node++) {
-        names[node] = prefix + "." + SSTR(node);
-        MMseqsNode::readExchangeTableColumns(fds[node], names[node], files[node].tableOffset, files[node].flushCount, unit, offsets[node]);
+        BatchReader::ReadRequest table = parts.getRead(files[node], node, NULL, files[node].tableOffset, 0);
+        MMseqsNode::readExchangeTableColumns(table.fileToRead, table.fileName, table.fileOffset, files[node].flushCount, unit, offsets[node]);
         for (size_t flush = 0; flush < files[node].flushCount; flush++) {
             size += offsets[node][files[node].flushCount + flush] - offsets[node][flush];
         }
@@ -3186,8 +3325,7 @@ static void readUnitAnswers(const std::string &prefix, const std::vector<PrefExc
         for (size_t flush = 0; flush < files[node].flushCount; flush++) {
             size_t readSize = offsets[node][files[node].flushCount + flush] - offsets[node][flush];
             if (readSize > 0) {
-                BatchReader::ReadRequest readRequest = {fds[node], names[node].c_str(), answers.data() + bufferPos, offsets[node][flush], readSize, readSize};
-                readRequests.push_back(readRequest);
+                readRequests.push_back(parts.getRead(files[node], node, answers.data() + bufferPos, offsets[node][flush], readSize));
             }
             bufferPos += readSize;
         }
@@ -3195,6 +3333,7 @@ static void readUnitAnswers(const std::string &prefix, const std::vector<PrefExc
     if (readRequests.empty() == false) {
         batchReader.readSync(readRequests);
     }
+    return readRequests;
 }
 
 static void setUnitShifts(const KmerExchange &exchange, const PrefUnit &unit) {
@@ -3275,10 +3414,10 @@ static const UnitKmers &extractNewUnitKmers(Parameters &par, DBReader<DBKeyType>
     return getUnitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, unit, ownUnit, extractSeconds);
 }
 
-// the rows of an own unit to its exchange file, a row per hash range of rowBits[hashRange] bits
+// the rows of an own unit to a file whose first byte has the offset fileStart, a row per hash range of rowBits[hashRange] bits
 template <typename WriteRow>
 static void writeUnitRows(const Parameters &par, const TargetPref &pref, FILE *file, const std::string &fileName, size_t &fileSize, std::vector<size_t> &flushOffsets,
-                          const std::vector<size_t> &rowBits, BatchWriter &batchWriter, WriteRow writeRow) {
+                          size_t fileStart, const std::vector<size_t> &rowBits, BatchWriter &batchWriter, WriteRow writeRow) {
     std::vector<size_t> rowOffsets(pref.hashRangeCount + 1);
     for (size_t hashRange = 0; hashRange <= pref.hashRangeCount; hashRange++) {
         rowOffsets[hashRange] = fileSize;
@@ -3296,22 +3435,30 @@ static void writeUnitRows(const Parameters &par, const TargetPref &pref, FILE *f
 #ifdef OPENMP
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-        KmerCodeWriter writer(fileno(file), fileName.c_str(), pref.writeBuffers + thread_idx * KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE, rowOffsets[hashRange], &batchWriter);
+        KmerCodeWriter writer(fileno(file), fileName.c_str(), pref.writeBuffers + thread_idx * KMER_FILE_BUFFER_SIZE, KMER_FILE_BUFFER_SIZE, rowOffsets[hashRange] - fileStart, &batchWriter);
         writeRow(hashRange, writer);
         endCodeBits(writer);
         writeKmerCodeBuffer(writer);
     }
 }
 
+// a flush of rows of rowBits to an exchange file
+template <typename WriteRow>
+static void writeUnitFlush(const Parameters &par, const TargetPref &pref, PrefExchangeWriter &writer, const std::vector<size_t> &rowBits, BatchWriter &batchWriter, WriteRow writeRow) {
+    size_t flushSize = 0;
+    for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
+        flushSize += (rowBits[hashRange] + CHAR_BIT - 1) / CHAR_BIT;
+    }
+    writer.startFlush(flushSize, &batchWriter);
+    writeUnitRows(par, pref, writer.file, writer.partName, writer.size, writer.flushOffsets, writer.partStarts.back() - MMseqsNode::EXCHANGE_FILE_HEADER_BYTES, rowBits, batchWriter, writeRow);
+}
+
 // pass 1: per row the k-mer and whole sequence group counts, then the fingerprint gaps of both kinds
 template <typename T, bool includeAdjacency, typename L>
 static std::string sendFingerprints(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, TargetPref &pref, MMseqsNode::WorkQueue &sendQueue,
                                     double &extractSeconds, size_t &sentSize) {
-    const std::string fileName = par.db2 + ".fingerprints." + SSTR(MMseqsNode::rank);
-    FILE *file = MMseqsNode::createExchangeFile(fileName, 0, "w");
-    size_t fileSize = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
-    std::vector<size_t> flushOffsets;
-    BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(file));
+    PrefExchangeWriter writer(par.db2 + ".fingerprints." + SSTR(MMseqsNode::rank));
+    BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(writer.file));
     std::string units;
     std::vector<size_t> rowBits(pref.hashRangeCount);
     // ids must fit next to the hash and the adjKey
@@ -3369,7 +3516,7 @@ static std::string sendFingerprints(Parameters &par, DBReader<DBKeyType> &seqDbr
                 size_t groupCount = counts[hashRange * GROUP_KINDS] + counts[hashRange * GROUP_KINDS + 1];
                 rowBits[hashRange] = (groupCount > 0) ? bits + getEliasGammaSize(counts[hashRange * GROUP_KINDS] + 1) + getEliasGammaSize(counts[hashRange * GROUP_KINDS + 1] + 1) : 0;
             }
-            writeUnitRows(par, pref, file, fileName, fileSize, flushOffsets, rowBits, batchWriter, [&](size_t hashRange, KmerCodeWriter &writer) {
+            writeUnitFlush(par, pref, writer, rowBits, batchWriter, [&](size_t hashRange, KmerCodeWriter &writer) {
                 putEliasGamma(writer, counts[hashRange * GROUP_KINDS] + 1);
                 putEliasGamma(writer, counts[hashRange * GROUP_KINDS + 1] + 1);
                 for (size_t kind = 0; kind < GROUP_KINDS; kind++) {
@@ -3392,8 +3539,8 @@ static std::string sendFingerprints(Parameters &par, DBReader<DBKeyType> &seqDbr
     }
     seqDbr.releaseDataPages();
     batchWriter.waitWrites();
-    sentSize = fileSize;
-    return publishPrefExchangeFile(file, fileName, flushOffsets, pref.hashRangeCount + 1, fileSize) + units;
+    sentSize = writer.size;
+    return writer.publish(pref.hashRangeCount + 1, 0) + units;
 }
 
 // a row of a sender unit in an owner's batch
@@ -3416,15 +3563,15 @@ static std::string answerHashRanges(const Parameters &par, const TargetPref &pre
     size_t firstHashRange = pref.hashRangeNodeOffsets[MMseqsNode::rank];
     size_t ownHashRanges = pref.hashRangeNodeOffsets[MMseqsNode::rank + 1] - firstHashRange;
     size_t unitCount = pref.units.size();
-    std::vector<int> fds = openPrefExchangeFiles(sentPrefix, sentFiles);
-    std::vector<std::string> names(fds.size());
+    PrefExchangeParts parts = openPrefExchangeFiles(sentPrefix, sentFiles);
     // the offsets of the own hash ranges in every sender unit
     std::vector<size_t> rowOffsets(unitCount * (ownHashRanges + 1));
-    for (size_t node = 0; node < fds.size(); node++) {
-        names[node] = sentPrefix + "." + SSTR(node);
+    for (size_t node = 0; node < sentFiles.size(); node++) {
         size_t flushCount = sentFiles[node].flushCount;
         std::vector<size_t> table((ownHashRanges + 1) * flushCount);
-        FileUtil::preadAll(fds[node], names[node].c_str(), (char *) table.data(), table.size() * sizeof(size_t), sentFiles[node].tableOffset + firstHashRange * flushCount * sizeof(size_t));
+        BatchReader::ReadRequest tableRead = parts.getRead(sentFiles[node], node, (char *) table.data(), sentFiles[node].tableOffset + firstHashRange * flushCount * sizeof(size_t),
+                                                           table.size() * sizeof(size_t));
+        FileUtil::preadAll(tableRead.fileToRead, tableRead.fileName, tableRead.destination, tableRead.bytesToRead, tableRead.fileOffset);
         for (size_t flush = 0; flush < flushCount; flush++) {
             for (size_t i = 0; i <= ownHashRanges; i++) {
                 rowOffsets[(pref.nodeUnitOffsets[node] + flush) * (ownHashRanges + 1) + i] = table[i * flushCount + flush];
@@ -3444,11 +3591,9 @@ static std::string answerHashRanges(const Parameters &par, const TargetPref &pre
     std::vector<size_t> passOffsets;
     std::vector<size_t> passSizes;
     planPasses(hashRangeSizes, ownerMemory / 2, passOffsets, passSizes);
-    const std::string fileName = answerPrefix + "." + SSTR(MMseqsNode::rank);
-    FILE *file = MMseqsNode::createExchangeFile(fileName, 0, "w");
-    size_t fileSize = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
-    std::vector<size_t> flushOffsets;
-    BatchReader batchReader(par.threads, fds.empty() ? fileno(file) : fds[0]);
+    PrefExchangeWriter writer(answerPrefix + "." + SSTR(MMseqsNode::rank));
+    BatchReader batchReader(par.threads, fileno(writer.file));
+    BackgroundRemoval punches;
     for (size_t pass = 0; pass + 1 < passOffsets.size(); pass++) {
         size_t passFirst = passOffsets[pass];
         size_t passEnd = passOffsets[pass + 1];
@@ -3461,19 +3606,20 @@ static std::string answerHashRanges(const Parameters &par, const TargetPref &pre
         }
         std::vector<char> rowData(unitDataOffsets[unitCount] + sizeof(uint64_t));
         std::vector<BatchReader::ReadRequest> readRequests;
-        for (size_t node = 0; node < fds.size(); node++) {
+        for (size_t node = 0; node < sentFiles.size(); node++) {
             for (size_t unit = pref.nodeUnitOffsets[node]; unit < pref.nodeUnitOffsets[node + 1]; unit++) {
                 const size_t *offsets = rowOffsets.data() + unit * (ownHashRanges + 1);
                 size_t readSize = offsets[passEnd] - offsets[passFirst];
                 if (readSize > 0) {
-                    BatchReader::ReadRequest readRequest = {fds[node], names[node].c_str(), rowData.data() + unitDataOffsets[unit], offsets[passFirst], readSize, readSize};
-                    readRequests.push_back(readRequest);
+                    readRequests.push_back(parts.getRead(sentFiles[node], node, rowData.data() + unitDataOffsets[unit], offsets[passFirst], readSize));
                 }
             }
         }
         if (readRequests.empty() == false) {
             batchReader.readSync(readRequests);
         }
+        // every row is read by its owner once
+        punches.punch(readRequests);
         receivedSize += unitDataOffsets[unitCount];
         // every row answers at most answerBits
         std::vector<PrefRowRead> rows(unitCount * passHashRanges);
@@ -3541,7 +3687,7 @@ static std::string answerHashRanges(const Parameters &par, const TargetPref &pre
             // the answers of a unit to the hash ranges of the sub pass are adjacent, moved down in place
             size_t answerSize = 0;
             for (size_t unit = 0; unit < unitCount; unit++) {
-                flushOffsets.push_back(fileSize + answerSize);
+                writer.flushOffsets.push_back(writer.size + answerSize);
                 for (size_t i = 0; i < subPassHashRanges; i++) {
                     size_t row = unit * passHashRanges + subPassFirst + i;
                     size_t size = answerSizeBytes[row] + rows[row].answer.bufferPos;
@@ -3549,14 +3695,16 @@ static std::string answerHashRanges(const Parameters &par, const TargetPref &pre
                     answerSize += size;
                 }
             }
-            flushOffsets.push_back(fileSize + answerSize);
-            FileUtil::pwriteAll(fileno(file), fileName.c_str(), answers, answerSize, fileSize);
-            fileSize += answerSize;
+            writer.flushOffsets.push_back(writer.size + answerSize);
+            writer.startFlush(answerSize, NULL);
+            FileUtil::pwriteAll(fileno(writer.file), writer.partName.c_str(), answers, answerSize, writer.getPartOffset(writer.size));
+            writer.size += answerSize;
             delete[] answers;
         }
     }
-    closePrefExchangeFiles(sentPrefix, fds);
-    return publishPrefExchangeFile(file, fileName, flushOffsets, unitCount + 1, fileSize);
+    punches.wait();
+    closePrefExchangeFiles(parts);
+    return writer.publish(unitCount + 1, 0);
 }
 
 // the rows by value, smallest on top; the top row moves on to its next value in place
@@ -3683,10 +3831,70 @@ static void collectNeededGroups(const TargetPref &pref, const PackedKmerPosition
     }
 }
 
-static void readUnitMarks(const TargetPref &pref, const std::string &prefix, const std::vector<PrefExchangeFile> &files, const std::vector<int> &fds, size_t ownUnit,
-                          UnitMarks &marks, BatchReader &batchReader) {
+// the needed groups of the hash ranges of a unit. The lists of all hash ranges are held from the first walk if an entry per k-mer, twice for the growth of the lists,
+// fits next to the held memory, the rest of the needed groups reserve and the marks; else the first walk counts the groups in the lists of its thread, holdIfFits
+// holds them from the next walk on if their counts fit next to the rows of the unit, else every walk collects a hash range again
+struct NeededGroupLists {
+    NeededGroupLists(const Parameters &par, const TargetPref &pref, const UnitKmers &unitKmers, const UnitMarks &marks) : pref(pref), unitKmers(unitKmers), marks(marks) {
+        size_t kmerCount = unitKmers.rangeOffsets[WHOLE_SEQUENCE_GROUPS][pref.hashRangeCount] - unitKmers.rangeOffsets[KMER_GROUPS][0];
+        isHeld = 2 * kmerCount * sizeof(std::pair<size_t, size_t>) + getHeldMemory(pref) + (pref.neededLimit - std::min(pref.neededLimit, pref.neededSize)) + marks.data.size()
+                 <= pref.unitMemory;
+        lists.resize((isHeld ? pref.hashRangeCount : par.threads) * GROUP_SEGMENTS);
+        isCollected.assign(isHeld ? pref.hashRangeCount : 0, false);
+        groupCounts.resize(isHeld ? 0 : pref.hashRangeCount * GROUP_SEGMENTS);
+    }
+
+    const std::vector<std::pair<size_t, size_t> > *get(size_t hashRange) {
+        if (isHeld) {
+            std::vector<std::pair<size_t, size_t> > *groups = lists.data() + hashRange * GROUP_SEGMENTS;
+            if (isCollected[hashRange] == false) {
+                for (size_t segment = 0; segment < GROUP_SEGMENTS && groupCounts.empty() == false; segment++) {
+                    groups[segment].reserve(groupCounts[hashRange * GROUP_SEGMENTS + segment]);
+                }
+                collectNeededGroups(pref, unitKmers.kmers, unitKmers.rangeOffsets, marks, hashRange, groups);
+                isCollected[hashRange] = true;
+            }
+            return groups;
+        }
+        unsigned int thread_idx = 0;
+#ifdef OPENMP
+        thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+#endif
+        std::vector<std::pair<size_t, size_t> > *groups = lists.data() + thread_idx * GROUP_SEGMENTS;
+        collectNeededGroups(pref, unitKmers.kmers, unitKmers.rangeOffsets, marks, hashRange, groups);
+        for (size_t segment = 0; segment < GROUP_SEGMENTS; segment++) {
+            groupCounts[hashRange * GROUP_SEGMENTS + segment] = groups[segment].size();
+        }
+        return groups;
+    }
+
+    void holdIfFits(size_t rowSize) {
+        size_t listSize = 0;
+        for (size_t i = 0; i < groupCounts.size(); i++) {
+            listSize += groupCounts[i] * sizeof(std::pair<size_t, size_t>);
+        }
+        if (isHeld || listSize + getHeldMemory(pref) + rowSize + marks.data.size() > pref.unitMemory) {
+            return;
+        }
+        std::vector<std::vector<std::pair<size_t, size_t> > >().swap(lists);
+        lists.resize(pref.hashRangeCount * GROUP_SEGMENTS);
+        isCollected.assign(pref.hashRangeCount, false);
+        isHeld = true;
+    }
+
+    const TargetPref &pref;
+    const UnitKmers &unitKmers;
+    const UnitMarks &marks;
+    bool isHeld;
+    std::vector<std::vector<std::pair<size_t, size_t> > > lists;
+    std::vector<char> isCollected;
+    std::vector<size_t> groupCounts;
+};
+
+static std::vector<BatchReader::ReadRequest> readUnitMarks(const TargetPref &pref, const std::vector<PrefExchangeFile> &files, const PrefExchangeParts &parts, size_t ownUnit,
+                                                           UnitMarks &marks, BatchReader &batchReader) {
     marks.init(pref, ownUnit);
-    readUnitAnswers(prefix, files, fds, getOwnUnit(pref, ownUnit), marks.data, batchReader);
+    return readUnitAnswers(files, parts, getOwnUnit(pref, ownUnit), marks.data, batchReader);
 }
 
 // pass 2 row: the counts of the sent k-mer and whole sequence groups, then per group its hash gap, a bit for another member in the unit and the
@@ -3838,30 +4046,39 @@ static size_t putNeededRow(const KmerExchange &exchange, const PrefUnit &unit, c
 
 // the needed group rows of an own unit with neededBits[hashRange] bits: in memory while those of all units fit, else in the spill file, else none
 static void storeNeededGroups(const Parameters &par, const KmerExchange &exchange, TargetPref &pref, NeededGroups &needed, const PrefUnit &unit,
-                              const PackedKmerPosition *kmers, const std::vector<std::vector<std::pair<size_t, size_t> > > &neededGroups,
-                              const std::vector<size_t> &neededBits, bool isPass3, BatchWriter &batchWriter) {
+                              const PackedKmerPosition *kmers, NeededGroupLists &groups, const std::vector<size_t> &neededBits, bool isPass3, BatchWriter &batchWriter) {
     std::vector<size_t> rowOffsets(pref.hashRangeCount + 1, 0);
     for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
         rowOffsets[hashRange + 1] = rowOffsets[hashRange] + (neededBits[hashRange] + CHAR_BIT - 1) / CHAR_BIT;
     }
     size_t size = rowOffsets.back();
-    if (isPass3 == false && pref.neededSize + size > pref.neededLimit && pref.localNodes > 0) {
-        // SIZE_MAX if statvfs failed
-        size_t freeSize = FileUtil::getFreeSpace(par.localTmp.c_str());
-        if (freeSize == SIZE_MAX || 2 * size * pref.localNodes > freeSize) {
-            MMseqsNode::reportUnusableLocalTmp("Cannot keep the needed groups in --local-tmp " + par.localTmp + ": "
-                                               + ((freeSize == SIZE_MAX) ? std::string("its free space is unknown") : "it has " + SSTR(freeSize) + " free bytes"));
-            pref.localNodes = 0;
-        } else {
-            if (pref.spillFile == NULL) {
-                pref.spillFile = FileUtil::openAndDelete(pref.spillName.c_str(), "w+");
-            }
-            needed.spillOffset = pref.spillSize;
-            writeUnitRows(par, pref, pref.spillFile, pref.spillName, pref.spillSize, needed.rowOffsets, neededBits, batchWriter, [&](size_t hashRange, KmerCodeWriter &writer) {
-                putNeededRow(exchange, unit, kmers, neededGroups.data() + hashRange * GROUP_SEGMENTS, &writer);
-            });
-            return;
+    for (size_t spill = 0; isPass3 == false && pref.neededSize + size > pref.neededLimit && spill < SPILL_KINDS; spill++) {
+        NeededSpill &neededSpill = pref.spills[spill];
+        if (neededSpill.nodes == 0) {
+            continue;
         }
+        // SIZE_MAX if statvfs failed
+        size_t freeSize = FileUtil::getFreeSpace(neededSpill.directory.c_str());
+        if (freeSize == SIZE_MAX || 2 * size * neededSpill.nodes > freeSize) {
+            std::string problem = "Cannot keep the needed groups in " + ((spill == LOCAL_SPILL) ? "--local-tmp " : std::string("the shared folder ")) + neededSpill.directory + ": "
+                                  + ((freeSize == SIZE_MAX) ? std::string("its free space is unknown") : "it has " + SSTR(freeSize) + " free bytes");
+            if (spill == LOCAL_SPILL) {
+                MMseqsNode::reportUnusableLocalTmp(problem);
+            } else {
+                Debug(Debug::WARNING) << problem << "; pass 3 extracts their k-mers again\n";
+            }
+            neededSpill.nodes = 0;
+            continue;
+        }
+        if (neededSpill.file == NULL) {
+            neededSpill.file = FileUtil::openAndDelete(neededSpill.name.c_str(), "w+");
+        }
+        needed.spill = spill;
+        needed.spillOffset = neededSpill.size;
+        writeUnitRows(par, pref, neededSpill.file, neededSpill.name, neededSpill.size, needed.rowOffsets, 0, neededBits, batchWriter, [&](size_t hashRange, KmerCodeWriter &writer) {
+            putNeededRow(exchange, unit, kmers, groups.get(hashRange), &writer);
+        });
+        return;
     }
     if (isPass3 == false && pref.neededSize + size > pref.neededLimit) {
         return;
@@ -3875,7 +4092,7 @@ static void storeNeededGroups(const Parameters &par, const KmerExchange &exchang
             continue;
         }
         KmerCodeWriter writer(needed.data.data(), needed.rowOffsets[hashRange + 1], needed.rowOffsets[hashRange]);
-        putNeededRow(exchange, unit, kmers, neededGroups.data() + hashRange * GROUP_SEGMENTS, &writer);
+        putNeededRow(exchange, unit, kmers, groups.get(hashRange), &writer);
         endCodeBits(writer);
     }
 }
@@ -3883,36 +4100,42 @@ static void storeNeededGroups(const Parameters &par, const KmerExchange &exchang
 template <typename T, bool includeAdjacency, typename L>
 static std::string sendCandidates(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, TargetPref &pref,
                                   const std::vector<PrefExchangeFile> &markFiles, double &extractSeconds, size_t &sentSize) {
-    const std::string fileName = par.db2 + ".candidates." + SSTR(MMseqsNode::rank);
-    FILE *file = MMseqsNode::createExchangeFile(fileName, 0, "w");
-    size_t fileSize = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
-    std::vector<size_t> flushOffsets;
-    BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(file));
-    std::vector<int> markFds = openPrefExchangeFiles(par.db2 + ".marks", markFiles);
-    BatchReader batchReader(par.threads, fileno(file));
+    PrefExchangeWriter writer(par.db2 + ".candidates." + SSTR(MMseqsNode::rank));
+    BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(writer.file));
+    PrefExchangeParts markParts = openPrefExchangeFiles(par.db2 + ".marks", markFiles);
+    BatchReader batchReader(par.threads, fileno(writer.file));
+    BackgroundRemoval punches;
     std::vector<size_t> rowBits(pref.hashRangeCount);
     std::vector<size_t> neededBits(pref.hashRangeCount);
-    std::vector<std::vector<std::pair<size_t, size_t> > > neededGroups(pref.hashRangeCount * GROUP_SEGMENTS);
     UnitMarks marks;
     pref.neededGroups.resize(pref.sendSplitUnitOffsets.back());
     for (size_t i = 0; i < pref.sendSplits.size(); i++) {
         setSendSplit(par, exchange, pref.sendSplits[i]);
         for (size_t ownUnit = pref.sendSplitUnitOffsets[i]; ownUnit < pref.sendSplitUnitOffsets[i + 1]; ownUnit++) {
             const PrefUnit &unit = pref.units[getOwnUnit(pref, ownUnit)];
-            readUnitMarks(pref, par.db2 + ".marks", markFiles, markFds, ownUnit, marks, batchReader);
+            std::vector<BatchReader::ReadRequest> markReads = readUnitMarks(pref, markFiles, markParts, ownUnit, marks, batchReader);
             const UnitKmers &unitKmers = getUnitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, unit, ownUnit, extractSeconds);
             const PackedKmerPosition *kmers = unitKmers.kmers;
-            const std::vector<size_t> *rangeOffsets = unitKmers.rangeOffsets;
+            NeededGroupLists groups(par, pref, unitKmers, marks);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
             for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
-                collectNeededGroups(pref, kmers, rangeOffsets, marks, hashRange, neededGroups.data() + hashRange * GROUP_SEGMENTS);
-                rowBits[hashRange] = putCandidateRow(exchange, pref, unit, kmers, neededGroups.data() + hashRange * GROUP_SEGMENTS, hashRange, NULL);
-                neededBits[hashRange] = putNeededRow(exchange, unit, kmers, neededGroups.data() + hashRange * GROUP_SEGMENTS, NULL);
+                const std::vector<std::pair<size_t, size_t> > *neededGroups = groups.get(hashRange);
+                rowBits[hashRange] = putCandidateRow(exchange, pref, unit, kmers, neededGroups, hashRange, NULL);
+                neededBits[hashRange] = putNeededRow(exchange, unit, kmers, neededGroups, NULL);
             }
-            writeUnitRows(par, pref, file, fileName, fileSize, flushOffsets, rowBits, batchWriter, [&](size_t hashRange, KmerCodeWriter &writer) {
-                putCandidateRow(exchange, pref, unit, kmers, neededGroups.data() + hashRange * GROUP_SEGMENTS, hashRange, &writer);
+            size_t neededRowSize = 0;
+            for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
+                neededRowSize += (neededBits[hashRange] + CHAR_BIT - 1) / CHAR_BIT;
+            }
+            groups.holdIfFits((pref.neededSize + neededRowSize <= pref.neededLimit) ? neededRowSize : 0);
+            writeUnitFlush(par, pref, writer, rowBits, batchWriter, [&](size_t hashRange, KmerCodeWriter &writer) {
+                putCandidateRow(exchange, pref, unit, kmers, groups.get(hashRange), hashRange, &writer);
             });
-            storeNeededGroups(par, exchange, pref, pref.neededGroups[ownUnit], unit, kmers, neededGroups, neededBits, false, batchWriter);
+            storeNeededGroups(par, exchange, pref, pref.neededGroups[ownUnit], unit, kmers, groups, neededBits, false, batchWriter);
+            // a unit extracted again in pass 3 reads its marks again
+            if (pref.neededGroups[ownUnit].data.empty() == false || pref.neededGroups[ownUnit].spillOffset != SIZE_MAX) {
+                punches.punch(markReads);
+            }
             if (pref.keptUnits[ownUnit].kmers != NULL) {
                 delete[] pref.keptUnits[ownUnit].kmers;
                 pref.keptUnits[ownUnit].kmers = NULL;
@@ -3922,9 +4145,15 @@ static std::string sendCandidates(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     pref.keptSize = 0;
     seqDbr.releaseDataPages();
     batchWriter.waitWrites();
-    closePrefExchangeFiles(par.db2 + ".marks", markFds);
-    sentSize = fileSize;
-    return publishPrefExchangeFile(file, fileName, flushOffsets, pref.hashRangeCount + 1, fileSize);
+    punches.wait();
+    closePrefExchangeFiles(markParts);
+    // the units extracted again in pass 3 read their marks again
+    size_t extractedUnits = 0;
+    for (size_t unit = 0; unit < pref.neededGroups.size(); unit++) {
+        extractedUnits += pref.neededGroups[unit].data.empty() && pref.neededGroups[unit].spill == SPILL_KINDS;
+    }
+    sentSize = writer.size;
+    return writer.publish(pref.hashRangeCount + 1, extractedUnits);
 }
 
 static size_t getRepAnswerBits(const KmerExchange &exchange, const size_t *groupCounts) {
@@ -4188,12 +4417,11 @@ static void appendCells(BatchWriter &batchWriter, FILE *dataFile, const std::str
 }
 
 // a column per rep cell, empty or the piece bytes and the cost of the cell, then per rep and target split the rep gap, the split and the target count
-static void flushPieceCounts(const TargetPref &pref, std::vector<PieceCount> &pieceCounts, std::vector<char> &compacted, FILE *file, const std::string &fileName, size_t &fileSize,
-                             std::vector<size_t> &flushOffsets) {
+static void flushPieceCounts(const TargetPref &pref, std::vector<PieceCount> &pieceCounts, std::vector<char> &compacted, PrefExchangeWriter &writer) {
     SORT_PARALLEL(pieceCounts.begin(), pieceCounts.end(), PieceCount::compareByRep);
     compacted.clear();
     for (size_t cell = 0, pos = 0; cell + 1 < pref.cellFirstKeys.size(); cell++) {
-        flushOffsets.push_back(fileSize + compacted.size());
+        writer.flushOffsets.push_back(writer.size + compacted.size());
         size_t cellEnd = pos;
         size_t pieceSize = 0;
         size_t cost = 0;
@@ -4219,9 +4447,10 @@ static void flushPieceCounts(const TargetPref &pref, std::vector<PieceCount> &pi
             prevRep = first.rep;
         }
     }
-    flushOffsets.push_back(fileSize + compacted.size());
-    FileUtil::pwriteAll(fileno(file), fileName.c_str(), compacted.data(), compacted.size(), fileSize);
-    fileSize += compacted.size();
+    writer.flushOffsets.push_back(writer.size + compacted.size());
+    writer.startFlush(compacted.size(), NULL);
+    FileUtil::pwriteAll(fileno(writer.file), writer.partName.c_str(), compacted.data(), compacted.size(), writer.getPartOffset(writer.size));
+    writer.size += compacted.size();
     pieceCounts.clear();
 }
 
@@ -4232,13 +4461,11 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                                   const std::vector<PrefExchangeFile> &markFiles, const std::vector<PrefExchangeFile> &repFiles,
                                   double &extractSeconds, size_t &prefSize, size_t &pairCount, size_t &sweepCount) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
-    const std::string fileName = par.db2 + ".piece_counts." + SSTR(MMseqsNode::rank);
-    FILE *file = MMseqsNode::createExchangeFile(fileName, 0, "w");
-    size_t fileSize = MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
-    std::vector<size_t> flushOffsets;
-    std::vector<int> markFds = openPrefExchangeFiles(par.db2 + ".marks", markFiles);
-    std::vector<int> repFds = openPrefExchangeFiles(par.db2 + ".reps", repFiles);
-    BatchReader batchReader(par.threads, fileno(file));
+    PrefExchangeWriter writer(par.db2 + ".piece_counts." + SSTR(MMseqsNode::rank));
+    PrefExchangeParts repParts = openPrefExchangeFiles(par.db2 + ".reps", repFiles);
+    BatchReader batchReader(par.threads, fileno(writer.file));
+    BackgroundRemoval punches;
+    BackgroundRemoval spillPunches[SPILL_KINDS];
     UnitMarks marks;
     std::vector<char> repAnswers;
     std::vector<size_t> repRowOffsets(pref.hashRangeCount);
@@ -4249,7 +4476,7 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     std::vector<std::vector<ClusterPair> > threadRecentPairs(par.threads, std::vector<ClusterPair>(RECENT_PAIR_SLOTS));
     std::vector<CellWriter> taskWriters;
     std::vector<std::vector<PieceCount> > taskPieceCounts;
-    BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(file));
+    BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(writer.file));
     // the units with their needed groups in memory first, then the spilled ones, then those extracted again, which need the memory of the others
     std::vector<std::pair<size_t, size_t> > unitOrder;
     std::vector<size_t> unitSendSplits(pref.sendSplitUnitOffsets.back());
@@ -4261,8 +4488,14 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
         }
     }
     SORT_SERIAL(unitOrder.begin(), unitOrder.end());
+    // a spill file is removed after its last unit was read
+    size_t spillUnitsLeft[SPILL_KINDS] = {0, 0};
+    for (size_t unit = 0; unit < pref.neededGroups.size(); unit++) {
+        spillUnitsLeft[pref.neededGroups[unit].spill] += pref.neededGroups[unit].spill < SPILL_KINDS;
+    }
+    // the marks are removed after pass 2 if no node extracts again
+    PrefExchangeParts markParts = (unitOrder.empty() == false && unitOrder.back().first == 2) ? openPrefExchangeFiles(par.db2 + ".marks", markFiles) : PrefExchangeParts();
     std::vector<size_t> neededBits(pref.hashRangeCount);
-    std::vector<std::vector<std::pair<size_t, size_t> > > extractedGroups;
     for (size_t order = 0; order < unitOrder.size(); order++) {
         size_t ownUnit = unitOrder[order].second;
         setSendSplit(par, exchange, pref.sendSplits[unitSendSplits[ownUnit]]);
@@ -4273,8 +4506,9 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             if (needed.data.empty() && needed.spillOffset != SIZE_MAX) {
                 size_t first = needed.rowOffsets[0];
                 needed.data.resize(needed.rowOffsets.back() - first + sizeof(uint64_t));
+                NeededSpill &neededSpill = pref.spills[needed.spill];
                 std::vector<BatchReader::ReadRequest> readRequests;
-                BatchReader::ReadRequest readRequest = {fileno(pref.spillFile), pref.spillName.c_str(), needed.data.data(), first, needed.rowOffsets.back() - first, needed.rowOffsets.back() - first};
+                BatchReader::ReadRequest readRequest = {fileno(neededSpill.file), neededSpill.name.c_str(), needed.data.data(), first, needed.rowOffsets.back() - first, needed.rowOffsets.back() - first};
                 if (readRequest.bytesToRead > 0) {
                     readRequests.push_back(readRequest);
                     batchReader.readSync(readRequests);
@@ -4282,18 +4516,33 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                 for (size_t hashRange = 0; hashRange <= pref.hashRangeCount; hashRange++) {
                     needed.rowOffsets[hashRange] -= first;
                 }
+                if (--spillUnitsLeft[needed.spill] > 0) {
+                    spillPunches[needed.spill].punch(readRequests);
+                } else {
+                    // the punches of the other units use the file
+                    spillPunches[needed.spill].wait();
+                    FILE *spillFile = neededSpill.file;
+                    std::string spillName = neededSpill.name;
+                    neededSpill.file = NULL;
+                    spillPunches[needed.spill].run([spillFile, spillName]() {
+                        if (fclose(spillFile) != 0) {
+                            Debug(Debug::ERROR) << "Cannot close " << spillName << "\n";
+                            EXIT(EXIT_FAILURE);
+                        }
+                        FileUtil::remove(spillName.c_str());
+                    });
+                }
             } else if (needed.data.empty()) {
-                readUnitMarks(pref, par.db2 + ".marks", markFiles, markFds, ownUnit, marks, batchReader);
+                punches.punch(readUnitMarks(pref, markFiles, markParts, ownUnit, marks, batchReader));
                 const UnitKmers &unitKmers = getUnitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, unit, ownUnit, extractSeconds);
-                extractedGroups.resize(pref.hashRangeCount * GROUP_SEGMENTS);
+                NeededGroupLists groups(par, pref, unitKmers, marks);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
                 for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
-                    collectNeededGroups(pref, unitKmers.kmers, unitKmers.rangeOffsets, marks, hashRange, extractedGroups.data() + hashRange * GROUP_SEGMENTS);
-                    neededBits[hashRange] = putNeededRow(exchange, unit, unitKmers.kmers, extractedGroups.data() + hashRange * GROUP_SEGMENTS, NULL);
+                    neededBits[hashRange] = putNeededRow(exchange, unit, unitKmers.kmers, groups.get(hashRange), NULL);
                 }
-                storeNeededGroups(par, exchange, pref, needed, unit, unitKmers.kmers, extractedGroups, neededBits, true, batchWriter);
+                storeNeededGroups(par, exchange, pref, needed, unit, unitKmers.kmers, groups, neededBits, true, batchWriter);
             }
-            readUnitAnswers(par.db2 + ".reps", repFiles, repFds, unitIndex, repAnswers, batchReader);
+            punches.punch(readUnitAnswers(repFiles, repParts, unitIndex, repAnswers, batchReader));
             // a row of the reps has a size if the unit sent a group
             for (size_t hashRange = 0, pos = 0; hashRange < pref.hashRangeCount; hashRange++) {
                 bool hasSent = false;
@@ -4524,7 +4773,7 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                 unitWriter.prevRep = taskWriters[taskCount - 1].prevRep;
                 repBegin = repEnd;
                 if (pieceCounts.size() * sizeof(PieceCount) > pieceCountLimit) {
-                    flushPieceCounts(pref, pieceCounts, compactedCounts, file, fileName, fileSize, flushOffsets);
+                    flushPieceCounts(pref, pieceCounts, compactedCounts, writer);
                 }
             }
             delete[] pairs;
@@ -4544,12 +4793,13 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
             std::vector<char>().swap(needed.data);
         }
     }
-    if (pieceCounts.empty() == false || flushOffsets.empty()) {
-        flushPieceCounts(pref, pieceCounts, compactedCounts, file, fileName, fileSize, flushOffsets);
+    if (pieceCounts.empty() == false || writer.flushOffsets.empty()) {
+        flushPieceCounts(pref, pieceCounts, compactedCounts, writer);
     }
-    closePrefExchangeFiles(par.db2 + ".marks", markFds);
-    closePrefExchangeFiles(par.db2 + ".reps", repFds);
-    return publishPrefExchangeFile(file, fileName, flushOffsets, pref.cellFirstKeys.size(), fileSize);
+    punches.wait();
+    closePrefExchangeFiles(markParts);
+    closePrefExchangeFiles(repParts);
+    return writer.publish(pref.cellFirstKeys.size(), 0);
 }
 
 // the owner of rep cells sums the piece counts: per target split a class file with an entry per own cell and a piece per rep with targets in the split, and a .partitions row per cell
@@ -4558,16 +4808,17 @@ static std::string writeSizeClasses(const Parameters &par, const TargetPref &pre
     size_t firstCell = pref.cellNodeOffsets[MMseqsNode::rank];
     size_t ownCells = pref.cellNodeOffsets[MMseqsNode::rank + 1] - firstCell;
     size_t targetSplitCount = pref.targetSplitKeyOffsets.size() - 1;
-    std::vector<int> fds = openPrefExchangeFiles(prefix, countFiles);
-    std::vector<std::string> names(fds.size());
+    PrefExchangeParts parts = openPrefExchangeFiles(prefix, countFiles);
+    size_t nodeCount = countFiles.size();
     // per node and flush the offsets of the own cells
-    std::vector<std::vector<size_t> > tables(fds.size());
+    std::vector<std::vector<size_t> > tables(nodeCount);
     std::vector<size_t> cellSizes(ownCells, 0);
-    for (size_t node = 0; node < fds.size(); node++) {
-        names[node] = prefix + "." + SSTR(node);
+    for (size_t node = 0; node < nodeCount; node++) {
         size_t flushCount = countFiles[node].flushCount;
         tables[node].resize((ownCells + 1) * flushCount);
-        FileUtil::preadAll(fds[node], names[node].c_str(), (char *) tables[node].data(), tables[node].size() * sizeof(size_t), countFiles[node].tableOffset + firstCell * flushCount * sizeof(size_t));
+        BatchReader::ReadRequest tableRead = parts.getRead(countFiles[node], node, (char *) tables[node].data(), countFiles[node].tableOffset + firstCell * flushCount * sizeof(size_t),
+                                                           tables[node].size() * sizeof(size_t));
+        FileUtil::preadAll(tableRead.fileToRead, tableRead.fileName, tableRead.destination, tableRead.bytesToRead, tableRead.fileOffset);
         for (size_t flush = 0; flush < flushCount; flush++) {
             for (size_t cell = 0; cell < ownCells; cell++) {
                 cellSizes[cell] += tables[node][(cell + 1) * flushCount + flush] - tables[node][cell * flushCount + flush];
@@ -4591,6 +4842,7 @@ static std::string writeSizeClasses(const Parameters &par, const TargetPref &pre
     }
     BatchWriter batchWriter(KMER_FILE_BUFFER_SIZE, 1, fileno(dataFiles[0]));
     BatchReader batchReader(1, fileno(dataFiles[0]));
+    BackgroundRemoval punches;
     std::vector<char> counts;
     std::vector<PieceCount> pieceCounts;
     std::vector<CellWriter> writers(targetSplitCount);
@@ -4599,7 +4851,7 @@ static std::string writeSizeClasses(const Parameters &par, const TargetPref &pre
         size_t passFirst = passOffsets[pass];
         size_t passEnd = passOffsets[pass + 1];
         size_t readSize = 0;
-        for (size_t node = 0; node < fds.size(); node++) {
+        for (size_t node = 0; node < nodeCount; node++) {
             size_t flushCount = countFiles[node].flushCount;
             for (size_t flush = 0; flush < flushCount; flush++) {
                 readSize += tables[node][passEnd * flushCount + flush] - tables[node][passFirst * flushCount + flush];
@@ -4608,14 +4860,13 @@ static std::string writeSizeClasses(const Parameters &par, const TargetPref &pre
         counts.resize(readSize);
         std::vector<BatchReader::ReadRequest> readRequests;
         char *bufferPos = counts.data();
-        for (size_t node = 0; node < fds.size(); node++) {
+        for (size_t node = 0; node < nodeCount; node++) {
             size_t flushCount = countFiles[node].flushCount;
             for (size_t flush = 0; flush < flushCount; flush++) {
                 size_t start = tables[node][passFirst * flushCount + flush];
                 size_t size = tables[node][passEnd * flushCount + flush] - start;
                 if (size > 0) {
-                    BatchReader::ReadRequest readRequest = {fds[node], names[node].c_str(), bufferPos, start, size, size};
-                    readRequests.push_back(readRequest);
+                    readRequests.push_back(parts.getRead(countFiles[node], node, bufferPos, start, size));
                 }
                 bufferPos += size;
             }
@@ -4623,11 +4874,12 @@ static std::string writeSizeClasses(const Parameters &par, const TargetPref &pre
         if (readRequests.empty() == false) {
             batchReader.readSync(readRequests);
         }
+        punches.punch(readRequests);
         std::vector<size_t> cellPrefSizes(passEnd - passFirst, 0);
         std::vector<size_t> cellCosts(passEnd - passFirst, 0);
         pieceCounts.clear();
         const char *data = counts.data();
-        for (size_t node = 0; node < fds.size(); node++) {
+        for (size_t node = 0; node < nodeCount; node++) {
             size_t flushCount = countFiles[node].flushCount;
             for (size_t flush = 0; flush < flushCount; flush++) {
                 for (size_t cell = passFirst; cell < passEnd; cell++) {
@@ -4698,7 +4950,8 @@ static std::string writeSizeClasses(const Parameters &par, const TargetPref &pre
         MMseqsNode::closeClusterFiles(dataFiles[split], dataNames[split], indexFile, indexName, dataSizes[split], indexSize);
         classSize += dataSizes[split] + indexSize + 2 * sizeof(uint64_t);
     }
-    closePrefExchangeFiles(prefix, fds);
+    punches.wait();
+    closePrefExchangeFiles(parts);
     return rows;
 }
 
@@ -4756,14 +5009,20 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     pref.isKeeping = true;
     pref.neededSize = 0;
     pref.neededLimit = unitMemory / 3;
-    pref.spillFile = NULL;
-    pref.spillSize = 0;
-    pref.localNodes = par.localTmp.empty() ? 0 : localNodes;
-    pref.spillName = par.localTmp + "/" + FileUtil::baseName(par.db2) + ".needed." + SSTR(MMseqsNode::rank);
+    pref.unitMemory = unitMemory;
+    // A/B switch MMSEQS_KMER_SHARED_SPILL=1: spill to the shared folder when --local-tmp is full instead of extracting again
+    const char *sharedSpillSwitch = getenv("MMSEQS_KMER_SHARED_SPILL");
+    const bool isSharedSpill = sharedSpillSwitch != NULL && strcmp(sharedSpillSwitch, "1") == 0;
+    NeededSpill localSpill = { par.localTmp + "/" + FileUtil::baseName(par.db2) + ".needed." + SSTR(MMseqsNode::rank), par.localTmp, par.localTmp.empty() ? 0 : localNodes, NULL, 0 };
+    NeededSpill sharedSpill = { par.db2 + ".needed." + SSTR(MMseqsNode::rank), FileUtil::dirName(par.db2), isSharedSpill ? nodeCount : 0, NULL, 0 };
+    pref.spills[LOCAL_SPILL] = localSpill;
+    pref.spills[SHARED_SPILL] = sharedSpill;
     if (MMseqsNode::isMaster()) {
         Debug(Debug::INFO) << "Send fingerprints in " << exchange.sendSplitCount << " send splits to " << pref.hashRangeCount << " hash ranges\n";
     }
 
+    // a file is removed once the barrier after its last read passed
+    BackgroundRemoval removal;
     Timer phaseTimer;
     std::string values;
     double extractSeconds = 0;
@@ -4778,20 +5037,19 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     MMseqsNode::addPhaseValue(values, "Fingerprint bytes sent", SSTR(sentSize));
     MMseqsNode::addPhaseValue(values, "Units", SSTR(pref.sendSplitUnitOffsets.back()) + (pref.isKeeping ? ", k-mers kept for the later passes" : ", k-mers extracted in every pass"));
     units = MMseqsNode::barrier(par.db2 + ".fingerprints.done", units);
-    sendQueue.removeTakenItemFiles();
+    removal.run([&sendQueue]() { sendQueue.removeTakenItemFiles(); });
     if (MMseqsNode::isMaster()) {
-        FileUtil::remove((par.db2 + ".memory").c_str());
+        removal.removeFile(par.db2 + ".memory");
     }
     // per node its fingerprint file, then a line per unit
     std::vector<PrefExchangeFile> fingerprintFiles;
     pref.nodeUnitOffsets.assign(1, 0);
     for (char *line = (char *) units.c_str(); *line != '\0';) {
-        const char *columns[3];
-        Util::getWordsOfLine(line, columns, 3);
-        PrefExchangeFile file = { Util::fast_atoi<size_t>(columns[0]), Util::fast_atoi<size_t>(columns[1]), Util::fast_atoi<size_t>(columns[2]) };
+        PrefExchangeFile file = readPrefExchangeLine(line);
         fingerprintFiles.push_back(file);
         line = Util::skipLine(line);
         for (size_t unit = 0; unit < file.flushCount; unit++, line = Util::skipLine(line)) {
+            const char *columns[2];
             Util::getWordsOfLine(line, columns, 2);
             PrefUnit prefUnit = { Util::fast_atoi<size_t>(columns[0]), Util::fast_atoi<size_t>(columns[1]), 0 };
             prefUnit.idBits = getBitWidth(prefUnit.endKey - prefUnit.firstKey);
@@ -4820,9 +5078,9 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     MMseqsNode::addPhaseTime(values, "marking fingerprints", phaseTimer);
     MMseqsNode::addPhaseValue(values, "Fingerprint bytes received", SSTR(receivedSize));
     std::vector<PrefExchangeFile> markFiles = readPrefExchangeFiles(MMseqsNode::barrier(par.db2 + ".marks.done", answer));
-    FileUtil::remove((par.db2 + ".fingerprints." + SSTR(MMseqsNode::rank)).c_str());
+    removePrefExchangeFile(removal, par.db2 + ".fingerprints", fingerprintFiles);
     if (MMseqsNode::isMaster()) {
-        FileUtil::remove((par.db2 + ".fingerprints.done").c_str());
+        removal.removeFile(par.db2 + ".fingerprints.done");
     }
     MMseqsNode::addPhaseTime(values, "waiting for the other nodes to mark fingerprints", phaseTimer);
 
@@ -4830,19 +5088,27 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     // pass 3 reads the needed groups, or extracts again into extractedUnit
     delete[] pref.extractedUnit.kmers;
     pref.extractedUnit.kmers = NULL;
-    size_t spilledUnits = 0;
+    size_t spilledUnits[SPILL_KINDS + 1] = {0, 0, 0};
     size_t extractedUnits = 0;
     for (size_t unit = 0; unit < pref.neededGroups.size(); unit++) {
-        spilledUnits += pref.neededGroups[unit].spillOffset != SIZE_MAX;
-        extractedUnits += pref.neededGroups[unit].data.empty() && pref.neededGroups[unit].spillOffset == SIZE_MAX;
+        spilledUnits[pref.neededGroups[unit].spill]++;
+        extractedUnits += pref.neededGroups[unit].data.empty() && pref.neededGroups[unit].spill == SPILL_KINDS;
     }
     MMseqsNode::addPhaseTime(values, "sending candidates", phaseTimer);
-    MMseqsNode::addPhaseValue(values, "Needed groups for pass 3", SSTR(pref.neededSize) + " bytes in memory, " + SSTR(pref.spillSize) + " bytes in " + SSTR(spilledUnits) + " units spilled, "
-                                                                   + SSTR(extractedUnits) + " units extracted again");
+    MMseqsNode::addPhaseValue(values, "Needed groups for pass 3", SSTR(pref.neededSize) + " bytes in memory, " + SSTR(pref.spills[LOCAL_SPILL].size) + " bytes in " + SSTR(spilledUnits[LOCAL_SPILL])
+                                                                   + " units in --local-tmp, " + SSTR(pref.spills[SHARED_SPILL].size) + " bytes in " + SSTR(spilledUnits[SHARED_SPILL])
+                                                                   + " units in the shared folder, " + SSTR(extractedUnits) + " units extracted again");
     MMseqsNode::addPhaseValue(values, "Candidate bytes sent", SSTR(sentSize));
     std::vector<PrefExchangeFile> candidateFiles = readPrefExchangeFiles(MMseqsNode::barrier(par.db2 + ".candidates.done", sent));
+    size_t allExtractedUnits = 0;
+    for (size_t node = 0; node < candidateFiles.size(); node++) {
+        allExtractedUnits += candidateFiles[node].value;
+    }
+    if (allExtractedUnits == 0) {
+        removePrefExchangeFile(removal, par.db2 + ".marks", markFiles);
+    }
     if (MMseqsNode::isMaster()) {
-        FileUtil::remove((par.db2 + ".marks.done").c_str());
+        removal.removeFile(par.db2 + ".marks.done");
     }
     MMseqsNode::addPhaseTime(values, "waiting for the other nodes to send candidates", phaseTimer);
 
@@ -4856,9 +5122,9 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     MMseqsNode::addPhaseTime(values, "picking reps", phaseTimer);
     MMseqsNode::addPhaseValue(values, "Candidate bytes received", SSTR(receivedSize));
     std::vector<PrefExchangeFile> repFiles = readPrefExchangeFiles(MMseqsNode::barrier(par.db2 + ".reps.done", answer));
-    FileUtil::remove((par.db2 + ".candidates." + SSTR(MMseqsNode::rank)).c_str());
+    removePrefExchangeFile(removal, par.db2 + ".candidates", candidateFiles);
     if (MMseqsNode::isMaster()) {
-        FileUtil::remove((par.db2 + ".candidates.done").c_str());
+        removal.removeFile(par.db2 + ".candidates.done");
     }
     MMseqsNode::addPhaseTime(values, "waiting for the other nodes to pick reps", phaseTimer);
 
@@ -4868,22 +5134,17 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     sent = writeUnitPrefs<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, markFiles, repFiles, extractSeconds, prefSize, pairCount, sweepCount);
     freeKeptUnits(pref);
     delete[] pref.extractedUnit.kmers;
-    if (pref.spillFile != NULL) {
-        if (fclose(pref.spillFile) != 0) {
-            Debug(Debug::ERROR) << "Cannot close " << pref.spillName << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        FileUtil::remove(pref.spillName.c_str());
-    }
     delete[] pref.writeBuffers;
     MMseqsNode::addPhaseTime(values, "writing unit prefilters", phaseTimer);
     MMseqsNode::addPhaseSeconds(values, "reading sequences and extracting k-mers", extractSeconds);
     MMseqsNode::addPhaseValue(values, "Prefilter pairs", SSTR(pairCount) + " in " + SSTR(sweepCount) + " sweeps");
     std::vector<PrefExchangeFile> countFiles = readPrefExchangeFiles(MMseqsNode::barrier(par.db2 + ".piece_counts.done", sent));
-    FileUtil::remove((par.db2 + ".marks." + SSTR(MMseqsNode::rank)).c_str());
-    FileUtil::remove((par.db2 + ".reps." + SSTR(MMseqsNode::rank)).c_str());
+    if (allExtractedUnits > 0) {
+        removePrefExchangeFile(removal, par.db2 + ".marks", markFiles);
+    }
+    removePrefExchangeFile(removal, par.db2 + ".reps", repFiles);
     if (MMseqsNode::isMaster()) {
-        FileUtil::remove((par.db2 + ".reps.done").c_str());
+        removal.removeFile(par.db2 + ".reps.done");
     }
     MMseqsNode::addPhaseTime(values, "waiting for the other nodes to write unit prefilters", phaseTimer);
 
@@ -4896,7 +5157,7 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     if (MMseqsNode::isMaster()) {
         rows = MMseqsNode::gatherRunFiles(par.db2 + ".partitions.");
         MMseqsNode::publishRunFile(par.db2 + ".merged", "");
-        FileUtil::remove((par.db2 + ".piece_counts.done").c_str());
+        removal.removeFile(par.db2 + ".piece_counts.done");
         // the owners' rows follow in cell order; the head: align groups and units, target split blocks, unit first keys, first cell of the class files of every node
         std::string partitions = SSTR(exchange.alignGroupCount) + "\t" + SSTR(pref.units.size()) + "\n";
         for (size_t split = 0; split < pref.targetSplitBlockOffsets.size(); split++) {
@@ -4916,7 +5177,7 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
         MMseqsNode::waitForRunFile(par.db2 + ".merged");
         MMseqsNode::removeOnceRead(par.db2 + ".merged");
     }
-    FileUtil::remove((par.db2 + ".piece_counts." + SSTR(MMseqsNode::rank)).c_str());
+    removePrefExchangeFile(removal, par.db2 + ".piece_counts", countFiles);
 }
 
 template <typename T, bool includeAdjacency, typename L>
@@ -5004,7 +5265,7 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
         }
     }
     std::string indexFiles[FILE_GROUP_KINDS] = { par.db2 + ".kmers.index." + SSTR(MMseqsNode::rank), par.db2 + ".pairs.index." + SSTR(MMseqsNode::rank) };
-    for (size_t i = 0; i < FILE_GROUP_KINDS; i++) {
+    for (size_t i = 0; i < FILE_GROUP_KINDS && isTargetPref == false; i++) {
         if (fclose(FileUtil::openAndDelete(indexFiles[i].c_str(), "w")) != 0) {
             Debug(Debug::ERROR) << "Cannot create " << indexFiles[i] << "\n";
             EXIT(EXIT_FAILURE);
@@ -5036,9 +5297,6 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
     exchange.partitionsPerRange = std::max((size_t) 4 * par.threads, 2 * rangePairPasses);
     if (isTargetPref) {
         kmermatcherTargetPref<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, sendQueue, totalKmerCount, smallestMemoryLimit, localNodes);
-        for (size_t i = 0; i < FILE_GROUP_KINDS; i++) {
-            FileUtil::remove(indexFiles[i].c_str());
-        }
         return;
     }
     exchange.pairRowSize = exchange.sendSplitCount * exchange.partitionsPerRange * sizeof(PairFileRow);
