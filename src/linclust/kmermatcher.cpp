@@ -247,7 +247,8 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                 }
             }
 #pragma omp barrier
-            // linfinity: the range and read of the previous id
+
+            // linfinity
             DBReader<DBKeyType>::LoadedBufferCursor cursor;
 #pragma omp for schedule(dynamic, 100)
             for (size_t id = start; id < (start + bucketSize); id++) {
