@@ -654,6 +654,9 @@ private:
     // header offsets or binary cluster index, their fds follow the data fds
     std::vector<std::string> entryOffsetsFileNames;
     std::vector<size_t> rangeRepresentativeCounts;
+    // bsearch result of every 2^idRangeShift-th key, findIdRange searches between two
+    std::vector<size_t> idRangeTable;
+    size_t idRangeShift;
     // uint64 (key, offset) pairs in <clu>.index.<node>
     bool hasBinaryIndex;
     // zstd seekable headers

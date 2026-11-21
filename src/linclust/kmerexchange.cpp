@@ -4453,13 +4453,17 @@ static size_t getRepPartition(const KeySplitPref &pref, DBKeyType key) {
     return std::upper_bound(pref.partitionFirstKeys.begin(), pref.partitionFirstKeys.end() - 1, key) - pref.partitionFirstKeys.begin() - 1;
 }
 
-static bool compareClusterPairs(const ClusterPair &first, const ClusterPair &second) {
-    return first.repKey < second.repKey || (first.repKey == second.repKey && first.memberKey < second.memberKey);
-}
+struct compareClusterPairs {
+    bool operator()(const ClusterPair &first, const ClusterPair &second) const {
+        return first.repKey < second.repKey || (first.repKey == second.repKey && first.memberKey < second.memberKey);
+    }
+};
 
-static bool isSameClusterPair(const ClusterPair &first, const ClusterPair &second) {
-    return first.repKey == second.repKey && first.memberKey == second.memberKey;
-}
+struct isSameClusterPair {
+    bool operator()(const ClusterPair &first, const ClusterPair &second) const {
+        return first.repKey == second.repKey && first.memberKey == second.memberKey;
+    }
+};
 
 // piece bytes, cost, target split and rep count, then per rep its gap and target count
 static void putPieceCounts(PartitionWriter &writer, size_t partition, size_t targetSplit, size_t pieceSize, size_t cost, size_t repCount, const std::vector<char> &repCounts) {
@@ -4548,7 +4552,7 @@ static void appendPartitions(BatchWriter &batchWriter, FILE *dataFile, const std
 template <typename T, bool includeAdjacency, typename L>
 static std::string writeKeySplitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, KeySplitPref &pref,
                                   const std::vector<PrefExchangeFile> &markFiles, const std::vector<PrefExchangeFile> &repFiles,
-                                  double &extractSeconds, size_t &prefSize, size_t &pairCount, size_t &repSplitCount, std::string &phaseValues) {
+                                  double &extractSeconds, size_t &prefSize, size_t &pairCount, size_t &sortedPairCount, size_t &repSplitCount, std::string &phaseValues) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     PrefExchangeWriter countWriter(par.db2 + ".piece_counts." + SSTR(MMseqsNode::rank));
     PrefExchangeParts repParts = openPrefExchangeFiles(par.db2 + ".reps", repFiles);
@@ -4726,18 +4730,19 @@ static std::string writeKeySplitPrefs(Parameters &par, DBReader<DBKeyType> &seqD
             for (size_t chunk = 0; chunk + 1 < chunkHashRanges.size(); chunk++) {
                 if (pairEnd + chunkPairBounds[chunk + 1] + par.threads * PAIR_BLOCK_SIZE > arraySize) {
                     timer.reset();
-                    SORT_PARALLEL(pairs, pairs + pairEnd, compareClusterPairs);
-                    pairEnd = std::unique(pairs, std::lower_bound(pairs, pairs + pairEnd, sentinel, compareClusterPairs), isSameClusterPair) - pairs;
+                    sortedPairCount += pairEnd;
+                    SORT_PARALLEL(pairs, pairs + pairEnd, compareClusterPairs());
+                    pairEnd = std::unique(pairs, std::lower_bound(pairs, pairs + pairEnd, sentinel, compareClusterPairs()), isSameClusterPair()) - pairs;
                     // end at half of the capacity, keep one rep
                     ClusterPair firstRepEnd = { pairs[0].repKey, DB_KEY_INVALID };
                     const ClusterPair *cut = pairs + pairEnd;
                     if (pairEnd > splitPairLimit) {
-                        cut = std::max(pairs + splitPairLimit, std::upper_bound(pairs, pairs + pairEnd, firstRepEnd, compareClusterPairs));
+                        cut = std::max(pairs + splitPairLimit, std::upper_bound(pairs, pairs + pairEnd, firstRepEnd, compareClusterPairs()));
                     }
                     if (cut < pairs + pairEnd) {
                         repEnd = cut->repKey;
                         ClusterPair end = { repEnd, 0 };
-                        pairEnd = std::lower_bound(pairs, pairs + pairEnd, end, compareClusterPairs) - pairs;
+                        pairEnd = std::lower_bound(pairs, pairs + pairEnd, end, compareClusterPairs()) - pairs;
                     }
                     sortSeconds += timer.getTimediff();
                 }
@@ -4810,7 +4815,7 @@ static std::string writeKeySplitPrefs(Parameters &par, DBReader<DBKeyType> &seqD
                                         }
                                         ClusterPair pair = { reps[rep], members[member] };
                                         ClusterPair &recent = recentPairs[(reps[rep] * 0x9E3779B97F4A7C15ULL + members[member]) & (RECENT_PAIR_SLOTS - 1)];
-                                        if (isSameClusterPair(recent, pair)) {
+                                        if (isSameClusterPair()(recent, pair)) {
                                             continue;
                                         }
                                         recent = pair;
@@ -4829,8 +4834,9 @@ static std::string writeKeySplitPrefs(Parameters &par, DBReader<DBKeyType> &seqD
                 emitSeconds += timer.getTimediff();
             }
             timer.reset();
-            SORT_PARALLEL(pairs, pairs + pairEnd, compareClusterPairs);
-            pairEnd = std::lower_bound(pairs, pairs + pairEnd, sentinel, compareClusterPairs) - pairs;
+            SORT_PARALLEL(pairs, pairs + pairEnd, compareClusterPairs());
+            pairEnd = std::lower_bound(pairs, pairs + pairEnd, sentinel, compareClusterPairs()) - pairs;
+            sortedPairCount += pairEnd;
 
             // write the partitions in tasks of about equal pairs
             size_t firstInnerPartition = getRepPartition(pref, repBegin) + 1;
@@ -4843,7 +4849,7 @@ static std::string writeKeySplitPrefs(Parameters &par, DBReader<DBKeyType> &seqD
                 while (low < high) {
                     size_t partition = low + (high - low) / 2;
                     ClusterPair first = { static_cast<DBKeyType>(pref.partitionFirstKeys[partition]), 0 };
-                    if (static_cast<size_t>(std::lower_bound(pairs, pairs + pairEnd, first, compareClusterPairs) - pairs) < task * pairEnd / taskCount) {
+                    if (static_cast<size_t>(std::lower_bound(pairs, pairs + pairEnd, first, compareClusterPairs()) - pairs) < task * pairEnd / taskCount) {
                         low = partition + 1;
                     } else {
                         high = partition;
@@ -4863,8 +4869,8 @@ static std::string writeKeySplitPrefs(Parameters &par, DBReader<DBKeyType> &seqD
             for (size_t task = 0; task < taskCount; task++) {
                 ClusterPair first = { taskReps[task], 0 };
                 ClusterPair end = { taskReps[task + 1], 0 };
-                ClusterPair *taskPairs = std::lower_bound(pairs, pairs + pairEnd, first, compareClusterPairs);
-                size_t taskPairCount = std::unique(taskPairs, std::lower_bound(taskPairs, pairs + pairEnd, end, compareClusterPairs), isSameClusterPair) - taskPairs;
+                ClusterPair *taskPairs = std::lower_bound(pairs, pairs + pairEnd, first, compareClusterPairs());
+                size_t taskPairCount = std::unique(taskPairs, std::lower_bound(taskPairs, pairs + pairEnd, end, compareClusterPairs()), isSameClusterPair()) - taskPairs;
                 PartitionWriter &writer = taskWriters[task];
                 if (task == 0) {
                     writer.nextPartition = keySplitWriter.nextPartition;
@@ -5319,17 +5325,18 @@ static void kmermatcherKeySplitPref(Parameters &par, DBReader<DBKeyType> &seqDbr
 
     size_t prefSize = 0;
     size_t pairCount = 0;
+    size_t sortedPairCount = 0;
     size_t repSplitCount = 0;
     std::string prefValues;
     FileUtil::checkRlimitNoFile(fixedOpenFiles + getPartCount(markFiles) + getPartCount(repFiles) + pref.sendSplitKeySplitOffsets.back() + 2);
-    sent = writeKeySplitPrefs<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, markFiles, repFiles, extractSeconds, prefSize, pairCount, repSplitCount, prefValues);
+    sent = writeKeySplitPrefs<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, markFiles, repFiles, extractSeconds, prefSize, pairCount, sortedPairCount, repSplitCount, prefValues);
     freeKeptKeySplits(pref);
     delete[] pref.extractedKeySplit.kmers;
     delete[] pref.writeBuffers;
     MMseqsNode::addPhaseTime(values, "writing key split prefilters", phaseTimer);
     values += prefValues;
     MMseqsNode::addPhaseSeconds(values, "reading sequences and extracting k-mers", extractSeconds);
-    MMseqsNode::addPhaseValue(values, "Prefilter pairs", SSTR(pairCount) + " in " + SSTR(repSplitCount) + " rep splits");
+    MMseqsNode::addPhaseValue(values, "Prefilter pairs", SSTR(pairCount) + " in " + SSTR(repSplitCount) + " rep splits, " + SSTR(sortedPairCount) + " sorted");
     std::vector<PrefExchangeFile> countFiles = readPrefExchangeFiles(MMseqsNode::barrier(par.db2 + ".piece_counts.done", sent));
     if (allExtractedKeySplits > 0) {
         removePrefExchangeFile(removal, par.db2 + ".marks", markFiles);

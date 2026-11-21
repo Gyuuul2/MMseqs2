@@ -33,7 +33,7 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         indexFileName(strdup(indexFileName_)), size(0), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), indexSize(0), index(NULL), id2local(NULL), local2id(NULL),
-        index2dbfile(NULL), hasBinaryIndex(false), batchReader(NULL), loadedBuffer(), prefetchBuffer(), readStepKeyEnd(0), readStepSize(0),
+        index2dbfile(NULL), idRangeShift(0), hasBinaryIndex(false), batchReader(NULL), loadedBuffer(), prefetchBuffer(), readStepKeyEnd(0), readStepSize(0),
         blockCacheSize(0), cachedBlockSize(0), blockReadSize(0), keyReadSize(0), localBlockCacheSize(0), cachedLocalBlockSize(0), localBlockReadSize(0), localKeyReadSize(0),
         dataMapped(false), accessType(0), externalData(false), didMlock(false)
 {}
@@ -44,7 +44,7 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         threads(threads), dataMode(USE_INDEX), dataFileName(NULL), indexFileName(NULL),
         size(size), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), indexSize(size), index(index), sortedByOffset(true),
-        id2local(NULL), local2id(NULL), index2dbfile(NULL), hasBinaryIndex(false), batchReader(NULL), loadedBuffer(), prefetchBuffer(),
+        id2local(NULL), local2id(NULL), index2dbfile(NULL), idRangeShift(0), hasBinaryIndex(false), batchReader(NULL), loadedBuffer(), prefetchBuffer(),
         readStepKeyEnd(0), readStepSize(0), blockCacheSize(0), cachedBlockSize(0), blockReadSize(0), keyReadSize(0), localBlockCacheSize(0), cachedLocalBlockSize(0),
         localBlockReadSize(0), localKeyReadSize(0), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
 {}
@@ -315,6 +315,19 @@ template <typename T> bool DBReader<T>::open(int accessType){
                 indexDataChar = Util::skipLine(indexDataChar);
             }
             lastKey = (size == 0) ? 0 : size - 1;
+            size_t tableSize = 1;
+            while (tableSize < indexSize) {
+                tableSize *= 2;
+            }
+            while ((tableSize << idRangeShift) < size) {
+                idRangeShift++;
+            }
+            for (size_t i = 0; i < tableSize; i++) {
+                T key = T();
+                key += i << idRangeShift;
+                idRangeTable.push_back(bsearch(index, indexSize, key));
+            }
+            idRangeTable.push_back(indexSize);
         } else {
             bool isSortedById = readIndex(indexDataChar, indexDataSize, index, dataSize);
 
@@ -511,6 +524,8 @@ template <typename T> void DBReader<T>::close(){
     localBlocks.clear();
     entryOffsetsFileNames.clear();
     rangeRepresentativeCounts.clear();
+    idRangeTable.clear();
+    idRangeShift = 0;
     decrementMemory(blockKeyOffsets.size() * sizeof(size_t));
     blockKeyOffsets.clear();
     blockCacheSize = 0;
@@ -906,7 +921,14 @@ template <typename T> void DBReader<T>::checkClosed() const {
 template <typename T> size_t DBReader<T>::findIdRange(size_t id) {
     T key = T();
     key += id;
-    size_t range = bsearch(index, indexSize, key);
+    size_t range = 0;
+    size_t rangeEnd = indexSize;
+    if (idRangeTable.empty() == false) {
+        size_t i = std::min(id >> idRangeShift, idRangeTable.size() - 2);
+        range = idRangeTable[i];
+        rangeEnd = idRangeTable[i + 1];
+    }
+    range += bsearch(index + range, rangeEnd - range, key);
     return (range < indexSize && index[range].id == key) ? range : range - 1;
 }
 
