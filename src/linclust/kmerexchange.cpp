@@ -8,6 +8,10 @@
 #include <sys/stat.h>
 
 #include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
+#include <functional>
 #include <algorithm>
 
 #ifdef OPENMP
@@ -3054,15 +3058,29 @@ struct PrefExchangeParts {
     }
 };
 
-// the fds of a punch stay open until wait()
+// one thread runs the removals in order, the fds of a punch stay open until wait()
 struct BackgroundRemoval {
+    BackgroundRemoval() : isClosing(false) {}
+
     ~BackgroundRemoval() {
-        wait();
+        if (worker.joinable()) {
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                isClosing = true;
+            }
+            condition.notify_all();
+            worker.join();
+        }
     }
 
     template <typename Removal>
     void run(Removal removal) {
-        threads.push_back(std::thread(removal));
+        std::lock_guard<std::mutex> lock(mutex);
+        removals.emplace_back(removal);
+        if (worker.joinable() == false) {
+            worker = std::thread(&BackgroundRemoval::runRemovals, this);
+        }
+        condition.notify_all();
     }
 
     void removeFile(const std::string &file) {
@@ -3087,13 +3105,36 @@ struct BackgroundRemoval {
     }
 
     void wait() {
-        for (size_t i = 0; i < threads.size(); i++) {
-            threads[i].join();
+        std::unique_lock<std::mutex> lock(mutex);
+        while (removals.empty() == false) {
+            condition.wait(lock);
         }
-        threads.clear();
     }
 
-    std::vector<std::thread> threads;
+    // a removal leaves the queue once done
+    void runRemovals() {
+        std::unique_lock<std::mutex> lock(mutex);
+        while (true) {
+            while (removals.empty() && isClosing == false) {
+                condition.wait(lock);
+            }
+            if (removals.empty()) {
+                return;
+            }
+            std::function<void()> removal = removals.front();
+            lock.unlock();
+            removal();
+            lock.lock();
+            removals.pop_front();
+            condition.notify_all();
+        }
+    }
+
+    std::deque<std::function<void()> > removals;
+    bool isClosing;
+    std::mutex mutex;
+    std::condition_variable condition;
+    std::thread worker;
 };
 
 struct PieceCount {
@@ -3268,6 +3309,15 @@ static PrefExchangeParts openPrefExchangeFiles(const std::string &prefix, const 
             parts.names[node].push_back(prefix + "." + SSTR(node) + "." + SSTR(part));
             parts.fds[node].push_back(MMseqsNode::waitForExchangeFile(parts.names[node].back(), partEnd - partStarts[part] + MMseqsNode::EXCHANGE_FILE_HEADER_BYTES, part));
         }
+    }
+    return parts;
+}
+
+// the parts of all node files are open at once
+static size_t getPartCount(const std::vector<PrefExchangeFile> &files) {
+    size_t parts = 0;
+    for (size_t node = 0; node < files.size(); node++) {
+        parts += files[node].partStarts.size();
     }
     return parts;
 }
@@ -5171,8 +5221,9 @@ static void kmermatcherKeySplitPref(Parameters &par, DBReader<DBKeyType> &seqDbr
     double extractSeconds = 0;
     size_t sentSize = 0;
     std::string keySplitLines = sendFingerprints<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, sendQueue, extractSeconds, sentSize);
-    // own key split files, marks and reps of all nodes; class files and piece counts
-    FileUtil::checkRlimitNoFile(2 * seqDbr.getDataFileCnt() + 64 + std::max(2 * nodeCount + pref.sendSplitKeySplitOffsets.back() + 2, nodeCount + pref.targetSplitKeyOffsets.size()));
+    // own key split files, marks and reps of all nodes; class files and piece counts; again with the parts after each barrier
+    const size_t fixedOpenFiles = 2 * seqDbr.getDataFileCnt() + 64;
+    FileUtil::checkRlimitNoFile(fixedOpenFiles + std::max(2 * nodeCount + pref.sendSplitKeySplitOffsets.back() + 2, nodeCount + pref.targetSplitKeyOffsets.size()));
     delete[] pref.extractedKeySplit.kmers;
     pref.extractedKeySplit.kmers = NULL;
     MMseqsNode::addPhaseTime(values, "sending fingerprints", phaseTimer);
@@ -5212,6 +5263,7 @@ static void kmermatcherKeySplitPref(Parameters &par, DBReader<DBKeyType> &seqDbr
 
     size_t receivedSize = 0;
     std::string answerValues;
+    FileUtil::checkRlimitNoFile(fixedOpenFiles + getPartCount(fingerprintFiles));
     std::string answer = answerHashRanges(par, exchange, pref, par.db2 + ".fingerprints", fingerprintFiles, par.db2 + ".marks", false, receivedSize, answerValues);
     MMseqsNode::addPhaseTime(values, "marking fingerprints", phaseTimer);
     values += answerValues;
@@ -5223,6 +5275,7 @@ static void kmermatcherKeySplitPref(Parameters &par, DBReader<DBKeyType> &seqDbr
     }
     MMseqsNode::addPhaseTime(values, "waiting for the other nodes to mark fingerprints", phaseTimer);
 
+    FileUtil::checkRlimitNoFile(fixedOpenFiles + getPartCount(markFiles));
     std::string sent = sendCandidates<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, markFiles, extractSeconds, sentSize);
     delete[] pref.extractedKeySplit.kmers;
     pref.extractedKeySplit.kmers = NULL;
@@ -5252,6 +5305,7 @@ static void kmermatcherKeySplitPref(Parameters &par, DBReader<DBKeyType> &seqDbr
 
     receivedSize = 0;
     answerValues.clear();
+    FileUtil::checkRlimitNoFile(fixedOpenFiles + getPartCount(candidateFiles));
     answer = answerHashRanges(par, exchange, pref, par.db2 + ".candidates", candidateFiles, par.db2 + ".reps", true, receivedSize, answerValues);
     MMseqsNode::addPhaseTime(values, "picking reps", phaseTimer);
     values += answerValues;
@@ -5267,6 +5321,7 @@ static void kmermatcherKeySplitPref(Parameters &par, DBReader<DBKeyType> &seqDbr
     size_t pairCount = 0;
     size_t repSplitCount = 0;
     std::string prefValues;
+    FileUtil::checkRlimitNoFile(fixedOpenFiles + getPartCount(markFiles) + getPartCount(repFiles) + pref.sendSplitKeySplitOffsets.back() + 2);
     sent = writeKeySplitPrefs<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, markFiles, repFiles, extractSeconds, prefSize, pairCount, repSplitCount, prefValues);
     freeKeptKeySplits(pref);
     delete[] pref.extractedKeySplit.kmers;
@@ -5287,6 +5342,7 @@ static void kmermatcherKeySplitPref(Parameters &par, DBReader<DBKeyType> &seqDbr
 
     size_t classSize = 0;
     std::string classValues;
+    FileUtil::checkRlimitNoFile(fixedOpenFiles + getPartCount(countFiles) + pref.targetSplitKeyOffsets.size());
     std::string rows = writeSizeClasses(par, exchange, pref, countFiles, classSize, classValues);
     MMseqsNode::addPhaseTime(values, "writing size classes", phaseTimer);
     values += classValues;
