@@ -318,7 +318,6 @@ static void fitLocalFileGroups(ExchangeFileGroups &groups, const std::vector<siz
         for (size_t i = groups.count - groups.localCount; i < groups.count; i++) {
             growth += flushEnds[i] - flushStarts[i];
         }
-        // SIZE_MAX if statvfs failed
         size_t freeSize = FileUtil::getFreeSpace(groups.localTmp.c_str());
         if (freeSize != SIZE_MAX && 2 * growth * groups.localNodes <= freeSize) {
             return;
@@ -603,6 +602,8 @@ struct KmerExchange {
     size_t memoryLimit;
     size_t writeBehindSize;
     size_t keySplitMemoryLimit;
+    size_t readChunkLimit;
+    size_t readBufferSize;
     size_t pairRowSize;
     unsigned int adjKeyBits;
     unsigned int adjKeyBase;
@@ -1535,8 +1536,10 @@ static bool compareKmerHash(const PackedKmerPosition &kmer, uint64_t hash) {
     return static_cast<uint64_t>(kmer.getKmer()) < hash;
 }
 
-static size_t addKeySplits(const Parameters &par, DBReader<DBKeyType> &seqDbr, size_t dbFrom, size_t from, size_t to, size_t kmerCapacity,
-                           size_t keySplitKeyLimit, std::vector<size_t> &keySplitOffsets) {
+static size_t addKeySplits(const Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange, size_t dbFrom, size_t from, size_t to, size_t kmerCapacity,
+                           std::vector<size_t> &keySplitOffsets) {
+    // ids must fit next to the hash and the adjKey
+    size_t keySplitKeyLimit = (1ULL << (128 - 1 - 64 - exchange.adjKeyBits)) - 1;
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     float kmersPerSequenceScale = par.kmersPerSequenceScale.values.aminoacid();
     size_t firstRange = (to > from) ? seqDbr.findIdRange(from) : seqDbr.getIndexSize();
@@ -1592,11 +1595,6 @@ static size_t addKeySplits(const Parameters &par, DBReader<DBKeyType> &seqDbr, s
 template <typename T, bool includeAdjacency, typename L>
 static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, MMseqsNode::WorkQueue &sendQueue,
                         size_t representativeBitsMemory, size_t &sentSplitCount, OwnKmers &ownKmers, ExchangeFileGroups &kmerGroups, double &extractSeconds) {
-    size_t readChunkLimit = std::min(BatchReader::MAX_INFLIGHT_READ_SIZE, exchange.keySplitMemoryLimit / 6);
-    // the current and the prefetched input buffer, page aligned in every data file
-    size_t readBufferBytes = 2 * (std::max(readChunkLimit, seqDbr.getMaxSeqLen()) + 2 * Util::getPageSize() * seqDbr.getDataFileCnt());
-    // ids must fit next to the hash and the adjKey
-    size_t keySplitKeyLimit = (1ULL << (128 - 1 - 64 - exchange.adjKeyBits)) - 1;
     createFileGroups(kmerGroups);
     std::vector<KmerFileRow> keySplitRows(exchange.hashRangeCount * exchange.rowsPerHashRange);
     std::vector<size_t> hashSubRangeOffsets(exchange.hashSubRangeCount + 1);
@@ -1615,7 +1613,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
         if (countRepresentatives(dbFrom, dbFrom, dbFrom + dbSize) == 0) {
             continue;
         }
-        size_t keySplitMemoryLimit = exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, ownKmers.size + readBufferBytes);
+        size_t keySplitMemoryLimit = exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, ownKmers.size + exchange.readBufferSize);
         size_t kmerCapacity = keySplitMemoryLimit / sizeof(PackedKmerPosition);
         std::vector<size_t> keySplitOffsets;
         size_t maxKeySplitKmers = 0;
@@ -1624,7 +1622,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
         size_t fixedSize = 0;
         while (true) {
             keySplitOffsets.assign(1, dbFrom);
-            maxKeySplitKmers = addKeySplits(par, seqDbr, dbFrom, dbFrom, dbFrom + dbSize, kmerCapacity, keySplitKeyLimit, keySplitOffsets);
+            maxKeySplitKmers = addKeySplits(par, seqDbr, exchange, dbFrom, dbFrom, dbFrom + dbSize, kmerCapacity, keySplitOffsets);
             maxKeySplitKeys = 0;
             for (size_t keySplit = 0; keySplit + 1 < keySplitOffsets.size(); keySplit++) {
                 maxKeySplitKeys = std::max(maxKeySplitKeys, keySplitOffsets[keySplit + 1] - keySplitOffsets[keySplit]);
@@ -1665,7 +1663,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
             if (countRepresentatives(dbFrom, keySplitOffsets[keySplit], keySplitOffsets[keySplit + 1]) == 0) {
                 continue;
             }
-            std::vector<size_t> readChunkOffsets = seqDbr.getSplitKeyOffsets(keySplitOffsets[keySplit], keySplitOffsets[keySplit + 1], readChunkLimit, 0);
+            std::vector<size_t> readChunkOffsets = seqDbr.getSplitKeyOffsets(keySplitOffsets[keySplit], keySplitOffsets[keySplit + 1], exchange.readChunkLimit, 0);
             Timer timer;
             size_t kmerCount = fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, L>(
                 hashSeqPair, maxKeySplitKmers, seqDbr, par, subMat, true, 0, SIZE_MAX, NULL, readChunkOffsets).first;
@@ -1730,7 +1728,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                     hashSubRangeRow.offsets[code + 1] = hashSubRangeRow.offsets[code] + (codeBits[code] + CHAR_BIT - 1) / CHAR_BIT;
                 }
             }
-            size_t ownKeySplitLimit = std::min(exchange.keySplitMemoryLimit - ownKmers.size - readBufferBytes - fixedSize - hashSeqPairCapacity * sizeof(PackedKmerPosition),
+            size_t ownKeySplitLimit = std::min(exchange.keySplitMemoryLimit - ownKmers.size - exchange.readBufferSize - fixedSize - hashSeqPairCapacity * sizeof(PackedKmerPosition),
                                                      ownKmers.limit - std::min(ownKmers.limit, ownKmers.size));
             size_t ownKeySplitSize = 0;
             isOwnHashRange.assign(exchange.hashRangeCount, false);
@@ -2977,13 +2975,13 @@ enum { KMER_GROUPS, WHOLE_SEQUENCE_GROUPS, GROUP_KINDS };
 static const size_t RECENT_PAIR_SLOTS = 1 << 16;
 static const size_t PAIR_BLOCK_SIZE = 4096;
 
-struct PrefUnit {
+struct KeySplit {
     size_t firstKey;
     size_t endKey;
     unsigned int idBits;
 };
 
-// a node's exchange file of a step, as published at the barrier: value is the sender's for all nodes, part p starts at partStarts[p] behind its header
+// as published at the barrier, part p starts at partStarts[p]
 struct PrefExchangeFile {
     size_t size;
     size_t tableOffset;
@@ -2992,10 +2990,10 @@ struct PrefExchangeFile {
     std::vector<size_t> partStarts;
 };
 
-// a part stays well below the 16 TiB file size limit of ext4 and Lustre ldiskfs, a node's file of 1 T sequences has a few
+// below the 16 TiB file limit of ext4 and Lustre ldiskfs
 static const size_t EXCHANGE_PART_SIZE = 1ULL << 40;
 
-// a node's exchange file of a step in parts <name>.<part>, a flush stays in one part and offsets count on over the parts
+// parts <name>.<part>, a flush stays in one part
 struct PrefExchangeWriter {
     PrefExchangeWriter(const std::string &name) : name(name), file(NULL), size(MMseqsNode::EXCHANGE_FILE_HEADER_BYTES) {
         startFlush(0, NULL);
@@ -3005,7 +3003,7 @@ struct PrefExchangeWriter {
         return offset - partStarts.back() + MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
     }
 
-    // a flush that would pass EXCHANGE_PART_SIZE starts the next part once the writes of the current one are done
+    // start the next part once the writes are done
     void startFlush(size_t flushSize, BatchWriter *batchWriter) {
         if (file != NULL && (size == partStarts.back() || getPartOffset(size) + flushSize <= EXCHANGE_PART_SIZE)) {
             return;
@@ -3021,7 +3019,7 @@ struct PrefExchangeWriter {
         file = MMseqsNode::createExchangeFile(partName, partStarts.size() - 1, "w");
     }
 
-    // the table of the flush offsets ends the last part
+    // the flush table ends the last part
     std::string publish(size_t columns, size_t value) {
         size_t flushCount = flushOffsets.size() / columns;
         startFlush(flushOffsets.size() * sizeof(size_t), NULL);
@@ -3045,7 +3043,6 @@ struct PrefExchangeWriter {
     std::vector<size_t> flushOffsets;
 };
 
-// the open parts of the exchange files of all nodes
 struct PrefExchangeParts {
     std::vector<std::vector<int> > fds;
     std::vector<std::vector<std::string> > names;
@@ -3057,7 +3054,7 @@ struct PrefExchangeParts {
     }
 };
 
-// punching read ranges and removing files run in threads next to the work, the fds of a punch stay open until wait()
+// the fds of a punch stay open until wait()
 struct BackgroundRemoval {
     ~BackgroundRemoval() {
         wait();
@@ -3072,7 +3069,7 @@ struct BackgroundRemoval {
         run([file]() { FileUtil::remove(file.c_str()); });
     }
 
-    // in whole MiB, the bytes around a range belong to other readers
+    // whole MiB, the bytes around belong to other readers
     void punch(const std::vector<BatchReader::ReadRequest> &readRequests) {
         if (readRequests.empty()) {
             return;
@@ -3113,19 +3110,18 @@ struct PieceCount {
     }
 };
 
-struct UnitKmers {
-    UnitKmers() : kmers(NULL) {}
+struct KeySplitKmers {
+    KeySplitKmers() : kmers(NULL) {}
     PackedKmerPosition *kmers;
     std::vector<size_t> rangeOffsets[GROUP_KINDS];
 };
 
-// the groups of a unit that pass 3 needs, per hash range the sent k-mer and whole sequence groups, then those with another member in the unit
 enum { SENT_KMER_GROUPS, SENT_WHOLE_SEQUENCE_GROUPS, LOCAL_KMER_GROUPS, LOCAL_WHOLE_SEQUENCE_GROUPS, GROUP_SEGMENTS };
 
-// the spill files of the needed groups: in --local-tmp, then in the shared folder with MMSEQS_KMER_SHARED_SPILL=1
+// --local-tmp, then the shared folder with MMSEQS_KMER_SHARED_SPILL=1
 enum { LOCAL_SPILL, SHARED_SPILL, SPILL_KINDS };
 
-// nodes: the nodes that spill to the device of directory, none if the spill file cannot be used
+// nodes: the nodes spilling to the device of directory, 0 if unusable
 struct NeededSpill {
     std::string name;
     std::string directory;
@@ -3134,7 +3130,6 @@ struct NeededSpill {
     size_t size;
 };
 
-// the needed groups of an own unit, a bit row per hash range (see putNeededRow), in memory, in a spill file or else extracted again in pass 3
 struct NeededGroups {
     NeededGroups() : spill(SPILL_KINDS), spillOffset(SIZE_MAX) {}
     std::vector<char> data;
@@ -3143,53 +3138,52 @@ struct NeededGroups {
     std::vector<size_t> rowOffsets;
 };
 
-struct TargetPref {
+struct KeySplitPref {
     size_t hashRangeCount;
     std::vector<size_t> hashRangeNodeOffsets;
     unsigned int codeShifts[GROUP_KINDS];
     unsigned int fingerprintShifts[GROUP_KINDS];
     std::vector<size_t> targetSplitBlockOffsets;
     std::vector<size_t> targetSplitKeyOffsets;
-    std::vector<size_t> cellFirstKeys;
-    std::vector<size_t> cellNodeOffsets;
+    std::vector<size_t> partitionFirstKeys;
+    std::vector<size_t> partitionNodeOffsets;
     std::vector<size_t> sendSplits;
-    std::vector<size_t> sendSplitUnitOffsets;
-    std::vector<PrefUnit> units;
-    std::vector<size_t> nodeUnitOffsets;
+    std::vector<size_t> sendSplitKeySplitOffsets;
+    std::vector<KeySplit> keySplits;
+    std::vector<size_t> nodeKeySplitOffsets;
     // numbered in key order
-    std::vector<size_t> unitFiles;
-    // own unit, hash range, kind
+    std::vector<size_t> keySplitFiles;
+    // own key split, hash range, kind
     std::vector<size_t> fingerprintCounts;
     std::vector<std::pair<DBKeyType, DBKeyType> > rangeCoveredKeys;
-    size_t unitKmerCapacity;
-    std::vector<UnitKmers> keptUnits;
+    size_t keySplitKmerCapacity;
+    std::vector<KeySplitKmers> keptKeySplits;
     size_t keptSize;
     bool isKeeping;
-    UnitKmers extractedUnit;
+    KeySplitKmers extractedKeySplit;
     std::vector<NeededGroups> neededGroups;
     size_t neededSize;
     size_t neededLimit;
     // keySplitMemoryLimit without the read buffers
-    size_t unitMemory;
+    size_t keySplitMemory;
     NeededSpill spills[SPILL_KINDS];
-    size_t readChunkLimit;
     size_t passLimit;
     char *writeBuffers;
 };
 
-static size_t getOwnUnit(const TargetPref &pref, size_t unit) {
-    return pref.nodeUnitOffsets[MMseqsNode::rank] + unit;
+static size_t getKeySplitIndex(const KeySplitPref &pref, size_t keySplit) {
+    return pref.nodeKeySplitOffsets[MMseqsNode::rank] + keySplit;
 }
 
-static size_t getHeldMemory(const TargetPref &pref) {
+static size_t getHeldMemory(const KeySplitPref &pref) {
     return pref.keptSize * sizeof(PackedKmerPosition) + pref.neededSize + pref.fingerprintCounts.size() * sizeof(size_t)
-           + ((pref.extractedUnit.kmers != NULL) ? pref.unitKmerCapacity * sizeof(PackedKmerPosition) : 0);
+           + ((pref.extractedKeySplit.kmers != NULL) ? pref.keySplitKmerCapacity * sizeof(PackedKmerPosition) : 0);
 }
 
-static void freeKeptUnits(TargetPref &pref) {
-    for (size_t unit = 0; unit < pref.keptUnits.size(); unit++) {
-        delete[] pref.keptUnits[unit].kmers;
-        pref.keptUnits[unit].kmers = NULL;
+static void freeKeptKeySplits(KeySplitPref &pref) {
+    for (size_t keySplit = 0; keySplit < pref.keptKeySplits.size(); keySplit++) {
+        delete[] pref.keptKeySplits[keySplit].kmers;
+        pref.keptKeySplits[keySplit].kmers = NULL;
     }
     pref.keptSize = 0;
 }
@@ -3202,12 +3196,12 @@ static size_t getEliasGammaSize(size_t value) {
     return 2 * getBitWidth(value) - 1;
 }
 
-static unsigned int getRowLowBits(const TargetPref &pref, size_t hashRange, unsigned int shift, size_t groupCount) {
+static unsigned int getRowLowBits(const KeySplitPref &pref, size_t hashRange, unsigned int shift, size_t groupCount) {
     return getHashDiffLowBits(hashRange, hashRange + 1, pref.hashRangeCount, shift, groupCount);
 }
 
 // rounded down for the fingerprint shift
-static uint64_t getRowFirstValue(const TargetPref &pref, size_t hashRange, unsigned int shift) {
+static uint64_t getRowFirstValue(const KeySplitPref &pref, size_t hashRange, unsigned int shift) {
     return static_cast<uint64_t>(((static_cast<PackedKmerPosition::uint128>(hashRange) << 64) / pref.hashRangeCount) >> shift);
 }
 
@@ -3289,35 +3283,36 @@ static void closePrefExchangeFiles(PrefExchangeParts &parts) {
     }
 }
 
-// the writer removes the parts of its exchange file
+// only the writer removes its parts
 static void removePrefExchangeFile(BackgroundRemoval &removal, const std::string &prefix, const std::vector<PrefExchangeFile> &files) {
     for (size_t part = 0; part < files[MMseqsNode::rank].partStarts.size(); part++) {
         removal.removeFile(prefix + "." + SSTR(MMseqsNode::rank) + "." + SSTR(part));
     }
 }
 
-// the answers of all owners to an own unit, in hash range order; returns the reads for punching
-static std::vector<BatchReader::ReadRequest> readUnitAnswers(const std::vector<PrefExchangeFile> &files, const PrefExchangeParts &parts, size_t unit,
-                                                             std::vector<char> &answers, BatchReader &batchReader) {
-    std::vector<std::vector<size_t> > offsets(files.size());
-    size_t size = 0;
+static void readTables(const PrefExchangeParts &parts, const std::vector<PrefExchangeFile> &files, size_t firstColumn, size_t columnCount,
+                       std::vector<std::vector<size_t> > &tables) {
     for (size_t node = 0; node < files.size(); node++) {
-        BatchReader::ReadRequest table = parts.getRead(files[node], node, NULL, files[node].tableOffset, 0);
-        MMseqsNode::readExchangeTableColumns(table.fileToRead, table.fileName, table.fileOffset, files[node].flushCount, unit, offsets[node]);
-        for (size_t flush = 0; flush < files[node].flushCount; flush++) {
-            size += offsets[node][files[node].flushCount + flush] - offsets[node][flush];
-        }
+        tables[node].resize(columnCount * files[node].flushCount);
+        BatchReader::ReadRequest read = parts.getRead(files[node], node, (char *) tables[node].data(), files[node].tableOffset + firstColumn * files[node].flushCount * sizeof(size_t),
+                                                      tables[node].size() * sizeof(size_t));
+        FileUtil::preadAll(read.fileToRead, read.fileName, read.destination, read.bytesToRead, read.fileOffset);
     }
-    answers.resize(size + sizeof(uint64_t));
+}
+
+// columns [first, end) of every node, flush after flush; returns the reads for punching
+static std::vector<BatchReader::ReadRequest> readTableColumns(const PrefExchangeParts &parts, const std::vector<PrefExchangeFile> &files,
+                                                              const std::vector<std::vector<size_t> > &tables, size_t first, size_t end, char *data, BatchReader &batchReader) {
     std::vector<BatchReader::ReadRequest> readRequests;
-    size_t bufferPos = 0;
     for (size_t node = 0; node < files.size(); node++) {
-        for (size_t flush = 0; flush < files[node].flushCount; flush++) {
-            size_t readSize = offsets[node][files[node].flushCount + flush] - offsets[node][flush];
-            if (readSize > 0) {
-                readRequests.push_back(parts.getRead(files[node], node, answers.data() + bufferPos, offsets[node][flush], readSize));
+        size_t flushCount = files[node].flushCount;
+        for (size_t flush = 0; flush < flushCount; flush++) {
+            size_t start = tables[node][first * flushCount + flush];
+            size_t size = tables[node][end * flushCount + flush] - start;
+            if (size > 0) {
+                readRequests.push_back(parts.getRead(files[node], node, data, start, size));
             }
-            bufferPos += readSize;
+            data += size;
         }
     }
     if (readRequests.empty() == false) {
@@ -3326,20 +3321,35 @@ static std::vector<BatchReader::ReadRequest> readUnitAnswers(const std::vector<P
     return readRequests;
 }
 
-static void setUnitShifts(const KmerExchange &exchange, const PrefUnit &unit) {
+// returns the reads for punching
+static std::vector<BatchReader::ReadRequest> readKeySplitAnswers(const std::vector<PrefExchangeFile> &files, const PrefExchangeParts &parts, size_t keySplit,
+                                                             std::vector<char> &answers, BatchReader &batchReader) {
+    std::vector<std::vector<size_t> > offsets(files.size());
+    readTables(parts, files, keySplit, 2, offsets);
+    size_t size = 0;
+    for (size_t node = 0; node < files.size(); node++) {
+        for (size_t flush = 0; flush < files[node].flushCount; flush++) {
+            size += offsets[node][files[node].flushCount + flush] - offsets[node][flush];
+        }
+    }
+    answers.resize(size + sizeof(uint64_t));
+    return readTableColumns(parts, files, offsets, 0, 1, answers.data(), batchReader);
+}
+
+static void setKeySplitShifts(const KmerExchange &exchange, const KeySplit &keySplit) {
     PackedKmerPosition::idShift = 0;
-    PackedKmerPosition::seqLenShift = unit.idBits;
-    PackedKmerPosition::adjKeyShift = unit.idBits;
-    PackedKmerPosition::kmerShift = unit.idBits + exchange.adjKeyBits;
+    PackedKmerPosition::seqLenShift = keySplit.idBits;
+    PackedKmerPosition::adjKeyShift = keySplit.idBits;
+    PackedKmerPosition::kmerShift = keySplit.idBits + exchange.adjKeyBits;
     PackedKmerPosition::maxSeqLen = 0;
 }
 
 template <typename T, bool includeAdjacency, typename L>
-static void extractUnitKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, const TargetPref &pref,
-                             const PrefUnit &unit, UnitKmers &unitKmers, size_t capacity, double &extractSeconds) {
-    setUnitShifts(exchange, unit);
-    PackedKmerPosition *kmers = unitKmers.kmers;
-    std::vector<size_t> readChunkOffsets = seqDbr.getSplitKeyOffsets(unit.firstKey, unit.endKey, pref.readChunkLimit, 0);
+static void extractKeySplitKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, const KeySplitPref &pref,
+                             const KeySplit &keySplit, KeySplitKmers &keySplitKmers, size_t capacity, double &extractSeconds) {
+    setKeySplitShifts(exchange, keySplit);
+    PackedKmerPosition *kmers = keySplitKmers.kmers;
+    std::vector<size_t> readChunkOffsets = seqDbr.getSplitKeyOffsets(keySplit.firstKey, keySplit.endKey, exchange.readChunkLimit, 0);
     Timer timer;
     size_t kmerCount = fillKmerPositionArray<Parameters::DBTYPE_AMINO_ACIDS, T, includeAdjacency, L>(
         kmers, capacity, seqDbr, par, subMat, true, 0, SIZE_MAX, NULL, readChunkOffsets).first;
@@ -3347,7 +3357,7 @@ static void extractUnitKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseM
 
     SORT_PARALLEL(kmers, kmers + kmerCount);
     size_t wholeSequenceStart = std::partition_point(kmers, kmers + kmerCount, isKmerRecord) - kmers;
-    std::vector<size_t> *rangeOffsets = unitKmers.rangeOffsets;
+    std::vector<size_t> *rangeOffsets = keySplitKmers.rangeOffsets;
     for (size_t kind = 0; kind < GROUP_KINDS; kind++) {
         rangeOffsets[kind].resize(pref.hashRangeCount + 1);
     }
@@ -3363,54 +3373,54 @@ static void extractUnitKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseM
 }
 
 template <typename T, bool includeAdjacency, typename L>
-static const UnitKmers &getUnitKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, TargetPref &pref,
-                                     const PrefUnit &unit, size_t ownUnit, double &extractSeconds) {
-    if (pref.keptUnits[ownUnit].kmers != NULL) {
-        setUnitShifts(exchange, unit);
-        return pref.keptUnits[ownUnit];
+static const KeySplitKmers &getKeySplitKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, KeySplitPref &pref,
+                                     const KeySplit &keySplit, size_t ownKeySplit, double &extractSeconds) {
+    if (pref.keptKeySplits[ownKeySplit].kmers != NULL) {
+        setKeySplitShifts(exchange, keySplit);
+        return pref.keptKeySplits[ownKeySplit];
     }
-    if (pref.extractedUnit.kmers == NULL) {
-        pref.extractedUnit.kmers = new(std::nothrow) PackedKmerPosition[pref.unitKmerCapacity];
-        Util::checkAllocation(pref.extractedUnit.kmers, "Can not allocate kmers memory in getUnitKmers");
+    if (pref.extractedKeySplit.kmers == NULL) {
+        pref.extractedKeySplit.kmers = new(std::nothrow) PackedKmerPosition[pref.keySplitKmerCapacity];
+        Util::checkAllocation(pref.extractedKeySplit.kmers, "Can not allocate kmers memory in getKeySplitKmers");
     }
-    extractUnitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, unit, pref.extractedUnit, pref.unitKmerCapacity, extractSeconds);
-    return pref.extractedUnit;
+    extractKeySplitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, keySplit, pref.extractedKeySplit, pref.keySplitKmerCapacity, extractSeconds);
+    return pref.extractedKeySplit;
 }
 
 // keep the k-mers while all key splits fit
 template <typename T, bool includeAdjacency, typename L>
-static const UnitKmers &extractNewUnitKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange,
-                                            TargetPref &pref, const PrefUnit &unit, double &extractSeconds) {
-    size_t ownUnit = pref.keptUnits.size();
+static const KeySplitKmers &extractNewKeySplitKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange,
+                                            KeySplitPref &pref, const KeySplit &keySplit, double &extractSeconds) {
+    size_t ownKeySplit = pref.keptKeySplits.size();
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     float kmersPerSequenceScale = par.kmersPerSequenceScale.values.aminoacid();
     size_t maxKmerCount = 0;
-    for (size_t range = seqDbr.findIdRange(unit.firstKey); range < seqDbr.getIndexSize() && index[range].id < unit.endKey; range++) {
-        size_t rangeFrom = std::max(static_cast<size_t>(index[range].id), unit.firstKey);
-        size_t rangeTo = std::min((range + 1 < seqDbr.getIndexSize()) ? static_cast<size_t>(index[range + 1].id) : seqDbr.getSize(), unit.endKey);
+    for (size_t range = seqDbr.findIdRange(keySplit.firstKey); range < seqDbr.getIndexSize() && index[range].id < keySplit.endKey; range++) {
+        size_t rangeFrom = std::max(static_cast<size_t>(index[range].id), keySplit.firstKey);
+        size_t rangeTo = std::min((range + 1 < seqDbr.getIndexSize()) ? static_cast<size_t>(index[range + 1].id) : seqDbr.getSize(), keySplit.endKey);
         size_t seqKmers = computeSeqKmerCount(static_cast<int>(index[range].length - 2), par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
         maxKmerCount += countRepresentatives(sendSplitFirstKey, rangeFrom, rangeTo) * seqKmers;
     }
 
-    pref.keptUnits.push_back(UnitKmers());
-    if (pref.isKeeping && pref.keptSize + maxKmerCount <= pref.unitKmerCapacity) {
-        UnitKmers &kept = pref.keptUnits.back();
+    pref.keptKeySplits.push_back(KeySplitKmers());
+    if (pref.isKeeping && pref.keptSize + maxKmerCount <= pref.keySplitKmerCapacity) {
+        KeySplitKmers &kept = pref.keptKeySplits.back();
         kept.kmers = new(std::nothrow) PackedKmerPosition[maxKmerCount];
-        Util::checkAllocation(kept.kmers, "Can not allocate kmers memory in extractNewUnitKmers");
+        Util::checkAllocation(kept.kmers, "Can not allocate kmers memory in extractNewKeySplitKmers");
         pref.keptSize += maxKmerCount;
-        extractUnitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, unit, kept, maxKmerCount, extractSeconds);
+        extractKeySplitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, keySplit, kept, maxKmerCount, extractSeconds);
         return kept;
     }
     if (pref.isKeeping) {
-        freeKeptUnits(pref);
+        freeKeptKeySplits(pref);
         pref.isKeeping = false;
     }
-    return getUnitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, unit, ownUnit, extractSeconds);
+    return getKeySplitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, keySplit, ownKeySplit, extractSeconds);
 }
 
-// the rows of an own unit to a file whose first byte has the offset fileStart, a row per hash range of rowBits[hashRange] bits
+// fileStart: the offset of the first byte of file
 template <typename WriteRow>
-static void writeUnitRows(const Parameters &par, const TargetPref &pref, FILE *file, const std::string &fileName, size_t &fileSize, std::vector<size_t> &flushOffsets,
+static void writeKeySplitRows(const Parameters &par, const KeySplitPref &pref, FILE *file, const std::string &fileName, size_t &fileSize, std::vector<size_t> &flushOffsets,
                           size_t fileStart, const std::vector<size_t> &rowBits, BatchWriter &batchWriter, WriteRow writeRow) {
     std::vector<size_t> rowOffsets(pref.hashRangeCount + 1);
     for (size_t hashRange = 0; hashRange <= pref.hashRangeCount; hashRange++) {
@@ -3436,110 +3446,111 @@ static void writeUnitRows(const Parameters &par, const TargetPref &pref, FILE *f
     }
 }
 
-// a flush of rows of rowBits to an exchange file
 template <typename WriteRow>
-static void writeUnitFlush(const Parameters &par, const TargetPref &pref, PrefExchangeWriter &writer, const std::vector<size_t> &rowBits, BatchWriter &batchWriter, WriteRow writeRow) {
+static void writeKeySplitFlush(const Parameters &par, const KeySplitPref &pref, PrefExchangeWriter &writer, const std::vector<size_t> &rowBits, BatchWriter &batchWriter, WriteRow writeRow) {
     size_t flushSize = 0;
     for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
         flushSize += (rowBits[hashRange] + CHAR_BIT - 1) / CHAR_BIT;
     }
     writer.startFlush(flushSize, &batchWriter);
-    writeUnitRows(par, pref, writer.file, writer.partName, writer.size, writer.flushOffsets, writer.partStarts.back() - MMseqsNode::EXCHANGE_FILE_HEADER_BYTES, rowBits, batchWriter, writeRow);
+    writeKeySplitRows(par, pref, writer.file, writer.partName, writer.size, writer.flushOffsets, writer.partStarts.back() - MMseqsNode::EXCHANGE_FILE_HEADER_BYTES, rowBits, batchWriter, writeRow);
 }
 
-// pass 1: per row the k-mer and whole sequence group counts, then the fingerprint gaps of both kinds
+// writer NULL: count the bits only
+static size_t putFingerprintRow(const KeySplitPref &pref, const PackedKmerPosition *kmers, const std::vector<size_t> *rangeOffsets, const size_t *counts,
+                                size_t hashRange, KmerCodeWriter *writer) {
+    if (counts[KMER_GROUPS] + counts[WHOLE_SEQUENCE_GROUPS] == 0) {
+        return 0;
+    }
+    size_t bits = getEliasGammaSize(counts[KMER_GROUPS] + 1) + getEliasGammaSize(counts[WHOLE_SEQUENCE_GROUPS] + 1);
+    if (writer != NULL) {
+        putEliasGamma(*writer, counts[KMER_GROUPS] + 1);
+        putEliasGamma(*writer, counts[WHOLE_SEQUENCE_GROUPS] + 1);
+    }
+    for (size_t kind = 0; kind < GROUP_KINDS; kind++) {
+        unsigned int shift = pref.fingerprintShifts[kind];
+        unsigned int lowBits = getRowLowBits(pref, hashRange, shift, counts[kind]);
+        uint64_t prev = getRowFirstValue(pref, hashRange, shift);
+        size_t from = rangeOffsets[kind][hashRange];
+        for (size_t pos = from; pos < rangeOffsets[kind][hashRange + 1]; pos++) {
+            uint64_t value = getGroupValue(kmers[pos], shift);
+            if (pos == from || value != getGroupValue(kmers[pos - 1], shift)) {
+                uint64_t gap = (pos == from) ? value - prev : value - prev - 1;
+                bits += getRiceSize(gap, lowBits);
+                if (writer != NULL) {
+                    putRice(*writer, gap, lowBits);
+                }
+                prev = value;
+            }
+        }
+    }
+    return bits;
+}
+
+// pass 1: fingerprints
 template <typename T, bool includeAdjacency, typename L>
-static std::string sendFingerprints(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, TargetPref &pref, MMseqsNode::WorkQueue &sendQueue,
+static std::string sendFingerprints(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, KeySplitPref &pref, MMseqsNode::WorkQueue &sendQueue,
                                     double &extractSeconds, size_t &sentSize) {
     PrefExchangeWriter writer(par.db2 + ".fingerprints." + SSTR(MMseqsNode::rank));
     BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(writer.file));
-    std::string units;
+    std::string keySplitLines;
     std::vector<size_t> rowBits(pref.hashRangeCount);
-    // ids must fit next to the hash and the adjKey
-    size_t keySplitKeyLimit = (1ULL << (128 - 1 - 64 - exchange.adjKeyBits)) - 1;
-    pref.sendSplitUnitOffsets.assign(1, 0);
-    std::vector<PrefUnit> ownUnits;
+    pref.sendSplitKeySplitOffsets.assign(1, 0);
+    std::vector<KeySplit> ownKeySplits;
     for (size_t sendSplit = sendQueue.takeNextItem(); sendSplit < exchange.sendSplitCount; sendSplit = sendQueue.takeNextItem()) {
         setSendSplit(par, exchange, sendSplit);
         size_t dbFrom = exchange.sendSplitKeyOffsets[sendSplit];
         size_t dbTo = exchange.sendSplitKeyOffsets[sendSplit + 1];
-        // a unit stays in one target split
+        // a key split stays in one target split
         std::vector<size_t> keySplitOffsets(1, dbFrom);
         size_t split = std::upper_bound(pref.targetSplitKeyOffsets.begin(), pref.targetSplitKeyOffsets.end(), dbFrom) - pref.targetSplitKeyOffsets.begin() - 1;
         for (size_t from = dbFrom; from < dbTo; split++) {
             size_t to = std::min(dbTo, pref.targetSplitKeyOffsets[split + 1]);
-            addKeySplits(par, seqDbr, dbFrom, from, to, pref.unitKmerCapacity, keySplitKeyLimit, keySplitOffsets);
+            addKeySplits(par, seqDbr, exchange, dbFrom, from, to, pref.keySplitKmerCapacity, keySplitOffsets);
             from = to;
         }
         pref.sendSplits.push_back(sendSplit);
-        for (size_t keySplit = 0; keySplit + 1 < keySplitOffsets.size(); keySplit++) {
-            if (keySplitOffsets[keySplit + 1] == keySplitOffsets[keySplit] || countRepresentatives(dbFrom, keySplitOffsets[keySplit], keySplitOffsets[keySplit + 1]) == 0) {
+        for (size_t i = 0; i + 1 < keySplitOffsets.size(); i++) {
+            if (keySplitOffsets[i + 1] == keySplitOffsets[i] || countRepresentatives(dbFrom, keySplitOffsets[i], keySplitOffsets[i + 1]) == 0) {
                 continue;
             }
-            PrefUnit unit = { keySplitOffsets[keySplit], keySplitOffsets[keySplit + 1], getBitWidth(keySplitOffsets[keySplit + 1] - keySplitOffsets[keySplit]) };
-            ownUnits.push_back(unit);
-            units += SSTR(unit.firstKey) + "\t" + SSTR(unit.endKey) + "\n";
-            const UnitKmers &unitKmers = extractNewUnitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, unit, extractSeconds);
-            const PackedKmerPosition *kmers = unitKmers.kmers;
-            const std::vector<size_t> *rangeOffsets = unitKmers.rangeOffsets;
+            KeySplit keySplit = { keySplitOffsets[i], keySplitOffsets[i + 1], getBitWidth(keySplitOffsets[i + 1] - keySplitOffsets[i]) };
+            ownKeySplits.push_back(keySplit);
+            keySplitLines += SSTR(keySplit.firstKey) + "\t" + SSTR(keySplit.endKey) + "\n";
+            const KeySplitKmers &keySplitKmers = extractNewKeySplitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, keySplit, extractSeconds);
+            const PackedKmerPosition *kmers = keySplitKmers.kmers;
+            const std::vector<size_t> *rangeOffsets = keySplitKmers.rangeOffsets;
             size_t firstCount = pref.fingerprintCounts.size();
             pref.fingerprintCounts.resize(firstCount + pref.hashRangeCount * GROUP_KINDS);
             size_t *counts = pref.fingerprintCounts.data() + firstCount;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
             for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
-                size_t bits = 0;
                 for (size_t kind = 0; kind < GROUP_KINDS; kind++) {
                     unsigned int shift = pref.fingerprintShifts[kind];
                     size_t from = rangeOffsets[kind][hashRange];
-                    size_t to = rangeOffsets[kind][hashRange + 1];
                     size_t count = 0;
-                    for (size_t pos = from; pos < to; pos++) {
+                    for (size_t pos = from; pos < rangeOffsets[kind][hashRange + 1]; pos++) {
                         count += (pos == from || getGroupValue(kmers[pos], shift) != getGroupValue(kmers[pos - 1], shift));
                     }
                     counts[hashRange * GROUP_KINDS + kind] = count;
-                    unsigned int lowBits = getRowLowBits(pref, hashRange, shift, count);
-                    uint64_t prev = getRowFirstValue(pref, hashRange, shift);
-                    for (size_t pos = from; pos < to; pos++) {
-                        uint64_t value = getGroupValue(kmers[pos], shift);
-                        if (pos == from || value != getGroupValue(kmers[pos - 1], shift)) {
-                            bits += getRiceSize((pos == from) ? value - prev : value - prev - 1, lowBits);
-                            prev = value;
-                        }
-                    }
                 }
-                size_t groupCount = counts[hashRange * GROUP_KINDS] + counts[hashRange * GROUP_KINDS + 1];
-                rowBits[hashRange] = (groupCount > 0) ? bits + getEliasGammaSize(counts[hashRange * GROUP_KINDS] + 1) + getEliasGammaSize(counts[hashRange * GROUP_KINDS + 1] + 1) : 0;
+                rowBits[hashRange] = putFingerprintRow(pref, kmers, rangeOffsets, counts + hashRange * GROUP_KINDS, hashRange, NULL);
             }
-            writeUnitFlush(par, pref, writer, rowBits, batchWriter, [&](size_t hashRange, KmerCodeWriter &writer) {
-                putEliasGamma(writer, counts[hashRange * GROUP_KINDS] + 1);
-                putEliasGamma(writer, counts[hashRange * GROUP_KINDS + 1] + 1);
-                for (size_t kind = 0; kind < GROUP_KINDS; kind++) {
-                    unsigned int shift = pref.fingerprintShifts[kind];
-                    size_t from = rangeOffsets[kind][hashRange];
-                    size_t to = rangeOffsets[kind][hashRange + 1];
-                    unsigned int lowBits = getRowLowBits(pref, hashRange, shift, counts[hashRange * GROUP_KINDS + kind]);
-                    uint64_t prev = getRowFirstValue(pref, hashRange, shift);
-                    for (size_t pos = from; pos < to; pos++) {
-                        uint64_t value = getGroupValue(kmers[pos], shift);
-                        if (pos == from || value != getGroupValue(kmers[pos - 1], shift)) {
-                            putRice(writer, (pos == from) ? value - prev : value - prev - 1, lowBits);
-                            prev = value;
-                        }
-                    }
-                }
+            writeKeySplitFlush(par, pref, writer, rowBits, batchWriter, [&](size_t hashRange, KmerCodeWriter &writer) {
+                putFingerprintRow(pref, kmers, rangeOffsets, counts + hashRange * GROUP_KINDS, hashRange, &writer);
             });
         }
-        pref.sendSplitUnitOffsets.push_back(ownUnits.size());
+        pref.sendSplitKeySplitOffsets.push_back(ownKeySplits.size());
     }
     seqDbr.releaseDataPages();
     batchWriter.waitWrites();
     sentSize = writer.size;
-    return writer.publish(pref.hashRangeCount + 1, 0) + units;
+    return writer.publish(pref.hashRangeCount + 1, 0) + keySplitLines;
 }
 
 struct PrefRowRead {
     KmerCodeReader reader;
-    size_t unit;
+    size_t keySplit;
     size_t groupCounts[GROUP_KINDS];
     size_t groupsLeft;
     uint64_t value;
@@ -3547,189 +3558,6 @@ struct PrefRowRead {
     KmerCodeWriter answer;
 };
 
-// an owner reads the rows of its hash ranges from all units in batches and answers every row; answerBits bounds the answer of a row,
-// with hasRowSizes an answer to a row with groups starts with its size. A batch and its rows take half of memoryLimit, the answers the rest
-template <typename AnswerBits, typename AnswerHashRange>
-static std::string answerHashRanges(const Parameters &par, const KmerExchange &exchange, const TargetPref &pref, const std::string &sentPrefix, const std::vector<PrefExchangeFile> &sentFiles,
-                                    const std::string &answerPrefix, bool hasRowSizes, size_t memoryLimit, AnswerBits answerBits, AnswerHashRange answerHashRange,
-                                    size_t &receivedSize, std::string &phaseValues) {
-    size_t firstHashRange = pref.hashRangeNodeOffsets[MMseqsNode::rank];
-    size_t ownHashRanges = pref.hashRangeNodeOffsets[MMseqsNode::rank + 1] - firstHashRange;
-    size_t unitCount = pref.units.size();
-    PrefExchangeParts parts = openPrefExchangeFiles(sentPrefix, sentFiles);
-    // the offsets of the own hash ranges in every sender unit
-    std::vector<size_t> rowOffsets(unitCount * (ownHashRanges + 1));
-    for (size_t node = 0; node < sentFiles.size(); node++) {
-        size_t flushCount = sentFiles[node].flushCount;
-        std::vector<size_t> table((ownHashRanges + 1) * flushCount);
-        BatchReader::ReadRequest tableRead = parts.getRead(sentFiles[node], node, (char *) table.data(), sentFiles[node].tableOffset + firstHashRange * flushCount * sizeof(size_t),
-                                                           table.size() * sizeof(size_t));
-        FileUtil::preadAll(tableRead.fileToRead, tableRead.fileName, tableRead.destination, tableRead.bytesToRead, tableRead.fileOffset);
-        for (size_t flush = 0; flush < flushCount; flush++) {
-            for (size_t i = 0; i <= ownHashRanges; i++) {
-                rowOffsets[(pref.nodeUnitOffsets[node] + flush) * (ownHashRanges + 1) + i] = table[i * flushCount + flush];
-            }
-        }
-    }
-    // per row its PrefRowRead, answer size, size field and offset
-    std::vector<size_t> hashRangeSizes(ownHashRanges, unitCount * (sizeof(PrefRowRead) + 3 * sizeof(size_t)));
-    for (size_t unit = 0; unit < unitCount; unit++) {
-        for (size_t i = 0; i < ownHashRanges; i++) {
-            hashRangeSizes[i] += rowOffsets[unit * (ownHashRanges + 1) + i + 1] - rowOffsets[unit * (ownHashRanges + 1) + i];
-        }
-    }
-    // a thread merges the rows of a hash range in less than two PrefRowRead per unit
-    size_t fixedMemory = rowOffsets.size() * sizeof(size_t) + 2 * par.threads * unitCount * sizeof(PrefRowRead);
-    size_t ownerMemory = memoryLimit - std::min(memoryLimit, fixedMemory);
-    std::vector<size_t> passOffsets;
-    std::vector<size_t> passSizes;
-    planPasses(hashRangeSizes, ownerMemory / 2, passOffsets, passSizes);
-    PrefExchangeWriter writer(answerPrefix + "." + SSTR(MMseqsNode::rank));
-    BatchReader batchReader(par.threads, fileno(writer.file));
-    BackgroundRemoval punches;
-    // a sub pass is answered while the previous one is written
-    BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(writer.file));
-    double readSeconds = 0;
-    double answerSeconds = 0;
-    double writeSeconds = 0;
-    Timer timer;
-    for (size_t pass = 0; pass + 1 < passOffsets.size(); pass++) {
-        size_t passFirst = passOffsets[pass];
-        size_t passEnd = passOffsets[pass + 1];
-        size_t passHashRanges = passEnd - passFirst;
-        // a read per sender unit, the rows of its hash ranges are adjacent
-        std::vector<size_t> unitDataOffsets(unitCount + 1, 0);
-        for (size_t unit = 0; unit < unitCount; unit++) {
-            const size_t *offsets = rowOffsets.data() + unit * (ownHashRanges + 1);
-            unitDataOffsets[unit + 1] = unitDataOffsets[unit] + offsets[passEnd] - offsets[passFirst];
-        }
-        timer.reset();
-        std::vector<char> rowData(unitDataOffsets[unitCount] + sizeof(uint64_t));
-        std::vector<BatchReader::ReadRequest> readRequests;
-        for (size_t node = 0; node < sentFiles.size(); node++) {
-            for (size_t unit = pref.nodeUnitOffsets[node]; unit < pref.nodeUnitOffsets[node + 1]; unit++) {
-                const size_t *offsets = rowOffsets.data() + unit * (ownHashRanges + 1);
-                size_t readSize = offsets[passEnd] - offsets[passFirst];
-                if (readSize > 0) {
-                    readRequests.push_back(parts.getRead(sentFiles[node], node, rowData.data() + unitDataOffsets[unit], offsets[passFirst], readSize));
-                }
-            }
-        }
-        if (readRequests.empty() == false) {
-            batchReader.readSync(readRequests);
-        }
-        readSeconds += timer.getTimediff();
-        // every row is read by its owner once
-        punches.punch(readRequests);
-        receivedSize += unitDataOffsets[unitCount];
-        // every row answers at most answerBits
-        std::vector<PrefRowRead> rows(unitCount * passHashRanges);
-        std::vector<size_t> answerSizes(unitCount * passHashRanges);
-        std::vector<size_t> answerSizeBytes(unitCount * passHashRanges);
-        std::vector<size_t> hashRangeAnswerSizes(passHashRanges, 0);
-        for (size_t unit = 0; unit < unitCount; unit++) {
-            const size_t *offsets = rowOffsets.data() + unit * (ownHashRanges + 1);
-            for (size_t i = 0; i < passHashRanges; i++) {
-                PrefRowRead &row = rows[unit * passHashRanges + i];
-                row.unit = unit;
-                row.groupCounts[KMER_GROUPS] = 0;
-                row.groupCounts[WHOLE_SEQUENCE_GROUPS] = 0;
-                if (offsets[passFirst + i + 1] > offsets[passFirst + i]) {
-                    row.reader = getMemoryCodeReader(rowData.data() + unitDataOffsets[unit] + offsets[passFirst + i] - offsets[passFirst], offsets[passFirst + i + 1] - offsets[passFirst + i]);
-                    row.groupCounts[KMER_GROUPS] = getEliasGamma(row.reader) - 1;
-                    row.groupCounts[WHOLE_SEQUENCE_GROUPS] = getEliasGamma(row.reader) - 1;
-                }
-                size_t bits = answerBits(pref.units[unit], row.groupCounts);
-                answerSizeBytes[unit * passHashRanges + i] = (hasRowSizes && row.groupCounts[KMER_GROUPS] + row.groupCounts[WHOLE_SEQUENCE_GROUPS] > 0) ? sizeof(uint64_t) : 0;
-                answerSizes[unit * passHashRanges + i] = answerSizeBytes[unit * passHashRanges + i] + (bits + CHAR_BIT - 1) / CHAR_BIT;
-                hashRangeAnswerSizes[i] += answerSizes[unit * passHashRanges + i];
-            }
-        }
-        // the answers of the hash ranges in sub passes that fit next to the pass, a flush per sub pass
-        std::vector<size_t> subPassOffsets;
-        std::vector<size_t> subPassSizes;
-        planPasses(hashRangeAnswerSizes, ownerMemory - std::min(ownerMemory, passSizes[pass]), subPassOffsets, subPassSizes);
-        for (size_t subPass = 0; subPass + 1 < subPassOffsets.size(); subPass++) {
-            timer.reset();
-            size_t subPassFirst = subPassOffsets[subPass];
-            size_t subPassHashRanges = subPassOffsets[subPass + 1] - subPassFirst;
-            // answers unit by unit
-            std::vector<size_t> answerOffsets(unitCount * subPassHashRanges + 1, 0);
-            for (size_t unit = 0; unit < unitCount; unit++) {
-                for (size_t i = 0; i < subPassHashRanges; i++) {
-                    answerOffsets[unit * subPassHashRanges + i + 1] = answerOffsets[unit * subPassHashRanges + i] + answerSizes[unit * passHashRanges + subPassFirst + i];
-                }
-            }
-            // not zero filled, only the pages of the written answers are touched
-            char *answers = new(std::nothrow) char[answerOffsets.back() + sizeof(uint64_t)];
-            Util::checkAllocation(answers, "Can not allocate answers memory in answerHashRanges");
-            for (size_t unit = 0; unit < unitCount; unit++) {
-                for (size_t i = 0; i < subPassHashRanges; i++) {
-                    size_t row = unit * passHashRanges + subPassFirst + i;
-                    size_t answer = unit * subPassHashRanges + i;
-                    rows[row].answer = KmerCodeWriter(answers, answerOffsets[answer + 1], answerOffsets[answer] + answerSizeBytes[row]);
-                }
-            }
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-            for (size_t i = subPassFirst; i < subPassFirst + subPassHashRanges; i++) {
-                std::vector<PrefRowRead *> hashRangeRows;
-                for (size_t unit = 0; unit < unitCount; unit++) {
-                    hashRangeRows.push_back(&rows[unit * passHashRanges + i]);
-                }
-                answerHashRange(firstHashRange + passFirst + i, hashRangeRows);
-                for (size_t unit = 0; unit < unitCount; unit++) {
-                    KmerCodeWriter &answer = hashRangeRows[unit]->answer;
-                    endCodeBits(answer);
-                    if (answerSizeBytes[unit * passHashRanges + i] > 0) {
-                        uint64_t size = answer.bufferPos;
-                        memcpy(answer.buffer - sizeof(uint64_t), &size, sizeof(uint64_t));
-                    }
-                }
-            }
-            answerSeconds += timer.getTimediff();
-            timer.reset();
-            // the answers of a unit to the hash ranges of the sub pass are adjacent in the file, moved down in the space of the unit and written behind
-            size_t flushStart = writer.flushOffsets.size();
-            size_t flushEnd = writer.size;
-            for (size_t unit = 0; unit < unitCount; unit++) {
-                writer.flushOffsets.push_back(flushEnd);
-                for (size_t i = 0; i < subPassHashRanges; i++) {
-                    size_t row = unit * passHashRanges + subPassFirst + i;
-                    flushEnd += answerSizeBytes[row] + rows[row].answer.bufferPos;
-                }
-            }
-            writer.flushOffsets.push_back(flushEnd);
-            writer.startFlush(flushEnd - writer.size, &batchWriter);
-            writer.size = flushEnd;
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-            for (size_t unit = 0; unit < unitCount; unit++) {
-                char *unitAnswers = answers + answerOffsets[unit * subPassHashRanges];
-                size_t answerSize = 0;
-                for (size_t i = 0; i < subPassHashRanges; i++) {
-                    size_t row = unit * passHashRanges + subPassFirst + i;
-                    size_t size = answerSizeBytes[row] + rows[row].answer.bufferPos;
-                    memmove(unitAnswers + answerSize, answers + answerOffsets[unit * subPassHashRanges + i], size);
-                    answerSize += size;
-                }
-                batchWriter.write(fileno(writer.file), writer.partName.c_str(), unitAnswers, answerSize, writer.getPartOffset(writer.flushOffsets[flushStart + unit]));
-            }
-            delete[] answers;
-            writeSeconds += timer.getTimediff();
-        }
-    }
-    timer.reset();
-    batchWriter.waitWrites();
-    writeSeconds += timer.getTimediff();
-    punches.wait();
-    closePrefExchangeFiles(parts);
-    std::string sent = sentPrefix.substr(par.db2.size() + 1);
-    MMseqsNode::addPhaseSeconds(phaseValues, "reading " + sent, readSeconds);
-    MMseqsNode::addPhaseSeconds(phaseValues, "answering " + sent, answerSeconds);
-    MMseqsNode::addPhaseSeconds(phaseValues, "writing " + answerPrefix.substr(par.db2.size() + 1), writeSeconds);
-    return writer.publish(unitCount + 1, 0);
-}
-
-// the rows by value, smallest on top; the top row moves on to its next value in place
 static void siftDownRowValue(std::vector<RowValue> &heap, size_t pos) {
     RowValue moved = heap[pos];
     for (size_t child = 2 * pos + 1; child < heap.size(); child = 2 * pos + 1) {
@@ -3745,24 +3573,37 @@ static void siftDownRowValue(std::vector<RowValue> &heap, size_t pos) {
     heap[pos] = moved;
 }
 
-// owner 1: a mark per fingerprint of a row, set if another unit has the fingerprint
-static void markFingerprints(const TargetPref &pref, size_t hashRange, std::vector<PrefRowRead *> &rows) {
+static bool startRowValue(const KeySplitPref &pref, size_t hashRange, unsigned int shift, size_t kind, PrefRowRead &read) {
+    read.groupsLeft = read.groupCounts[kind];
+    read.lowBits = getRowLowBits(pref, hashRange, shift, read.groupsLeft);
+    read.value = getRowFirstValue(pref, hashRange, shift);
+    if (read.groupsLeft == 0) {
+        return false;
+    }
+    read.value += getRice(read.reader, read.lowBits);
+    return true;
+}
+
+static bool nextRowValue(PrefRowRead &read) {
+    if (--read.groupsLeft == 0) {
+        return false;
+    }
+    read.value += getRice(read.reader, read.lowBits) + 1;
+    return true;
+}
+
+static void markFingerprints(const KeySplitPref &pref, size_t hashRange, std::vector<PrefRowRead *> &rows) {
     std::vector<RowValue> heap;
     std::vector<unsigned int> valueRows;
     for (size_t kind = 0; kind < GROUP_KINDS; kind++) {
         unsigned int shift = pref.fingerprintShifts[kind];
         heap.clear();
         for (size_t row = 0; row < rows.size(); row++) {
-            PrefRowRead &read = *rows[row];
-            read.groupsLeft = read.groupCounts[kind];
-            read.lowBits = getRowLowBits(pref, hashRange, shift, read.groupsLeft);
-            read.value = getRowFirstValue(pref, hashRange, shift);
-            if (read.groupsLeft > 0) {
-                read.value += getRice(read.reader, read.lowBits);
-                heap.push_back(RowValue(read.value, row));
+            if (startRowValue(pref, hashRange, shift, kind, *rows[row])) {
+                heap.push_back(RowValue(rows[row]->value, row));
             }
         }
-        // RowValue orders a max heap by the smallest value
+        // RowValue::operator< makes this a min heap
         std::make_heap(heap.begin(), heap.end());
         while (heap.empty() == false) {
             uint64_t value = heap[0].value;
@@ -3770,8 +3611,7 @@ static void markFingerprints(const TargetPref &pref, size_t hashRange, std::vect
             while (heap.empty() == false && heap[0].value == value) {
                 PrefRowRead &read = *rows[heap[0].row];
                 valueRows.push_back(heap[0].row);
-                if (--read.groupsLeft > 0) {
-                    read.value += getRice(read.reader, read.lowBits) + 1;
+                if (nextRowValue(read)) {
                     heap[0].value = read.value;
                 } else {
                     heap[0] = heap.back();
@@ -3788,13 +3628,13 @@ static void markFingerprints(const TargetPref &pref, size_t hashRange, std::vect
     }
 }
 
-struct UnitMarks {
+struct FingerprintMarks {
     std::vector<char> data;
     std::vector<size_t> rowOffsets;
 
-    void init(const TargetPref &pref, size_t ownUnit) {
+    void init(const KeySplitPref &pref, size_t ownKeySplit) {
         rowOffsets.assign(pref.hashRangeCount + 1, 0);
-        const size_t *counts = pref.fingerprintCounts.data() + ownUnit * pref.hashRangeCount * GROUP_KINDS;
+        const size_t *counts = pref.fingerprintCounts.data() + ownKeySplit * pref.hashRangeCount * GROUP_KINDS;
         for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
             size_t fingerprintCount = counts[hashRange * GROUP_KINDS] + counts[hashRange * GROUP_KINDS + 1];
             rowOffsets[hashRange + 1] = rowOffsets[hashRange] + (fingerprintCount + CHAR_BIT - 1) / CHAR_BIT;
@@ -3833,7 +3673,7 @@ struct MarkedGroups {
     uint64_t fingerprint;
 };
 
-static void collectNeededGroups(const TargetPref &pref, const PackedKmerPosition *kmers, const std::vector<size_t> *rangeOffsets, const UnitMarks &marks,
+static void collectNeededGroups(const KeySplitPref &pref, const PackedKmerPosition *kmers, const std::vector<size_t> *rangeOffsets, const FingerprintMarks &marks,
                                 size_t hashRange, std::vector<std::pair<size_t, size_t> > *neededGroups) {
     size_t rowOffset = marks.rowOffsets[hashRange];
     KmerCodeReader marksRead = getMemoryCodeReader((char *) marks.data.data() + rowOffset, marks.rowOffsets[hashRange + 1] - rowOffset);
@@ -3853,14 +3693,12 @@ static void collectNeededGroups(const TargetPref &pref, const PackedKmerPosition
     }
 }
 
-// the needed groups of the hash ranges of a unit. The lists of all hash ranges are held from the first walk if an entry per k-mer, twice for the growth of the lists,
-// fits next to the held memory, the rest of the needed groups reserve and the marks; else the first walk counts the groups in the lists of its thread, holdIfFits
-// holds them from the next walk on if their counts fit next to the rows of the unit, else every walk collects a hash range again
+// held from the first walk if they fit, else held by holdIfFits or collected again in every walk
 struct NeededGroupLists {
-    NeededGroupLists(const Parameters &par, const TargetPref &pref, const UnitKmers &unitKmers, const UnitMarks &marks) : pref(pref), unitKmers(unitKmers), marks(marks) {
-        size_t kmerCount = unitKmers.rangeOffsets[WHOLE_SEQUENCE_GROUPS][pref.hashRangeCount] - unitKmers.rangeOffsets[KMER_GROUPS][0];
+    NeededGroupLists(const Parameters &par, const KeySplitPref &pref, const KeySplitKmers &keySplitKmers, const FingerprintMarks &marks) : pref(pref), keySplitKmers(keySplitKmers), marks(marks) {
+        size_t kmerCount = keySplitKmers.rangeOffsets[WHOLE_SEQUENCE_GROUPS][pref.hashRangeCount] - keySplitKmers.rangeOffsets[KMER_GROUPS][0];
         isHeld = 2 * kmerCount * sizeof(std::pair<size_t, size_t>) + getHeldMemory(pref) + (pref.neededLimit - std::min(pref.neededLimit, pref.neededSize)) + marks.data.size()
-                 <= pref.unitMemory;
+                 <= pref.keySplitMemory;
         lists.resize((isHeld ? pref.hashRangeCount : par.threads) * GROUP_SEGMENTS);
         isCollected.assign(isHeld ? pref.hashRangeCount : 0, false);
         groupCounts.resize(isHeld ? 0 : pref.hashRangeCount * GROUP_SEGMENTS);
@@ -3873,7 +3711,7 @@ struct NeededGroupLists {
                 for (size_t segment = 0; segment < GROUP_SEGMENTS && groupCounts.empty() == false; segment++) {
                     groups[segment].reserve(groupCounts[hashRange * GROUP_SEGMENTS + segment]);
                 }
-                collectNeededGroups(pref, unitKmers.kmers, unitKmers.rangeOffsets, marks, hashRange, groups);
+                collectNeededGroups(pref, keySplitKmers.kmers, keySplitKmers.rangeOffsets, marks, hashRange, groups);
                 isCollected[hashRange] = true;
             }
             return groups;
@@ -3883,7 +3721,7 @@ struct NeededGroupLists {
         thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
         std::vector<std::pair<size_t, size_t> > *groups = lists.data() + thread_idx * GROUP_SEGMENTS;
-        collectNeededGroups(pref, unitKmers.kmers, unitKmers.rangeOffsets, marks, hashRange, groups);
+        collectNeededGroups(pref, keySplitKmers.kmers, keySplitKmers.rangeOffsets, marks, hashRange, groups);
         for (size_t segment = 0; segment < GROUP_SEGMENTS; segment++) {
             groupCounts[hashRange * GROUP_SEGMENTS + segment] = groups[segment].size();
         }
@@ -3895,7 +3733,7 @@ struct NeededGroupLists {
         for (size_t i = 0; i < groupCounts.size(); i++) {
             listSize += groupCounts[i] * sizeof(std::pair<size_t, size_t>);
         }
-        if (isHeld || listSize + getHeldMemory(pref) + rowSize + marks.data.size() > pref.unitMemory) {
+        if (isHeld || listSize + getHeldMemory(pref) + rowSize + marks.data.size() > pref.keySplitMemory) {
             return;
         }
         std::vector<std::vector<std::pair<size_t, size_t> > >().swap(lists);
@@ -3904,23 +3742,23 @@ struct NeededGroupLists {
         isHeld = true;
     }
 
-    const TargetPref &pref;
-    const UnitKmers &unitKmers;
-    const UnitMarks &marks;
+    const KeySplitPref &pref;
+    const KeySplitKmers &keySplitKmers;
+    const FingerprintMarks &marks;
     bool isHeld;
     std::vector<std::vector<std::pair<size_t, size_t> > > lists;
     std::vector<char> isCollected;
     std::vector<size_t> groupCounts;
 };
 
-static std::vector<BatchReader::ReadRequest> readUnitMarks(const TargetPref &pref, const std::vector<PrefExchangeFile> &files, const PrefExchangeParts &parts, size_t ownUnit,
-                                                           UnitMarks &marks, BatchReader &batchReader) {
-    marks.init(pref, ownUnit);
-    return readUnitAnswers(files, parts, getOwnUnit(pref, ownUnit), marks.data, batchReader);
+static std::vector<BatchReader::ReadRequest> readFingerprintMarks(const KeySplitPref &pref, const std::vector<PrefExchangeFile> &files, const PrefExchangeParts &parts, size_t ownKeySplit,
+                                                           FingerprintMarks &marks, BatchReader &batchReader) {
+    marks.init(pref, ownKeySplit);
+    return readKeySplitAnswers(files, parts, getKeySplitIndex(pref, ownKeySplit), marks.data, batchReader);
 }
 
 // writer NULL: count the bits only
-static size_t putCandidateRow(const KmerExchange &exchange, const TargetPref &pref, const PrefUnit &unit, const PackedKmerPosition *kmers,
+static size_t putCandidateRow(const KmerExchange &exchange, const KeySplitPref &pref, const KeySplit &keySplit, const PackedKmerPosition *kmers,
                               const std::vector<std::pair<size_t, size_t> > *sentGroups, size_t hashRange, KmerCodeWriter *writer) {
     size_t sentCounts[GROUP_KINDS] = {sentGroups[KMER_GROUPS].size(), sentGroups[WHOLE_SEQUENCE_GROUPS].size()};
     if (sentCounts[KMER_GROUPS] + sentCounts[WHOLE_SEQUENCE_GROUPS] == 0) {
@@ -3945,7 +3783,7 @@ static size_t putCandidateRow(const KmerExchange &exchange, const TargetPref &pr
             for (size_t pos = groupStart + 1; kind == KMER_GROUPS && pos < groupEnd; pos++) {
                 candidateCount += (kmers[pos].getAdjKey() != kmers[pos - 1].getAdjKey());
             }
-            bits += getRiceSize(gap, lowBits) + 1 + candidateCount * unit.idBits;
+            bits += getRiceSize(gap, lowBits) + 1 + candidateCount * keySplit.idBits;
             if (kind == KMER_GROUPS) {
                 bits += getEliasGammaSize(candidateCount) + candidateCount * exchange.adjKeyCodeBits;
             }
@@ -3962,7 +3800,7 @@ static size_t putCandidateRow(const KmerExchange &exchange, const TargetPref &pr
                     if (kind == KMER_GROUPS) {
                         putAdjKeyCode(*writer, exchange, kmers[pos].getAdjKey());
                     }
-                    putBits(*writer, kmers[pos].getId(), unit.idBits);
+                    putBits(*writer, kmers[pos].getId(), keySplit.idBits);
                 }
             }
         }
@@ -3980,7 +3818,7 @@ struct GroupCandidate {
 };
 
 // writer NULL: count the bits only
-static size_t putNeededRow(const KmerExchange &exchange, const PrefUnit &unit, const PackedKmerPosition *kmers,
+static size_t putNeededRow(const KmerExchange &exchange, const KeySplit &keySplit, const PackedKmerPosition *kmers,
                            const std::vector<std::pair<size_t, size_t> > *groups, KmerCodeWriter *writer) {
     size_t groupCount = 0;
     for (size_t segment = 0; segment < GROUP_SEGMENTS; segment++) {
@@ -4019,11 +3857,11 @@ static size_t putNeededRow(const KmerExchange &exchange, const PrefUnit &unit, c
                 SORT_SERIAL(members.begin(), members.end());
             }
             members.erase(std::unique(members.begin(), members.end()), members.end());
-            bits += getEliasGammaSize(members.size()) + members.size() * unit.idBits;
+            bits += getEliasGammaSize(members.size()) + members.size() * keySplit.idBits;
             if (writer != NULL) {
                 putEliasGamma(*writer, members.size());
                 for (size_t member = 0; member < members.size(); member++) {
-                    putBits(*writer, members[member], unit.idBits);
+                    putBits(*writer, members[member], keySplit.idBits);
                 }
             }
             if (segment != SENT_KMER_GROUPS && segment != LOCAL_KMER_GROUPS) {
@@ -4061,8 +3899,7 @@ static size_t putNeededRow(const KmerExchange &exchange, const PrefUnit &unit, c
     return bits;
 }
 
-// the needed group rows of an own unit with neededBits[hashRange] bits: in memory while those of all units fit, else in the spill file, else none
-static void storeNeededGroups(const Parameters &par, const KmerExchange &exchange, TargetPref &pref, NeededGroups &needed, const PrefUnit &unit,
+static void storeNeededGroups(const Parameters &par, const KmerExchange &exchange, KeySplitPref &pref, NeededGroups &needed, const KeySplit &keySplit,
                               const PackedKmerPosition *kmers, NeededGroupLists &groups, const std::vector<size_t> &neededBits, bool isPass3, BatchWriter &batchWriter) {
     std::vector<size_t> rowOffsets(pref.hashRangeCount + 1, 0);
     for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
@@ -4074,7 +3911,6 @@ static void storeNeededGroups(const Parameters &par, const KmerExchange &exchang
         if (neededSpill.nodes == 0) {
             continue;
         }
-        // SIZE_MAX if statvfs failed
         size_t freeSize = FileUtil::getFreeSpace(neededSpill.directory.c_str());
         if (freeSize == SIZE_MAX || 2 * size * neededSpill.nodes > freeSize) {
             std::string problem = "Cannot keep the needed groups in " + ((spill == LOCAL_SPILL) ? "--local-tmp " : std::string("the shared folder ")) + neededSpill.directory + ": "
@@ -4092,8 +3928,8 @@ static void storeNeededGroups(const Parameters &par, const KmerExchange &exchang
         }
         needed.spill = spill;
         needed.spillOffset = neededSpill.size;
-        writeUnitRows(par, pref, neededSpill.file, neededSpill.name, neededSpill.size, needed.rowOffsets, 0, neededBits, batchWriter, [&](size_t hashRange, KmerCodeWriter &writer) {
-            putNeededRow(exchange, unit, kmers, groups.get(hashRange), &writer);
+        writeKeySplitRows(par, pref, neededSpill.file, neededSpill.name, neededSpill.size, needed.rowOffsets, 0, neededBits, batchWriter, [&](size_t hashRange, KmerCodeWriter &writer) {
+            putNeededRow(exchange, keySplit, kmers, groups.get(hashRange), &writer);
         });
         return;
     }
@@ -4109,13 +3945,13 @@ static void storeNeededGroups(const Parameters &par, const KmerExchange &exchang
             continue;
         }
         KmerCodeWriter writer(needed.data.data(), needed.rowOffsets[hashRange + 1], needed.rowOffsets[hashRange]);
-        putNeededRow(exchange, unit, kmers, groups.get(hashRange), &writer);
+        putNeededRow(exchange, keySplit, kmers, groups.get(hashRange), &writer);
         endCodeBits(writer);
     }
 }
 
 template <typename T, bool includeAdjacency, typename L>
-static std::string sendCandidates(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, TargetPref &pref,
+static std::string sendCandidates(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, KeySplitPref &pref,
                                   const std::vector<PrefExchangeFile> &markFiles, double &extractSeconds, size_t &sentSize) {
     PrefExchangeWriter writer(par.db2 + ".candidates." + SSTR(MMseqsNode::rank));
     BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(writer.file));
@@ -4124,38 +3960,38 @@ static std::string sendCandidates(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     BackgroundRemoval punches;
     std::vector<size_t> rowBits(pref.hashRangeCount);
     std::vector<size_t> neededBits(pref.hashRangeCount);
-    UnitMarks marks;
-    pref.neededGroups.resize(pref.sendSplitUnitOffsets.back());
+    FingerprintMarks marks;
+    pref.neededGroups.resize(pref.sendSplitKeySplitOffsets.back());
     for (size_t i = 0; i < pref.sendSplits.size(); i++) {
         setSendSplit(par, exchange, pref.sendSplits[i]);
-        for (size_t ownUnit = pref.sendSplitUnitOffsets[i]; ownUnit < pref.sendSplitUnitOffsets[i + 1]; ownUnit++) {
-            const PrefUnit &unit = pref.units[getOwnUnit(pref, ownUnit)];
-            std::vector<BatchReader::ReadRequest> markReads = readUnitMarks(pref, markFiles, markParts, ownUnit, marks, batchReader);
-            const UnitKmers &unitKmers = getUnitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, unit, ownUnit, extractSeconds);
-            const PackedKmerPosition *kmers = unitKmers.kmers;
-            NeededGroupLists groups(par, pref, unitKmers, marks);
+        for (size_t ownKeySplit = pref.sendSplitKeySplitOffsets[i]; ownKeySplit < pref.sendSplitKeySplitOffsets[i + 1]; ownKeySplit++) {
+            const KeySplit &keySplit = pref.keySplits[getKeySplitIndex(pref, ownKeySplit)];
+            std::vector<BatchReader::ReadRequest> markReads = readFingerprintMarks(pref, markFiles, markParts, ownKeySplit, marks, batchReader);
+            const KeySplitKmers &keySplitKmers = getKeySplitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, keySplit, ownKeySplit, extractSeconds);
+            const PackedKmerPosition *kmers = keySplitKmers.kmers;
+            NeededGroupLists groups(par, pref, keySplitKmers, marks);
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
             for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
                 const std::vector<std::pair<size_t, size_t> > *neededGroups = groups.get(hashRange);
-                rowBits[hashRange] = putCandidateRow(exchange, pref, unit, kmers, neededGroups, hashRange, NULL);
-                neededBits[hashRange] = putNeededRow(exchange, unit, kmers, neededGroups, NULL);
+                rowBits[hashRange] = putCandidateRow(exchange, pref, keySplit, kmers, neededGroups, hashRange, NULL);
+                neededBits[hashRange] = putNeededRow(exchange, keySplit, kmers, neededGroups, NULL);
             }
             size_t neededRowSize = 0;
             for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
                 neededRowSize += (neededBits[hashRange] + CHAR_BIT - 1) / CHAR_BIT;
             }
             groups.holdIfFits((pref.neededSize + neededRowSize <= pref.neededLimit) ? neededRowSize : 0);
-            writeUnitFlush(par, pref, writer, rowBits, batchWriter, [&](size_t hashRange, KmerCodeWriter &writer) {
-                putCandidateRow(exchange, pref, unit, kmers, groups.get(hashRange), hashRange, &writer);
+            writeKeySplitFlush(par, pref, writer, rowBits, batchWriter, [&](size_t hashRange, KmerCodeWriter &writer) {
+                putCandidateRow(exchange, pref, keySplit, kmers, groups.get(hashRange), hashRange, &writer);
             });
-            storeNeededGroups(par, exchange, pref, pref.neededGroups[ownUnit], unit, kmers, groups, neededBits, false, batchWriter);
-            // a unit extracted again in pass 3 reads its marks again
-            if (pref.neededGroups[ownUnit].data.empty() == false || pref.neededGroups[ownUnit].spillOffset != SIZE_MAX) {
+            storeNeededGroups(par, exchange, pref, pref.neededGroups[ownKeySplit], keySplit, kmers, groups, neededBits, false, batchWriter);
+            // pass 3 reads the marks again if extracting again
+            if (pref.neededGroups[ownKeySplit].data.empty() == false || pref.neededGroups[ownKeySplit].spillOffset != SIZE_MAX) {
                 punches.punch(markReads);
             }
-            if (pref.keptUnits[ownUnit].kmers != NULL) {
-                delete[] pref.keptUnits[ownUnit].kmers;
-                pref.keptUnits[ownUnit].kmers = NULL;
+            if (pref.keptKeySplits[ownKeySplit].kmers != NULL) {
+                delete[] pref.keptKeySplits[ownKeySplit].kmers;
+                pref.keptKeySplits[ownKeySplit].kmers = NULL;
             }
         }
     }
@@ -4164,13 +4000,13 @@ static std::string sendCandidates(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     batchWriter.waitWrites();
     punches.wait();
     closePrefExchangeFiles(markParts);
-    // the units extracted again in pass 3 read their marks again
-    size_t extractedUnits = 0;
-    for (size_t unit = 0; unit < pref.neededGroups.size(); unit++) {
-        extractedUnits += pref.neededGroups[unit].data.empty() && pref.neededGroups[unit].spill == SPILL_KINDS;
+    // these read their marks again in pass 3
+    size_t extractedKeySplits = 0;
+    for (size_t keySplit = 0; keySplit < pref.neededGroups.size(); keySplit++) {
+        extractedKeySplits += pref.neededGroups[keySplit].data.empty() && pref.neededGroups[keySplit].spill == SPILL_KINDS;
     }
     sentSize = writer.size;
-    return writer.publish(pref.hashRangeCount + 1, extractedUnits);
+    return writer.publish(pref.hashRangeCount + 1, extractedKeySplits);
 }
 
 static size_t getRepAnswerBits(const KmerExchange &exchange, const size_t *groupCounts) {
@@ -4192,7 +4028,7 @@ static void putRepAnswer(KmerCodeWriter &answer, const std::vector<DBKeyType> &r
     }
 }
 
-static void pickReps(const KmerExchange &exchange, const TargetPref &pref, size_t hashRange, std::vector<PrefRowRead *> &rows) {
+static void pickReps(const KmerExchange &exchange, const KeySplitPref &pref, size_t hashRange, std::vector<PrefRowRead *> &rows) {
     unsigned int thread_idx = 0;
 #ifdef OPENMP
     thread_idx = static_cast<unsigned int>(omp_get_thread_num());
@@ -4214,13 +4050,8 @@ static void pickReps(const KmerExchange &exchange, const TargetPref &pref, size_
         unsigned int shift = pref.codeShifts[kind];
         RowValueQueue queue;
         for (size_t row = 0; row < rows.size(); row++) {
-            PrefRowRead &read = *rows[row];
-            read.groupsLeft = read.groupCounts[kind];
-            read.lowBits = getRowLowBits(pref, hashRange, shift, read.groupsLeft);
-            read.value = getRowFirstValue(pref, hashRange, shift);
-            if (read.groupsLeft > 0) {
-                read.value += getRice(read.reader, read.lowBits);
-                queue.push(RowValue(read.value, row));
+            if (startRowValue(pref, hashRange, shift, kind, *rows[row])) {
+                queue.push(RowValue(rows[row]->value, row));
             }
         }
         while (queue.empty() == false) {
@@ -4244,10 +4075,10 @@ static void pickReps(const KmerExchange &exchange, const TargetPref &pref, size_
             if (rowCandidateOffsets.back() <= candidateCapacity) {
                 for (size_t i = 0; i < valueRows.size(); i++) {
                     PrefRowRead &read = *rows[valueRows[i]];
-                    const PrefUnit &unit = pref.units[read.unit];
+                    const KeySplit &keySplit = pref.keySplits[read.keySplit];
                     for (size_t j = rowCandidateOffsets[i]; j < rowCandidateOffsets[i + 1]; j++) {
                         candidates[j].adjKey = (kind == WHOLE_SEQUENCE_GROUPS) ? 0 : getAdjKeyCode(read.reader, exchange);
-                        candidates[j].id = unit.firstKey + getBits(read.reader, unit.idBits);
+                        candidates[j].id = keySplit.firstKey + getBits(read.reader, keySplit.idBits);
                     }
                 }
                 size_t candidateCount = rowCandidateOffsets.back();
@@ -4281,9 +4112,9 @@ static void pickReps(const KmerExchange &exchange, const TargetPref &pref, size_
                 if (hasTwoMembers && kind == WHOLE_SEQUENCE_GROUPS) {
                     DBKeyType rep = 0;
                     for (size_t i = 0; i < valueRows.size(); i++) {
-                        const PrefUnit &unit = pref.units[rows[valueRows[i]]->unit];
+                        const KeySplit &keySplit = pref.keySplits[rows[valueRows[i]]->keySplit];
                         KmerCodeReader candidateRead = candidateStarts[i];
-                        DBKeyType id = unit.firstKey + getBits(candidateRead, unit.idBits);
+                        DBKeyType id = keySplit.firstKey + getBits(candidateRead, keySplit.idBits);
                         rep = (i == 0) ? id : std::min(rep, id);
                     }
                     reps.push_back(rep);
@@ -4291,7 +4122,7 @@ static void pickReps(const KmerExchange &exchange, const TargetPref &pref, size_
                     // in key split order the candidates come by (adjKey, id)
                     rowOrder.clear();
                     for (size_t i = 0; i < valueRows.size(); i++) {
-                        rowOrder.push_back(std::make_pair(pref.units[rows[valueRows[i]]->unit].firstKey, i));
+                        rowOrder.push_back(std::make_pair(pref.keySplits[rows[valueRows[i]]->keySplit].firstKey, i));
                     }
                     SORT_SERIAL(rowOrder.begin(), rowOrder.end());
                     candidateReads.resize(rowOrder.size());
@@ -4308,8 +4139,8 @@ static void pickReps(const KmerExchange &exchange, const TargetPref &pref, size_
                         while (adjKeyQueue.empty() == false) {
                             RowValue candidate = adjKeyQueue.top();
                             adjKeyQueue.pop();
-                            const PrefUnit &unit = pref.units[rows[valueRows[rowOrder[candidate.row].second]]->unit];
-                            DBKeyType id = unit.firstKey + getBits(candidateReads[candidate.row], unit.idBits);
+                            const KeySplit &keySplit = pref.keySplits[rows[valueRows[rowOrder[candidate.row].second]]->keySplit];
+                            DBKeyType id = keySplit.firstKey + getBits(candidateReads[candidate.row], keySplit.idBits);
                             visit(static_cast<unsigned int>(candidate.value), id);
                             if (--candidatesLeft[candidate.row] > 0) {
                                 adjKeyQueue.push(RowValue(getAdjKeyCode(candidateReads[candidate.row], exchange), candidate.row));
@@ -4319,14 +4150,14 @@ static void pickReps(const KmerExchange &exchange, const TargetPref &pref, size_
                 }
                 for (size_t i = 0; i < valueRows.size(); i++) {
                     PrefRowRead &read = *rows[valueRows[i]];
-                    const PrefUnit &unit = pref.units[read.unit];
+                    const KeySplit &keySplit = pref.keySplits[read.keySplit];
                     size_t rowCandidateCount = rowCandidateOffsets[i + 1] - rowCandidateOffsets[i];
                     repIndexes.assign(reps.size(), SIZE_MAX);
                     for (size_t j = 0; j < rowCandidateCount; j++) {
                         if (kind == KMER_GROUPS) {
                             getAdjKeyCode(read.reader, exchange);
                         }
-                        DBKeyType id = unit.firstKey + getBits(read.reader, unit.idBits);
+                        DBKeyType id = keySplit.firstKey + getBits(read.reader, keySplit.idBits);
                         for (size_t rep = 0; rep < reps.size(); rep++) {
                             if (repIndexes[rep] == SIZE_MAX && id == reps[rep]) {
                                 repIndexes[rep] = j;
@@ -4338,8 +4169,7 @@ static void pickReps(const KmerExchange &exchange, const TargetPref &pref, size_
             }
             for (size_t i = 0; i < valueRows.size(); i++) {
                 PrefRowRead &read = *rows[valueRows[i]];
-                if (--read.groupsLeft > 0) {
-                    read.value += getRice(read.reader, read.lowBits) + 1;
+                if (nextRowValue(read)) {
                     queue.push(RowValue(read.value, valueRows[i]));
                 }
             }
@@ -4347,16 +4177,199 @@ static void pickReps(const KmerExchange &exchange, const TargetPref &pref, size_
     }
 }
 
-// encodes whole rep cells of a unit file: per cell a 0 terminated entry, per rep the rep gap, the size class (0, the class files hold it), the target gaps and 0;
-// pieces holds the piece counts of the cells, pieceCells their cells and starts
-struct CellWriter {
+static std::string answerHashRanges(const Parameters &par, const KmerExchange &exchange, const KeySplitPref &pref, const std::string &sentPrefix, const std::vector<PrefExchangeFile> &sentFiles,
+                                    const std::string &answerPrefix, bool isPickingReps, size_t &receivedSize, std::string &phaseValues) {
+    size_t memoryLimit = exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, getHeldMemory(pref));
+    size_t firstHashRange = pref.hashRangeNodeOffsets[MMseqsNode::rank];
+    size_t ownHashRanges = pref.hashRangeNodeOffsets[MMseqsNode::rank + 1] - firstHashRange;
+    size_t keySplitCount = pref.keySplits.size();
+    PrefExchangeParts parts = openPrefExchangeFiles(sentPrefix, sentFiles);
+    // read the own table columns
+    std::vector<size_t> rowOffsets(keySplitCount * (ownHashRanges + 1));
+    for (size_t node = 0; node < sentFiles.size(); node++) {
+        size_t flushCount = sentFiles[node].flushCount;
+        std::vector<size_t> table((ownHashRanges + 1) * flushCount);
+        BatchReader::ReadRequest tableRead = parts.getRead(sentFiles[node], node, (char *) table.data(), sentFiles[node].tableOffset + firstHashRange * flushCount * sizeof(size_t),
+                                                           table.size() * sizeof(size_t));
+        FileUtil::preadAll(tableRead.fileToRead, tableRead.fileName, tableRead.destination, tableRead.bytesToRead, tableRead.fileOffset);
+        for (size_t flush = 0; flush < flushCount; flush++) {
+            for (size_t i = 0; i <= ownHashRanges; i++) {
+                rowOffsets[(pref.nodeKeySplitOffsets[node] + flush) * (ownHashRanges + 1) + i] = table[i * flushCount + flush];
+            }
+        }
+    }
+    // per row a PrefRowRead and three sizes
+    std::vector<size_t> hashRangeSizes(ownHashRanges, keySplitCount * (sizeof(PrefRowRead) + 3 * sizeof(size_t)));
+    for (size_t keySplit = 0; keySplit < keySplitCount; keySplit++) {
+        for (size_t i = 0; i < ownHashRanges; i++) {
+            hashRangeSizes[i] += rowOffsets[keySplit * (ownHashRanges + 1) + i + 1] - rowOffsets[keySplit * (ownHashRanges + 1) + i];
+        }
+    }
+    // two PrefRowRead per key split and thread
+    size_t fixedMemory = rowOffsets.size() * sizeof(size_t) + 2 * par.threads * keySplitCount * sizeof(PrefRowRead);
+    size_t answerMemory = memoryLimit - std::min(memoryLimit, fixedMemory);
+    std::vector<size_t> passOffsets;
+    std::vector<size_t> passSizes;
+    // half for the rows, half for the answers
+    planPasses(hashRangeSizes, answerMemory / 2, passOffsets, passSizes);
+    PrefExchangeWriter writer(answerPrefix + "." + SSTR(MMseqsNode::rank));
+    BatchReader batchReader(par.threads, fileno(writer.file));
+    BackgroundRemoval punches;
+    // answer a sub pass while the last one is written
+    BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(writer.file));
+    double readSeconds = 0;
+    double answerSeconds = 0;
+    double writeSeconds = 0;
+    Timer timer;
+    for (size_t pass = 0; pass + 1 < passOffsets.size(); pass++) {
+        size_t passFirst = passOffsets[pass];
+        size_t passEnd = passOffsets[pass + 1];
+        size_t passHashRanges = passEnd - passFirst;
+
+        // read the rows of a pass, one read per key split
+        std::vector<size_t> keySplitDataOffsets(keySplitCount + 1, 0);
+        for (size_t keySplit = 0; keySplit < keySplitCount; keySplit++) {
+            const size_t *offsets = rowOffsets.data() + keySplit * (ownHashRanges + 1);
+            keySplitDataOffsets[keySplit + 1] = keySplitDataOffsets[keySplit] + offsets[passEnd] - offsets[passFirst];
+        }
+        timer.reset();
+        std::vector<char> rowData(keySplitDataOffsets[keySplitCount] + sizeof(uint64_t));
+        std::vector<BatchReader::ReadRequest> readRequests;
+        for (size_t node = 0; node < sentFiles.size(); node++) {
+            for (size_t keySplit = pref.nodeKeySplitOffsets[node]; keySplit < pref.nodeKeySplitOffsets[node + 1]; keySplit++) {
+                const size_t *offsets = rowOffsets.data() + keySplit * (ownHashRanges + 1);
+                size_t readSize = offsets[passEnd] - offsets[passFirst];
+                if (readSize > 0) {
+                    readRequests.push_back(parts.getRead(sentFiles[node], node, rowData.data() + keySplitDataOffsets[keySplit], offsets[passFirst], readSize));
+                }
+            }
+        }
+        if (readRequests.empty() == false) {
+            batchReader.readSync(readRequests);
+        }
+        readSeconds += timer.getTimediff();
+        // every row is read once
+        punches.punch(readRequests);
+        receivedSize += keySplitDataOffsets[keySplitCount];
+        std::vector<PrefRowRead> rows(keySplitCount * passHashRanges);
+        std::vector<size_t> answerSizes(keySplitCount * passHashRanges);
+        std::vector<size_t> sizeFieldSizes(keySplitCount * passHashRanges);
+        std::vector<size_t> hashRangeAnswerSizes(passHashRanges, 0);
+        for (size_t keySplit = 0; keySplit < keySplitCount; keySplit++) {
+            const size_t *offsets = rowOffsets.data() + keySplit * (ownHashRanges + 1);
+            for (size_t i = 0; i < passHashRanges; i++) {
+                PrefRowRead &row = rows[keySplit * passHashRanges + i];
+                row.keySplit = keySplit;
+                row.groupCounts[KMER_GROUPS] = 0;
+                row.groupCounts[WHOLE_SEQUENCE_GROUPS] = 0;
+                if (offsets[passFirst + i + 1] > offsets[passFirst + i]) {
+                    row.reader = getMemoryCodeReader(rowData.data() + keySplitDataOffsets[keySplit] + offsets[passFirst + i] - offsets[passFirst], offsets[passFirst + i + 1] - offsets[passFirst + i]);
+                    row.groupCounts[KMER_GROUPS] = getEliasGamma(row.reader) - 1;
+                    row.groupCounts[WHOLE_SEQUENCE_GROUPS] = getEliasGamma(row.reader) - 1;
+                }
+                size_t bits = isPickingReps ? getRepAnswerBits(exchange, row.groupCounts) : row.groupCounts[KMER_GROUPS] + row.groupCounts[WHOLE_SEQUENCE_GROUPS];
+                sizeFieldSizes[keySplit * passHashRanges + i] = (isPickingReps && row.groupCounts[KMER_GROUPS] + row.groupCounts[WHOLE_SEQUENCE_GROUPS] > 0) ? sizeof(uint64_t) : 0;
+                answerSizes[keySplit * passHashRanges + i] = sizeFieldSizes[keySplit * passHashRanges + i] + (bits + CHAR_BIT - 1) / CHAR_BIT;
+                hashRangeAnswerSizes[i] += answerSizes[keySplit * passHashRanges + i];
+            }
+        }
+
+        // answer in sub passes that fit next to the pass, a flush per sub pass
+        std::vector<size_t> subPassOffsets;
+        std::vector<size_t> subPassSizes;
+        planPasses(hashRangeAnswerSizes, answerMemory - std::min(answerMemory, passSizes[pass]), subPassOffsets, subPassSizes);
+        for (size_t subPass = 0; subPass + 1 < subPassOffsets.size(); subPass++) {
+            timer.reset();
+            size_t subPassFirst = subPassOffsets[subPass];
+            size_t subPassHashRanges = subPassOffsets[subPass + 1] - subPassFirst;
+            std::vector<size_t> answerOffsets(keySplitCount * subPassHashRanges + 1, 0);
+            for (size_t keySplit = 0; keySplit < keySplitCount; keySplit++) {
+                for (size_t i = 0; i < subPassHashRanges; i++) {
+                    answerOffsets[keySplit * subPassHashRanges + i + 1] = answerOffsets[keySplit * subPassHashRanges + i] + answerSizes[keySplit * passHashRanges + subPassFirst + i];
+                }
+            }
+            // not zero filled
+            char *answers = new(std::nothrow) char[answerOffsets.back() + sizeof(uint64_t)];
+            Util::checkAllocation(answers, "Can not allocate answers memory in answerHashRanges");
+            for (size_t keySplit = 0; keySplit < keySplitCount; keySplit++) {
+                for (size_t i = 0; i < subPassHashRanges; i++) {
+                    size_t row = keySplit * passHashRanges + subPassFirst + i;
+                    size_t answer = keySplit * subPassHashRanges + i;
+                    rows[row].answer = KmerCodeWriter(answers, answerOffsets[answer + 1], answerOffsets[answer] + sizeFieldSizes[row]);
+                }
+            }
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+            for (size_t i = subPassFirst; i < subPassFirst + subPassHashRanges; i++) {
+                std::vector<PrefRowRead *> hashRangeRows;
+                for (size_t keySplit = 0; keySplit < keySplitCount; keySplit++) {
+                    hashRangeRows.push_back(&rows[keySplit * passHashRanges + i]);
+                }
+                if (isPickingReps) {
+                    pickReps(exchange, pref, firstHashRange + passFirst + i, hashRangeRows);
+                } else {
+                    markFingerprints(pref, firstHashRange + passFirst + i, hashRangeRows);
+                }
+                for (size_t keySplit = 0; keySplit < keySplitCount; keySplit++) {
+                    KmerCodeWriter &answer = hashRangeRows[keySplit]->answer;
+                    endCodeBits(answer);
+                    if (sizeFieldSizes[keySplit * passHashRanges + i] > 0) {
+                        uint64_t size = answer.bufferPos;
+                        memcpy(answer.buffer - sizeof(uint64_t), &size, sizeof(uint64_t));
+                    }
+                }
+            }
+            answerSeconds += timer.getTimediff();
+            timer.reset();
+            // move the answers of a key split down and write them behind
+            size_t flushStart = writer.flushOffsets.size();
+            size_t flushEnd = writer.size;
+            for (size_t keySplit = 0; keySplit < keySplitCount; keySplit++) {
+                writer.flushOffsets.push_back(flushEnd);
+                for (size_t i = 0; i < subPassHashRanges; i++) {
+                    size_t row = keySplit * passHashRanges + subPassFirst + i;
+                    flushEnd += sizeFieldSizes[row] + rows[row].answer.bufferPos;
+                }
+            }
+            writer.flushOffsets.push_back(flushEnd);
+            writer.startFlush(flushEnd - writer.size, &batchWriter);
+            writer.size = flushEnd;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+            for (size_t keySplit = 0; keySplit < keySplitCount; keySplit++) {
+                char *keySplitAnswers = answers + answerOffsets[keySplit * subPassHashRanges];
+                size_t answerSize = 0;
+                for (size_t i = 0; i < subPassHashRanges; i++) {
+                    size_t row = keySplit * passHashRanges + subPassFirst + i;
+                    size_t size = sizeFieldSizes[row] + rows[row].answer.bufferPos;
+                    memmove(keySplitAnswers + answerSize, answers + answerOffsets[keySplit * subPassHashRanges + i], size);
+                    answerSize += size;
+                }
+                batchWriter.write(fileno(writer.file), writer.partName.c_str(), keySplitAnswers, answerSize, writer.getPartOffset(writer.flushOffsets[flushStart + keySplit]));
+            }
+            delete[] answers;
+            writeSeconds += timer.getTimediff();
+        }
+    }
+    timer.reset();
+    batchWriter.waitWrites();
+    writeSeconds += timer.getTimediff();
+    punches.wait();
+    closePrefExchangeFiles(parts);
+    std::string sent = sentPrefix.substr(par.db2.size() + 1);
+    MMseqsNode::addPhaseSeconds(phaseValues, "reading " + sent, readSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "answering " + sent, answerSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "writing " + answerPrefix.substr(par.db2.size() + 1), writeSeconds);
+    return writer.publish(keySplitCount + 1, 0);
+}
+
+// pieces: the piece counts, piecePartitions their partition and start
+struct PartitionWriter {
     std::vector<char> data;
-    std::vector<uint64_t> indexCells;
-    size_t nextCell;
+    std::vector<uint64_t> indexData;
+    size_t nextPartition;
     bool isOpen;
     DBKeyType prevRep;
     std::vector<char> pieces;
-    std::vector<std::pair<size_t, size_t> > pieceCells;
+    std::vector<std::pair<size_t, size_t> > piecePartitions;
 };
 
 static void putPrefKey(std::vector<char> &data, uint64_t key) {
@@ -4364,21 +4377,21 @@ static void putPrefKey(std::vector<char> &data, uint64_t key) {
     data.insert(data.end(), buffer, buffer + Util::putPrefKey(buffer, key));
 }
 
-static void startCell(const TargetPref &pref, CellWriter &writer, size_t cell) {
-    for (; writer.nextCell <= cell; writer.nextCell++) {
+static void startPartition(const KeySplitPref &pref, PartitionWriter &writer, size_t partition) {
+    for (; writer.nextPartition <= partition; writer.nextPartition++) {
         if (writer.isOpen) {
             writer.data.push_back('\0');
         }
-        writer.indexCells.push_back(pref.cellFirstKeys[writer.nextCell]);
-        writer.indexCells.push_back(writer.data.size());
-        writer.prevRep = pref.cellFirstKeys[writer.nextCell];
+        writer.indexData.push_back(pref.partitionFirstKeys[writer.nextPartition]);
+        writer.indexData.push_back(writer.data.size());
+        writer.prevRep = pref.partitionFirstKeys[writer.nextPartition];
         writer.isOpen = true;
     }
 }
 
-static void closeCells(const TargetPref &pref, CellWriter &writer, size_t cellEnd) {
-    if (writer.nextCell < cellEnd) {
-        startCell(pref, writer, cellEnd - 1);
+static void closePartitions(const KeySplitPref &pref, PartitionWriter &writer, size_t partitionEnd) {
+    if (writer.nextPartition < partitionEnd) {
+        startPartition(pref, writer, partitionEnd - 1);
     }
     if (writer.isOpen) {
         writer.data.push_back('\0');
@@ -4386,8 +4399,8 @@ static void closeCells(const TargetPref &pref, CellWriter &writer, size_t cellEn
     }
 }
 
-static size_t getCell(const TargetPref &pref, DBKeyType key) {
-    return std::upper_bound(pref.cellFirstKeys.begin(), pref.cellFirstKeys.end() - 1, key) - pref.cellFirstKeys.begin() - 1;
+static size_t getRepPartition(const KeySplitPref &pref, DBKeyType key) {
+    return std::upper_bound(pref.partitionFirstKeys.begin(), pref.partitionFirstKeys.end() - 1, key) - pref.partitionFirstKeys.begin() - 1;
 }
 
 static bool compareClusterPairs(const ClusterPair &first, const ClusterPair &second) {
@@ -4398,9 +4411,9 @@ static bool isSameClusterPair(const ClusterPair &first, const ClusterPair &secon
     return first.repKey == second.repKey && first.memberKey == second.memberKey;
 }
 
-// a part of a piece counts column: the piece bytes, the cost (rep length * target residues), the target split and the rep count, then per rep the rep gap and the target count
-static void putPieceCounts(CellWriter &writer, size_t cell, size_t targetSplit, size_t pieceSize, size_t cost, size_t repCount, const std::vector<char> &repCounts) {
-    writer.pieceCells.push_back(std::make_pair(cell, writer.pieces.size()));
+// piece bytes, cost, target split and rep count, then per rep its gap and target count
+static void putPieceCounts(PartitionWriter &writer, size_t partition, size_t targetSplit, size_t pieceSize, size_t cost, size_t repCount, const std::vector<char> &repCounts) {
+    writer.piecePartitions.push_back(std::make_pair(partition, writer.pieces.size()));
     putPrefKey(writer.pieces, pieceSize);
     putPrefKey(writer.pieces, cost);
     putPrefKey(writer.pieces, targetSplit);
@@ -4408,40 +4421,41 @@ static void putPieceCounts(CellWriter &writer, size_t cell, size_t targetSplit, 
     writer.pieces.insert(writer.pieces.end(), repCounts.begin(), repCounts.end());
 }
 
-// the sorted unique pairs of a task, the writer continues its cells and adds a piece counts part per cell
-static void writeTaskCells(const TargetPref &pref, DBReader<DBKeyType> &seqDbr, const PrefUnit &unit, const ClusterPair *pairs, size_t pairCount, CellWriter &writer) {
+static void writeTaskPartitions(const KeySplitPref &pref, DBReader<DBKeyType> &seqDbr, const KeySplit &keySplit, const ClusterPair *pairs, size_t pairCount, PartitionWriter &writer) {
     writer.data.clear();
-    writer.indexCells.clear();
+    writer.indexData.clear();
     writer.pieces.clear();
-    writer.pieceCells.clear();
-    size_t targetSplit = std::upper_bound(pref.targetSplitKeyOffsets.begin(), pref.targetSplitKeyOffsets.end(), unit.firstKey) - pref.targetSplitKeyOffsets.begin() - 1;
+    writer.piecePartitions.clear();
+    size_t targetSplit = std::upper_bound(pref.targetSplitKeyOffsets.begin(), pref.targetSplitKeyOffsets.end(), keySplit.firstKey) - pref.targetSplitKeyOffsets.begin() - 1;
     std::vector<char> repCounts;
-    size_t countCell = SIZE_MAX;
+    size_t countPartition = SIZE_MAX;
     size_t pieceSize = 0;
     size_t cost = 0;
     size_t repCount = 0;
     DBKeyType prevCountRep = 0;
     for (size_t repStart = 0, repEnd = 0; repStart < pairCount; repStart = repEnd) {
         DBKeyType rep = pairs[repStart].repKey;
-        for (repEnd = repStart + 1; repEnd < pairCount && pairs[repEnd].repKey == rep; repEnd++) {
+        repEnd = repStart + 1;
+        while (repEnd < pairCount && pairs[repEnd].repKey == rep) {
+            repEnd++;
         }
-        size_t cell = getCell(pref, rep);
-        if (cell != countCell) {
+        size_t partition = getRepPartition(pref, rep);
+        if (partition != countPartition) {
             if (repCount > 0) {
-                putPieceCounts(writer, countCell, targetSplit, pieceSize, cost, repCount, repCounts);
+                putPieceCounts(writer, countPartition, targetSplit, pieceSize, cost, repCount, repCounts);
             }
-            countCell = cell;
+            countPartition = partition;
             pieceSize = 0;
             cost = 0;
             repCount = 0;
             repCounts.clear();
-            prevCountRep = pref.cellFirstKeys[cell];
+            prevCountRep = pref.partitionFirstKeys[partition];
         }
-        startCell(pref, writer, cell);
+        startPartition(pref, writer, partition);
         size_t pieceStart = writer.data.size();
         putPrefKey(writer.data, rep - writer.prevRep);
         putPrefKey(writer.data, 0);
-        DBKeyType prevTarget = unit.firstKey - 1;
+        DBKeyType prevTarget = keySplit.firstKey - 1;
         size_t targetRange = SIZE_MAX;
         size_t targetResidues = 0;
         for (size_t i = repStart; i < repEnd; i++) {
@@ -4459,37 +4473,44 @@ static void writeTaskCells(const TargetPref &pref, DBReader<DBKeyType> &seqDbr, 
         prevCountRep = rep;
     }
     if (repCount > 0) {
-        putPieceCounts(writer, countCell, targetSplit, pieceSize, cost, repCount, repCounts);
+        putPieceCounts(writer, countPartition, targetSplit, pieceSize, cost, repCount, repCounts);
     }
 }
 
-static void appendCells(BatchWriter &batchWriter, FILE *dataFile, const std::string &dataName, const CellWriter &writer, std::vector<uint64_t> &indexCells, size_t &dataSize) {
-    for (size_t i = 0; i < writer.indexCells.size(); i += 2) {
-        indexCells.push_back(writer.indexCells[i]);
-        indexCells.push_back(dataSize + writer.indexCells[i + 1]);
+static size_t closePrefFile(const std::string &indexName, FILE *dataFile, const std::string &dataName, size_t dataSize, const std::vector<uint64_t> &indexData) {
+    FILE *indexFile = FileUtil::openAndDelete(indexName.c_str(), "w");
+    size_t indexSize = indexData.size() * sizeof(uint64_t);
+    FileUtil::pwriteAll(fileno(indexFile), indexName.c_str(), (const char *) indexData.data(), indexSize, 0);
+    MMseqsNode::closeClusterFiles(dataFile, dataName, indexFile, indexName, dataSize, indexSize);
+    return dataSize + indexSize + 2 * sizeof(uint64_t);
+}
+
+static void appendPartitions(BatchWriter &batchWriter, FILE *dataFile, const std::string &dataName, const PartitionWriter &writer, std::vector<uint64_t> &indexData, size_t &dataSize) {
+    for (size_t i = 0; i < writer.indexData.size(); i += 2) {
+        indexData.push_back(writer.indexData[i]);
+        indexData.push_back(dataSize + writer.indexData[i + 1]);
     }
     batchWriter.write(fileno(dataFile), dataName.c_str(), writer.data.data(), writer.data.size(), dataSize);
     dataSize += writer.data.size();
 }
 
-// pass 3: the reps of every group, from the owner if its fingerprint is in another unit, else from the unit; every member a target of its reps.
-// Every thread keeps a run of pairs; tasks of rep cells merge the runs and encode in parallel; past the pair capacity a sweep ends at a cell and the unit is walked again
+// pass 3: every member is a target of its reps
 template <typename T, bool includeAdjacency, typename L>
-static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, TargetPref &pref,
+static std::string writeKeySplitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, KeySplitPref &pref,
                                   const std::vector<PrefExchangeFile> &markFiles, const std::vector<PrefExchangeFile> &repFiles,
-                                  double &extractSeconds, size_t &prefSize, size_t &pairCount, size_t &sweepCount, std::string &phaseValues) {
+                                  double &extractSeconds, size_t &prefSize, size_t &pairCount, size_t &repSplitCount, std::string &phaseValues) {
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     PrefExchangeWriter countWriter(par.db2 + ".piece_counts." + SSTR(MMseqsNode::rank));
     PrefExchangeParts repParts = openPrefExchangeFiles(par.db2 + ".reps", repFiles);
     BatchReader batchReader(par.threads, fileno(countWriter.file));
     BackgroundRemoval punches;
     BackgroundRemoval spillPunches[SPILL_KINDS];
-    UnitMarks marks;
+    FingerprintMarks marks;
     std::vector<char> repAnswers;
     std::vector<size_t> repRowOffsets(pref.hashRangeCount);
-    size_t cellCount = pref.cellFirstKeys.size() - 1;
+    size_t partitionCount = pref.partitionFirstKeys.size() - 1;
     std::vector<std::vector<ClusterPair> > threadRecentPairs(par.threads, std::vector<ClusterPair>(RECENT_PAIR_SLOTS));
-    std::vector<CellWriter> taskWriters;
+    std::vector<PartitionWriter> taskWriters;
     double prepareSeconds = 0;
     double emitSeconds = 0;
     double sortSeconds = 0;
@@ -4498,424 +4519,433 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     double waitSeconds = 0;
     Timer timer;
     BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(countWriter.file));
-    // the units with their needed groups in memory first, then the spilled ones, then those extracted again, which need the memory of the others
-    std::vector<std::pair<size_t, size_t> > unitOrder;
-    std::vector<size_t> unitSendSplits(pref.sendSplitUnitOffsets.back());
+    // in memory first, then spilled, then extracted again
+    std::vector<std::pair<size_t, size_t> > keySplitOrder;
+    std::vector<size_t> keySplitSendSplits(pref.sendSplitKeySplitOffsets.back());
     for (size_t i = 0; i < pref.sendSplits.size(); i++) {
-        for (size_t ownUnit = pref.sendSplitUnitOffsets[i]; ownUnit < pref.sendSplitUnitOffsets[i + 1]; ownUnit++) {
-            const NeededGroups &needed = pref.neededGroups[ownUnit];
-            unitSendSplits[ownUnit] = i;
-            unitOrder.push_back(std::make_pair((needed.data.empty() == false) ? 0 : ((needed.spillOffset != SIZE_MAX) ? 1 : 2), ownUnit));
+        for (size_t ownKeySplit = pref.sendSplitKeySplitOffsets[i]; ownKeySplit < pref.sendSplitKeySplitOffsets[i + 1]; ownKeySplit++) {
+            const NeededGroups &needed = pref.neededGroups[ownKeySplit];
+            keySplitSendSplits[ownKeySplit] = i;
+            size_t source = 2;
+            if (needed.data.empty() == false) {
+                source = 0;
+            } else if (needed.spillOffset != SIZE_MAX) {
+                source = 1;
+            }
+            keySplitOrder.push_back(std::make_pair(source, ownKeySplit));
         }
     }
-    SORT_SERIAL(unitOrder.begin(), unitOrder.end());
-    // a spill file is removed after its last unit was read
-    size_t spillUnitsLeft[SPILL_KINDS] = {0, 0};
-    for (size_t unit = 0; unit < pref.neededGroups.size(); unit++) {
-        spillUnitsLeft[pref.neededGroups[unit].spill] += pref.neededGroups[unit].spill < SPILL_KINDS;
+    SORT_SERIAL(keySplitOrder.begin(), keySplitOrder.end());
+    // remove a spill file after its last key split
+    size_t spillKeySplitsLeft[SPILL_KINDS] = {0, 0};
+    for (size_t keySplit = 0; keySplit < pref.neededGroups.size(); keySplit++) {
+        spillKeySplitsLeft[pref.neededGroups[keySplit].spill] += pref.neededGroups[keySplit].spill < SPILL_KINDS;
     }
-    // the marks are removed after pass 2 if no node extracts again
-    PrefExchangeParts markParts = (unitOrder.empty() == false && unitOrder.back().first == 2) ? openPrefExchangeFiles(par.db2 + ".marks", markFiles) : PrefExchangeParts();
+    // only for extracting again, the marks may be gone otherwise
+    PrefExchangeParts markParts = (keySplitOrder.empty() == false && keySplitOrder.back().first == 2) ? openPrefExchangeFiles(par.db2 + ".marks", markFiles) : PrefExchangeParts();
     std::vector<size_t> neededBits(pref.hashRangeCount);
-    for (size_t order = 0; order < unitOrder.size(); order++) {
-        size_t ownUnit = unitOrder[order].second;
-        setSendSplit(par, exchange, pref.sendSplits[unitSendSplits[ownUnit]]);
+    for (size_t order = 0; order < keySplitOrder.size(); order++) {
+        size_t ownKeySplit = keySplitOrder[order].second;
+        setSendSplit(par, exchange, pref.sendSplits[keySplitSendSplits[ownKeySplit]]);
         timer.reset();
-        {
-            size_t unitIndex = getOwnUnit(pref, ownUnit);
-            const PrefUnit &unit = pref.units[unitIndex];
-            NeededGroups &needed = pref.neededGroups[ownUnit];
-            if (needed.data.empty() && needed.spillOffset != SIZE_MAX) {
-                size_t first = needed.rowOffsets[0];
-                needed.data.resize(needed.rowOffsets.back() - first + sizeof(uint64_t));
-                NeededSpill &neededSpill = pref.spills[needed.spill];
-                std::vector<BatchReader::ReadRequest> readRequests;
-                BatchReader::ReadRequest readRequest = {fileno(neededSpill.file), neededSpill.name.c_str(), needed.data.data(), first, needed.rowOffsets.back() - first, needed.rowOffsets.back() - first};
-                if (readRequest.bytesToRead > 0) {
-                    readRequests.push_back(readRequest);
-                    batchReader.readSync(readRequests);
-                }
-                for (size_t hashRange = 0; hashRange <= pref.hashRangeCount; hashRange++) {
-                    needed.rowOffsets[hashRange] -= first;
-                }
-                if (--spillUnitsLeft[needed.spill] > 0) {
-                    spillPunches[needed.spill].punch(readRequests);
-                } else {
-                    // the punches of the other units use the file
-                    spillPunches[needed.spill].wait();
-                    FILE *spillFile = neededSpill.file;
-                    std::string spillName = neededSpill.name;
-                    neededSpill.file = NULL;
-                    spillPunches[needed.spill].run([spillFile, spillName]() {
-                        if (fclose(spillFile) != 0) {
-                            Debug(Debug::ERROR) << "Cannot close " << spillName << "\n";
-                            EXIT(EXIT_FAILURE);
-                        }
-                        FileUtil::remove(spillName.c_str());
-                    });
-                }
-            } else if (needed.data.empty()) {
-                punches.punch(readUnitMarks(pref, markFiles, markParts, ownUnit, marks, batchReader));
-                const UnitKmers &unitKmers = getUnitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, unit, ownUnit, extractSeconds);
-                NeededGroupLists groups(par, pref, unitKmers, marks);
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-                for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
-                    neededBits[hashRange] = putNeededRow(exchange, unit, unitKmers.kmers, groups.get(hashRange), NULL);
-                }
-                storeNeededGroups(par, exchange, pref, needed, unit, unitKmers.kmers, groups, neededBits, true, batchWriter);
+        size_t keySplitIndex = getKeySplitIndex(pref, ownKeySplit);
+        const KeySplit &keySplit = pref.keySplits[keySplitIndex];
+        NeededGroups &needed = pref.neededGroups[ownKeySplit];
+
+        // read the needed groups
+        if (needed.data.empty() && needed.spillOffset != SIZE_MAX) {
+            size_t first = needed.rowOffsets[0];
+            needed.data.resize(needed.rowOffsets.back() - first + sizeof(uint64_t));
+            NeededSpill &neededSpill = pref.spills[needed.spill];
+            std::vector<BatchReader::ReadRequest> readRequests;
+            BatchReader::ReadRequest readRequest = {fileno(neededSpill.file), neededSpill.name.c_str(), needed.data.data(), first, needed.rowOffsets.back() - first, needed.rowOffsets.back() - first};
+            if (readRequest.bytesToRead > 0) {
+                readRequests.push_back(readRequest);
+                batchReader.readSync(readRequests);
             }
-            punches.punch(readUnitAnswers(repFiles, repParts, unitIndex, repAnswers, batchReader));
-            // a row of the reps has a size if the unit sent a group
-            for (size_t hashRange = 0, pos = 0; hashRange < pref.hashRangeCount; hashRange++) {
-                bool hasSent = false;
-                if (needed.rowOffsets[hashRange + 1] > needed.rowOffsets[hashRange]) {
-                    KmerCodeReader neededRead = getMemoryCodeReader(needed.data.data() + needed.rowOffsets[hashRange], needed.rowOffsets[hashRange + 1] - needed.rowOffsets[hashRange]);
-                    hasSent = getEliasGamma(neededRead) > 1;
-                    hasSent |= getEliasGamma(neededRead) > 1;
-                }
-                uint64_t rowSize = 0;
-                if (hasSent) {
-                    memcpy(&rowSize, repAnswers.data() + pos, sizeof(uint64_t));
-                    pos += sizeof(uint64_t);
-                }
-                repRowOffsets[hashRange] = pos;
-                pos += rowSize;
+            for (size_t hashRange = 0; hashRange <= pref.hashRangeCount; hashRange++) {
+                needed.rowOffsets[hashRange] -= first;
             }
-            if (unitOrder[order].first == 2) {
-                // extracted again: the k-mers and read buffers are not needed any more
-                delete[] pref.extractedUnit.kmers;
-                pref.extractedUnit.kmers = NULL;
-                seqDbr.releaseDataPages();
-            }
-            // the reps that can cover a key of the unit
-            size_t firstRepRange = SIZE_MAX;
-            size_t endRepRange = 0;
-            for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {
-                if (pref.rangeCoveredKeys[range].first < unit.endKey && pref.rangeCoveredKeys[range].second > unit.firstKey) {
-                    firstRepRange = std::min(firstRepRange, range);
-                    endRepRange = range + 1;
-                }
-            }
-            DBKeyType unitRepBegin = (firstRepRange < endRepRange) ? index[firstRepRange].id : 0;
-            DBKeyType unitRepEnd = (firstRepRange < endRepRange) ? ((endRepRange < seqDbr.getIndexSize()) ? index[endRepRange].id : seqDbr.getSize()) : 0;
-            std::string dataName = par.db2 + "." + SSTR(pref.unitFiles[unitIndex]);
-            FILE *dataFile = FileUtil::openAndDelete(dataName.c_str(), "w");
-            size_t dataSize = 0;
-            std::vector<uint64_t> unitIndexCells;
-            // the memory the passes do not hold takes the pairs of a sweep with their unit file bytes and piece counts, and the cells of a sweep with their piece count parts
-            size_t usedMemory = getHeldMemory(pref) + ((unitOrder[order].first == 0) ? 0 : needed.data.size()) + repAnswers.size() + cellCount * (3 * sizeof(uint64_t) + 1 + 4 * getPrefKeySize(SIZE_MAX));
-            size_t pairBytes = sizeof(ClusterPair) + 4 * getPrefKeySize(seqDbr.getSize()) + 2;
-            // a rep keeps all its pairs of the unit in one sweep
-            size_t pairCapacity = std::max((exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, usedMemory)) / pairBytes, 2 * (unit.endKey - unit.firstKey));
-            // chunks of hash ranges whose groups cannot add more than half of the capacity
-            std::vector<size_t> chunkHashRanges(1, 0);
-            std::vector<size_t> chunkPairBounds(1, 0);
-            for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
-                // a member takes at least idBits of a row
-                size_t records = (needed.rowOffsets[hashRange + 1] - needed.rowOffsets[hashRange]) * CHAR_BIT / std::max(1u, unit.idBits);
-                if (hashRange > chunkHashRanges.back() && chunkPairBounds.back() + records * exchange.maxRepSeqCount > pairCapacity / 2) {
-                    chunkHashRanges.push_back(hashRange);
-                    chunkPairBounds.push_back(0);
-                }
-                chunkPairBounds.back() += records * exchange.maxRepSeqCount;
-            }
-            chunkHashRanges.push_back(pref.hashRangeCount);
-            size_t arraySize = pairCapacity / 2 + *std::max_element(chunkPairBounds.begin(), chunkPairBounds.end()) + par.threads * PAIR_BLOCK_SIZE;
-            ClusterPair *pairs = new(std::nothrow) ClusterPair[arraySize];
-            Util::checkAllocation(pairs, "Can not allocate pairs memory in writeUnitPrefs");
-            const ClusterPair sentinel = { DB_KEY_INVALID, DB_KEY_INVALID };
-            // the cells are written in order, a sweep may end and the next start inside a cell
-            CellWriter unitWriter;
-            unitWriter.nextCell = 0;
-            unitWriter.isOpen = false;
-            unitWriter.prevRep = 0;
-            // the unit's piece counts are a flush, its parts are appended in cell order
-            size_t countColumns = 0;
-            prepareSeconds += timer.getTimediff();
-            for (DBKeyType repBegin = unitRepBegin; repBegin < unitRepEnd; sweepCount++) {
-                // a pair dropped at the end of a sweep may come again in the next
-                for (size_t thread = 0; thread < threadRecentPairs.size(); thread++) {
-                    std::fill(threadRecentPairs[thread].begin(), threadRecentPairs[thread].end(), sentinel);
-                }
-                DBKeyType repEnd = unitRepEnd;
-                size_t pairEnd = 0;
-                for (size_t chunk = 0; chunk + 1 < chunkHashRanges.size(); chunk++) {
-                    if (pairEnd + chunkPairBounds[chunk + 1] + par.threads * PAIR_BLOCK_SIZE > arraySize) {
-                        timer.reset();
-                        SORT_PARALLEL(pairs, pairs + pairEnd, compareClusterPairs);
-                        pairEnd = std::unique(pairs, std::lower_bound(pairs, pairs + pairEnd, sentinel, compareClusterPairs), isSameClusterPair) - pairs;
-                        // the sweep ends at the rep where its pairs reach half of the capacity, but keeps one rep
-                        ClusterPair firstRepEnd = { pairs[0].repKey, DB_KEY_INVALID };
-                        const ClusterPair *cut = (pairEnd > pairCapacity / 2) ? std::max(pairs + pairCapacity / 2, std::upper_bound(pairs, pairs + pairEnd, firstRepEnd, compareClusterPairs)) : pairs + pairEnd;
-                        if (cut < pairs + pairEnd) {
-                            repEnd = cut->repKey;
-                            ClusterPair end = { repEnd, 0 };
-                            pairEnd = std::lower_bound(pairs, pairs + pairEnd, end, compareClusterPairs) - pairs;
-                        }
-                        sortSeconds += timer.getTimediff();
+            if (--spillKeySplitsLeft[needed.spill] > 0) {
+                spillPunches[needed.spill].punch(readRequests);
+            } else {
+                // the other punches use the file
+                spillPunches[needed.spill].wait();
+                FILE *spillFile = neededSpill.file;
+                std::string spillName = neededSpill.name;
+                neededSpill.file = NULL;
+                spillPunches[needed.spill].run([spillFile, spillName]() {
+                    if (fclose(spillFile) != 0) {
+                        Debug(Debug::ERROR) << "Cannot close " << spillName << "\n";
+                        EXIT(EXIT_FAILURE);
                     }
+                    FileUtil::remove(spillName.c_str());
+                });
+            }
+        } else if (needed.data.empty()) {
+            punches.punch(readFingerprintMarks(pref, markFiles, markParts, ownKeySplit, marks, batchReader));
+            const KeySplitKmers &keySplitKmers = getKeySplitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, keySplit, ownKeySplit, extractSeconds);
+            NeededGroupLists groups(par, pref, keySplitKmers, marks);
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+            for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
+                neededBits[hashRange] = putNeededRow(exchange, keySplit, keySplitKmers.kmers, groups.get(hashRange), NULL);
+            }
+            storeNeededGroups(par, exchange, pref, needed, keySplit, keySplitKmers.kmers, groups, neededBits, true, batchWriter);
+        }
+
+        // read the reps
+        punches.punch(readKeySplitAnswers(repFiles, repParts, keySplitIndex, repAnswers, batchReader));
+        // rows of sent groups start with their size
+        for (size_t hashRange = 0, pos = 0; hashRange < pref.hashRangeCount; hashRange++) {
+            bool hasSent = false;
+            if (needed.rowOffsets[hashRange + 1] > needed.rowOffsets[hashRange]) {
+                KmerCodeReader neededRead = getMemoryCodeReader(needed.data.data() + needed.rowOffsets[hashRange], needed.rowOffsets[hashRange + 1] - needed.rowOffsets[hashRange]);
+                hasSent = getEliasGamma(neededRead) > 1;
+                hasSent |= getEliasGamma(neededRead) > 1;
+            }
+            uint64_t rowSize = 0;
+            if (hasSent) {
+                memcpy(&rowSize, repAnswers.data() + pos, sizeof(uint64_t));
+                pos += sizeof(uint64_t);
+            }
+            repRowOffsets[hashRange] = pos;
+            pos += rowSize;
+        }
+        if (keySplitOrder[order].first == 2) {
+            delete[] pref.extractedKeySplit.kmers;
+            pref.extractedKeySplit.kmers = NULL;
+            seqDbr.releaseDataPages();
+        }
+        // reps that can cover the key split
+        size_t firstRepRange = SIZE_MAX;
+        size_t endRepRange = 0;
+        for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {
+            if (pref.rangeCoveredKeys[range].first < keySplit.endKey && pref.rangeCoveredKeys[range].second > keySplit.firstKey) {
+                firstRepRange = std::min(firstRepRange, range);
+                endRepRange = range + 1;
+            }
+        }
+        DBKeyType keySplitRepBegin = 0;
+        DBKeyType keySplitRepEnd = 0;
+        if (firstRepRange < endRepRange) {
+            keySplitRepBegin = index[firstRepRange].id;
+            keySplitRepEnd = (endRepRange < seqDbr.getIndexSize()) ? index[endRepRange].id : seqDbr.getSize();
+        }
+        std::string dataName = par.db2 + "." + SSTR(pref.keySplitFiles[keySplitIndex]);
+        FILE *dataFile = FileUtil::openAndDelete(dataName.c_str(), "w");
+        size_t dataSize = 0;
+        std::vector<uint64_t> indexData;
+        size_t usedMemory = getHeldMemory(pref) + ((keySplitOrder[order].first == 0) ? 0 : needed.data.size()) + repAnswers.size() + partitionCount * (3 * sizeof(uint64_t) + 1 + 4 * getPrefKeySize(SIZE_MAX));
+        size_t pairBytes = sizeof(ClusterPair) + 4 * getPrefKeySize(seqDbr.getSize()) + 2;
+        // a rep keeps its pairs in one rep split
+        size_t pairCapacity = std::max((exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, usedMemory)) / pairBytes, 2 * (keySplit.endKey - keySplit.firstKey));
+        size_t splitPairLimit = pairCapacity / 2;
+        // a chunk adds at most half of the capacity
+        std::vector<size_t> chunkHashRanges(1, 0);
+        std::vector<size_t> chunkPairBounds(1, 0);
+        for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
+            // a member takes at least idBits of a row
+            size_t records = (needed.rowOffsets[hashRange + 1] - needed.rowOffsets[hashRange]) * CHAR_BIT / std::max(1u, keySplit.idBits);
+            if (hashRange > chunkHashRanges.back() && chunkPairBounds.back() + records * exchange.maxRepSeqCount > splitPairLimit) {
+                chunkHashRanges.push_back(hashRange);
+                chunkPairBounds.push_back(0);
+            }
+            chunkPairBounds.back() += records * exchange.maxRepSeqCount;
+        }
+        chunkHashRanges.push_back(pref.hashRangeCount);
+        size_t arraySize = splitPairLimit + *std::max_element(chunkPairBounds.begin(), chunkPairBounds.end()) + par.threads * PAIR_BLOCK_SIZE;
+        ClusterPair *pairs = new(std::nothrow) ClusterPair[arraySize];
+        Util::checkAllocation(pairs, "Can not allocate pairs memory in writeKeySplitPrefs");
+        const ClusterPair sentinel = { DB_KEY_INVALID, DB_KEY_INVALID };
+        // a rep split may end inside a partition
+        PartitionWriter keySplitWriter;
+        keySplitWriter.nextPartition = 0;
+        keySplitWriter.isOpen = false;
+        keySplitWriter.prevRep = 0;
+        // one piece counts flush per key split
+        size_t countColumns = 0;
+        prepareSeconds += timer.getTimediff();
+        for (DBKeyType repBegin = keySplitRepBegin; repBegin < keySplitRepEnd; repSplitCount++) {
+            // collect the pairs of a rep split
+            // a dropped pair may come again in the next rep split
+            for (size_t thread = 0; thread < threadRecentPairs.size(); thread++) {
+                std::fill(threadRecentPairs[thread].begin(), threadRecentPairs[thread].end(), sentinel);
+            }
+            DBKeyType repEnd = keySplitRepEnd;
+            size_t pairEnd = 0;
+            for (size_t chunk = 0; chunk + 1 < chunkHashRanges.size(); chunk++) {
+                if (pairEnd + chunkPairBounds[chunk + 1] + par.threads * PAIR_BLOCK_SIZE > arraySize) {
                     timer.reset();
-                    size_t chunkStart = chunkHashRanges[chunk];
-                    size_t chunkEnd = chunkHashRanges[chunk + 1];
+                    SORT_PARALLEL(pairs, pairs + pairEnd, compareClusterPairs);
+                    pairEnd = std::unique(pairs, std::lower_bound(pairs, pairs + pairEnd, sentinel, compareClusterPairs), isSameClusterPair) - pairs;
+                    // end at half of the capacity, keep one rep
+                    ClusterPair firstRepEnd = { pairs[0].repKey, DB_KEY_INVALID };
+                    const ClusterPair *cut = pairs + pairEnd;
+                    if (pairEnd > splitPairLimit) {
+                        cut = std::max(pairs + splitPairLimit, std::upper_bound(pairs, pairs + pairEnd, firstRepEnd, compareClusterPairs));
+                    }
+                    if (cut < pairs + pairEnd) {
+                        repEnd = cut->repKey;
+                        ClusterPair end = { repEnd, 0 };
+                        pairEnd = std::lower_bound(pairs, pairs + pairEnd, end, compareClusterPairs) - pairs;
+                    }
+                    sortSeconds += timer.getTimediff();
+                }
+                timer.reset();
+                size_t chunkStart = chunkHashRanges[chunk];
+                size_t chunkEnd = chunkHashRanges[chunk + 1];
 #pragma omp parallel num_threads(par.threads)
-                    {
-                        unsigned int thread_idx = 0;
+                {
+                    unsigned int thread_idx = 0;
 #ifdef OPENMP
-                        thread_idx = static_cast<unsigned int>(omp_get_thread_num());
+                    thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
-                        // the thread claims blocks of the pair array, the rest of its last block is filled with the sentinel
-                        size_t blockPos = 0;
-                        size_t blockEnd = 0;
-                        ClusterPair *recentPairs = threadRecentPairs[thread_idx].data();
-                        std::vector<DBKeyType> reps;
-                        std::vector<DBKeyType> members;
-                        std::vector<size_t> candidateMembers;
-                        DBKeyType coveredRep = DB_KEY_INVALID;
-                        std::pair<DBKeyType, DBKeyType> coveredKeys;
+                    // claim blocks, pad the last with the sentinel
+                    size_t blockPos = 0;
+                    size_t blockEnd = 0;
+                    ClusterPair *recentPairs = threadRecentPairs[thread_idx].data();
+                    std::vector<DBKeyType> reps;
+                    std::vector<DBKeyType> members;
+                    std::vector<size_t> candidateMembers;
+                    DBKeyType coveredRep = DB_KEY_INVALID;
+                    std::pair<DBKeyType, DBKeyType> coveredKeys;
 #pragma omp for schedule(dynamic, 1)
-                        for (size_t hashRange = chunkStart; hashRange < chunkEnd; hashRange++) {
-                            if (needed.rowOffsets[hashRange + 1] == needed.rowOffsets[hashRange]) {
-                                continue;
-                            }
-                            KmerCodeReader neededRead = getMemoryCodeReader(needed.data.data() + needed.rowOffsets[hashRange], needed.rowOffsets[hashRange + 1] - needed.rowOffsets[hashRange]);
-                            KmerCodeReader repRead = getMemoryCodeReader(repAnswers.data() + repRowOffsets[hashRange], repAnswers.size() - repRowOffsets[hashRange]);
-                            size_t segmentGroups[GROUP_SEGMENTS];
-                            for (size_t segment = 0; segment < GROUP_SEGMENTS; segment++) {
-                                segmentGroups[segment] = getEliasGamma(neededRead) - 1;
-                            }
-                            for (size_t segment = 0; segment < GROUP_SEGMENTS; segment++) {
-                                for (size_t group = 0; group < segmentGroups[segment]; group++) {
-                                    members.resize(getEliasGamma(neededRead));
+                    for (size_t hashRange = chunkStart; hashRange < chunkEnd; hashRange++) {
+                        if (needed.rowOffsets[hashRange + 1] == needed.rowOffsets[hashRange]) {
+                            continue;
+                        }
+                        KmerCodeReader neededRead = getMemoryCodeReader(needed.data.data() + needed.rowOffsets[hashRange], needed.rowOffsets[hashRange + 1] - needed.rowOffsets[hashRange]);
+                        KmerCodeReader repRead = getMemoryCodeReader(repAnswers.data() + repRowOffsets[hashRange], repAnswers.size() - repRowOffsets[hashRange]);
+                        size_t segmentGroups[GROUP_SEGMENTS];
+                        for (size_t segment = 0; segment < GROUP_SEGMENTS; segment++) {
+                            segmentGroups[segment] = getEliasGamma(neededRead) - 1;
+                        }
+                        for (size_t segment = 0; segment < GROUP_SEGMENTS; segment++) {
+                            for (size_t group = 0; group < segmentGroups[segment]; group++) {
+                                members.resize(getEliasGamma(neededRead));
+                                for (size_t member = 0; member < members.size(); member++) {
+                                    members[member] = keySplit.firstKey + getBits(neededRead, keySplit.idBits);
+                                }
+                                unsigned int memberIndexBits = getBitWidth(members.size() - 1);
+                                candidateMembers.assign(1, 0);
+                                if (segment == SENT_KMER_GROUPS || segment == LOCAL_KMER_GROUPS) {
+                                    candidateMembers.resize(getEliasGamma(neededRead));
+                                    for (size_t candidate = 0; candidate < candidateMembers.size(); candidate++) {
+                                        candidateMembers[candidate] = getBits(neededRead, memberIndexBits);
+                                    }
+                                }
+                                reps.clear();
+                                if (segment < LOCAL_KMER_GROUPS) {
+                                    size_t repCount = getEliasGamma(repRead) - 1;
+                                    for (size_t rep = 0; rep < repCount; rep++) {
+                                        bool isOwn = getBits(repRead, 1) != 0;
+                                        reps.push_back(isOwn ? members[candidateMembers[getBits(repRead, getBitWidth(candidateMembers.size() - 1))]] : getBits(repRead, exchange.globalIdBits));
+                                    }
+                                } else {
+                                    for (size_t rep = 0; rep < candidateMembers.size(); rep++) {
+                                        reps.push_back(members[candidateMembers[rep]]);
+                                    }
+                                }
+                                for (size_t rep = 0; rep < reps.size(); rep++) {
+                                    if (reps[rep] < repBegin || reps[rep] >= repEnd) {
+                                        continue;
+                                    }
+                                    if (reps[rep] != coveredRep) {
+                                        coveredRep = reps[rep];
+                                        coveredKeys = pref.rangeCoveredKeys[seqDbr.findIdRange(coveredRep)];
+                                    }
                                     for (size_t member = 0; member < members.size(); member++) {
-                                        members[member] = unit.firstKey + getBits(neededRead, unit.idBits);
-                                    }
-                                    unsigned int memberIndexBits = getBitWidth(members.size() - 1);
-                                    candidateMembers.assign(1, 0);
-                                    if (segment == SENT_KMER_GROUPS || segment == LOCAL_KMER_GROUPS) {
-                                        candidateMembers.resize(getEliasGamma(neededRead));
-                                        for (size_t candidate = 0; candidate < candidateMembers.size(); candidate++) {
-                                            candidateMembers[candidate] = getBits(neededRead, memberIndexBits);
-                                        }
-                                    }
-                                    reps.clear();
-                                    if (segment < LOCAL_KMER_GROUPS) {
-                                        // the owner's answer: per rep the own candidate or the global id
-                                        size_t repCount = getEliasGamma(repRead) - 1;
-                                        for (size_t rep = 0; rep < repCount; rep++) {
-                                            bool isOwn = getBits(repRead, 1) != 0;
-                                            reps.push_back(isOwn ? members[candidateMembers[getBits(repRead, getBitWidth(candidateMembers.size() - 1))]] : getBits(repRead, exchange.globalIdBits));
-                                        }
-                                    } else {
-                                        for (size_t rep = 0; rep < candidateMembers.size(); rep++) {
-                                            reps.push_back(members[candidateMembers[rep]]);
-                                        }
-                                    }
-                                    for (size_t rep = 0; rep < reps.size(); rep++) {
-                                        if (reps[rep] < repBegin || reps[rep] >= repEnd) {
+                                        if (members[member] < coveredKeys.first || members[member] >= coveredKeys.second || members[member] == reps[rep]) {
                                             continue;
                                         }
-                                        if (reps[rep] != coveredRep) {
-                                            coveredRep = reps[rep];
-                                            coveredKeys = pref.rangeCoveredKeys[seqDbr.findIdRange(coveredRep)];
+                                        ClusterPair pair = { reps[rep], members[member] };
+                                        ClusterPair &recent = recentPairs[(reps[rep] * 0x9E3779B97F4A7C15ULL + members[member]) & (RECENT_PAIR_SLOTS - 1)];
+                                        if (isSameClusterPair(recent, pair)) {
+                                            continue;
                                         }
-                                        for (size_t member = 0; member < members.size(); member++) {
-                                            if (members[member] < coveredKeys.first || members[member] >= coveredKeys.second || members[member] == reps[rep]) {
-                                                continue;
-                                            }
-                                            ClusterPair pair = { reps[rep], members[member] };
-                                            ClusterPair &recent = recentPairs[(reps[rep] * 0x9E3779B97F4A7C15ULL + members[member]) & (RECENT_PAIR_SLOTS - 1)];
-                                            if (isSameClusterPair(recent, pair)) {
-                                                continue;
-                                            }
-                                            recent = pair;
-                                            if (blockPos == blockEnd) {
-                                                blockPos = __sync_fetch_and_add(&pairEnd, PAIR_BLOCK_SIZE);
-                                                blockEnd = blockPos + PAIR_BLOCK_SIZE;
-                                            }
-                                            pairs[blockPos++] = pair;
+                                        recent = pair;
+                                        if (blockPos == blockEnd) {
+                                            blockPos = __sync_fetch_and_add(&pairEnd, PAIR_BLOCK_SIZE);
+                                            blockEnd = blockPos + PAIR_BLOCK_SIZE;
                                         }
+                                        pairs[blockPos++] = pair;
                                     }
                                 }
                             }
                         }
-                        std::fill(pairs + blockPos, pairs + blockEnd, sentinel);
                     }
-                    emitSeconds += timer.getTimediff();
+                    std::fill(pairs + blockPos, pairs + blockEnd, sentinel);
                 }
-                timer.reset();
-                SORT_PARALLEL(pairs, pairs + pairEnd, compareClusterPairs);
-                pairEnd = std::lower_bound(pairs, pairs + pairEnd, sentinel, compareClusterPairs) - pairs;
-                // tasks of whole cells with about equal pairs, the first may continue and the last end inside a cell
-                size_t firstInnerCell = getCell(pref, repBegin) + 1;
-                size_t endCell = std::lower_bound(pref.cellFirstKeys.begin(), pref.cellFirstKeys.end(), static_cast<size_t>(repEnd)) - pref.cellFirstKeys.begin();
-                size_t taskCount = std::max((size_t) 1, std::min(endCell - std::min(endCell, firstInnerCell) + 1, TASKS_PER_THREAD * par.threads));
-                std::vector<DBKeyType> taskReps(1, repBegin);
-                for (size_t task = 1; task < taskCount; task++) {
-                    size_t low = std::max(firstInnerCell, getCell(pref, taskReps.back()) + 1);
-                    size_t high = endCell;
-                    while (low < high) {
-                        size_t cell = low + (high - low) / 2;
-                        ClusterPair first = { static_cast<DBKeyType>(pref.cellFirstKeys[cell]), 0 };
-                        if (static_cast<size_t>(std::lower_bound(pairs, pairs + pairEnd, first, compareClusterPairs) - pairs) < task * pairEnd / taskCount) {
-                            low = cell + 1;
-                        } else {
-                            high = cell;
-                        }
-                    }
-                    if (low < endCell && pref.cellFirstKeys[low] < repEnd) {
-                        taskReps.push_back(pref.cellFirstKeys[low]);
-                    }
-                }
-                taskReps.push_back(repEnd);
-                taskCount = taskReps.size() - 1;
-                taskWriters.resize(taskCount);
-                sortSeconds += timer.getTimediff();
-                timer.reset();
-                size_t sweepPairCount = 0;
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+:sweepPairCount)
-                for (size_t task = 0; task < taskCount; task++) {
-                    ClusterPair first = { taskReps[task], 0 };
-                    ClusterPair end = { taskReps[task + 1], 0 };
-                    ClusterPair *taskPairs = std::lower_bound(pairs, pairs + pairEnd, first, compareClusterPairs);
-                    size_t taskPairCount = std::unique(taskPairs, std::lower_bound(taskPairs, pairs + pairEnd, end, compareClusterPairs), isSameClusterPair) - taskPairs;
-                    CellWriter &writer = taskWriters[task];
-                    writer.nextCell = (task == 0) ? unitWriter.nextCell : getCell(pref, taskReps[task]);
-                    writer.isOpen = (task == 0) ? unitWriter.isOpen : false;
-                    writer.prevRep = (task == 0) ? unitWriter.prevRep : taskReps[task];
-                    writeTaskCells(pref, seqDbr, unit, taskPairs, taskPairCount, writer);
-                    sweepPairCount += taskPairCount;
-                    size_t taskEndCell = std::lower_bound(pref.cellFirstKeys.begin(), pref.cellFirstKeys.end(), static_cast<size_t>(taskReps[task + 1])) - pref.cellFirstKeys.begin();
-                    if (pref.cellFirstKeys[taskEndCell] == taskReps[task + 1]) {
-                        closeCells(pref, writer, taskEndCell);
-                    } else {
-                        startCell(pref, writer, taskEndCell - 1);
-                    }
-                }
-                pairCount += sweepPairCount;
-                encodeSeconds += timer.getTimediff();
-                timer.reset();
-                // the tasks follow each other in the unit file and the piece counts, the threads copy them to the writer
-                std::vector<size_t> taskDataOffsets(taskCount);
-                std::vector<size_t> taskPieceOffsets(taskCount);
-                size_t sweepPieceSize = 0;
-                for (size_t task = 0; task < taskCount; task++) {
-                    sweepPieceSize += taskWriters[task].pieces.size();
-                }
-                // the flush of the unit ends early if the sweep would pass its part
-                if (countColumns > 0 && countWriter.getPartOffset(countWriter.size) + sweepPieceSize > EXCHANGE_PART_SIZE) {
-                    for (; countColumns <= cellCount; countColumns++) {
-                        countWriter.flushOffsets.push_back(countWriter.size);
-                    }
-                    countColumns = 0;
-                }
-                if (countColumns == 0) {
-                    countWriter.startFlush(sweepPieceSize, &batchWriter);
-                }
-                for (size_t task = 0; task < taskCount; task++) {
-                    const CellWriter &writer = taskWriters[task];
-                    for (size_t i = 0; i < writer.indexCells.size(); i += 2) {
-                        unitIndexCells.push_back(writer.indexCells[i]);
-                        unitIndexCells.push_back(dataSize + writer.indexCells[i + 1]);
-                    }
-                    for (size_t i = 0; i < writer.pieceCells.size(); i++) {
-                        for (; countColumns <= writer.pieceCells[i].first; countColumns++) {
-                            countWriter.flushOffsets.push_back(countWriter.size + writer.pieceCells[i].second);
-                        }
-                    }
-                    taskDataOffsets[task] = dataSize;
-                    taskPieceOffsets[task] = countWriter.getPartOffset(countWriter.size);
-                    dataSize += writer.data.size();
-                    countWriter.size += writer.pieces.size();
-                }
-#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-                for (size_t task = 0; task < taskCount; task++) {
-                    CellWriter &writer = taskWriters[task];
-                    batchWriter.write(fileno(dataFile), dataName.c_str(), writer.data.data(), writer.data.size(), taskDataOffsets[task]);
-                    batchWriter.write(fileno(countWriter.file), countWriter.partName.c_str(), writer.pieces.data(), writer.pieces.size(), taskPieceOffsets[task]);
-                    std::vector<char>().swap(writer.data);
-                    std::vector<char>().swap(writer.pieces);
-                }
-                appendSeconds += timer.getTimediff();
-                unitWriter.nextCell = taskWriters[taskCount - 1].nextCell;
-                unitWriter.isOpen = taskWriters[taskCount - 1].isOpen;
-                unitWriter.prevRep = taskWriters[taskCount - 1].prevRep;
-                repBegin = repEnd;
+                emitSeconds += timer.getTimediff();
             }
-            delete[] pairs;
-            for (; countColumns <= cellCount; countColumns++) {
-                countWriter.flushOffsets.push_back(countWriter.size);
-            }
-            unitWriter.data.clear();
-            unitWriter.indexCells.clear();
-            closeCells(pref, unitWriter, cellCount);
-            appendCells(batchWriter, dataFile, dataName, unitWriter, unitIndexCells, dataSize);
-            // the unit file is closed once its writes are done
             timer.reset();
-            batchWriter.waitWrites();
-            waitSeconds += timer.getTimediff();
-            std::string indexName = par.db2 + ".index." + SSTR(pref.unitFiles[unitIndex]);
-            FILE *indexFile = FileUtil::openAndDelete(indexName.c_str(), "w");
-            size_t indexSize = unitIndexCells.size() * sizeof(uint64_t);
-            FileUtil::pwriteAll(fileno(indexFile), indexName.c_str(), (const char *) unitIndexCells.data(), indexSize, 0);
-            MMseqsNode::closeClusterFiles(dataFile, dataName, indexFile, indexName, dataSize, indexSize);
-            prefSize += dataSize + indexSize + 2 * sizeof(uint64_t);
-            pref.neededSize -= (unitOrder[order].first == 0) ? needed.rowOffsets.back() : 0;
-            std::vector<char>().swap(needed.data);
+            SORT_PARALLEL(pairs, pairs + pairEnd, compareClusterPairs);
+            pairEnd = std::lower_bound(pairs, pairs + pairEnd, sentinel, compareClusterPairs) - pairs;
+
+            // write the partitions in tasks of about equal pairs
+            size_t firstInnerPartition = getRepPartition(pref, repBegin) + 1;
+            size_t endPartition = std::lower_bound(pref.partitionFirstKeys.begin(), pref.partitionFirstKeys.end(), static_cast<size_t>(repEnd)) - pref.partitionFirstKeys.begin();
+            size_t taskCount = std::max((size_t) 1, std::min(endPartition - std::min(endPartition, firstInnerPartition) + 1, TASKS_PER_THREAD * par.threads));
+            std::vector<DBKeyType> taskReps(1, repBegin);
+            for (size_t task = 1; task < taskCount; task++) {
+                size_t low = std::max(firstInnerPartition, getRepPartition(pref, taskReps.back()) + 1);
+                size_t high = endPartition;
+                while (low < high) {
+                    size_t partition = low + (high - low) / 2;
+                    ClusterPair first = { static_cast<DBKeyType>(pref.partitionFirstKeys[partition]), 0 };
+                    if (static_cast<size_t>(std::lower_bound(pairs, pairs + pairEnd, first, compareClusterPairs) - pairs) < task * pairEnd / taskCount) {
+                        low = partition + 1;
+                    } else {
+                        high = partition;
+                    }
+                }
+                if (low < endPartition && pref.partitionFirstKeys[low] < repEnd) {
+                    taskReps.push_back(pref.partitionFirstKeys[low]);
+                }
+            }
+            taskReps.push_back(repEnd);
+            taskCount = taskReps.size() - 1;
+            taskWriters.resize(taskCount);
+            sortSeconds += timer.getTimediff();
+            timer.reset();
+            size_t repSplitPairCount = 0;
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+:repSplitPairCount)
+            for (size_t task = 0; task < taskCount; task++) {
+                ClusterPair first = { taskReps[task], 0 };
+                ClusterPair end = { taskReps[task + 1], 0 };
+                ClusterPair *taskPairs = std::lower_bound(pairs, pairs + pairEnd, first, compareClusterPairs);
+                size_t taskPairCount = std::unique(taskPairs, std::lower_bound(taskPairs, pairs + pairEnd, end, compareClusterPairs), isSameClusterPair) - taskPairs;
+                PartitionWriter &writer = taskWriters[task];
+                if (task == 0) {
+                    writer.nextPartition = keySplitWriter.nextPartition;
+                    writer.isOpen = keySplitWriter.isOpen;
+                    writer.prevRep = keySplitWriter.prevRep;
+                } else {
+                    writer.nextPartition = getRepPartition(pref, taskReps[task]);
+                    writer.isOpen = false;
+                    writer.prevRep = taskReps[task];
+                }
+                writeTaskPartitions(pref, seqDbr, keySplit, taskPairs, taskPairCount, writer);
+                repSplitPairCount += taskPairCount;
+                size_t taskEndPartition = std::lower_bound(pref.partitionFirstKeys.begin(), pref.partitionFirstKeys.end(), static_cast<size_t>(taskReps[task + 1])) - pref.partitionFirstKeys.begin();
+                if (pref.partitionFirstKeys[taskEndPartition] == taskReps[task + 1]) {
+                    closePartitions(pref, writer, taskEndPartition);
+                } else {
+                    startPartition(pref, writer, taskEndPartition - 1);
+                }
+            }
+            pairCount += repSplitPairCount;
+            encodeSeconds += timer.getTimediff();
+            timer.reset();
+            // tasks follow each other in both files
+            std::vector<size_t> taskDataOffsets(taskCount);
+            std::vector<size_t> taskPieceOffsets(taskCount);
+            size_t repSplitPieceSize = 0;
+            for (size_t task = 0; task < taskCount; task++) {
+                repSplitPieceSize += taskWriters[task].pieces.size();
+            }
+            // end the flush early if the rep split would pass the part
+            if (countColumns > 0 && countWriter.getPartOffset(countWriter.size) + repSplitPieceSize > EXCHANGE_PART_SIZE) {
+                for (; countColumns <= partitionCount; countColumns++) {
+                    countWriter.flushOffsets.push_back(countWriter.size);
+                }
+                countColumns = 0;
+            }
+            if (countColumns == 0) {
+                countWriter.startFlush(repSplitPieceSize, &batchWriter);
+            }
+            for (size_t task = 0; task < taskCount; task++) {
+                const PartitionWriter &writer = taskWriters[task];
+                for (size_t i = 0; i < writer.indexData.size(); i += 2) {
+                    indexData.push_back(writer.indexData[i]);
+                    indexData.push_back(dataSize + writer.indexData[i + 1]);
+                }
+                for (size_t i = 0; i < writer.piecePartitions.size(); i++) {
+                    for (; countColumns <= writer.piecePartitions[i].first; countColumns++) {
+                        countWriter.flushOffsets.push_back(countWriter.size + writer.piecePartitions[i].second);
+                    }
+                }
+                taskDataOffsets[task] = dataSize;
+                taskPieceOffsets[task] = countWriter.getPartOffset(countWriter.size);
+                dataSize += writer.data.size();
+                countWriter.size += writer.pieces.size();
+            }
+#pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
+            for (size_t task = 0; task < taskCount; task++) {
+                PartitionWriter &writer = taskWriters[task];
+                batchWriter.write(fileno(dataFile), dataName.c_str(), writer.data.data(), writer.data.size(), taskDataOffsets[task]);
+                batchWriter.write(fileno(countWriter.file), countWriter.partName.c_str(), writer.pieces.data(), writer.pieces.size(), taskPieceOffsets[task]);
+                std::vector<char>().swap(writer.data);
+                std::vector<char>().swap(writer.pieces);
+            }
+            appendSeconds += timer.getTimediff();
+            keySplitWriter.nextPartition = taskWriters[taskCount - 1].nextPartition;
+            keySplitWriter.isOpen = taskWriters[taskCount - 1].isOpen;
+            keySplitWriter.prevRep = taskWriters[taskCount - 1].prevRep;
+            repBegin = repEnd;
         }
+        delete[] pairs;
+        for (; countColumns <= partitionCount; countColumns++) {
+            countWriter.flushOffsets.push_back(countWriter.size);
+        }
+        keySplitWriter.data.clear();
+        keySplitWriter.indexData.clear();
+        closePartitions(pref, keySplitWriter, partitionCount);
+        appendPartitions(batchWriter, dataFile, dataName, keySplitWriter, indexData, dataSize);
+        timer.reset();
+        batchWriter.waitWrites();
+        waitSeconds += timer.getTimediff();
+        prefSize += closePrefFile(par.db2 + ".index." + SSTR(pref.keySplitFiles[keySplitIndex]), dataFile, dataName, dataSize, indexData);
+        pref.neededSize -= (keySplitOrder[order].first == 0) ? needed.rowOffsets.back() : 0;
+        std::vector<char>().swap(needed.data);
     }
     if (countWriter.flushOffsets.empty()) {
-        countWriter.flushOffsets.assign(cellCount + 1, countWriter.size);
+        countWriter.flushOffsets.assign(partitionCount + 1, countWriter.size);
     }
     punches.wait();
     closePrefExchangeFiles(markParts);
     closePrefExchangeFiles(repParts);
-    MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 preparing units", prepareSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 preparing key splits", prepareSeconds);
     MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 emitting pairs", emitSeconds);
     MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 sorting pairs", sortSeconds);
-    MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 encoding cells", encodeSeconds);
-    MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 appending cells and piece counts", appendSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 encoding partitions", encodeSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 appending partitions and piece counts", appendSeconds);
     MMseqsNode::addPhaseSeconds(phaseValues, "pass 3 waiting for writes", waitSeconds);
-    return countWriter.publish(pref.cellFirstKeys.size(), 0);
+    return countWriter.publish(pref.partitionFirstKeys.size(), 0);
 }
 
-// the owner of rep cells sums the piece counts: per target split a class file with an entry per own cell and a piece per rep with targets in the split, and a .partitions row per cell.
-// The cells of a pass are decoded, sorted and encoded in parallel, their class pieces split by split
-static std::string writeSizeClasses(const Parameters &par, const KmerExchange &exchange, const TargetPref &pref, const std::vector<PrefExchangeFile> &countFiles, size_t &classSize,
+static std::string writeSizeClasses(const Parameters &par, const KmerExchange &exchange, const KeySplitPref &pref, const std::vector<PrefExchangeFile> &countFiles, size_t &classSize,
                                     std::string &phaseValues) {
-    const std::string prefix = par.db2 + ".piece_counts";
-    size_t firstCell = pref.cellNodeOffsets[MMseqsNode::rank];
-    size_t ownCells = pref.cellNodeOffsets[MMseqsNode::rank + 1] - firstCell;
+    std::string prefix = par.db2 + ".piece_counts";
+    size_t firstPartition = pref.partitionNodeOffsets[MMseqsNode::rank];
+    size_t ownPartitions = pref.partitionNodeOffsets[MMseqsNode::rank + 1] - firstPartition;
     size_t targetSplitCount = pref.targetSplitKeyOffsets.size() - 1;
     PrefExchangeParts parts = openPrefExchangeFiles(prefix, countFiles);
     size_t nodeCount = countFiles.size();
-    // per node and flush the offsets of the own cells
     std::vector<std::vector<size_t> > tables(nodeCount);
-    std::vector<size_t> cellSizes(ownCells, 0);
+    readTables(parts, countFiles, firstPartition, ownPartitions + 1, tables);
+    std::vector<size_t> partitionSizes(ownPartitions, 0);
     for (size_t node = 0; node < nodeCount; node++) {
         size_t flushCount = countFiles[node].flushCount;
-        tables[node].resize((ownCells + 1) * flushCount);
-        BatchReader::ReadRequest tableRead = parts.getRead(countFiles[node], node, (char *) tables[node].data(), countFiles[node].tableOffset + firstCell * flushCount * sizeof(size_t),
-                                                           tables[node].size() * sizeof(size_t));
-        FileUtil::preadAll(tableRead.fileToRead, tableRead.fileName, tableRead.destination, tableRead.bytesToRead, tableRead.fileOffset);
         for (size_t flush = 0; flush < flushCount; flush++) {
-            for (size_t cell = 0; cell < ownCells; cell++) {
-                cellSizes[cell] += tables[node][(cell + 1) * flushCount + flush] - tables[node][cell * flushCount + flush];
+            for (size_t partition = 0; partition < ownPartitions; partition++) {
+                partitionSizes[partition] += tables[node][(partition + 1) * flushCount + flush] - tables[node][partition * flushCount + flush];
             }
         }
     }
-    // a rep count takes at least 2 bytes, decoded a PieceCount and a class piece of at most 12 bytes; per target split an entry end, its offset and its index cell
-    for (size_t cell = 0; cell < ownCells; cell++) {
-        cellSizes[cell] += cellSizes[cell] / 2 * (sizeof(PieceCount) + 12) + targetSplitCount * (1 + 3 * sizeof(size_t));
+    // per rep count (>= 2 bytes) a PieceCount and <= 12 class bytes, per target split 1 byte and 3 words
+    for (size_t partition = 0; partition < ownPartitions; partition++) {
+        partitionSizes[partition] += partitionSizes[partition] / 2 * (sizeof(PieceCount) + 12) + targetSplitCount * (1 + 3 * sizeof(size_t));
     }
     std::vector<size_t> passOffsets;
     std::vector<size_t> passSizes;
-    planPasses(cellSizes, pref.passLimit, passOffsets, passSizes);
+    planPasses(partitionSizes, pref.passLimit, passOffsets, passSizes);
     std::vector<std::string> dataNames(targetSplitCount);
     std::vector<FILE *> dataFiles(targetSplitCount);
     std::vector<size_t> dataSizes(targetSplitCount, 0);
-    std::vector<std::vector<uint64_t> > indexCells(targetSplitCount);
+    std::vector<std::vector<uint64_t> > indexData(targetSplitCount);
     for (size_t split = 0; split < targetSplitCount; split++) {
-        dataNames[split] = par.db2 + "." + SSTR(pref.units.size() + MMseqsNode::rank * targetSplitCount + split);
+        dataNames[split] = par.db2 + "." + SSTR(pref.keySplits.size() + MMseqsNode::rank * targetSplitCount + split);
         dataFiles[split] = FileUtil::openAndDelete(dataNames[split].c_str(), "w");
     }
     BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(dataFiles[0]));
@@ -4932,9 +4962,11 @@ static std::string writeSizeClasses(const Parameters &par, const KmerExchange &e
     for (size_t pass = 0; pass + 1 < passOffsets.size(); pass++) {
         size_t passFirst = passOffsets[pass];
         size_t passEnd = passOffsets[pass + 1];
-        size_t passCells = passEnd - passFirst;
+        size_t passPartitions = passEnd - passFirst;
+
+        // read the piece counts of a pass
         timer.reset();
-        // per node and flush its start in counts
+        // start in counts per node and flush
         std::vector<size_t> flushStarts;
         size_t readSize = 0;
         for (size_t node = 0; node < nodeCount; node++) {
@@ -4945,28 +4977,16 @@ static std::string writeSizeClasses(const Parameters &par, const KmerExchange &e
             }
         }
         counts.resize(readSize);
-        std::vector<BatchReader::ReadRequest> readRequests;
-        for (size_t node = 0, k = 0; node < nodeCount; node++) {
-            size_t flushCount = countFiles[node].flushCount;
-            for (size_t flush = 0; flush < flushCount; flush++, k++) {
-                size_t start = tables[node][passFirst * flushCount + flush];
-                size_t size = tables[node][passEnd * flushCount + flush] - start;
-                if (size > 0) {
-                    readRequests.push_back(parts.getRead(countFiles[node], node, counts.data() + flushStarts[k], start, size));
-                }
-            }
-        }
-        if (readRequests.empty() == false) {
-            batchReader.readSync(readRequests);
-        }
+        punches.punch(readTableColumns(parts, countFiles, tables, passFirst, passEnd, counts.data(), batchReader));
         readSeconds += timer.getTimediff();
-        punches.punch(readRequests);
+
+        // decode, sort and encode the partitions
         timer.reset();
-        std::vector<size_t> cellPrefSizes(passCells, 0);
-        std::vector<size_t> cellCosts(passCells, 0);
-        // per cell its class pieces in split order, an entry per split
-        std::vector<std::vector<char> > cellClasses(passCells);
-        std::vector<size_t> splitOffsets(passCells * (targetSplitCount + 1));
+        std::vector<size_t> partitionPrefSizes(passPartitions, 0);
+        std::vector<size_t> partitionCosts(passPartitions, 0);
+        // class pieces in split order
+        std::vector<std::vector<char> > partitionClasses(passPartitions);
+        std::vector<size_t> splitOffsets(passPartitions * (targetSplitCount + 1));
         double threadDecodeSeconds = 0;
         double threadSortSeconds = 0;
         double threadEncodeSeconds = 0;
@@ -4975,21 +4995,21 @@ static std::string writeSizeClasses(const Parameters &par, const KmerExchange &e
             std::vector<PieceCount> pieceCounts;
             Timer threadTimer;
 #pragma omp for schedule(dynamic, 1)
-            for (size_t cell = 0; cell < passCells; cell++) {
+            for (size_t partition = 0; partition < passPartitions; partition++) {
                 threadTimer.reset();
                 pieceCounts.clear();
                 for (size_t node = 0, k = 0; node < nodeCount; node++) {
                     size_t flushCount = countFiles[node].flushCount;
                     const size_t *table = tables[node].data();
                     for (size_t flush = 0; flush < flushCount; flush++, k++) {
-                        const char *data = counts.data() + flushStarts[k] + table[(passFirst + cell) * flushCount + flush] - table[passFirst * flushCount + flush];
-                        const char *columnEnd = data + table[(passFirst + cell + 1) * flushCount + flush] - table[(passFirst + cell) * flushCount + flush];
+                        const char *data = counts.data() + flushStarts[k] + table[(passFirst + partition) * flushCount + flush] - table[passFirst * flushCount + flush];
+                        const char *columnEnd = data + table[(passFirst + partition + 1) * flushCount + flush] - table[(passFirst + partition) * flushCount + flush];
                         while (data < columnEnd) {
-                            cellPrefSizes[cell] += Util::getPrefKey(data);
-                            cellCosts[cell] += Util::getPrefKey(data);
+                            partitionPrefSizes[partition] += Util::getPrefKey(data);
+                            partitionCosts[partition] += Util::getPrefKey(data);
                             size_t targetSplit = Util::getPrefKey(data);
                             size_t repCount = Util::getPrefKey(data);
-                            PieceCount pieceCount = { static_cast<DBKeyType>(pref.cellFirstKeys[firstCell + passFirst + cell]), targetSplit, 0 };
+                            PieceCount pieceCount = { static_cast<DBKeyType>(pref.partitionFirstKeys[firstPartition + passFirst + partition]), targetSplit, 0 };
                             for (size_t i = 0; i < repCount; i++) {
                                 pieceCount.rep += Util::getPrefKey(data);
                                 pieceCount.targetCount = Util::getPrefKey(data);
@@ -5001,7 +5021,7 @@ static std::string writeSizeClasses(const Parameters &par, const KmerExchange &e
                 threadDecodeSeconds += threadTimer.getTimediff();
                 threadTimer.reset();
                 SORT_SERIAL(pieceCounts.begin(), pieceCounts.end(), PieceCount::compareByRep);
-                // the size class of a rep from its targets in all splits, kept once per split it has targets in
+                // size class from all splits, once per split with targets
                 size_t kept = 0;
                 for (size_t pos = 0, repEnd = 0; pos < pieceCounts.size(); pos = repEnd) {
                     size_t targetCount = 0;
@@ -5019,11 +5039,11 @@ static std::string writeSizeClasses(const Parameters &par, const KmerExchange &e
                 SORT_SERIAL(pieceCounts.begin(), pieceCounts.end(), PieceCount::compareBySplit);
                 threadSortSeconds += threadTimer.getTimediff();
                 threadTimer.reset();
-                std::vector<char> &data = cellClasses[cell];
-                size_t *offsets = splitOffsets.data() + cell * (targetSplitCount + 1);
+                std::vector<char> &data = partitionClasses[partition];
+                size_t *offsets = splitOffsets.data() + partition * (targetSplitCount + 1);
                 for (size_t split = 0, pos = 0; split < targetSplitCount; split++) {
                     offsets[split] = data.size();
-                    DBKeyType prevRep = pref.cellFirstKeys[firstCell + passFirst + cell];
+                    DBKeyType prevRep = pref.partitionFirstKeys[firstPartition + passFirst + partition];
                     for (; pos < pieceCounts.size() && pieceCounts[pos].targetSplit == split; pos++) {
                         putPrefKey(data, pieceCounts[pos].rep - prevRep);
                         putPrefKey(data, getBitWidth(pieceCounts[pos].targetCount) - 1);
@@ -5033,32 +5053,34 @@ static std::string writeSizeClasses(const Parameters &par, const KmerExchange &e
                     data.push_back('\0');
                 }
                 offsets[targetSplitCount] = data.size();
-                cellPrefSizes[cell] += data.size();
+                partitionPrefSizes[partition] += data.size();
                 threadEncodeSeconds += threadTimer.getTimediff();
             }
         }
         decodeSeconds += threadDecodeSeconds;
         sortSeconds += threadSortSeconds;
         encodeSeconds += threadEncodeSeconds;
+
+        // write the class files and rows
         timer.reset();
         for (size_t split = 0; split < targetSplitCount; split++) {
-            for (size_t cell = 0; cell < passCells; cell++) {
-                const size_t *offsets = splitOffsets.data() + cell * (targetSplitCount + 1);
-                indexCells[split].push_back(pref.cellFirstKeys[firstCell + passFirst + cell]);
-                indexCells[split].push_back(dataSizes[split]);
+            for (size_t partition = 0; partition < passPartitions; partition++) {
+                const size_t *offsets = splitOffsets.data() + partition * (targetSplitCount + 1);
+                indexData[split].push_back(pref.partitionFirstKeys[firstPartition + passFirst + partition]);
+                indexData[split].push_back(dataSizes[split]);
                 dataSizes[split] += offsets[split + 1] - offsets[split];
             }
         }
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
-        for (size_t cell = 0; cell < passCells; cell++) {
-            const size_t *offsets = splitOffsets.data() + cell * (targetSplitCount + 1);
+        for (size_t partition = 0; partition < passPartitions; partition++) {
+            const size_t *offsets = splitOffsets.data() + partition * (targetSplitCount + 1);
             for (size_t split = 0; split < targetSplitCount; split++) {
-                batchWriter.write(fileno(dataFiles[split]), dataNames[split].c_str(), cellClasses[cell].data() + offsets[split], offsets[split + 1] - offsets[split],
-                                  indexCells[split][2 * (passFirst + cell) + 1]);
+                batchWriter.write(fileno(dataFiles[split]), dataNames[split].c_str(), partitionClasses[partition].data() + offsets[split], offsets[split + 1] - offsets[split],
+                                  indexData[split][2 * (passFirst + partition) + 1]);
             }
         }
-        for (size_t cell = 0; cell < passCells; cell++) {
-            rows += SSTR(pref.cellFirstKeys[firstCell + passFirst + cell]) + "\t" + SSTR(firstCell + passFirst + cell) + "\t" + SSTR(cellPrefSizes[cell]) + "\t" + SSTR(cellCosts[cell])
+        for (size_t partition = 0; partition < passPartitions; partition++) {
+            rows += SSTR(pref.partitionFirstKeys[firstPartition + passFirst + partition]) + "\t" + SSTR(firstPartition + passFirst + partition) + "\t" + SSTR(partitionPrefSizes[partition]) + "\t" + SSTR(partitionCosts[partition])
                     + "\t" + SSTR(MMseqsNode::rank) + "\n";
         }
         writeSeconds += timer.getTimediff();
@@ -5067,12 +5089,8 @@ static std::string writeSizeClasses(const Parameters &par, const KmerExchange &e
     batchWriter.waitWrites();
     classSize = 0;
     for (size_t split = 0; split < targetSplitCount; split++) {
-        std::string indexName = par.db2 + ".index." + SSTR(pref.units.size() + MMseqsNode::rank * targetSplitCount + split);
-        FILE *indexFile = FileUtil::openAndDelete(indexName.c_str(), "w");
-        size_t indexSize = indexCells[split].size() * sizeof(uint64_t);
-        FileUtil::pwriteAll(fileno(indexFile), indexName.c_str(), (const char *) indexCells[split].data(), indexSize, 0);
-        MMseqsNode::closeClusterFiles(dataFiles[split], dataNames[split], indexFile, indexName, dataSizes[split], indexSize);
-        classSize += dataSizes[split] + indexSize + 2 * sizeof(uint64_t);
+        classSize += closePrefFile(par.db2 + ".index." + SSTR(pref.keySplits.size() + MMseqsNode::rank * targetSplitCount + split), dataFiles[split], dataNames[split], dataSizes[split],
+                                   indexData[split]);
     }
     punches.wait();
     closePrefExchangeFiles(parts);
@@ -5086,15 +5104,12 @@ static std::string writeSizeClasses(const Parameters &par, const KmerExchange &e
 }
 
 template <typename T, bool includeAdjacency, typename L>
-static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, MMseqsNode::WorkQueue &sendQueue,
-                                  size_t totalKmerCount, size_t smallestMemoryLimit, size_t localNodes) {
-    TargetPref pref;
+static void kmermatcherKeySplitPref(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, MMseqsNode::WorkQueue &sendQueue,
+                                  size_t totalKmerCount, size_t minPassLimit, size_t receiverKmerSize, size_t localNodes) {
+    KeySplitPref pref;
     size_t nodeCount = MMseqsNode::count;
-    // an owner pass holds TASKS_PER_THREAD hash ranges per thread
-    size_t minPassLimit = std::max((size_t) 1, getPassLimit(smallestMemoryLimit));
-    size_t receiverKmerSize = (2 * exchange.globalIdBits + exchange.adjKeyCodeBits + CHAR_BIT - 1) / CHAR_BIT;
-    size_t ownerPasses = std::max((size_t) 1, (totalKmerCount * receiverKmerSize / nodeCount + minPassLimit - 1) / minPassLimit);
-    pref.hashRangeCount = nodeCount * std::max(RANGES_PER_NODE, ownerPasses * TASKS_PER_THREAD * par.threads);
+    size_t hashRangePasses = std::max((size_t) 1, (totalKmerCount * receiverKmerSize / nodeCount + minPassLimit - 1) / minPassLimit);
+    pref.hashRangeCount = nodeCount * std::max(RANGES_PER_NODE, hashRangePasses * TASKS_PER_THREAD * par.threads);
     pref.hashRangeNodeOffsets.resize(nodeCount + 1);
     for (size_t node = 0; node <= nodeCount; node++) {
         pref.hashRangeNodeOffsets[node] = node * pref.hashRangeCount / nodeCount;
@@ -5111,37 +5126,34 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     for (size_t split = 0; split < pref.targetSplitBlockOffsets.size(); split++) {
         pref.targetSplitKeyOffsets.push_back(seqDbr.getBlockKeyOffsets()[pref.targetSplitBlockOffsets[split]]);
     }
-    // the rep cells are the partitions of the pair merge
-    size_t cellCount = exchange.sendSplitCount * exchange.partitionsPerRange;
-    pref.cellFirstKeys.resize(cellCount + 1);
-    for (size_t cell = 0; cell < cellCount; cell++) {
-        pref.cellFirstKeys[cell] = getPartitionFirstKey(exchange, cell / exchange.partitionsPerRange, cell % exchange.partitionsPerRange);
+    // the partitions of the pair merge
+    size_t partitionCount = exchange.sendSplitCount * exchange.partitionsPerRange;
+    pref.partitionFirstKeys.resize(partitionCount + 1);
+    for (size_t partition = 0; partition < partitionCount; partition++) {
+        pref.partitionFirstKeys[partition] = getPartitionFirstKey(exchange, partition / exchange.partitionsPerRange, partition % exchange.partitionsPerRange);
     }
-    pref.cellFirstKeys[cellCount] = seqDbr.getSize();
-    pref.cellNodeOffsets.resize(nodeCount + 1);
+    pref.partitionFirstKeys[partitionCount] = seqDbr.getSize();
+    pref.partitionNodeOffsets.resize(nodeCount + 1);
     for (size_t node = 0; node <= nodeCount; node++) {
-        pref.cellNodeOffsets[node] = node * cellCount / nodeCount;
+        pref.partitionNodeOffsets[node] = node * partitionCount / nodeCount;
     }
     pref.rangeCoveredKeys.resize(seqDbr.getIndexSize());
 #pragma omp parallel for schedule(static) num_threads(par.threads)
     for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {
         pref.rangeCoveredKeys[range] = getCoveredKeys(par, seqDbr, seqDbr.getIndex()[range].id);
     }
-    pref.readChunkLimit = std::min(BatchReader::MAX_INFLIGHT_READ_SIZE, exchange.keySplitMemoryLimit / 6);
-    // the current and the prefetched input buffer, page aligned in every data file
-    size_t readBufferBytes = 2 * (std::max(pref.readChunkLimit, seqDbr.getMaxSeqLen()) + 2 * Util::getPageSize() * seqDbr.getDataFileCnt());
-    size_t unitMemory = exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, readBufferBytes);
-    // two thirds for the k-mers of a unit, a third for the needed groups of the units
-    pref.unitKmerCapacity = unitMemory / 3 * 2 / sizeof(PackedKmerPosition);
+    size_t keySplitMemory = exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, exchange.readBufferSize);
+    // 2/3 for the k-mers, 1/3 for the needed groups
+    pref.keySplitKmerCapacity = keySplitMemory / 3 * 2 / sizeof(PackedKmerPosition);
     pref.passLimit = std::max((size_t) 1, getPassLimit(exchange.keySplitMemoryLimit));
     pref.writeBuffers = new(std::nothrow) char[par.threads * KMER_FILE_BUFFER_SIZE];
-    Util::checkAllocation(pref.writeBuffers, "Can not allocate writeBuffers memory in kmermatcherTargetPref");
+    Util::checkAllocation(pref.writeBuffers, "Can not allocate writeBuffers memory in kmermatcherKeySplitPref");
     pref.keptSize = 0;
     pref.isKeeping = true;
     pref.neededSize = 0;
-    pref.neededLimit = unitMemory / 3;
-    pref.unitMemory = unitMemory;
-    // A/B switch MMSEQS_KMER_SHARED_SPILL=1: spill to the shared folder when --local-tmp is full instead of extracting again
+    pref.neededLimit = keySplitMemory / 3;
+    pref.keySplitMemory = keySplitMemory;
+    // A/B switch: spill to the shared folder instead of extracting again
     const char *sharedSpillSwitch = getenv("MMSEQS_KMER_SHARED_SPILL");
     const bool isSharedSpill = sharedSpillSwitch != NULL && strcmp(sharedSpillSwitch, "1") == 0;
     NeededSpill localSpill = { par.localTmp + "/" + FileUtil::baseName(par.db2) + ".needed." + SSTR(MMseqsNode::rank), par.localTmp, par.localTmp.empty() ? 0 : localNodes, NULL, 0 };
@@ -5152,63 +5164,57 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
         Debug(Debug::INFO) << "Send fingerprints in " << exchange.sendSplitCount << " send splits to " << pref.hashRangeCount << " hash ranges\n";
     }
 
-    // a file is removed once the barrier after its last read passed
+    // remove a file after the barrier past its last read
     BackgroundRemoval removal;
     Timer phaseTimer;
     std::string values;
     double extractSeconds = 0;
     size_t sentSize = 0;
-    std::string units = sendFingerprints<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, sendQueue, extractSeconds, sentSize);
-    // pass 3 keeps the files of all own units open next to the marks and reps of all nodes, the size classes a file per target split next to the piece counts
-    FileUtil::checkRlimitNoFile(2 * seqDbr.getDataFileCnt() + 64 + std::max(2 * nodeCount + pref.sendSplitUnitOffsets.back() + 2, nodeCount + pref.targetSplitKeyOffsets.size()));
-    // the owners get the memory of the extraction buffer, pass 2 allocates it again
-    delete[] pref.extractedUnit.kmers;
-    pref.extractedUnit.kmers = NULL;
+    std::string keySplitLines = sendFingerprints<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, sendQueue, extractSeconds, sentSize);
+    // own key split files, marks and reps of all nodes; class files and piece counts
+    FileUtil::checkRlimitNoFile(2 * seqDbr.getDataFileCnt() + 64 + std::max(2 * nodeCount + pref.sendSplitKeySplitOffsets.back() + 2, nodeCount + pref.targetSplitKeyOffsets.size()));
+    delete[] pref.extractedKeySplit.kmers;
+    pref.extractedKeySplit.kmers = NULL;
     MMseqsNode::addPhaseTime(values, "sending fingerprints", phaseTimer);
     MMseqsNode::addPhaseValue(values, "Fingerprint bytes sent", SSTR(sentSize));
-    MMseqsNode::addPhaseValue(values, "Units", SSTR(pref.sendSplitUnitOffsets.back()) + (pref.isKeeping ? ", k-mers kept for the later passes" : ", k-mers extracted in every pass"));
-    units = MMseqsNode::barrier(par.db2 + ".fingerprints.done", units);
+    MMseqsNode::addPhaseValue(values, "Key splits", SSTR(pref.sendSplitKeySplitOffsets.back()) + (pref.isKeeping ? " (k-mers kept)" : " (k-mers extracted again)"));
+    keySplitLines = MMseqsNode::barrier(par.db2 + ".fingerprints.done", keySplitLines);
     removal.run([&sendQueue]() { sendQueue.removeTakenItemFiles(); });
     if (MMseqsNode::isMaster()) {
         removal.removeFile(par.db2 + ".memory");
     }
-    // per node its fingerprint file, then a line per unit
+    // per node: its file, then a line per key split
     std::vector<PrefExchangeFile> fingerprintFiles;
-    pref.nodeUnitOffsets.assign(1, 0);
-    for (char *line = (char *) units.c_str(); *line != '\0';) {
+    pref.nodeKeySplitOffsets.assign(1, 0);
+    for (char *line = (char *) keySplitLines.c_str(); *line != '\0';) {
         PrefExchangeFile file = readPrefExchangeLine(line);
         fingerprintFiles.push_back(file);
         line = Util::skipLine(line);
-        for (size_t unit = 0; unit < file.flushCount; unit++, line = Util::skipLine(line)) {
+        for (size_t i = 0; i < file.flushCount; i++, line = Util::skipLine(line)) {
             const char *columns[2];
             Util::getWordsOfLine(line, columns, 2);
-            PrefUnit prefUnit = { Util::fast_atoi<size_t>(columns[0]), Util::fast_atoi<size_t>(columns[1]), 0 };
-            prefUnit.idBits = getBitWidth(prefUnit.endKey - prefUnit.firstKey);
-            pref.units.push_back(prefUnit);
+            KeySplit keySplit = { Util::fast_atoi<size_t>(columns[0]), Util::fast_atoi<size_t>(columns[1]), 0 };
+            keySplit.idBits = getBitWidth(keySplit.endKey - keySplit.firstKey);
+            pref.keySplits.push_back(keySplit);
         }
-        pref.nodeUnitOffsets.push_back(pref.units.size());
+        pref.nodeKeySplitOffsets.push_back(pref.keySplits.size());
     }
-    std::vector<std::pair<size_t, size_t> > unitOrder;
-    for (size_t unit = 0; unit < pref.units.size(); unit++) {
-        unitOrder.push_back(std::make_pair(pref.units[unit].firstKey, unit));
+    std::vector<std::pair<size_t, size_t> > keySplitOrder;
+    for (size_t keySplit = 0; keySplit < pref.keySplits.size(); keySplit++) {
+        keySplitOrder.push_back(std::make_pair(pref.keySplits[keySplit].firstKey, keySplit));
     }
-    SORT_SERIAL(unitOrder.begin(), unitOrder.end());
-    pref.unitFiles.resize(pref.units.size());
-    for (size_t i = 0; i < unitOrder.size(); i++) {
-        pref.unitFiles[unitOrder[i].second] = i;
+    SORT_SERIAL(keySplitOrder.begin(), keySplitOrder.end());
+    pref.keySplitFiles.resize(pref.keySplits.size());
+    for (size_t i = 0; i < keySplitOrder.size(); i++) {
+        pref.keySplitFiles[keySplitOrder[i].second] = i;
     }
     MMseqsNode::addPhaseTime(values, "waiting for the other nodes to send fingerprints", phaseTimer);
 
     size_t receivedSize = 0;
-    std::string ownerValues;
-    std::string answer = answerHashRanges(par, exchange, pref, par.db2 + ".fingerprints", fingerprintFiles, par.db2 + ".marks", false,
-                                          exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, getHeldMemory(pref)), [](const PrefUnit &, const size_t *groupCounts) {
-        return groupCounts[KMER_GROUPS] + groupCounts[WHOLE_SEQUENCE_GROUPS];
-    }, [&](size_t hashRange, std::vector<PrefRowRead *> &rows) {
-        markFingerprints(pref, hashRange, rows);
-    }, receivedSize, ownerValues);
+    std::string answerValues;
+    std::string answer = answerHashRanges(par, exchange, pref, par.db2 + ".fingerprints", fingerprintFiles, par.db2 + ".marks", false, receivedSize, answerValues);
     MMseqsNode::addPhaseTime(values, "marking fingerprints", phaseTimer);
-    values += ownerValues;
+    values += answerValues;
     MMseqsNode::addPhaseValue(values, "Fingerprint bytes received", SSTR(receivedSize));
     std::vector<PrefExchangeFile> markFiles = readPrefExchangeFiles(MMseqsNode::barrier(par.db2 + ".marks.done", answer));
     removePrefExchangeFile(removal, par.db2 + ".fingerprints", fingerprintFiles);
@@ -5218,26 +5224,25 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     MMseqsNode::addPhaseTime(values, "waiting for the other nodes to mark fingerprints", phaseTimer);
 
     std::string sent = sendCandidates<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, markFiles, extractSeconds, sentSize);
-    // pass 3 reads the needed groups, or extracts again into extractedUnit
-    delete[] pref.extractedUnit.kmers;
-    pref.extractedUnit.kmers = NULL;
-    size_t spilledUnits[SPILL_KINDS + 1] = {0, 0, 0};
-    size_t extractedUnits = 0;
-    for (size_t unit = 0; unit < pref.neededGroups.size(); unit++) {
-        spilledUnits[pref.neededGroups[unit].spill]++;
-        extractedUnits += pref.neededGroups[unit].data.empty() && pref.neededGroups[unit].spill == SPILL_KINDS;
+    delete[] pref.extractedKeySplit.kmers;
+    pref.extractedKeySplit.kmers = NULL;
+    size_t spilledKeySplits[SPILL_KINDS + 1] = {0, 0, 0};
+    size_t extractedKeySplits = 0;
+    for (size_t keySplit = 0; keySplit < pref.neededGroups.size(); keySplit++) {
+        spilledKeySplits[pref.neededGroups[keySplit].spill]++;
+        extractedKeySplits += pref.neededGroups[keySplit].data.empty() && pref.neededGroups[keySplit].spill == SPILL_KINDS;
     }
     MMseqsNode::addPhaseTime(values, "sending candidates", phaseTimer);
-    MMseqsNode::addPhaseValue(values, "Needed groups for pass 3", SSTR(pref.neededSize) + " bytes in memory, " + SSTR(pref.spills[LOCAL_SPILL].size) + " bytes in " + SSTR(spilledUnits[LOCAL_SPILL])
-                                                                   + " units in --local-tmp, " + SSTR(pref.spills[SHARED_SPILL].size) + " bytes in " + SSTR(spilledUnits[SHARED_SPILL])
-                                                                   + " units in the shared folder, " + SSTR(extractedUnits) + " units extracted again");
+    MMseqsNode::addPhaseValue(values, "Needed group bytes", SSTR(pref.neededSize) + " in memory, " + SSTR(pref.spills[LOCAL_SPILL].size) + " in --local-tmp ("
+                                                             + SSTR(spilledKeySplits[LOCAL_SPILL]) + " key splits), " + SSTR(pref.spills[SHARED_SPILL].size) + " in the shared folder ("
+                                                             + SSTR(spilledKeySplits[SHARED_SPILL]) + " key splits), " + SSTR(extractedKeySplits) + " key splits extracted again");
     MMseqsNode::addPhaseValue(values, "Candidate bytes sent", SSTR(sentSize));
     std::vector<PrefExchangeFile> candidateFiles = readPrefExchangeFiles(MMseqsNode::barrier(par.db2 + ".candidates.done", sent));
-    size_t allExtractedUnits = 0;
+    size_t allExtractedKeySplits = 0;
     for (size_t node = 0; node < candidateFiles.size(); node++) {
-        allExtractedUnits += candidateFiles[node].value;
+        allExtractedKeySplits += candidateFiles[node].value;
     }
-    if (allExtractedUnits == 0) {
+    if (allExtractedKeySplits == 0) {
         removePrefExchangeFile(removal, par.db2 + ".marks", markFiles);
     }
     if (MMseqsNode::isMaster()) {
@@ -5246,15 +5251,10 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
     MMseqsNode::addPhaseTime(values, "waiting for the other nodes to send candidates", phaseTimer);
 
     receivedSize = 0;
-    ownerValues.clear();
-    answer = answerHashRanges(par, exchange, pref, par.db2 + ".candidates", candidateFiles, par.db2 + ".reps", true,
-                              exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, getHeldMemory(pref)), [&](const PrefUnit &, const size_t *groupCounts) {
-        return getRepAnswerBits(exchange, groupCounts);
-    }, [&](size_t hashRange, std::vector<PrefRowRead *> &rows) {
-        pickReps(exchange, pref, hashRange, rows);
-    }, receivedSize, ownerValues);
+    answerValues.clear();
+    answer = answerHashRanges(par, exchange, pref, par.db2 + ".candidates", candidateFiles, par.db2 + ".reps", true, receivedSize, answerValues);
     MMseqsNode::addPhaseTime(values, "picking reps", phaseTimer);
-    values += ownerValues;
+    values += answerValues;
     MMseqsNode::addPhaseValue(values, "Candidate bytes received", SSTR(receivedSize));
     std::vector<PrefExchangeFile> repFiles = readPrefExchangeFiles(MMseqsNode::barrier(par.db2 + ".reps.done", answer));
     removePrefExchangeFile(removal, par.db2 + ".candidates", candidateFiles);
@@ -5265,25 +5265,25 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
 
     size_t prefSize = 0;
     size_t pairCount = 0;
-    size_t sweepCount = 0;
+    size_t repSplitCount = 0;
     std::string prefValues;
-    sent = writeUnitPrefs<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, markFiles, repFiles, extractSeconds, prefSize, pairCount, sweepCount, prefValues);
-    freeKeptUnits(pref);
-    delete[] pref.extractedUnit.kmers;
+    sent = writeKeySplitPrefs<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, markFiles, repFiles, extractSeconds, prefSize, pairCount, repSplitCount, prefValues);
+    freeKeptKeySplits(pref);
+    delete[] pref.extractedKeySplit.kmers;
     delete[] pref.writeBuffers;
-    MMseqsNode::addPhaseTime(values, "writing unit prefilters", phaseTimer);
+    MMseqsNode::addPhaseTime(values, "writing key split prefilters", phaseTimer);
     values += prefValues;
     MMseqsNode::addPhaseSeconds(values, "reading sequences and extracting k-mers", extractSeconds);
-    MMseqsNode::addPhaseValue(values, "Prefilter pairs", SSTR(pairCount) + " in " + SSTR(sweepCount) + " sweeps");
+    MMseqsNode::addPhaseValue(values, "Prefilter pairs", SSTR(pairCount) + " in " + SSTR(repSplitCount) + " rep splits");
     std::vector<PrefExchangeFile> countFiles = readPrefExchangeFiles(MMseqsNode::barrier(par.db2 + ".piece_counts.done", sent));
-    if (allExtractedUnits > 0) {
+    if (allExtractedKeySplits > 0) {
         removePrefExchangeFile(removal, par.db2 + ".marks", markFiles);
     }
     removePrefExchangeFile(removal, par.db2 + ".reps", repFiles);
     if (MMseqsNode::isMaster()) {
         removal.removeFile(par.db2 + ".reps.done");
     }
-    MMseqsNode::addPhaseTime(values, "waiting for the other nodes to write unit prefilters", phaseTimer);
+    MMseqsNode::addPhaseTime(values, "waiting for the other nodes to write key split prefilters", phaseTimer);
 
     size_t classSize = 0;
     std::string classValues;
@@ -5297,17 +5297,17 @@ static void kmermatcherTargetPref(Parameters &par, DBReader<DBKeyType> &seqDbr, 
         rows = MMseqsNode::gatherRunFiles(par.db2 + ".partitions.");
         MMseqsNode::publishRunFile(par.db2 + ".merged", "");
         removal.removeFile(par.db2 + ".piece_counts.done");
-        // the owners' rows follow in cell order; the head: align groups and units, target split blocks, unit first keys, first cell of the class files of every node
-        std::string partitions = SSTR(exchange.alignGroupCount) + "\t" + SSTR(pref.units.size()) + "\n";
+        // head: align groups and key splits, target split blocks, key split first keys, partition node offsets
+        std::string partitions = SSTR(exchange.alignGroupCount) + "\t" + SSTR(pref.keySplits.size()) + "\n";
         for (size_t split = 0; split < pref.targetSplitBlockOffsets.size(); split++) {
             partitions += SSTR(pref.targetSplitBlockOffsets[split]) + ((split + 1 < pref.targetSplitBlockOffsets.size()) ? "\t" : "\n");
         }
-        for (size_t i = 0; i < unitOrder.size(); i++) {
-            partitions += SSTR(unitOrder[i].first) + "\t";
+        for (size_t i = 0; i < keySplitOrder.size(); i++) {
+            partitions += SSTR(keySplitOrder[i].first) + "\t";
         }
         partitions += SSTR(seqDbr.getSize()) + "\n";
         for (size_t node = 0; node <= nodeCount; node++) {
-            partitions += SSTR(pref.cellNodeOffsets[node]) + ((node < nodeCount) ? "\t" : "\n");
+            partitions += SSTR(pref.partitionNodeOffsets[node]) + ((node < nodeCount) ? "\t" : "\n");
         }
         FileUtil::publishFile(par.db2 + ".partitions", partitions + rows);
         MMseqsNode::removeOnceRead(par.db2 + ".merged");
@@ -5433,10 +5433,13 @@ void kmermatcherLinfinity(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatr
                                + exchange.hashRangeCount * exchange.rowsPerHashRange * sizeof(KmerFileRow)
                                + (exchange.hasTargetSplits ? seqDbr.getBlockKeyOffsets().size() * sizeof(size_t) + 2 * KMER_FILE_BUFFER_SIZE : 0);
     exchange.keySplitMemoryLimit = (fixedMemory < memoryLimit) ? static_cast<size_t>(static_cast<double>(memoryLimit - fixedMemory) * 0.95) : 0;
+    exchange.readChunkLimit = std::min(BatchReader::MAX_INFLIGHT_READ_SIZE, exchange.keySplitMemoryLimit / 6);
+    // the current and the prefetched input buffer, page aligned in every data file
+    exchange.readBufferSize = 2 * (std::max(exchange.readChunkLimit, seqDbr.getMaxSeqLen()) + 2 * Util::getPageSize() * seqDbr.getDataFileCnt());
     size_t rangePairPasses = std::max((size_t) 1, (totalKmerCount / exchange.sendSplitCount * exchange.maxRepSeqCount * pairTargetSize + minPassLimit - 1) / minPassLimit);
     exchange.partitionsPerRange = std::max((size_t) 4 * par.threads, 2 * rangePairPasses);
     if (isTargetPref) {
-        kmermatcherTargetPref<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, sendQueue, totalKmerCount, smallestMemoryLimit, localNodes);
+        kmermatcherKeySplitPref<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, sendQueue, totalKmerCount, minPassLimit, receiverKmerSize, localNodes);
         return;
     }
     exchange.pairRowSize = exchange.sendSplitCount * exchange.partitionsPerRange * sizeof(PairFileRow);
