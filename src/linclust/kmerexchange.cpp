@@ -557,7 +557,7 @@ static void punchPassRows(const std::vector<ReceivedFile> &receivedFiles, const 
 
 template <typename Row>
 static KmerCodeReader getRowCodeReader(const ReceivedFile &receivedFile, const Row &codeRow, size_t bufferOffset, size_t code, char *passBuffer, char *codeReadBuffer, size_t codeReadBufferSize) {
-    KmerCodeReader codeRead = {NULL, 0, 0, 0, -1, NULL, SIZE_MAX, 0, 0};
+    KmerCodeReader codeRead = {NULL, 0, 0, 0, -1, NULL, codeRow.offsets[code + 1] - codeRow.offsets[code], 0, 0};
     if (receivedFile.data != NULL) {
         codeRead.buffer = receivedFile.data + codeRow.offsets[code];
     } else if (codeReadBufferSize == 0) {
@@ -949,7 +949,7 @@ static void writePairFileRows(const KmerExchange &exchange, PairFile &pairFile, 
             for (size_t code = 0; code < PAIR_CODE_COUNT; code++) {
                 size_t writePos = rows[row].offsets[code];
                 codeWrites[code] = isOwnRow
-                    ? KmerCodeWriter(ownPairs.data, ownPairs.size, writePos)
+                    ? KmerCodeWriter(ownPairs.data, rows[row].offsets[code + 1], writePos)
                     : KmerCodeWriter(fileno(pairFile.groups->files[group]), pairFile.groups->names[group].c_str(), writeBuffer + code * KMER_FILE_BUFFER_SIZE / 4, KMER_FILE_BUFFER_SIZE / 4, writePos, pairFile.batchWriter);
             }
             KmerCodeWriter &indexWrite = codeWrites[PAIR_INDEX_CODES];
@@ -1787,7 +1787,7 @@ static size_t sendKmers(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix
                 for (size_t code = 0; code < KMER_CODE_COUNT; code++) {
                     size_t writePos = hashSubRangeRow.offsets[code];
                     codeWrites[code] = isOwnHashRange[row / exchange.rowsPerHashRange]
-                        ? KmerCodeWriter(ownKmers.data, ownKmers.size, writePos)
+                        ? KmerCodeWriter(ownKmers.data, hashSubRangeRow.offsets[code + 1], writePos)
                         : KmerCodeWriter(fileno(kmerGroups.files[group]), kmerGroups.names[group].c_str(), kmerWriteBuffer + thread_idx * KMER_FILE_BUFFER_SIZE + code * codeBufferSize, codeBufferSize, writePos, &batchWriter);
                 }
                 unsigned int hashDiffLowBits = getHashDiffLowBits(hashSubRange, hashSubRangeEnd, exchange.hashSubRangeCount, hashShift, hashSubRangeRow.groupCount);
@@ -3133,8 +3133,8 @@ static inline bool hasOtherMember(const PackedKmerPosition *kmers, size_t groupS
     return false;
 }
 
-static KmerCodeReader getMemoryCodeReader(char *data) {
-    KmerCodeReader reader = {data, 0, 0, 0, -1, NULL, SIZE_MAX, 0, 0};
+static KmerCodeReader getMemoryCodeReader(char *data, size_t size) {
+    KmerCodeReader reader = {data, 0, 0, 0, -1, NULL, size, 0, 0};
     return reader;
 }
 
@@ -3499,7 +3499,7 @@ static std::string answerHashRanges(const Parameters &par, const TargetPref &pre
                 row.groupCounts[KMER_GROUPS] = 0;
                 row.groupCounts[WHOLE_SEQUENCE_GROUPS] = 0;
                 if (offsets[passFirst + i + 1] > offsets[passFirst + i]) {
-                    row.reader = getMemoryCodeReader(rowData.data() + unitDataOffsets[unit] + offsets[passFirst + i] - offsets[passFirst]);
+                    row.reader = getMemoryCodeReader(rowData.data() + unitDataOffsets[unit] + offsets[passFirst + i] - offsets[passFirst], offsets[passFirst + i + 1] - offsets[passFirst + i]);
                     row.groupCounts[KMER_GROUPS] = getEliasGamma(row.reader) - 1;
                     row.groupCounts[WHOLE_SEQUENCE_GROUPS] = getEliasGamma(row.reader) - 1;
                 }
@@ -3677,7 +3677,7 @@ struct MarkedGroups {
 // the [start, end) of the groups of a row that pass 3 needs, by GROUP_SEGMENTS
 static void collectNeededGroups(const TargetPref &pref, const PackedKmerPosition *kmers, const std::vector<size_t> *rangeOffsets, const UnitMarks &marks, size_t hashRange,
                                 std::vector<std::pair<size_t, size_t> > *neededGroups) {
-    KmerCodeReader marksRead = getMemoryCodeReader((char *) marks.data.data() + marks.rowOffsets[hashRange]);
+    KmerCodeReader marksRead = getMemoryCodeReader((char *) marks.data.data() + marks.rowOffsets[hashRange], marks.rowOffsets[hashRange + 1] - marks.rowOffsets[hashRange]);
     for (size_t segment = 0; segment < GROUP_SEGMENTS; segment++) {
         neededGroups[segment].clear();
     }
@@ -3759,7 +3759,7 @@ static void compactUnitKmers(const Parameters &par, TargetPref &pref, const Pack
     for (int copy = 0; copy < 2; copy++) {
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
         for (size_t hashRange = 0; hashRange < pref.hashRangeCount; hashRange++) {
-            KmerCodeReader marksRead = getMemoryCodeReader((char *) marks.data.data() + marks.rowOffsets[hashRange]);
+            KmerCodeReader marksRead = getMemoryCodeReader((char *) marks.data.data() + marks.rowOffsets[hashRange], marks.rowOffsets[hashRange + 1] - marks.rowOffsets[hashRange]);
             size_t *segments = compact.segmentOffsets.data() + hashRange * GROUP_SEGMENTS;
             size_t segmentPos[GROUP_SEGMENTS];
             std::copy(segments, segments + GROUP_SEGMENTS, segmentPos);
@@ -4391,7 +4391,7 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                         };
 #pragma omp for schedule(dynamic, 1)
                         for (size_t hashRange = chunkStart; hashRange < chunkEnd; hashRange++) {
-                            KmerCodeReader repRead = getMemoryCodeReader(repAnswers.data() + repRowOffsets[hashRange]);
+                            KmerCodeReader repRead = getMemoryCodeReader(repAnswers.data() + repRowOffsets[hashRange], repAnswers.size() - repRowOffsets[hashRange]);
                             if (compact.kmers != NULL) {
                                 for (size_t segment = 0; segment < GROUP_SEGMENTS; segment++) {
                                     size_t to = compact.segmentOffsets[hashRange * GROUP_SEGMENTS + segment + 1];
@@ -4410,7 +4410,7 @@ static std::string writeUnitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                                 }
                                 continue;
                             }
-                            KmerCodeReader marksRead = getMemoryCodeReader(marks.data.data() + marks.rowOffsets[hashRange]);
+                            KmerCodeReader marksRead = getMemoryCodeReader(marks.data.data() + marks.rowOffsets[hashRange], marks.rowOffsets[hashRange + 1] - marks.rowOffsets[hashRange]);
                             for (size_t kind = 0; kind < GROUP_KINDS; kind++) {
                                 MarkedGroups groups(kmers, rangeOffsets[kind][hashRange], rangeOffsets[kind][hashRange + 1], pref.fingerprintShifts[kind], marksRead);
                                 while (groups.next()) {

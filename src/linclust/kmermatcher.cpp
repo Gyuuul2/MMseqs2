@@ -63,7 +63,10 @@ uint64_t hashUInt64(uint64_t in, uint64_t seed) {
 #if SIMDE_ENDIAN_ORDER == SIMDE_ENDIAN_BIG
     in = __builtin_bswap64(in);
 #endif
-    return XXH64(&in, sizeof(uint64_t), seed);
+    // XXH64 of the 8 bytes
+    uint64_t hash = seed + XXH_PRIME64_5 + sizeof(uint64_t);
+    hash ^= XXH64_round(0, XXH_readLE64(&in));
+    return XXH64_avalanche(XXH_rotl64(hash, 27) * XXH_PRIME64_1 + XXH_PRIME64_4);
 }
 
 // odd multiplication modulo 2^kmerBits, moved to the top bits
@@ -244,7 +247,8 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                 }
             }
 #pragma omp barrier
-
+            // linfinity: the range and read of the previous id
+            DBReader<DBKeyType>::LoadedBufferCursor cursor;
 #pragma omp for schedule(dynamic, 100)
             for (size_t id = start; id < (start + bucketSize); id++) {
                 if (isLinfinity == false) {
@@ -255,8 +259,8 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                 }
                 memset(hierarchicalScoreDist, 0, sizeof(unsigned int) * 128);
 
-                const char *seqData = seqDbr.getData(id, thread_idx);
-                seq.mapSequence(id, seqDbr.getDbKey(id), seqData, seqDbr.getSeqLen(id));
+                const char *seqData = isLinfinity ? seqDbr.getDataFromLoadedBuffer(id, cursor) : seqDbr.getData(id, thread_idx);
+                seq.mapSequence(id, seqDbr.getDbKey(id), seqData, isLinfinity ? seqDbr.getSeqLenFromRange(cursor.range, id) : seqDbr.getSeqLen(id));
 
                 size_t seqHash =  SIZE_T_MAX;
                 if(hashWholeSequence){

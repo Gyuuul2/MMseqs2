@@ -496,18 +496,35 @@ static void refillKmerCodeBuffer(KmerCodeReader &reader, size_t fileOffset) {
     reader.bufferPos = 0;
 }
 
-static inline void putBits(KmerCodeWriter &writer, uint64_t value, unsigned int width) {
-    for (unsigned int done = 0; done < width; done += KMER_FILE_STEP_BITS) {
-        unsigned int bits = std::min(width - done, KMER_FILE_STEP_BITS);
-        writer.bitBuffer |= ((value >> done) & ((1ULL << bits) - 1)) << writer.bitCount;
-        for (writer.bitCount += bits; writer.bitCount >= CHAR_BIT; writer.bitCount -= CHAR_BIT) {
-            if (writer.bufferPos == writer.bufferSize) {
-                writeKmerCodeBuffer(writer);
-            }
-            writer.buffer[writer.bufferPos++] = static_cast<char>(writer.bitBuffer);
-            writer.bitBuffer >>= CHAR_BIT;
+// at most KMER_FILE_STEP_BITS bits; the writer may write up to bufferSize, bytes after its position are written again later
+static inline void putStepBits(KmerCodeWriter &writer, uint64_t value, unsigned int bits) {
+    writer.bitBuffer |= (value & ((1ULL << bits) - 1)) << writer.bitCount;
+    writer.bitCount += bits;
+    if (writer.bufferSize - writer.bufferPos >= sizeof(uint64_t)) {
+        for (unsigned int i = 0; i < sizeof(uint64_t); i++) {
+            writer.buffer[writer.bufferPos + i] = static_cast<char>(writer.bitBuffer >> (CHAR_BIT * i));
         }
+        unsigned int byteCount = writer.bitCount / CHAR_BIT;
+        writer.bufferPos += byteCount;
+        writer.bitBuffer >>= CHAR_BIT * byteCount;
+        writer.bitCount -= CHAR_BIT * byteCount;
+        return;
     }
+    for (; writer.bitCount >= CHAR_BIT; writer.bitCount -= CHAR_BIT) {
+        if (writer.bufferPos == writer.bufferSize) {
+            writeKmerCodeBuffer(writer);
+        }
+        writer.buffer[writer.bufferPos++] = static_cast<char>(writer.bitBuffer);
+        writer.bitBuffer >>= CHAR_BIT;
+    }
+}
+
+static inline void putBits(KmerCodeWriter &writer, uint64_t value, unsigned int width) {
+    for (; width > KMER_FILE_STEP_BITS; width -= KMER_FILE_STEP_BITS) {
+        putStepBits(writer, value, KMER_FILE_STEP_BITS);
+        value >>= KMER_FILE_STEP_BITS;
+    }
+    putStepBits(writer, value, width);
 }
 
 // the writer is at a byte boundary
@@ -532,10 +549,25 @@ static inline size_t getPrefKeySize(uint64_t key) {
     return (std::max(1u, getBitWidth(key)) + 6) / 7;
 }
 
+// whole bytes up to 63 bits at once when the buffer has 8 more bytes
+static inline void loadKmerCodeBytes(KmerCodeReader &reader) {
+    uint64_t word = 0;
+    for (unsigned int i = 0; i < sizeof(uint64_t); i++) {
+        word |= static_cast<uint64_t>(static_cast<unsigned char>(reader.buffer[reader.bufferPos + i])) << (CHAR_BIT * i);
+    }
+    unsigned int byteCount = (63 - reader.bitCount) / CHAR_BIT;
+    reader.bitBuffer |= (word & ((1ULL << (CHAR_BIT * byteCount)) - 1)) << reader.bitCount;
+    reader.bufferPos += byteCount;
+    reader.bitCount += CHAR_BIT * byteCount;
+}
+
 static inline uint64_t getBits(KmerCodeReader &reader, unsigned int width) {
     uint64_t value = 0;
     for (unsigned int done = 0; done < width; done += KMER_FILE_STEP_BITS) {
         unsigned int bits = std::min(width - done, KMER_FILE_STEP_BITS);
+        if (reader.bitCount < bits && reader.bufferSize - reader.bufferPos >= sizeof(uint64_t)) {
+            loadKmerCodeBytes(reader);
+        }
         for (; reader.bitCount < bits; reader.bitCount += CHAR_BIT) {
             if (reader.bufferPos == reader.bufferSize) {
                 refillKmerCodeBuffer(reader, reader.fileOffset + reader.bufferSize);
@@ -553,6 +585,11 @@ static inline uint64_t getUnary(KmerCodeReader &reader) {
     uint64_t zeros = 0;
     while (reader.bitBuffer == 0) {
         zeros += reader.bitCount;
+        if (reader.bufferSize - reader.bufferPos >= sizeof(uint64_t)) {
+            reader.bitCount = 0;
+            loadKmerCodeBytes(reader);
+            continue;
+        }
         if (reader.bufferPos == reader.bufferSize) {
             refillKmerCodeBuffer(reader, reader.fileOffset + reader.bufferSize);
         }
@@ -571,7 +608,7 @@ static inline size_t getKmerCodeBitPos(const KmerCodeReader &reader) {
 
 static inline void seekKmerCodeBits(KmerCodeReader &reader, size_t bitPos) {
     size_t bytePos = bitPos / CHAR_BIT;
-    if (bytePos >= reader.fileOffset && bytePos - reader.fileOffset < reader.bufferSize) {
+    if (bytePos >= reader.fileOffset && bytePos - reader.fileOffset <= reader.bufferSize) {
         reader.bufferPos = bytePos - reader.fileOffset;
     } else {
         refillKmerCodeBuffer(reader, bytePos);
@@ -584,6 +621,10 @@ static inline void seekKmerCodeBits(KmerCodeReader &reader, size_t bitPos) {
 // Elias gamma code of a value >= 1
 static inline void putEliasGamma(KmerCodeWriter &writer, size_t value) {
     unsigned int valueBits = getBitWidth(value) - 1;
+    if (valueBits < 32) {
+        putBits(writer, ((value ^ (1ULL << valueBits)) << (valueBits + 1)) | (1ULL << valueBits), 2 * valueBits + 1);
+        return;
+    }
     putBits(writer, 0, valueBits);
     putBits(writer, 1, 1);
     putBits(writer, value ^ (1ULL << valueBits), valueBits);
@@ -596,7 +637,12 @@ static inline size_t getEliasGamma(KmerCodeReader &reader) {
 
 // Rice code: value >> bits in unary, then the low bits
 static inline void putRice(KmerCodeWriter &writer, uint64_t value, unsigned int bits) {
-    for (uint64_t quotient = value >> bits; quotient > 0;) {
+    uint64_t quotient = value >> bits;
+    if (quotient < 64 - bits) {
+        putBits(writer, ((value & ((1ULL << bits) - 1)) << (quotient + 1)) | (1ULL << quotient), quotient + 1 + bits);
+        return;
+    }
+    for (; quotient > 0;) {
         unsigned int zeros = std::min(quotient, (uint64_t) KMER_FILE_STEP_BITS);
         putBits(writer, 0, zeros);
         quotient -= zeros;
