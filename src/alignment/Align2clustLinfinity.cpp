@@ -608,6 +608,10 @@ struct RepTargetsRecord {
 // target split mode
 static std::vector<size_t> targetSplitBlockOffsets;
 static std::vector<unsigned int> targetSplitAlignNodes;
+// units of kmermatcher MMSEQS_KMER_TARGET_PREF=1: the pref file of unit i, in key order, holds the targets of a unit; the class file of a node and a target split the size classes
+// of the reps of its rep cells with targets in the split
+static std::vector<size_t> unitFirstKeys;
+static std::vector<size_t> classFileFirstEntries;
 // a window belongs to one align group, a node holds the target split table of its own group
 static std::vector<unsigned int> windowAlignGroups;
 static unsigned int alignGroup;
@@ -2108,6 +2112,13 @@ private:
     }
 };
 
+// a pref file of the target split mode, its entry 0 is entry firstEntry of the window rows
+struct PrefFile {
+    size_t number;
+    DBKeyType firstKey;
+    size_t firstEntry;
+};
+
 // targets of a rep in one target split
 struct TargetSplitPiece {
     const char *data;
@@ -2145,10 +2156,9 @@ struct TargetSplitReader : PrefPassReader {
         for (size_t split = 0; split < targetSplitCount; split++) {
             if (targetSplitAlignNodes[split] == MMseqsNode::rank) {
                 targetSplits.push_back(split);
-                targetSplitFirstKeys.push_back(seqDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[split]]);
             }
         }
-        prefOffsets.resize(MMseqsNode::count * targetSplitCount);
+        prefOffsets.resize((unitFirstKeys.empty() ? 0 : unitFirstKeys.size() - 1) + MMseqsNode::count * targetSplitCount);
     }
 
     // load every window once and mark its size classes
@@ -2240,11 +2250,12 @@ private:
     const size_t sizeClassCount;
     const size_t maxRecordTargetCount;
     std::vector<size_t> targetSplits;
-    std::vector<DBKeyType> targetSplitFirstKeys;
     size_t windowPos;
     std::vector<DBReader<DBKeyType> *> prefDbs;
     size_t prefNode;
-    // per node and target split
+    // the pref files of prefNode in target order
+    std::vector<PrefFile> prefFiles;
+    // per pref file
     std::vector<std::vector<uint64_t> > prefOffsets;
     std::vector<size_t> entrySizes;
     size_t bufferFetchSize;
@@ -2259,17 +2270,50 @@ private:
     bool isFilling;
     size_t fillMaxAlignmentCells;
 
+    // first a file of node per own target split, its pref or the class file, then the unit files of the own target splits
+    std::vector<PrefFile> getPrefFiles(size_t node) const {
+        std::vector<PrefFile> files;
+        for (size_t i = 0; i < targetSplits.size(); i++) {
+            size_t splitFirstKey = seqDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[targetSplits[i]]];
+            PrefFile file = { node * targetSplitCount + targetSplits[i], static_cast<DBKeyType>(splitFirstKey), 0 };
+            if (unitFirstKeys.empty() == false) {
+                file.number += unitFirstKeys.size() - 1;
+                file.firstEntry = classFileFirstEntries[node];
+            }
+            files.push_back(file);
+        }
+        for (size_t i = 0; i < targetSplits.size() && unitFirstKeys.empty() == false; i++) {
+            size_t splitFirstKey = seqDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[targetSplits[i]]];
+            size_t splitEndKey = seqDbr.getBlockKeyOffsets()[targetSplitBlockOffsets[targetSplits[i] + 1]];
+            for (size_t unit = std::lower_bound(unitFirstKeys.begin(), unitFirstKeys.end() - 1, splitFirstKey) - unitFirstKeys.begin();
+                 unit + 1 < unitFirstKeys.size() && unitFirstKeys[unit] < splitEndKey; unit++) {
+                PrefFile file = { unit, static_cast<DBKeyType>(unitFirstKeys[unit]), 0 };
+                files.push_back(file);
+            }
+        }
+        return files;
+    }
+
+    // the unit files do not depend on the node and stay open
     void openPrefDbs(size_t node) {
         if (node == prefNode) {
             return;
         }
-        closePrefDbs();
         prefNode = node;
-        for (size_t i = 0; i < targetSplits.size(); i++) {
-            std::string file = SSTR(node * targetSplitCount + targetSplits[i]);
-            prefDbs.push_back(new DBReader<DBKeyType>((par.db2 + "." + file).c_str(), (par.db2 + ".index." + file).c_str(), par.threads,
-                                                      DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY));
-            prefDbs.back()->open(DBReader<DBKeyType>::NOSORT);
+        prefFiles = getPrefFiles(node);
+        prefDbs.resize(prefFiles.size(), NULL);
+        for (size_t i = 0; i < prefFiles.size(); i++) {
+            if (prefDbs[i] != NULL) {
+                if (i >= targetSplits.size()) {
+                    continue;
+                }
+                prefDbs[i]->close();
+                delete prefDbs[i];
+            }
+            std::string file = SSTR(prefFiles[i].number);
+            prefDbs[i] = new DBReader<DBKeyType>((par.db2 + "." + file).c_str(), (par.db2 + ".index." + file).c_str(), par.threads,
+                                                 DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_LINFINITY);
+            prefDbs[i]->open(DBReader<DBKeyType>::NOSORT);
         }
     }
 
@@ -2293,23 +2337,24 @@ private:
                 continue;
             }
             // read each index once
-            std::vector<uint64_t> *offsets = prefOffsets.data() + window.node * targetSplitCount;
-            for (size_t i = 0; i < targetSplits.size(); i++) {
-                std::vector<uint64_t> &splitOffsets = offsets[targetSplits[i]];
-                if (splitOffsets.empty()) {
-                    std::string index = MMseqsNode::readFile(par.db2 + ".index." + SSTR(window.node * targetSplitCount + targetSplits[i]));
-                    splitOffsets.resize(index.size() / (2 * sizeof(uint64_t)));
-                    for (size_t entry = 0; entry < splitOffsets.size(); entry++) {
-                        memcpy(&splitOffsets[entry], index.data() + (2 * entry + 1) * sizeof(uint64_t), sizeof(uint64_t));
+            const std::vector<PrefFile> files = getPrefFiles(window.node);
+            for (size_t i = 0; i < files.size(); i++) {
+                std::vector<uint64_t> &fileOffsets = prefOffsets[files[i].number];
+                if (fileOffsets.empty()) {
+                    std::string index = MMseqsNode::readFile(par.db2 + ".index." + SSTR(files[i].number));
+                    fileOffsets.resize(index.size() / (2 * sizeof(uint64_t)));
+                    for (size_t entry = 0; entry < fileOffsets.size(); entry++) {
+                        memcpy(&fileOffsets[entry], index.data() + (2 * entry + 1) * sizeof(uint64_t), sizeof(uint64_t));
                     }
                 }
             }
             const size_t entryCount = window.endEntry - window.firstEntry;
             entrySizes.assign(entryCount, 0);
-            for (size_t i = 0; i < targetSplits.size(); i++) {
-                const std::vector<uint64_t> &splitOffsets = offsets[targetSplits[i]];
+            for (size_t i = 0; i < files.size(); i++) {
+                const std::vector<uint64_t> &fileOffsets = prefOffsets[files[i].number];
+                const size_t firstEntry = window.firstEntry - files[i].firstEntry;
                 for (size_t entry = 0; entry < entryCount; entry++) {
-                    entrySizes[entry] += splitOffsets[window.firstEntry + entry + 1] - splitOffsets[window.firstEntry + entry];
+                    entrySizes[entry] += fileOffsets[firstEntry + entry + 1] - fileOffsets[firstEntry + entry];
                 }
             }
             // cut the window into pref reads
@@ -2332,9 +2377,10 @@ private:
 
     void startEntry(size_t entry, std::vector<TargetSplitPiece> &pieces) {
         for (size_t i = 0; i < prefDbs.size(); i++) {
-            pieces[i].data = prefDbs[i]->getData(entry, 0);
-            pieces[i].end = pieces[i].data + prefDbs[i]->getEntryLen(entry) - 1;
-            pieces[i].repKey = prefDbs[i]->getDbKey(entry);
+            const size_t fileEntry = entry - prefFiles[i].firstEntry;
+            pieces[i].data = prefDbs[i]->getData(fileEntry, 0);
+            pieces[i].end = pieces[i].data + prefDbs[i]->getEntryLen(fileEntry) - 1;
+            pieces[i].repKey = prefDbs[i]->getDbKey(fileEntry);
             pieces[i].next();
         }
     }
@@ -2357,7 +2403,7 @@ private:
         const PrefRead prefRead = takePrefRead();
         openPrefDbs(prefRead.prefNode);
         for (size_t i = 0; i < prefDbs.size(); i++) {
-            prefDbs[i]->loadData(prefRead.firstEntry, prefRead.endEntry);
+            prefDbs[i]->loadData(prefRead.firstEntry - prefFiles[i].firstEntry, prefRead.endEntry - prefFiles[i].firstEntry);
         }
         // the last pref read of a window takes the next window, so that its first read is prefetched
         if (prefReadPos == prefReads.size()) {
@@ -2366,7 +2412,7 @@ private:
         // prefetch here, io_uring reads can fail once their thread ends
         if (prefReadPos < prefReads.size() && prefReads[prefReadPos].prefNode == prefRead.prefNode) {
             for (size_t i = 0; i < prefDbs.size(); i++) {
-                prefDbs[i]->prefetchData(prefReads[prefReadPos].firstEntry, prefReads[prefReadPos].endEntry);
+                prefDbs[i]->prefetchData(prefReads[prefReadPos].firstEntry - prefFiles[i].firstEntry, prefReads[prefReadPos].endEntry - prefFiles[i].firstEntry);
             }
         }
         entryPartOffsets.resize(parse.entryCount + 1);
@@ -2374,7 +2420,7 @@ private:
         for (size_t entry = parse.firstEntry; entry < parse.firstEntry + parse.entryCount; entry++) {
             size_t entrySize = 0;
             for (size_t i = 0; i < prefDbs.size(); i++) {
-                entrySize += prefDbs[i]->getEntryLen(entry);
+                entrySize += prefDbs[i]->getEntryLen(entry - prefFiles[i].firstEntry);
             }
             parse.size += entrySize;
             parse.maxEntrySize = std::max(parse.maxEntrySize, entrySize);
@@ -2420,7 +2466,8 @@ private:
                         for (size_t i = 0; i < pieces.size(); i++) {
                             if (pieces[i].repKey == repKey) {
                                 repTargetCount += pieces[i].targetCount;
-                                sizeClass = std::min(sizeClassCount - 1, pieces[i].sizeClass);
+                                // the largest class of the pieces: unit pieces hold 0, the class file before them the class
+                                sizeClass = std::max(sizeClass, std::min(sizeClassCount - 1, pieces[i].sizeClass));
                                 partEntrySize += pieces[i].data - pieces[i].targets;
                                 pieces[i].next();
                             }
@@ -2472,10 +2519,10 @@ private:
                     size_t sizeClass = 0;
                     for (size_t i = 0; i < pieces.size(); i++) {
                         if (pieces[i].repKey == repKey) {
-                            sizeClass = std::min(sizeClassCount - 1, pieces[i].sizeClass);
+                            sizeClass = std::max(sizeClass, std::min(sizeClassCount - 1, pieces[i].sizeClass));
                             const char *data = pieces[i].targets;
                             size_t targetCount = (((passClasses >> sizeClass) & 1) != 0) ? pieces[i].targetCount : 0;
-                            DBKeyType target = targetSplitFirstKeys[i] - 1;
+                            DBKeyType target = prefFiles[i].firstKey - 1;
                             for (size_t k = 0; k < targetCount; k++) {
                                 target += Util::getPrefKey(data);
                                 repTargets[repTargetCount++] = target;
@@ -6306,16 +6353,26 @@ int align2clustLinfinity(Parameters &par) {
     const size_t firstAlignNode = MMseqsNode::getFirstAlignNode();
     const bool isAligningNode = MMseqsNode::rank >= firstAlignNode;
     size_t alignNodeCount = MMseqsNode::count - firstAlignNode;
-    const bool hasTargetSplits = alignNodeCount > 1;
     alignGroupNodeBegin = firstAlignNode;
     alignGroupNodeEnd = MMseqsNode::count;
     // the first .partitions line holds the align group count kmermatcher chose, the second the target split blocks
     std::string partitionsData = MMseqsNode::readFile(par.db2 + ".partitions");
     const size_t alignGroupCount = Util::fast_atoi<size_t>(partitionsData.c_str());
+    // with unit files the first line also holds the unit count, the third line the unit first keys, the fourth the first entry of every class file
+    const char *firstLineWords[2];
+    const bool hasUnitFiles = Util::getWordsOfLine(partitionsData.c_str(), firstLineWords, 2) > 1;
+    const bool hasTargetSplits = alignNodeCount > 1 || hasUnitFiles;
     char *partitionLine = Util::skipLine((char *) partitionsData.c_str());
     for (; hasTargetSplits && *partitionLine != '\n'; partitionLine += Util::skipWhitespace(partitionLine)) {
         targetSplitBlockOffsets.push_back(Util::fast_atoi<size_t>(partitionLine));
         partitionLine += Util::skipNoneWhitespace(partitionLine);
+    }
+    for (size_t i = 0; hasUnitFiles && i < 2; i++) {
+        std::vector<size_t> &numbers = (i == 0) ? unitFirstKeys : classFileFirstEntries;
+        for (partitionLine++; *partitionLine != '\n'; partitionLine += Util::skipWhitespace(partitionLine)) {
+            numbers.push_back(Util::fast_atoi<size_t>(partitionLine));
+            partitionLine += Util::skipNoneWhitespace(partitionLine);
+        }
     }
     std::vector<PrefPartition> partitions;
     std::vector<PrefWindow> windows;
@@ -6407,8 +6464,12 @@ int align2clustLinfinity(Parameters &par) {
     // a master that only clusters reads no sequences
     const bool isCopyingServedBlocks = par.localTmp.empty() == false && isAligningNode;
     const std::vector<std::string> dataFiles = FileUtil::findDatafiles(par.db1.c_str());
-    // fds per data file: 4, or 6 with members; 5 per own target split; alignRepTargets adds the copy
-    const size_t minOpenFiles = (par.filterCluDBFile.empty() ? 4 : 6) * dataFiles.size() + 64 + 2 * MMseqsNode::count + 5 * std::count(targetSplitAlignNodes.begin(), targetSplitAlignNodes.end(), MMseqsNode::rank);
+    // fds per data file: 4, or 6 with members; 5 per open pref file, a file per own target split and the unit files of the own target splits; alignRepTargets adds the copy
+    size_t ownPrefFiles = std::count(targetSplitAlignNodes.begin(), targetSplitAlignNodes.end(), MMseqsNode::rank);
+    for (size_t unit = 0; unit + 1 < unitFirstKeys.size(); unit++) {
+        ownPrefFiles += getKeyAlignNode(blockDbr, unitFirstKeys[unit]) == MMseqsNode::rank;
+    }
+    const size_t minOpenFiles = (par.filterCluDBFile.empty() ? 4 : 6) * dataFiles.size() + 64 + 2 * MMseqsNode::count + 5 * ownPrefFiles;
     FileUtil::checkRlimitNoFile(minOpenFiles);
     std::string cluPartDb = par.filterCluDBFile;
     std::vector<std::string> localCopies;
