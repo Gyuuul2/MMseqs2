@@ -498,18 +498,22 @@ static void refillKmerCodeBuffer(KmerCodeReader &reader, size_t fileOffset) {
 
 // writes 8 bytes when they fit, the bytes past bufferPos are written again
 static inline void putStepBits(KmerCodeWriter &writer, uint64_t value, unsigned int bits) {
-    writer.bitBuffer |= (value & ((1ULL << bits) - 1)) << writer.bitCount;
-    writer.bitCount += bits;
-    if (writer.bufferSize - writer.bufferPos >= sizeof(uint64_t)) {
+    uint64_t bitBuffer = writer.bitBuffer | ((value & ((1ULL << bits) - 1)) << writer.bitCount);
+    unsigned int bitCount = writer.bitCount + bits;
+    size_t bufferPos = writer.bufferPos;
+    if (writer.bufferSize - bufferPos >= sizeof(uint64_t)) {
+        char *out = writer.buffer + bufferPos;
         for (unsigned int i = 0; i < sizeof(uint64_t); i++) {
-            writer.buffer[writer.bufferPos + i] = static_cast<char>(writer.bitBuffer >> (CHAR_BIT * i));
+            out[i] = static_cast<char>(bitBuffer >> (CHAR_BIT * i));
         }
-        unsigned int byteCount = writer.bitCount / CHAR_BIT;
-        writer.bufferPos += byteCount;
-        writer.bitBuffer >>= CHAR_BIT * byteCount;
-        writer.bitCount -= CHAR_BIT * byteCount;
+        unsigned int byteCount = bitCount / CHAR_BIT;
+        writer.bufferPos = bufferPos + byteCount;
+        writer.bitBuffer = bitBuffer >> (CHAR_BIT * byteCount);
+        writer.bitCount = bitCount - CHAR_BIT * byteCount;
         return;
     }
+    writer.bitBuffer = bitBuffer;
+    writer.bitCount = bitCount;
     for (; writer.bitCount >= CHAR_BIT; writer.bitCount -= CHAR_BIT) {
         if (writer.bufferPos == writer.bufferSize) {
             writeKmerCodeBuffer(writer);

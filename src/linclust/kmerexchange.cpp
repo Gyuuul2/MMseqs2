@@ -3465,7 +3465,7 @@ static const KeySplitKmers &extractNewKeySplitKmers(Parameters &par, DBReader<DB
         freeKeptKeySplits(pref);
         pref.isKeeping = false;
     }
-    return getKeySplitKmers<T, includeAdjacency, L>(par, seqDbr, subMat, exchange, pref, keySplit, ownKeySplit, extractSeconds);
+    return getKeySplitKmers<T, false, L>(par, seqDbr, subMat, exchange, pref, keySplit, ownKeySplit, extractSeconds);
 }
 
 // fileStart: the offset of the first byte of file
