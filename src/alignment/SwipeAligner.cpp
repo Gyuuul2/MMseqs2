@@ -84,7 +84,7 @@ __attribute__((noinline)) static int8_t computeLetterBias(const BaseMatrix *subM
 }
 
 // bias of a letter with a full window for each sum of the scores of the other letters
-static void fillBiasTable(const BaseMatrix *subMat, float scale, std::vector<int8_t> &biasTable, std::vector<int> &biasTableOffsets) {
+void SwipeAligner::fillBiasTable(const BaseMatrix *subMat, float scale, std::vector<int8_t> &biasTable, std::vector<int> &biasTableOffsets) {
     const int otherLetters = BIAS_WINDOW_SIZE - 1;
     biasTableOffsets.resize(subMat->alphabetSize);
     for (int r = 0; r < subMat->alphabetSize; r++) {
@@ -98,8 +98,8 @@ static void fillBiasTable(const BaseMatrix *subMat, float scale, std::vector<int
     }
 }
 
-static void computeQueryBias(BaseMatrix *subMat, const Sequence *q, bool aaBiasCorrection, float aaBiasCorrectionScale,
-                             const std::vector<int8_t> &biasTable, const std::vector<int> &biasTableOffsets, std::vector<int8_t> &bias) {
+void SwipeAligner::computeQueryBias(BaseMatrix *subMat, const Sequence *q, bool aaBiasCorrection, float aaBiasCorrectionScale,
+                                    const std::vector<int8_t> &biasTable, const std::vector<int> &biasTableOffsets, std::vector<int8_t> &bias) {
     bias.assign(q->L, 0);
     if (aaBiasCorrection) {
         const unsigned char *seq = q->numSequence;
@@ -1001,17 +1001,14 @@ inline void laneCellScores<uint8_t>(const unsigned char *const *letters, const i
 #undef SWIPE_LOAD_LANES
 #undef SWIPE_WIDEN
 
-SwipeExtender::SwipeExtender(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend)
-    : extensionActiveLaneRowCount(0), extensionTotalLaneRowCount(0), byteExtensionActiveLaneRowCount(0), byteExtensionTotalLaneRowCount(0), longExtensionCount(0), rerunExtensionCount(0),
-      subMat(subMat), aaBiasCorrection(aaBiasCorrection), aaBiasCorrectionScale(aaBiasCorrectionScale), gapOpen(gapOpen), gapExtend(gapExtend), matrixBias(0),
+SwipeExtender::SwipeExtender(BaseMatrix *subMat, int gapOpen, int gapExtend)
+    : subMat(subMat), gapOpen(gapOpen), gapExtend(gapExtend), matrixBias(0),
       band(NULL), bandCapacity(0), trace(NULL), traceCapacity(0), laneTargets(ExtendLanes<uint8_t>::COUNT), laneTraces(ExtendLanes<uint8_t>::COUNT) {
     int alphabetSize = subMat->alphabetSize;
     if (alphabetSize > 32) {
         Debug(Debug::ERROR) << "SWIPE supports alphabets of at most 32 letters\n";
         EXIT(EXIT_FAILURE);
     }
-    bias.reserve(maxSeqLen);
-    fillBiasTable(subMat, aaBiasCorrectionScale, biasTable, biasTableOffsets);
     scoreRows = new int8_t[32 * 32];
     for (int a = 0; a < 32; a++) {
         for (int t = 0; t < 32; t++) {
@@ -1027,14 +1024,13 @@ SwipeExtender::~SwipeExtender() {
     free(trace);
 }
 
-size_t SwipeExtender::addQuery(const Sequence *q) {
+size_t SwipeExtender::addQuery(const Sequence *q, const int16_t *queryBias) {
     queryOffsets.push_back(queries.size());
     queryLengths.push_back(q->L);
     queries.insert(queries.end(), q->numSequence, q->numSequence + q->L);
     queries.insert(queries.end(), std::reverse_iterator<const unsigned char *>(q->numSequence + q->L), std::reverse_iterator<const unsigned char *>(q->numSequence));
-    computeQueryBias(subMat, q, aaBiasCorrection, aaBiasCorrectionScale, biasTable, biasTableOffsets, bias);
-    biases.insert(biases.end(), bias.begin(), bias.end());
-    biases.insert(biases.end(), bias.rbegin(), bias.rend());
+    biases.insert(biases.end(), queryBias, queryBias + q->L);
+    biases.insert(biases.end(), std::reverse_iterator<const int16_t *>(queryBias + q->L), std::reverse_iterator<const int16_t *>(queryBias));
     return queryLengths.size() - 1;
 }
 
@@ -1331,12 +1327,6 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
                 }
             }
         }
-        extensionActiveLaneRowCount += activeCount;
-        extensionTotalLaneRowCount += lanes;
-        if (sizeof(T) == 1) {
-            byteExtensionActiveLaneRowCount += activeCount;
-            byteExtensionTotalLaneRowCount += lanes;
-        }
         simd_int vActive = simdi_loadu((const simd_int *) active);
         simd_int vMaskBegin = simdi_loadu((const simd_int *) maskBegins);
         simd_int vColumnEnd = simdi_loadu((const simd_int *) columnEnds);
@@ -1352,7 +1342,6 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
         // keep the trace row that this row overwrites
         for (int l = 0; step >= traceStep && l < lanes; l++) {
             if (laneJobs[l] != NULL && step - laneStarts[l] >= traceSteps) {
-                longExtensionCount += (step - laneStarts[l] == traceSteps);
                 std::vector<uint16_t> &laneTrace = laneTraces[l];
                 for (int w = 0; w < traceWidth; w++) {
                     laneTrace.push_back(getLaneValue<T>(traceRow + w, l));
@@ -1466,7 +1455,6 @@ void SwipeExtender::extendBand(const ExtendJob *jobs, size_t jobCount, bool back
                     rerun.isWordAlignment = true;
                     extendPending.push_back(rerun);
                     laneJobs[l] = NULL;
-                    rerunExtensionCount++;
                     fullStep = step + 1;
                 } else if (laneFlags[l] != 0) {
                     finish(l);

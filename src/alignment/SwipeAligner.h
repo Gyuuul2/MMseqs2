@@ -18,6 +18,10 @@ public:
 
     void initQuery(const Sequence *query);
 
+    static void fillBiasTable(const BaseMatrix *subMat, float scale, std::vector<int8_t> &biasTable, std::vector<int> &biasTableOffsets);
+    static void computeQueryBias(BaseMatrix *subMat, const Sequence *q, bool aaBiasCorrection, float aaBiasCorrectionScale,
+                                 const std::vector<int8_t> &biasTable, const std::vector<int> &biasTableOffsets, std::vector<int8_t> &bias);
+
     // word 0 starts in 8 bit lanes, 1 in 16 bit, 2 if 16 bit saturates
     void alignForward(size_t count, const unsigned char *const *targets, const int *targetLengths, s_align *aligns);
 
@@ -97,10 +101,10 @@ class SwipeExtender {
 public:
     static const int LANES = VECSIZE_INT * 4;
 
-    SwipeExtender(BaseMatrix *subMat, size_t maxSeqLen, bool aaBiasCorrection, float aaBiasCorrectionScale, int gapOpen, int gapExtend);
+    SwipeExtender(BaseMatrix *subMat, int gapOpen, int gapExtend);
     ~SwipeExtender();
 
-    size_t addQuery(const Sequence *query);
+    size_t addQuery(const Sequence *query, const int16_t *queryBias);
     void clearQueries();
     // frees the buffers that grow with the batches; the next batch allocates them again
     void release();
@@ -112,13 +116,6 @@ public:
         size_t pos = queryOffsets[queryId] + queryPos;
         return subMat->subMatrix[queries[pos]][targetLetter] + biases[pos];
     }
-
-    size_t extensionActiveLaneRowCount;
-    size_t extensionTotalLaneRowCount;
-    size_t byteExtensionActiveLaneRowCount;
-    size_t byteExtensionTotalLaneRowCount;
-    size_t longExtensionCount;
-    size_t rerunExtensionCount;
 
 private:
     // a dead cell is this far below the best score of its lane
@@ -139,8 +136,6 @@ private:
                     s_align *aligns, std::string *backtraces);
 
     BaseMatrix *subMat;
-    bool aaBiasCorrection;
-    float aaBiasCorrectionScale;
     int gapOpen;
     int gapExtend;
     int matrixBias;
@@ -150,9 +145,6 @@ private:
     std::vector<int8_t> biases;
     std::vector<size_t> queryOffsets;
     std::vector<int> queryLengths;
-    std::vector<int8_t> bias;
-    std::vector<int8_t> biasTable;
-    std::vector<int> biasTableOffsets;
 
     int8_t *scoreRows;
 

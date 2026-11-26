@@ -20,6 +20,7 @@ public:
 
     void initQuery(Sequence* query);
     void setQuery(Sequence* query);
+    const int16_t* getQueryCompBias();
 
     typedef struct UngappedAln_res {
         int bitScore;
@@ -141,10 +142,16 @@ private:
     int querySeqType;
     int16_t* queryCompBias;
     int16_t* targetCompBias;
-    float *tmpCompBias;
+    std::vector<int8_t> tmpCompBias;
+    std::vector<int8_t> compBiasTable;
+    std::vector<int> compBiasTableOffsets;
     int8_t* queryRevNumSeq;
     int8_t* targetRevNumSeq;
     int16_t* queryCompBiasRev;
+    Sequence* compBiasQuery;
+    DBKeyType compBiasQueryKey;
+    int compBiasQueryLength;
+    void computeQueryCompBias();
 
     // computeBestDiagonal: 8-bit query profile, its 16-bit copy only for saturated groups
     int8_t* diagSubMatrix;

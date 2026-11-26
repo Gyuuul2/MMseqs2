@@ -71,8 +71,9 @@ int main (int, const char**) {
         query.mapSequence(0, 0, longText.data(), longText.size());
         longTarget.mapSequence(1, 1, longText.data(), longText.size());
         shortTarget.mapSequence(2, 2, shortText.data(), shortText.size());
-        SwipeExtender extender(&subMat, 97, false, 1.0f, 11, 1);
-        const size_t queryId = extender.addQuery(&query);
+        SwipeExtender extender(&subMat, 11, 1);
+        const std::vector<int16_t> queryBias(query.L, 0);
+        const size_t queryId = extender.addQuery(&query, queryBias.data());
         const size_t ids[] = {queryId, queryId};
         const unsigned char *targets[] = {longTarget.numSequence, shortTarget.numSequence};
         const int lengths[] = {longTarget.L, shortTarget.L};
