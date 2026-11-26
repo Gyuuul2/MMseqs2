@@ -471,6 +471,11 @@ void MMseqsNode::writeExchangeFile(const std::string &fileName, uint64_t exchang
     for (size_t offset = 0; offset < size; offset += BatchReader::MAX_READ_REQUEST_SIZE) {
         FileUtil::pwriteAll(fileno(file), fileName.c_str(), data + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, size - offset), EXCHANGE_FILE_HEADER_BYTES + offset);
     }
+    finishExchangeFile(file, fileName, exchangeFileNumber, size, indexFile, line);
+}
+
+void MMseqsNode::finishExchangeFile(FILE *file, const std::string &fileName, uint64_t exchangeFileNumber, size_t size, const std::string &indexFile,
+                                    const std::vector<uint64_t> &line) {
     // header last, a reader that sees it finds no hole
     ExchangeFileHeader header = { getExchangeFileMagic(), exchangeFileNumber };
     FileUtil::pwriteAll(fileno(file), fileName.c_str(), (const char *) &header, sizeof(header), 0);

@@ -109,6 +109,8 @@ public:
     static FILE *createExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber);
     static void writeExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *data, size_t size, const std::string &indexFile,
                                   const std::vector<uint64_t> &line, int threads);
+    static void finishExchangeFile(FILE *file, const std::string &fileName, uint64_t exchangeFileNumber, size_t size, const std::string &indexFile,
+                                   const std::vector<uint64_t> &line);
     static int tryOpenExchangeFile(const std::string &file, size_t expectedSize, uint64_t expectedNumber,
                                    size_t &observedSize, uint64_t &observedNumber, int &lastError, int openFlags = 0);
     static int waitForExchangeFile(const std::string &file, size_t size, uint64_t exchangeFileNumber);

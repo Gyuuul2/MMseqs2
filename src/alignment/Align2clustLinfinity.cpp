@@ -797,35 +797,30 @@ static void unpackEntry(const char *packedEntry, size_t entryLen, char *entry) {
     }
 }
 
-static void unpackEntries(const char *servedEntries, size_t keyCount, const size_t *entryOffsets, char *data, int threads, int unpackThreads) {
+// chunks of ascending keys, run by runChunks in any order
+static void unpackEntries(const char *servedEntries, size_t keyCount, const size_t *entryOffsets, char *data, size_t chunks, const std::function<void(size_t, const std::function<void(size_t)> &)> &runChunks) {
     const char *packedEntries = servedEntries + (keyCount + 7) / 8;
     std::vector<size_t> packedEntryOffsets(keyCount + 1, 0);
     for (size_t i = 0; i < keyCount; i++) {
         bool isAssigned = (static_cast<unsigned char>(servedEntries[i / 8]) >> (i % 8)) & 1;
         packedEntryOffsets[i + 1] = packedEntryOffsets[i] + (isAssigned ? 0 : getPackedEntrySize(entryOffsets[i + 1] - entryOffsets[i]));
     }
-    std::vector<std::vector<size_t> > threadRawEntries(threads);
-#pragma omp parallel num_threads(unpackThreads)
-    {
-        unsigned int thread_idx = 0;
-#ifdef OPENMP
-        thread_idx = static_cast<unsigned int>(omp_get_thread_num());
-#endif
-#pragma omp for schedule(static)
-        for (size_t i = 0; i < keyCount; i++) {
+    std::vector<std::vector<size_t> > chunkRawEntries(chunks);
+    runChunks(chunks, [&](size_t chunk) {
+        for (size_t i = keyCount * chunk / chunks; i < keyCount * (chunk + 1) / chunks; i++) {
             if (packedEntryOffsets[i + 1] == packedEntryOffsets[i]) {
                 memset(data + entryOffsets[i], 0, entryOffsets[i + 1] - entryOffsets[i]);
             } else if ((static_cast<unsigned char>(packedEntries[packedEntryOffsets[i]]) & 31) == PACKED_RAW_CODE) {
-                threadRawEntries[thread_idx].push_back(i);
+                chunkRawEntries[chunk].push_back(i);
             } else {
                 unpackEntry(packedEntries + packedEntryOffsets[i], entryOffsets[i + 1] - entryOffsets[i], data + entryOffsets[i]);
             }
         }
-    }
+    });
     const char *rawEntry = packedEntries + packedEntryOffsets[keyCount];
-    for (int thread = 0; thread < threads; thread++) {
-        for (size_t j = 0; j < threadRawEntries[thread].size(); j++) {
-            size_t i = threadRawEntries[thread][j];
+    for (size_t chunk = 0; chunk < chunks; chunk++) {
+        for (size_t j = 0; j < chunkRawEntries[chunk].size(); j++) {
+            size_t i = chunkRawEntries[chunk][j];
             memcpy(data + entryOffsets[i], rawEntry, entryOffsets[i + 1] - entryOffsets[i]);
             rawEntry += entryOffsets[i + 1] - entryOffsets[i];
         }
@@ -3645,6 +3640,17 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     std::vector<MemberAligners *> threadMemberAligners(par.threads, NULL);
     double waitSeconds = 0;
     double sequenceWaitSeconds = 0;
+    // held by an I/O thread, owed by other nodes, other
+    double sequenceWaitParts[3] = { 0, 0, 0 };
+    int teamReceiveState = 2;
+    // [0] I/O threads, [1] aligning team
+    double receiveSeconds[2] = { 0, 0 };
+    size_t receiveCalls[2] = { 0, 0 };
+    double serveSeconds[2] = { 0, 0 };
+    size_t serveCalls[2] = { 0, 0 };
+    double servePackSeconds = 0;
+    double serveWriteSeconds = 0;
+    const std::thread::id alignThreadId = std::this_thread::get_id();
     double alignedCells = 0;
     double alignSeconds = 0;
     // wall time of the lookups, not thread time
@@ -3868,14 +3874,79 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         MMseqsNode::printPhaseValues(status);
     };
 
+    // chunks of a task loop, idle threads join with their team
+    struct SharedLoop {
+        const std::function<void(size_t)> *body;
+        size_t count;
+        std::atomic<size_t> next;
+        size_t users;
+    };
+    std::mutex sharedLoopMutex;
+    std::condition_variable sharedLoopCondition;
+    std::vector<SharedLoop *> sharedLoops;
+    const auto runLoopChunks = [&](SharedLoop &loop) {
+#pragma omp parallel
+        {
+            for (size_t chunk = loop.next++; chunk < loop.count; chunk = loop.next++) {
+                (*loop.body)(chunk);
+            }
+        }
+    };
+    // returns once all chunks are done, the caller completes the task
+    const std::function<void(size_t, const std::function<void(size_t)> &)> runSharedLoop = [&](size_t count, const std::function<void(size_t)> &body) {
+        SharedLoop loop;
+        loop.body = &body;
+        loop.count = count;
+        loop.next = 0;
+        loop.users = 0;
+        {
+            std::lock_guard<std::mutex> lock(sharedLoopMutex);
+            sharedLoops.push_back(&loop);
+        }
+        {
+            std::lock_guard<std::mutex> lock(serviceMutex);
+            ioWork++;
+        }
+        serviceCondition.notify_all();
+        runLoopChunks(loop);
+        std::unique_lock<std::mutex> lock(sharedLoopMutex);
+        sharedLoops.erase(std::find(sharedLoops.begin(), sharedLoops.end(), &loop));
+        sharedLoopCondition.wait(lock, [&]() { return loop.users == 0; });
+    };
+    const auto joinSharedLoop = [&]() {
+        SharedLoop *loop = NULL;
+        {
+            std::lock_guard<std::mutex> lock(sharedLoopMutex);
+            for (size_t i = 0; i < sharedLoops.size() && loop == NULL; i++) {
+                if (sharedLoops[i]->next < sharedLoops[i]->count) {
+                    loop = sharedLoops[i];
+                    loop->users++;
+                }
+            }
+        }
+        if (loop == NULL) {
+            return false;
+        }
+        runLoopChunks(*loop);
+        {
+            std::lock_guard<std::mutex> lock(sharedLoopMutex);
+            loop->users--;
+        }
+        sharedLoopCondition.notify_all();
+        return true;
+    };
+
     std::mutex receiveMutex;
     std::mutex serveMutex;
     // pass over own requests and their served pieces
     const auto receiveSequences = [&]() {
+        bool isTeam = std::this_thread::get_id() == alignThreadId;
         std::unique_lock<std::mutex> taskLock(receiveMutex, std::try_to_lock);
         if (taskLock.owns_lock() == false) {
+            teamReceiveState = isTeam ? 0 : teamReceiveState;
             return false;
         }
+        Timer receiveTimer;
         bool hasWorked = false;
         // keep the bits of the served keys current
         time_t passTime = time(NULL);
@@ -4046,15 +4117,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                     // parts keep their errors
                     size_t partCount = (piece.size + BatchReader::MAX_READ_REQUEST_SIZE - 1) / BatchReader::MAX_READ_REQUEST_SIZE;
                     std::vector<int> readErrors(partCount, 0);
-#pragma omp parallel for schedule(dynamic, 1)
-                    for (size_t part = 0; part < partCount; part++) {
+                    runSharedLoop(partCount, [&](size_t part) {
                         size_t offset = part * BatchReader::MAX_READ_REQUEST_SIZE;
                         size_t partSize = std::min(BatchReader::MAX_READ_REQUEST_SIZE, piece.size - offset);
                         int partError;
                         if (FileUtil::tryPreadAll(fd, receivedEntries.data() + offset, partSize, MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + piece.offset + offset, partError) < partSize) {
                             readErrors[part] = (partError != 0) ? partError : -1;
                         }
-                    }
+                    });
                     int readError = 0;
                     for (size_t part = 0; part < partCount; part++) {
                         readError = (readErrors[part] != 0) ? readErrors[part] : readError;
@@ -4072,11 +4142,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                     missingServedAttempts[node] = 0;
                     FetchedSequences *sequences = request.sequences;
                     size_t firstKey = sequences->fetchSourceKeyOffsets[node] + request.receivedKeys[node];
-                    int unpackThreads = 1;
-#ifdef OPENMP
-                    unpackThreads = omp_get_max_threads();
-#endif
-                    unpackEntries(receivedEntries.data(), piece.keyCount, sequences->entryOffsets.data() + firstKey, sequences->entries, par.threads, unpackThreads);
+                    unpackEntries(receivedEntries.data(), piece.keyCount, sequences->entryOffsets.data() + firstKey, sequences->entries, par.threads, runSharedLoop);
                     request.receivedKeys[node] += piece.keyCount;
                     request.receivedPieces[node]++;
                     receivedSize += piece.size;
@@ -4149,6 +4215,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             waitWarning.check(requestedFetches.empty() == false ? served + " of other nodes" : (isGated ? assignedKeysLog : requests + " of other nodes"));
         }
         seenExportPassCount = exportPasses;
+        receiveSeconds[isTeam] += receiveTimer.getTimediff();
+        receiveCalls[isTeam]++;
+        if (isTeam) {
+            teamReceiveState = (hasWorked == false && ownRequests.empty() == false) ? 1 : 2;
+        }
         return hasWorked;
     };
 
@@ -4158,6 +4229,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         if (taskLock.owns_lock() == false) {
             return false;
         }
+        bool isTeam = std::this_thread::get_id() == alignThreadId;
+        Timer serveTimer;
         bool hasWorked = false;
         // read a requester's progress once a listing shows a new request
         if (serviceTimer.getTimediff() >= nextRequestListing) {
@@ -4174,6 +4247,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         }
 
         // piece a pass for each requesting node
+        Timer packTimer;
         bool isServing = false;
         size_t passEntrySize = 0;
         size_t passKeyCount = 0;
@@ -4371,13 +4445,18 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         }
         firstRequester = (deferredRequester == UINT_MAX) ? firstRequester : deferredRequester;
 
+        servePackSeconds += packTimer.getTimediff();
         if (passPieces.empty() == false) {
-            // team of the caller, one on an I/O thread
-            int maxThreads = 1;
-#ifdef OPENMP
-            maxThreads = omp_get_max_threads();
-#endif
-            MMseqsNode::writeExchangeFile(getServedFile(rank, servedFileCount), servedFileCount, servedFileData.data(), servedFileData.size(), "", std::vector<uint64_t>(), maxThreads);
+            Timer writeTimer;
+            // idle aligning team joins the chunk writes, header last once all are done
+            std::string servedFile = getServedFile(rank, servedFileCount);
+            FILE *file = FileUtil::openAndDelete(servedFile.c_str(), "w");
+            const size_t chunkSize = BatchReader::MAX_READ_REQUEST_SIZE;
+            runSharedLoop((servedFileData.size() + chunkSize - 1) / chunkSize, [&](size_t chunk) {
+                size_t offset = chunk * chunkSize;
+                FileUtil::pwriteAll(fileno(file), servedFile.c_str(), servedFileData.data() + offset, std::min(chunkSize, servedFileData.size() - offset), MMseqsNode::EXCHANGE_FILE_HEADER_BYTES + offset);
+            });
+            MMseqsNode::finishExchangeFile(file, servedFile, servedFileCount, servedFileData.size(), "", std::vector<uint64_t>());
             for (size_t j = 0; j < passPieces.size(); j++) {
                 passPieces[j].second.fileSize = servedFileData.size();
                 requesters[passPieces[j].first].pieces.push_back(passPieces[j].second);
@@ -4387,6 +4466,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             servedFileData.clear();
             servedFileCount++;
             isServedProgressChanged = true;
+            serveWriteSeconds += writeTimer.getTimediff();
         }
 
         // pieces not yet deleted, per requester
@@ -4405,6 +4485,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         if (hasWorked) {
             exportPassCount++;
         }
+        serveSeconds[isTeam] += serveTimer.getTimediff();
+        serveCalls[isTeam]++;
         {
             std::lock_guard<std::mutex> lock(serviceMutex);
             if (isServing || isServeDone) {
@@ -4435,6 +4517,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         copyEntries(sequences.keys.data() + ownKey, ownKeyEnd - ownKey, sequences.entryOffsets.data() + ownKey, sequences.entries, NULL, maxFetchSize);
         // aligning team waits for these sequences too
         sequenceWaitSeconds += copyTimer.getTimediff();
+        sequenceWaitParts[2] += copyTimer.getTimediff();
     };
     // copy own keys of the next block of the queued fetches
     const auto copyOwnKeysAhead = [&]() {
@@ -4481,7 +4564,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     };
     // work the waiting main thread needs, else work other nodes need
     const auto runWaitTasks = [&]() {
-        return receiveSequences() || copyOwnKeysAhead() || (memberExchange != NULL && memberExchange->serveRequests()) || serveSequences() || clusterStep();
+        return receiveSequences() || joinSharedLoop() || copyOwnKeysAhead() || (memberExchange != NULL && memberExchange->serveRequests()) || serveSequences() || clusterStep();
     };
     const auto runIoLoop = [&](bool isPrefilterReader) {
         for (unsigned int polls = 0;;) {
@@ -4499,6 +4582,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             hasWorked |= clusterStep();
             hasWorked |= serveSequences();
             hasWorked |= receiveSequences();
+            hasWorked |= joinSharedLoop();
             hasWorked |= copyOwnKeysAhead();
             hasWorked |= memberExchange != NULL && memberExchange->preloadNextRange();
             hasWorked |= fillNextPrefilterBuffer(false, isPrefilterReader);
@@ -4566,14 +4650,17 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         // later fetch at the gate is no wait for the master
         bool waitsForMaster = isWaitingForMaster && handedOffFetches.empty() == false && handedOffFetches.front() == &fetched;
         for (unsigned int polls = 0; fetched.isReady == false;) {
+            Timer pollTimer;
             uint64_t seenWork = ioWork;
             lock.unlock();
+            teamReceiveState = 2;
             // run the work it waits for, else work others wait for
             bool hasWorked = runWaitTasks();
             lock.lock();
             if (hasWorked == false) {
                 serviceCondition.wait_for(lock, std::chrono::microseconds(10000u << std::min(polls++, 1u)), [&]() { return fetched.isReady || ioWork != seenWork; });
             }
+            sequenceWaitParts[teamReceiveState] += waitsForMaster ? 0 : pollTimer.getTimediff();
         }
         (waitsForMaster ? waitSeconds : sequenceWaitSeconds) += waitTimer.getTimediff();
     };
@@ -5365,6 +5452,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     if (isAligningNode) {
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the master", waitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences", sequenceWaitSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences while an I/O thread receives", sequenceWaitParts[0]);
+        MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences served by other nodes", sequenceWaitParts[1]);
+        MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences otherwise", sequenceWaitParts[2]);
+        MMseqsNode::addPhaseValue(phaseValues, "Receiving sequences", formatSeconds(receiveSeconds[0]) + " in " + SSTR(receiveCalls[0]) + " calls on I/O threads, "
+                                  + formatSeconds(receiveSeconds[1]) + " in " + SSTR(receiveCalls[1]) + " calls on the aligning team");
+        MMseqsNode::addPhaseValue(phaseValues, "Serving sequences", formatSeconds(serveSeconds[0]) + " in " + SSTR(serveCalls[0]) + " calls on I/O threads, "
+                                  + formatSeconds(serveSeconds[1]) + " in " + SSTR(serveCalls[1]) + " calls on the aligning team, "
+                                  + formatSeconds(servePackSeconds) + " packing, " + formatSeconds(serveWriteSeconds) + " writing");
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the candidate pairs", prefilterWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "computing alignments", alignSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Sequences fetched ahead", "at most " + formatSeconds(maxFetchAheadSeconds) + ", mean " + formatSeconds(fetchAheadSecondsSum / std::max<size_t>(1, alignedFetchCount)) + " of aligning");
