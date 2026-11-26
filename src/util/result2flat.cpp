@@ -6,7 +6,6 @@
 #include "Util.h"
 #include "FileUtil.h"
 #include "MMseqsNode.h"
-#include "S3Client.h"
 #include "Timer.h"
 
 #ifdef OPENMP
@@ -41,13 +40,16 @@ int result2flat(int argc, const char **argv, const Command &command) {
     }
 
     std::string fastaFile = par.db4 + nodeSuffix;
-    FILE *fastaFP = FileUtil::openAndDelete(fastaFile.c_str(), "w");
+    FILE *fastaFP = isLinfinity ? FileUtil::openAndDelete(fastaFile.c_str(), "w") : fopen(fastaFile.c_str(), "w");
 
     // linfinity: splits of the node file keys whose sequences and names fit
     std::vector<size_t> splitKeyOffsets;
     std::vector<size_t> cluKeyOffsets;
+    Timer timer;
+    double waitSeconds = 0;
     if (isLinfinity) {
         cluKeyOffsets = MMseqsNode::getClusterKeyOffsets(par.db3 + "_fasta.cluster_key_offsets", par.db3, seqDbr.getSize());
+        waitSeconds = timer.getTimediff();
         std::vector<size_t> fileKeyOffsets = seqDbr.getFileKeyOffsets(MMseqsNode::count);
         size_t fileFirstKey = fileKeyOffsets[MMseqsNode::rank];
         size_t fileEndKey = fileKeyOffsets[MMseqsNode::rank + 1];
@@ -76,11 +78,15 @@ int result2flat(int argc, const char **argv, const Command &command) {
     std::vector<size_t> taskOffsets(tasksPerBatch + 1);
     size_t fastaBytes = 0;
     std::vector<DBKeyType> repKeys;
-    Timer timer;
+    timer.reset();
     double loadSeconds = 0;
     double formatSeconds = 0;
     double writeSeconds = 0;
+    Debug::Progress progress(splitCount);
     for (size_t split = 0; split < splitCount; split++) {
+        if (isLinfinity && MMseqsNode::isMaster()) {
+            progress.updateProgress();
+        }
         size_t splitEnd = isLinfinity ? 0 : dbr_data.getSize();
         if (isLinfinity) {
             querydb_header.loadData(splitKeyOffsets[split], splitKeyOffsets[split + 1]);
@@ -190,10 +196,16 @@ int result2flat(int argc, const char **argv, const Command &command) {
             for (size_t task = batchBegin; task < batchEnd; task++) {
                 taskOffsets[task - batchBegin + 1] = taskOffsets[task - batchBegin] + taskFastaText[task - batchBegin].size();
             }
+            if (isLinfinity) {
 #pragma omp parallel for schedule(dynamic, 1)
-            for (size_t task = batchBegin; task < batchEnd; task++) {
-                const std::string &buffer = taskFastaText[task - batchBegin];
-                FileUtil::pwriteAll(fileno(fastaFP), fastaFile.c_str(), buffer.data(), buffer.size(), taskOffsets[task - batchBegin]);
+                for (size_t task = batchBegin; task < batchEnd; task++) {
+                    const std::string &buffer = taskFastaText[task - batchBegin];
+                    FileUtil::pwriteAll(fileno(fastaFP), fastaFile.c_str(), buffer.data(), buffer.size(), taskOffsets[task - batchBegin]);
+                }
+            } else {
+                for (size_t task = batchBegin; task < batchEnd; task++) {
+                    fwrite(taskFastaText[task - batchBegin].data(), sizeof(char), taskFastaText[task - batchBegin].size(), fastaFP);
+                }
             }
             fastaBytes = taskOffsets[batchEnd - batchBegin];
             writeSeconds += timer.getTimediff();
@@ -206,14 +218,12 @@ int result2flat(int argc, const char **argv, const Command &command) {
         EXIT(EXIT_FAILURE);
     }
     if (isLinfinity) {
-        if (S3Client::isEnabled()) {
-            MMseqsNode::uploadFile(fastaFile);
-        }
-        writeSeconds += timer.getTimediff();
+        double closeSeconds = timer.getTimediff();
         std::string phaseValues;
+        MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the other nodes", waitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "loading sequences", loadSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "formatting sequences", formatSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "writing sequences", writeSeconds);
+        MMseqsNode::addPhaseSeconds(phaseValues, "writing sequences", writeSeconds + closeSeconds);
         MMseqsNode::printPhaseValues(phaseValues);
         seqDbr.close();
     } else {
