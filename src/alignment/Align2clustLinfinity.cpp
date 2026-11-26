@@ -3108,8 +3108,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     // key and its record entry, SIZE_MAX for members
     std::vector<std::vector<std::pair<DBKeyType, size_t> > > threadRecordKeys(par.threads);
     std::vector<std::pair<DBKeyType, size_t> > recordKeys;
-    std::vector<DBKeyType> uniqueKeys;
-    std::vector<size_t> uniqueKeyEntries;
     std::vector<unsigned int> keyFetchSources;
     std::vector<size_t> threadSourceOffsets;
     // accepted pairs waiting for their member checks, in log order
@@ -3540,19 +3538,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             recordKeys.insert(recordKeys.end(), threadRecordKeys[thread].begin(), threadRecordKeys[thread].end());
         }
         SORT_PARALLEL(recordKeys.begin(), recordKeys.end());
-        // record entries hold the unique key index until the keys are placed
-        uniqueKeys.clear();
-        for (size_t i = 0; i < recordKeys.size(); i++) {
-            if (uniqueKeys.empty() || uniqueKeys.back() != recordKeys[i].first) {
-                uniqueKeys.push_back(recordKeys[i].first);
-            }
-            if (recordKeys[i].second != SIZE_MAX) {
-                sequences.recordEntries[recordKeys[i].second] = uniqueKeys.size() - 1;
-            }
-        }
-        uniqueKeyEntries.resize(uniqueKeys.size());
-        keyFetchSources.resize(uniqueKeys.size());
-        sequences.keys.resize(uniqueKeys.size());
+        // record entries hold the first pair of their key until the keys are placed
+        keyFetchSources.resize(recordKeys.size());
         // sort keys by fetch source, assigned keys go last and are dropped
         threadSourceOffsets.assign((nodes + 2) * par.threads + 1, 0);
 #pragma omp parallel
@@ -3564,8 +3551,17 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             std::vector<size_t> fetchSourceOffsets(nodes + 2, 0);
             FetchedKeyCursor keyCursor(nodes + 1);
 #pragma omp for schedule(static)
-            for (size_t i = 0; i < uniqueKeys.size(); i++) {
-                keyFetchSources[i] = isAssigned(uniqueKeys[i]) ? nodes + 1 : ((getFetchedEntry(previous, uniqueKeys[i], NULL, &keyCursor) != NULL) ? nodes : getFetchSource(uniqueKeys[i], keyCursor.block));
+            for (size_t i = 0; i < recordKeys.size(); i++) {
+                DBKeyType key = recordKeys[i].first;
+                if (i > 0 && recordKeys[i - 1].first == key) {
+                    continue;
+                }
+                for (size_t j = i; j < recordKeys.size() && recordKeys[j].first == key; j++) {
+                    if (recordKeys[j].second != SIZE_MAX) {
+                        sequences.recordEntries[recordKeys[j].second] = i;
+                    }
+                }
+                keyFetchSources[i] = isAssigned(key) ? nodes + 1 : ((getFetchedEntry(previous, key, NULL, &keyCursor) != NULL) ? nodes : getFetchSource(key, keyCursor.block));
                 fetchSourceOffsets[keyFetchSources[i]]++;
             }
             for (unsigned int node = 0; node <= nodes + 1; node++) {
@@ -3573,16 +3569,21 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             }
 #pragma omp barrier
 #pragma omp single
-            for (size_t i = 0; i + 1 < threadSourceOffsets.size(); i++) {
-                threadSourceOffsets[i + 1] += threadSourceOffsets[i];
+            {
+                for (size_t i = 0; i + 1 < threadSourceOffsets.size(); i++) {
+                    threadSourceOffsets[i + 1] += threadSourceOffsets[i];
+                }
+                sequences.keys.resize(threadSourceOffsets.back());
             }
             for (unsigned int node = 0; node <= nodes + 1; node++) {
                 fetchSourceOffsets[node] = threadSourceOffsets[node * par.threads + thread_idx];
             }
 #pragma omp for schedule(static)
-            for (size_t i = 0; i < uniqueKeys.size(); i++) {
-                uniqueKeyEntries[i] = fetchSourceOffsets[keyFetchSources[i]]++;
-                sequences.keys[uniqueKeyEntries[i]] = uniqueKeys[i];
+            for (size_t i = 0; i < recordKeys.size(); i++) {
+                if (i == 0 || recordKeys[i - 1].first != recordKeys[i].first) {
+                    recordKeys[i].second = fetchSourceOffsets[keyFetchSources[i]]++;
+                    sequences.keys[recordKeys[i].second] = recordKeys[i].first;
+                }
             }
         }
         sequences.fetchSourceKeyOffsets.resize(nodes + 2);
@@ -3595,7 +3596,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
 #pragma omp parallel for schedule(static)
         for (size_t i = 0; i < sequences.recordEntries.size(); i++) {
             size_t &entry = sequences.recordEntries[i];
-            entry = (entry != SIZE_MAX && uniqueKeyEntries[entry] < keyCount) ? uniqueKeyEntries[entry] : SIZE_MAX;
+            entry = (entry != SIZE_MAX && recordKeys[entry].second < keyCount) ? recordKeys[entry].second : SIZE_MAX;
         }
         sequences.entryOffsets.resize(keyCount + 1);
         sequences.entryOffsets[0] = 0;
