@@ -56,9 +56,9 @@ std::vector<int> sequenceCopyFds;
 int sequenceCopyError = 0;
 
 static DBReader<DBKeyType> *memberDbr = NULL;
-std::vector<MedianMember> medianMembers;
+std::vector<SeedMember> seedMembers;
 
-// --kmer-score-mode 1: a higher self score gives a smaller score, the hash orders equal self scores
+// --kmer-score-mode 1: higher self score first, hash breaks ties
 static inline unsigned short kmerScore(unsigned short hash, const std::vector<int> &selfScore, int maxSelfScore, int levelBits,
                                        const unsigned char *window, const unsigned char *patternPos, int kmerSize) {
     if (selfScore.empty()) {
@@ -259,14 +259,14 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
         const unsigned int BUFFER_SIZE = static_cast<unsigned int>(KMER_STAGING_BUFFER_SIZE);
         size_t bufferPos = 0;
         KmerPosition<T, includeAdjacency, L> * threadKmerBuffer = NULL;
-        size_t *threadHashDistribution = NULL;
+        size_t *threadHashDist = NULL;
         if (hashDistribution == NULL) {
             threadKmerBuffer = new(std::nothrow) KmerPosition<T, includeAdjacency, L>[BUFFER_SIZE];
             Util::checkAllocation(threadKmerBuffer, "Can not allocate threadKmerBuffer memory in fillKmerPositionArray");
         } else {
-            threadHashDistribution = new(std::nothrow) size_t[USHRT_MAX + 1];
-            Util::checkAllocation(threadHashDistribution, "Can not allocate threadHashDistribution memory in fillKmerPositionArray");
-            memset(threadHashDistribution, 0, sizeof(size_t) * (USHRT_MAX + 1));
+            threadHashDist = new(std::nothrow) size_t[USHRT_MAX + 1];
+            Util::checkAllocation(threadHashDist, "Can not allocate threadHashDistribution memory in fillKmerPositionArray");
+            memset(threadHashDist, 0, sizeof(size_t) * (USHRT_MAX + 1));
         }
         size_t countTableBufferPos = 0;
         KmerPosition<T, includeAdjacency, L> *countTableKmerBuffer = NULL;
@@ -277,11 +277,11 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
         SequencePosition * kmers = (SequencePosition *) malloc((par.pickNbest * (par.maxSeqLen + 1) + 1) * sizeof(SequencePosition) * 2);
         Util::checkAllocation(kmers, "Can not allocate kmers memory in fillKmerPositionArray");
         size_t kmersArraySize = par.maxSeqLen;
-        for (size_t readChunk = 0; readChunk < readChunks.size() + (medianMembers.empty() ? 0 : 1); readChunk++) {
-            const bool isMedianMember = readChunk == readChunks.size();
-            size_t start = isMedianMember ? 0 : readChunkOffsets[readChunks[readChunk]];
-            size_t bucketSize = isMedianMember ? medianMembers.size() : readChunkOffsets[readChunks[readChunk] + 1] - start;
-            if (thread_idx == 0 && isMedianMember == false) {
+        for (size_t readChunk = 0; readChunk < readChunks.size() + (seedMembers.empty() ? 0 : 1); readChunk++) {
+            const bool isSeedMember = readChunk == readChunks.size();
+            size_t start = isSeedMember ? 0 : readChunkOffsets[readChunks[readChunk]];
+            size_t bucketSize = isSeedMember ? seedMembers.size() : readChunkOffsets[readChunks[readChunk] + 1] - start;
+            if (thread_idx == 0 && isSeedMember == false) {
                 seqDbr.loadData(start, start + bucketSize);
                 if (isLinfinity && readChunk + 1 < readChunks.size()) {
                     size_t nextChunk = readChunks[readChunk + 1];
@@ -289,33 +289,33 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                 }
             }
 #pragma omp barrier
-            if (thread_idx == 0 && isMedianMember == false && sequenceCopyFds.empty() == false && sequenceCopyError == 0) {
+            if (thread_idx == 0 && isSeedMember == false && sequenceCopyFds.empty() == false && sequenceCopyError == 0) {
                 sequenceCopyError = seqDbr.writeLoadedData(sequenceCopyFds);
             }
 
-            // linfinity reads the read chunk from the loaded buffer
+            // linfinity: read from the loaded buffer
             DBReader<DBKeyType>::LoadedBufferCursor cursor;
 #pragma omp for schedule(dynamic, 100)
             for (size_t id = start; id < (start + bucketSize); id++) {
-                if (isLinfinity == false && isMedianMember == false) {
+                if (isLinfinity == false && isSeedMember == false) {
                     progress.updateProgress();
                 }
-                if (isMedianMember == false && isRepresentative(id) == false) {
+                if (isSeedMember == false && isRepresentative(id) == false) {
                     continue;
                 }
                 memset(hierarchicalScoreDist, 0, sizeof(unsigned int) * 128);
 
                 const char *seqData;
-                if (isMedianMember) {
-                    const MedianMember &medianMember = medianMembers[id];
-                    seqData = isLinfinity ? medianMember.seqData : memberDbr->getData(medianMember.memberId, thread_idx);
-                    seq.mapSequence(medianMember.memberId, medianMember.repKey, seqData, medianMember.seqLen);
+                if (isSeedMember) {
+                    const SeedMember &seedMember = seedMembers[id];
+                    seqData = isLinfinity ? seedMember.seqData : memberDbr->getData(seedMember.memberId, thread_idx);
+                    seq.mapSequence(seedMember.memberId, seedMember.repKey, seqData, seedMember.seqLen);
                 } else {
                     seqData = isLinfinity ? seqDbr.getDataFromLoadedBuffer(id, cursor) : seqDbr.getData(id, thread_idx);
                     seq.mapSequence(id, seqDbr.getDbKey(id), seqData, isLinfinity ? seqDbr.getSeqLenFromRange(cursor.range, id) : seqDbr.getSeqLen(id));
                 }
-                const L recordSeqLen = static_cast<L>(isMedianMember ? medianMembers[id].repLen : seq.L);
-                // -1: a median member position is not a position in the rep
+                const L recordSeqLen = static_cast<L>(isSeedMember ? seedMembers[id].repLen : seq.L);
+                // -1: seed member positions are not rep positions
                 const T memberPos = static_cast<T>(-1);
 
                 size_t seqHash =  SIZE_T_MAX;
@@ -521,12 +521,12 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                 bool seqHashInCountTable = countTableKmerArray != NULL && static_cast<unsigned short>(seqHash) <= countTableEndRange;
                 if (seqHashInRange || seqHashInCountTable) {
                     if(hashDistribution != NULL){
-                        threadHashDistribution[static_cast<unsigned short>(seqHash)]++;
+                        threadHashDist[static_cast<unsigned short>(seqHash)]++;
                     }
                     else{
                         threadKmerBuffer[bufferPos].kmer = seqHash;
                         threadKmerBuffer[bufferPos].id = seqId;
-                        threadKmerBuffer[bufferPos].pos = isMedianMember ? memberPos : 0;
+                        threadKmerBuffer[bufferPos].pos = isSeedMember ? memberPos : 0;
                         threadKmerBuffer[bufferPos].seqLen = recordSeqLen;
                         if (includeAdjacency) {
                             for (int i = 0; i < 6; i++) {
@@ -611,12 +611,12 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
                         if (kmerInRange || kmerInCountTable)
                         {
                             if(hashDistribution != NULL){
-                                threadHashDistribution[(kmers + kmerIdx)->score]++;
+                                threadHashDist[(kmers + kmerIdx)->score]++;
                                 continue;
                             }
                             threadKmerBuffer[bufferPos].kmer = isLinfinity ? mixKmerIndex((kmers + kmerIdx)->kmer, kmerBits) : (kmers + kmerIdx)->kmer;
                             threadKmerBuffer[bufferPos].id = seqId;
-                            threadKmerBuffer[bufferPos].pos = isMedianMember ? memberPos : static_cast<T>((kmers + kmerIdx)->pos);
+                            threadKmerBuffer[bufferPos].pos = isSeedMember ? memberPos : static_cast<T>((kmers + kmerIdx)->pos);
                             threadKmerBuffer[bufferPos].seqLen = recordSeqLen;
                             if (includeAdjacency) {
                                 unsigned int startPos = (kmers + kmerIdx)->pos;
@@ -694,11 +694,11 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
 #pragma omp critical
         {
             longestKmer = std::max(threadLongestKmer, longestKmer);
-            for (size_t i = 0; threadHashDistribution != NULL && i < USHRT_MAX + 1; i++) {
-                hashDistribution[i] += threadHashDistribution[i];
+            for (size_t i = 0; threadHashDist != NULL && i < USHRT_MAX + 1; i++) {
+                hashDistribution[i] += threadHashDist[i];
             }
         }
-        delete[] threadHashDistribution;
+        delete[] threadHashDist;
     }
 
     if (TYPE == Parameters::DBTYPE_HMM_PROFILE) {
@@ -1448,7 +1448,7 @@ static size_t assignGroupWithoutDiagonal(KmerPositionType *hashSeqPair, int maxR
                                    }
                                },
                                isBefore);
-            // the members found in the most k-mer groups are reps too
+            // members in the most k-mer groups are reps too
             for (int iter = 0; iter < groupCountRepSeqCount; iter++) {
                 size_t bestPos = SIZE_T_MAX;
                 int maxCount = -1;
@@ -1683,7 +1683,7 @@ static KmerPositionType *doComputationWithoutDiagonal(size_t totalKmers, size_t 
     sortKmers(hashSeqPair, elementsToSort);
     Debug(Debug::INFO) << timer.lap() << "\n";
 
-    // with one hash range the count table is filled from the same k-mers
+    // one hash range: fill the count table from these k-mers
     if (countTable != NULL && (phase == ComputationPhase::SetupCountTable || hashEndRange == SIZE_T_MAX)) {
 #pragma omp parallel for schedule(static) num_threads(par.threads)
         for (size_t i = 0; i < elementsToSort; i++) {
@@ -1920,7 +1920,7 @@ static void kmermatcherWithoutDiagonalInner(Parameters &par, DBReader<DBKeyType>
     if (par.includeCountTable) {
         countTable.assign(seqDbr.getLastKey() + 1, 0);
     }
-    // all hash ranges are counted before the first rep is picked
+    // count all hash ranges before picking reps
     for (size_t split = 0; countTable.empty() == false && splits > 1 && split < hashRanges.size(); split++) {
         Debug(Debug::INFO) << "Fill count table for " << (split + 1) << " split\n";
         doComputationWithoutDiagonal<KmerPositionType, T, includeAdjacency, L>(totalKmersPerSplit, hashRanges[split].first, hashRanges[split].second,
@@ -2228,24 +2228,25 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
 
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(querySeqType) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
-    size_t medianMemberMemory = medianMembers.capacity() * sizeof(MedianMember);
-    if (medianMemberMemory >= memoryLimit) {
+    size_t seedMemberMemory = seedMembers.capacity() * sizeof(SeedMember);
+    if (seedMemberMemory >= memoryLimit) {
         Debug(Debug::ERROR) << "Not enough memory to run the kmermatcher. Memory limit: " << memoryLimit
-                            << " bytes, the median member array needs: " << medianMemberMemory << " bytes.\n"
+                            << " bytes, the seed member array needs: " << seedMemberMemory << " bytes.\n"
                             << "Raise --split-memory-limit.\n";
         EXIT(EXIT_FAILURE);
     }
-    memoryLimit -= medianMemberMemory;
+    memoryLimit -= seedMemberMemory;
 
     Debug(Debug::INFO) << "\n";
     float kmersPerSequenceScale = (Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES)) ?
                                         par.kmersPerSequenceScale.values.nucleotide() : par.kmersPerSequenceScale.values.aminoacid();
     if (isLinfinity) {
         kmermatcherLinfinity<T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit);
+        MMseqsNode::writeNodeLog(par.db2);
     } else {
         size_t totalKmers = computeKmerCount(seqDbr, par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
-        for (size_t i = 0; i < medianMembers.size(); i++) {
-            totalKmers += computeSeqKmerCount(static_cast<int>(medianMembers[i].seqLen), par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
+        for (size_t i = 0; i < seedMembers.size(); i++) {
+            totalKmers += computeSeqKmerCount(static_cast<int>(seedMembers[i].seqLen), par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
         }
         if (par.linclustVersion == Parameters::LINCLUST_VERSION2 && Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_AMINO_ACIDS)) {
             runKmermatcherWithoutDiagonal<T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit, totalKmers);
@@ -2423,7 +2424,7 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
 
     size_t aminoAcidDBSize = seqDbr.getAminoAcidDBSize();
     if (isLinfinity) {
-        // only the residues of the representatives of clusthashfast subsets
+        // residues of clusthashfast representatives only
         const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
         aminoAcidDBSize = 0;
         for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {
@@ -2486,6 +2487,7 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
         par.countTableIteration = 0;
         par.kmerPosFilter = false;
     }
+
     const bool withoutDiagonal = isLinfinity || (par.linclustVersion == Parameters::LINCLUST_VERSION2 && Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_AMINO_ACIDS));
     if (withoutDiagonal) {
         if (par.includeOnlyExtendable && par.PARAM_INCLUDE_ONLY_EXTENDABLE.wasSet) {
@@ -2499,7 +2501,7 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
         par.needWriteBuffer = false;
     }
 
-    // positions are meaningless for the median member, so only without diagonals
+    // only without diagonals, seed member positions are meaningless
     if (par.filterCluDBFile.empty() == false && withoutDiagonal && isLinfinity == false) {
         memberDbr = new DBReader<DBKeyType>(par.filterSeqDBFile.c_str(), (par.filterSeqDBFile + ".index").c_str(), par.threads,
                                             DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
@@ -2507,8 +2509,8 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
         DBReader<DBKeyType> cluDbr(par.filterCluDBFile.c_str(), (par.filterCluDBFile + ".index").c_str(), par.threads,
                                    DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
         cluDbr.open(DBReader<DBKeyType>::NOSORT);
-        const size_t membersPerCluster = static_cast<size_t>(par.medianMemberCount);
-        medianMembers.resize(cluDbr.getSize() * membersPerCluster);
+        const size_t membersPerCluster = static_cast<size_t>(par.seedMemberPerRep);
+        seedMembers.resize(cluDbr.getSize() * membersPerCluster);
 #pragma omp parallel num_threads(par.threads)
         {
             unsigned int thread_idx = 0;
@@ -2533,38 +2535,39 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
                 size_t memberCount = std::min(members.size(), membersPerCluster);
                 std::vector<std::pair<size_t, size_t> >::iterator unranked = members.begin();
                 for (size_t m = 0; m < membersPerCluster; m++) {
-                    MedianMember &medianMember = medianMembers[i * membersPerCluster + m];
-                    medianMember.repKey = repKey;
-                    medianMember.repLen = repLen;
-                    medianMember.memberId = SIZE_T_MAX;
-                    medianMember.seqData = NULL;
+                    SeedMember &seedMember = seedMembers[i * membersPerCluster + m];
+                    seedMember.repKey = repKey;
+                    seedMember.repLen = repLen;
+                    seedMember.memberId = SIZE_T_MAX;
+                    seedMember.seqData = NULL;
                     if (m < memberCount) {
-                        // evenly spaced length ranks, longest first, ties by smaller key (ids are in key order)
+                        // evenly spaced length ranks, longest first, then smaller id
                         std::vector<std::pair<size_t, size_t> >::iterator rank = members.begin() + (m + 1) * members.size() / (memberCount + 1);
                         std::nth_element(unranked, rank, members.end(),
                                          [](const std::pair<size_t, size_t> &first, const std::pair<size_t, size_t> &second) {
                                              return first.first > second.first || (first.first == second.first && first.second < second.second);
                                          });
-                        medianMember.memberId = rank->second;
-                        medianMember.seqLen = rank->first;
+                        seedMember.memberId = rank->second;
+                        seedMember.seqLen = rank->first;
                         unranked = rank + 1;
                     }
                 }
             }
         }
-        size_t medianMemberCount = 0;
-        for (size_t i = 0; i < medianMembers.size(); i++) {
-            if (medianMembers[i].memberId != SIZE_T_MAX) {
-                medianMembers[medianMemberCount++] = medianMembers[i];
+
+        size_t seedMemberCount = 0;
+        for (size_t i = 0; i < seedMembers.size(); i++) {
+            if (seedMembers[i].memberId != SIZE_T_MAX) {
+                seedMembers[seedMemberCount++] = seedMembers[i];
             }
         }
-        medianMembers.resize(medianMemberCount);
-        // the memory limit counts the capacity, several members per cluster leave many slots empty
+        seedMembers.resize(seedMemberCount);
+        // shrink, the memory limit counts the capacity
         if (membersPerCluster > 1) {
-            std::vector<MedianMember>(medianMembers).swap(medianMembers);
+            std::vector<SeedMember>(seedMembers).swap(seedMembers);
         }
         cluDbr.close();
-        Debug(Debug::INFO) << "Cluster members adding k-mers to their representative: " << medianMemberCount << "\n";
+        Debug(Debug::INFO) << "Cluster members adding k-mers to their representative: " << seedMemberCount << "\n";
     }
 
     if (seqDbr.getMaxSeqLen() < SHRT_MAX) {

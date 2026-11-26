@@ -305,11 +305,11 @@ public:
     size_t getLocalBlockReadSize() { return localBlockReadSize; }
     size_t getLocalKeyReadSize() { return localKeyReadSize; }
     size_t getLoadBufferSize(size_t keyBegin, size_t keyEnd);
-    // range loads from copies at the offsets of the data files, empty: from the data files
+    // range loads from copies, empty: from the data files
     void setLocalCopyFds(const std::vector<int> &fds) { localCopyFds = fds; }
     // 0 or the errno of the failed write
     int writeLoadedData(const std::vector<int> &fds);
-    // false if the block cache does not hold [offset, offset + size) of the data file of block
+    // false unless the cache holds [offset, offset + size)
     bool copyCachedBlockData(size_t block, size_t offset, size_t size, char *data) const;
 
     // linfinity headers
@@ -592,9 +592,9 @@ public:
     size_t getRangeRepresentativeCount(size_t range) const {
         return rangeRepresentativeCounts[range];
     }
-    // seventh column of a createsubdb subset: the reps with a median member
-    size_t getRangeMedianMemberCount(size_t range) const {
-        return rangeMedianMemberCounts[range];
+    // reps with a seed member, seventh column of a createsubdb subset
+    size_t getRangeSeedMemberCount(size_t range) const {
+        return rangeSeedMemberCounts[range];
     }
 
 private:
@@ -607,7 +607,7 @@ private:
     size_t planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys);
     void loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
     void decompressLoadedBuffer();
-    // the offset of a key in the data file of its range
+    // offset of a key in its data file
     size_t getKeyOffset(size_t range, size_t key);
     char *allocateReadBuffer(size_t bytes);
 
@@ -665,7 +665,7 @@ private:
     // header offsets or binary cluster index, their fds follow the data fds
     std::vector<std::string> entryOffsetsFileNames;
     std::vector<size_t> rangeRepresentativeCounts;
-    std::vector<size_t> rangeMedianMemberCounts;
+    std::vector<size_t> rangeSeedMemberCounts;
     // bsearch result of every 2^idRangeShift-th key, findIdRange searches between two
     std::vector<size_t> idRangeTable;
     size_t idRangeShift;

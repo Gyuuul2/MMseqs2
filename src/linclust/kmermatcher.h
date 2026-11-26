@@ -442,20 +442,20 @@ void setLinearFilterDefault(Parameters *p);
 size_t computeMemoryNeededLinearfilter(size_t totalKmer);
 
 extern BaseMatrix *adjSubMat;
-// iteration 2: --median-member-count members of each iteration-1 cluster add their k-mers under the key and length of their rep
-struct MedianMember {
+// iteration 2: cluster members add k-mers under the key and length of their rep
+struct SeedMember {
     size_t memberId;
     DBKeyType repKey;
     size_t repLen;
-    // linfinity: the member sequence, read for the key split
+    // linfinity: member sequence of the key split
     const char *seqData;
     size_t seqLen;
 };
-extern std::vector<MedianMember> medianMembers;
+extern std::vector<SeedMember> seedMembers;
 // linfinity send split
 extern size_t sendSplitFirstKey;
 extern uint64_t *representativeBits;
-// linfinity: copies of the loaded sequences at the offsets of the data files, the errno of a failed write
+// linfinity: copies of the loaded sequences, errno of a failed write
 extern std::vector<int> sequenceCopyFds;
 extern int sequenceCopyError;
 
@@ -511,7 +511,7 @@ static void refillKmerCodeBuffer(KmerCodeReader &reader, size_t fileOffset) {
     reader.bufferPos = 0;
 }
 
-// writes 8 bytes when they fit, the bytes past bufferPos are written again
+// write 8 bytes if they fit, bytes past bufferPos are rewritten later
 static inline void putStepBits(KmerCodeWriter &writer, uint64_t value, unsigned int bits) {
     uint64_t bitBuffer = writer.bitBuffer | ((value & ((1ULL << bits) - 1)) << writer.bitCount);
     unsigned int bitCount = writer.bitCount + bits;

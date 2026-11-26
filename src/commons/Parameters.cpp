@@ -176,7 +176,7 @@ Parameters::Parameters():
         PARAM_NUM_COUNTS(PARAM_NUM_COUNTS_ID, "--num-count-table", "Number of count table based center swapping", "Number of count table based center swapping", typeid(int), (void *) &countTableIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_INCLUDE_ADJACENCY(PARAM_INCLUDE_ADJACENCY_ID, "--include-adjacency", "Include adjacency based center swapping", "Include adjacency based center swapping", typeid(bool), (void *) &includeAdjacency, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_LINCLUST_ITERATIONS(PARAM_LINCLUST_ITERATIONS_ID, "--linclust-iterations", "Linclust iterations", "k-mer matching rounds linclust2 and lin8clust run: 2 reclusters the first round representatives, 1 stops after the first round. Iteration 2 uses spaced k-mers unless --spaced-kmer-mode is set and adds 0.1 to --kmer-per-seq-scale; up to --min-seq-id 0.5 it picks the k-mers of highest self score and adds the k-mers of 3 members of each cluster instead of 1, 4 below 0.5, unless --kmer-score-mode or --median-member-count is set. From --min-seq-id 0.7 linclust2 and lin8clust run 1 unless it is set", typeid(int), (void *) &linclustIterations, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LINCLUST_ITERATIONS(PARAM_LINCLUST_ITERATIONS_ID, "--linclust-iterations", "Linclust iterations", "Linclust2 k-mer matching rounds, 2 reclusters the round 1 representatives with spaced k-mers and 0.1 more --kmer-per-seq-scale (1 from --min-seq-id 0.7)", typeid(int), (void *) &linclustIterations, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJACENCY_ALPH_SIZE(PARAM_ADJACENCY_ALPH_SIZE_ID, "--adjacency-alph-size", "Alphabet the adjacent residues are stored in", "Alphabet size the adjacent residues are stored and scored in, 0 keeps --alph-size", typeid(int), (void *) &adjacencyAlphabetSize, "^(0|[2-9]|1[0-9]|2[01])$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: align on the diagonal of the prefilter hit\n1: align on the best diagonal of an ungapped scan", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
         PARAM_ALIGN2CLUST_ALIGNER_MODE(PARAM_ALIGN2CLUST_ALIGNER_MODE_ID, "--align2clust-aligner-mode", "Align2clust aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: forward pass and traceback of several targets at once (SWIPE), also the seed extensions of the representative targets", typeid(int), (void *) &align2clustAlignerMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
@@ -184,8 +184,8 @@ Parameters::Parameters():
         PARAM_KMER_POS_FILTER(PARAM_KMER_POS_FILTER_ID, "--kmer-pos-filter", "K-mer position filter", "Drop k-mer matches whose diagonal cannot reach the coverage", typeid(bool), (void *) &kmerPosFilter, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
-        PARAM_KMER_SCORE_MODE(PARAM_KMER_SCORE_MODE_ID, "--kmer-score-mode", "K-mer score mode", "Order the k-mers of a sequence are picked in, 1 in linclust2 and lin8clust iteration 2 below --min-seq-id 0.5 unless set:\n0: lowest hash\n1: highest substitution matrix self score, then lowest hash", typeid(int), (void *) &kmerScoreMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
-        PARAM_MEDIAN_MEMBER_COUNT(PARAM_MEDIAN_MEMBER_COUNT_ID, "--median-member-count", "Median member count", "Members of each cluster that add their k-mers to the representative (kmermatcher --filter-cludb-file, createsubdb of linfinity clusterings), at evenly spaced ranks of the members sorted by length; in linclust2 and lin8clust iteration 2 3 up to --min-seq-id 0.5 and 4 below 0.5 unless set", typeid(int), (void *) &medianMemberCount, "^[1-9][0-9]*$", MMseqsParameter::COMMAND_HIDDEN),
+        PARAM_KMER_SCORE_MODE(PARAM_KMER_SCORE_MODE_ID, "--kmer-score-mode", "K-mer score mode", "K-mer selection order (1 in linclust2 round 2 up to --min-seq-id 0.5)\n0: lowest hash\n1: highest self score, then lowest hash", typeid(int), (void *) &kmerScoreMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_SEED_MEMBER_PER_REP(PARAM_SEED_MEMBER_PER_REP_ID, "--seed-member-per-rep", "Seed members per representative", "Cluster members, evenly spaced by length, that add their k-mers to the representative (linclust2 round 2: 4 below --min-seq-id 0.5, 3 at 0.5)", typeid(int), (void *) &seedMemberPerRep, "^[1-9][0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_VERSION(PARAM_LINCLUST_VERSION_ID, "--linclust-version", "Linclust version", "Linclust version: 1: Linclust1, 2: Linclust2", typeid(int), (void *) &linclustVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUSTER_VERSION(PARAM_CLUSTER_VERSION_ID, "--cluster-version", "Cluster version", "Cluster version: 1: Cluster1, 2: Cluster2", typeid(int), (void *) &clusterVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -1160,7 +1160,7 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_USE_PARALLELISM);
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
     kmermatcher.push_back(&PARAM_KMER_SCORE_MODE);
-    kmermatcher.push_back(&PARAM_MEDIAN_MEMBER_COUNT);
+    kmermatcher.push_back(&PARAM_SEED_MEMBER_PER_REP);
     kmermatcher.push_back(&PARAM_LINCLUST_VERSION);
     kmermatcher.push_back(&PARAM_FILTER_CLUDB_FILE);
     kmermatcher.push_back(&PARAM_FILTER_SEQDB_FILE);
@@ -1317,7 +1317,7 @@ Parameters::Parameters():
     createsubdb.push_back(&PARAM_SUBDB_MODE);
     createsubdb.push_back(&PARAM_ID_MODE);
     createsubdb.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
-    createsubdb.push_back(&PARAM_MEDIAN_MEMBER_COUNT);
+    createsubdb.push_back(&PARAM_SEED_MEMBER_PER_REP);
     createsubdb.push_back(&PARAM_V);
 
     // renamedbkeys
@@ -2190,9 +2190,8 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
         }
     }
 
-    if (MMseqsMPI::isMaster()) {
-        // the other linfinity nodes print warnings, errors and their own lines (MMseqsNode::printPhaseValues)
-        Debug::setDebugLevel(MMseqsNode::isMaster() ? verbosity : std::min(verbosity, static_cast<int>(Debug::WARNING)));
+    if (MMseqsMPI::isMaster() && MMseqsNode::isMaster()) {
+        Debug::setDebugLevel(verbosity);
     }
 
 #ifdef OPENMP
@@ -2886,7 +2885,7 @@ void Parameters::setDefaults() {
     alignerMode = ALIGNER_MODE_FARRAR;
     kmerPosFilter = true;
     kmerScoreMode = 0;
-    medianMemberCount = 1;
+    seedMemberPerRep = 1;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;
     clusterVersion = CLUSTER_VERSION1;

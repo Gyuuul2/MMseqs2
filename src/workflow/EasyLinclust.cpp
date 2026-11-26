@@ -24,7 +24,6 @@ void setEasyLinclustDefaults(Parameters *p) {
     p->evalProfile = 0.1;
 }
 void setEasyLinclustMustPassAlong(Parameters *p) {
-    p->PARAM_SPACED_KMER_MODE.wasSet = true;
     p->PARAM_REMOVE_TMP_FILES.wasSet = true;
     p->PARAM_CREATEDB_MODE.wasSet = true;
     p->PARAM_WRITE_LOOKUP.wasSet = true;
