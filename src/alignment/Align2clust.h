@@ -61,19 +61,17 @@ struct AlignmentScoring {
     }
 };
 
-extern std::atomic<size_t> swipeLanePairCount;
-extern std::atomic<size_t> swipeLaneCapacity;
-extern std::atomic<size_t> swipeScalarPairCount;
-extern std::atomic<size_t> swipeMemberExtensionCount;
-extern std::atomic<size_t> swipeMemberActiveLaneRowCount;
-extern std::atomic<size_t> swipeMemberTotalLaneRowCount;
-extern std::atomic<size_t> swipeTargetPairCount;
-extern std::atomic<size_t> swipeTargetActiveLaneRowCount;
-extern std::atomic<size_t> swipeTargetTotalLaneRowCount;
-extern std::atomic<size_t> swipeLongTargetPairCount;
-extern std::atomic<size_t> swipeByteActiveLaneRowCount;
-extern std::atomic<size_t> swipeByteTotalLaneRowCount;
-extern std::atomic<size_t> swipeRerunPairCount;
+// last pair a thread aligns, printed on a crash
+struct AlignmentTrace {
+    enum Stage { NOT_ALIGNING, UNGAPPED, GAPPED, SWIPE, MEMBER_CHECK };
+    Stage stage;
+    DBKeyType repKey;
+    int repLength;
+    DBKeyType targetKey;
+    int targetLength;
+};
+extern thread_local AlignmentTrace alignmentTrace;
+extern thread_local int alignmentThread;
 
 // member alignments in SWIPE lanes, per thread
 struct SwipeBatch {
@@ -93,25 +91,10 @@ struct SwipeBatch {
     std::vector<size_t> entries;
     // alignClusterMembers
     std::vector<size_t> gapped;
-    size_t lanePairCount;
-    size_t laneCapacity;
-    size_t scalarPairCount;
 
     SwipeBatch(const Parameters &par, BaseMatrix *subMat, EvalueComputation &evaluer, size_t maxSeqLen)
         : aligner(subMat, maxSeqLen, par.compBiasCorrection, par.compBiasCorrectionScale, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid()),
-          evaluer(evaluer), isQueryInitialized(false), lanePairCount(0), laneCapacity(0), scalarPairCount(0) {}
-
-    ~SwipeBatch() {
-        swipeLanePairCount += lanePairCount;
-        swipeLaneCapacity += laneCapacity;
-        swipeScalarPairCount += scalarPairCount;
-    }
-
-    void addLanePairs(size_t count) {
-        size_t lanes = VECSIZE_INT * 2;
-        lanePairCount += count;
-        laneCapacity += (count + lanes - 1) / lanes * lanes;
-    }
+          evaluer(evaluer), isQueryInitialized(false) {}
 
     void startRep() {
         isQueryInitialized = false;
@@ -141,11 +124,10 @@ struct SwipeBatch {
         aligner.release();
     }
 
-    size_t add(const Sequence &sequence) {
+    void add(const Sequence &sequence) {
         offsets.push_back(sequences.size());
         sequences.insert(sequences.end(), sequence.numSequence, sequence.numSequence + sequence.L);
         lengths.push_back(sequence.L);
-        return offsets.size() - 1;
     }
 
     // start in 16 bit lanes, most members saturate 8 bit
@@ -175,7 +157,9 @@ struct SwipeTargets {
     bool isQueryInitialized;
     size_t queryId;
     std::vector<DBKeyType> repKeys;
-    std::vector<const char *> repSequences;
+    // reps of a batch, one after the other
+    std::vector<char> repSeqData;
+    std::vector<size_t> repOffsets;
     std::vector<int> repLengths;
     std::vector<size_t> queryIds;
     std::vector<unsigned char> sequences;
@@ -192,36 +176,21 @@ struct SwipeTargets {
     std::vector<s_align> backAligns;
     std::vector<std::string> backBacktraces;
     size_t targetPairs;
-    bool isForMembers;
+    AlignmentTrace firstTarget;
 
-    SwipeTargets(const Parameters &par, BaseMatrix *subMat, EvalueComputation &evaluer, size_t maxSeqLen, bool isForMembers = false)
-        : extender(subMat, maxSeqLen, par.compBiasCorrection, par.compBiasCorrectionScale, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid()),
-          evaluer(evaluer), repKey(0), isQueryInitialized(false), queryId(0), targetPairs(0), isForMembers(isForMembers) {}
+    SwipeTargets(const Parameters &par, BaseMatrix *subMat, EvalueComputation &evaluer)
+        : extender(subMat, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid()),
+          evaluer(evaluer), repKey(0), isQueryInitialized(false), queryId(0), targetPairs(0) {}
 
-    ~SwipeTargets() {
-        if (isForMembers) {
-            swipeMemberExtensionCount += targetPairs;
-            swipeMemberActiveLaneRowCount += extender.extensionActiveLaneRowCount;
-            swipeMemberTotalLaneRowCount += extender.extensionTotalLaneRowCount;
-            swipeByteActiveLaneRowCount += extender.byteExtensionActiveLaneRowCount;
-            swipeByteTotalLaneRowCount += extender.byteExtensionTotalLaneRowCount;
-            swipeRerunPairCount += extender.rerunExtensionCount;
-            return;
+    void addTarget(Sequence &query, const int16_t *queryBias, Sequence &target, DBKeyType targetKey, int seedQuery, int seedTarget) {
+        if (targetKeys.empty()) {
+            firstTarget = alignmentTrace;
         }
-        swipeTargetPairCount += targetPairs;
-        swipeTargetActiveLaneRowCount += extender.extensionActiveLaneRowCount;
-        swipeTargetTotalLaneRowCount += extender.extensionTotalLaneRowCount;
-        swipeLongTargetPairCount += extender.longExtensionCount;
-        swipeByteActiveLaneRowCount += extender.byteExtensionActiveLaneRowCount;
-        swipeByteTotalLaneRowCount += extender.byteExtensionTotalLaneRowCount;
-        swipeRerunPairCount += extender.rerunExtensionCount;
-    }
-
-    void addTarget(Sequence &query, Sequence &target, DBKeyType targetKey, int seedQuery, int seedTarget) {
         if (isQueryInitialized == false) {
-            queryId = extender.addQuery(&query);
+            queryId = extender.addQuery(&query, queryBias);
             repKeys.push_back(repKey);
-            repSequences.push_back(query.getSeqData());
+            repOffsets.push_back(repSeqData.size());
+            repSeqData.insert(repSeqData.end(), query.getSeqData(), query.getSeqData() + query.L);
             repLengths.push_back(query.L);
             isQueryInitialized = true;
         }
@@ -239,7 +208,8 @@ struct SwipeTargets {
         extender.clearQueries();
         isQueryInitialized = false;
         repKeys.clear();
-        repSequences.clear();
+        repSeqData.clear();
+        repOffsets.clear();
         repLengths.clear();
         queryIds.clear();
         sequences.clear();
@@ -255,7 +225,8 @@ struct SwipeTargets {
     void release() {
         clearTargets();
         std::vector<DBKeyType>().swap(repKeys);
-        std::vector<const char *>().swap(repSequences);
+        std::vector<char>().swap(repSeqData);
+        std::vector<size_t>().swap(repOffsets);
         std::vector<int>().swap(repLengths);
         std::vector<size_t>().swap(queryIds);
         std::vector<unsigned char>().swap(sequences);
@@ -335,8 +306,6 @@ struct MemberChecks {
     }
 };
 
-Matcher::result_t createSwipeResult(const Parameters &par, EvalueComputation &evaluer, DBKeyType key, int rawScore, const s_align &alignment,
-                                    int queryLength, int targetLength, const std::string &backtrace);
 void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherInitialized, MemberChecks &memberChecks, Sequence &query, Sequence &element,
                        DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer);
 bool canCoverMember(const Parameters &par, int queryLength, int memberLength);
@@ -348,9 +317,14 @@ bool alignNextMembers(const Parameters &par, BlockAligner &blockAligner, Matcher
 void alignClusterMembers(const Parameters &par, BlockAligner &blockAligner, Matcher &matcher, bool &matcherInitialized, Sequence &query, Sequence &element,
                          DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer,
                          MemberChecks &memberChecks);
+struct SwipeSeed {
+    DBLocalId targetId;
+    int seedQuery;
+    int seedTarget;
+};
 bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockAlignerInitialized, Sequence &query, Sequence &target,
                  float scorePerColThreshold, unsigned short &diagonal, const ClusterAssignment *assignedCluster, size_t targetId, Matcher::result_t *result,
-                 SwipeTargets *swipeTargets);
+                 SwipeTargets *swipeTargets, std::vector<SwipeSeed> *swipeSeeds = NULL);
 bool doSwipeExtensionsPass(const Parameters &par, SwipeTargets &swipeTargets, size_t i);
 int align2clustLinfinity(Parameters &par);
 
@@ -383,6 +357,10 @@ void alignTargetsSwipe(const Parameters &par, SwipeTargets &swipeTargets, const 
     for (size_t i = 0; i < count; i++) {
         swipeTargets.targets[i] = swipeTargets.sequences.data() + swipeTargets.offsets[i];
         swipeTargets.targetSequences[i] = swipeTargets.seqData.data() + swipeTargets.offsets[i];
+    }
+    alignmentTrace = swipeTargets.firstTarget;
+    if (alignmentTrace.stage != AlignmentTrace::MEMBER_CHECK) {
+        alignmentTrace.stage = AlignmentTrace::SWIPE;
     }
     swipeTargets.extender.extendBanded(count, swipeTargets.queryIds.data(), swipeTargets.targets.data(), swipeTargets.lengths.data(), swipeTargets.seedQueries.data(), swipeTargets.seedTargets.data(), false, xDrop,
                                bandSide, swipeTargets.aligns.data(), swipeTargets.backtraces.data());

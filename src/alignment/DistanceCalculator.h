@@ -92,18 +92,19 @@ public:
     template<typename T>
     static LocalAlignment computeUngappedAlignment(const T *querySeq, unsigned int querySeqLen,
                                                    const T *dbSeq, unsigned int dbSeqLen,
-                                                   const unsigned short diagonal, const char **subMat, int alnMode){
+                                                   const unsigned short diagonal, const char **subMat, int alnMode,
+                                                   const int16_t *queryBias = NULL){
         LocalAlignment max;
         for(unsigned int devisions = 1; devisions <= 1 + dbSeqLen / 32768; devisions++) {
             int realDiagonal = (-devisions * 65536  + diagonal);
-            LocalAlignment tmp = ungappedAlignmentByDiagonal(querySeq, querySeqLen, dbSeq, dbSeqLen, realDiagonal, subMat, alnMode);
+            LocalAlignment tmp = ungappedAlignmentByDiagonal(querySeq, querySeqLen, dbSeq, dbSeqLen, realDiagonal, subMat, alnMode, queryBias);
             if(tmp.score > max.score){
                 max = tmp;
             }
         }
         for(unsigned int devisions = 0; devisions <= querySeqLen / 65536; devisions++) {
             int realDiagonal = (devisions * 65536 + diagonal);
-            LocalAlignment tmp = ungappedAlignmentByDiagonal(querySeq, querySeqLen, dbSeq, dbSeqLen, realDiagonal, subMat, alnMode);
+            LocalAlignment tmp = ungappedAlignmentByDiagonal(querySeq, querySeqLen, dbSeq, dbSeqLen, realDiagonal, subMat, alnMode, queryBias);
             if(tmp.score > max.score){
                 max = tmp;
             }
@@ -114,7 +115,8 @@ public:
     template<typename T>
     static LocalAlignment ungappedAlignmentByDiagonal(const T * querySeq, unsigned int querySeqLen,
                                                       const T * dbSeq,  unsigned int dbSeqLen,
-                                                      int diagonal, const char **subMat, int alnMode) {
+                                                      int diagonal, const char **subMat, int alnMode,
+                                                      const int16_t *queryBias = NULL) {
         unsigned int minDistToDiagonal = abs(diagonal);
         LocalAlignment res;
         res.distToDiagonal = minDistToDiagonal;
@@ -129,7 +131,8 @@ public:
                 res.score = DistanceCalculator::computeSubstitutionDistance(
                         querySeq + minDistToDiagonal, dbSeq, minSeqLen, subMat, false);
             } else if (alnMode == Parameters::RESCORE_MODE_ALIGNMENT) {
-                LocalAlignment tmp = computeSubstitutionStartEndDistance(querySeq + minDistToDiagonal, dbSeq, minSeqLen, subMat);
+                LocalAlignment tmp = computeSubstitutionStartEndDistance(querySeq + minDistToDiagonal, dbSeq, minSeqLen, subMat,
+                                                                         (queryBias != NULL) ? queryBias + minDistToDiagonal : NULL);
                 res.score = tmp.score;
                 res.startPos = tmp.startPos;
                 res.endPos = tmp.endPos;
@@ -154,7 +157,7 @@ public:
                 res.score = DistanceCalculator::computeSubstitutionDistance(
                         querySeq, dbSeq + minDistToDiagonal, minSeqLen, subMat, false);
             } else if (alnMode == Parameters::RESCORE_MODE_ALIGNMENT) {
-                LocalAlignment tmp = computeSubstitutionStartEndDistance(querySeq, dbSeq + minDistToDiagonal, minSeqLen, subMat);
+                LocalAlignment tmp = computeSubstitutionStartEndDistance(querySeq, dbSeq + minDistToDiagonal, minSeqLen, subMat, queryBias);
                 res.score = tmp.score;
                 res.startPos = tmp.startPos;
                 res.endPos = tmp.endPos;
@@ -178,7 +181,8 @@ public:
     static LocalAlignment computeSubstitutionStartEndDistance(const T *seq1,
                                                               const T *seq2,
                                                               const unsigned int length,
-                                                              const char **subMat) {
+                                                              const char **subMat,
+                                                              const int16_t *seq1Bias = NULL) {
         int maxScore = 0;
         int maxEndPos = 0;
         int maxStartPos = 0;
@@ -186,7 +190,8 @@ public:
 //        int maxMinPos = 0;
         int score = 0;
         for(unsigned int pos = 0; pos < length; pos++){
-            int curr = subMat[static_cast<unsigned char>(seq1[pos])][static_cast<unsigned char>(seq2[pos])];
+            int curr = subMat[static_cast<unsigned char>(seq1[pos])][static_cast<unsigned char>(seq2[pos])]
+                       + ((seq1Bias != NULL) ? seq1Bias[pos] : 0);
             score = curr  + score;
             const bool isMinScore = (score <= 0);
             score =  (isMinScore) ? 0 : score;

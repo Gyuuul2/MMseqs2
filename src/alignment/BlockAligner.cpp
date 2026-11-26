@@ -5,6 +5,7 @@
 #include "SubstitutionMatrix.h"
 #include "EvalueComputation.h"
 #include "DistanceCalculator.h"
+#include "SwipeAligner.h"
 #include "simd.h"
 
 #define MAX_SIZE 4096 //change
@@ -67,7 +68,7 @@ BlockAligner::BlockAligner(
     memset(queryCompBias, 0, maxSequenceLength * sizeof(int16_t));
     memset(queryCompBiasRev, 0, maxSequenceLength * sizeof(int16_t));
     memset(targetCompBias, 0, maxSequenceLength * sizeof(int16_t));
-    tmpCompBias   = new float[maxSequenceLength];
+    SwipeAligner::fillBiasTable(subMat, compBiasCorrectionScale, compBiasTable, compBiasTableOffsets);
     diagProfileStride = maxSequenceLength + 4 * DIAG_GROUP;
     diagProfileWord = new int16_t[subMat->alphabetSize * diagProfileStride];
     diagProfileByte = new int8_t[subMat->alphabetSize * diagProfileStride];
@@ -79,6 +80,7 @@ BlockAligner::BlockAligner(
     }
     isDiagProfileStale = true;
     isDiagWordProfileStale = true;
+    compBiasQuery = NULL;
 }
 
 BlockAligner::~BlockAligner() {
@@ -94,7 +96,6 @@ BlockAligner::~BlockAligner() {
     }
     delete[] queryCompBias;
     delete[] targetCompBias;
-    delete[] tmpCompBias;
     delete[] queryRevNumSeq;
     delete[] targetRevNumSeq;
     delete[] queryCompBiasRev;
@@ -104,31 +105,41 @@ BlockAligner::~BlockAligner() {
 }
 
 void BlockAligner::initQuery(Sequence* query){
-    currentQuery = query;
-    querySeq = query->getSeqData();
-    queryNumSeq = query->numSequence;
-    queryLength = query->L;
-    isDiagProfileStale = true;
+    setQuery(query);
+    computeQueryCompBias();
     // the alignments only read the first queryLength positions of these buffers
     std::reverse_copy(queryNumSeq, queryNumSeq + queryLength, queryRevNumSeq);
-    if (Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_AMINO_ACIDS)&& compBiasCorrection){
-        SubstitutionMatrix::calcLocalAaBiasCorrection(subMat, queryNumSeq, queryLength, tmpCompBias, compBiasCorrectionScale);
-        for (int i =0; i < queryLength; i++) { 
-            queryCompBias[i] = (int16_t) ((tmpCompBias[i] < 0.0) ? tmpCompBias[i] - 0.5 : tmpCompBias[i] + 0.5);
-		}
-    } else {
-        memset(queryCompBias, 0, queryLength * sizeof(int16_t));
-    }
     std::reverse_copy(queryCompBias, queryCompBias + queryLength, queryCompBiasRev);
 }
 
-// the ungapped alignment only reads the query, so it can skip the reverse and composition bias of initQuery
+// the ungapped alignment only reads the query and its composition bias, so it can skip the reverse of initQuery
 void BlockAligner::setQuery(Sequence* query){
     currentQuery = query;
     querySeq = query->getSeqData();
     queryNumSeq = query->numSequence;
     queryLength = query->L;
     isDiagProfileStale = true;
+}
+
+const int16_t* BlockAligner::getQueryCompBias(){
+    computeQueryCompBias();
+    return queryCompBias;
+}
+
+// keep the bias while the same rep (Sequence, db key, length) is set again
+void BlockAligner::computeQueryCompBias(){
+    if (compBiasQuery == currentQuery && compBiasQueryKey == currentQuery->getDbKey() && compBiasQueryLength == queryLength) {
+        return;
+    }
+    compBiasQuery = currentQuery;
+    compBiasQueryKey = currentQuery->getDbKey();
+    compBiasQueryLength = queryLength;
+    if (Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_AMINO_ACIDS)&& compBiasCorrection){
+        SwipeAligner::computeQueryBias(subMat, currentQuery, true, compBiasCorrectionScale, compBiasTable, compBiasTableOffsets, tmpCompBias);
+        std::copy(tmpCompBias.begin(), tmpCompBias.end(), queryCompBias);
+    } else {
+        memset(queryCompBias, 0, queryLength * sizeof(int16_t));
+    }
 }
 
 // note: traceback cigar string will be reversed, but UngappedAln_res will contain correct start and end positions
@@ -457,9 +468,11 @@ BlockAligner::UngappedAln_res BlockAligner::ungappedAlign(
     Sequence* target, const unsigned short diagonal)
 {
     const char* targetSeq = target->getSeqData();
+    computeQueryCompBias();
     DistanceCalculator::LocalAlignment alignment = DistanceCalculator::computeUngappedAlignment(
                                                         querySeq, queryLength, targetSeq, target->L,
-                                                        diagonal, fastMatrix->matrix, Parameters::RESCORE_MODE_ALIGNMENT
+                                                        diagonal, fastMatrix->matrix, Parameters::RESCORE_MODE_ALIGNMENT,
+                                                        compBiasCorrection ? queryCompBias : NULL
                                                     );
     unsigned int distanceToDiagonal = alignment.distToDiagonal;
     int ungappedDiagonal = alignment.diagonal;

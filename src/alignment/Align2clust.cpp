@@ -21,6 +21,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <algorithm>
+#include <signal.h>
+#include <unistd.h>
 
 #ifdef OPENMP
 #include <omp.h>
@@ -29,8 +31,16 @@
 struct ClusterResult {
     size_t sequenceIdx;
     DBLocalId representativeId;
+    // bound of a set that the workers finish
     size_t prefSize;
     std::vector<DBLocalId> memberIds;
+    // extended once the set may be the largest
+    std::vector<SwipeSeed> swipeSeeds;
+};
+
+struct KeyBits {
+    uint64_t keyMask;
+    size_t keysBefore;
 };
 
 struct PrefInfo {
@@ -59,18 +69,76 @@ static std::mutex clusterMutex;
 static std::condition_variable clusterCondition;
 static std::condition_variable reorderSpaceCondition;
 static std::vector<ClusterResult> reorderSlots;
-static std::vector<unsigned char> reorderFilled;
+static std::vector<std::atomic<unsigned char>> reorderFilled;
 static size_t reorderCapacity = 0;
-static size_t reorderBufferedCount = 0;
 // max-heap by member count
 static std::vector<SetCoverCandidate> setCoverCandidates;
 static SetCoverComparator setCoverComparator;
 static std::vector<DBLocalId> setCoverMemberPool;
 static size_t setCoverLiveMemberCount = 0;
 
-static size_t currentProcessPosition = 0;
+static std::atomic<size_t> currentProcessPosition(0);
 static size_t currentPrefSize = 0;
 static bool allCalculationsDone = false;
+static size_t clusterResultCount = 0;
+// set cover sets with extensions left, by bound (memberIds + swipeSeeds)
+static std::vector<std::vector<ClusterResult>> deferredSets;
+static std::vector<size_t> unfinishedSetCounts;
+static size_t finishBound = 0;
+static std::atomic<bool> hasSetsToFinish(false);
+static std::vector<ClusterResult> finishedSets;
+static bool areSetsFinished = false;
+static std::condition_variable finishCondition;
+static std::atomic<size_t> deferredSetBytes(0);
+static size_t deferredSetLimit = 0;
+
+static size_t getDeferredSetBytes(const ClusterResult &result) {
+    return sizeof(ClusterResult) + result.memberIds.capacity() * sizeof(DBLocalId) + result.swipeSeeds.capacity() * sizeof(SwipeSeed);
+}
+
+thread_local AlignmentTrace alignmentTrace;
+thread_local int alignmentThread;
+
+static char *appendText(char *p, const char *text) {
+    while (*text != '\0') {
+        *p++ = *text++;
+    }
+    return p;
+}
+
+// async-signal-safe: no allocation, no stdio
+static void printCrash(int sig) {
+    static const char *stageNames[] = { "", "ungapped", "gapped", "SWIPE", "member check" };
+    const AlignmentTrace &trace = alignmentTrace;
+    char line[512];
+    char *p = Itoa::i32toa_sse2(sig, appendText(line, "align2clust: signal ")) - 1;
+    p = Itoa::u32toa_sse2(MMseqsNode::rank, appendText(p, " (node ")) - 1;
+    if (trace.stage == AlignmentTrace::NOT_ALIGNING) {
+        p = appendText(p, ") not aligning");
+    } else {
+        p = Itoa::i32toa_sse2(alignmentThread, appendText(p, ", thread ")) - 1;
+        p = Itoa::u64toa_sse2(trace.repKey, appendText(p, ") aligning rep key ")) - 1;
+        p = Itoa::i32toa_sse2(trace.repLength, appendText(p, " (length ")) - 1;
+        p = Itoa::u64toa_sse2(trace.targetKey, appendText(p, ") with target key ")) - 1;
+        p = Itoa::i32toa_sse2(trace.targetLength, appendText(p, " (length ")) - 1;
+        p = appendText(appendText(p, "), stage "), stageNames[trace.stage]);
+    }
+    *p++ = '\n';
+    if (write(STDERR_FILENO, line, p - line) < 0) {}
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
+
+static void installCrashReport() {
+    struct sigaction act;
+    memset(&act, 0, sizeof(act));
+    act.sa_handler = printCrash;
+    act.sa_flags = SA_RESETHAND;
+    const int signals[] = { SIGSEGV, SIGBUS, SIGFPE, SIGILL, SIGABRT };
+    for (int sig : signals) {
+        sigaction(sig, &act, NULL);
+    }
+}
 
 static DBLocalId loadAssignedCluster(const ClusterAssignment *assignedCluster, size_t sequenceId) {
     return assignedCluster[sequenceId].load(std::memory_order_relaxed);
@@ -138,10 +206,12 @@ static void assignSetCoverCandidates(std::vector<SetCoverCandidate> &candidates,
     }
 }
 
-static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int mode, size_t resultCount) {
+static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int mode, size_t resultCount, size_t keyBitsSize, bool isDeferring, size_t &deferredLimit) {
     size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
 
-    size_t fixedMemory = dbSize * sizeof(ClusterAssignment);
+    size_t resultSize = sizeof(ClusterResult) + (par.maxResListLen + 1) * (sizeof(DBLocalId) + (isDeferring ? sizeof(SwipeSeed) : 0));
+    // pending reps of every thread
+    size_t fixedMemory = dbSize * sizeof(ClusterAssignment) + keyBitsSize + static_cast<size_t>(par.threads) * SwipeExtender::LANES * SwipeExtender::LANES * resultSize;
     if (mode == Parameters::SET_COVER) {
         fixedMemory += dbSize * sizeof(PrefInfo);
     }
@@ -150,35 +220,31 @@ static size_t computeReorderCapacity(const Parameters &par, size_t dbSize, int m
     if (memoryLimit > fixedMemory) {
         budget = static_cast<size_t>(static_cast<double>(memoryLimit - fixedMemory) * 0.9);
     }
-    size_t resultSize = sizeof(ClusterResult) + (par.maxResListLen + 1) * sizeof(DBLocalId);
 
-    size_t capacity = std::min(resultCount, std::max((size_t) 1, budget / resultSize));
+    // deferred sets share the budget with the reorder slots
+    size_t capacity = std::min(resultCount, std::max((size_t) 1, (isDeferring ? budget / 2 : budget) / resultSize));
     capacity = std::max((size_t) 1, capacity);
+    deferredLimit = budget - std::min(budget, capacity * resultSize);
 
-    Debug(Debug::INFO) << "Reorder buffer sizing: memory limit " << memoryLimit << " byte, reserved (fixed) "
-                       << fixedMemory << " byte, budget " << budget << " byte, " << resultSize
-                       << " byte/result\n";
-    Debug(Debug::INFO) << "Reorder buffer capacity: " << capacity << " results ("
-                       << capacity * sizeof(ClusterResult) << " byte pre-allocated slots)\n";
     return capacity;
 }
 
+// lock only beyond the buffer or for the next in order
 static void pushClusterResult(ClusterResult &&clusterResult) {
     size_t idx = clusterResult.sequenceIdx;
-    bool notify = false;
-    {
+    if (idx >= currentProcessPosition + reorderCapacity) {
         std::unique_lock<std::mutex> lock(clusterMutex);
         // the next slot in order is always free
         while ((allCalculationsDone || idx < currentProcessPosition + reorderCapacity) == false) {
             reorderSpaceCondition.wait(lock);
         }
-        size_t slot = idx % reorderCapacity;
-        reorderSlots[slot] = std::move(clusterResult);
-        reorderFilled[slot] = 1;
-        reorderBufferedCount++;
-        notify = (idx == currentProcessPosition);
     }
-    if (notify) {
+    size_t slot = idx % reorderCapacity;
+    reorderSlots[slot] = std::move(clusterResult);
+    reorderFilled[slot] = 1;
+    if (idx == currentProcessPosition) {
+        // so the notify cannot fall between check and wait
+        { std::lock_guard<std::mutex> lock(clusterMutex); }
         clusterCondition.notify_one();
     }
 }
@@ -274,44 +340,8 @@ static void getClusterMembers(DBReader<DBKeyType> *cluDbr, DBKeyType targetKey, 
     }
 }
 
-std::atomic<size_t> swipeLanePairCount(0);
-std::atomic<size_t> swipeLaneCapacity(0);
-std::atomic<size_t> swipeScalarPairCount(0);
-
-std::atomic<size_t> swipeMemberExtensionCount(0);
-std::atomic<size_t> swipeMemberActiveLaneRowCount(0);
-std::atomic<size_t> swipeMemberTotalLaneRowCount(0);
-
-std::atomic<size_t> swipeTargetPairCount(0);
-std::atomic<size_t> swipeTargetActiveLaneRowCount(0);
-std::atomic<size_t> swipeTargetTotalLaneRowCount(0);
-std::atomic<size_t> swipeLongTargetPairCount(0);
-std::atomic<size_t> swipeByteActiveLaneRowCount(0);
-std::atomic<size_t> swipeByteTotalLaneRowCount(0);
-std::atomic<size_t> swipeRerunPairCount(0);
-
-static void printSwipeLanes() {
-    Debug(Debug::INFO) << "SWIPE member gapped alignments: " << swipeLanePairCount.load() << " in lanes ("
-                       << swipeLanePairCount.load() * 100 / std::max((size_t) 1, swipeLaneCapacity.load()) << "% active lane rows), "
-                       << swipeScalarPairCount.load() << " scalar\n";
-    if (swipeMemberExtensionCount.load() > 0) {
-        Debug(Debug::INFO) << "SWIPE member extensions: " << swipeMemberExtensionCount.load() << " in lanes ("
-                           << swipeMemberActiveLaneRowCount.load() * 100 / std::max((size_t) 1, swipeMemberTotalLaneRowCount.load()) << "% active lane rows)\n";
-    }
-    if (swipeTargetPairCount.load() + swipeLongTargetPairCount.load() > 0) {
-        Debug(Debug::INFO) << "SWIPE target gapped alignments: " << swipeTargetPairCount.load() << " in lanes ("
-                           << swipeTargetActiveLaneRowCount.load() * 100 / std::max((size_t) 1, swipeTargetTotalLaneRowCount.load()) << "% active lane rows), "
-                           << swipeLongTargetPairCount.load() << " extensions longer than the lane trace\n";
-    }
-    if (swipeMemberTotalLaneRowCount.load() + swipeTargetTotalLaneRowCount.load() > 0) {
-        Debug(Debug::INFO) << "SWIPE extensions in 8 bit lanes: " << swipeByteTotalLaneRowCount.load() * 100 / (swipeMemberTotalLaneRowCount.load() + swipeTargetTotalLaneRowCount.load())
-                           << "% of the lane rows (" << swipeByteActiveLaneRowCount.load() * 100 / std::max((size_t) 1, swipeByteTotalLaneRowCount.load()) << "% active), "
-                           << swipeRerunPairCount.load() << " again in 16 bit lanes\n";
-    }
-}
-
-Matcher::result_t createSwipeResult(const Parameters &par, EvalueComputation &evaluer, DBKeyType key, int rawScore, const s_align &alignment,
-                                    int queryLength, int targetLength, const std::string &backtrace) {
+static Matcher::result_t createSwipeResult(const Parameters &par, EvalueComputation &evaluer, DBKeyType key, int rawScore, const s_align &alignment,
+                                           int queryLength, int targetLength, const std::string &backtrace) {
     float seqId = Util::computeSeqId(par.seqIdMode, alignment.identicalAACnt, queryLength, targetLength, backtrace.size());
     return Matcher::result_t(key, static_cast<int>(evaluer.computeBitScore(rawScore) + 0.5),
                              SmithWaterman::computeCov(alignment.qStartPos1, alignment.qEndPos1, queryLength),
@@ -341,7 +371,7 @@ bool doSwipeExtensionsPass(const Parameters &par, SwipeTargets &swipeTargets, si
     s_align joined = forward;
     joined.qStartPos1 = backward.qStartPos1;
     joined.dbStartPos1 = backward.dbStartPos1;
-    const char *querySequence = swipeTargets.repSequences[swipeTargets.queryIds[i]];
+    const char *querySequence = swipeTargets.repSeqData.data() + swipeTargets.repOffsets[swipeTargets.queryIds[i]];
     const char *targetSequence = swipeTargets.targetSequences[i];
     joined.identicalAACnt = 0;
     for (size_t b = 0, q = joined.qStartPos1, t = joined.dbStartPos1; b < gappedBacktrace.size(); b++) {
@@ -392,15 +422,16 @@ void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherIni
         }
     }
     size_t laneCount = swipeMembers.entries.size();
-    swipeMembers.scalarPairCount += swipeMembers.gapped.size() - laneCount;
     if (laneCount > 0) {
-        swipeMembers.addLanePairs(laneCount);
         swipeMembers.select(laneCount);
         swipeMembers.laneLengths.resize(laneCount);
         for (size_t l = 0; l < laneCount; l++) {
             swipeMembers.laneLengths[l] = swipeMembers.lengths[swipeMembers.entries[l]];
         }
         swipeMembers.setQuery(query);
+        size_t firstLane = swipeMembers.entries[0];
+        alignmentTrace = { AlignmentTrace::MEMBER_CHECK, query.getDbKey(), query.L, memberChecks.checks[memberChecks.gappedMemberChecks[firstLane]].memberKeys[swipeMembers.gapped[firstLane]],
+                           swipeMembers.laneLengths[0] };
         swipeMembers.aligner.alignForward(laneCount, swipeMembers.targets.data(), swipeMembers.laneLengths.data(), swipeMembers.aligns.data());
         for (size_t l = 0; l < laneCount; l++) {
             const s_align &alignment = swipeMembers.aligns[l];
@@ -431,6 +462,7 @@ void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherIni
         size_t l = gappedMemberBatchIndices[g];
         Matcher::result_t res_element;
         if (l == SIZE_MAX || swipeMembers.aligns[l].word >= 2) {
+            alignmentTrace = { AlignmentTrace::MEMBER_CHECK, query.getDbKey(), query.L, elementKey, element.L };
             res_element = matcher.getSWResult(&element, 0, false, par.covMode, par.covThr, par.evalThr, swMode, par.seqIdMode, false);
         } else {
             res_element = createSwipeResult(par, swipeMembers.evaluer, elementKey, swipeMembers.minScores[l], swipeMembers.aligns[l], query.L, element.L, swipeMembers.backtraces[l]);
@@ -522,6 +554,7 @@ bool alignNextMembers(const Parameters &par, BlockAligner &blockAligner, Matcher
 
             // 1. ungapped alignment
             element.mapSequence(elementId, elementKey, elementSequence, elementLength);
+            alignmentTrace = { AlignmentTrace::MEMBER_CHECK, query.getDbKey(), query.L, elementKey, element.L };
             if (Util::canBeCovered(par.covThr, par.covMode, query.L, element.L) == false) {
                 check.isPassing = false;
                 break;
@@ -558,7 +591,7 @@ bool alignNextMembers(const Parameters &par, BlockAligner &blockAligner, Matcher
                     int seedQuery, seedTarget;
                     if (findMatchSeed(querySequence, elementSequence, elementUngappedAlignment, seedQuery, seedTarget)) {
                         // key = position in extendedMemberChecks
-                        memberChecks.swipeTargets->addTarget(query, element, memberChecks.extendedMemberChecks.size(), seedQuery, seedTarget);
+                        memberChecks.swipeTargets->addTarget(query, blockAligner.getQueryCompBias(), element, memberChecks.extendedMemberChecks.size(), seedQuery, seedTarget);
                     }
                     memberChecks.extendedMemberChecks.push_back(g);
                     memberChecks.gappedMembers.push_back(i);
@@ -586,7 +619,7 @@ bool alignNextMembers(const Parameters &par, BlockAligner &blockAligner, Matcher
                 }
             } else if (withRecords) {
                 std::string elementBacktrace = par.addBacktrace ? std::string(elementUngappedAlignment.alnLen, 'M') : std::string();
-                Matcher::result_t elementResult(elementKey, elementUngappedAlignment.score, elementUngappedAlignment.qcov,
+                Matcher::result_t elementResult(elementKey, elementUngappedAlignment.bitScore, elementUngappedAlignment.qcov,
                     elementUngappedAlignment.tcov, elementSeqId, elementUngappedAlignment.eval, elementUngappedAlignment.alnLen,
                     elementUngappedAlignment.qStart, elementUngappedAlignment.qEnd, query.L,
                     elementUngappedAlignment.tStart, elementUngappedAlignment.tEnd, elementLength, elementBacktrace);
@@ -648,9 +681,10 @@ static bool isTargetAssigned(const ClusterAssignment *assignedCluster, size_t ta
 
 bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockAlignerInitialized, Sequence &query, Sequence &target,
                  float scorePerColThreshold, unsigned short &diagonal, const ClusterAssignment *assignedCluster, size_t targetId, Matcher::result_t *result,
-                 SwipeTargets *swipeTargets) {
+                 SwipeTargets *swipeTargets, std::vector<SwipeSeed> *swipeSeeds) {
     const char *querySequence = query.getSeqData();
     const char *targetSequence = target.getSeqData();
+    alignmentTrace = { AlignmentTrace::UNGAPPED, query.getDbKey(), query.L, target.getDbKey(), target.L };
     if (Util::canBeCovered(par.covThr, par.covMode, query.L, target.L) == false) {
         return false;
     }
@@ -687,7 +721,7 @@ bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockA
     if (hasAlnLen && hasCoverage && hasSeqId && hasEvalue) {
         if (result != NULL) {
             std::string backtrace = par.addBacktrace ? std::string(ungappedAlignment.alnLen, 'M') : std::string();
-            *result = Matcher::result_t(target.getDbKey(), ungappedAlignment.score, ungappedAlignment.qcov,
+            *result = Matcher::result_t(target.getDbKey(), ungappedAlignment.bitScore, ungappedAlignment.qcov,
                 ungappedAlignment.tcov, seqId, ungappedAlignment.eval, ungappedAlignment.alnLen,
                 ungappedAlignment.qStart, ungappedAlignment.qEnd, query.L,
                 ungappedAlignment.tStart, ungappedAlignment.tEnd, target.L, backtrace);
@@ -704,8 +738,13 @@ bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockA
     if (isTargetAssigned(assignedCluster, targetId) || findMatchSeed(querySequence, targetSequence, ungappedAlignment, seedQuery, seedTarget) == false) {
         return false;
     }
+    if (swipeSeeds != NULL) {
+        SwipeSeed seed = { static_cast<DBLocalId>(targetId), seedQuery, seedTarget };
+        swipeSeeds->push_back(seed);
+        return false;
+    }
     if (swipeTargets != NULL) {
-        swipeTargets->addTarget(query, target, target.getDbKey(), seedQuery, seedTarget);
+        swipeTargets->addTarget(query, blockAligner.getQueryCompBias(), target, target.getDbKey(), seedQuery, seedTarget);
         return false;
     }
 
@@ -715,6 +754,7 @@ bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockA
         blockAlignerInitialized = true;
     }
     int32_t xDrop = (MIN_SIZE * par.gapExtend.values.aminoacid() + par.gapOpen.values.aminoacid());
+    alignmentTrace.stage = AlignmentTrace::GAPPED;
     s_align gappedAlignment = blockAligner.bandedalign(&target, seedQuery, seedTarget,
                                                        gappedBacktrace, xDrop, par.covThr, par.covMode);
     // bandedalign failed
@@ -746,48 +786,80 @@ bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockA
 
 static void (*clusterThreadFunc)(ClusterAssignment*) = NULL;
 
-void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
-    while (true) {
-        std::unique_lock<std::mutex> lock(clusterMutex);
-        
-        while (reorderFilled[currentProcessPosition % reorderCapacity] == 0 && allCalculationsDone == false) {
-            clusterCondition.wait(lock);
-        }
+static void addSetCoverCandidate(const ClusterResult &result) {
+    if (result.memberIds.size() > 1) {
+        SetCoverCandidate candidate;
+        candidate.representativeId = result.representativeId;
+        candidate.memberCount = result.memberIds.size();
+        candidate.memberOffset = setCoverMemberPool.size();
+        setCoverMemberPool.insert(setCoverMemberPool.end(), result.memberIds.begin(), result.memberIds.end());
+        setCoverLiveMemberCount += candidate.memberCount;
+        setCoverCandidates.push_back(candidate);
+        std::push_heap(setCoverCandidates.begin(), setCoverCandidates.end(), setCoverComparator);
+    }
+}
 
-        // move the results in order to the candidates
+void clusterThreadFuncSetcover(ClusterAssignment* assignedCluster) {
+    std::vector<ClusterResult> completeSets;
+    std::unique_lock<std::mutex> lock(clusterMutex);
+    while (true) {
+        // move the results in order, defer sets with extensions left
         while (reorderFilled[currentProcessPosition % reorderCapacity] != 0) {
             size_t slot = currentProcessPosition % reorderCapacity;
             ClusterResult result = std::move(reorderSlots[slot]);
             reorderFilled[slot] = 0;
-            reorderBufferedCount--;
             currentProcessPosition++;
             reorderSpaceCondition.notify_all();
             currentPrefSize = result.prefSize;
-
-            if (result.memberIds.size() > 1) {
-                SetCoverCandidate candidate;
-                candidate.representativeId = result.representativeId;
-                candidate.memberCount = result.memberIds.size();
-                candidate.memberOffset = setCoverMemberPool.size();
-                setCoverMemberPool.insert(setCoverMemberPool.end(),
-                                          result.memberIds.begin(), result.memberIds.end());
-                setCoverLiveMemberCount += candidate.memberCount;
-                setCoverCandidates.push_back(candidate);
-                std::push_heap(setCoverCandidates.begin(), setCoverCandidates.end(), setCoverComparator);
+            size_t bound = result.memberIds.size() + result.swipeSeeds.size();
+            if (result.swipeSeeds.empty()) {
+                completeSets.push_back(std::move(result));
+            } else if (bound > 1 && loadAssignedCluster(assignedCluster, result.representativeId) == DB_LOCAL_ID_INVALID) {
+                if (bound >= deferredSets.size()) {
+                    deferredSets.resize(bound + 1);
+                }
+                if (bound >= unfinishedSetCounts.size()) {
+                    unfinishedSetCounts.resize(bound + 1, 0);
+                }
+                deferredSetBytes += getDeferredSetBytes(result);
+                deferredSets[bound].push_back(std::move(result));
+                unfinishedSetCounts[bound]++;
             }
         }
+        for (ClusterResult &result : finishedSets) {
+            unfinishedSetCounts[result.prefSize]--;
+            completeSets.push_back(std::move(result));
+        }
+        finishedSets.clear();
+
+        // workers finish sets that may beat every set to come
+        finishBound = (currentProcessPosition == clusterResultCount) ? 0 : currentPrefSize;
+        if (hasSetsToFinish == false && deferredSets.size() > finishBound + 1) {
+            hasSetsToFinish = true;
+            finishCondition.notify_all();
+        }
+        while (unfinishedSetCounts.empty() == false && unfinishedSetCounts.back() == 0) {
+            unfinishedSetCounts.pop_back();
+        }
+        size_t maxSetSize = std::max(finishBound, unfinishedSetCounts.empty() ? 0 : unfinishedSetCounts.size() - 1);
 
         // assign the sets that are surely the largest
-        assignSetCoverCandidates(setCoverCandidates, setCoverMemberPool, setCoverLiveMemberCount, allCalculationsDone ? 0 : currentPrefSize, assignedCluster);
-
         lock.unlock();
+        for (const ClusterResult &result : completeSets) {
+            addSetCoverCandidate(result);
+        }
+        completeSets.clear();
+        assignSetCoverCandidates(setCoverCandidates, setCoverMemberPool, setCoverLiveMemberCount, maxSetSize, assignedCluster);
         compactSetCoverMemberPool(setCoverCandidates, setCoverMemberPool, setCoverLiveMemberCount);
         lock.lock();
 
-        if (allCalculationsDone &&
-            reorderBufferedCount == 0 &&
-            setCoverCandidates.empty()) {
+        if (currentProcessPosition == clusterResultCount && unfinishedSetCounts.empty() && finishedSets.empty()) {
+            areSetsFinished = true;
+            finishCondition.notify_all();
             break;
+        }
+        while (reorderFilled[currentProcessPosition % reorderCapacity] == 0 && finishedSets.empty()) {
+            clusterCondition.wait(lock);
         }
     }
 }
@@ -800,7 +872,7 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
             clusterCondition.wait(lock);
         }
 
-        if (allCalculationsDone && reorderBufferedCount == 0) {
+        if (allCalculationsDone && reorderFilled[currentProcessPosition % reorderCapacity] == 0) {
             break;
         }
 
@@ -808,7 +880,6 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
             size_t slot = currentProcessPosition % reorderCapacity;
             ClusterResult result = std::move(reorderSlots[slot]);
             reorderFilled[slot] = 0;
-            reorderBufferedCount--;
             currentProcessPosition++;
             reorderSpaceCondition.notify_all();
 
@@ -816,19 +887,19 @@ void clusterThreadFuncGreedy(ClusterAssignment* assignedCluster) {
                 continue;
             }
 
-            std::vector<DBLocalId> validMemberIds;
-            validMemberIds.reserve(result.memberIds.size());
+            size_t valid = 0;
             for (DBLocalId memberId : result.memberIds) {
                 if (loadAssignedCluster(assignedCluster, memberId) == DB_LOCAL_ID_INVALID) {
-                    validMemberIds.push_back(memberId);
+                    result.memberIds[valid++] = memberId;
                 }
             }
 
-            if (validMemberIds.size() <= 1) {
+            if (valid <= 1) {
                 continue;
             }
 
-            for (DBLocalId memberId : validMemberIds) {
+            result.memberIds.resize(valid);
+            for (DBLocalId memberId : result.memberIds) {
                 storeAssignedCluster(assignedCluster, memberId, result.representativeId);
             }
         }
@@ -850,7 +921,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             par.filterCluDBFile.c_str(), cluIndex.c_str(), par.threads, 
             DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
         );
-        cluDbr->open(DBReader<DBKeyType>::LINEAR_ACCCESS);
+        cluDbr->open(DBReader<DBKeyType>::NOSORT);
 
         std::string cluSeqIndex = par.filterSeqDBFile + ".index";
         cluSeqDbr = new DBReader<DBKeyType>(
@@ -858,7 +929,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             DBReader<DBKeyType>::USE_DATA | DBReader<DBKeyType>::USE_INDEX
         );
             
-        cluSeqDbr->open(DBReader<DBKeyType>::LINEAR_ACCCESS);
+        cluSeqDbr->open(DBReader<DBKeyType>::NOSORT);
     }
 
     size_t dbSize = seqDbr->getSize();
@@ -868,6 +939,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
     ClusterAssignment *assignedCluster = new(std::nothrow) ClusterAssignment[dbSize];
     Util::checkAllocation(assignedCluster, "Can not allocate assignedCluster memory in Align2Clust");
+#pragma omp parallel for schedule(static)
     for (size_t i = 0; i < dbSize; ++i) {
         storeAssignedCluster(assignedCluster, i, DB_LOCAL_ID_INVALID);
     }
@@ -888,20 +960,55 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         return EXIT_FAILURE;
     }
 
+    // NOSORT: id of a key = number of keys before it
+    size_t keyWords = ((dbSize > 0) ? seqDbr->getDbKey(dbSize - 1) : 0) / 64 + 1;
+    KeyBits *keyBits = NULL;
+    if (keyWords * sizeof(KeyBits) <= dbSize * sizeof(ClusterAssignment)) {
+        keyBits = new(std::nothrow) KeyBits[keyWords];
+        Util::checkAllocation(keyBits, "Can not allocate keyBits memory in Align2Clust");
+        memset(keyBits, 0, sizeof(KeyBits) * keyWords);
+#pragma omp parallel for schedule(static)
+        for (size_t i = 0; i < dbSize; i++) {
+            size_t key = seqDbr->getDbKey(i);
+            __sync_fetch_and_or(&keyBits[key / 64].keyMask, 1ull << (key % 64));
+        }
+        for (size_t i = 0, keyCount = 0; i < keyWords; i++) {
+            keyBits[i].keysBefore = keyCount;
+            keyCount += __builtin_popcountll(keyBits[i].keyMask);
+        }
+    }
+    const auto getSeqId = [&](DBKeyType key) -> size_t {
+        if (keyBits == NULL) {
+            return seqDbr->getId(key);
+        }
+        return keyBits[key / 64].keysBefore + __builtin_popcountll(keyBits[key / 64].keyMask & ((1ull << (key % 64)) - 1));
+    };
+
+    const bool isSwipeEnabled = (par.align2clustAlignerMode != Parameters::ALIGNER_MODE_FARRAR && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid());
+    const bool isTargetSwipeEnabled = isSwipeEnabled && alnWriter == NULL;
+    const bool isDeferring = mode == Parameters::SET_COVER && isTargetSwipeEnabled && cluDbr == NULL;
     size_t align2clustResultCount = (mode == Parameters::SET_COVER) ? dbSize : alnDbr.getSize();
-    size_t reorderCapacityChosen = computeReorderCapacity(par, dbSize, mode, align2clustResultCount);
+    size_t deferredLimit = 0;
+    size_t reorderCapacityChosen = computeReorderCapacity(par, dbSize, mode, align2clustResultCount, (keyBits != NULL) ? keyWords * sizeof(KeyBits) : 0, isDeferring, deferredLimit);
     {
         std::lock_guard<std::mutex> lock(clusterMutex);
         reorderCapacity = reorderCapacityChosen;
         reorderSlots.clear();
         reorderSlots.resize(reorderCapacity);
-        reorderFilled.assign(reorderCapacity, 0);
-        reorderBufferedCount = 0;
+        reorderFilled = std::vector<std::atomic<unsigned char>>(reorderCapacity);
         setCoverCandidates.clear();
         setCoverCandidates.shrink_to_fit();
         setCoverMemberPool.clear();
         setCoverMemberPool.shrink_to_fit();
         setCoverLiveMemberCount = 0;
+        clusterResultCount = align2clustResultCount;
+        deferredSets.clear();
+        unfinishedSetCounts.clear();
+        hasSetsToFinish = false;
+        finishedSets.clear();
+        areSetsFinished = false;
+        deferredSetBytes = 0;
+        deferredSetLimit = deferredLimit;
         currentProcessPosition = 0;
         currentPrefSize = 0;
         allCalculationsDone = false;
@@ -982,6 +1089,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 #ifdef OPENMP
         threadIdx = (unsigned int) omp_get_thread_num();
 #endif
+        alignmentThread = threadIdx;
         Matcher matcher(Parameters::DBTYPE_AMINO_ACIDS, db_maxseqlen, scoring.subMat, &scoring.evaluer,
                        par.compBiasCorrection, par.compBiasCorrectionScale,
                        par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid(),
@@ -994,17 +1102,28 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                                  -par.gapOpen.values.aminoacid(), -par.gapExtend.values.aminoacid());
         std::vector<std::pair<size_t, unsigned short>> targetsWithDiagonal;
         targetsWithDiagonal.reserve(1000);
-        const bool isSwipeEnabled = (par.align2clustAlignerMode != Parameters::ALIGNER_MODE_FARRAR && par.gapOpen.values.aminoacid() >= par.gapExtend.values.aminoacid());
         SwipeBatch swipeMembers(par, scoring.subMat, scoring.evaluer, db_maxseqlen);
-        const bool isTargetSwipeEnabled = isSwipeEnabled && alnWriter == NULL;
-        SwipeTargets swipeTargets(par, scoring.subMat, scoring.evaluer, db_maxseqlen);
-        SwipeTargets memberTargets(par, scoring.subMat, scoring.evaluer, db_maxseqlen, true);
+        SwipeTargets swipeTargets(par, scoring.subMat, scoring.evaluer);
+        SwipeTargets memberTargets(par, scoring.subMat, scoring.evaluer);
         MemberChecks memberChecks(isSwipeEnabled ? &swipeMembers : NULL, isTargetSwipeEnabled && cluDbr != NULL, isTargetSwipeEnabled ? &memberTargets : NULL);
         std::vector<ClusterPair> swipePairs;
-        std::vector<size_t> repMemberCheckOffsets(2, 0);
-        std::vector<DBKeyType> repKeys(1);
+        std::vector<size_t> repMemberCheckOffsets;
+        std::vector<DBKeyType> repKeys;
+        std::vector<size_t> repResults;
         std::string querySeqBuffer;
         querySeqBuffer.reserve(db_maxseqlen + 1);
+
+        // reps sharing the lanes, in loop order
+        std::vector<ClusterResult> pendingResults;
+        std::vector<std::pair<size_t, unsigned short>> acceptedTargets;
+        std::vector<size_t> acceptedTargetOffsets(1, 0);
+        bool matcherInitialized = false;
+        const auto mapRep = [&](Sequence &rep, BlockAligner &aligner, DBKeyType repKey) {
+            size_t repId = getSeqId(repKey);
+            querySeqBuffer.assign(seqDbr->getData(repId, threadIdx), seqDbr->getSeqLen(repId));
+            rep.mapSequence(repId, repKey, querySeqBuffer.c_str(), querySeqBuffer.size());
+            aligner.setQuery(&rep);
+        };
 
         const bool includeAlignFiles = (alnWriter != NULL);
         std::string alnResultBuffer;
@@ -1015,9 +1134,116 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             alnLineBuffer.resize(1024 + 32768 * 4);
         }
 
+        const auto alignPendingResults = [&](bool isFinishing) {
+            swipePairs.clear();
+            alignTargetsSwipe(par, swipeTargets, [&](DBKeyType key) { return loadAssignedCluster(assignedCluster, getSeqId(key)) != DB_LOCAL_ID_INVALID; }, swipePairs);
+            swipeTargets.clearTargets();
+            repMemberCheckOffsets.assign(1, 0);
+            repKeys.clear();
+            repResults.clear();
+            for (size_t r = 0, p = 0; r < pendingResults.size(); r++) {
+                ClusterResult &result = pendingResults[r];
+                DBKeyType repKey = seqDbr->getDbKey(result.representativeId);
+                for (size_t a = acceptedTargetOffsets[r]; a < acceptedTargetOffsets[r + 1]; a++) {
+                    size_t targetId = acceptedTargets[a].first;
+                    alignTargetMembers(par, blockAligner, matcher, matcherInitialized, query, element, cluDbr, cluSeqDbr, seqDbr->getDbKey(targetId), targetId,
+                                       acceptedTargets[a].second, swMode, threadIdx, NULL, NULL, memberChecks);
+                }
+                for (; p < swipePairs.size() && swipePairs[p].repKey == repKey; p++) {
+                    size_t targetId = getSeqId(swipePairs[p].memberKey);
+                    if (cluDbr == NULL || alignTargetMembers(par, blockAligner, matcher, matcherInitialized, query, element, cluDbr, cluSeqDbr, swipePairs[p].memberKey, targetId,
+                                                             0, swMode, threadIdx, NULL, NULL, memberChecks)) {
+                        result.memberIds.push_back(targetId);
+                    }
+                }
+                if (memberChecks.isMemberCheckDeferred && memberChecks.checkCount > repMemberCheckOffsets.back()) {
+                    repMemberCheckOffsets.push_back(memberChecks.checkCount);
+                    repKeys.push_back(repKey);
+                    repResults.push_back(r);
+                }
+            }
+            if (repKeys.empty() == false) {
+                alignMemberChecksSwipe(par, blockAligner, matcher, query, element, cluSeqDbr, swMode, threadIdx, memberChecks, repMemberCheckOffsets, repKeys, mapRep);
+                for (size_t rep = 0; rep < repKeys.size(); rep++) {
+                    std::vector<DBLocalId> &memberIds = pendingResults[repResults[rep]].memberIds;
+                    // checks follow the target order in memberIds
+                    size_t g = repMemberCheckOffsets[rep];
+                    size_t valid = 0;
+                    for (DBLocalId memberId : memberIds) {
+                        if (g < repMemberCheckOffsets[rep + 1] && memberChecks.checks[g].targetId == memberId && memberChecks.checks[g++].isPassing == false) {
+                            continue;
+                        }
+                        memberIds[valid++] = memberId;
+                    }
+                    memberIds.resize(valid);
+                }
+                memberChecks.checkCount = 0;
+            }
+            if (isFinishing) {
+                {
+                    std::lock_guard<std::mutex> lock(clusterMutex);
+                    for (size_t r = 0; r < pendingResults.size(); r++) {
+                        finishedSets.push_back(std::move(pendingResults[r]));
+                    }
+                }
+                clusterCondition.notify_one();
+            } else {
+                for (size_t r = 0; r < pendingResults.size(); r++) {
+                    pushClusterResult(std::move(pendingResults[r]));
+                }
+            }
+            pendingResults.clear();
+            acceptedTargets.clear();
+            acceptedTargetOffsets.assign(1, 0);
+        };
+
+        // align the largest sets above finishBound
+        const auto finishSets = [&]() {
+            {
+                std::lock_guard<std::mutex> lock(clusterMutex);
+                for (size_t targets = 0; deferredSets.size() > finishBound + 1 && targets < SwipeExtender::LANES * SwipeExtender::LANES;) {
+                    size_t bound = deferredSets.size() - 1;
+                    std::vector<ClusterResult> &sets = deferredSets[bound];
+                    if (sets.empty()) {
+                        deferredSets.pop_back();
+                        continue;
+                    }
+                    ClusterResult &result = sets.back();
+                    result.prefSize = bound;
+                    deferredSetBytes -= getDeferredSetBytes(result);
+                    // return sets of assigned reps empty, the cluster thread counts them
+                    if (loadAssignedCluster(assignedCluster, result.representativeId) != DB_LOCAL_ID_INVALID) {
+                        result.memberIds.clear();
+                        finishedSets.push_back(std::move(result));
+                    } else {
+                        targets += result.swipeSeeds.size() + 1;
+                        pendingResults.push_back(std::move(result));
+                    }
+                    sets.pop_back();
+                }
+                hasSetsToFinish = deferredSets.size() > finishBound + 1;
+            }
+            for (ClusterResult &result : pendingResults) {
+                DBKeyType repKey = seqDbr->getDbKey(result.representativeId);
+                mapRep(query, blockAligner, repKey);
+                swipeTargets.startRep(repKey);
+                for (const SwipeSeed &seed : result.swipeSeeds) {
+                    if (loadAssignedCluster(assignedCluster, seed.targetId) == DB_LOCAL_ID_INVALID) {
+                        target.mapSequence(seed.targetId, seqDbr->getDbKey(seed.targetId), seqDbr->getData(seed.targetId, threadIdx), seqDbr->getSeqLen(seed.targetId));
+                        swipeTargets.addTarget(query, blockAligner.getQueryCompBias(), target, target.getDbKey(), seed.seedQuery, seed.seedTarget);
+                    }
+                }
+                acceptedTargetOffsets.push_back(acceptedTargets.size());
+            }
+            alignPendingResults(true);
+        };
+
 #pragma omp for schedule(dynamic, 1) nowait
         for (size_t i = 0; i < endRange; i++) {
             progress.updateProgress();
+            if (swipeTargets.targetKeys.empty() || swipeTargets.targetKeys.size() + acceptedTargets.size() + pendingResults.size() >= SwipeExtender::LANES * SwipeExtender::LANES) {
+                alignPendingResults(false);
+            }
             ClusterResult clusterResult;
             clusterResult.sequenceIdx = i;
             targetsWithDiagonal.clear();
@@ -1040,7 +1266,8 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             clusterResult.representativeId = representativeId;
 
             if (loadAssignedCluster(assignedCluster, representativeId) != DB_LOCAL_ID_INVALID) {
-                pushClusterResult(std::move(clusterResult));
+                pendingResults.push_back(std::move(clusterResult));
+                acceptedTargetOffsets.push_back(acceptedTargets.size());
                 continue;
             }
 
@@ -1049,7 +1276,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             size_t prefSize = 0;
             while (*alignmentData != '\0') {
                 hit_t hit = QueryMatcher::parsePrefilterHit(alignmentData);
-                size_t targetId = seqDbr->getId(hit.seqId);
+                size_t targetId = getSeqId(hit.seqId);
                 if (mode == Parameters::SET_COVER || loadAssignedCluster(assignedCluster, targetId) == DB_LOCAL_ID_INVALID) {
                     targetsWithDiagonal.push_back(std::make_pair(targetId, hit.diagonal));
                 }
@@ -1060,16 +1287,18 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
             size_t queryId = representativeId;
             size_t queryLength = seqDbr->getSeqLen(queryId);
-            // the entry holds the rep itself
-            if (targetsWithDiagonal.size() > 1) {
+            // no copy when the only target is the rep itself
+            if (targetsWithDiagonal.size() > 1 || (targetsWithDiagonal.empty() == false && targetsWithDiagonal[0].first != queryId)) {
                 querySeqBuffer.assign(seqDbr->getData(queryId, threadIdx), queryLength);
                 query.mapSequence(queryId, queryKey, querySeqBuffer.c_str(), queryLength);
                 blockAligner.setQuery(&query);
             }
             bool blockAlignerInitialized = false;
-            bool matcherInitialized = false;
+            matcherInitialized = false;
             swipeMembers.startRep();
             swipeTargets.startRep(queryKey);
+            // defer extensions while the deferred sets fit their memory
+            std::vector<SwipeSeed> *swipeSeeds = (isDeferring && deferredSetBytes <= deferredSetLimit) ? &clusterResult.swipeSeeds : NULL;
 
             for (size_t targetIdx = 0; targetIdx < targetsWithDiagonal.size(); targetIdx++) {
                 if (loadAssignedCluster(assignedCluster, representativeId) != DB_LOCAL_ID_INVALID) {
@@ -1084,7 +1313,9 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     clusterResult.memberIds.push_back(queryId);
                     if (includeAlignFiles) {
                         std::string backtrace = par.addBacktrace ? std::string(queryLength, 'M') : std::string();
-                        Matcher::result_t selfResult(queryKey, queryLength, 1.0f, 1.0f, 1.0f, 0.0,
+                        const char *selfSeq = seqDbr->getData(queryId, threadIdx);
+                        unsigned int selfScore = DistanceCalculator::computeSubstitutionDistance(selfSeq, selfSeq, queryLength, scoring.fastMatrix.matrix, true);
+                        Matcher::result_t selfResult(queryKey, static_cast<int>(scoring.evaluer.computeBitScore(selfScore) + 0.5), 1.0f, 1.0f, 1.0f, 0.0,
                             queryLength, 0, queryLength - 1, queryLength, 0, queryLength - 1, queryLength, backtrace);
                         appendAlignmentResult(alnResultBuffer, alnLineBuffer.data(), selfResult, par.addBacktrace);
                     }
@@ -1100,8 +1331,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                 target.mapSequence(targetId, targetKey, targetSequence, targetLength);
                 unsigned short diagonal = targetsWithDiagonal[targetIdx].second;
                 bool isAccepted = alignTarget(par, blockAligner, blockAlignerInitialized, query, target, scoring.scorePerColThreshold, diagonal, assignedCluster, targetId,
-                                              includeAlignFiles ? &targetResult : NULL, isTargetSwipeEnabled ? &swipeTargets : NULL);
-                if (isAccepted && cluDbr != NULL) {
+                                              includeAlignFiles ? &targetResult : NULL, isTargetSwipeEnabled ? &swipeTargets : NULL, swipeSeeds);
+                if (isAccepted && memberChecks.isMemberCheckDeferred) {
+                    acceptedTargets.push_back(std::make_pair(targetId, diagonal));
+                } else if (isAccepted && cluDbr != NULL) {
                     isAccepted = alignTargetMembers(par, blockAligner, matcher, matcherInitialized, query, element, cluDbr, cluSeqDbr, targetKey, targetId,
                                                     diagonal, swMode, threadIdx, includeAlignFiles ? &pendingMemberAln : NULL, alnLineBuffer.data(), memberChecks);
                 }
@@ -1113,40 +1346,32 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
                     clusterResult.memberIds.push_back(targetId);
                 }
             }
-            swipePairs.clear();
-            alignTargetsSwipe(par, swipeTargets, [&](DBKeyType key) { return loadAssignedCluster(assignedCluster, seqDbr->getId(key)) != DB_LOCAL_ID_INVALID; }, swipePairs);
-            swipeTargets.clearTargets();
-            for (size_t p = 0; p < swipePairs.size(); p++) {
-                DBKeyType targetKey = swipePairs[p].memberKey;
-                size_t targetId = seqDbr->getId(targetKey);
-                if (cluDbr == NULL || alignTargetMembers(par, blockAligner, matcher, matcherInitialized, query, element, cluDbr, cluSeqDbr, targetKey, targetId,
-                                                         0, swMode, threadIdx, NULL, NULL, memberChecks)) {
-                    clusterResult.memberIds.push_back(targetId);
-                }
-            }
-            if (memberChecks.isMemberCheckDeferred && memberChecks.checkCount > 0) {
-                repMemberCheckOffsets[1] = memberChecks.checkCount;
-                repKeys[0] = queryKey;
-                alignMemberChecksSwipe(par, blockAligner, matcher, query, element, cluSeqDbr, swMode, threadIdx, memberChecks, repMemberCheckOffsets, repKeys,
-                                       [](Sequence &, BlockAligner &, DBKeyType) {});
-                for (size_t g = 0; g < memberChecks.checkCount; g++) {
-                    if (memberChecks.checks[g].isPassing == false) {
-                        clusterResult.memberIds.erase(std::find(clusterResult.memberIds.begin(), clusterResult.memberIds.end(), memberChecks.checks[g].targetId));
-                    }
-                }
-                memberChecks.checkCount = 0;
-            }
 
             if (includeAlignFiles) {
                 alnWriter->writeData(alnResultBuffer.c_str(), alnResultBuffer.length(), queryKey, threadIdx);
             }
-            pushClusterResult(std::move(clusterResult));
+            pendingResults.push_back(std::move(clusterResult));
+            acceptedTargetOffsets.push_back(acceptedTargets.size());
+            // after the rep, so its result does not wait
+            if (isDeferring && hasSetsToFinish) {
+                alignPendingResults(false);
+                finishSets();
+            }
+        }
+        alignPendingResults(false);
+        while (isDeferring) {
+            {
+                std::unique_lock<std::mutex> lock(clusterMutex);
+                while (hasSetsToFinish == false && areSetsFinished == false) {
+                    finishCondition.wait(lock);
+                }
+                if (hasSetsToFinish == false) {
+                    break;
+                }
+            }
+            finishSets();
         }
     }
-    if (par.align2clustAlignerMode != Parameters::ALIGNER_MODE_FARRAR) {
-        printSwipeLanes();
-    }
-
     {
         std::lock_guard<std::mutex> lock(clusterMutex);
         allCalculationsDone = true;
@@ -1158,6 +1383,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
         clusterThread.join(); 
     }
 
+#pragma omp parallel for schedule(static)
     for (size_t i = 0; i < dbSize; ++i) {
         if (loadAssignedCluster(assignedCluster, i) == DB_LOCAL_ID_INVALID) {
             storeAssignedCluster(assignedCluster, i, i);
@@ -1165,21 +1391,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     }
 
     std::pair<DBKeyType, DBKeyType> *assignment = new std::pair<DBKeyType, DBKeyType>[dbSize];
-    
-#pragma omp parallel
-    {
-#pragma omp for schedule(static)
-        for (size_t i = 0; i < dbSize; i++) {
-            DBLocalId representativeId = loadAssignedCluster(assignedCluster, i);
-            if (representativeId == DB_LOCAL_ID_INVALID) {
-                Debug(Debug::ERROR) << "There must be an error: " << i 
-                                    << " is not assigned to a cluster\n";
-                continue;
-            }
-
-            assignment[i].first = seqDbr->getDbKey(representativeId);
-            assignment[i].second = seqDbr->getDbKey(i);
-        }
+#pragma omp parallel for schedule(static)
+    for (size_t i = 0; i < dbSize; i++) {
+        assignment[i].first = seqDbr->getDbKey(loadAssignedCluster(assignedCluster, i));
+        assignment[i].second = seqDbr->getDbKey(i);
     }
     
     SORT_PARALLEL(assignment, assignment + dbSize);
@@ -1196,12 +1411,11 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
     
     delete[] assignedCluster;
     delete[] assignment;
+    delete[] keyBits;
     if (prefRepSizePair != NULL) {
         delete[] prefRepSizePair;
     }
-    if (lengthOrder != NULL) {
-        delete[] lengthOrder;
-    }
+    delete[] lengthOrder;
     seqDbr->close();
     delete seqDbr;
 
@@ -1218,6 +1432,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
 
 int align2clust(int argc, const char **argv, const Command &command) {
     MMseqsNode::init();
+    installCrashReport();
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
     if (par.filterCluDBFile.empty() != par.filterSeqDBFile.empty()) {
@@ -1256,12 +1471,12 @@ int align2clust(int argc, const char **argv, const Command &command) {
     
     DBReader<DBKeyType> alnDbr(par.db2.c_str(), par.db2Index.c_str(), par.threads,
                                   DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_DATA);
-    alnDbr.open(DBReader<DBKeyType>::LINEAR_ACCCESS);
-    int dbtype =  Parameters::DBTYPE_CLUSTER_RES;
+    alnDbr.open(DBReader<DBKeyType>::NOSORT);
 
-    DBWriter resultWriter(par.db3.c_str(), par.db3Index.c_str(), 1, par.compressed, dbtype);
+    DBWriter resultWriter(par.db3.c_str(), par.db3Index.c_str(), 1, par.compressed, Parameters::DBTYPE_CLUSTER_RES);
     resultWriter.open();
 
+    DBWriter *alnWriter = NULL;
     if (par.includeAlignFiles) {
         unsigned int effectiveSwMode = Alignment::initSWMode(par.alignmentMode, par.covThr, par.seqIdThr);
         if (par.addBacktrace == false || effectiveSwMode != Matcher::SCORE_COV_SEQID) {
@@ -1270,9 +1485,6 @@ int align2clust(int argc, const char **argv, const Command &command) {
                                 << Parameters::ALIGNMENT_MODE_SCORE_COV_SEQID << "'.\n";
             EXIT(EXIT_FAILURE);
         }
-    }
-    DBWriter *alnWriter = NULL;
-    if (par.includeAlignFiles) {
         std::string alnDb = par.db3 + "_aln";
         std::string alnDbIndex = alnDb + ".index";
         alnWriter = new DBWriter(alnDb.c_str(), alnDbIndex.c_str(), par.threads, par.compressed, Parameters::DBTYPE_ALIGNMENT_RES);
