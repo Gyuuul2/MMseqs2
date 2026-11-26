@@ -614,12 +614,21 @@ std::string MMseqsNode::formatBytes(size_t bytes) {
     return buffer;
 }
 
-MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextItem(rank), itemsLeft(count, 0), nextNode((rank + 1) % count) {
+MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextRound(0), itemsLeft(count, 0), nextNode((rank + 1) % count) {
     for (size_t node = 0; node < count; node++) {
-        if (node != rank && node < itemCount) {
-            itemsLeft[node] = (itemCount - 1 - node) / count + 1;
+        if (node != rank) {
+            itemsLeft[node] = getItemCount(node);
         }
     }
+}
+
+size_t MMseqsNode::WorkQueue::getItemCount(size_t node) const {
+    return itemCount / count + (getItem(node, itemCount / count) < itemCount);
+}
+
+// dealt back and forth, so no node always gets the last item of a round
+size_t MMseqsNode::WorkQueue::getItem(size_t node, size_t round) const {
+    return round * count + ((round % 2 == 0) ? node : count - 1 - node);
 }
 
 bool MMseqsNode::WorkQueue::takeItem(size_t item) {
@@ -636,10 +645,9 @@ bool MMseqsNode::WorkQueue::takeItem(size_t item) {
 }
 
 size_t MMseqsNode::WorkQueue::takeNextItem() {
-    for (; nextItem < itemCount; nextItem += count) {
-        if (takeItem(nextItem)) {
-            nextItem += count;
-            return nextItem - count;
+    for (; getItem(rank, nextRound) < itemCount; nextRound++) {
+        if (takeItem(getItem(rank, nextRound))) {
+            return getItem(rank, nextRound++);
         }
     }
     for (size_t emptyNodes = 0; emptyNodes < count;) {
@@ -651,8 +659,8 @@ size_t MMseqsNode::WorkQueue::takeNextItem() {
         }
         emptyNodes = 0;
         itemsLeft[node]--;
-        if (takeItem(node + itemsLeft[node] * count)) {
-            return node + itemsLeft[node] * count;
+        if (takeItem(getItem(node, itemsLeft[node]))) {
+            return getItem(node, itemsLeft[node]);
         }
         itemsLeft[node] = 0;
     }
@@ -660,8 +668,8 @@ size_t MMseqsNode::WorkQueue::takeNextItem() {
 }
 
 void MMseqsNode::WorkQueue::removeTakenItemFiles() {
-    for (size_t item = rank; item < itemCount; item += count) {
-        FileUtil::removeSharedFile(name + "." + SSTR(item));
+    for (size_t round = 0; getItem(rank, round) < itemCount; round++) {
+        FileUtil::removeSharedFile(name + "." + SSTR(getItem(rank, round)));
     }
 }
 

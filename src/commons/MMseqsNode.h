@@ -135,13 +135,15 @@ public:
         WorkQueue(const std::string &name, size_t itemCount);
         size_t takeNextItem();
         void removeTakenItemFiles();
+        size_t getItemCount(size_t node) const;
 
     private:
         bool takeItem(size_t item);
+        size_t getItem(size_t node, size_t round) const;
 
         const std::string name;
         const size_t itemCount;
-        size_t nextItem;
+        size_t nextRound;
         std::vector<size_t> itemsLeft;
         size_t nextNode;
     };
