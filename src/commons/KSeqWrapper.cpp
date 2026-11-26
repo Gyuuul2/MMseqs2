@@ -3,21 +3,44 @@
 #include "FileUtil.h"
 #include "Util.h"
 #include "Debug.h"
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
 #include <unistd.h>
 
+// a pipe has no size
+static int openInput(const char *fileName, size_t &size) {
+    int fd = FileUtil::openSharedFd(fileName, O_RDONLY);
+    struct stat sb;
+    if (fstat(fd, &sb) != 0) {
+        Debug(Debug::ERROR) << "Cannot read " << fileName << ": " << strerror(errno) << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    size = S_ISREG(sb.st_mode) ? sb.st_size : SIZE_MAX;
+    return fd;
+}
+
 namespace KSEQFILE {
-    KSEQ_INIT(int, read)
+    // pread with retries, a pipe with read
+    static ssize_t readInput(KSeqFile::InputFile *file, char *buffer, int length) {
+        if (file->size == SIZE_MAX) {
+            return read(file->fd, buffer, length);
+        }
+        size_t size = std::min((size_t) length, file->size - file->offset);
+        FileUtil::preadAll(file->fd, file->name.c_str(), buffer, size, file->offset);
+        file->offset += size;
+        return size;
+    }
+    KSEQ_INIT(KSeqFile::InputFile*, readInput)
 }
 
 KSeqFile::KSeqFile(const char* fileName, size_t start, size_t end) : end(end) {
-    file = FileUtil::openFileOrDie(fileName, "r", true);
-    seq = (void*) KSEQFILE::kseq_init(fileno(file));
+    file.fd = openInput(fileName, file.size);
+    file.name = fileName;
+    file.offset = start;
+    seq = (void*) KSEQFILE::kseq_init(&file);
     type = KSEQ_FILE;
     if (start > 0) {
-        if (lseek(fileno(file), start, SEEK_SET) != (off_t) start) {
-            Debug(Debug::ERROR) << "Cannot seek in file " << fileName << "\n";
-            EXIT(EXIT_FAILURE);
-        }
         KSEQFILE::kseq_t* s = (KSEQFILE::kseq_t*) seq;
         s->f->cur_buf_pos = start;
         int c;
@@ -27,7 +50,13 @@ KSeqFile::KSeqFile(const char* fileName, size_t start, size_t end) : end(end) {
 
 bool KSeqFile::ReadEntry() {
     KSEQFILE::kseq_t* s = (KSEQFILE::kseq_t*) seq;
-    if (KSEQFILE::kseq_read(s) < 0 || s->headerOffset - 1 > end)
+    int64_t result = KSEQFILE::kseq_read(s);
+    // kseq takes a read error as end of input
+    if (ks_err(s->f)) {
+        Debug(Debug::ERROR) << "Cannot read " << file.name << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (result < 0 || s->headerOffset - 1 > end)
         return false;
     entry.headerOffset = s->headerOffset;
     entry.sequenceOffset = s->sequenceOffset;
@@ -42,8 +71,8 @@ bool KSeqFile::ReadEntry() {
 
 KSeqFile::~KSeqFile() {
     kseq_destroy((KSEQFILE::kseq_t*)seq);
-    if (fclose(file) != 0) {
-        Debug(Debug::ERROR) << "Cannot close KSeq input file\n";
+    if (close(file.fd) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << file.name << "\n";
         EXIT(EXIT_FAILURE);
     }
 }
@@ -80,14 +109,8 @@ namespace KSEQGZIP {
     KSEQ_INIT(gzFile, gzread)
 }
 
-KSeqGzip::KSeqGzip(const char* fileName) {
-    if(FileUtil::fileExists(fileName) == false) {
-        errno = ENOENT;
-        perror(fileName);
-        EXIT(EXIT_FAILURE);
-    }
-
-    file = gzopen(fileName, "r");
+KSeqGzip::KSeqGzip(const char* fileName) : fileName(fileName) {
+    file = gzdopen(FileUtil::openSharedFd(fileName, O_RDONLY), "r");
     if(file == NULL) {
         perror(fileName); EXIT(EXIT_FAILURE);
     }
@@ -98,7 +121,15 @@ KSeqGzip::KSeqGzip(const char* fileName) {
 
 bool KSeqGzip::ReadEntry() {
     KSEQGZIP::kseq_t* s = (KSEQGZIP::kseq_t*) seq;
-    if (KSEQGZIP::kseq_read(s) < 0)
+    int64_t result = KSEQGZIP::kseq_read(s);
+    // gzread takes a truncated file as end of input
+    int error = Z_OK;
+    const char *message = gzerror(file, &error);
+    if (ks_err(s->f) || error != Z_OK) {
+        Debug(Debug::ERROR) << "Cannot read " << fileName << ": " << message << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (result < 0)
         return false;
 
     entry.name = s->name;
@@ -124,7 +155,7 @@ namespace KSEQBZIP {
     KSEQ_INIT(BZFILE *, BZ2_bzread)
 }
 
-KSeqBzip::KSeqBzip(const char* fileName) {
+KSeqBzip::KSeqBzip(const char* fileName) : fileName(fileName) {
     if(FileUtil::fileExists(fileName) == false) {
         errno = ENOENT;
         perror(fileName);
@@ -142,7 +173,12 @@ KSeqBzip::KSeqBzip(const char* fileName) {
 
 bool KSeqBzip::ReadEntry() {
     KSEQBZIP::kseq_t* s = (KSEQBZIP::kseq_t*) seq;
-    if (KSEQBZIP::kseq_read(s) < 0)
+    int64_t result = KSEQBZIP::kseq_read(s);
+    if (ks_err(s->f)) {
+        Debug(Debug::ERROR) << "Cannot read " << fileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    if (result < 0)
         return false;
 
     entry.name = s->name;
@@ -174,20 +210,31 @@ namespace KSEQZSTD {
                 } else if (file->decompressedEndOffset == SIZE_MAX) {
                     readSize = 0;
                 }
-                file->input.size = fread((void*) file->input.src, sizeof(char), readSize, file->file);
+                readSize = std::min(readSize, file->fileSize - file->compressedOffset);
+                if (file->fileSize == SIZE_MAX) {
+                    ssize_t bytes = read(file->fd, (char *) file->input.src, readSize);
+                    if (bytes < 0) {
+                        Debug(Debug::ERROR) << "Cannot read " << file->fileName << ": " << strerror(errno) << "\n";
+                        EXIT(EXIT_FAILURE);
+                    }
+                    readSize = bytes;
+                } else {
+                    FileUtil::preadAll(file->fd, file->fileName.c_str(), (char *) file->input.src, readSize, file->compressedOffset);
+                }
+                file->input.size = readSize;
                 file->input.pos = 0;
-                file->compressedOffset += file->input.size;
-                if (file->input.size == 0 && file->readHintBytes == 0 && ferror(file->file) == 0) {
+                file->compressedOffset += readSize;
+                if (readSize == 0 && file->readHintBytes == 0) {
                     break;
                 }
             }
             file->readHintBytes = ZSTD_decompressStream(file->dstream, &output, &file->input);
             if (ZSTD_isError(file->readHintBytes)) {
-                Debug(Debug::ERROR) << "ZSTD_decompressStream " << ZSTD_getErrorName(file->readHintBytes) << "\n";
+                Debug(Debug::ERROR) << "Cannot read " << file->fileName << ": " << ZSTD_getErrorName(file->readHintBytes) << "\n";
                 EXIT(EXIT_FAILURE);
             }
             if (file->input.size == 0 && output.pos == 0) {
-                Debug(Debug::ERROR) << "Cannot read truncated zstd input\n";
+                Debug(Debug::ERROR) << "Cannot read " << file->fileName << ": it ends inside a zstd frame\n";
                 EXIT(EXIT_FAILURE);
             }
             if (file->decompressedEndOffset == SIZE_MAX && file->compressedOffset >= file->compressedEndOffset
@@ -202,14 +249,13 @@ namespace KSEQZSTD {
     KSEQ_INIT(KSeqZstd::ZstdFile*, zstdread)
 
     // find the first pzstd frame in [pos, limit)
-    static size_t findFrame(FILE *file, const char *fileName, size_t pos, size_t limit) {
-        size_t fileBytes = FileUtil::getFileSize(fileName);
+    static size_t findFrame(int fd, const char *fileName, size_t fileBytes, size_t pos, size_t limit) {
         limit = std::min(limit, fileBytes);
         size_t scanBytes = 1024 * 1024;
         std::vector<char> buffer(scanBytes + 4 * sizeof(uint32_t));
         for (; pos < limit; pos += scanBytes) {
             size_t bytes = std::min(buffer.size(), fileBytes - pos);
-            FileUtil::preadAll(fileno(file), fileName, buffer.data(), bytes, pos);
+            FileUtil::preadAll(fd, fileName, buffer.data(), bytes, pos);
             for (size_t i = 0; i < scanBytes && pos + i < limit && i + 4 * sizeof(uint32_t) <= bytes; i++) {
                 uint32_t header[4];
                 memcpy(header, buffer.data() + i, sizeof(header));
@@ -219,7 +265,7 @@ namespace KSEQZSTD {
                 size_t next = pos + i + 3 * sizeof(uint32_t) + header[2];
                 uint32_t nextHeader[2] = {0, 0};
                 if (next + sizeof(nextHeader) <= fileBytes) {
-                    FileUtil::preadAll(fileno(file), fileName, (char *) nextHeader, sizeof(nextHeader), next);
+                    FileUtil::preadAll(fd, fileName, (char *) nextHeader, sizeof(nextHeader), next);
                 }
                 if (next == fileBytes || (nextHeader[0] == ZSTD_MAGIC_SKIPPABLE_START && nextHeader[1] == 4)) {
                     return pos + i;
@@ -231,17 +277,14 @@ namespace KSEQZSTD {
 }
 
 KSeqZstd::KSeqZstd(const char* fileName, size_t start, size_t end) {
-    file.file = FileUtil::openFileOrDie(fileName, "r", true);
+    file.fd = openInput(fileName, file.fileSize);
+    file.fileName = fileName;
     // a split holds the pzstd frames that start in it
     if (start > 0) {
-        start = KSEQZSTD::findFrame(file.file, fileName, start, end);
+        start = KSEQZSTD::findFrame(file.fd, fileName, file.fileSize, start, end);
     }
     if (end != SIZE_MAX && start < end) {
-        end = KSEQZSTD::findFrame(file.file, fileName, end, SIZE_MAX);
-    }
-    if (start > 0 && fseek(file.file, start, SEEK_SET) != 0) {
-        Debug(Debug::ERROR) << "Cannot seek in file " << fileName << "\n";
-        EXIT(EXIT_FAILURE);
+        end = KSEQZSTD::findFrame(file.fd, fileName, file.fileSize, end, SIZE_MAX);
     }
     file.dstream = ZSTD_createDStream();
     if (file.dstream == NULL) {
@@ -287,8 +330,8 @@ KSeqZstd::~KSeqZstd() {
     kseq_destroy((KSEQZSTD::kseq_t*)seq);
     ZSTD_freeDStream(file.dstream);
     free((void*) file.input.src);
-    if (fclose(file.file) != 0) {
-        Debug(Debug::ERROR) << "Cannot close KSeq input file\n";
+    if (close(file.fd) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << file.fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
 }

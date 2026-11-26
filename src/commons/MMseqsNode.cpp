@@ -8,7 +8,6 @@
 #include "itoa.h"
 #include "Timer.h"
 #include "BatchReader.h"
-#include "S3Client.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -16,10 +15,8 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
-#include <climits>
-#include <condition_variable>
+#include <iostream>
 #include <map>
-#include <mutex>
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -33,9 +30,9 @@ unsigned int MMseqsNode::rank = 0;
 unsigned int MMseqsNode::count = 1;
 const size_t MMseqsNode::EXCHANGE_FILE_HEADER_BYTES;
 static std::string runId;
+static bool isRunIdMissing = false;
 static size_t sentExchangeSize = 0;
 static size_t sentOtherNodeExchangeSize = 0;
-static size_t exchangeIndexOpenCount = 0;
 static std::map<std::string, std::vector<std::pair<char *, size_t> > > ownExchangeRecords;
 static const unsigned int MAX_READ_POLLS = 400;
 
@@ -43,12 +40,14 @@ void MMseqsNode::init() {
     setvbuf(stdout, NULL, _IOLBF, 0);
     // Open MPI, MPICH/Intel MPI, then SLURM
     const char *rankVariables[][2] = { { "OMPI_COMM_WORLD_RANK", "OMPI_COMM_WORLD_SIZE" }, { "PMI_RANK", "PMI_SIZE" }, { "SLURM_PROCID", "SLURM_STEP_NUM_TASKS" } };
+    const char *rankVariable = "";
     for (size_t i = 0; i < sizeof(rankVariables) / sizeof(rankVariables[0]); i++) {
         const char *procId = getenv(rankVariables[i][0]);
         const char *taskCount = getenv(rankVariables[i][1]);
         if (procId != NULL && taskCount != NULL) {
             rank = strtoul(procId, NULL, 10);
             count = strtoul(taskCount, NULL, 10);
+            rankVariable = rankVariables[i][0];
             break;
         }
     }
@@ -59,72 +58,18 @@ void MMseqsNode::init() {
         runId += std::string(value != NULL ? value : "") + "\t";
     }
     runId += "\n";
+    // Hydra (MPICH, Intel MPI) gives its ranks no job id
+    isRunIdMissing = count > 1 && strcmp(rankVariable, "PMI_RANK") == 0 && runId.find_first_not_of("\t\n") == std::string::npos;
     if (count == 0 || rank >= count) {
         Debug(Debug::ERROR) << "Invalid node rank " << rank << " for " << count << " nodes\n";
         EXIT(EXIT_FAILURE);
     }
 }
 
-void MMseqsNode::publishFile(const std::string &file, const std::string &content) {
-    FileUtil::publishFile(file, content);
-}
-
-void MMseqsNode::sleepBeforePoll(unsigned int polls, unsigned int maxShift) {
-    usleep(10000u << std::min(polls, maxShift));
-}
-
-// NFS caches a missing name for up to 60 s
-static bool isListed(const std::string &file) {
-    if (FileUtil::needsDirectoryRefresh(file) == false) {
-        return false;
-    }
-    static time_t lastListing = 0;
-    time_t now = time(NULL);
-    time_t last = __atomic_load_n(&lastListing, __ATOMIC_RELAXED);
-    if (now == last || __sync_bool_compare_and_swap(&lastListing, last, now) == false) {
-        return false;
-    }
-    std::string name = FileUtil::baseName(file);
-    DIR *directory = opendir(FileUtil::dirName(file).c_str());
-    if (directory == NULL) {
-        return false;
-    }
-    bool isFound = false;
-    for (struct dirent *entry; isFound == false && (entry = readdir(directory)) != NULL;) {
-        isFound = name == entry->d_name;
-    }
-    closedir(directory);
-    return isFound;
-}
-
-static int openFile(const std::string &file, int flags = O_RDONLY) {
-    int fd;
-    do {
-        fd = open(file.c_str(), flags, 0666);
-    } while (fd < 0 && errno == EINTR);
-    return fd;
-}
-
-static int openListedFile(const std::string &file, int flags = O_RDONLY) {
-    int fd = openFile(file, flags);
-    int openError = errno;
-    if (fd < 0 && openError == ENOENT && isListed(file)) {
-        return openFile(file, flags);
-    }
-    errno = openError;
-    return fd;
-}
-
 // NFS caches a missing name, so poll on an empty file
 static std::string readPolledFile(const std::string &file) {
-    // aws backend: a missing object is not there yet
-    if (S3Client::isEnabled()) {
-        std::string content;
-        S3Client::get(S3Client::getObjectName(file), content);
-        return content;
-    }
     int flags = FileUtil::needsDirectoryRefresh(file) ? (O_RDONLY | O_CREAT) : O_RDONLY;
-    int fd = openFile(file, flags);
+    int fd = FileUtil::openFile(file, flags);
     int openError = (fd < 0) ? errno : 0;
     time_t start = time(NULL);
     for (unsigned int polls = 0; openError == ENOENT && (flags & O_CREAT) != 0; polls++) {
@@ -132,14 +77,14 @@ static std::string readPolledFile(const std::string &file) {
             Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(openError) << ". Its directory must be shared by all nodes\n";
             EXIT(EXIT_FAILURE);
         }
-        MMseqsNode::sleepBeforePoll(polls, 7);
+        FileUtil::sleepBeforePoll(polls, 7);
         FileUtil::refreshDirectory(file);
-        fd = openFile(file, flags);
+        fd = FileUtil::openFile(file, flags);
         openError = (fd < 0) ? errno : 0;
     }
     // NFS can fail a name that a rename just replaced with ESTALE or EIO, the next poll reads it again
     if (fd < 0) {
-        if (openError == ESTALE || openError == EIO || openError == ENOENT) {
+        if (FileUtil::isTransientError(openError) || openError == ENOENT) {
             return std::string();
         }
         Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(openError) << "\n";
@@ -149,7 +94,7 @@ static std::string readPolledFile(const std::string &file) {
     bool isStale = false;
     if (fstat(fd, &sb) != 0) {
         int statError = errno;
-        isStale = statError == ESTALE || statError == EIO;
+        isStale = FileUtil::isTransientError(statError);
         if (isStale == false) {
             Debug(Debug::ERROR) << "Cannot read " << file << ": " << strerror(statError) << "\n";
             EXIT(EXIT_FAILURE);
@@ -157,8 +102,8 @@ static std::string readPolledFile(const std::string &file) {
     }
     std::string content(isStale ? 0 : sb.st_size, '\0');
     int readError;
-    if (MMseqsNode::tryPreadAll(fd, &content[0], content.size(), 0, readError) == false) {
-        if (readError != 0 && readError != ESTALE && readError != EIO) {
+    if (FileUtil::tryPreadAll(fd, &content[0], content.size(), 0, readError) < content.size()) {
+        if (readError != 0 && FileUtil::isTransientError(readError) == false) {
             Debug(Debug::ERROR) << "Cannot read " << file << ": " << strerror(readError) << "\n";
             EXIT(EXIT_FAILURE);
         }
@@ -177,54 +122,44 @@ void MMseqsNode::WaitWarning::reset() {
     nextSeconds = WAIT_WARNING_SECONDS;
 }
 
-// MMSEQS_WAIT_TIMEOUT: seconds of one wait before the node stops; aws backend: the launcher writes the object failed when the run fails
+// MMSEQS_WAIT_TIMEOUT: seconds of one wait before the node stops
 void MMseqsNode::WaitWarning::check(const std::string &what) {
     static const char *timeout = getenv("MMSEQS_WAIT_TIMEOUT");
-    static time_t lastFailedCheck = 0;
     const time_t now = time(NULL);
     if (timeout != NULL && *timeout != '\0' && now - start > strtol(timeout, NULL, 10)) {
         Debug(Debug::ERROR) << "Node " << rank << " waited more than MMSEQS_WAIT_TIMEOUT=" << timeout << " s for " << what << "\n";
         EXIT(EXIT_FAILURE);
     }
-    const time_t last = __atomic_load_n(&lastFailedCheck, __ATOMIC_RELAXED);
-    if (S3Client::isEnabled() && now - last >= 60 && __sync_bool_compare_and_swap(&lastFailedCheck, last, now) && S3Client::head("failed", NULL)) {
-        Debug(Debug::ERROR) << "Node " << rank << " stops while it waits for " << what << ": the run failed, the object failed exists below the run prefix\n";
-        EXIT(EXIT_FAILURE);
-    }
     if (static_cast<size_t>(now - start) >= nextSeconds) {
-        Debug(Debug::ERROR) << "Node " << rank << " waited " << nextSeconds << " s for " << what << ". Check that no node has died and that all nodes share this directory\n";
+        Debug(Debug::WARNING) << "Node " << rank << " has waited " << nextSeconds << " s for " << what << ". Long steps are normal at large scale; "
+                              << "if no node makes progress, check that all nodes are running and use the same shared temporary folder\n";
         nextSeconds *= 2;
     }
 }
 
-static void sleepInWait(unsigned int polls) {
-    MMseqsNode::sleepBeforePoll(polls, std::min(8u, 4 + polls / 32));
-}
-
-std::string MMseqsNode::readFile(const std::string &file) {
-    if (S3Client::isEnabled() && (FileUtil::fileExists(file.c_str()) == false || FileUtil::fileExists((file + ".staged").c_str()))) {
-        std::string content;
-        if (S3Client::get(S3Client::getObjectName(file), content) == false) {
-            Debug(Debug::ERROR) << "Cannot find " << file << " on this node or in S3\n";
-            EXIT(EXIT_FAILURE);
-        }
-        return content;
-    }
-    return FileUtil::readFile(file);
+// sleep 1/64 of the wait so far, at least 1 ms per node so that all nodes poll about 1000 times per second at most, at most 2.56 s
+static void sleepInWait(Timer &waited) {
+    double seconds = std::min(2.56, std::max(0.001 * std::max(MMseqsNode::count, 10u), waited.getTimediff() / 64));
+    // 0.8 to 1.2 times by rank, so that nodes that started waiting together do not poll together
+    usleep(static_cast<useconds_t>(seconds * (0.8 + 0.4 * (MMseqsNode::rank % 16) / 15.0) * 1e6));
 }
 
 std::string MMseqsNode::waitForRunFile(const std::string &file) {
-    std::string content = readPolledFile(file);
+    std::string content;
     WaitWarning warning;
-    for (unsigned int polls = 0; content.compare(0, runId.size(), runId) != 0; polls++) {
-        sleepInWait(polls);
+    Timer waited;
+    while (readRunFile(file, content) == false) {
+        sleepInWait(waited);
         warning.check(file);
-        content = readPolledFile(file);
     }
-    return content.substr(runId.size());
+    return content;
 }
 
 bool MMseqsNode::readRunFile(const std::string &file, std::string &content) {
+    if (isRunIdMissing) {
+        Debug(Debug::ERROR) << "Set MMSEQS_RUN_ID to an id unique to this run, MPICH and Intel MPI ranks have no job id\n";
+        EXIT(EXIT_FAILURE);
+    }
     content = readPolledFile(file);
     if (content.compare(0, runId.size(), runId) != 0) {
         return false;
@@ -234,49 +169,29 @@ bool MMseqsNode::readRunFile(const std::string &file, std::string &content) {
 }
 
 void MMseqsNode::publishRunFile(const std::string &file, const std::string &content) {
-    std::string runContent = runId + content;
-    publishFile(file, runContent);
-    if (S3Client::isEnabled()) {
-        S3Client::put(S3Client::getObjectName(file), runContent.data(), runContent.size());
-    }
+    FileUtil::publishFile(file, runId + content);
 }
 
-// aws backend: only the node that published a run file has a local copy
-static void removeRunFile(const std::string &file) {
-    if (S3Client::isEnabled()) {
-        S3Client::remove(S3Client::getObjectName(file));
-        if (FileUtil::fileExists(file.c_str()) == false) {
-            return;
-        }
-    }
-    FileUtil::remove(file.c_str());
-}
-
+// no wait warning, only a background thread of the master waits here and it holds back no node
 void MMseqsNode::waitForRunFilesChange(const std::string &prefix, std::string &content) {
-    WaitWarning warning;
     for (unsigned int polls = 4;; polls++) {
         std::string nodeContents;
         for (unsigned int node = 0; node < count; node++) {
-            std::string nodeContent = readPolledFile(prefix + SSTR(node));
-            if (nodeContent.compare(0, runId.size(), runId) == 0) {
-                nodeContents.append(nodeContent, runId.size(), std::string::npos);
+            std::string nodeContent;
+            if (readRunFile(prefix + SSTR(node), nodeContent)) {
+                nodeContents += nodeContent;
             }
         }
         if (nodeContents != content) {
             content.swap(nodeContents);
             return;
         }
-        sleepBeforePoll(polls, 7);
-        warning.check(prefix);
+        FileUtil::sleepBeforePoll(polls, 7);
     }
 }
 
 // opening a directory asks an NFS server for its state
 void MMseqsNode::listDirectory(const std::string &directory, std::vector<std::string> &names) {
-    if (S3Client::isEnabled()) {
-        S3Client::list(S3Client::getObjectName(directory), names);
-        return;
-    }
     names.clear();
     DIR *handle = opendir(directory.c_str());
     if (handle == NULL) {
@@ -294,7 +209,7 @@ std::string MMseqsNode::gatherRunFiles(const std::string &prefix) {
     for (unsigned int node = 0; node < count; node++) {
         std::string file = prefix + SSTR(node);
         nodeContents[node] = waitForRunFile(file);
-        removeRunFile(file);
+        FileUtil::removeSharedFile(file);
     }
     std::string content;
     for (unsigned int node = 0; node < count; node++) {
@@ -303,47 +218,22 @@ std::string MMseqsNode::gatherRunFiles(const std::string &prefix) {
     return content;
 }
 
-// aws backend: the bytes of a publish are the object <log>.<n>, the progress has the count of these chunks
-static std::mutex logMutex;
-static std::map<std::string, std::pair<size_t, size_t> > publishedLogs;
-static std::map<std::string, std::vector<size_t> > logChunkEnds;
-
-static size_t syncLog(FILE *file, const std::string &log, size_t size) {
+void MMseqsNode::publishLog(FILE *file, const std::string &log, PolledFile &progress, size_t key, size_t size) {
     if (fflush(file) != 0 || fsync(fileno(file)) != 0) {
         Debug(Debug::ERROR) << "Cannot flush " << log << "\n";
         EXIT(EXIT_FAILURE);
     }
-    if (S3Client::isEnabled() == false) {
-        return 0;
-    }
-    std::pair<size_t, size_t> published;
-    {
-        std::lock_guard<std::mutex> lock(logMutex);
-        published = publishedLogs[log];
-    }
-    if (size > published.second) {
-        S3Client::putFile(S3Client::getObjectName(log) + "." + SSTR(published.first), log, published.second, size - published.second);
-        published = std::make_pair(published.first + 1, size);
-        std::lock_guard<std::mutex> lock(logMutex);
-        publishedLogs[log] = published;
-    }
-    return published.first;
+    progress.publish(SSTR(key) + "\t" + SSTR(size) + "\n");
 }
 
-void MMseqsNode::publishLog(FILE *file, const std::string &log, size_t key, size_t size) {
-    size_t chunks = syncLog(file, log, size);
-    publishRunFile(log + ".progress", SSTR(key) + "\t" + SSTR(size) + (S3Client::isEnabled() ? "\t" + SSTR(chunks) : "") + "\n");
-}
-
-bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &size) {
-    std::string file = log + ".progress";
-    std::string content = readPolledFile(file);
-    if (content.compare(0, runId.size(), runId) != 0) {
+bool MMseqsNode::readLogProgress(PolledFile &progress, size_t &key, size_t &size) {
+    std::string content;
+    if (progress.read(content) == false) {
         return false;
     }
     const char *columns[2];
-    if (Util::getWordsOfLine((char *) content.c_str() + runId.size(), columns, 2) < 2) {
-        Debug(Debug::ERROR) << "Cannot read " << file << "\n";
+    if (Util::getWordsOfLine((char *) content.c_str(), columns, 2) < 2) {
+        Debug(Debug::ERROR) << "Cannot read " << progress.file << "\n";
         EXIT(EXIT_FAILURE);
     }
     key = Util::fast_atoi<size_t>(columns[0]);
@@ -352,43 +242,12 @@ bool MMseqsNode::readLogProgress(const std::string &log, size_t &key, size_t &si
 }
 
 void MMseqsNode::waitForLog(const std::string &log, size_t &key, size_t &size) {
+    PolledFile progress(log + ".progress");
     WaitWarning warning;
-    for (unsigned int polls = 0; readLogProgress(log, key, size) == false; polls++) {
-        sleepInWait(polls);
-        warning.check(log + ".progress");
-    }
-}
-
-// the chunks exist once a progress counts them; a reader learns the chunk sizes once
-static void readLogChunks(const std::string &log, size_t from, size_t to, char *data) {
-    const std::string object = S3Client::getObjectName(log);
-    while (from < to) {
-        size_t chunk;
-        size_t chunkBegin;
-        size_t chunkEnd = SIZE_MAX;
-        {
-            std::lock_guard<std::mutex> lock(logMutex);
-            const std::vector<size_t> &ends = logChunkEnds[log];
-            chunk = std::upper_bound(ends.begin(), ends.end(), from) - ends.begin();
-            chunkBegin = (chunk > 0) ? ends[chunk - 1] : 0;
-            if (chunk < ends.size()) {
-                chunkEnd = ends[chunk];
-            }
-        }
-        std::string chunkObject = object + "." + SSTR(chunk);
-        if (chunkEnd == SIZE_MAX) {
-            chunkEnd = chunkBegin + S3Client::getSize(chunkObject);
-            std::lock_guard<std::mutex> lock(logMutex);
-            std::vector<size_t> &ends = logChunkEnds[log];
-            if (ends.size() == chunk) {
-                ends.push_back(chunkEnd);
-            }
-            continue;
-        }
-        size_t size = std::min(to, chunkEnd) - from;
-        S3Client::getRange(chunkObject, from - chunkBegin, size, data);
-        data += size;
-        from += size;
+    Timer waited;
+    while (readLogProgress(progress, key, size) == false) {
+        sleepInWait(waited);
+        warning.check(progress.file);
     }
 }
 
@@ -397,78 +256,46 @@ bool MMseqsNode::readLog(const std::string &log, size_t from, size_t to, char *d
     if (size == 0) {
         return true;
     }
-    // aws backend: a log of this node from the local file
-    if (S3Client::isEnabled()) {
-        std::unique_lock<std::mutex> lock(logMutex);
-        if (publishedLogs.find(log) == publishedLogs.end()) {
-            lock.unlock();
-            readLogChunks(log, from, to, data);
-            return true;
-        }
-    }
     // NFS can expose the progress before the log
-    for (unsigned int polls = 0; polls < MAX_READ_POLLS; polls++) {
-        int fd = openListedFile(log);
-        int openError = (fd < 0) ? errno : 0;
-        if (fd < 0) {
-            if (openError != ENOENT && openError != ESTALE) {
-                Debug(Debug::ERROR) << "Cannot open " << log << ": " << strerror(openError) << "\n";
-                EXIT(EXIT_FAILURE);
-            }
-        } else {
+    time_t failedSince = 0;
+    unsigned int attempts = 0;
+    for (unsigned int polls = 0; polls < MAX_READ_POLLS;) {
+        int fd = FileUtil::openListedFile(log);
+        int error = (fd < 0) ? errno : 0;
+        bool isRead = false;
+        if (fd >= 0) {
             int readError;
-            bool isRead = tryPreadAll(fd, data, size, from, readError);
+            isRead = FileUtil::tryPreadAll(fd, data, size, from, readError) == size;
             int closeError = (close(fd) != 0) ? errno : 0;
-            if ((readError != 0 && readError != ESTALE) || (closeError != 0 && closeError != ESTALE && closeError != EINTR)) {
-                Debug(Debug::ERROR) << "Cannot read " << log << ": " << strerror(readError != 0 ? readError : closeError) << "\n";
+            error = (readError != 0) ? readError : ((closeError != EINTR) ? closeError : 0);
+            isRead = isRead && closeError == 0;
+        }
+        // a log that is not there yet is polled again
+        if (error != 0 && (fd >= 0 || error != ENOENT)) {
+            if (FileUtil::canRetryRead(log, error, failedSince, attempts) == false) {
+                Debug(Debug::ERROR) << "Cannot " << ((fd < 0) ? "open " : "read ") << log << ": " << strerror(error) << "\n";
                 EXIT(EXIT_FAILURE);
             }
-            if (isRead && closeError == 0) {
-                return true;
+            if (wait) {
+                continue;
             }
+        }
+        if (isRead) {
+            return true;
         }
         if (wait == false) {
             return false;
         }
-        sleepBeforePoll(polls);
+        attempts = 0;
+        FileUtil::sleepBeforePoll(polls++);
     }
     Debug(Debug::ERROR) << "Cannot read " << log << " bytes " << from << " to " << to << " after " << MAX_READ_POLLS << " polls\n";
     EXIT(EXIT_FAILURE);
 }
 
 void MMseqsNode::removeLog(const std::string &log) {
-    if (S3Client::isEnabled()) {
-        // the writer knows its chunks, another node reads their count in the progress
-        size_t chunks = 0;
-        bool isPublished;
-        {
-            std::lock_guard<std::mutex> lock(logMutex);
-            std::map<std::string, std::pair<size_t, size_t> >::const_iterator it = publishedLogs.find(log);
-            isPublished = it != publishedLogs.end();
-            chunks = isPublished ? it->second.first : 0;
-        }
-        if (isPublished == false) {
-            std::string progress = readPolledFile(log + ".progress");
-            const char *columns[3];
-            chunks = (progress.compare(0, runId.size(), runId) == 0 && Util::getWordsOfLine((char *) progress.c_str() + runId.size(), columns, 3) == 3)
-                     ? Util::fast_atoi<size_t>(columns[2]) : 0;
-        }
-        const std::string object = S3Client::getObjectName(log);
-#pragma omp parallel for schedule(dynamic, 1)
-        for (size_t i = 0; i < chunks; i++) {
-            S3Client::remove(object + "." + SSTR(i));
-        }
-        removeRunFile(log + ".progress");
-        if (FileUtil::fileExists(log.c_str())) {
-            FileUtil::remove(log.c_str());
-        }
-        std::lock_guard<std::mutex> lock(logMutex);
-        publishedLogs.erase(log);
-        logChunkEnds.erase(log);
-        return;
-    }
-    FileUtil::remove(log.c_str());
-    FileUtil::remove((log + ".progress").c_str());
+    FileUtil::removeSharedFile(log);
+    FileUtil::removeSharedFile(log + ".progress");
 }
 
 struct ExchangeFileHeader {
@@ -476,12 +303,6 @@ struct ExchangeFileHeader {
     uint64_t exchangeFileNumber;
 };
 static_assert(sizeof(ExchangeFileHeader) == MMseqsNode::EXCHANGE_FILE_HEADER_BYTES, "Unexpected exchange file header layout");
-
-static std::string getExchangeObjectName(const std::string &file, uint64_t exchangeFileNumber) {
-    return S3Client::getObjectName(file) + "~" + SSTR(exchangeFileNumber);
-}
-
-static int openRemoteExchangeFile(const std::string &file, const std::string &object, size_t size, const std::vector<size_t> &segmentOffsets = std::vector<size_t>());
 
 static uint64_t getExchangeFileMagic() {
     uint64_t magic = 0x4d4d533258434831ULL;
@@ -492,120 +313,138 @@ static uint64_t getExchangeFileMagic() {
     return magic;
 }
 
-void MMseqsNode::publishExchangeFile(FILE *file, const std::string &fileName, size_t size, const std::string &indexFile, const std::vector<uint64_t> &line,
-                                     const std::vector<size_t> *segmentOffsets) {
-    ExchangeFileHeader header = { 0, 0 };
-    // size 0 publishes no file yet; a rewritten file gets an object per exchange file number
-    bool isUploaded = S3Client::isEnabled() && size > 0;
-    if (isUploaded) {
-        if (fflush(file) != 0) {
-            Debug(Debug::ERROR) << "Cannot flush " << fileName << "\n";
+static uint64_t getRecordChecksum(const char *data, size_t size) {
+    uint64_t checksum = getExchangeFileMagic();
+    for (size_t i = 0; i < size; i++) {
+        checksum = (checksum ^ static_cast<unsigned char>(data[i])) * 1099511628211ULL;
+    }
+    return checksum;
+}
+
+MMseqsNode::PolledFile::~PolledFile() {
+    if (fd >= 0) {
+        close(fd);
+    }
+}
+
+void MMseqsNode::PolledFile::decideMode() {
+    if (isModeKnown == false) {
+        isOpenedPerRead = FileUtil::needsDirectoryRefresh(file);
+        isModeKnown = true;
+    }
+}
+
+// record: payload size, checksum of this run, payload; a record read while it is rewritten fails the checksum
+void MMseqsNode::PolledFile::publish(const std::string &content) {
+    const uint64_t header[2] = { content.size(), getRecordChecksum(content.data(), content.size()) };
+    std::string record((const char *) header, sizeof(header));
+    record += content;
+    decideMode();
+    if (isOpenedPerRead) {
+        FileUtil::publishFile(file, record);
+        return;
+    }
+    if (fd < 0) {
+        fd = FileUtil::openSharedFd(file, O_WRONLY | O_CREAT);
+    }
+    FileUtil::pwriteAll(fd, file.c_str(), record.data(), record.size(), 0);
+    if (fsync(fd) != 0) {
+        Debug(Debug::ERROR) << "Cannot flush " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
+bool MMseqsNode::PolledFile::read(std::string &content) {
+    uint64_t header[2];
+    size_t readSize;
+    // the buffer doubles until it holds the record or the whole file
+    for (size_t size = std::max(buffer.size(), Util::getPageSize());; size *= 2) {
+        buffer.resize(size);
+        readSize = read(buffer.data(), size, 0);
+        if (readSize < sizeof(header)) {
+            return false;
+        }
+        memcpy(header, buffer.data(), sizeof(header));
+        if (readSize < size || header[0] <= readSize - sizeof(header)) {
+            break;
+        }
+    }
+    if (header[0] > readSize - sizeof(header) || getRecordChecksum(buffer.data() + sizeof(header), header[0]) != header[1]) {
+        return false;
+    }
+    content.assign(buffer.data() + sizeof(header), header[0]);
+    return true;
+}
+
+size_t MMseqsNode::PolledFile::read(char *data, size_t size, size_t offset) {
+    if (fd < 0) {
+        decideMode();
+        fd = FileUtil::openListedFile(file, O_RDONLY | O_CLOEXEC);
+        int openError = (fd < 0) ? errno : 0;
+        if (fd < 0) {
+            if (openError == ENOENT || FileUtil::isTransientError(openError)) {
+                return 0;
+            }
+            Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(openError) << "\n";
             EXIT(EXIT_FAILURE);
         }
-        FileUtil::preadAll(fileno(file), fileName.c_str(), (char *) &header, sizeof(header), 0);
     }
+    ssize_t readSize;
+    do {
+        readSize = pread(fd, data, size, offset);
+    } while (readSize < 0 && errno == EINTR);
+    int readError = (readSize < 0) ? errno : 0;
+    // a failed read opens the file again
+    int closeError = 0;
+    if (isOpenedPerRead || readError != 0) {
+        closeError = (close(fd) != 0) ? errno : 0;
+        fd = -1;
+    }
+    if (FileUtil::isTransientError(readError) || FileUtil::isTransientError(closeError) || closeError == EINTR) {
+        return 0;
+    }
+    if (readError != 0 || closeError != 0) {
+        Debug(Debug::ERROR) << "Cannot read " << file << ": " << strerror(readError != 0 ? readError : closeError) << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return static_cast<size_t>(readSize);
+}
+
+void MMseqsNode::publishExchangeFile(FILE *file, const std::string &fileName, size_t size, const std::string &indexFile, const std::vector<uint64_t> &line) {
     if (fclose(file) != 0) {
         Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
-    // no exchange data stays on the local disk after its upload
-    if (isUploaded && segmentOffsets != NULL) {
-        // the earlier segments are up already, the last one holds the table
-        std::vector<size_t> offsets(*segmentOffsets);
-        offsets.push_back(size);
-        const std::string object = getExchangeObjectName(fileName, header.exchangeFileNumber);
-        const size_t lastBegin = offsets[offsets.size() - 2];
-        S3Client::putFile(object + "." + SSTR(offsets.size() - 2), fileName, lastBegin, size - lastBegin);
-        S3Client::put(object + ".segments", (const char *) offsets.data(), offsets.size() * sizeof(size_t));
-        FileUtil::remove(fileName.c_str());
-    } else if (isUploaded) {
-        uploadFile(fileName, getExchangeObjectName(fileName, header.exchangeFileNumber));
-        FileUtil::remove(fileName.c_str());
-    }
-    __sync_fetch_and_add(&sentExchangeSize, size);
-    __sync_fetch_and_add(&sentOtherNodeExchangeSize, size);
+    addSentExchangeBytes(size, size);
     // without an index the reader learns of the file from a run file
     if (indexFile.empty()) {
         return;
     }
-    FILE *handle = FileUtil::openFileOrDie(indexFile.c_str(), "a", true);
-    uint64_t magic = getExchangeFileMagic();
-    if (fwrite(line.data(), sizeof(uint64_t), line.size() - 1, handle) != line.size() - 1
-        || fwrite(&magic, sizeof(magic), 1, handle) != 1 || fflush(handle) != 0 || fclose(handle) != 0) {
+    std::vector<uint64_t> words(line.begin(), line.end() - 1);
+    words.push_back(getExchangeFileMagic());
+    size_t lineSize = words.size() * sizeof(uint64_t);
+    // a failed append is not retried: readers find a line at its offset
+    int fd = FileUtil::openSharedFd(indexFile, O_WRONLY | O_APPEND);
+    if (write(fd, words.data(), lineSize) != static_cast<ssize_t>(lineSize) || close(fd) != 0) {
         Debug(Debug::ERROR) << "Cannot write " << indexFile << "\n";
         EXIT(EXIT_FAILURE);
     }
-    // aws backend: line n of an index is the object <index>.<n>
-    if (S3Client::isEnabled()) {
-        std::vector<uint64_t> words(line.begin(), line.end() - 1);
-        words.push_back(magic);
-        S3Client::put(S3Client::getObjectName(indexFile) + "." + SSTR(line[0]), (const char *) words.data(), words.size() * sizeof(uint64_t));
-    }
 }
 
-size_t MMseqsNode::readExchangeIndexLines(const std::string &indexFile, size_t firstLine, size_t lineWords, std::vector<uint64_t> &lines) {
+size_t MMseqsNode::readExchangeIndexLines(PolledFile &index, size_t firstLine, size_t lineWords, std::vector<uint64_t> &lines) {
     size_t lineSize = lineWords * sizeof(uint64_t);
-    if (S3Client::isEnabled()) {
-        const std::string object = S3Client::getObjectName(indexFile);
-        size_t lineCount = 0;
-        for (std::string line; (lineCount + 1) * lineWords <= lines.size(); lineCount++) {
-            __sync_fetch_and_add(&exchangeIndexOpenCount, 1);
-            if (S3Client::get(object + "." + SSTR(firstLine + lineCount), line) == false || line.size() != lineSize) {
-                break;
-            }
-            memcpy(lines.data() + lineCount * lineWords, line.data(), lineSize);
-            if (lines[lineCount * lineWords] != firstLine + lineCount || lines[(lineCount + 1) * lineWords - 1] != getExchangeFileMagic()) {
-                break;
-            }
-        }
-        return lineCount;
-    }
-    int fd = openListedFile(indexFile);
-    __sync_fetch_and_add(&exchangeIndexOpenCount, 1);
-    int openError = (fd < 0) ? errno : 0;
-    if (fd < 0) {
-        if (openError == ENOENT || openError == ESTALE) {
-            return 0;
-        }
-        Debug(Debug::ERROR) << "Cannot open " << indexFile << ": " << strerror(openError) << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    ssize_t readSize;
-    do {
-        readSize = pread(fd, lines.data(), lines.size() * sizeof(uint64_t), firstLine * lineSize);
-    } while (readSize < 0 && errno == EINTR);
-    int readError = (readSize < 0) ? errno : 0;
-    int closeError = (close(fd) != 0) ? errno : 0;
-    if (readError == ESTALE || closeError == ESTALE || closeError == EINTR) {
-        return 0;
-    }
-    if (readError != 0 || closeError != 0) {
-        Debug(Debug::ERROR) << "Cannot read " << indexFile << ": " << strerror(readError != 0 ? readError : closeError) << "\n";
-        EXIT(EXIT_FAILURE);
-    }
+    // callers poll again after 0 lines
+    size_t readSize = index.read((char *) lines.data(), lines.size() * sizeof(uint64_t), firstLine * lineSize);
     size_t lineCount = 0;
-    while ((lineCount + 1) * lineSize <= static_cast<size_t>(readSize) && lines[lineCount * lineWords] == firstLine + lineCount
+    while ((lineCount + 1) * lineSize <= readSize && lines[lineCount * lineWords] == firstLine + lineCount
            && lines[(lineCount + 1) * lineWords - 1] == getExchangeFileMagic()) {
         lineCount++;
     }
     return lineCount;
 }
 
-size_t MMseqsNode::waitForExchangeIndexLines(const std::string &indexFile, size_t &nextLine, size_t lineWords, std::vector<uint64_t> &lines, bool wait) {
-    WaitWarning warning;
-    for (unsigned int polls = 0;; polls++) {
-        size_t lineCount = readExchangeIndexLines(indexFile, nextLine, lineWords, lines);
-        if (lineCount > 0 || wait == false) {
-            nextLine += lineCount;
-            return lineCount;
-        }
-        sleepInWait(polls);
-        warning.check(indexFile);
-    }
-}
-
-FILE *MMseqsNode::createExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *mode) {
-    FILE *file = FileUtil::openAndDelete(fileName.c_str(), mode);
+FILE *MMseqsNode::createExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber) {
+    FILE *file = FileUtil::openAndDelete(fileName.c_str(), "w");
     ExchangeFileHeader header = { getExchangeFileMagic(), exchangeFileNumber };
     if (fwrite(&header, sizeof(header), 1, file) != 1 || fflush(file) != 0) {
         Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
@@ -616,12 +455,14 @@ FILE *MMseqsNode::createExchangeFile(const std::string &fileName, uint64_t excha
 
 void MMseqsNode::writeExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *data, size_t size, const std::string &indexFile,
                                    const std::vector<uint64_t> &line, int threads) {
-    // aws backend: publishExchangeFile reads the header back
-    FILE *file = createExchangeFile(fileName, exchangeFileNumber, "w+");
+    FILE *file = FileUtil::openAndDelete(fileName.c_str(), "w");
 #pragma omp parallel for schedule(dynamic, 1) num_threads(threads)
     for (size_t offset = 0; offset < size; offset += BatchReader::MAX_READ_REQUEST_SIZE) {
         FileUtil::pwriteAll(fileno(file), fileName.c_str(), data + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, size - offset), EXCHANGE_FILE_HEADER_BYTES + offset);
     }
+    // the header goes last, a reader that sees the full size and the header does not find a hole
+    ExchangeFileHeader header = { getExchangeFileMagic(), exchangeFileNumber };
+    FileUtil::pwriteAll(fileno(file), fileName.c_str(), (const char *) &header, sizeof(header), 0);
     publishExchangeFile(file, fileName, EXCHANGE_FILE_HEADER_BYTES + size, indexFile, line);
 }
 
@@ -630,11 +471,7 @@ int MMseqsNode::tryOpenExchangeFile(const std::string &file, size_t expectedSize
     observedSize = SIZE_MAX;
     observedNumber = UINT64_MAX;
     lastError = 0;
-    int fd = openListedFile(file, O_RDONLY | O_CLOEXEC | openFlags);
-    if (fd < 0 && errno == ENOENT && S3Client::isEnabled()) {
-        // the writer uploads the file before its index line and removes it, so it is in S3 with the published size
-        fd = openRemoteExchangeFile(file, getExchangeObjectName(file, expectedNumber), expectedSize);
-    }
+    int fd = FileUtil::openListedFile(file, O_RDONLY | O_CLOEXEC | openFlags);
     if (fd < 0) {
         lastError = errno;
         return -1;
@@ -648,37 +485,25 @@ int MMseqsNode::tryOpenExchangeFile(const std::string &file, size_t expectedSize
         observedSize = static_cast<size_t>(fileStat.st_size);
         if (observedSize == expectedSize) {
             ExchangeFileHeader header;
-            ssize_t headerSize;
-            size_t remoteSize;
-            if (readRemoteFile(fd, (char *) &header, sizeof(header), 0, remoteSize)) {
-                headerSize = remoteSize;
-            } else {
-                do {
-                    headerSize = pread(fd, &header, sizeof(header), 0);
-                } while (headerSize < 0 && errno == EINTR);
-            }
-            if (headerSize == static_cast<ssize_t>(sizeof(header))) {
+            bool isRead = FileUtil::tryPreadAll(fd, (char *) &header, sizeof(header), 0, lastError) == sizeof(header);
+            if (isRead) {
                 observedNumber = header.exchangeFileNumber;
             }
-            if (headerSize == static_cast<ssize_t>(sizeof(header)) && header.magic == getExchangeFileMagic()
-                && header.exchangeFileNumber == expectedNumber) {
+            if (isRead && header.magic == getExchangeFileMagic() && header.exchangeFileNumber == expectedNumber) {
                 return fd;
-            }
-            if (headerSize < 0) {
-                lastError = errno;
             }
         }
     } else {
         lastError = errno;
     }
-    releaseExchangeCopy(fd);
     close(fd);
     return -1;
 }
 
 int MMseqsNode::waitForExchangeFile(const std::string &file, size_t size, uint64_t exchangeFileNumber) {
     WaitWarning warning;
-    for (unsigned int polls = 0;; polls++) {
+    Timer waited;
+    for (;;) {
         size_t observedSize;
         uint64_t observedNumber;
         int lastError;
@@ -686,41 +511,20 @@ int MMseqsNode::waitForExchangeFile(const std::string &file, size_t size, uint64
         if (fd >= 0) {
             return fd;
         }
-        if (lastError != 0 && lastError != ENOENT && lastError != ESTALE) {
+        if (lastError != 0 && lastError != ENOENT && FileUtil::isTransientError(lastError) == false) {
             Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(lastError) << "\n";
             EXIT(EXIT_FAILURE);
         }
-        sleepInWait(polls);
+        sleepInWait(waited);
         warning.check(file);
     }
-}
-
-bool MMseqsNode::tryPreadAll(int fd, char *data, size_t size, size_t offset, int &readError) {
-    size_t remoteSize;
-    if (readRemoteFile(fd, data, size, offset, remoteSize)) {
-        readError = 0;
-        return remoteSize == size;
-    }
-    for (size_t done = 0; done < size;) {
-        ssize_t count = pread(fd, data + done, size - done, offset + done);
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        if (count <= 0) {
-            readError = (count < 0) ? errno : 0;
-            return false;
-        }
-        done += count;
-    }
-    readError = 0;
-    return true;
 }
 
 void MMseqsNode::removeOnceRead(const std::string &file) {
     publishRunFile(file + ".read." + SSTR(rank), "");
     if (isMaster()) {
         gatherRunFiles(file + ".read.");
-        removeRunFile(file);
+        FileUtil::removeSharedFile(file);
     }
 }
 
@@ -748,7 +552,7 @@ void MMseqsNode::addPhaseSeconds(std::string &content, const std::string &phase,
 }
 
 void MMseqsNode::printPhaseValues(const std::string &values) {
-    if (Debug::debugLevel < Debug::INFO) {
+    if (Parameters::getInstance().verbosity < Debug::INFO) {
         return;
     }
     std::string prefix = (count > 1) ? "[node " + SSTR(rank) + "] " : "";
@@ -762,7 +566,33 @@ void MMseqsNode::printPhaseValues(const std::string &values) {
         output.append(columns[2], strchr(columns[2], '\n'));
         output += '\n';
     }
-    Debug(Debug::INFO) << output;
+    std::cout << output;
+}
+
+void MMseqsNode::printProgress(const std::string &name, size_t before, size_t after, size_t total, Timer &timer) {
+    if (total > 0 && after <= total && after * 10 / total > before * 10 / total) {
+        double seconds = timer.getTimediff();
+        std::string progress;
+        addPhaseValue(progress, name, SSTR(after * 100 / total) + "% after " + SSTR(static_cast<size_t>(seconds)) + " s"
+                                      + ((after < total) ? ", about " + SSTR(static_cast<size_t>(seconds * (total - after) / after)) + " s left" : ""));
+        printPhaseValues(progress);
+    }
+}
+
+std::string MMseqsNode::formatBytes(size_t bytes) {
+    if (bytes < 1024) {
+        return SSTR(bytes) + "B";
+    }
+    const char units[] = "KMGTPE";
+    double value = bytes / 1024.0;
+    size_t unit = 0;
+    // %.1f prints 1023.95 and up as 1024.0
+    for (; value >= 1023.95 && unit + 1 < sizeof(units) - 1; unit++) {
+        value /= 1024;
+    }
+    char buffer[32];
+    snprintf(buffer, sizeof(buffer), "%.1f%c", value, units[unit]);
+    return buffer;
 }
 
 MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextItem(rank), itemsLeft(count, 0), nextNode((rank + 1) % count) {
@@ -773,23 +603,8 @@ MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : na
     }
 }
 
-// unique to this process
-static std::string getClaimNonce() {
-    struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
-    char host[256] = "";
-    gethostname(host, sizeof(host) - 1);
-    return std::string(host) + "\t" + SSTR(getpid()) + "\t" + SSTR(now.tv_sec) + "." + SSTR(now.tv_nsec) + "\n";
-}
-
 bool MMseqsNode::WorkQueue::takeItem(size_t item) {
     std::string file = name + "." + SSTR(item);
-    // aws backend: the first PUT of a claim wins
-    if (S3Client::isEnabled()) {
-        static const std::string nonce = getClaimNonce();
-        std::string claim = std::string((const char *) &rank, sizeof(rank)) + runId + nonce;
-        return S3Client::putIfAbsent(S3Client::getObjectName(file), claim.data(), claim.size());
-    }
     int fd = open(file.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0666);
     if (fd < 0 && errno == EEXIST) {
         return false;
@@ -826,32 +641,30 @@ size_t MMseqsNode::WorkQueue::takeNextItem() {
 }
 
 void MMseqsNode::WorkQueue::removeTakenItemFiles() {
-    if (S3Client::isEnabled()) {
-#pragma omp parallel for schedule(dynamic, 1)
-        for (size_t item = rank; item < itemCount; item += count) {
-            S3Client::remove(S3Client::getObjectName(name + "." + SSTR(item)));
-        }
-        return;
-    }
     for (size_t item = rank; item < itemCount; item += count) {
-        std::string file = name + "." + SSTR(item);
-        if (FileUtil::fileExists(file.c_str())) {
-            FileUtil::remove(file.c_str());
-        }
+        FileUtil::removeSharedFile(name + "." + SSTR(item));
     }
-}
-
-size_t MMseqsNode::getMemoryLimit(const Parameters &par, size_t localCopyBytes) {
-    const size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
-    if (localCopyBytes > 0 && localCopyBytes >= memoryLimit) {
-        Debug(Debug::ERROR) << "The sequence copy on tmpfs needs " << localCopyBytes << " bytes, the available memory is " << memoryLimit << " bytes\n";
-        EXIT(EXIT_FAILURE);
-    }
-    return memoryLimit - localCopyBytes;
 }
 
 void MMseqsNode::reportUnusableLocalTmp(const std::string &problem) {
-    Debug(Debug::WARNING) << problem << "; using the shared folder instead\n";
+    Debug(Debug::WARNING) << problem << "; continuing without --local-tmp\n";
+}
+
+std::string MMseqsNode::getLocalTmpProblem(const Parameters &par) {
+    // ranks on one machine may create it at once
+    if (FileUtil::makeDir(par.localTmp.c_str()) == false && FileUtil::directoryExists(par.localTmp.c_str()) == false) {
+        Debug(Debug::ERROR) << "Cannot create local tmp dir " << par.localTmp << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    int localTmpFd = open(par.localTmp.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    const StorageKind localTmpStorage = getStorageKind(localTmpFd);
+    struct stat localTmpStat, dbStat;
+    bool isDbDevice = fstat(localTmpFd, &localTmpStat) == 0 && stat(par.db1Index.c_str(), &dbStat) == 0 && localTmpStat.st_dev == dbStat.st_dev;
+    close(localTmpFd);
+    if (localTmpStorage != STORAGE_LOCAL_FLASH) {
+        return std::string("it is on ") + getStorageName(localTmpStorage) + ", not local flash";
+    }
+    return isDbDevice ? "it is on the device of the database" : "";
 }
 
 size_t MMseqsNode::getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads, const std::string &localDirectory, size_t *localNodes) {
@@ -905,6 +718,32 @@ void MMseqsNode::readExchangeTableColumns(int fd, const std::string &fileName, s
     FileUtil::preadAll(fd, fileName.c_str(), (char *) offsets.data(), offsets.size() * sizeof(size_t), tableOffset + column * flushCount * sizeof(size_t));
 }
 
+size_t MMseqsNode::closeExchangeTableFile(FILE *file, const std::string &fileName, const std::vector<size_t> &flushOffsets, size_t columns, size_t tableOffset) {
+    std::vector<size_t> tail(2);
+    tail[0] = tableOffset;
+    tail[1] = flushOffsets.size() / columns;
+    size_t fileSize = writeExchangeTable(fileno(file), fileName, flushOffsets, columns, tail, tableOffset);
+    if (fclose(file) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return fileSize;
+}
+
+int MMseqsNode::openExchangeTableFile(const std::string &fileName, size_t &tableOffset, size_t &flushCount) {
+    size_t size;
+    int fd = FileUtil::openSharedFd(fileName, O_RDONLY, &size);
+    uint64_t tail[2];
+    FileUtil::preadAll(fd, fileName.c_str(), (char *) tail, sizeof(tail), size - sizeof(tail));
+    tableOffset = tail[0];
+    flushCount = tail[1];
+    return fd;
+}
+
+std::string MMseqsNode::getMedianMemberRequestsFile(const std::string &db, size_t node) {
+    return db + ".median_member_requests." + SSTR(node);
+}
+
 // buffer offsets; the own records [ownBegin, ownEnd) are not in the file
 void MMseqsNode::addExchangeFlush(std::vector<size_t> &indexData, size_t &writtenSize, const std::vector<size_t> &nodeOffsets, size_t ownBegin, size_t ownEnd, size_t lineBegin, size_t lineEnd) {
     lineBegin = getExchangeFileOffset(lineBegin, ownBegin, ownEnd);
@@ -937,10 +776,6 @@ std::string MMseqsNode::closeExchange(FILE *file, const std::string &fileName, c
         Debug(Debug::ERROR) << "Cannot close " << fileName << "\n";
         EXIT(EXIT_FAILURE);
     }
-    if (S3Client::isEnabled()) {
-        uploadFile(fileName);
-        FileUtil::remove(fileName.c_str());
-    }
     return barrier(indexFile, SSTR(writtenSize) + "\t" + SSTR(flushCount) + "\n");
 }
 
@@ -956,21 +791,14 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
         flushCounts[node] = Util::fast_atoi<size_t>(columns[1]);
     }
     std::vector<std::vector<size_t> > flushOffsets(count);
-    std::vector<std::string> objects(count);
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t node = 0; node < count; node++) {
         if (flushCounts[node] == 0) {
             continue;
         }
         std::string file = prefix + "." + SSTR(node);
-        if (S3Client::isEnabled()) {
-            objects[node] = S3Client::getObjectName(file);
-            flushOffsets[node].resize(2 * flushCounts[node]);
-            S3Client::getRange(objects[node], writtenSizes[node] + rank * flushCounts[node] * sizeof(size_t), flushOffsets[node].size() * sizeof(size_t), (char *) flushOffsets[node].data());
-            continue;
-        }
         // writable to punch holes
-        files[node] = FileUtil::openFileOrDie(file.c_str(), "r+", true);
+        files[node] = FileUtil::openSharedFile(file, "r+");
         readExchangeTableColumns(fileno(files[node]), file, writtenSizes[node], flushCounts[node], rank, flushOffsets[node]);
     }
     for (size_t node = 0; node < count; node++) {
@@ -979,7 +807,7 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
             size_t pos = flushOffsets[node][flush];
             size_t end = flushOffsets[node][flushCounts[node] + flush];
             if (pos < end) {
-                ExchangeReader reader = { files[node], pos, end, std::vector<char>(), 0, 0, 0, 0, NULL, pos, objects[node] };
+                ExchangeReader reader = { files[node], prefix + "." + SSTR(node), pos, end, std::vector<char>(), 0, 0, 0, 0, NULL, pos, std::vector<char>(), 0, 0, { 0, 0 } };
                 readers.push_back(reader);
             }
         }
@@ -994,7 +822,7 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
     std::map<std::string, std::vector<std::pair<char *, size_t> > >::iterator own = ownExchangeRecords.find(prefix);
     if (own != ownExchangeRecords.end()) {
         for (size_t i = 0; i < own->second.size(); i++) {
-            ExchangeReader reader = { NULL, 0, own->second[i].second, std::vector<char>(), 0, 0, 0, 0, own->second[i].first, 0, std::string() };
+            ExchangeReader reader = { NULL, std::string(), 0, own->second[i].second, std::vector<char>(), 0, 0, 0, 0, own->second[i].first, 0, std::vector<char>(), 0, 0, { 0, 0 } };
             readers.push_back(reader);
         }
         ownExchangeRecords.erase(own);
@@ -1002,17 +830,18 @@ void MMseqsNode::openExchange(const std::string &index, const std::string &prefi
 }
 
 static size_t getUnreadSize(const MMseqsNode::ExchangeReader &reader) {
-    return reader.end - reader.pos;
+    return reader.end - reader.pos + reader.encodedEnd - reader.encodedPos;
 }
 
 static const char *getReaderData(const MMseqsNode::ExchangeReader &reader) {
     return (reader.ownRecords != NULL) ? reader.ownRecords : reader.buffer.data();
 }
 
-static const size_t PUNCH_HOLE_ALIGNMENT = 1024 * 1024;
+static const size_t PUNCH_HOLE_MIN_SIZE = 1024 * 1024 * 1024;
 static const size_t EXCHANGE_BUFFER_SIZE = 1024 * 1024;
 
-static void fillExchangeReader(MMseqsNode::ExchangeReader &reader, size_t size, size_t bufferSize, const std::string &prefix) {
+// an encoded reader reads file bytes into encoded, decodeExchangeReader fills the buffer
+static void fillExchangeReader(MMseqsNode::ExchangeReader &reader, size_t size, size_t bufferSize, bool isEncoded = false) {
     if (reader.ownRecords != NULL) {
         reader.bufferEnd = std::max(reader.bufferEnd, std::min(reader.end, reader.bufferPos + std::max(size, bufferSize)));
         reader.pos = reader.bufferEnd;
@@ -1021,9 +850,10 @@ static void fillExchangeReader(MMseqsNode::ExchangeReader &reader, size_t size, 
     if (reader.bufferEnd - reader.bufferPos >= size || getUnreadSize(reader) == 0) {
         return;
     }
-    size_t punchEnd = (reader.pos - reader.bufferEnd + reader.bufferPos) / PUNCH_HOLE_ALIGNMENT * PUNCH_HOLE_ALIGNMENT;
-    if (reader.file != NULL && punchEnd >= reader.punchEnd + 1024 * 1024 * 1024) {
-        FileUtil::punchHole(fileno(reader.file), reader.punchEnd, punchEnd - reader.punchEnd);
+    size_t unusedSize = isEncoded ? reader.encodedEnd - reader.encodedPos : reader.bufferEnd - reader.bufferPos;
+    size_t punchEnd = (reader.pos - unusedSize) / FileUtil::PUNCH_HOLE_ALIGNMENT * FileUtil::PUNCH_HOLE_ALIGNMENT;
+    if (punchEnd >= reader.punchEnd + PUNCH_HOLE_MIN_SIZE) {
+        FileUtil::punchWholeBlocks(fileno(reader.file), reader.punchEnd, punchEnd - reader.punchEnd);
         reader.punchEnd = punchEnd;
     }
     if (reader.bufferEnd > reader.bufferPos) {
@@ -1033,26 +863,97 @@ static void fillExchangeReader(MMseqsNode::ExchangeReader &reader, size_t size, 
     reader.recordEnd -= std::min(reader.recordEnd, reader.bufferPos);
     reader.lastRecord -= std::min(reader.lastRecord, reader.bufferPos);
     reader.bufferPos = 0;
-    size_t readerBufferSize = std::min(std::max(size, bufferSize), reader.bufferEnd + getUnreadSize(reader));
-    if (reader.buffer.size() < readerBufferSize) {
-        reader.buffer.resize(readerBufferSize);
+    if (reader.encodedPos > 0) {
+        memmove(reader.encoded.data(), reader.encoded.data() + reader.encodedPos, reader.encodedEnd - reader.encodedPos);
+    }
+    reader.encodedEnd -= reader.encodedPos;
+    reader.encodedPos = 0;
+    std::vector<char> &data = isEncoded ? reader.encoded : reader.buffer;
+    size_t &dataEnd = isEncoded ? reader.encodedEnd : reader.bufferEnd;
+    size_t readerBufferSize = std::min(std::max(size, bufferSize), dataEnd + reader.end - reader.pos);
+    if (data.size() < readerBufferSize) {
+        data.resize(readerBufferSize);
     }
     std::vector<std::pair<size_t, size_t> > reads;
-    while (reader.bufferEnd < reader.buffer.size() && getUnreadSize(reader) > 0) {
-        size_t readSize = std::min(std::min(reader.buffer.size() - reader.bufferEnd, reader.end - reader.pos), BatchReader::MAX_READ_REQUEST_SIZE);
-        reads.push_back(std::make_pair(reader.pos, reader.bufferEnd));
+    while (dataEnd < data.size() && reader.pos < reader.end) {
+        size_t readSize = std::min(std::min(data.size() - dataEnd, reader.end - reader.pos), BatchReader::MAX_READ_REQUEST_SIZE);
+        reads.push_back(std::make_pair(reader.pos, dataEnd));
         reader.pos += readSize;
-        reader.bufferEnd += readSize;
+        dataEnd += readSize;
     }
     size_t readCount = reads.size();
-    reads.push_back(std::make_pair(reader.pos, reader.bufferEnd));
+    reads.push_back(std::make_pair(reader.pos, dataEnd));
 #pragma omp parallel for schedule(dynamic, 1) if (omp_in_parallel() == 0)
     for (size_t i = 0; i < readCount; i++) {
-        if (reader.file == NULL) {
-            S3Client::getRange(reader.object, reads[i].first, reads[i + 1].second - reads[i].second, reader.buffer.data() + reads[i].second);
-        } else {
-            FileUtil::preadAll(fileno(reader.file), prefix.c_str(), reader.buffer.data() + reads[i].second, reads[i + 1].second - reads[i].second, reads[i].first);
+        FileUtil::preadAll(fileno(reader.file), reader.fileName.c_str(), data.data() + reads[i].second, reads[i + 1].second - reads[i].second, reads[i].first);
+    }
+}
+
+static char *putVarint(char *data, uint64_t value) {
+    for (; value >= 128; value >>= 7) {
+        *data++ = static_cast<char>(value | 128);
+    }
+    *data++ = static_cast<char>(value);
+    return data;
+}
+
+// NULL if the varint goes past end
+static const char *getVarint(const char *data, const char *end, uint64_t &value) {
+    value = 0;
+    for (unsigned int shift = 0; data < end; shift += 7) {
+        unsigned char byte = static_cast<unsigned char>(*data++);
+        value |= static_cast<uint64_t>(byte & 127) << shift;
+        if (byte < 128) {
+            return data;
         }
+    }
+    return NULL;
+}
+
+static void decodeExchangeReader(MMseqsNode::ExchangeReader &reader, size_t size, bool isClusterPair, bool byMember) {
+    size_t headerSize = sizeof(ClusterPair) + (isClusterPair ? 0 : sizeof(unsigned int));
+    if (reader.ownRecords != NULL || reader.bufferEnd - reader.bufferPos >= size || reader.encodedPos == reader.encodedEnd) {
+        return;
+    }
+    const char *end = reader.encoded.data() + reader.encodedEnd;
+    while (reader.bufferEnd - reader.bufferPos < size && reader.encodedPos < reader.encodedEnd) {
+        const char *data = reader.encoded.data() + reader.encodedPos;
+        ClusterPair previous = reader.previous;
+        if (*data == 0) {
+            previous.repKey = 0;
+            previous.memberKey = 0;
+            data++;
+        }
+        uint64_t keyDelta;
+        uint64_t otherKeyDelta;
+        uint64_t length = 0;
+        if ((data = getVarint(data, end, keyDelta)) == NULL || (data = getVarint(data, end, otherKeyDelta)) == NULL
+            || (isClusterPair == false && ((data = getVarint(data, end, length)) == NULL || static_cast<size_t>(end - data) < length))) {
+            break;
+        }
+        DBKeyType previousKey = byMember ? previous.memberKey : previous.repKey;
+        DBKeyType key = previousKey + keyDelta - 1;
+        DBKeyType otherKey = ((key == previousKey) ? (byMember ? previous.repKey : previous.memberKey) : key) + ((otherKeyDelta >> 1) ^ (0 - (otherKeyDelta & 1)));
+        ClusterPair pair = { byMember ? otherKey : key, byMember ? key : otherKey };
+        // grow with the decoded records, size can be far more than the part holds
+        if (reader.buffer.size() < reader.bufferEnd + headerSize + length) {
+            reader.buffer.resize(std::max(reader.bufferEnd + headerSize + length, std::min(2 * reader.buffer.size(), reader.bufferPos + size + headerSize)));
+        }
+        char *record = reader.buffer.data() + reader.bufferEnd;
+        memcpy(record, &pair, sizeof(ClusterPair));
+        if (isClusterPair == false) {
+            unsigned int recordLength = static_cast<unsigned int>(length);
+            memcpy(record + sizeof(ClusterPair), &recordLength, sizeof(unsigned int));
+            memcpy(record + headerSize, data, length);
+            data += length;
+        }
+        reader.bufferEnd += headerSize + length;
+        reader.previous = pair;
+        reader.encodedPos = data - reader.encoded.data();
+    }
+    if (reader.bufferEnd - reader.bufferPos < size && reader.encodedPos < reader.encodedEnd && reader.pos == reader.end) {
+        Debug(Debug::ERROR) << "Cannot read " << reader.fileName << ": a record ends after its part\n";
+        EXIT(EXIT_FAILURE);
     }
 }
 
@@ -1063,10 +964,9 @@ static void releaseExchangeReader(MMseqsNode::ExchangeReader &reader) {
             free(reader.ownRecords);
             reader.ownRecords = NULL;
         } else {
-            if (reader.file != NULL) {
-                FileUtil::punchHole(fileno(reader.file), reader.punchEnd, reader.end - reader.punchEnd);
-            }
+            FileUtil::punchWholeBlocks(fileno(reader.file), reader.punchEnd, reader.end - reader.punchEnd);
             std::vector<char>().swap(reader.buffer);
+            std::vector<char>().swap(reader.encoded);
         }
         reader.bufferPos = 0;
         reader.bufferEnd = 0;
@@ -1081,6 +981,7 @@ size_t MMseqsNode::readExchangeRecordsUpTo(std::vector<ExchangeReader> &readers,
     size_t bufferSize = std::max(EXCHANGE_BUFFER_SIZE, bufferMemory / 2 / std::max((size_t) 1, readers.size()));
     size_t threads = static_cast<size_t>(Parameters::getInstance().threads);
     bool isClusterPair = recordSize == NULL;
+    bool byMember = compare == ClusterPair::compareByMember;
     std::vector<char> needsRead(readers.size());
     for (size_t i = 0; i < readers.size(); i++) {
         const ExchangeReader &reader = readers[i];
@@ -1089,7 +990,7 @@ size_t MMseqsNode::readExchangeRecordsUpTo(std::vector<ExchangeReader> &readers,
 #pragma omp parallel for schedule(dynamic, 1) if (readers.size() >= threads)
     for (size_t i = 0; i < readers.size(); i++) {
         if (needsRead[i]) {
-            fillExchangeReader(readers[i], bufferSize, bufferSize, prefix);
+            fillExchangeReader(readers[i], bufferSize, bufferSize, true);
         }
     }
 #pragma omp parallel for schedule(dynamic, 1)
@@ -1099,7 +1000,8 @@ size_t MMseqsNode::readExchangeRecordsUpTo(std::vector<ExchangeReader> &readers,
             continue;
         }
         for (size_t fillSize = bufferSize; ; fillSize *= 2) {
-            fillExchangeReader(reader, fillSize, fillSize, prefix);
+            fillExchangeReader(reader, fillSize, fillSize, true);
+            decodeExchangeReader(reader, fillSize, isClusterPair, byMember);
             const char *data = getReaderData(reader);
             if (isClusterPair && reader.bufferEnd - reader.recordEnd >= sizeof(ClusterPair)) {
                 reader.recordEnd += (reader.bufferEnd - reader.recordEnd) / sizeof(ClusterPair) * sizeof(ClusterPair);
@@ -1216,7 +1118,7 @@ size_t MMseqsNode::readExchangeCompressionUnits(std::vector<ExchangeReader> &rea
             std::vector<std::pair<size_t, size_t> >::const_iterator lengthOffset = readerLengthOffsets[i].end();
             uint64_t compressionUnit[4];
             for (;;) {
-                fillExchangeReader(reader, sizeof(compressionUnit), bufferSize, prefix);
+                fillExchangeReader(reader, sizeof(compressionUnit), bufferSize);
                 if (reader.bufferEnd - reader.bufferPos < sizeof(compressionUnit)) {
                     break;
                 }
@@ -1229,7 +1131,7 @@ size_t MMseqsNode::readExchangeCompressionUnits(std::vector<ExchangeReader> &rea
                     nextOffset = std::min(nextOffset, offset);
                     break;
                 }
-                fillExchangeReader(reader, sizeof(compressionUnit) + compressionUnit[3], bufferSize, prefix);
+                fillExchangeReader(reader, sizeof(compressionUnit) + compressionUnit[3], bufferSize);
                 if (reader.bufferEnd - reader.bufferPos < sizeof(compressionUnit) + compressionUnit[3]) {
                     Debug(Debug::ERROR) << "Cannot read " << prefix << ": a record ends after its part\n";
                     EXIT(EXIT_FAILURE);
@@ -1286,6 +1188,96 @@ static void addBinOffsets(const ClusterPair *pairs, size_t pairCount, bool (*com
     binOffsets[flushBegin + bins] = pairCount;
 }
 
+// a 0 resets the previous record to { 0, 0 }; the key the records are sorted by is stored as difference + 1, the other key as zigzag difference
+// to the previous other key if the sorted key repeats, else to the sorted key
+void MMseqsNode::encodeExchangeRecords(const char *records, std::vector<size_t> &sliceOffsets, std::vector<size_t> &cuts, size_t skipBegin, size_t skipEnd,
+                                       bool isClusterPair, bool (*compare)(const ClusterPair &, const ClusterPair &), std::vector<std::vector<char> > &sliceRecords) {
+    bool byMember = compare == ClusterPair::compareByMember;
+    size_t headerSize = sizeof(ClusterPair) + (isClusterPair ? 0 : sizeof(unsigned int));
+    size_t slices = sliceOffsets.size() - 1;
+    sliceRecords.resize(slices);
+    std::vector<size_t> cutSliceOffsets(cuts.size(), 0);
+#pragma omp parallel for schedule(dynamic, 1)
+    for (size_t slice = 0; slice < slices; slice++) {
+        std::vector<char> &encoded = sliceRecords[slice];
+        size_t encodedSize = 0;
+        size_t cut = std::upper_bound(cuts.begin(), cuts.end(), sliceOffsets[slice]) - cuts.begin();
+        ClusterPair previous = { 0, 0 };
+        bool isRunStart = true;
+        for (size_t pos = sliceOffsets[slice]; pos < sliceOffsets[slice + 1];) {
+            for (; cut < cuts.size() && cuts[cut] <= pos; cut++) {
+                cutSliceOffsets[cut] = encodedSize;
+                isRunStart = true;
+            }
+            if (pos >= skipBegin && pos < skipEnd) {
+                pos = skipEnd;
+                isRunStart = true;
+                continue;
+            }
+            ClusterPair pair;
+            memcpy(&pair, records + pos, sizeof(ClusterPair));
+            unsigned int length = 0;
+            if (isClusterPair == false) {
+                memcpy(&length, records + pos + sizeof(ClusterPair), sizeof(unsigned int));
+            }
+            // a reset and three varints at most
+            size_t maxSize = 31 + length;
+            if (encoded.size() < encodedSize + maxSize) {
+                encoded.resize(std::max(2 * encoded.size(), encodedSize + maxSize));
+            }
+            char *data = encoded.data() + encodedSize;
+            if (isRunStart) {
+                previous.repKey = 0;
+                previous.memberKey = 0;
+                *data++ = 0;
+                isRunStart = false;
+            }
+            DBKeyType key = byMember ? pair.memberKey : pair.repKey;
+            DBKeyType otherKey = byMember ? pair.repKey : pair.memberKey;
+            DBKeyType previousKey = byMember ? previous.memberKey : previous.repKey;
+            uint64_t otherKeyDelta = static_cast<uint64_t>(otherKey) - ((key == previousKey) ? (byMember ? previous.repKey : previous.memberKey) : key);
+            data = putVarint(data, static_cast<uint64_t>(key) - previousKey + 1);
+            data = putVarint(data, (otherKeyDelta << 1) ^ (0 - (otherKeyDelta >> 63)));
+            if (isClusterPair == false) {
+                data = putVarint(data, length);
+                memcpy(data, records + pos + headerSize, length);
+                data += length;
+            }
+            encodedSize = data - encoded.data();
+            previous = pair;
+            pos += headerSize + length;
+        }
+        encoded.resize(encodedSize);
+    }
+    std::vector<size_t> recordSliceOffsets(sliceOffsets);
+    sliceOffsets[0] = 0;
+    for (size_t slice = 0; slice < slices; slice++) {
+        sliceOffsets[slice + 1] = sliceOffsets[slice] + sliceRecords[slice].size();
+    }
+    for (size_t i = 0; i < cuts.size(); i++) {
+        size_t slice = std::upper_bound(recordSliceOffsets.begin(), recordSliceOffsets.end(), cuts[i]) - recordSliceOffsets.begin() - 1;
+        cuts[i] = sliceOffsets[slice] + ((recordSliceOffsets[slice] == cuts[i]) ? 0 : cutSliceOffsets[i]);
+    }
+}
+
+// sliceOffsets become offsets in the file part
+static void writeEncodedPairs(const ClusterPair *pairs, size_t pairCount, std::vector<size_t> &cuts, size_t skipBegin, size_t skipEnd, bool (*compare)(const ClusterPair &, const ClusterPair &),
+                              FILE *file, const std::string &fileName, std::vector<size_t> &sliceOffsets) {
+    int threads = Parameters::getInstance().threads;
+    sliceOffsets.resize(threads + 1);
+    for (int thread = 0; thread <= threads; thread++) {
+        sliceOffsets[thread] = pairCount * thread / threads * sizeof(ClusterPair);
+    }
+    std::vector<std::vector<char> > sliceRecords;
+    MMseqsNode::encodeExchangeRecords((const char *) pairs, sliceOffsets, cuts, skipBegin, skipEnd, true, compare, sliceRecords);
+    for (int thread = 0; thread < threads; thread++) {
+        if (fwrite(sliceRecords[thread].data(), 1, sliceRecords[thread].size(), file) != sliceRecords[thread].size()) {
+            Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+}
+
 static size_t writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare)(const ClusterPair &, const ClusterPair &), const std::vector<size_t> &nodeKeyOffsets,
                          FILE *file, const std::string &fileName, std::vector<size_t> &indexData, size_t &writtenSize, size_t ownPairLimit) {
     std::vector<size_t> nodeOffsets(MMseqsNode::count + 1, pairCount * sizeof(ClusterPair));
@@ -1295,14 +1287,17 @@ static size_t writePairs(ClusterPair *pairs, size_t pairCount, bool (*compare)(c
     }
     size_t ownBegin = nodeOffsets[MMseqsNode::rank] / sizeof(ClusterPair);
     size_t ownEnd = ownBegin + std::min(nodeOffsets[MMseqsNode::rank + 1] / sizeof(ClusterPair) - ownBegin, ownPairLimit);
-    if (fwrite(pairs, sizeof(ClusterPair), ownBegin, file) != ownBegin || fwrite(pairs + ownEnd, sizeof(ClusterPair), pairCount - ownEnd, file) != pairCount - ownEnd) {
-        Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
-        EXIT(EXIT_FAILURE);
-    }
+    std::vector<size_t> sliceOffsets;
+    writeEncodedPairs(pairs, pairCount, nodeOffsets, ownBegin * sizeof(ClusterPair), ownEnd * sizeof(ClusterPair), compare, file, fileName, sliceOffsets);
     if (ownBegin > 0) {
         memmove(pairs, pairs + ownBegin, (ownEnd - ownBegin) * sizeof(ClusterPair));
     }
-    MMseqsNode::addExchangeFlush(indexData, writtenSize, nodeOffsets, ownBegin * sizeof(ClusterPair), ownEnd * sizeof(ClusterPair), 0, pairCount * sizeof(ClusterPair));
+    // index lines per thread group, so receivers decode on all threads
+    size_t threads = sliceOffsets.size() - 1;
+    size_t lines = std::max((size_t) 1, threads / MMseqsNode::count);
+    for (size_t line = 0; line < lines; line++) {
+        MMseqsNode::addExchangeFlush(indexData, writtenSize, nodeOffsets, 0, 0, sliceOffsets[threads * line / lines], sliceOffsets[threads * (line + 1) / lines]);
+    }
     return ownEnd - ownBegin;
 }
 
@@ -1321,10 +1316,14 @@ void MMseqsNode::ClusterPairWriter::flush() {
     SORT_PARALLEL(pairs, pairs + pairCount, compare);
     if (balancedKeyOffsets != NULL) {
         addBinOffsets(pairs, pairCount, compare, nodeKeyOffsets[count], binOffsets);
-        if (fwrite(pairs, sizeof(ClusterPair), pairCount, file) != pairCount) {
-            Debug(Debug::ERROR) << "Cannot write " << fileName << "\n";
-            EXIT(EXIT_FAILURE);
+        // every bin decodes on its own, the nodes get bins
+        std::vector<size_t> binCuts(binOffsets.end() - BALANCE_BINS_PER_NODE * count - 1, binOffsets.end());
+        for (size_t bin = 0; bin < binCuts.size(); bin++) {
+            binCuts[bin] *= sizeof(ClusterPair);
         }
+        std::vector<size_t> sliceOffsets;
+        writeEncodedPairs(pairs, pairCount, binCuts, 0, 0, compare, file, fileName, sliceOffsets);
+        binByteOffsets.insert(binByteOffsets.end(), binCuts.begin(), binCuts.end());
         pairCount = 0;
         return;
     }
@@ -1361,18 +1360,12 @@ std::string MMseqsNode::ClusterPairWriter::close(const uint64_t *singletonBits, 
         publishRunFile(binFile + "." + SSTR(rank), std::string((const char *) binLines.data(), bins * sizeof(uint64_t)));
         std::vector<uint64_t> nodeBinOffsets(count + 1, bins);
         if (isMaster()) {
+            std::string nodeBinLines = gatherRunFiles(binFile + ".");
             std::fill(binLines.begin(), binLines.end(), 0);
-#pragma omp parallel for schedule(dynamic, 1)
-            for (unsigned int node = 0; node < count; node++) {
-                std::string file = binFile + "." + SSTR(node);
-                std::string nodeBinLines = waitForRunFile(file);
-                removeRunFile(file);
-#pragma omp critical
-                for (size_t bin = 0; bin < bins; bin++) {
-                    uint64_t lines;
-                    memcpy(&lines, nodeBinLines.data() + bin * sizeof(uint64_t), sizeof(uint64_t));
-                    binLines[bin] += lines;
-                }
+            for (size_t i = 0; i < count * bins; i++) {
+                uint64_t lines;
+                memcpy(&lines, nodeBinLines.data() + i * sizeof(uint64_t), sizeof(uint64_t));
+                binLines[i % bins] += lines;
             }
             uint64_t totalLines = 0;
             for (size_t bin = 0; bin < bins; bin++) {
@@ -1397,13 +1390,17 @@ std::string MMseqsNode::ClusterPairWriter::close(const uint64_t *singletonBits, 
             (*balancedKeyOffsets)[node] = getBinKey(keyEnd, nodeBinOffsets[node]);
         }
         std::vector<size_t> nodeOffsets(count + 1);
-        for (size_t flushBegin = 0; flushBegin + bins + 1 < binOffsets.size(); flushBegin += bins + 1) {
+        size_t lines = std::max((size_t) 1, static_cast<size_t>(Parameters::getInstance().threads) / count);
+        for (size_t flushBegin = 0; flushBegin < binByteOffsets.size(); flushBegin += bins + 1) {
             for (size_t node = 0; node <= count; node++) {
-                nodeOffsets[node] = binOffsets[flushBegin + nodeBinOffsets[node]] * sizeof(ClusterPair);
+                nodeOffsets[node] = binByteOffsets[flushBegin + nodeBinOffsets[node]];
             }
-            addExchangeFlush(indexData, writtenSize, nodeOffsets, 0, 0, 0, nodeOffsets[count]);
+            for (size_t line = 0; line < lines; line++) {
+                addExchangeFlush(indexData, writtenSize, nodeOffsets, 0, 0, binByteOffsets[flushBegin + bins * line / lines], binByteOffsets[flushBegin + bins * (line + 1) / lines]);
+            }
         }
         std::vector<size_t>().swap(binOffsets);
+        std::vector<size_t>().swap(binByteOffsets);
     }
     size_t ownPairCount = 0;
     if (pairCount > 0) {
@@ -1433,9 +1430,6 @@ static void writeKeyBits(const std::string &bitsFile, const uint64_t *bits, size
         || fclose(file) != 0) {
         Debug(Debug::ERROR) << "Cannot write " << bitsFile << "\n";
         EXIT(EXIT_FAILURE);
-    }
-    if (S3Client::isEnabled()) {
-        MMseqsNode::uploadFile(bitsFile);
     }
 }
 
@@ -1475,7 +1469,7 @@ static void sendMembersWithoutEntry(MMseqsNode::ClusterPairWriter &pairWriter, c
 }
 
 // empty if its first entry is larger than splitSize
-static size_t findSplitEnd(DBReader<DBKeyType> &cluDb, size_t splitBegin, size_t splitOffset, size_t splitSize, size_t splitEntries, size_t entryEnd) {
+size_t MMseqsNode::findSplitEnd(DBReader<DBKeyType> &cluDb, size_t splitBegin, size_t splitOffset, size_t splitSize, size_t splitEntries, size_t entryEnd) {
     size_t sizeEnd = (splitOffset + splitSize >= cluDb.getDataSize()) ? cluDb.getSize() : cluDb.findEntryByOffset(splitOffset + splitSize + 1) - 1;
     return std::min(std::min(sizeEnd, splitBegin + splitEntries), entryEnd);
 }
@@ -1489,7 +1483,7 @@ std::string MMseqsNode::sendClusterPairs(const std::string &clu, bool withRepres
     if (receivedPrefix.empty() == false) {
         openExchange(receivedIndex, receivedPrefix, receivedReaders, receivedFiles);
     }
-    size_t memoryLimit = getMemoryLimit(Parameters::getInstance());
+    size_t memoryLimit = Util::computeMemory(Parameters::getInstance().splitMemoryLimit);
     ClusterPairWriter pairWriter(exchange, memoryLimit / 4 / sizeof(ClusterPair), compare, nodeKeyOffsets, balancedKeyOffsets);
 
     std::vector<DBKeyType> repKeys;
@@ -1675,8 +1669,7 @@ uint64_t *MMseqsNode::readRepresentativeBits(const std::string &db, const std::v
             continue;
         }
         std::string bitsFile = db + ".bits." + SSTR(node);
-        addRemoteDatabaseFile(bitsFile);
-        FILE *file = FileUtil::openFileOrDie(bitsFile.c_str(), "r", true);
+        FILE *file = FileUtil::openSharedFile(bitsFile, "r");
         uint64_t keyRange[2];
         FileUtil::preadAll(fileno(file), bitsFile.c_str(), (char *) keyRange, sizeof(keyRange), 0);
         if (keyRange[0] > from || keyRange[0] + keyRange[1] < to) {
@@ -1692,29 +1685,34 @@ uint64_t *MMseqsNode::readRepresentativeBits(const std::string &db, const std::v
     return bits;
 }
 
-void MMseqsNode::writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount) {
+void MMseqsNode::writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount,
+                                         const std::vector<size_t> &rangeMedianMemberCounts) {
     writeKeyBits(db + ".bits." + SSTR(rank), bits, firstKey, keyCount);
-    // add the representative count as a sixth column
+    // add the representative count as a sixth column, the median member count as a seventh
     const DBReader<DBKeyType>::Index *index = seqDbr.getIndex();
     std::string representativeIndex;
     for (size_t range = 0; range < seqDbr.getIndexSize(); range++) {
         if (seqDbr.getRangeDataFile(range) != rank) {
             continue;
         }
-        size_t rangeEndKey = (range + 1 < seqDbr.getIndexSize()) ? index[range + 1].id : seqDbr.getSize();
+        size_t rangeEndKey = seqDbr.getRangeEndId(range);
         size_t rangeRepresentatives = Util::countSetBits(bits, index[range].id - firstKey, rangeEndKey - firstKey);
         representativeIndex += SSTR(index[range].id) + "\t" + SSTR(index[range].offset) + "\t" + SSTR(index[range].length) + "\t"
-                             + SSTR(rangeEndKey - index[range].id) + "\t" + SSTR(rank) + "\t" + SSTR(rangeRepresentatives) + "\n";
+                             + SSTR(rangeEndKey - index[range].id) + "\t" + SSTR(rank) + "\t" + SSTR(rangeRepresentatives)
+                             + (rangeMedianMemberCounts.empty() ? "" : "\t" + SSTR(rangeMedianMemberCounts[range])) + "\n";
     }
     publishRunFile(db + ".index." + SSTR(rank), representativeIndex);
+}
+
+void MMseqsNode::gatherRepresentativeIndex(const std::string &db) {
     if (isMaster()) {
-        publishFile(db + ".index", gatherRunFiles(db + ".index."));
+        FileUtil::publishFile(db + ".index", gatherRunFiles(db + ".index."));
     }
 }
 
 std::vector<size_t> MMseqsNode::getClusterKeyOffsets(const std::string &barrierFile, const std::string &clu, size_t keyCount, const std::string &firstKeySource) {
     std::string cluIndex = firstKeySource.empty() ? clu + ".index." + SSTR(rank) : firstKeySource;
-    FILE *handle = FileUtil::openFileOrDie(cluIndex.c_str(), "r", true);
+    FILE *handle = FileUtil::openSharedFile(cluIndex, "r");
     uint64_t firstIndexPair[2];
     if (fread(firstIndexPair, sizeof(uint64_t), 2, handle) != 2 || fclose(handle) != 0) {
         Debug(Debug::ERROR) << "Cannot read " << cluIndex << "\n";
@@ -1792,8 +1790,6 @@ void MMseqsNode::readClusterKeys(const std::string &clu, const std::vector<size_
         cluDb.open(DBReader<DBKeyType>::NOSORT);
         size_t entryBegin = cluDb.findEntryByKey(from);
         size_t entryEnd = cluDb.findEntryByKey(to);
-        cluDb.close();
-        FILE *cluIndexFile = FileUtil::openFileOrDie(cluIndex.c_str(), "r", true);
         size_t nodeKeysBegin = keys.size();
         keys.resize(nodeKeysBegin + entryEnd - entryBegin);
 #pragma omp parallel
@@ -1802,16 +1798,13 @@ void MMseqsNode::readClusterKeys(const std::string &clu, const std::vector<size_
 #pragma omp for schedule(dynamic, 1)
             for (size_t entry = entryBegin; entry < entryEnd; entry += pairsPerRead) {
                 size_t pairCount = std::min(pairsPerRead, entryEnd - entry);
-                FileUtil::preadAll(fileno(cluIndexFile), cluIndex.c_str(), (char *) indexPairs.data(), pairCount * 2 * sizeof(uint64_t), entry * 2 * sizeof(uint64_t));
+                cluDb.readIndexPairs(entry, entry + pairCount, indexPairs.data());
                 for (size_t i = 0; i < pairCount; i++) {
                     keys[nodeKeysBegin + entry - entryBegin + i] = indexPairs[2 * i];
                 }
             }
         }
-        if (fclose(cluIndexFile) != 0) {
-            Debug(Debug::ERROR) << "Cannot close " << cluIndex << "\n";
-            EXIT(EXIT_FAILURE);
-        }
+        cluDb.close();
     }
 }
 
@@ -1877,7 +1870,7 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
     std::vector<ExchangeReader> repReaders;
     std::vector<FILE *> repFiles;
     openExchange(index, prefix, repReaders, repFiles);
-    size_t memoryLimit = getMemoryLimit(par);
+    size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
     std::string resultDb = clu + "." + SSTR(rank);
     std::string resultIndex = clu + ".index." + SSTR(rank);
     FILE *resultDataFile = FileUtil::openAndDelete(resultDb.c_str(), "w");
@@ -1987,331 +1980,12 @@ void MMseqsNode::writeClusterPairs(const std::string &index, const std::string &
 }
 
 void MMseqsNode::removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues) {
-    addPhaseValue(phaseValues, "Exchange bytes sent", SSTR(sentExchangeSize));
-    addPhaseValue(phaseValues, "Exchange bytes sent to other nodes", SSTR(sentOtherNodeExchangeSize));
-    addPhaseValue(phaseValues, "Exchange index opens", SSTR(exchangeIndexOpenCount));
+    addPhaseValue(phaseValues, "Data sent", formatBytes(sentExchangeSize) + ", " + formatBytes(sentOtherNodeExchangeSize) + " of it to other nodes");
     printPhaseValues(phaseValues);
     barrier(prefix + ".merged");
-    removeFile(lastExchange + "." + SSTR(rank));
+    FileUtil::removeSharedFile(lastExchange + "." + SSTR(rank));
     for (size_t i = 0; isMaster() && i < exchanges.size(); i++) {
-        FileUtil::remove((exchanges[i] + ".index").c_str());
+        FileUtil::removeSharedFile(exchanges[i] + ".index");
     }
     removeOnceRead(prefix + ".merged");
-}
-
-void MMseqsNode::uploadFile(const std::string &file, const std::string &object) {
-    S3Client::putFile(object.empty() ? S3Client::getObjectName(file) : object, file);
-}
-
-// aws backend: the local file may be gone already, written exchange files are removed after their upload
-void MMseqsNode::removeFile(const std::string &file) {
-    if (S3Client::isEnabled() == false) {
-        FileUtil::remove(file.c_str());
-        return;
-    }
-    if (FileUtil::fileExists(file.c_str())) {
-        FileUtil::remove(file.c_str());
-    }
-    S3Client::remove(S3Client::getObjectName(file));
-}
-
-bool MMseqsNode::fetchFile(const std::string &file, bool mustExist) {
-    if (S3Client::isEnabled() == false || FileUtil::fileExists(file.c_str())) {
-        return true;
-    }
-    std::string content;
-    if (S3Client::get(S3Client::getObjectName(file), content) == false) {
-        if (mustExist) {
-            Debug(Debug::ERROR) << "Cannot find " << file << " in S3\n";
-            EXIT(EXIT_FAILURE);
-        }
-        return false;
-    }
-    FileUtil::publishFile(file, content);
-    return true;
-}
-
-// another node's file is an empty sparse placeholder of the object size; reads of it go from S3 straight into the read buffer
-struct RemoteFile {
-    std::string object;
-    // empty for an exchange file, whose placeholder is unlinked
-    std::string path;
-    // keeps the inode, so no other file takes it
-    int fd;
-    size_t size;
-    bool isExchange;
-    // segment starts and the size; segment k is the object <object>.<k>
-    std::vector<size_t> segmentOffsets;
-};
-
-static std::map<std::pair<dev_t, ino_t>, RemoteFile *> remoteFiles;
-static size_t remoteFileCount = 0;
-static std::mutex remoteMutex;
-
-static RemoteFile *findRemoteFile(int fd) {
-    struct stat sb;
-    if (__atomic_load_n(&remoteFileCount, __ATOMIC_ACQUIRE) == 0 || fstat(fd, &sb) != 0) {
-        return NULL;
-    }
-    std::lock_guard<std::mutex> lock(remoteMutex);
-    std::map<std::pair<dev_t, ino_t>, RemoteFile *>::iterator it = remoteFiles.find(std::make_pair(sb.st_dev, sb.st_ino));
-    return (it == remoteFiles.end()) ? NULL : it->second;
-}
-
-static void addRemoteFile(RemoteFile *remote) {
-    struct stat sb;
-    if (fstat(remote->fd, &sb) != 0) {
-        Debug(Debug::ERROR) << "Cannot stat the placeholder of " << remote->object << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    remoteFiles[std::make_pair(sb.st_dev, sb.st_ino)] = remote;
-    __atomic_store_n(&remoteFileCount, remoteFiles.size(), __ATOMIC_RELEASE);
-}
-
-bool MMseqsNode::isRemoteFile(int fd) {
-    return findRemoteFile(fd) != NULL;
-}
-
-bool MMseqsNode::readRemoteFile(int fd, char *data, size_t size, size_t offset, size_t &readSize) {
-    RemoteFile *remote = findRemoteFile(fd);
-    if (remote == NULL) {
-        return false;
-    }
-    readSize = (offset < remote->size) ? std::min(size, remote->size - offset) : 0;
-    if (readSize > 0 && remote->segmentOffsets.empty()) {
-        S3Client::getRange(remote->object, offset, readSize, data);
-    }
-    const std::vector<size_t> &segments = remote->segmentOffsets;
-    for (size_t pos = offset; segments.empty() == false && pos < offset + readSize;) {
-        size_t segment = std::upper_bound(segments.begin(), segments.end(), pos) - segments.begin() - 1;
-        size_t end = std::min(offset + readSize, segments[segment + 1]);
-        S3Client::getRange(remote->object + "." + SSTR(segment), pos - segments[segment], end - pos, data + (pos - offset));
-        pos = end;
-    }
-    return true;
-}
-
-// for the few fread readers: the bytes go into the placeholder until releaseStagedReads
-void MMseqsNode::stageRead(int fd, size_t offset, size_t size) {
-    RemoteFile *remote = findRemoteFile(fd);
-    if (remote == NULL || remote->path.empty() || offset >= remote->size) {
-        return;
-    }
-    S3Client::getRanges(remote->object, std::vector<std::pair<size_t, size_t> >(1, std::make_pair(offset, std::min(size, remote->size - offset))), remote->path);
-}
-
-void MMseqsNode::releaseStagedReads(int fd) {
-    RemoteFile *remote = findRemoteFile(fd);
-    if (remote != NULL && remote->path.empty() == false) {
-        FileUtil::punchHole(remote->fd, 0, remote->size);
-    }
-}
-
-// <file>.staged holds the object and its size, so later steps know the placeholder; a local file without it was written by this node
-void MMseqsNode::addRemoteDatabaseFile(const std::string &file) {
-    if (S3Client::isEnabled() == false) {
-        return;
-    }
-    std::string path = file;
-    char target[PATH_MAX];
-    ssize_t targetSize = readlink(file.c_str(), target, sizeof(target) - 1);
-    if (targetSize > 0) {
-        target[targetSize] = '\0';
-        path = (target[0] == '/') ? std::string(target) : FileUtil::dirName(file) + "/" + target;
-    }
-    std::string statePath = path + ".staged";
-    std::lock_guard<std::mutex> lock(remoteMutex);
-    struct stat sb;
-    bool hasFile = stat(path.c_str(), &sb) == 0;
-    bool hasState = FileUtil::fileExists(statePath.c_str());
-    if (hasFile && (hasState == false || remoteFiles.find(std::make_pair(sb.st_dev, sb.st_ino)) != remoteFiles.end())) {
-        return;
-    }
-    RemoteFile *remote = new RemoteFile();
-    remote->object = S3Client::getObjectName(path);
-    remote->path = path;
-    remote->isExchange = false;
-    std::string state = hasState ? FileUtil::readFile(statePath) : std::string();
-    size_t objectEnd = state.find('\n');
-    if (hasFile && objectEnd != std::string::npos && state.compare(0, objectEnd, remote->object) == 0) {
-        remote->size = Util::fast_atoi<size_t>(state.c_str() + objectEnd + 1);
-    } else {
-        remote->size = S3Client::getSize(remote->object);
-        // the state first, a crash must not leave a placeholder that looks like a file of this node
-        FileUtil::publishFile(statePath, remote->object + "\n" + SSTR(remote->size) + "\n");
-        int fd = open(path.c_str(), O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, 0666);
-        if (fd < 0 || ftruncate(fd, remote->size) != 0 || close(fd) != 0) {
-            Debug(Debug::ERROR) << "Cannot create the placeholder " << path << " of " << remote->object << ": " << strerror(errno) << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-    }
-    remote->fd = open(path.c_str(), O_RDWR | O_CLOEXEC);
-    if (remote->fd < 0) {
-        Debug(Debug::ERROR) << "Cannot open the placeholder " << path << ": " << strerror(errno) << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    addRemoteFile(remote);
-}
-
-// an unlinked placeholder per open, released by releaseExchangeCopy before the caller closes the fd
-static int openRemoteExchangeFile(const std::string &file, const std::string &object, size_t size, const std::vector<size_t> &segmentOffsets) {
-    std::string placeholder = file + "~XXXXXX";
-    int fd = mkstemp(&placeholder[0]);
-    if (fd < 0 || unlink(placeholder.c_str()) != 0 || ftruncate(fd, size) != 0) {
-        Debug(Debug::ERROR) << "Cannot create a placeholder for " << file << ": " << strerror(errno) << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    RemoteFile *remote = new RemoteFile();
-    remote->object = object;
-    remote->fd = fd;
-    remote->size = size;
-    remote->isExchange = true;
-    remote->segmentOffsets = segmentOffsets;
-    {
-        std::lock_guard<std::mutex> lock(remoteMutex);
-        addRemoteFile(remote);
-    }
-    int callerFd = fcntl(fd, F_DUPFD_CLOEXEC, 0);
-    if (callerFd < 0) {
-        Debug(Debug::ERROR) << "Cannot open a placeholder for " << file << ": " << strerror(errno) << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    return callerFd;
-}
-
-// the writer's file or, on another node, nothing; the object or the flush segments in both cases
-void MMseqsNode::removeExchangeFile(const std::string &file, uint64_t exchangeFileNumber, bool isSegmented) {
-    if (S3Client::isEnabled() == false) {
-        FileUtil::remove(file.c_str());
-        return;
-    }
-    if (FileUtil::fileExists(file.c_str())) {
-        FileUtil::remove(file.c_str());
-    }
-    std::string object = getExchangeObjectName(file, exchangeFileNumber);
-    std::string segments;
-    if (isSegmented && S3Client::get(object + ".segments", segments)) {
-        for (size_t segment = 0; segment + 1 < segments.size() / sizeof(size_t); segment++) {
-            S3Client::remove(object + "." + SSTR(segment));
-        }
-        S3Client::remove(object + ".segments");
-    } else if (isSegmented == false) {
-        S3Client::remove(object);
-    }
-}
-
-// the local range goes once it is up, so a file written in flushes holds only the flushes not yet uploaded
-void MMseqsNode::uploadExchangeSegment(const std::string &file, int fd, uint64_t exchangeFileNumber, size_t segment, size_t begin, size_t end) {
-    if (end > begin) {
-        S3Client::putFile(getExchangeObjectName(file, exchangeFileNumber) + "." + SSTR(segment), file, begin, end - begin);
-        // whole pages only, and never the first page: the close reads the header there
-        const size_t page = Util::getPageSize();
-        const size_t punchBegin = std::max(page, (begin + page - 1) / page * page);
-        const size_t punchEnd = end / page * page;
-        if (punchEnd > punchBegin) {
-            FileUtil::punchHole(fd, punchBegin, punchEnd - punchBegin, true);
-        }
-    }
-}
-
-int MMseqsNode::openSegmentedExchangeFile(const std::string &file, uint64_t exchangeFileNumber, size_t size) {
-    std::string object = getExchangeObjectName(file, exchangeFileNumber);
-    std::string segments;
-    if (S3Client::get(object + ".segments", segments) == false) {
-        Debug(Debug::ERROR) << "Cannot find " << object << ".segments in S3\n";
-        EXIT(EXIT_FAILURE);
-    }
-    std::vector<size_t> segmentOffsets(segments.size() / sizeof(size_t));
-    memcpy(segmentOffsets.data(), segments.data(), segmentOffsets.size() * sizeof(size_t));
-    if (segmentOffsets.size() < 2 || segmentOffsets.back() != size) {
-        Debug(Debug::ERROR) << "Invalid segments of " << object << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    return openRemoteExchangeFile(file, object, size, segmentOffsets);
-}
-
-void MMseqsNode::releaseExchangeCopy(int fd) {
-    struct stat sb;
-    if (__atomic_load_n(&remoteFileCount, __ATOMIC_ACQUIRE) == 0 || fstat(fd, &sb) != 0) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(remoteMutex);
-    std::map<std::pair<dev_t, ino_t>, RemoteFile *>::iterator it = remoteFiles.find(std::make_pair(sb.st_dev, sb.st_ino));
-    if (it != remoteFiles.end() && it->second->isExchange) {
-        close(it->second->fd);
-        delete it->second;
-        remoteFiles.erase(it);
-        __atomic_store_n(&remoteFileCount, remoteFiles.size(), __ATOMIC_RELEASE);
-    }
-}
-
-// the metadata whole, the data and binary indexes as sparse copies of the files of all nodes, which cost one size request each until read
-void MMseqsNode::stageDatabase(const std::string &dataFile, const char *indexFile) {
-    if (S3Client::isEnabled() == false) {
-        return;
-    }
-    // <clu>.<node> uses <clu>.dbtype like in DBReader::open; once fetched, the parts of all nodes find it locally
-    std::string dbtypeName = dataFile;
-    size_t nodePos = dataFile.find_last_of('.');
-    bool isPart = nodePos != std::string::npos && Util::isNumber(dataFile.substr(nodePos + 1)) && FileUtil::fileExists((dataFile + ".dbtype").c_str()) == false
-                  && fetchFile(dataFile.substr(0, nodePos) + ".dbtype", false);
-    if (isPart) {
-        dbtypeName.resize(nodePos);
-    }
-    fetchFile(dbtypeName + ".dbtype");
-    int dbtype = FileUtil::parseDbType(dbtypeName.c_str());
-    if ((DBReader<DBKeyType>::getExtendedDbtype(dbtype) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {
-        return;
-    }
-    bool isHeader = Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_GENERIC_DB);
-    if (indexFile != NULL) {
-        if (Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_CLUSTER_RES) || Parameters::isEqualDbtype(dbtype, Parameters::DBTYPE_PREFILTER_RES)) {
-            addRemoteDatabaseFile(indexFile);
-        } else {
-            fetchFile(indexFile);
-        }
-    }
-    // also without USE_DATA, getFileKeyOffsets counts the data files
-    if (isPart) {
-        addRemoteDatabaseFile(dataFile);
-        return;
-    }
-    for (unsigned int node = 0; node < count; node++) {
-        addRemoteDatabaseFile(dataFile + "." + SSTR(node));
-        if (isHeader) {
-            addRemoteDatabaseFile(dataFile + ".index." + SSTR(node));
-        }
-    }
-}
-
-static bool isNodeCopy(const std::string &file) {
-    struct stat sb;
-    return lstat(file.c_str(), &sb) != 0 || S_ISREG(sb.st_mode) == false || FileUtil::fileExists((file + ".staged").c_str());
-}
-
-// each node its own parts, the master the files of all nodes and the dbtype last
-void MMseqsNode::publishDatabase(const std::string &db, size_t filesPerNode) {
-    if (S3Client::isEnabled() == false) {
-        return;
-    }
-    // writeKeyBits uploads the bits
-    const char *nodeSuffixes[] = { ".", ".index." };
-    for (size_t part = rank * filesPerNode; part < (rank + 1) * filesPerNode; part++) {
-        for (size_t i = 0; i < sizeof(nodeSuffixes) / sizeof(nodeSuffixes[0]); i++) {
-            std::string file = db + nodeSuffixes[i] + SSTR(part);
-            if (isNodeCopy(file) == false) {
-                uploadFile(file);
-            }
-        }
-    }
-    if (isMaster() == false) {
-        return;
-    }
-    const char *masterSuffixes[] = { ".index", ".file_keys", ".partitions", ".source", ".lookup", ".dbtype" };
-    for (size_t i = 0; i < sizeof(masterSuffixes) / sizeof(masterSuffixes[0]); i++) {
-        std::string file = db + masterSuffixes[i];
-        if (isNodeCopy(file) == false) {
-            uploadFile(file);
-        }
-    }
 }

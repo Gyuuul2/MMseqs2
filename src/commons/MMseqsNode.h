@@ -8,6 +8,7 @@
 #include <ctime>
 #include <string>
 #include <vector>
+#include <sys/stat.h>
 
 class Timer;
 class Parameters;
@@ -48,9 +49,10 @@ public:
         return (count > 1) ? 1 : 0;
     }
 
-    static void sleepBeforePoll(unsigned int polls, unsigned int maxShift = 4);
     // a --local-tmp that cannot be used is reported and the run goes on in the shared folder
     static void reportUnusableLocalTmp(const std::string &problem);
+    // empty if --local-tmp can hold files of this rank
+    static std::string getLocalTmpProblem(const Parameters &par);
 
     class WaitWarning {
     public:
@@ -63,35 +65,52 @@ public:
         size_t nextSeconds;
     };
 
-    static void publishFile(const std::string &file, const std::string &content);
-    static std::string readFile(const std::string &file);
     static void publishRunFile(const std::string &file, const std::string &content);
     static std::string waitForRunFile(const std::string &file);
     // false while the file holds no content of this run
     static bool readRunFile(const std::string &file, std::string &content);
     static void waitForRunFilesChange(const std::string &prefix, std::string &content);
     static std::string gatherRunFiles(const std::string &prefix);
-    // the names in a directory, none if it cannot be opened; aws backend: the object names below it
+    // the names in a directory, none if it cannot be opened
     static void listDirectory(const std::string &directory, std::vector<std::string> &names);
 
-    static void publishLog(FILE *file, const std::string &log, size_t key, size_t size);
-    static bool readLogProgress(const std::string &log, size_t &key, size_t &size);
+    // file of one node that the others poll: rewritten in place and kept open, on NFS (open files can miss other machines' writes) renamed into place and opened per read
+    struct PolledFile {
+        PolledFile() : fd(-1), isModeKnown(false), isOpenedPerRead(false) {}
+        explicit PolledFile(const std::string &file) : file(file), fd(-1), isModeKnown(false), isOpenedPerRead(false) {}
+        PolledFile(const PolledFile &) = delete;
+        PolledFile &operator=(const PolledFile &) = delete;
+        ~PolledFile();
+        void publish(const std::string &content);
+        // false while the file holds no complete record of this run
+        bool read(std::string &content);
+        // bytes at offset in one read, 0 while the file is missing or fails on a transient error
+        size_t read(char *data, size_t size, size_t offset);
+        // decided once, so that a failed directory check later does not switch between in place and rename
+        void decideMode();
+
+        std::string file;
+        int fd;
+        bool isModeKnown;
+        bool isOpenedPerRead;
+        std::vector<char> buffer;
+    };
+
+    static void publishLog(FILE *file, const std::string &log, PolledFile &progress, size_t key, size_t size);
+    static bool readLogProgress(PolledFile &progress, size_t &key, size_t &size);
     static void waitForLog(const std::string &log, size_t &key, size_t &size);
     static bool readLog(const std::string &log, size_t from, size_t to, char *data, bool wait = true);
     static void removeLog(const std::string &log);
 
-    static void publishExchangeFile(FILE *file, const std::string &fileName, size_t size, const std::string &indexFile, const std::vector<uint64_t> &line,
-                                    const std::vector<size_t> *segmentOffsets = NULL);
-    static size_t readExchangeIndexLines(const std::string &indexFile, size_t firstLine, size_t lineWords, std::vector<uint64_t> &lines);
-    static size_t waitForExchangeIndexLines(const std::string &indexFile, size_t &nextLine, size_t lineWords, std::vector<uint64_t> &lines, bool wait);
+    static void publishExchangeFile(FILE *file, const std::string &fileName, size_t size, const std::string &indexFile, const std::vector<uint64_t> &line);
+    static size_t readExchangeIndexLines(PolledFile &index, size_t firstLine, size_t lineWords, std::vector<uint64_t> &lines);
     static const size_t EXCHANGE_FILE_HEADER_BYTES = 2 * sizeof(uint64_t);
-    static FILE *createExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *mode = "w");
+    static FILE *createExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber);
     static void writeExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *data, size_t size, const std::string &indexFile,
                                   const std::vector<uint64_t> &line, int threads);
     static int tryOpenExchangeFile(const std::string &file, size_t expectedSize, uint64_t expectedNumber,
                                    size_t &observedSize, uint64_t &observedNumber, int &lastError, int openFlags = 0);
     static int waitForExchangeFile(const std::string &file, size_t size, uint64_t exchangeFileNumber);
-    static bool tryPreadAll(int fd, char *data, size_t size, size_t offset, int &readError);
 
     static std::string barrier(const std::string &file, const std::string &content = "");
     static void removeOnceRead(const std::string &file);
@@ -100,15 +119,20 @@ public:
     static void addPhaseTime(std::string &content, const std::string &phase, Timer &timer);
     static void addPhaseSeconds(std::string &content, const std::string &phase, double seconds);
     static void printPhaseValues(const std::string &values);
+    // a line with the estimated time left when after passes a tenth of total, also on the nodes besides the master
+    static void printProgress(const std::string &name, size_t before, size_t after, size_t total, Timer &timer);
+    // one decimal like df -h: 512B, 68.3M, 1.9T
+    static std::string formatBytes(size_t bytes);
 
     class WorkQueue {
     public:
         WorkQueue(const std::string &name, size_t itemCount);
         size_t takeNextItem();
         void removeTakenItemFiles();
-        bool takeItem(size_t item);
 
     private:
+        bool takeItem(size_t item);
+
         const std::string name;
         const size_t itemCount;
         size_t nextItem;
@@ -117,11 +141,10 @@ public:
     };
 
     static size_t getSmallestMemoryLimit(const std::string &file, size_t memoryLimit, int threads = 0, const std::string &localDirectory = "", size_t *localNodes = NULL);
-    // Reserve tmpfs sequence copies only in linfinity paths; localCopyBytes is for a module-owned copy.
-    static size_t getMemoryLimit(const Parameters &par, size_t localCopyBytes = 0);
 
     struct ExchangeReader {
         FILE *file;
+        std::string fileName;
         size_t pos;
         size_t end;
         std::vector<char> buffer;
@@ -131,12 +154,21 @@ public:
         size_t lastRecord;
         char *ownRecords;
         size_t punchEnd;
-        // aws backend: the object of another node's file, read with ranged GETs
-        std::string object;
+        std::vector<char> encoded;
+        size_t encodedPos;
+        size_t encodedEnd;
+        ClusterPair previous;
     };
+
+    // sorted records as varint deltas, a run starts at every slice offset and cut; both become offsets in the encoded records
+    static void encodeExchangeRecords(const char *records, std::vector<size_t> &sliceOffsets, std::vector<size_t> &cuts, size_t skipBegin, size_t skipEnd,
+                                      bool isClusterPair, bool (*compare)(const ClusterPair &, const ClusterPair &), std::vector<std::vector<char> > &sliceRecords);
 
     static size_t writeExchangeTable(int fd, const std::string &fileName, const std::vector<size_t> &flushOffsets, size_t columns, const std::vector<size_t> &tail, size_t tableOffset);
     static void readExchangeTableColumns(int fd, const std::string &fileName, size_t tableOffset, size_t flushCount, size_t column, std::vector<size_t> &offsets);
+    // the table, its offset and the flush count end the file
+    static size_t closeExchangeTableFile(FILE *file, const std::string &fileName, const std::vector<size_t> &flushOffsets, size_t columns, size_t tableOffset);
+    static int openExchangeTableFile(const std::string &fileName, size_t &tableOffset, size_t &flushCount);
     static size_t getExchangeFileOffset(size_t offset, size_t ownBegin, size_t ownEnd) {
         return offset - (std::min(offset, ownEnd) - std::min(offset, ownBegin));
     }
@@ -187,6 +219,7 @@ public:
         const std::vector<size_t> &nodeKeyOffsets;
         std::vector<size_t> *balancedKeyOffsets;
         std::vector<size_t> binOffsets;
+        std::vector<size_t> binByteOffsets;
         std::vector<size_t> indexData;
         size_t writtenSize;
         size_t keptPairCount;
@@ -197,10 +230,16 @@ public:
                                         uint64_t *representativeBits = NULL, const std::vector<size_t> &cluKeyOffsets = std::vector<size_t>(), size_t firstKey = 0, size_t keyCount = 0,
                                         std::vector<size_t> *balancedKeyOffsets = NULL);
     static void removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues = "");
+    static size_t findSplitEnd(DBReader<DBKeyType> &cluDb, size_t splitBegin, size_t splitOffset, size_t splitSize, size_t splitEntries, size_t entryEnd);
+    // createsubdb asks kmermatcher for the sequences of the median members
+    static std::string getMedianMemberRequestsFile(const std::string &db, size_t node);
 
     static void readKeyBits(int fd, const std::string &fileName, size_t fileOffset, size_t fileFirstKey, size_t from, size_t to, size_t firstKey, uint64_t *bits);
     static uint64_t *readRepresentativeBits(const std::string &db, const std::vector<size_t> &fileKeyOffsets, size_t firstKey, size_t keyCount);
-    static void writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount);
+    static void writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount,
+                                        const std::vector<size_t> &rangeMedianMemberCounts = std::vector<size_t>());
+    // the master publishes the index rows of writeRepresentativeBits of all nodes
+    static void gatherRepresentativeIndex(const std::string &db);
 
     static std::vector<size_t> getClusterKeyOffsets(const std::string &barrierFile, const std::string &clu, size_t keyCount, const std::string &firstKeySource = "");
     static std::vector<size_t> getBalancedClusterKeyOffsets(const std::string &file, const std::string &clu, size_t keyCount);
@@ -209,23 +248,6 @@ public:
                                           std::vector<std::string> &threadData, std::vector<std::vector<uint64_t> > &threadEntries, size_t &dataSize, size_t &indexSize);
     static void closeClusterFiles(FILE *dataFile, const std::string &dataFileName, FILE *indexFile, const std::string &indexFileName, size_t dataSize, size_t indexSize);
     static void writeClusterPairs(const std::string &index, const std::string &prefix, const std::string &clu, const uint64_t *singletonBits, size_t firstKey, size_t keyCount);
-
-    // aws backend: a node uploads the files it wrote; another node's file is an empty placeholder whose reads go to S3
-    static void uploadFile(const std::string &file, const std::string &object = "");
-    static void removeFile(const std::string &file);
-    static void removeExchangeFile(const std::string &file, uint64_t exchangeFileNumber, bool isSegmented = false);
-    static void releaseExchangeCopy(int fd);
-    // aws backend: a file written in flushes goes up as one object per flush segment, the segment offsets as <object>.segments
-    static void uploadExchangeSegment(const std::string &file, int fd, uint64_t exchangeFileNumber, size_t segment, size_t begin, size_t end);
-    static int openSegmentedExchangeFile(const std::string &file, uint64_t exchangeFileNumber, size_t size);
-    static bool fetchFile(const std::string &file, bool mustExist = true);
-    static void addRemoteDatabaseFile(const std::string &file);
-    static bool isRemoteFile(int fd);
-    static bool readRemoteFile(int fd, char *data, size_t size, size_t offset, size_t &readSize);
-    static void stageRead(int fd, size_t offset, size_t size);
-    static void releaseStagedReads(int fd);
-    static void stageDatabase(const std::string &dataFile, const char *indexFile);
-    static void publishDatabase(const std::string &db, size_t filesPerNode = 1);
 };
 
 #endif

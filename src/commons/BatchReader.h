@@ -16,9 +16,6 @@ struct io_uring_cqe;
 enum StorageKind { STORAGE_LOCAL_FLASH, STORAGE_LOCAL_DISK, STORAGE_MEMORY, STORAGE_PARALLEL_FS, STORAGE_NFS, STORAGE_UNKNOWN };
 StorageKind getStorageKind(int fd);
 const char *getStorageName(StorageKind storage);
-// MMSEQS_IO_MODE
-enum IoMode { IO_MODE_AUTO, IO_MODE_BUFFERED, IO_MODE_DIRECT };
-IoMode getIoMode();
 
 class BatchReader {
 public:
@@ -50,17 +47,23 @@ public:
     int getMaxInflightRequests() const {
         return maxInflightRequests;
     }
+    bool usesIoUring() const {
+#ifdef HAVE_IO_URING
+        return ringFd >= 0;
+#else
+        return false;
+#endif
+    }
 
 private:
     void startRead(const std::vector<ReadRequest> &requests, bool callingThreadReads);
     void readWithPread();
+    bool retryRead(const ReadRequest &request, int &error);
 
     StorageKind storage;
     int maxInflightRequests;
     std::vector<ReadRequest> splitReadRequests;
     size_t nextSplitReadRequest;
-    // aws backend: reads of another node's file go from S3 into the buffers, in the pread threads
-    bool hasRemoteReads;
     // errno, -1 for an unexpected end of file
     int readError;
     const char *readErrorFileName;

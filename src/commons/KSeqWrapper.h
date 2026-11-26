@@ -43,8 +43,16 @@ public:
     KSeqFile(const char* file, size_t start, size_t end);
     bool ReadEntry();
     ~KSeqFile();
+
+    struct InputFile {
+        int fd;
+        std::string name;
+        size_t offset;
+        // SIZE_MAX for a pipe
+        size_t size;
+    };
 private:
-    FILE* file;
+    InputFile file;
     size_t end;
 };
 
@@ -66,6 +74,7 @@ public:
     ~KSeqGzip();
 private:
     gzFile file;
+    std::string fileName;
 };
 #endif
 
@@ -79,6 +88,7 @@ public:
     ~KSeqBzip();
 private:
     BZFILE *file;
+    std::string fileName;
 };
 #endif
 
@@ -98,7 +108,9 @@ public:
     ~KSeqZstd();
 
     struct ZstdFile {
-        FILE* file;
+        int fd;
+        std::string fileName;
+        size_t fileSize;
         ZSTD_DStream* dstream;
         ZSTD_inBuffer input;
         size_t readHintBytes;

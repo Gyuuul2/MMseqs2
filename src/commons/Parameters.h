@@ -303,6 +303,7 @@ public:
     static const int CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE = 2;   // count-table iters (symmetric cov-mode)
     static const int CLUST_LINEAR_DEFAULT_NUM_ADJACENCY = 4;     // adjacency iters (non-symmetric cov-mode)
     static const int CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY = 1;   // adjacency iters (symmetric cov-mode)
+    static const int CLUST_LINEAR2_NUM_ADJACENCY = 5;            // adjacency iters of linclust2 and lin8clust (non-symmetric cov-mode)
     static constexpr float CLUST_LINEAR_DIAG_COV_SCALE = 0.95f;
     static constexpr float CLUST_LINEAR_DIAG_BAND_COV_SCALE = 0.9f; // align2clust --diagonal-mode 1 diagonal band
 
@@ -466,8 +467,6 @@ public:
     std::string spacedKmerPattern;       // User-specified kmer pattern
     std::string localTmp;                // Local temporary path
     bool localTmpFallback;               // warn instead of stopping when align2clust cannot use --local-tmp
-    std::string backend;                 // how linfinity nodes share files: posix or aws
-    std::string awsBucket;               // S3 bucket[/prefix] of the aws backend
 
 
     // ALIGNMENT
@@ -613,16 +612,16 @@ public:
     bool needWriteBuffer;
     bool includeCountTable;
     int countTableIteration;
-    float countTableScale;
     bool includeAdjacency;
     int adjIteration;
     int linclustIterations;
     int adjacencyAlphabetSize;
     int diagonalMode;
     int align2clustAlignerMode;
-    int align2clustSplit;
     int alignerMode;
     bool kmerPosFilter;
+    int kmerScoreMode;
+    int medianMemberCount;
     bool clustHash;
     int linclustVersion;
     int clusterVersion;
@@ -873,8 +872,6 @@ public:
     PARAMETER(PARAM_SPACED_KMER_PATTERN)
     PARAMETER(PARAM_LOCAL_TMP)
     PARAMETER(PARAM_LOCAL_TMP_FALLBACK)
-    PARAMETER(PARAM_BACKEND)
-    PARAMETER(PARAM_AWS_BUCKET)
     std::vector<MMseqsParameter*> prefilter;
     std::vector<MMseqsParameter*> ungappedprefilter;
     std::vector<MMseqsParameter*> gappedprefilter;
@@ -998,11 +995,12 @@ public:
     PARAMETER(PARAM_ADJACENCY_ALPH_SIZE)
     PARAMETER(PARAM_DIAGONAL_MODE)
     PARAMETER(PARAM_ALIGN2CLUST_ALIGNER_MODE)
-    PARAMETER(PARAM_ALIGN2CLUST_SPLIT)
     PARAMETER(PARAM_ALIGNER_MODE)
     PARAMETER(PARAM_KMER_POS_FILTER)
     PARAMETER(PARAM_USE_PARALLELISM)
     PARAMETER(PARAM_NEED_WRITEBUFFER)
+    PARAMETER(PARAM_KMER_SCORE_MODE)
+    PARAMETER(PARAM_MEDIAN_MEMBER_COUNT)
     PARAMETER(PARAM_CLUST_HASH)
     PARAMETER(PARAM_LINCLUST_VERSION)
     PARAMETER(PARAM_CLUSTER_VERSION)

@@ -6,7 +6,6 @@
 #include "ByteParser.h"
 #include "FileUtil.h"
 #include "MMseqsNode.h"
-#include "S3Client.h"
 
 #include <map>
 #include <iomanip>
@@ -72,10 +71,8 @@ Parameters::Parameters():
         PARAM_INCLUDE_IDENTITY(PARAM_INCLUDE_IDENTITY_ID, "--add-self-matches", "Include identical seq. id.", "Artificially add entries of queries with themselves (for clustering)", typeid(bool), (void *) &includeIdentity, "", MMseqsParameter::COMMAND_PREFILTER | MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_PRELOAD_MODE(PARAM_PRELOAD_MODE_ID, "--db-load-mode", "Preload mode", "Database preload mode 0: auto, 1: fread, 2: mmap, 3: mmap+touch", typeid(int), (void *) &preloadMode, "[0-3]{1}", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
         PARAM_SPACED_KMER_PATTERN(PARAM_SPACED_KMER_PATTERN_ID, "--spaced-kmer-pattern", "Spaced k-mer pattern", "User-specified spaced k-mer pattern", typeid(std::string), (void *) &spacedKmerPattern, "^1[01]*1$", MMseqsParameter::COMMAND_PREFILTER | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_LOCAL_TMP(PARAM_LOCAL_TMP_ID, "--local-tmp", "Local temporary path", "Path on node-local flash for some temporary files. Linfinity createdb spools the sent sequences there, align2clust copies the sequence blocks it serves and kmermatcher writes its last exchange file groups there before it copies them to the shared folder", typeid(std::string), (void *) &localTmp, "", MMseqsParameter::COMMAND_PREFILTER | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_LOCAL_TMP_FALLBACK(PARAM_LOCAL_TMP_FALLBACK_ID, "--local-tmp-fallback", "Local temporary path fallback", "What linfinity align2clust does when it cannot copy its served sequence blocks to --local-tmp: it is not node-local flash, is on the device of the database or has too little free space\n0: stop with an error\n1: warn and read them from the shared folder instead", typeid(bool), (void *) &localTmpFallback, "", MMseqsParameter::COMMAND_EXPERT),
-        PARAM_BACKEND(PARAM_BACKEND_ID, "--backend", "Storage backend", "How the nodes of linfinity steps share files\nposix: a folder that all nodes mount\naws: an S3 bucket (--aws-bucket), each node keeps its own files in its own folder", typeid(std::string), (void *) &backend, "^(posix|aws)$", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_AWS_BUCKET(PARAM_AWS_BUCKET_ID, "--aws-bucket", "AWS bucket", "S3 bucket[/prefix] of --backend aws, giving it selects that backend. The objects go below <prefix>/<run id>, the run id is MMSEQS_RUN_ID or else SLURM_JOB_ID. AWS_REGION, AWS_ENDPOINT_URL and the credentials come from the environment or AWS_SHARED_CREDENTIALS_FILE", typeid(std::string), (void *) &awsBucket, "", MMseqsParameter::COMMAND_COMMON | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LOCAL_TMP(PARAM_LOCAL_TMP_ID, "--local-tmp", "Local temporary path", "Path on node-local flash for some temporary files. Linfinity createdb spools the sent sequences there, align2clust copies as many of the sequence blocks of its target splits as fit and kmermatcher keeps there the needed groups of its key splits that do not fit into memory and the k-mer hashes, representatives and, alone on the device, shared k-mers it sends to itself. Use instance-store NVMe, not a network volume such as EBS. All ranks get the same path, so run one rank per node with its own device", typeid(std::string), (void *) &localTmp, "", MMseqsParameter::COMMAND_PREFILTER | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LOCAL_TMP_FALLBACK(PARAM_LOCAL_TMP_FALLBACK_ID, "--local-tmp-fallback", "Local temporary path fallback", "What linfinity align2clust does when it cannot use --local-tmp: it is not node-local flash, is on the device of the database or holds neither its sequence blocks nor its cluster part\n0: stop with an error\n1: warn and read them from the database and the shared temporary folder instead", typeid(bool), (void *) &localTmpFallback, "", MMseqsParameter::COMMAND_EXPERT),
         // alignment
         PARAM_ALIGNMENT_MODE(PARAM_ALIGNMENT_MODE_ID, "--alignment-mode", "Alignment mode", "How to compute the alignment:\n0: automatic\n1: only score and end_pos\n2: also start_pos and cov\n3: also seq.id\n4: only ungapped alignment", typeid(int), (void *) &alignmentMode, "^[0-5]{1}$", MMseqsParameter::COMMAND_ALIGN),
         PARAM_ALIGNMENT_OUTPUT_MODE(PARAM_ALIGNMENT_OUTPUT_MODE_ID, "--alignment-output-mode", "Alignment mode", "How to compute the alignment:\n0: automatic\n1: only score and end_pos\n2: also start_pos and cov\n3: also seq.id\n4: only ungapped alignment\n5: score only (output) cluster format", typeid(int), (void *) &alignmentOutputMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_ALIGN),
@@ -179,15 +176,16 @@ Parameters::Parameters():
         PARAM_NUM_COUNTS(PARAM_NUM_COUNTS_ID, "--num-count-table", "Number of count table based center swapping", "Number of count table based center swapping", typeid(int), (void *) &countTableIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_INCLUDE_ADJACENCY(PARAM_INCLUDE_ADJACENCY_ID, "--include-adjacency", "Include adjacency based center swapping", "Include adjacency based center swapping", typeid(bool), (void *) &includeAdjacency, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NUM_ADJACENCY(PARAM_NUM_ADJACENCY_ID, "--num-adjacency", "Number of adjacency based center swapping", "Number of adjacency based center swapping", typeid(int), (void *) &adjIteration, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_LINCLUST_ITERATIONS(PARAM_LINCLUST_ITERATIONS_ID, "--linclust-iterations", "Linclust iterations", "k-mer matching rounds linclust2 and lin8clust run: 2 reclusters the first round representatives, 1 stops after the first round", typeid(int), (void *) &linclustIterations, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_LINCLUST_ITERATIONS(PARAM_LINCLUST_ITERATIONS_ID, "--linclust-iterations", "Linclust iterations", "k-mer matching rounds linclust2 and lin8clust run: 2 reclusters the first round representatives, 1 stops after the first round. Iteration 2 uses spaced k-mers unless --spaced-kmer-mode is set and adds 0.1 to --kmer-per-seq-scale; up to --min-seq-id 0.5 it picks the k-mers of highest self score and adds the k-mers of 3 members of each cluster instead of 1, 4 below 0.5, unless --kmer-score-mode or --median-member-count is set. From --min-seq-id 0.7 linclust2 and lin8clust run 1 unless it is set", typeid(int), (void *) &linclustIterations, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ADJACENCY_ALPH_SIZE(PARAM_ADJACENCY_ALPH_SIZE_ID, "--adjacency-alph-size", "Alphabet the adjacent residues are stored in", "Alphabet size the adjacent residues are stored and scored in, 0 keeps --alph-size", typeid(int), (void *) &adjacencyAlphabetSize, "^(0|[2-9]|1[0-9]|2[01])$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: align on the diagonal of the k-mer match\n1: align on the best diagonal of an ungapped scan (linclust version 2 and amino acids only)", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
+        PARAM_DIAGONAL_MODE(PARAM_DIAGONAL_MODE_ID, "--diagonal-mode", "Diagonal mode", "0: align on the diagonal of the prefilter hit\n1: align on the best diagonal of an ungapped scan", typeid(int), (void *) &diagonalMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
         PARAM_ALIGN2CLUST_ALIGNER_MODE(PARAM_ALIGN2CLUST_ALIGNER_MODE_ID, "--align2clust-aligner-mode", "Align2clust aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: forward pass and traceback of several targets at once (SWIPE), also the seed extensions of the representative targets", typeid(int), (void *) &align2clustAlignerMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
-        PARAM_ALIGN2CLUST_SPLIT(PARAM_ALIGN2CLUST_SPLIT_ID, "--align2clust-split", "Align2clust split", "Split the align nodes into N groups that each align every N-th window of the representatives (2 or more align nodes). 0: set automatically to the square root of the align node count, fewer if a group node's share of the sequences does not fit in a quarter of --split-memory-limit, 1: no split", typeid(int), (void *) &align2clustSplit, "^[0-9]{1}[0-9]*$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_ALIGNER_MODE(PARAM_ALIGNER_MODE_ID, "--aligner-mode", "Aligner mode", "0: Farrar forward pass, then Farrar or block aligner backward pass and traceback\n1: SWIPE forward pass for full lane batches, then the same Farrar or block backward pass and traceback as mode 0", typeid(int), (void *) &alignerMode, "^[0-1]$", MMseqsParameter::COMMAND_ALIGN | MMseqsParameter::COMMAND_EXPERT),
         PARAM_KMER_POS_FILTER(PARAM_KMER_POS_FILTER_ID, "--kmer-pos-filter", "K-mer position filter", "Drop k-mer matches whose diagonal cannot reach the coverage", typeid(bool), (void *) &kmerPosFilter, "", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_USE_PARALLELISM(PARAM_USE_PARALLELISM_ID, "--use-parallelism", "Use parallelism", "Enable or disable parallel execution for group assignment and related k-mer processing steps", typeid(bool), (void *) &useParallelism, "^[0-1]{1}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_NEED_WRITEBUFFER(PARAM_NEED_WRITEBUFFER_ID, "--need-write-buffer", "Use write buffer", "Enable or disable allocation of an auxiliary write buffer for intermediate per-thread or per-iteration output and merge steps", typeid(bool), (void *) &needWriteBuffer, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
+        PARAM_KMER_SCORE_MODE(PARAM_KMER_SCORE_MODE_ID, "--kmer-score-mode", "K-mer score mode", "Order the k-mers of a sequence are picked in, 1 in linclust2 and lin8clust iteration 2 below --min-seq-id 0.5 unless set:\n0: lowest hash\n1: highest substitution matrix self score, then lowest hash", typeid(int), (void *) &kmerScoreMode, "^[0-1]{1}$", MMseqsParameter::COMMAND_HIDDEN),
+        PARAM_MEDIAN_MEMBER_COUNT(PARAM_MEDIAN_MEMBER_COUNT_ID, "--median-member-count", "Median member count", "Members of each cluster that add their k-mers to the representative (kmermatcher --filter-cludb-file, createsubdb of linfinity clusterings), at evenly spaced ranks of the members sorted by length; in linclust2 and lin8clust iteration 2 3 up to --min-seq-id 0.5 and 4 below 0.5 unless set", typeid(int), (void *) &medianMemberCount, "^[1-9][0-9]*$", MMseqsParameter::COMMAND_HIDDEN),
         PARAM_CLUST_HASH(PARAM_CLUST_HASH_ID, "--clust-hash", "Cluster hash", "Use clusthash before kmermatcher in linclust", typeid(bool), (void *) &clustHash, "^[0-1]{0}$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_LINCLUST_VERSION(PARAM_LINCLUST_VERSION_ID, "--linclust-version", "Linclust version", "Linclust version: 1: Linclust1, 2: Linclust2", typeid(int), (void *) &linclustVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
         PARAM_CLUSTER_VERSION(PARAM_CLUSTER_VERSION_ID, "--cluster-version", "Cluster version", "Cluster version: 1: Cluster1, 2: Cluster2", typeid(int), (void *) &clusterVersion, "^[1-2]$", MMseqsParameter::COMMAND_CLUSTLINEAR | MMseqsParameter::COMMAND_EXPERT),
@@ -398,8 +396,6 @@ Parameters::Parameters():
     mergeclusters.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     mergeclusters.push_back(&PARAM_THREADS);
     mergeclusters.push_back(&PARAM_COMPRESSED);
-    mergeclusters.push_back(&PARAM_BACKEND);
-    mergeclusters.push_back(&PARAM_AWS_BUCKET);
     mergeclusters.push_back(&PARAM_V);
 
     // createclusearchdb
@@ -492,14 +488,13 @@ Parameters::Parameters():
     align2clust.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     align2clust.push_back(&PARAM_THREADS);
     align2clust.push_back(&PARAM_COMPRESSED);
-    align2clust.push_back(&PARAM_BACKEND);
-    align2clust.push_back(&PARAM_AWS_BUCKET);
     align2clust.push_back(&PARAM_V);
     align2clust.push_back(&PARAM_CLUSTER_MODE);
     align2clust.push_back(&PARAM_FILTER_CLUDB_FILE);
     align2clust.push_back(&PARAM_FILTER_SEQDB_FILE);
     align2clust.push_back(&PARAM_LOCAL_TMP);
     align2clust.push_back(&PARAM_LOCAL_TMP_FALLBACK);
+    align2clust.push_back(&PARAM_REMOVE_TMP_FILES);
     align2clust.push_back(&PARAM_INCLUDE_ALIGN_FILES);
     align2clust.push_back(&PARAM_DIAGONAL_MODE);
     align2clust.push_back(&PARAM_ALIGN2CLUST_ALIGNER_MODE);
@@ -686,8 +681,6 @@ Parameters::Parameters():
     createtsv.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     createtsv.push_back(&PARAM_THREADS);
     createtsv.push_back(&PARAM_COMPRESSED);
-    createtsv.push_back(&PARAM_BACKEND);
-    createtsv.push_back(&PARAM_AWS_BUCKET);
     createtsv.push_back(&PARAM_V);
 
     //result2stats
@@ -950,8 +943,6 @@ Parameters::Parameters():
     createdb.push_back(&PARAM_MASK_LOWER_CASE);
     createdb.push_back(&PARAM_MASK_N_REPEAT);
     createdb.push_back(&PARAM_GPU);
-    createdb.push_back(&PARAM_BACKEND);
-    createdb.push_back(&PARAM_AWS_BUCKET);
     createdb.push_back(&PARAM_V);
 
     // makepaddedseqdb
@@ -973,8 +964,6 @@ Parameters::Parameters():
     result2flat.push_back(&PARAM_USE_HEADER);
     result2flat.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
     result2flat.push_back(&PARAM_THREADS);
-    result2flat.push_back(&PARAM_BACKEND);
-    result2flat.push_back(&PARAM_AWS_BUCKET);
     result2flat.push_back(&PARAM_V);
 
     // result2repseq
@@ -1135,8 +1124,6 @@ Parameters::Parameters():
 
     clusthashfast = clusthash;
     clusthashfast.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
-    clusthashfast.push_back(&PARAM_BACKEND);
-    clusthashfast.push_back(&PARAM_AWS_BUCKET);
     // kmermatcher
     kmermatcher.push_back(&PARAM_SUB_MAT);
     kmermatcher.push_back(&PARAM_ALPH_SIZE);
@@ -1161,8 +1148,6 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_IGNORE_MULTI_KMER);
     kmermatcher.push_back(&PARAM_THREADS);
     kmermatcher.push_back(&PARAM_COMPRESSED);
-    kmermatcher.push_back(&PARAM_BACKEND);
-    kmermatcher.push_back(&PARAM_AWS_BUCKET);
     kmermatcher.push_back(&PARAM_V);
     kmermatcher.push_back(&PARAM_WEIGHT_FILE);
     kmermatcher.push_back(&PARAM_WEIGHT_THR);
@@ -1171,12 +1156,14 @@ Parameters::Parameters():
     kmermatcher.push_back(&PARAM_INCLUDE_ADJACENCY);
     kmermatcher.push_back(&PARAM_NUM_ADJACENCY);
     kmermatcher.push_back(&PARAM_ADJACENCY_ALPH_SIZE);
-    kmermatcher.push_back(&PARAM_DIAGONAL_MODE);
     kmermatcher.push_back(&PARAM_KMER_POS_FILTER);
     kmermatcher.push_back(&PARAM_USE_PARALLELISM);
     kmermatcher.push_back(&PARAM_NEED_WRITEBUFFER);
+    kmermatcher.push_back(&PARAM_KMER_SCORE_MODE);
+    kmermatcher.push_back(&PARAM_MEDIAN_MEMBER_COUNT);
     kmermatcher.push_back(&PARAM_LINCLUST_VERSION);
-    kmermatcher.push_back(&PARAM_ALIGN2CLUST_SPLIT);
+    kmermatcher.push_back(&PARAM_FILTER_CLUDB_FILE);
+    kmermatcher.push_back(&PARAM_FILTER_SEQDB_FILE);
 
     // kmermatcher
     kmersearch.push_back(&PARAM_SEED_SUB_MAT);
@@ -1330,8 +1317,7 @@ Parameters::Parameters():
     createsubdb.push_back(&PARAM_SUBDB_MODE);
     createsubdb.push_back(&PARAM_ID_MODE);
     createsubdb.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
-    createsubdb.push_back(&PARAM_BACKEND);
-    createsubdb.push_back(&PARAM_AWS_BUCKET);
+    createsubdb.push_back(&PARAM_MEDIAN_MEMBER_COUNT);
     createsubdb.push_back(&PARAM_V);
 
     // renamedbkeys
@@ -1579,9 +1565,9 @@ Parameters::Parameters():
     linclustworkflow = combineList(linclustworkflow, rescorediagonal);
     linclustworkflow = combineList(linclustworkflow, align2clust);
     linclustworkflow = combineList(linclustworkflow, clusthash);
+    linclustworkflow = removeParameter(linclustworkflow, PARAM_DIAGONAL_MODE);
     linclustworkflow.push_back(&PARAM_SWITCH_CONSENSUS_REP);
     linclustworkflow.push_back(&PARAM_CLUST_HASH);
-    linclustworkflow.push_back(&PARAM_REMOVE_TMP_FILES);
     linclustworkflow.push_back(&PARAM_LINCLUST_ITERATIONS);
     linclustworkflow.push_back(&PARAM_REUSELATEST);
     linclustworkflow.push_back(&PARAM_RUNNER);
@@ -1591,7 +1577,6 @@ Parameters::Parameters():
 
     // lin8clust workflow
     lin8clustworkflow = removeParameter(linclustworkflow, PARAM_RUNNER);
-    lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_DIAGONAL_MODE);
     lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_ALIGNER_MODE);
     lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_LINCLUST_VERSION);
     lin8clustworkflow = removeParameter(lin8clustworkflow, PARAM_KMER_POS_FILTER);
@@ -2206,7 +2191,8 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
     }
 
     if (MMseqsMPI::isMaster()) {
-        Debug::setDebugLevel(verbosity);
+        // the other linfinity nodes print warnings, errors and their own lines (MMseqsNode::printPhaseValues)
+        Debug::setDebugLevel(MMseqsNode::isMaster() ? verbosity : std::min(verbosity, static_cast<int>(Debug::WARNING)));
     }
 
 #ifdef OPENMP
@@ -2354,30 +2340,6 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
 
     initMatrices();
 
-    if (awsBucket.empty() == false) {
-        backend = "aws";
-    }
-    if (backend == "aws") {
-        const char *runId = getenv("MMSEQS_RUN_ID");
-        if (runId == NULL || *runId == '\0') {
-            runId = getenv("SLURM_JOB_ID");
-        }
-        S3Client::init(awsBucket, (runId != NULL) ? runId : "");
-        // no shared folder: each node keeps the directories of the run
-        for (size_t i = 0; i < filenames.size(); i++) {
-            std::string dir = FileUtil::dirName(filenames[i]);
-            for (size_t pos = dir.find('/', 1); filenames[i].find("://") == std::string::npos && FileUtil::directoryExists(dir.c_str()) == false; pos = dir.find('/', pos + 1)) {
-                FileUtil::makeDir(dir.substr(0, pos).c_str());
-                if (pos == std::string::npos) {
-                    break;
-                }
-            }
-        }
-    } else if (backend != "posix") {
-        Debug(Debug::ERROR) << "--backend must be posix or aws\n";
-        EXIT(EXIT_FAILURE);
-    }
-
     if (ignorePathCountChecks == false) {
         checkIfDatabaseIsValid(command, argc, pargv, isStartVar, isMiddleVar, isEndVar);
     }
@@ -2432,20 +2394,12 @@ void Parameters::checkIfDatabaseIsValid(const Command& command, int argc, const 
                     continue;
                 }
 
-                // aws backend: the dbtypes of other nodes come from S3
-                if (S3Client::isEnabled() && filenames[fileIdx] != "stdin") {
-                    MMseqsNode::fetchFile(filenames[fileIdx] + ".dbtype", false);
-                    if (db.specialType & DbType::NEED_HEADER) {
-                        MMseqsNode::fetchFile(filenames[fileIdx] + "_h.dbtype", false);
-                    }
-                }
                 const auto isMissing = [&]() {
                     FileUtil::refreshDirectory(filenames[fileIdx]);
                     return filenames[fileIdx] != "stdin" && FileUtil::fileExists((filenames[fileIdx]).c_str()) == false && FileUtil::fileExists((filenames[fileIdx] + ".dbtype").c_str()) == false;
                 };
                 // a step on another machine may have written the input; like --latency-wait of Snakemake and exitReadTimeout of Nextflow
-                const char *stepTaskCount = getenv("SLURM_STEP_NUM_TASKS");
-                for (int second = 0; stepTaskCount != NULL && atoi(stepTaskCount) > 1 && second < INPUT_LATENCY_SECONDS && isMissing(); second++) {
+                for (int second = 0; MMseqsNode::count > 1 && second < INPUT_LATENCY_SECONDS && isMissing(); second++) {
                     sleep(1);
                 }
                 if (isMissing()) {
@@ -2632,8 +2586,6 @@ void Parameters::setDefaults() {
     spacedKmerPattern = "";
     localTmp = "";
     localTmpFallback = true;
-    backend = "posix";
-    awsBucket = "";
 
     // search workflow
     numIterations = 1;
@@ -2925,16 +2877,16 @@ void Parameters::setDefaults() {
     needWriteBuffer = false;
     includeCountTable = true;
     countTableIteration = 2;
-    countTableScale = 0.1;
     includeAdjacency = true;
     adjIteration = 3;
     linclustIterations = 2;
     adjacencyAlphabetSize = 21;
-    diagonalMode = DIAGONAL_MODE_KMER;
+    diagonalMode = DIAGONAL_MODE_UNGAPPED;
     align2clustAlignerMode = ALIGNER_MODE_SWIPE;
-    align2clustSplit = 0;
     alignerMode = ALIGNER_MODE_FARRAR;
     kmerPosFilter = true;
+    kmerScoreMode = 0;
+    medianMemberCount = 1;
     clustHash = false;
     linclustVersion = LINCLUST_VERSION2;
     clusterVersion = CLUSTER_VERSION1;

@@ -1,6 +1,5 @@
 #include "FileUtil.h"
 #include "Util.h"
-#include "S3Client.h"
 #include "Debug.h"
 #include "simd.h"
 #include "BatchReader.h"
@@ -11,6 +10,7 @@
 #include <cstring>
 #include <climits>
 #include <algorithm>
+#include <atomic>
 #include <map>
 #include <mutex>
 #include <stdio.h>
@@ -106,60 +106,260 @@ void FileUtil::deleteTempFiles(const std::list<std::string> &tmpFiles) {
     }
 }
 
-void FileUtil::preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset) {
-    size_t remoteSize;
-    if (MMseqsNode::readRemoteFile(fd, data, size, offset, remoteSize)) {
-        if (remoteSize < size) {
-            Debug(Debug::ERROR) << "Cannot read " << fileName << " at offset " << offset + remoteSize << " (" << size - remoteSize << " bytes remaining): end of file\n";
+void FileUtil::sleepBeforePoll(unsigned int polls, unsigned int maxShift) {
+    usleep(10000u << std::min(polls, maxShift));
+}
+
+bool FileUtil::hasFailedTooLong(time_t &failedSince, unsigned int &attempts) {
+    time_t now = time(NULL);
+    if (attempts++ == 0) {
+        failedSince = now;
+    }
+    return attempts >= 100 && now - failedSince >= 60;
+}
+
+// false once it failed 100 times and for 60 s
+bool FileUtil::waitBeforeRetry(const char *file, const char *error, time_t &failedSince, unsigned int &attempts) {
+    if (hasFailedTooLong(failedSince, attempts)) {
+        return false;
+    }
+    if (attempts > 1) {
+        if (attempts == 2) {
+            Debug(Debug::WARNING) << "Cannot access " << file << ": " << error << ", retrying\n";
+        }
+        sleepBeforePoll(attempts - 1, 7);
+    }
+    return true;
+}
+
+// EIO, ESTALE or a name that NFS caches as missing
+bool FileUtil::canRetryRead(const std::string &file, int error, time_t &failedSince, unsigned int &attempts) {
+    bool isCachedMissing = error == ENOENT && FileUtil::needsDirectoryRefresh(file);
+    return (FileUtil::isTransientError(error) || isCachedMissing) && FileUtil::waitBeforeRetry(file.c_str(), strerror(error), failedSince, attempts);
+}
+
+// NFS caches a missing name for up to 60 s
+static bool isListed(const std::string &file) {
+    if (FileUtil::needsDirectoryRefresh(file) == false) {
+        return false;
+    }
+    static time_t lastListing = 0;
+    time_t now = time(NULL);
+    time_t last = __atomic_load_n(&lastListing, __ATOMIC_RELAXED);
+    if (now == last || __sync_bool_compare_and_swap(&lastListing, last, now) == false) {
+        return false;
+    }
+    std::string name = FileUtil::baseName(file);
+    DIR *directory = opendir(FileUtil::dirName(file).c_str());
+    if (directory == NULL) {
+        return false;
+    }
+    bool isFound = false;
+    for (struct dirent *entry; isFound == false && (entry = readdir(directory)) != NULL;) {
+        isFound = name == entry->d_name;
+    }
+    closedir(directory);
+    return isFound;
+}
+
+int FileUtil::openFile(const std::string &file, int flags) {
+    int fd;
+    do {
+        fd = open(file.c_str(), flags, 0666);
+    } while (fd < 0 && errno == EINTR);
+    return fd;
+}
+
+int FileUtil::openListedFile(const std::string &file, int flags) {
+    int fd = openFile(file, flags);
+    int openError = errno;
+    if (fd < 0 && openError == ENOENT && isListed(file)) {
+        return openFile(file, flags);
+    }
+    errno = openError;
+    return fd;
+}
+
+// retry EIO, ESTALE and an NFS name cached as missing
+int FileUtil::openSharedFd(const std::string &file, int flags, size_t *size) {
+    time_t failedSince = 0;
+    unsigned int attempts = 0;
+    for (;;) {
+        int fd = openListedFile(file, flags | O_CLOEXEC);
+        if (fd >= 0) {
+            struct stat sb;
+            if (size != NULL) {
+                if (fstat(fd, &sb) != 0) {
+                    Debug(Debug::ERROR) << "Cannot read " << file << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
+                *size = sb.st_size;
+            }
+            return fd;
+        }
+        int openError = errno;
+        if (canRetryRead(file, openError, failedSince, attempts) == false) {
+            Debug(Debug::ERROR) << "Cannot open " << file << ": " << strerror(openError) << "\n";
             EXIT(EXIT_FAILURE);
         }
-        return;
     }
+}
+
+// for the modes r, rb and r+
+FILE *FileUtil::openSharedFile(const std::string &file, const char *mode) {
+    FILE *handle = fdopen(openSharedFd(file, (strchr(mode, '+') != NULL) ? O_RDWR : O_RDONLY), mode);
+    if (handle == NULL) {
+        Debug(Debug::ERROR) << "Cannot open " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return handle;
+}
+
+// a missing name returns false at once
+bool FileUtil::statSharedFile(const std::string &file, struct stat *sb) {
+    time_t failedSince = 0;
+    unsigned int attempts = 0;
+    struct stat st;
+    for (;;) {
+        if (stat(file.c_str(), (sb != NULL) ? sb : &st) == 0) {
+            return true;
+        }
+        int statError = errno;
+        if (statError == ENOENT || statError == ENOTDIR) {
+            return false;
+        }
+        if (canRetryRead(file, statError, failedSince, attempts) == false) {
+            Debug(Debug::ERROR) << "Cannot stat " << file << ": " << strerror(statError) << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+}
+
+std::string FileUtil::readFile(const std::string &file) {
+    size_t size;
+    int fd = openSharedFd(file, O_RDONLY, &size);
+    std::string content(size, '\0');
+    FileUtil::preadAll(fd, file.c_str(), &content[0], content.size(), 0);
+    if (close(fd) != 0) {
+        Debug(Debug::ERROR) << "Cannot close " << file << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+    return content;
+}
+
+size_t FileUtil::tryPreadAll(int fd, char *data, size_t size, size_t offset, int &readError) {
     for (size_t done = 0; done < size;) {
-        const ssize_t count = pread(fd, data + done, size - done, offset + done);
+        ssize_t count = pread(fd, data + done, size - done, offset + done);
         if (count < 0 && errno == EINTR) {
             continue;
         }
         if (count <= 0) {
-            const int readError = (count < 0) ? errno : 0;
-            Debug(Debug::ERROR) << "Cannot read " << fileName << " at offset " << offset + done
-                                << " (" << size - done << " bytes remaining): "
-                                << (readError == 0 ? "end of file" : strerror(readError)) << "\n";
-            EXIT(EXIT_FAILURE);
+            readError = (count < 0) ? errno : 0;
+            return done;
         }
         done += count;
     }
+    readError = 0;
+    return size;
+}
+
+bool FileUtil::waitBeforeReadRetry(int fd, const char *fileName, int readError, const char *reason, time_t &failedSince, unsigned int &attempts) {
+    if ((readError <= 0 || readError == EAGAIN || isTransientError(readError)) == false
+        || waitBeforeRetry(fileName, reason, failedSince, attempts) == false) {
+        return false;
+    }
+    // first retry only rereads, another reader may have reopened it
+    if (attempts > 1 && isTransientError(readError)) {
+        reopenFile(fd, fileName);
+    }
+    return true;
+}
+
+void FileUtil::preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset) {
+    time_t failedSince = 0;
+    unsigned int attempts = 0;
+    int readError;
+    for (size_t done = tryPreadAll(fd, data, size, offset, readError); done < size;) {
+        const char *reason = (readError == 0) ? "end of file" : strerror(readError);
+        if (waitBeforeReadRetry(fd, fileName, readError, reason, failedSince, attempts) == false) {
+            Debug(Debug::ERROR) << "Cannot read " << fileName << " at offset " << offset + done
+                                << " (" << size - done << " bytes remaining): " << reason << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+        size_t count = tryPreadAll(fd, data + done, size - done, offset + done, readError);
+        attempts = (count > 0) ? 0 : attempts;
+        done += count;
+    }
+}
+
+void FileUtil::reopenFile(int fd, const char *fileName) {
+    int fileFlags = fcntl(fd, F_GETFL);
+    int fdFlags = fcntl(fd, F_GETFD);
+    int reopenedFd = (fileFlags < 0 || fdFlags < 0) ? -1 : open(fileName, fileFlags);
+    if (reopenedFd >= 0) {
+        dup2(reopenedFd, fd);
+        fcntl(fd, F_SETFD, fdFlags);
+        close(reopenedFd);
+    }
+}
+
+size_t FileUtil::tryPwriteAll(int fd, const char *data, size_t size, size_t offset, int &writeError) {
+    for (size_t done = 0; done < size;) {
+        ssize_t count = pwrite(fd, data + done, size - done, offset + done);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count <= 0) {
+            writeError = (count < 0) ? errno : 0;
+            return done;
+        }
+        done += count;
+    }
+    writeError = 0;
+    return size;
 }
 
 void FileUtil::pwriteAll(int fd, const char *fileName, const char *data, size_t size, size_t offset) {
-    for (size_t done = 0; done < size;) {
-        const ssize_t count = pwrite(fd, data + done, size - done, offset + done);
-        if (count < 0 && errno == EINTR) {
-            continue;
-        }
-        if (count <= 0) {
-            const int writeError = (count < 0) ? errno : 0;
+    time_t failedSince = 0;
+    unsigned int attempts = 0;
+    int writeError;
+    for (size_t done = tryPwriteAll(fd, data, size, offset, writeError); done < size;) {
+        // no retry on EIO, NFS may have lost written back data
+        if ((writeError != EAGAIN && writeError != ESTALE) || waitBeforeRetry(fileName, strerror(writeError), failedSince, attempts) == false) {
             Debug(Debug::ERROR) << "Cannot write " << fileName << " at offset " << offset + done << ": " << (writeError == 0 ? "no bytes written" : strerror(writeError)) << "\n";
             EXIT(EXIT_FAILURE);
         }
+        if (attempts > 1 && writeError == ESTALE) {
+            reopenFile(fd, fileName);
+        }
+        size_t count = tryPwriteAll(fd, data + done, size - done, offset + done, writeError);
+        attempts = (count > 0) ? 0 : attempts;
         done += count;
     }
 }
 
-void FileUtil::punchHole(int fd, size_t offset, size_t size, bool isUploaded) {
-    // aws backend: a punched local copy of another node's file would read as zeros
-    if (S3Client::isEnabled() && isUploaded == false) {
+void FileUtil::punchHole(int fd, size_t offset, size_t size) {
+#ifdef FALLOC_FL_PUNCH_HOLE
+    static std::atomic<bool> warned(false);
+    if (size == 0 || fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size) == 0) {
         return;
     }
-#ifdef FALLOC_FL_PUNCH_HOLE
-    static int warned = 0;
-    if (size > 0 && fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, size) != 0 && errno == EOPNOTSUPP
-        && __sync_bool_compare_and_swap(&warned, 0, 1)) {
-        Debug(Debug::WARNING) << "Exchange files are not freed while read on this file system, so they need more temporary disk space\n";
+    int error = errno;
+    if (warned.exchange(true) == false) {
+        Debug(Debug::WARNING) << "The file system cannot free the parts of temporary files that the nodes have read (" << strerror(error) << "). "
+                              << "Each temporary file keeps its full size until its step deletes it, so the run needs more free temporary disk\n";
     }
 #else
     (void) fd; (void) offset; (void) size;
 #endif
+}
+
+void FileUtil::punchWholeBlocks(int fd, size_t offset, size_t size) {
+    size_t start = (offset + PUNCH_HOLE_ALIGNMENT - 1) / PUNCH_HOLE_ALIGNMENT * PUNCH_HOLE_ALIGNMENT;
+    size_t end = (offset + size) / PUNCH_HOLE_ALIGNMENT * PUNCH_HOLE_ALIGNMENT;
+    if (end > start) {
+        punchHole(fd, start, end - start);
+    }
 }
 
 void FileUtil::writeFile(const std::string &pathToFile, const unsigned char *data, size_t len) {
@@ -179,23 +379,6 @@ void FileUtil::writeFile(const std::string &pathToFile, const unsigned char *dat
         Debug(Debug::ERROR) << "Error closing file " << pathToFile << "!\n";
         EXIT(EXIT_FAILURE);
     }
-}
-
-std::string FileUtil::readFile(const std::string &file) {
-    FILE *handle = openFileOrDie(file.c_str(), "r", true);
-    struct stat sb;
-    if (fstat(fileno(handle), &sb) != 0) {
-        Debug(Debug::ERROR) << "Cannot read " << file << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    std::string content(sb.st_size, '\0');
-    size_t readSize = content.empty() ? 0 : fread(&content[0], sizeof(char), content.size(), handle);
-    int closeResult = fclose(handle);
-    if (readSize != content.size() || closeResult != 0) {
-        Debug(Debug::ERROR) << "Cannot read " << file << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    return content;
 }
 
 void FileUtil::publishFile(const std::string &file, const std::string &content) {
@@ -479,13 +662,13 @@ std::vector<std::string> FileUtil::findDatafiles(const char * datafiles){
     std::string checkName = baseName + ".0";
     std::vector<std::string> filenames;
     size_t cnt = 0;
-    while(FileUtil::fileExists(checkName.c_str()) == true){
+    while(statSharedFile(checkName) == true){
         filenames.push_back(checkName);
         cnt++;
         checkName = baseName + "." + SSTR(cnt);
     }
     if(cnt == 0){
-        if(FileUtil::fileExists(baseName.c_str())){
+        if(statSharedFile(baseName)){
             filenames.push_back(baseName);
         }
     }
@@ -494,6 +677,13 @@ std::vector<std::string> FileUtil::findDatafiles(const char * datafiles){
 
 void FileUtil::remove(const char * file ) {
     if (std::remove(file) != 0){
+        Debug(Debug::ERROR) << "Could not delete " << file << "!\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
+void FileUtil::removeSharedFile(const std::string &file) {
+    if (std::remove(file.c_str()) != 0 && errno != ENOENT) {
         Debug(Debug::ERROR) << "Could not delete " << file << "!\n";
         EXIT(EXIT_FAILURE);
     }
@@ -537,27 +727,20 @@ void FileUtil::move(const char * src, const char * dst) {
 
 int FileUtil::parseDbType(const char *name) {
     std::string dbTypeFile = std::string(name) + ".dbtype";
-    if (FileUtil::fileExists(dbTypeFile.c_str()) == false) {
+    struct stat sb;
+    if (statSharedFile(dbTypeFile, &sb) == false) {
         return Parameters::DBTYPE_GENERIC_DB;
     }
 
-    size_t fileSize = FileUtil::getFileSize(dbTypeFile);
+    size_t fileSize = sb.st_size;
     if (fileSize != sizeof(int)) {
         Debug(Debug::ERROR) << "File size of " << dbTypeFile << " seems to be wrong!\n";
         Debug(Debug::ERROR) << "It should have 4 bytes but it has " <<  fileSize << " bytes.";
         EXIT(EXIT_FAILURE);
     }
-    FILE *file = fopen(dbTypeFile.c_str(), "r");
-    if (file == NULL) {
-        Debug(Debug::ERROR) << "Could not open data file " << dbTypeFile << "!\n";
-        EXIT(EXIT_FAILURE);
-    }
+    FILE *file = openSharedFile(dbTypeFile, "r");
     int dbtype;
-    size_t result = fread(&dbtype, 1, fileSize, file);
-    if (result != fileSize) {
-        Debug(Debug::ERROR) << "Could not read " << dbTypeFile << "!\n";
-        EXIT(EXIT_FAILURE);
-    }
+    preadAll(fileno(file), dbTypeFile.c_str(), (char *) &dbtype, fileSize, 0);
     if (fclose(file) != 0) {
         Debug(Debug::ERROR) << "Cannot close file " << dbTypeFile << "\n";
         EXIT(EXIT_FAILURE);
@@ -607,6 +790,19 @@ void FileUtil::fixRlimitNoFile() {
     }
 }
 
+void FileUtil::checkRlimitNoFile(size_t minOpenFiles) {
+    struct rlimit limit;
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) {
+        Debug(Debug::WARNING) << "Could not check maximum number of open files (getrlimit " << errno << "). Use ulimit -n " << minOpenFiles << " manually\n";
+        return;
+    }
+    struct rlimit raised = { (rlim_t) minOpenFiles, limit.rlim_max };
+    if (minOpenFiles > limit.rlim_cur && setrlimit(RLIMIT_NOFILE, &raised) != 0) {
+        Debug(Debug::ERROR) << "Raise the open file limit (ulimit -n) to at least " << minOpenFiles << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+}
+
 std::string FileUtil::sanitizeFilename(std::string name){
     static const std::vector<std::pair<char, char>> symbolTable =
             {{'\\', '@'},
@@ -643,11 +839,18 @@ bool FileUtil::isSameDbData(const std::string &firstDb, const std::string &secon
 
 // the bytes copied at once by a thread
 static const size_t LOCAL_COPY_IO_BYTES = 64 * 1024 * 1024;
-// shared storage serves this many large reads of a copy at once
-static const int LOCAL_COPY_THREADS = 64;
 
-std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &memoryBytes,
-                                     const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges) {
+int FileUtil::copyRange(int sourceFd, const char *sourceName, int copyFd, char *buffer, size_t bytes, size_t offset) {
+    preadAll(sourceFd, sourceName, buffer, bytes, offset);
+    int writeError;
+    if (tryPwriteAll(copyFd, buffer, bytes, offset, writeError) < bytes) {
+        return (writeError != 0) ? writeError : EIO;
+    }
+    return 0;
+}
+
+std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &copiedBytes,
+                                     const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges, size_t maxBytes, bool isReservingOnly) {
     const std::vector<std::string> dataFiles = findDatafiles(db.c_str());
     if (dataFiles.empty()) {
         Debug(Debug::ERROR) << "No datafile could be found for " << db << "\n";
@@ -656,21 +859,6 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
     if (directoryExists(localDir.c_str()) == false && makeDir(localDir.c_str()) == false) {
         Debug(Debug::ERROR) << "Cannot create " << localDir << "\n";
         EXIT(EXIT_FAILURE);
-    }
-    const int localFd = open(localDir.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-    if (localFd < 0) {
-        Debug(Debug::ERROR) << "Cannot open local database dir " << localDir << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    const StorageKind localStorage = getStorageKind(localFd);
-    struct stat localStat, dbStat;
-    const bool isDbDevice = fstat(localFd, &localStat) == 0 && stat((db + ".index").c_str(), &dbStat) == 0 && localStat.st_dev == dbStat.st_dev;
-    close(localFd);
-    if (localStorage != STORAGE_LOCAL_FLASH && localStorage != STORAGE_MEMORY) {
-        Debug(Debug::WARNING) << localDir << " is on " << getStorageName(localStorage) << ", not local flash\n";
-    }
-    if (isDbDevice) {
-        Debug(Debug::WARNING) << localDir << " is on the device of the database\n";
     }
     const std::string localDb = localDir + "/" + baseName(db);
     if (isSameDbData(db, localDb)) {
@@ -683,7 +871,6 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
     std::vector<size_t> fileBytes(dataFiles.size());
     std::vector<std::pair<size_t, size_t> > chunks;
     std::vector<size_t> chunkBytes;
-    size_t totalBytes = 0;
     for (size_t i = 0; i < dataFiles.size(); i++) {
         fileBytes[i] = getFileSize(dataFiles[i]);
         const std::vector<std::pair<size_t, size_t> > &ranges = fileRanges[i];
@@ -691,12 +878,12 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
             for (size_t offset = ranges[range].first; offset < ranges[range].second; offset += LOCAL_COPY_IO_BYTES) {
                 chunks.emplace_back(i, offset);
                 chunkBytes.push_back(std::min(LOCAL_COPY_IO_BYTES, ranges[range].second - offset));
-                totalBytes += chunkBytes.back();
             }
         }
     }
     std::vector<int> sourceFds(dataFiles.size());
     std::vector<int> copyFds(dataFiles.size());
+    const size_t firstCopy = copies.size();
     for (size_t i = 0; i < dataFiles.size(); i++) {
         // the copy keeps the suffix of the data file, so DBReader finds it next to localDb
         copies.push_back(localDb + dataFiles[i].substr(db.size()));
@@ -707,30 +894,7 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
             EXIT(EXIT_FAILURE);
         }
     }
-    // after O_TRUNC, so a copy left by a killed run does not take the free space; the copies are still sparse
-    struct statvfs fs;
-    if (statvfs(localDir.c_str(), &fs) != 0 || static_cast<size_t>(fs.f_bavail) * fs.f_frsize < totalBytes) {
-        Debug(Debug::ERROR) << localDir << " needs " << totalBytes << " free bytes for the sequences of " << db << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    const int copyThreads = std::max(1, std::min(std::min(threads, LOCAL_COPY_THREADS), (int) chunks.size()));
-#pragma omp parallel num_threads(copyThreads)
-    {
-        std::vector<char> buffer(LOCAL_COPY_IO_BYTES);
-#pragma omp for schedule(dynamic, 1)
-        for (size_t i = 0; i < chunks.size(); i++) {
-            const size_t file = chunks[i].first;
-            preadAll(sourceFds[file], dataFiles[file].c_str(), buffer.data(), chunkBytes[i], chunks[i].second);
-            pwriteAll(copyFds[file], copies[file].c_str(), buffer.data(), chunkBytes[i], chunks[i].second);
-        }
-    }
-    for (size_t i = 0; i < dataFiles.size(); i++) {
-        if (::close(sourceFds[i]) != 0 || ::close(copyFds[i]) != 0) {
-            Debug(Debug::ERROR) << "Cannot copy " << dataFiles[i] << " to " << copies[i] << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-    }
-    memoryBytes = (localStorage == STORAGE_MEMORY) ? totalBytes : 0;
+    // before reserving, publishFile exits on a full device
     const std::string dbtype = readFile(db + ".dbtype");
     if (dbtype.size() != sizeof(int)) {
         Debug(Debug::ERROR) << "Invalid database type file: " << db << ".dbtype\n";
@@ -738,6 +902,78 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
     }
     publishFile(localDb + ".dbtype", dbtype);
     copies.push_back(localDb + ".dbtype");
-    Debug(Debug::INFO) << "Copied " << totalBytes << " bytes of " << db << " to " << localDb << "\n";
+    // reserve in order up to the first chunk that does not fit
+    size_t totalBytes = 0;
+    size_t chunkCount = 0;
+    for (; chunkCount < chunks.size() && chunkBytes[chunkCount] <= maxBytes - totalBytes; chunkCount++) {
+#ifdef __linux__
+        const int fd = copyFds[chunks[chunkCount].first];
+        int failed;
+        do {
+            failed = fallocate(fd, 0, chunks[chunkCount].second, chunkBytes[chunkCount]);
+        } while (failed != 0 && errno == EINTR);
+        const int reserveError = errno;
+        if (failed != 0 && reserveError != EOPNOTSUPP && reserveError != ENOSYS) {
+            std::string copyEnd;
+            MMseqsNode::addPhaseValue(copyEnd, "Local tmp", "cannot reserve " + copies[firstCopy + chunks[chunkCount].first] + " at offset " + SSTR(chunks[chunkCount].second) + ": " + strerror(reserveError)
+                                      + ", the copy ends there");
+            MMseqsNode::printPhaseValues(copyEnd);
+            punchHole(fd, chunks[chunkCount].second, chunkBytes[chunkCount]);
+            break;
+        }
+#endif
+        totalBytes += chunkBytes[chunkCount];
+    }
+    chunks.resize(isReservingOnly ? 0 : chunkCount);
+    // without fallocate the first chunk on a full device ends the copy
+    size_t failedChunk = chunks.size();
+    // up to 64 large reads from shared storage
+    const int copyThreads = std::max(1, std::min(std::min(threads, 64), (int) chunks.size()));
+#pragma omp parallel num_threads(copyThreads)
+    {
+        std::vector<char> buffer(chunks.empty() ? 0 : LOCAL_COPY_IO_BYTES);
+#pragma omp for schedule(dynamic, 1)
+        for (size_t i = 0; i < chunks.size(); i++) {
+            if (i > __atomic_load_n(&failedChunk, __ATOMIC_RELAXED)) {
+                continue;
+            }
+            const size_t file = chunks[i].first;
+            const int writeError = copyRange(sourceFds[file], dataFiles[file].c_str(), copyFds[file], buffer.data(), chunkBytes[i], chunks[i].second);
+            if (writeError == ENOSPC || writeError == EDQUOT) {
+                std::string copyEnd;
+                MMseqsNode::addPhaseValue(copyEnd, "Local tmp", "cannot write " + copies[firstCopy + file] + " at offset " + SSTR(chunks[i].second) + ": " + strerror(writeError) + ", the copy ends there");
+                MMseqsNode::printPhaseValues(copyEnd);
+                size_t failed = __atomic_load_n(&failedChunk, __ATOMIC_RELAXED);
+                while (i < failed && __atomic_compare_exchange_n(&failedChunk, &failed, i, false, __ATOMIC_RELAXED, __ATOMIC_RELAXED) == false) {}
+            } else if (writeError != 0) {
+                Debug(Debug::ERROR) << "Cannot write " << copies[firstCopy + file] << " at offset " << chunks[i].second << ": " << strerror(writeError) << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+    }
+    // cut off everything from the failed chunk on
+    if (failedChunk < chunks.size()) {
+        totalBytes = 0;
+        for (size_t i = 0; i < failedChunk; i++) {
+            totalBytes += chunkBytes[i];
+        }
+        for (size_t file = chunks[failedChunk].first; file < dataFiles.size(); file++) {
+            const size_t keptBytes = (file == chunks[failedChunk].first) ? chunks[failedChunk].second : 0;
+            if (ftruncate(copyFds[file], keptBytes) != 0 || ftruncate(copyFds[file], fileBytes[file]) != 0) {
+                Debug(Debug::ERROR) << "Cannot truncate " << copies[firstCopy + file] << "\n";
+                EXIT(EXIT_FAILURE);
+            }
+        }
+    }
+    for (size_t i = 0; i < dataFiles.size(); i++) {
+        if (::close(sourceFds[i]) != 0 || ::close(copyFds[i]) != 0) {
+            Debug(Debug::ERROR) << "Cannot copy " << dataFiles[i] << " to " << copies[firstCopy + i] << "\n";
+            EXIT(EXIT_FAILURE);
+        }
+    }
+    copiedBytes = totalBytes;
+    std::string copied;
+    MMseqsNode::addPhaseValue(copied, "Local tmp", (isReservingOnly ? "reserved " : "copied ") + MMseqsNode::formatBytes(totalBytes) + " of " + db + " to " + localDb);
+    MMseqsNode::printPhaseValues(copied);
     return localDb;
 }

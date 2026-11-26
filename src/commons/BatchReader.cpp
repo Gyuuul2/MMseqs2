@@ -2,12 +2,13 @@
 #include "Debug.h"
 #include "FastSort.h"
 #include "FileUtil.h"
-#include "MMseqsNode.h"
 #include "Util.h"
 
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
+#include <ctime>
+#include <unistd.h>
 
 #ifdef __linux__
 #include <sys/stat.h>
@@ -65,39 +66,15 @@ StorageKind getStorageKind(int fd) {
 const char *getStorageName(StorageKind storage) {
     switch (storage) {
         case STORAGE_LOCAL_FLASH: return "local flash";
-        case STORAGE_LOCAL_DISK: return "local disk";
+        case STORAGE_LOCAL_DISK: return "a local disk";
         case STORAGE_MEMORY: return "memory";
-        case STORAGE_PARALLEL_FS: return "parallel file system";
+        case STORAGE_PARALLEL_FS: return "a parallel file system";
         case STORAGE_NFS: return "NFS";
         default: return "unknown storage";
     }
 }
 
-IoMode getIoMode() {
-    const char *mode = getenv("MMSEQS_IO_MODE");
-    if (mode == NULL || strcmp(mode, "auto") == 0) {
-        return IO_MODE_AUTO;
-    }
-    if (strcmp(mode, "buffered") == 0) {
-        return IO_MODE_BUFFERED;
-    }
-    if (strcmp(mode, "direct") == 0) {
-        return IO_MODE_DIRECT;
-    }
-    Debug(Debug::ERROR) << "MMSEQS_IO_MODE must be auto, buffered or direct, not " << mode << "\n";
-    EXIT(EXIT_FAILURE);
-}
-
 static int getStorageMaxInflightRequests(StorageKind storage, int maxIoThreads) {
-    const char *concurrency = getenv("MMSEQS_IO_CONCURRENCY");
-    if (concurrency != NULL) {
-        int value = atoi(concurrency);
-        if (value < 1) {
-            Debug(Debug::ERROR) << "MMSEQS_IO_CONCURRENCY must be a positive number, not " << concurrency << "\n";
-            EXIT(EXIT_FAILURE);
-        }
-        return value;
-    }
     switch (storage) {
         case STORAGE_PARALLEL_FS: return 128;
         case STORAGE_NFS: return 16;
@@ -107,7 +84,7 @@ static int getStorageMaxInflightRequests(StorageKind storage, int maxIoThreads) 
     }
 }
 
-BatchReader::BatchReader(int maxIoThreads, int fdToDetectStorage) : nextSplitReadRequest(0), hasRemoteReads(false), readError(0), readErrorFileName(NULL) {
+BatchReader::BatchReader(int maxIoThreads, int fdToDetectStorage) : nextSplitReadRequest(0), readError(0), readErrorFileName(NULL) {
     storage = getStorageKind(fdToDetectStorage);
     maxInflightRequests = std::max(1, std::min(getStorageMaxInflightRequests(storage, maxIoThreads), maxIoThreads));
 #ifdef HAVE_IO_URING
@@ -188,7 +165,7 @@ void BatchReader::waitAsyncRead() {
     if (ringThread.joinable()) {
         ringThread.join();
     }
-    if (ringFd >= 0 && hasRemoteReads == false) {
+    if (ringFd >= 0) {
         readWithRing(true);
     }
 #endif
@@ -207,10 +184,8 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
     waitAsyncRead();
     splitReadRequests.clear();
     nextSplitReadRequest = 0;
-    hasRemoteReads = false;
     for (size_t i = 0; i < requests.size(); i++) {
         const ReadRequest &request = requests[i];
-        hasRemoteReads = hasRemoteReads || MMseqsNode::isRemoteFile(request.fileToRead);
         size_t end = request.fileOffset + request.bytesToRead;
         size_t minEnd = request.fileOffset + request.minBytesToRead;
         for (size_t at = request.fileOffset; at < minEnd;) {
@@ -225,7 +200,7 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
         }
     }
 #ifdef HAVE_IO_URING
-    if (ringFd >= 0 && hasRemoteReads == false) {
+    if (ringFd >= 0) {
         if (isRingWorkerCountLimited == false) {
             unsigned int maxWorkers[2] = { static_cast<unsigned int>(maxInflightRequests), static_cast<unsigned int>(maxInflightRequests) };
             // no cap before Linux 5.15
@@ -247,6 +222,24 @@ void BatchReader::startRead(const std::vector<ReadRequest> &requests, bool calli
     }
 }
 
+static bool preadRequest(const BatchReader::ReadRequest &request, size_t pageSize, int &error) {
+    for (size_t done = 0; done < request.minBytesToRead;) {
+        ssize_t count = pread(request.fileToRead, request.destination + done, request.bytesToRead - done, request.fileOffset + done);
+        if (count < 0 && errno == EINTR) {
+            continue;
+        }
+        if (count < static_cast<ssize_t>(std::min(pageSize, request.minBytesToRead - done))) {
+            error = (count < 0) ? errno : -1;
+            return false;
+        }
+        done += count;
+        if (done < request.minBytesToRead) {
+            done -= done % pageSize;
+        }
+    }
+    return true;
+}
+
 void BatchReader::readWithPread() {
     size_t pageSize = Util::getPageSize();
     while (__atomic_load_n(&readError, __ATOMIC_RELAXED) == 0) {
@@ -255,30 +248,26 @@ void BatchReader::readWithPread() {
             return;
         }
         const ReadRequest &request = splitReadRequests[i];
-        size_t remoteSize;
-        if (MMseqsNode::readRemoteFile(request.fileToRead, request.destination, request.bytesToRead, request.fileOffset, remoteSize)) {
-            if (remoteSize < request.minBytesToRead && __sync_bool_compare_and_swap(&readError, 0, -1)) {
+        int error = 0;
+        if (preadRequest(request, pageSize, error) == false && retryRead(request, error) == false) {
+            if (__sync_bool_compare_and_swap(&readError, 0, error)) {
                 readErrorFileName = request.fileName;
             }
-            continue;
-        }
-        for (size_t done = 0; done < request.minBytesToRead;) {
-            ssize_t count = pread(request.fileToRead, request.destination + done, request.bytesToRead - done, request.fileOffset + done);
-            if (count < 0 && errno == EINTR) {
-                continue;
-            }
-            if (count < static_cast<ssize_t>(std::min(pageSize, request.minBytesToRead - done))) {
-                if (__sync_bool_compare_and_swap(&readError, 0, count < 0 ? errno : -1)) {
-                    readErrorFileName = request.fileName;
-                }
-                return;
-            }
-            done += count;
-            if (done < request.minBytesToRead) {
-                done -= done % pageSize;
-            }
+            return;
         }
     }
+}
+
+bool BatchReader::retryRead(const ReadRequest &request, int &error) {
+    time_t failedSince = 0;
+    unsigned int attempts = 0;
+    while (__atomic_load_n(&readError, __ATOMIC_RELAXED) == 0
+           && FileUtil::waitBeforeReadRetry(request.fileToRead, request.fileName, error, (error > 0) ? strerror(error) : "unexpected end of file", failedSince, attempts)) {
+        if (preadRequest(request, Util::getPageSize(), error)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 #ifdef HAVE_IO_URING
@@ -313,8 +302,9 @@ void BatchReader::readWithRing(bool waitForAll) {
                 continue;
             }
             if (cqe.res < static_cast<int>(std::min(pageSize, rest.minBytesToRead))) {
-                if (readError == 0) {
-                    readError = (cqe.res < 0) ? -cqe.res : -1;
+                int error = (cqe.res < 0) ? -cqe.res : -1;
+                if (readError == 0 && retryRead(rest, error) == false) {
+                    readError = error;
                     readErrorFileName = rest.fileName;
                 }
                 continue;
@@ -339,7 +329,7 @@ const size_t BatchWriter::BUFFER_SIZE;
 
 BatchWriter::BatchWriter(size_t memorySize, int maxIoThreads, int fdToDetectStorage)
     : bufferSize(std::min(BUFFER_SIZE, std::max((size_t) 1, memorySize / 3))), currentBuffer(NULL), busyBufferCount(0), isClosing(false) {
-    // each thread has a buffer to join writes, so threads take at most half
+    // each thread has a join buffer, threads take at most half
     size_t threads = std::max((size_t) 1, std::min((size_t) std::min(getStorageMaxInflightRequests(getStorageKind(fdToDetectStorage), maxIoThreads), maxIoThreads), memorySize / bufferSize / 2));
     size_t bufferCount = std::max((size_t) 2, memorySize / bufferSize - std::min(memorySize / bufferSize, threads));
     memory = new(std::nothrow) char[(bufferCount + threads) * bufferSize];

@@ -296,7 +296,21 @@ public:
     const std::vector<size_t> &getBlockKeyOffsets() const { return blockKeyOffsets; }
     size_t getBlockReadSize() { return blockReadSize; }
     size_t getKeyReadSize() { return keyReadSize; }
+    // linfinity local copy
+    void setLocalBlocks(const std::string &localDataFileName, const std::vector<char> &blocks);
+    // not while a loaded buffer is read
+    void setLocalBlock(size_t block);
+    void setLocalBlockCacheSize(size_t cacheSize) { localBlockCacheSize = cacheSize; }
+    bool isLocalBlock(size_t block) const { return localBlocks.empty() == false && localBlocks[block]; }
+    size_t getLocalBlockReadSize() { return localBlockReadSize; }
+    size_t getLocalKeyReadSize() { return localKeyReadSize; }
     size_t getLoadBufferSize(size_t keyBegin, size_t keyEnd);
+    // range loads from copies at the offsets of the data files, empty: from the data files
+    void setLocalCopyFds(const std::vector<int> &fds) { localCopyFds = fds; }
+    // 0 or the errno of the failed write
+    int writeLoadedData(const std::vector<int> &fds);
+    // false if the block cache does not hold [offset, offset + size) of the data file of block
+    bool copyCachedBlockData(size_t block, size_t offset, size_t size, char *data) const;
 
     // linfinity headers
     size_t getNamesSize(size_t keyBegin, size_t keyEnd);
@@ -310,7 +324,7 @@ public:
     }
     Index getIndexEntry(size_t id);
     void readIndexPairs(size_t first, size_t last, uint64_t *indexPairs);
-    void readSampledKeys(size_t entryStep, size_t bufferSize, T *keys, size_t &readSize, size_t &readCount);
+    void readSampledKeys(size_t entryStep, size_t bufferSize, T *keys);
     void readData(size_t offset, size_t bytes, char *destination);
     int getBufferedFd() const { return bufferedFds[0]; }
     char *getDataFromLoadedBuffer(size_t key);
@@ -570,11 +584,17 @@ public:
     std::vector<size_t> getEvenNodeKeyOffsets(size_t nodeCount);
     std::vector<size_t> getSplitKeyOffsets(size_t keyBegin, size_t keyEnd, size_t splitSize, size_t keySize);
     size_t findIdRange(size_t id);
+    // the first id after the range
+    size_t getRangeEndId(size_t range);
     // range SIZE_MAX searches from the start
     size_t getSeqLenFromRange(size_t &range, size_t id);
     // sixth index column of a clusthashfast subset
     size_t getRangeRepresentativeCount(size_t range) const {
         return rangeRepresentativeCounts[range];
+    }
+    // seventh column of a createsubdb subset: the reps with a median member
+    size_t getRangeMedianMemberCount(size_t range) const {
+        return rangeMedianMemberCounts[range];
     }
 
 private:
@@ -587,6 +607,9 @@ private:
     size_t planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys);
     void loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
     void decompressLoadedBuffer();
+    // the offset of a key in the data file of its range
+    size_t getKeyOffset(size_t range, size_t key);
+    char *allocateReadBuffer(size_t bytes);
 
     int threads;
 
@@ -642,6 +665,10 @@ private:
     // header offsets or binary cluster index, their fds follow the data fds
     std::vector<std::string> entryOffsetsFileNames;
     std::vector<size_t> rangeRepresentativeCounts;
+    std::vector<size_t> rangeMedianMemberCounts;
+    // bsearch result of every 2^idRangeShift-th key, findIdRange searches between two
+    std::vector<size_t> idRangeTable;
+    size_t idRangeShift;
     // uint64 (key, offset) pairs in <clu>.index.<node>
     bool hasBinaryIndex;
     // zstd seekable headers
@@ -650,6 +677,7 @@ private:
     std::vector<int> dataFds;
     // without O_DIRECT for key loads and index searches
     std::vector<int> bufferedFds;
+    bool openDataFile(const std::string &fileName, size_t fileSize, std::vector<int> &fds, std::vector<int> &bufferedFds);
     BatchReader * batchReader;
     struct EntryReadBuffer {
         char *buffer;
@@ -674,13 +702,21 @@ private:
 
     // block cache
     void cacheBlocks(EntryReadBuffer &buffer);
-    void freeBlocks(size_t keyEnd, size_t neededSize);
+    void freeBlocks(size_t keyEnd, size_t neededSize, bool isLocal = false);
     std::vector<size_t> blockKeyOffsets;
     std::map<size_t, BatchReader::ReadRequest> cachedBlocks;
     size_t blockCacheSize;
     size_t cachedBlockSize;
     size_t blockReadSize;
     size_t keyReadSize;
+    std::vector<char> localBlocks;
+    std::vector<int> localDataFds;
+    std::vector<int> localBufferedFds;
+    size_t localBlockCacheSize;
+    size_t cachedLocalBlockSize;
+    size_t localBlockReadSize;
+    size_t localKeyReadSize;
+    std::vector<int> localCopyFds;
     bool prepareBufferToLoad(EntryReadBuffer &bufferToLoadInto, size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
 
     bool dataMapped;
