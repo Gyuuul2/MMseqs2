@@ -21,6 +21,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <algorithm>
+#include <atomic>
+#include <cstring>
+#include <ctime>
 #include <map>
 
 #ifdef OPENMP
@@ -443,6 +446,14 @@ struct SequenceRun {
 
 static bool isBeforeRun(size_t sentOffset, const SequenceRun &run) {
     return sentOffset < run.sentOffset;
+}
+
+static std::string currentTime() {
+    time_t now = time(NULL);
+    struct tm local;
+    char buffer[16];
+    strftime(buffer, sizeof(buffer), "%H:%M:%S", localtime_r(&now, &local));
+    return buffer;
 }
 
 static void flushBufferToExchange(char *buffer, size_t bufferPos, char *sortedBuffer, ZSTD_CCtx *cctx, size_t lengthCount, size_t inputSplit, size_t inputSplitFlush,
@@ -1086,6 +1097,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
 
     // receive the compression units of this node
     double compressSeconds = 0;
+    double waitSeconds = 0;
     std::string tmpHeaderName = dataFileNames[HEADER_DATA] + ".tmp";
     {
         std::vector<FILE *> exchangeFiles(MMseqsNode::count, NULL);
@@ -1235,11 +1247,37 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
             outputBytes += (isSpooled && fileType == SEQUENCE_DATA) ? sentSequenceSize : dataFileBytes[fileType * MMseqsNode::count + MMseqsNode::rank];
         }
-        size_t writtenBytes = 0;
         Debug::Progress writeProgress(100);
+        size_t writtenPercent = 0;
+        std::atomic<size_t> writeTotal(outputBytes);
+        std::string writeSamples;
+        batchWriter.setReport([&](const BatchWriter::Statistics &statistics) {
+            size_t percent = std::min(statistics.writtenBytes, writeTotal.load()) * 100 / std::max(writeTotal.load(), (size_t) 1);
+            MMseqsNode::printProgress(writeProgress, writtenPercent, percent, 100);
+            writtenPercent = std::max(writtenPercent, percent);
+            char blocked[32];
+            snprintf(blocked, sizeof(blocked), "%.1f s", statistics.blockedSeconds);
+            std::string value = "queued " + MMseqsNode::formatBytes(statistics.queuedBytes) + ", written " + MMseqsNode::formatBytes(statistics.writtenBytes)
+                                + ", " + SSTR(statistics.busyBufferCount) + " of " + SSTR(statistics.bufferCount) + " buffers busy, " + SSTR(statistics.fullBufferCount) + " full, "
+                                + SSTR(statistics.blockedWriterCount) + " threads blocked, " + blocked + " blocked in total";
+            FILE *vmstat = fopen("/proc/vmstat", "r");
+            if (vmstat != NULL) {
+                char name[64];
+                unsigned long long pages;
+                while (fscanf(vmstat, "%63s %llu", name, &pages) == 2) {
+                    if (strcmp(name, "nr_dirty") == 0 || strcmp(name, "nr_writeback") == 0) {
+                        value += std::string(", ") + name + " " + MMseqsNode::formatBytes(pages * pageSize);
+                    }
+                }
+                fclose(vmstat);
+            }
+            for (std::map<std::string, BatchWriter::FileWrites>::const_iterator it = statistics.files.begin(); it != statistics.files.end(); ++it) {
+                snprintf(blocked, sizeof(blocked), "%.1f s", it->second.seconds);
+                value += ", " + FileUtil::baseName(it->first) + " " + MMseqsNode::formatBytes(it->second.bytes) + " in " + blocked;
+            }
+            MMseqsNode::addPhaseValue(writeSamples, "Database writes at " + currentTime(), value);
+        }, 15);
         for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
-            size_t fileTypeBegin = writtenBytes;
-            size_t fileTypeBytes = (isSpooled && fileType == SEQUENCE_DATA) ? sentSequenceSize : dataFileBytes[fileType * MMseqsNode::count + MMseqsNode::rank];
             bool isCompressedHeader = par.compressHeaders && fileType == HEADER_DATA;
             for (size_t writeBufferBegin = 0; writeBufferBegin != SIZE_MAX; ) {
                 compressionUnits.clear();
@@ -1301,6 +1339,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                                           frameTaskOffsets[task + 1] - frameTaskOffsets[task], compressedBytes + frameTaskOffsets[task]);
                     }
                     compressedBytes += frameTaskOffsets.back();
+                    writeTotal += frameTaskOffsets.back();
+                    writeTotal -= frameEnd - writeBufferBegin;
                     memmove(writeBuffer, writeBuffer + (frameEnd - writeBufferBegin), writeBufferEnd - frameEnd);
                     writeBufferBegin = (frameEnd == headerDataBytes) ? SIZE_MAX : frameEnd;
                     compressSeconds += compressTimer.getTimediff();
@@ -1346,13 +1386,13 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     }
                     writeBufferBegin = nextOffset;
                 }
-                size_t writtenEnd = fileTypeBegin + std::min(writeBufferBegin, fileTypeBytes);
-                MMseqsNode::printProgress(writeProgress, writtenBytes, writtenEnd, outputBytes);
-                writtenBytes = writtenEnd;
             }
         }
 
         batchWriter.waitWrites();
+        batchWriter.setReport(NULL, 0);
+        MMseqsNode::printProgress(writeProgress, writtenPercent, 100, 100);
+        phaseValues += writeSamples;
         Util::releasePages(writeBuffer, writeBufferSize + MAX_UNIT_SIZE);
         delete[] writeBuffer;
         MMseqsNode::closeExchangeFiles(exchangeFiles, exchange);
@@ -1369,9 +1409,12 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 EXIT(EXIT_FAILURE);
             }
             MMseqsNode::addSentExchangeBytes(edgeSize, edgeSize);
+            std::string barrierEntered = currentTime();
             Timer waitTimer;
             MMseqsNode::barrier(edges + ".index");
-            MMseqsNode::addPhaseTime(phaseValues, "waiting for the other nodes to send the sequences on shared pages", waitTimer);
+            waitSeconds = waitTimer.getTimediff();
+            MMseqsNode::addPhaseValue(phaseValues, "Edges barrier", "entered at " + barrierEntered + ", left at " + currentTime());
+            MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the other nodes to send the sequences on shared pages", waitSeconds);
             FileUtil::removeSharedFile(exchangeFile);
 
             // write the edges of the runs of other nodes, one read per node and chunk
@@ -1443,13 +1486,17 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         FileUtil::move(tmpHeaderName.c_str(), dataFileNames[HEADER_DATA].c_str());
         MMseqsNode::addPhaseSeconds(phaseValues, "compressing headers", compressSeconds);
     }
-    MMseqsNode::addPhaseSeconds(phaseValues, "writing sequences", timer.getTimediff() - compressSeconds);
+    MMseqsNode::addPhaseSeconds(phaseValues, "writing sequences", timer.getTimediff() - compressSeconds - waitSeconds);
     std::vector<std::string> exchanges;
     exchanges.push_back(exchange);
     if (isSpooled) {
         exchanges.push_back(edges);
     }
+    std::string barrierEntered = currentTime();
     MMseqsNode::removeExchanges(dataFile, exchanges.back(), exchanges, phaseValues);
+    std::string barrierValues;
+    MMseqsNode::addPhaseValue(barrierValues, "Final barrier", "entered at " + barrierEntered + ", left at " + currentTime());
+    MMseqsNode::printPhaseValues(barrierValues);
     MMseqsNode::writeNodeLog(dataFile);
 
     if (MMseqsNode::isMaster()) {
