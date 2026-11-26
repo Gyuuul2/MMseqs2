@@ -354,9 +354,11 @@ template <typename T> bool DBReader<T>::open(int accessType){
 
         batchReader = new BatchReader(threads, dataFds[0]);
         if (entryOffsetsFileNames.empty()) {
-            Debug(Debug::INFO) << "Reading " << dataFileName << " from " << getStorageName(batchReader->getStorage()) << ", up to " << batchReader->getMaxInflightRequests()
-                               << " reads at once (" << (batchReader->usesIoUring() ? "io_uring" : "pread") << ")"
-                               << ((directFiles > 0) ? ", " + SSTR(directFiles) + " of " + SSTR(dataFds.size()) + " files without the page cache (O_DIRECT)" : "") << "\n";
+            std::string reading;
+            MMseqsNode::addPhaseValue(reading, "Reading", std::string(dataFileName) + " from " + getStorageName(batchReader->getStorage()) + ", up to " + SSTR(batchReader->getMaxInflightRequests())
+                                      + " reads at once (" + (batchReader->usesIoUring() ? "io_uring" : "pread") + ")"
+                                      + ((directFiles > 0) ? ", " + SSTR(directFiles) + " of " + SSTR(dataFds.size()) + " files without the page cache (O_DIRECT)" : ""));
+            MMseqsNode::printPhaseValues(reading);
         }
 
         if (isCompressed(dbtype) == COMPRESSED) {

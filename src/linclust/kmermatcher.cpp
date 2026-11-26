@@ -2445,8 +2445,6 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
                                                      : par.alphabetSize.values.aminoacid())
                            << ", k-mers per sequence " << par.kmersPerSequence << "\n";
     }
-    std::vector<MMseqsParameter *> *params = command.params;
-    par.printParameters(command.cmd, argc, argv, *params);
     if (MMseqsNode::isMaster()) {
         Debug(Debug::INFO) << "Database size: " << seqDbr.getSize() << " type: " << seqDbr.getDbTypeName() << "\n";
     }

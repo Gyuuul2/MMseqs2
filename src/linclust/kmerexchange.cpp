@@ -2148,7 +2148,7 @@ static size_t getRepAnswerBits(const KmerExchange &exchange, const size_t *group
 }
 
 static void putRepAnswer(KmerCodeWriter &answer, const std::vector<DBKeyType> &reps, const std::vector<size_t> &repIndexes, size_t candidateCount,
-                         unsigned int globalIdBits, const std::pair<DBKeyType, DBKeyType> &repKeys) {
+                         const std::pair<DBKeyType, DBKeyType> &repKeys) {
     size_t repCount = 0;
     for (size_t rep = 0; rep < reps.size(); rep++) {
         repCount += reps[rep] >= repKeys.first && reps[rep] < repKeys.second;
@@ -2162,7 +2162,7 @@ static void putRepAnswer(KmerCodeWriter &answer, const std::vector<DBKeyType> &r
         if (repIndexes[rep] != SIZE_MAX) {
             putBits(answer, repIndexes[rep], getBitWidth(candidateCount - 1));
         } else {
-            putBits(answer, reps[rep], globalIdBits);
+            putBits(answer, reps[rep] - repKeys.first, getBitWidth(repKeys.second - repKeys.first - 1));
         }
     }
 }
@@ -2244,7 +2244,7 @@ static void pickReps(const KmerExchange &exchange, const KeySplitPref &pref, siz
                             }
                         }
                     }
-                    putRepAnswer(rows[valueRows[i]]->answer, reps, repIndexes, rowCandidateCount, exchange.globalIdBits, pref.keySplitRepKeys[rows[valueRows[i]]->keySplit]);
+                    putRepAnswer(rows[valueRows[i]]->answer, reps, repIndexes, rowCandidateCount, pref.keySplitRepKeys[rows[valueRows[i]]->keySplit]);
                 }
             } else {
                 if (hasTwoMembers && kind == WHOLE_SEQUENCE_GROUPS) {
@@ -2302,7 +2302,7 @@ static void pickReps(const KmerExchange &exchange, const KeySplitPref &pref, siz
                             }
                         }
                     }
-                    putRepAnswer(read.answer, reps, repIndexes, rowCandidateCount, exchange.globalIdBits, pref.keySplitRepKeys[read.keySplit]);
+                    putRepAnswer(read.answer, reps, repIndexes, rowCandidateCount, pref.keySplitRepKeys[read.keySplit]);
                 }
             }
             for (size_t i = 0; i < valueRows.size(); i++) {
@@ -3193,7 +3193,8 @@ static std::string writeKeySplitPrefs(Parameters &par, DBReader<DBKeyType> &seqD
                                     size_t repCount = getEliasGamma(repRead) - 1;
                                     for (size_t rep = 0; rep < repCount; rep++) {
                                         bool isOwn = getBits(repRead, 1) != 0;
-                                        reps.push_back(isOwn ? members[candidateMembers[getBits(repRead, getBitWidth(candidateMembers.size() - 1))]] : getBits(repRead, exchange.globalIdBits));
+                                        reps.push_back(isOwn ? members[candidateMembers[getBits(repRead, getBitWidth(candidateMembers.size() - 1))]]
+                                                            : keySplitRepBegin + getBits(repRead, getBitWidth(keySplitRepEnd - keySplitRepBegin - 1)));
                                     }
                                 } else {
                                     for (size_t rep = 0; rep < candidateMembers.size(); rep++) {
@@ -3617,8 +3618,10 @@ static void kmermatcherKeySplitPref(Parameters &par, DBReader<DBKeyType> &seqDbr
     marked.memorySize = 0;
     marked.fd = -1;
     marked.name = par.localTmp + "/" + FileUtil::baseName(par.db2) + ".marked_fingerprints." + SSTR(MMseqsNode::rank);
-    printStep(exchange, 1, "send the k-mer hashes of each sequence batch to the nodes that own their hash range (about " + SSTR(totalKmerCount) + " k-mers, "
-                              + SSTR(exchange.sendSplitCount) + " parts of the database, " + SSTR(pref.hashRangeCount) + " hash ranges)");
+    printStep(exchange, 1, "send the k-mer hashes of each sequence batch to the nodes that own their hash range");
+    std::string layout;
+    MMseqsNode::addPhaseValue(layout, "Layout", "about " + SSTR(totalKmerCount) + " k-mers, " + SSTR(exchange.sendSplitCount) + " parts of the database, " + SSTR(pref.hashRangeCount) + " hash ranges");
+    MMseqsNode::printPhaseValues(layout);
 
     // remove a file after the barrier past its last read
     BackgroundRemoval removal;
