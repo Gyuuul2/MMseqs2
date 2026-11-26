@@ -394,6 +394,7 @@ static void copyToCompressionUnits(char *buffer, size_t &written, const char *da
 
 struct SentLengthRow {
     uint64_t flush;
+    uint64_t spool;
     uint64_t length;
     uint64_t sequenceCount;
     uint64_t headerBytes;
@@ -458,7 +459,7 @@ static std::string currentTime() {
 
 static void flushBufferToExchange(char *buffer, size_t bufferPos, char *sortedBuffer, ZSTD_CCtx *cctx, size_t lengthCount, size_t inputSplit, size_t inputSplitFlush,
                                   FILE *exchangeFile, const std::string &exchangeFileName, FILE *sequenceFile, const std::string &sequenceFileName,
-                                  std::vector<SentFlush> &sentFlushes, size_t &exchangeBytes, size_t &sequenceBytes) {
+                                  std::vector<SentFlush> &sentFlushes, size_t &exchangeBytes, size_t &sequenceBytes, size_t spool) {
     std::vector<size_t> lengthBytes(DATA_FILE_TYPE_COUNT * lengthCount, 0);
     for (size_t pos = 0; pos < bufferPos; ) {
         size_t seqSize = strlen(buffer + pos) + 1;
@@ -474,7 +475,7 @@ static void flushBufferToExchange(char *buffer, size_t bufferPos, char *sortedBu
     flush.inputSplitFlush = inputSplitFlush;
     for (size_t length = lengthCount; length-- > 0; ) {
         if (lengthBytes[SEQUENCE_DATA * lengthCount + length] > 0) {
-            SentLengthRow row = {0, length, lengthBytes[SEQUENCE_DATA * lengthCount + length] / (length + 2), lengthBytes[HEADER_DATA * lengthCount + length], {}, {}};
+            SentLengthRow row = {0, spool, length, lengthBytes[SEQUENCE_DATA * lengthCount + length] / (length + 2), lengthBytes[HEADER_DATA * lengthCount + length], {}, {}};
             flush.rows.push_back(row);
         }
     }
@@ -749,16 +750,22 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                          + MMseqsNode::formatBytes(it->second.first) + " (" + SSTR(it->second.first) + " bytes)";
         }
     }
-    std::string spoolFile = par.localTmp + "/" + FileUtil::baseName(dataFile) + "_sent_sequences." + SSTR(MMseqsNode::rank) + ".XXXXXX";
-    FILE *spoolHandle = exchangeHandle;
+    std::vector<std::string> spoolFiles(1, exchangeFile);
+    std::vector<FILE *> spoolHandles(1, exchangeHandle);
     if (nodeReason.empty()) {
         if (MMseqsNode::isMaster()) {
             Debug(Debug::INFO) << "Keeping the read sequences in --local-tmp " << par.localTmp << " instead of the shared temporary folder\n";
         }
-        int fd = mkstemp(&spoolFile[0]);
-        if (fd < 0 || unlink(spoolFile.c_str()) != 0 || (spoolHandle = fdopen(fd, "r+")) == NULL) {
-            Debug(Debug::ERROR) << "Cannot create " << spoolFile << "\n";
-            EXIT(EXIT_FAILURE);
+        // one spool per thread, writes to one ext4 inode serialize
+        FileUtil::checkRlimitNoFile(FileUtil::UNCOUNTED_OPEN_FILES + threadCnt);
+        spoolFiles.assign(threadCnt, par.localTmp + "/" + FileUtil::baseName(dataFile) + "_sent_sequences." + SSTR(MMseqsNode::rank) + ".XXXXXX");
+        spoolHandles.assign(threadCnt, NULL);
+        for (size_t i = 0; i < spoolFiles.size(); i++) {
+            int fd = mkstemp(&spoolFiles[i][0]);
+            if (fd < 0 || unlink(spoolFiles[i].c_str()) != 0 || (spoolHandles[i] = fdopen(fd, "r+")) == NULL) {
+                Debug(Debug::ERROR) << "Cannot create " << spoolFiles[i] << "\n";
+                EXIT(EXIT_FAILURE);
+            }
         }
     } else if (hasLocalTmp && MMseqsNode::isMaster()) {
         MMseqsNode::reportUnusableLocalTmp("Cannot write the read sequences to --local-tmp " + par.localTmp + ": " + nodeReason);
@@ -766,8 +773,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     if (hasLocalTmp) {
         MMseqsNode::addPhaseValue(phaseValues, "Local tmp", nodeReason.empty() ? "holds the read sequences" : "not used, " + nodeReason);
     }
-    bool isSpooled = spoolHandle != exchangeHandle;
-    size_t spoolBytes = 0;
+    bool isSpooled = spoolHandles[0] != exchangeHandle;
+    std::vector<size_t> spoolBytes(spoolHandles.size(), 0);
     size_t readBytes = 0;
     size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
     size_t entryBufferBytes = static_cast<size_t>(memoryLimit * 0.95) / (2 * threadCnt);
@@ -783,6 +790,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             Debug(Debug::ERROR) << "ZSTD_createCCtx() error\n";
             EXIT(EXIT_FAILURE);
         }
+        size_t spool = isSpooled ? omp_get_thread_num() : 0;
+        size_t &sequenceBytes = isSpooled ? spoolBytes[spool] : exchangeBytes;
 #pragma omp for schedule(dynamic, 1)
         for (size_t i = 0; i < nodeInputSplits.size(); i++) {
             size_t bufferPos = 0;
@@ -809,7 +818,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                         EXIT(EXIT_FAILURE);
                     }
                     flushBufferToExchange(buffer, bufferPos, sortedBuffer, cctx, lengthCount, i, inputSplitFlush++, exchangeHandle, exchangeFile,
-                                          spoolHandle, isSpooled ? spoolFile : exchangeFile, sentFlushes, exchangeBytes, isSpooled ? spoolBytes : exchangeBytes);
+                                          spoolHandles[spool], spoolFiles[spool], sentFlushes, exchangeBytes, sequenceBytes, spool);
                     bufferPos = 0;
                     entryCount = 0;
                     lengthCount = 0;
@@ -828,7 +837,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             }
             if (bufferPos > 0) {
                 flushBufferToExchange(buffer, bufferPos, sortedBuffer, cctx, lengthCount, i, inputSplitFlush, exchangeHandle, exchangeFile,
-                                      spoolHandle, isSpooled ? spoolFile : exchangeFile, sentFlushes, exchangeBytes, isSpooled ? spoolBytes : exchangeBytes);
+                                      spoolHandles[spool], spoolFiles[spool], sentFlushes, exchangeBytes, sequenceBytes, spool);
             }
             delete kseq;
             size_t splitBytes = nodeInputSplits[i].end - nodeInputSplits[i].start;
@@ -1122,7 +1131,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         for (size_t i = 0; i < edgeRuns.size(); i++) {
             edgeFileCount += (i == 0 || edgeRuns[i].node != edgeRuns[i - 1].node);
         }
-        FileUtil::checkRlimitNoFile(FileUtil::UNCOUNTED_OPEN_FILES + std::max(openFiles, edgeFileCount));
+        FileUtil::checkRlimitNoFile(FileUtil::UNCOUNTED_OPEN_FILES + std::max(openFiles + (isSpooled ? spoolHandles.size() : 0), edgeFileCount));
 #pragma omp parallel for schedule(dynamic, 1)
         for (size_t node = 0; node < MMseqsNode::count; node++) {
             size_t firstRow = nodeRowRanges[node].first;
@@ -1179,7 +1188,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         SORT_SERIAL(sentRows.begin(), sentRows.end(), SentLengthRow::compareByFlush);
         for (size_t i = 0; i < sentRows.size(); i++) {
             if (i == 0 || sentRows[i - 1].flush != sentRows[i].flush) {
-                MMseqsNode::ExchangeReader reader = { spoolHandle, spoolFile, sentRows[i].starts[SEQUENCE_DATA], sentRows[i].ends[SEQUENCE_DATA],
+                MMseqsNode::ExchangeReader reader = { spoolHandles[sentRows[i].spool], spoolFiles[sentRows[i].spool], sentRows[i].starts[SEQUENCE_DATA], sentRows[i].ends[SEQUENCE_DATA],
                                                        std::vector<char>(), 0, 0, 0, 0, NULL, sentRows[i].starts[SEQUENCE_DATA], std::vector<char>(), 0, 0, { 0, 0 } };
                 readers[SEQUENCE_DATA].push_back(reader);
                 readerLengthOffsets[SEQUENCE_DATA].push_back(std::vector<std::pair<size_t, size_t> >());
@@ -1404,9 +1413,15 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     EXIT(EXIT_FAILURE);
                 }
             }
-            if (fclose(edgeHandle) != 0 || fclose(spoolHandle) != 0) {
-                Debug(Debug::ERROR) << "Cannot close " << edgeFile << " or " << spoolFile << "\n";
+            if (fclose(edgeHandle) != 0) {
+                Debug(Debug::ERROR) << "Cannot close " << edgeFile << "\n";
                 EXIT(EXIT_FAILURE);
+            }
+            for (size_t i = 0; i < spoolHandles.size(); i++) {
+                if (fclose(spoolHandles[i]) != 0) {
+                    Debug(Debug::ERROR) << "Cannot close " << spoolFiles[i] << "\n";
+                    EXIT(EXIT_FAILURE);
+                }
             }
             MMseqsNode::addSentExchangeBytes(edgeSize, edgeSize);
             std::string barrierEntered = currentTime();
