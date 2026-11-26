@@ -8,7 +8,6 @@
 #include "DistanceCalculator.h"
 #include "FastSort.h"
 #include "MMseqsNode.h"
-#include "S3Client.h"
 #include "itoa.h"
 #include "FileUtil.h"
 #include "Timer.h"
@@ -376,14 +375,15 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         representativeWriter.open();
     }
 
-    size_t memoryLimit = isLinfinity ? MMseqsNode::getMemoryLimit(par) : Util::computeMemory(par.splitMemoryLimit);
+    size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
     // linfinity: one representative bit per key
     size_t bitWords = isLinfinity ? (localKeyCount + 63) / 64 : 0;
     uint64_t *representativeBits = new(std::nothrow) uint64_t[bitWords]();
     Util::checkAllocation(representativeBits, "Can not allocate representative bit memory");
     // key, newline, entry end and index entry, doubled for growth
     size_t writeSeqBytes = 2 * (20 + 1 + 1 + 2 * sizeof(uint64_t));
-    size_t writeBufferBytes = std::min(localKeyCount, par.threads * WRITE_SEQS_PER_THREAD) * writeSeqBytes;
+    // a sixteenth of the memory limit for one large cluster
+    size_t writeBufferBytes = std::min(localKeyCount, std::max(par.threads * WRITE_SEQS_PER_THREAD, memoryLimit / 16 / writeSeqBytes)) * writeSeqBytes;
     if (bitWords * sizeof(uint64_t) + writeBufferBytes >= memoryLimit) {
         Debug(Debug::ERROR) << "Not enough memory to run clusthashfast. Memory limit: " << memoryLimit
                             << " bytes, the representative bits and write buffers need: " << bitWords * sizeof(uint64_t) + writeBufferBytes << " bytes.\n"
@@ -442,11 +442,14 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     SubstitutionMatrix sMat(par.scoringMatrixFile.values.aminoacid().c_str(), 2.0, -0.2);
     ReducedMatrix subMat(sMat.probMatrix, sMat.subMatrixPseudoCounts, sMat.aa2num, sMat.num2aa, sMat.alphabetSize, par.alphabetSize.values.aminoacid(), 2.0);
 
-    Debug(Debug::INFO) << "Hashing " << localKeyCount << " sequences in " << splitRangeOffsets.size() - 1 << " splits\n";
+    Debug(Debug::INFO) << "Clustering sequences of the same length and the same hash in a " << par.alphabetSize.values.aminoacid() << " letter alphabet at "
+                       << SSTR(par.seqIdThr) << " sequence identity\n";
+    std::string hashing;
+    MMseqsNode::addPhaseValue(hashing, "Hashing", SSTR(localKeyCount) + " sequences in " + SSTR(splitRangeOffsets.size() - 1) + " sequence batches");
+    MMseqsNode::printPhaseValues(hashing);
     Timer timer;
     Debug::Progress progress(splitRangeOffsets.size() - 1);
     for (size_t split = 0; split + 1 < splitRangeOffsets.size(); split++) {
-        progress.updateProgress();
         size_t splitFirstKey = nodeLengthRanges[splitRangeOffsets[split]].startKey;
         size_t splitSeqCount = nodeLengthRanges[splitRangeOffsets[split + 1]].startKey - splitFirstKey;
         bool isLargeLength = hashIdPairsCapacity[splitRangeOffsets[split]] > 0;
@@ -787,25 +790,30 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             hashIdPairs = NULL;
             allocatedHashEntryCount = 0;
         }
+        progress.updateProgress();
     }
 
     if (isLinfinity) {
         std::string phaseValues;
         MMseqsNode::addPhaseTime(phaseValues, "hashing sequences", timer);
-        MMseqsNode::printPhaseValues(phaseValues);
         MMseqsNode::closeClusterFiles(resultDataFile, resultDb, resultIndexFile, resultIndex, resultDataBytes, resultIndexBytes);
+        MMseqsNode::addPhaseTime(phaseValues, "closing cluster files", timer);
         MMseqsNode::writeRepresentativeBits(representativeDb, reader, representativeBits, localFirstKey, localKeyCount);
+        MMseqsNode::addPhaseTime(phaseValues, "writing the list of representatives", timer);
+        if (MMseqsNode::isMaster()) {
+            MMseqsNode::gatherRepresentativeIndex(representativeDb);
+            MMseqsNode::addPhaseTime(phaseValues, "waiting for the other nodes to write their lists of representatives", timer);
+        }
+        MMseqsNode::printPhaseValues(phaseValues);
+        MMseqsNode::writeNodeLog(par.db2);
     } else {
         // unsorted only if a length was split into hash ranges
         resultWriter.close(false, needsSort);
         representativeWriter.close(false, needsSort);
     }
 
-    // aws backend: every node links the data files, the later steps stage the targets
-    if (MMseqsNode::isMaster() || (isLinfinity && S3Client::isEnabled())) {
-        DBReader<DBKeyType>::softlinkDb(par.db1, representativeDb, DBFiles::DATA);
-    }
     if (MMseqsNode::isMaster()) {
+        DBReader<DBKeyType>::softlinkDb(par.db1, representativeDb, DBFiles::DATA);
         DBWriter::writeDbtypeFile(representativeDb.c_str(), reader.getDbtype(), reader.isCompressed());
         if (isLinfinity) {
             DBReader<DBKeyType> representativeReader(representativeDb.c_str(), (representativeDb + ".index").c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
@@ -821,10 +829,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
         }
         Debug(Debug::INFO) << "Size of the sequence database: " << reader.getSize() << "\n";
         Debug(Debug::INFO) << "Number of clusters: " << clusters << "\n";
-    }
-    if (isLinfinity) {
-        MMseqsNode::publishDatabase(par.db2);
-        MMseqsNode::publishDatabase(representativeDb);
     }
     delete[] representativeBits;
     Util::releasePages(hashIdPairs, allocatedHashEntryCount * sizeof(HashEntry));

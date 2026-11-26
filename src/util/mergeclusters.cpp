@@ -24,8 +24,7 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         bool hasSecondClu = par.filenames.size() > 3;
         // clusthashfast keeps its singletons in representative bits
         std::string representativeDb = par.filenames[2] + "_redundancy";
-        MMseqsNode::fetchFile(representativeDb + ".dbtype", false);
-        bool hasRepBits = FileUtil::fileExists((representativeDb + ".dbtype").c_str());
+        bool hasRepBits = FileUtil::statSharedFile(representativeDb + ".dbtype");
         std::vector<size_t> firstCluKeyOffsets;
         if (hasSecondClu || hasRepBits) {
             std::string firstKeyFile = hasRepBits ? representativeDb + ".bits." + SSTR(MMseqsNode::rank) : "";
@@ -48,22 +47,25 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         std::string sortedByMember = par.db2 + "_by_member";
         std::string sortedByMemberIndex;
         if (hasSecondClu) {
+            Debug(Debug::INFO) << "Sending the pairs of " << FileUtil::baseName(par.filenames[3]) << " to the nodes of their members\n";
             sortedByMemberIndex = MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, workKeyOffsets, sortedByMember);
         }
         std::string sortedByRep = par.db2 + "_by_rep";
         // singletons left go to <sortedByRep>.bits.<node>
         std::vector<size_t> repKeyOffsets = workKeyOffsets;
+        Debug(Debug::INFO) << "Sending the pairs of " << FileUtil::baseName(par.filenames[2]) << " to the nodes of their " << (hasSecondClu ? "final " : "") << "representatives\n";
         std::string sortedByRepIndex = MMseqsNode::sendClusterPairs(par.filenames[2], true, ClusterPair::compareByRep, workKeyOffsets, sortedByRep,
                                                                     sortedByMemberIndex, hasSecondClu ? sortedByMember : "", repBits,
                                                                     firstCluKeyOffsets, firstKey, keyCount, keepCluFiles ? NULL : &repKeyOffsets);
         delete[] repBits;
         MMseqsNode::addPhaseTime(phaseValues, "sending cluster pairs", timer);
         if (hasSecondClu) {
-            MMseqsNode::removeFile(sortedByMember + "." + SSTR(MMseqsNode::rank));
+            FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
         }
 
         size_t repFirstKey = repKeyOffsets[MMseqsNode::rank];
         size_t repKeyCount = repKeyOffsets[MMseqsNode::rank + 1] - repFirstKey;
+        Debug(Debug::INFO) << "Writing the merged clusters\n";
         uint64_t *singletonBits = NULL;
         if (hasRepBits) {
             singletonBits = MMseqsNode::readRepresentativeBits(sortedByRep, nodeKeyOffsets, repFirstKey, repKeyCount);
@@ -78,13 +80,13 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
             exchanges.push_back(sortedByMember);
         }
         MMseqsNode::removeExchanges(par.db2, sortedByRep, exchanges, phaseValues);
+        MMseqsNode::writeNodeLog(par.db2);
         if (hasRepBits) {
-            MMseqsNode::removeFile(sortedByRep + ".bits." + SSTR(MMseqsNode::rank));
+            FileUtil::remove((sortedByRep + ".bits." + SSTR(MMseqsNode::rank)).c_str());
         }
         if (MMseqsNode::isMaster()) {
             DBWriter::writeDbtypeFile(par.db2.c_str(), DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_CLUSTER_RES, Parameters::DBTYPE_EXTENDED_LINFINITY), false);
         }
-        MMseqsNode::publishDatabase(par.db2);
         return EXIT_SUCCESS;
     }
 

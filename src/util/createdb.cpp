@@ -14,7 +14,6 @@
 #include "Masker.h"
 #include "MMseqsNode.h"
 #include "BatchReader.h"
-#include "S3Client.h"
 
 #include "zstd/contrib/seekable_format/zstd_seekable.h"
 #include <sys/stat.h>
@@ -446,14 +445,6 @@ static bool isBeforeRun(size_t sentOffset, const SequenceRun &run) {
     return sentOffset < run.sentOffset;
 }
 
-// prints every 10 % of a node's bytes, also on the nodes besides the master
-static void printProgress(const char *step, size_t before, size_t after, size_t total, Timer &timer) {
-    if (total > 0 && after * 10 / total > before * 10 / total) {
-        Debug(Debug::INFO) << ((MMseqsNode::count > 1) ? "[node " + SSTR(MMseqsNode::rank) + "] " : "") << after * 100 / total << "% of " << step << " after "
-                           << static_cast<size_t>(timer.getTimediff()) << " s\n";
-    }
-}
-
 static void flushBufferToExchange(char *buffer, size_t bufferPos, char *sortedBuffer, ZSTD_CCtx *cctx, size_t lengthCount, size_t inputSplit, size_t inputSplitFlush,
                                   FILE *exchangeFile, const std::string &exchangeFileName, FILE *sequenceFile, const std::string &sequenceFileName,
                                   std::vector<SentFlush> &sentFlushes, size_t &exchangeBytes, size_t &sequenceBytes) {
@@ -563,11 +554,16 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         size_t totalSize = 0;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads) reduction(+:totalSize)
         for (size_t i = 0; i < filenames.size(); i++) {
-            fileSizes[i] = FileUtil::getFileSize(filenames[i]);
-            if (fileSizes[i] == SIZE_MAX) {
+            struct stat sb;
+            if (FileUtil::statSharedFile(filenames[i], &sb) == false) {
                 Debug(Debug::ERROR) << "File " << filenames[i] << " does not exist\n";
                 EXIT(EXIT_FAILURE);
             }
+            if (S_ISREG(sb.st_mode) == false) {
+                Debug(Debug::ERROR) << "Cannot split " << filenames[i] << ": linfinity createdb needs a regular file\n";
+                EXIT(EXIT_FAILURE);
+            }
+            fileSizes[i] = sb.st_size;
             totalSize += fileSizes[i];
         }
 
@@ -585,7 +581,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     delete kseq;
                 }
                 // pzstd files start with a skippable frame
-                if (isSplittable && Util::endsWith(".zst", filenames[i]) == true) {
+                if (isSplittable && (Util::endsWith(".zst", filenames[i]) || Util::endsWith(".zstd", filenames[i]))) {
                     FILE *handle = FileUtil::openFileOrDie(filenames[i].c_str(), "r", true);
                     uint32_t header[3];
                     isSplittable = fread(header, sizeof(uint32_t), 3, handle) == 3 && header[0] == ZSTD_MAGIC_SKIPPABLE_START && header[1] == 4;
@@ -603,7 +599,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
 
         if (unsplitFileCount > 0) {
-            Debug(Debug::WARNING) << unsplitFileCount << " input files larger than " << splitSize << " bytes cannot be split and are read by one thread each\n";
+            Debug(Debug::WARNING) << unsplitFileCount << " input files larger than " << MMseqsNode::formatBytes(splitSize) << " cannot be split and are read by one thread each\n";
             Debug(Debug::WARNING) << "Give FASTA uncompressed or compressed with pzstd\n";
         }
 
@@ -637,6 +633,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             }
             MMseqsNode::publishRunFile(planPrefix + SSTR(node), planData);
         }
+        Debug(Debug::INFO) << "Converting sequences from " << filenames.size() << " files (" << MMseqsNode::formatBytes(totalSize) << " in " << inputSplitCount
+                           << " input splits) on " << MMseqsNode::count << " nodes\n";
     }
 
     std::string planFile = planPrefix + SSTR(MMseqsNode::rank);
@@ -652,11 +650,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         planTextChar = Util::skipLine(planTextChar);
         currPos = planTextChar - planText.c_str();
     }
-    MMseqsNode::removeFile(planFile);
-
-    if (MMseqsNode::isMaster()) {
-        Debug(Debug::INFO) << "Converting sequences from " << filenames.size() << " files on " << MMseqsNode::count << " nodes\n";
-    }
+    FileUtil::removeSharedFile(planFile);
 
     std::string phaseValues;
     Timer timer;
@@ -673,7 +667,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     for (size_t i = 0; i < nodeInputSplits.size(); i++) {
         size_t splitBytes = nodeInputSplits[i].end - nodeInputSplits[i].start;
         const std::string &name = filenames[nodeInputSplits[i].file];
-        bool isCompressed = Util::endsWith(".gz", name) || Util::endsWith(".bz2", name) || Util::endsWith(".zst", name);
+        bool isCompressed = Util::endsWith(".gz", name) || Util::endsWith(".bz2", name) || Util::endsWith(".zst", name) || Util::endsWith(".zstd", name);
         inputBytes += splitBytes;
         spoolSize += isCompressed ? splitBytes : splitBytes / 5 * 3;
     }
@@ -721,10 +715,6 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             EXIT(EXIT_FAILURE);
         }
     }
-    // the spool writes into the files of other nodes
-    if (S3Client::isEnabled() && reason.empty()) {
-        reason = "the nodes share files only through S3";
-    }
     std::string nodeSpools = MMseqsNode::barrier(dataFile + ".local_tmp", SSTR(spoolSize) + "\t" + SSTR(localFreeSize) + "\t" + localDevice + "\t" + reason + "\n");
     bool hasLocalTmp = false;
     std::string nodeReason;
@@ -744,29 +734,33 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     }
     for (std::map<std::string, std::pair<size_t, size_t> >::const_iterator it = deviceSpools.begin(); nodeReason.empty() && it != deviceSpools.end(); ++it) {
         if (it->second.first > it->second.second) {
-            nodeReason = it->first + " has " + SSTR(it->second.second) + " free bytes, the spooled sequences may need " + SSTR(it->second.first);
+            nodeReason = it->first + " has " + MMseqsNode::formatBytes(it->second.second) + " (" + SSTR(it->second.second) + " bytes) free, the read sequences may need "
+                         + MMseqsNode::formatBytes(it->second.first) + " (" + SSTR(it->second.first) + " bytes)";
         }
     }
     std::string spoolFile = par.localTmp + "/" + FileUtil::baseName(dataFile) + "_sent_sequences." + SSTR(MMseqsNode::rank) + ".XXXXXX";
     FILE *spoolHandle = exchangeHandle;
     if (nodeReason.empty()) {
-        Debug(Debug::INFO) << "Spooling the sent sequences to " << par.localTmp << "\n";
+        if (MMseqsNode::isMaster()) {
+            Debug(Debug::INFO) << "Keeping the read sequences in --local-tmp " << par.localTmp << " instead of the shared temporary folder\n";
+        }
         int fd = mkstemp(&spoolFile[0]);
         if (fd < 0 || unlink(spoolFile.c_str()) != 0 || (spoolHandle = fdopen(fd, "r+")) == NULL) {
             Debug(Debug::ERROR) << "Cannot create " << spoolFile << "\n";
             EXIT(EXIT_FAILURE);
         }
-    } else if (hasLocalTmp) {
-        MMseqsNode::reportUnusableLocalTmp("Cannot spool the sent sequences to --local-tmp " + par.localTmp + ": " + nodeReason);
+    } else if (hasLocalTmp && MMseqsNode::isMaster()) {
+        MMseqsNode::reportUnusableLocalTmp("Cannot write the read sequences to --local-tmp " + par.localTmp + ": " + nodeReason);
     }
     if (hasLocalTmp) {
-        MMseqsNode::addPhaseValue(phaseValues, "Local tmp", nodeReason.empty() ? "holds the sent sequences" : "not used, " + nodeReason);
+        MMseqsNode::addPhaseValue(phaseValues, "Local tmp", nodeReason.empty() ? "holds the read sequences" : "not used, " + nodeReason);
     }
     bool isSpooled = spoolHandle != exchangeHandle;
     size_t spoolBytes = 0;
     size_t readBytes = 0;
     size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
     size_t entryBufferBytes = static_cast<size_t>(memoryLimit * 0.95) / (2 * threadCnt);
+    Debug::Progress progress(100);
 #pragma omp parallel num_threads(threadCnt) reduction(+:emptySequenceCount)
     {
         char *buffer = new(std::nothrow) char[entryBufferBytes];
@@ -830,7 +824,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             size_t readEnd;
 #pragma omp atomic capture
             readEnd = readBytes += splitBytes;
-            printProgress("the input read", readEnd - splitBytes, readEnd, inputBytes, timer);
+            MMseqsNode::printProgress(progress, readEnd - splitBytes, readEnd, inputBytes);
         }
         Util::releasePages(buffer, entryBufferBytes);
         Util::releasePages(sortedBuffer, entryBufferBytes);
@@ -873,16 +867,13 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         Debug(Debug::ERROR) << "Cannot close " << exchangeFile << "\n";
         EXIT(EXIT_FAILURE);
     }
-    if (S3Client::isEnabled()) {
-        MMseqsNode::uploadFile(exchangeFile);
-        FileUtil::remove(exchangeFile.c_str());
-    }
     if (isSpooled == false) {
         std::vector<SentLengthRow>().swap(sentRows);
     }
 
-    std::string nodeLines = MMseqsNode::barrier(exchange + ".index", nodeLine + "\n");
     MMseqsNode::addPhaseTime(phaseValues, "sending sequences", timer);
+    std::string nodeLines = MMseqsNode::barrier(exchange + ".index", nodeLine + "\n");
+    MMseqsNode::addPhaseTime(phaseValues, "waiting for the other nodes to send sequences", timer);
 
     // every node computes the same layout
     std::vector<size_t> tableOffsets(MMseqsNode::count);
@@ -930,7 +921,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             for (size_t fileIdx = 0; fileIdx < filenames.size(); fileIdx++) {
                 Debug(Debug::ERROR) << " - " << filenames[fileIdx] << "\n";
             }
-            Debug(Debug::ERROR) << "Please check your input files. Only files in fasta/fastq[.gz|bz2|zst] are supported\n";
+            Debug(Debug::ERROR) << "Please check your input files. Only files in fasta/fastq[.gz|.bz2|.zst] are supported\n";
         }
         EXIT(EXIT_FAILURE);
     }
@@ -1004,11 +995,11 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
         size_t freeSpace = FileUtil::getFreeSpace(FileUtil::dirName(dataFile).c_str());
         if (freeSpace < dataSize) {
-            Debug(Debug::ERROR) << FileUtil::dirName(dataFile) << " needs at least " << dataSize << " free bytes for the sequences of " << dataFile << ", but has " << freeSpace << "\n";
+            Debug(Debug::ERROR) << FileUtil::dirName(dataFile) << " needs at least " << dataSize << " free bytes for the sequences of " << dataFile << ", but has " << freeSpace << " free bytes\n";
             EXIT(EXIT_FAILURE);
         }
-        MMseqsNode::publishFile(dataFile + ".index", indexData);
-        MMseqsNode::publishFile(dataFile + ".file_keys", fileKeysText);
+        FileUtil::publishFile(dataFile + ".index", indexData);
+        FileUtil::publishFile(dataFile + ".file_keys", fileKeysText);
     }
 
     // resize early to fail on file size limits
@@ -1081,38 +1072,59 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
     }
 
+    if (MMseqsNode::isMaster()) {
+        size_t seqSize = 0;
+        size_t headerSize = 0;
+        for (unsigned int file = 0; file < MMseqsNode::count; file++) {
+            seqSize += dataFileBytes[SEQUENCE_DATA * MMseqsNode::count + file];
+            headerSize += dataFileBytes[HEADER_DATA * MMseqsNode::count + file];
+        }
+        Debug(Debug::INFO) << "Writing the database" << (par.compressHeaders ? " and compressing the headers" : "") << ": " << key << " sequences of " << globalHistogram.size()
+                           << " lengths, " << MMseqsNode::formatBytes(seqSize) << " of sequences and " << MMseqsNode::formatBytes(headerSize) << " of headers in "
+                           << MMseqsNode::count << " files\n";
+    }
+
     // receive the compression units of this node
     double compressSeconds = 0;
     std::string tmpHeaderName = dataFileNames[HEADER_DATA] + ".tmp";
     {
         std::vector<FILE *> exchangeFiles(MMseqsNode::count, NULL);
-        std::vector<std::string> exchangeObjects(MMseqsNode::count);
         std::vector<std::vector<SentLengthRow> > nodeSentRows(MMseqsNode::count);
-        if (nodeLengthRanges.empty() == false) {
+        std::vector<std::pair<size_t, size_t> > nodeRowRanges(MMseqsNode::count, std::make_pair(0, 0));
+        for (size_t node = 0; node < MMseqsNode::count && nodeLengthRanges.empty() == false; node++) {
+            const std::vector<LengthRangeLayout> &histogram = nodeHistograms[node];
+            size_t firstLength = std::lower_bound(histogram.begin(), histogram.end(), nodeLengthRanges.front().length, isLongerRange) - histogram.begin();
+            size_t lastLength = std::lower_bound(histogram.begin(), histogram.end(), nodeLengthRanges.back().length - 1, isLongerRange) - histogram.begin();
+            nodeRowRanges[node] = std::make_pair(nodeTableOffsets[node][firstLength], nodeTableOffsets[node][lastLength]);
+        }
+        std::vector<std::string> sequenceFileNames(MMseqsNode::count);
+        for (size_t i = 0; i < sentRuns.size(); i++) {
+            sequenceFileNames[sentRuns[i].file] = dataFile + "." + SSTR(sentRuns[i].file);
+        }
+        // exchange and sequence files are open together, edge files later
+        size_t openFiles = 0;
+        for (size_t node = 0; node < MMseqsNode::count; node++) {
+            openFiles += (nodeRowRanges[node].first != nodeRowRanges[node].second) + (node != MMseqsNode::rank && sequenceFileNames[node].empty() == false);
+        }
+        size_t edgeFileCount = 0;
+        for (size_t i = 0; i < edgeRuns.size(); i++) {
+            edgeFileCount += (i == 0 || edgeRuns[i].node != edgeRuns[i - 1].node);
+        }
+        FileUtil::checkRlimitNoFile(FileUtil::UNCOUNTED_OPEN_FILES + std::max(openFiles, edgeFileCount));
 #pragma omp parallel for schedule(dynamic, 1)
-            for (size_t node = 0; node < MMseqsNode::count; node++) {
-                const std::vector<LengthRangeLayout> &histogram = nodeHistograms[node];
-                size_t firstLength = std::lower_bound(histogram.begin(), histogram.end(), nodeLengthRanges.front().length, isLongerRange) - histogram.begin();
-                size_t lastLength = std::lower_bound(histogram.begin(), histogram.end(), nodeLengthRanges.back().length - 1, isLongerRange) - histogram.begin();
-                size_t firstRow = nodeTableOffsets[node][firstLength];
-                size_t lastRow = nodeTableOffsets[node][lastLength];
-                if (firstRow == lastRow) {
-                    continue;
-                }
-                std::string file = exchange + "." + SSTR(node);
-                nodeSentRows[node].resize(lastRow - firstRow);
-                if (S3Client::isEnabled()) {
-                    exchangeObjects[node] = S3Client::getObjectName(file);
-                    S3Client::getRange(exchangeObjects[node], tableOffsets[node] + firstRow * sizeof(SentLengthRow), nodeSentRows[node].size() * sizeof(SentLengthRow),
-                                       (char *) nodeSentRows[node].data());
-                } else {
-                    // r+ to punch read bytes
-                    exchangeFiles[node] = FileUtil::openFileOrDie(file.c_str(), "r+", true);
-                    FileUtil::preadAll(fileno(exchangeFiles[node]), file.c_str(), (char *) nodeSentRows[node].data(),
-                                       nodeSentRows[node].size() * sizeof(SentLengthRow), tableOffsets[node] + firstRow * sizeof(SentLengthRow));
-                }
-                SORT_SERIAL(nodeSentRows[node].begin(), nodeSentRows[node].end(), SentLengthRow::compareByFlush);
+        for (size_t node = 0; node < MMseqsNode::count; node++) {
+            size_t firstRow = nodeRowRanges[node].first;
+            size_t lastRow = nodeRowRanges[node].second;
+            if (firstRow == lastRow) {
+                continue;
             }
+            std::string file = exchange + "." + SSTR(node);
+            nodeSentRows[node].resize(lastRow - firstRow);
+            // r+ to punch read bytes
+            exchangeFiles[node] = FileUtil::openSharedFile(file, "r+");
+            FileUtil::preadAll(fileno(exchangeFiles[node]), file.c_str(), (char *) nodeSentRows[node].data(),
+                               nodeSentRows[node].size() * sizeof(SentLengthRow), tableOffsets[node] + firstRow * sizeof(SentLengthRow));
+            SORT_SERIAL(nodeSentRows[node].begin(), nodeSentRows[node].end(), SentLengthRow::compareByFlush);
         }
 
         // one reader per flush and data file type
@@ -1133,8 +1145,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 bool isFlushStart = i == 0 || rows[i - 1].flush != rows[i].flush;
                 for (size_t fileType = isSpooled ? HEADER_DATA : SEQUENCE_DATA; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
                     if (isFlushStart) {
-                        MMseqsNode::ExchangeReader reader = { exchangeFiles[node], rows[i].starts[fileType], rows[i].ends[fileType],
-                                                               std::vector<char>(), 0, 0, 0, 0, NULL, rows[i].starts[fileType], exchangeObjects[node] };
+                        MMseqsNode::ExchangeReader reader = { exchangeFiles[node], exchange + "." + SSTR(node), rows[i].starts[fileType], rows[i].ends[fileType],
+                                                               std::vector<char>(), 0, 0, 0, 0, NULL, rows[i].starts[fileType], std::vector<char>(), 0, 0, { 0, 0 } };
                         readers[fileType].push_back(reader);
                         readerLengthOffsets[fileType].push_back(std::vector<std::pair<size_t, size_t> >());
                     }
@@ -1155,8 +1167,8 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         SORT_SERIAL(sentRows.begin(), sentRows.end(), SentLengthRow::compareByFlush);
         for (size_t i = 0; i < sentRows.size(); i++) {
             if (i == 0 || sentRows[i - 1].flush != sentRows[i].flush) {
-                MMseqsNode::ExchangeReader reader = { spoolHandle, sentRows[i].starts[SEQUENCE_DATA], sentRows[i].ends[SEQUENCE_DATA],
-                                                       std::vector<char>(), 0, 0, 0, 0, NULL, sentRows[i].starts[SEQUENCE_DATA], std::string() };
+                MMseqsNode::ExchangeReader reader = { spoolHandle, spoolFile, sentRows[i].starts[SEQUENCE_DATA], sentRows[i].ends[SEQUENCE_DATA],
+                                                       std::vector<char>(), 0, 0, 0, 0, NULL, sentRows[i].starts[SEQUENCE_DATA], std::vector<char>(), 0, 0, { 0, 0 } };
                 readers[SEQUENCE_DATA].push_back(reader);
                 readerLengthOffsets[SEQUENCE_DATA].push_back(std::vector<std::pair<size_t, size_t> >());
             }
@@ -1173,7 +1185,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         // half for reader buffers, an eighth for writes
         size_t rowSize = sizeof(SentLengthRow) + (DATA_FILE_TYPE_COUNT + 1) * sizeof(std::pair<size_t, size_t>);
         if (receivedRowCount * rowSize >= static_cast<size_t>(memoryLimit * 0.95)) {
-            Debug(Debug::ERROR) << "createdb needs more than " << receivedRowCount * rowSize << " bytes of memory for the " << receivedRowCount << " received length rows, but has " << static_cast<size_t>(memoryLimit * 0.95) << ". Run on more nodes or with more memory\n";
+            Debug(Debug::ERROR) << "createdb needs more than " << receivedRowCount * rowSize << " bytes of memory for the " << receivedRowCount << " received length rows, but has " << static_cast<size_t>(memoryLimit * 0.95) << " bytes. Run on more nodes or with more memory\n";
             EXIT(EXIT_FAILURE);
         }
         size_t receiveMemory = static_cast<size_t>(memoryLimit * 0.95) - receivedRowCount * rowSize;
@@ -1182,7 +1194,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         size_t frameSize = 1024 * 1024;
         if (par.compressHeaders && writeBufferSize < std::min(frameSize, headerDataBytes)) {
             Debug(Debug::ERROR) << "Not enough memory to compress the headers. The write buffer needs " << std::min(frameSize, headerDataBytes)
-                                << " bytes, it has " << writeBufferSize << ". Raise --split-memory-limit.\n";
+                                << " bytes, it has " << writeBufferSize << " bytes. Raise --split-memory-limit.\n";
             EXIT(EXIT_FAILURE);
         }
         size_t threadWriteSize = std::max((size_t) 1, writeBufferSize / par.threads);
@@ -1207,21 +1219,14 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
 
         std::vector<int> sequenceFds(MMseqsNode::count, -1);
-        std::vector<std::string> sequenceFileNames(MMseqsNode::count);
         std::string edgeFile = edges + "." + SSTR(MMseqsNode::rank);
         FILE *edgeHandle = isSpooled ? FileUtil::openAndDelete(edgeFile.c_str(), "w") : NULL;
-        for (size_t i = 0; i < sentRuns.size(); i++) {
-            size_t file = sentRuns[i].file;
-            if (sequenceFds[file] != -1) {
+        for (size_t file = 0; file < MMseqsNode::count; file++) {
+            if (sequenceFileNames[file].empty()) {
                 continue;
             }
-            sequenceFileNames[file] = dataFile + "." + SSTR(file);
             // write only, NFS may read partial pages of files open for reading
-            sequenceFds[file] = (file == MMseqsNode::rank) ? fileno(dataFiles[SEQUENCE_DATA]) : open(sequenceFileNames[file].c_str(), O_WRONLY | O_CLOEXEC);
-            if (sequenceFds[file] < 0) {
-                Debug(Debug::ERROR) << "Cannot open " << sequenceFileNames[file] << " for writing: " << strerror(errno) << "\n";
-                EXIT(EXIT_FAILURE);
-            }
+            sequenceFds[file] = (file == MMseqsNode::rank) ? fileno(dataFiles[SEQUENCE_DATA]) : FileUtil::openSharedFd(sequenceFileNames[file], O_WRONLY);
         }
 
         std::vector<std::pair<size_t, size_t> > compressionUnits;
@@ -1231,6 +1236,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             outputBytes += (isSpooled && fileType == SEQUENCE_DATA) ? sentSequenceSize : dataFileBytes[fileType * MMseqsNode::count + MMseqsNode::rank];
         }
         size_t writtenBytes = 0;
+        Debug::Progress writeProgress(100);
         for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
             size_t fileTypeBegin = writtenBytes;
             size_t fileTypeBytes = (isSpooled && fileType == SEQUENCE_DATA) ? sentSequenceSize : dataFileBytes[fileType * MMseqsNode::count + MMseqsNode::rank];
@@ -1341,18 +1347,15 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     writeBufferBegin = nextOffset;
                 }
                 size_t writtenEnd = fileTypeBegin + std::min(writeBufferBegin, fileTypeBytes);
-                printProgress("the database written", writtenBytes, writtenEnd, outputBytes, timer);
+                MMseqsNode::printProgress(writeProgress, writtenBytes, writtenEnd, outputBytes);
                 writtenBytes = writtenEnd;
             }
         }
 
-        Timer writeCompletionTimer;
         batchWriter.waitWrites();
-        MMseqsNode::addPhaseTime(phaseValues, "writing sequences: waiting for writes", writeCompletionTimer);
         Util::releasePages(writeBuffer, writeBufferSize + MAX_UNIT_SIZE);
         delete[] writeBuffer;
         MMseqsNode::closeExchangeFiles(exchangeFiles, exchange);
-        MMseqsNode::addPhaseTime(phaseValues, "writing sequences: releasing exchange files", writeCompletionTimer);
 
         if (isSpooled) {
             for (unsigned int file = 0; file < MMseqsNode::count; file++) {
@@ -1365,11 +1368,11 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 Debug(Debug::ERROR) << "Cannot close " << edgeFile << " or " << spoolFile << "\n";
                 EXIT(EXIT_FAILURE);
             }
-            MMseqsNode::addPhaseTime(phaseValues, "writing sequences: closing sequence files", writeCompletionTimer);
             MMseqsNode::addSentExchangeBytes(edgeSize, edgeSize);
+            Timer waitTimer;
             MMseqsNode::barrier(edges + ".index");
-            MMseqsNode::addPhaseTime(phaseValues, "writing sequences: waiting for sequence edges", writeCompletionTimer);
-            FileUtil::remove(exchangeFile.c_str());
+            MMseqsNode::addPhaseTime(phaseValues, "waiting for the other nodes to send the sequences on shared pages", waitTimer);
+            FileUtil::removeSharedFile(exchangeFile);
 
             // write the edges of the runs of other nodes, one read per node and chunk
             size_t chunkSize = std::max(2 * pageSize, writeBufferSize / par.threads);
@@ -1381,7 +1384,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     chunkOffsets.push_back(i + 1);
                 }
                 if (edgeFiles[edgeRuns[i].node] == NULL) {
-                    edgeFiles[edgeRuns[i].node] = FileUtil::openFileOrDie((edges + "." + SSTR(edgeRuns[i].node)).c_str(), "r", true);
+                    edgeFiles[edgeRuns[i].node] = FileUtil::openSharedFile(edges + "." + SSTR(edgeRuns[i].node), "r");
                 }
             }
             size_t chunkCount = chunkOffsets.size() - 1;
@@ -1394,7 +1397,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     const SequenceRun &last = edgeRuns[chunkOffsets[chunk + 1] - 1];
                     size_t size = last.edgeOffset + (last.directStart - last.start) + (last.end - last.directEnd) - first.edgeOffset;
                     edgeBuffer.resize(size);
-                    FileUtil::preadAll(fileno(edgeFiles[first.node]), edges.c_str(), edgeBuffer.data(), size, first.edgeOffset);
+                    FileUtil::preadAll(fileno(edgeFiles[first.node]), (edges + "." + SSTR(first.node)).c_str(), edgeBuffer.data(), size, first.edgeOffset);
                     for (size_t i = chunkOffsets[chunk]; i < chunkOffsets[chunk + 1]; i++) {
                         const SequenceRun &run = edgeRuns[i];
                         const char *data = edgeBuffer.data() + (run.edgeOffset - first.edgeOffset);
@@ -1404,7 +1407,6 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 }
             }
             MMseqsNode::closeExchangeFiles(edgeFiles, edges);
-            MMseqsNode::addPhaseTime(phaseValues, "writing sequences: writing sequence edges", writeCompletionTimer);
         }
 
         if (par.compressHeaders) {
@@ -1426,11 +1428,9 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                 Debug(Debug::ERROR) << "Cannot close data file " << tmpHeaderName << "\n";
                 EXIT(EXIT_FAILURE);
             }
-            MMseqsNode::addPhaseTime(phaseValues, "writing sequences: closing headers", writeCompletionTimer);
         }
     }
 
-    Timer closeTimer;
 #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < DATA_FILE_TYPE_COUNT; i++) {
         if (fclose(dataFiles[i]) != 0) {
@@ -1438,7 +1438,6 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             EXIT(EXIT_FAILURE);
         }
     }
-    MMseqsNode::addPhaseTime(phaseValues, "writing sequences: closing database files", closeTimer);
 
     if (par.compressHeaders) {
         FileUtil::move(tmpHeaderName.c_str(), dataFileNames[HEADER_DATA].c_str());
@@ -1451,22 +1450,21 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         exchanges.push_back(edges);
     }
     MMseqsNode::removeExchanges(dataFile, exchanges.back(), exchanges, phaseValues);
+    MMseqsNode::writeNodeLog(dataFile);
 
     if (MMseqsNode::isMaster()) {
-        FileUtil::remove((dataFile + ".local_tmp").c_str());
+        FileUtil::removeSharedFile(dataFile + ".local_tmp");
         std::string sourceData;
         for (size_t i = 0; i < filenames.size(); i++) {
             sourceData += SSTR(i) + "\t" + FileUtil::baseName(filenames[i]) + "\n";
         }
-        MMseqsNode::publishFile(dataFile + ".source", sourceData);
+        FileUtil::publishFile(dataFile + ".source", sourceData);
         int headerDbType = DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_GENERIC_DB, Parameters::DBTYPE_EXTENDED_LINFINITY);
         DBWriter::writeDbtypeFile((dataFile + "_h").c_str(), headerDbType, par.compressHeaders);
         int dbType = DBReader<DBKeyType>::setExtendedDbtype(Parameters::DBTYPE_AMINO_ACIDS, Parameters::DBTYPE_EXTENDED_LINFINITY);
         DBWriter::writeDbtypeFile(dataFile.c_str(), dbType, false);
         Debug(Debug::INFO) << "Database type: " << Parameters::getDbTypeName(dbType) << "\n";
     }
-    MMseqsNode::publishDatabase(dataFile + "_h");
-    MMseqsNode::publishDatabase(dataFile);
 
     return EXIT_SUCCESS;
 }
@@ -1562,13 +1560,13 @@ int createdb(int argc, const char **argv, const Command& command) {
         par.shuffleDatabase = true;
     }
 
-    if ((par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT || par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH)
-        && par.filenames[0] == "stdin") {
-        if (MMseqsNode::count > 1) {
-            Debug(Debug::ERROR) << "Stdin input cannot be combined with --createdb-mode " << par.createdbMode << " on multiple nodes\n";
-            EXIT(EXIT_FAILURE);
-        }
-        Debug(Debug::WARNING) << "Stdin input cannot be combined with --createdb-mode " << par.createdbMode << "\n";
+    if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH && par.filenames[0] == "stdin") {
+        Debug(Debug::ERROR) << "Stdin input cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << "\n";
+        EXIT(EXIT_FAILURE);
+    }
+
+    if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT && par.filenames[0] == "stdin") {
+        Debug(Debug::WARNING) << "Stdin input cannot be combined with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_SOFT << "\n";
         Debug(Debug::WARNING) << "We recompute with --createdb-mode 1\n";
         par.createdbMode = Parameters::SEQUENCE_SPLIT_MODE_HARD;
     }
@@ -1604,7 +1602,7 @@ int createdb(int argc, const char **argv, const Command& command) {
 
     if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH && par.dbType == 2) {
         Debug(Debug::WARNING) << "Nucleotide database cannot be combined with --createdb-mode " << par.createdbMode << "\n";
-        Debug(Debug::WARNING) << "We recompute with --dbtype 1\n";
+        Debug(Debug::WARNING) << "We write an amino acid database instead\n";
     }
 
     if(par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH) {

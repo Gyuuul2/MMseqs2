@@ -6,7 +6,6 @@
 #include "IndexReader.h"
 #include "FileUtil.h"
 #include "MMseqsNode.h"
-#include "S3Client.h"
 #include "FastSort.h"
 
 #ifdef OPENMP
@@ -98,15 +97,6 @@ static size_t writeMemberAccessions(MemberAccession *memberAccessions, size_t ac
 
     size_t ownBegin = nodeOffsets[MMseqsNode::rank];
     size_t ownEnd = (nodeOffsets[MMseqsNode::rank + 1] - ownBegin <= ownBytesLimit) ? nodeOffsets[MMseqsNode::rank + 1] : ownBegin;
-#pragma omp parallel for schedule(static)
-    for (int thread = 0; thread < threads; thread++) {
-        size_t begin = threadOffsets[thread];
-        size_t end = threadOffsets[thread + 1];
-        size_t beforeOwn = std::max(begin, std::min(end, ownBegin));
-        size_t afterOwn = std::min(end, std::max(begin, ownEnd));
-        FileUtil::pwriteAll(fileno(file), fileName.c_str(), writeBuffer + begin, beforeOwn - begin, writtenBytes + begin);
-        FileUtil::pwriteAll(fileno(file), fileName.c_str(), writeBuffer + afterOwn, end - afterOwn, writtenBytes + MMseqsNode::getExchangeFileOffset(afterOwn, ownBegin, ownEnd));
-    }
 
     // index lines per thread group, so receivers scan on all threads
     int indexLines = std::max(1, threads / static_cast<int>(MMseqsNode::count));
@@ -129,10 +119,17 @@ static size_t writeMemberAccessions(MemberAccession *memberAccessions, size_t ac
         }
     }
 
+    std::vector<std::vector<char> > threadRecords;
+    MMseqsNode::encodeExchangeRecords(writeBuffer, threadOffsets, nodeOffsets, ownBegin, ownEnd, false, ClusterPair::compareByRep, threadRecords);
+#pragma omp parallel for schedule(static)
+    for (int thread = 0; thread < threads; thread++) {
+        FileUtil::pwriteAll(fileno(file), fileName.c_str(), threadRecords[thread].data(), threadRecords[thread].size(), writtenBytes + threadOffsets[thread]);
+    }
+
     Util::releasePages(writeBuffer, writeBufferBytes);
     free(writeBuffer);
     for (int indexLine = 0; indexLine < indexLines; indexLine++) {
-        MMseqsNode::addExchangeFlush(indexData, writtenBytes, nodeOffsets, ownBegin, ownEnd, threadOffsets[threads * indexLine / indexLines], threadOffsets[threads * (indexLine + 1) / indexLines]);
+        MMseqsNode::addExchangeFlush(indexData, writtenBytes, nodeOffsets, 0, 0, threadOffsets[threads * indexLine / indexLines], threadOffsets[threads * (indexLine + 1) / indexLines]);
     }
     return ownEnd - ownBegin;
 }
@@ -358,7 +355,6 @@ int createtsv(int argc, const char **argv, const Command &command) {
     par.parseParameters(argc, argv, command, true, Parameters::PARSE_VARIADIC, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
-        MMseqsNode::fetchFile(par.db3 + ".dbtype");
         int clusterDbtype = FileUtil::parseDbType(par.db3.c_str());
         if (Parameters::isEqualDbtype(clusterDbtype, Parameters::DBTYPE_CLUSTER_RES) == false
             || (DBReader<DBKeyType>::getExtendedDbtype(clusterDbtype) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {
@@ -374,27 +370,28 @@ int createtsv(int argc, const char **argv, const Command &command) {
 
         // exchange files next to the clustering, the TSV can be on another file system
         std::string sortedByMember = par.db3 + "_tsv_by_member";
+        Debug(Debug::INFO) << "Sending the cluster pairs to the nodes of their members\n";
         std::string sortedByMemberIndex = MMseqsNode::sendClusterPairs(par.db3, true, ClusterPair::compareByMember, nodeKeyOffsets, sortedByMember);
         MMseqsNode::addPhaseTime(phaseValues, "sending cluster pairs", timer);
 
         std::string sortedByRep = par.db3 + "_tsv_by_rep";
         std::vector<size_t> tsvKeyOffsets = MMseqsNode::getBalancedClusterKeyOffsets(par.db3 + "_tsv.cluster_key_offsets", par.db3, headers.getSize());
+        Debug(Debug::INFO) << "Sending the member names to the nodes of their representatives\n";
         std::string sortedByRepIndex = readMemberAccessions(sortedByMemberIndex, sortedByMember, headers, nodeKeyOffsets, tsvKeyOffsets,
                                                             Util::computeMemory(par.splitMemoryLimit), sortedByRep);
         headers.close();
         MMseqsNode::addPhaseTime(phaseValues, "sending member accessions", timer);
-        MMseqsNode::removeFile(sortedByMember + "." + SSTR(MMseqsNode::rank));
+        FileUtil::remove((sortedByMember + "." + SSTR(MMseqsNode::rank)).c_str());
 
+        Debug(Debug::INFO) << "Writing the cluster table to " << par.db4 << ".<node>, one file per node\n";
         writeClusterTsvLines(sortedByRepIndex, sortedByRep, par.db4, par);
-        if (S3Client::isEnabled()) {
-            MMseqsNode::uploadFile(par.db4 + "." + SSTR(MMseqsNode::rank));
-        }
         MMseqsNode::addPhaseTime(phaseValues, "writing TSV", timer);
 
         std::vector<std::string> exchanges;
         exchanges.push_back(sortedByMember);
         exchanges.push_back(sortedByRep);
         MMseqsNode::removeExchanges(sortedByRep, sortedByRep, exchanges, phaseValues);
+        MMseqsNode::writeNodeLog(par.db3 + "_tsv");
         return EXIT_SUCCESS;
     }
 
