@@ -49,9 +49,9 @@ public:
         return (count > 1) ? 1 : 0;
     }
 
-    // a --local-tmp that cannot be used is reported and the run goes on in the shared folder
+    // warn and go on in the shared folder
     static void reportUnusableLocalTmp(const std::string &problem);
-    // empty if --local-tmp can hold files of this rank
+    // empty if --local-tmp is usable
     static std::string getLocalTmpProblem(const Parameters &par);
 
     class WaitWarning {
@@ -71,10 +71,10 @@ public:
     static bool readRunFile(const std::string &file, std::string &content);
     static void waitForRunFilesChange(const std::string &prefix, std::string &content);
     static std::string gatherRunFiles(const std::string &prefix);
-    // the names in a directory, none if it cannot be opened
+    // empty if the directory cannot be opened
     static void listDirectory(const std::string &directory, std::vector<std::string> &names);
 
-    // file of one node that the others poll: rewritten in place and kept open, on NFS (open files can miss other machines' writes) renamed into place and opened per read
+    // polled by other nodes, on NFS renamed into place and reopened per read
     struct PolledFile {
         PolledFile() : fd(-1), isModeKnown(false), isOpenedPerRead(false) {}
         explicit PolledFile(const std::string &file) : file(file), fd(-1), isModeKnown(false), isOpenedPerRead(false) {}
@@ -84,9 +84,9 @@ public:
         void publish(const std::string &content);
         // false while the file holds no complete record of this run
         bool read(std::string &content);
-        // bytes at offset in one read, 0 while the file is missing or fails on a transient error
+        // 0 while missing or on a transient error
         size_t read(char *data, size_t size, size_t offset);
-        // decided once, so that a failed directory check later does not switch between in place and rename
+        // decide once, never switch modes later
         void decideMode();
 
         std::string file;
@@ -119,7 +119,7 @@ public:
     static void addPhaseTime(std::string &content, const std::string &phase, Timer &timer);
     static void addPhaseSeconds(std::string &content, const std::string &phase, double seconds);
     static void printPhaseValues(const std::string &values);
-    // a line with the estimated time left when after passes a tenth of total, also on the nodes besides the master
+    // time left at every tenth of total, on all nodes
     static void printProgress(const std::string &name, size_t before, size_t after, size_t total, Timer &timer);
     // one decimal like df -h: 512B, 68.3M, 1.9T
     static std::string formatBytes(size_t bytes);
@@ -160,13 +160,13 @@ public:
         ClusterPair previous;
     };
 
-    // sorted records as varint deltas, a run starts at every slice offset and cut; both become offsets in the encoded records
+    // varint delta runs from every slice offset and cut, both become encoded offsets
     static void encodeExchangeRecords(const char *records, std::vector<size_t> &sliceOffsets, std::vector<size_t> &cuts, size_t skipBegin, size_t skipEnd,
                                       bool isClusterPair, bool (*compare)(const ClusterPair &, const ClusterPair &), std::vector<std::vector<char> > &sliceRecords);
 
     static size_t writeExchangeTable(int fd, const std::string &fileName, const std::vector<size_t> &flushOffsets, size_t columns, const std::vector<size_t> &tail, size_t tableOffset);
     static void readExchangeTableColumns(int fd, const std::string &fileName, size_t tableOffset, size_t flushCount, size_t column, std::vector<size_t> &offsets);
-    // the table, its offset and the flush count end the file
+    // table, its offset and flush count end the file
     static size_t closeExchangeTableFile(FILE *file, const std::string &fileName, const std::vector<size_t> &flushOffsets, size_t columns, size_t tableOffset);
     static int openExchangeTableFile(const std::string &fileName, size_t &tableOffset, size_t &flushCount);
     static size_t getExchangeFileOffset(size_t offset, size_t ownBegin, size_t ownEnd) {
@@ -231,14 +231,14 @@ public:
                                         std::vector<size_t> *balancedKeyOffsets = NULL);
     static void removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues = "");
     static size_t findSplitEnd(DBReader<DBKeyType> &cluDb, size_t splitBegin, size_t splitOffset, size_t splitSize, size_t splitEntries, size_t entryEnd);
-    // createsubdb asks kmermatcher for the sequences of the median members
-    static std::string getMedianMemberRequestsFile(const std::string &db, size_t node);
+    // createsubdb asks kmermatcher for seed member sequences
+    static std::string getSeedMemberRequestsFile(const std::string &db, size_t node);
 
     static void readKeyBits(int fd, const std::string &fileName, size_t fileOffset, size_t fileFirstKey, size_t from, size_t to, size_t firstKey, uint64_t *bits);
     static uint64_t *readRepresentativeBits(const std::string &db, const std::vector<size_t> &fileKeyOffsets, size_t firstKey, size_t keyCount);
     static void writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount,
-                                        const std::vector<size_t> &rangeMedianMemberCounts = std::vector<size_t>());
-    // the master publishes the index rows of writeRepresentativeBits of all nodes
+                                        const std::vector<size_t> &rangeSeedMemberCounts = std::vector<size_t>());
+    // master joins the index rows of all nodes
     static void gatherRepresentativeIndex(const std::string &db);
 
     static std::vector<size_t> getClusterKeyOffsets(const std::string &barrierFile, const std::string &clu, size_t keyCount, const std::string &firstKeySource = "");

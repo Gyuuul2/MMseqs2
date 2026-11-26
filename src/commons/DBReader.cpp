@@ -309,7 +309,7 @@ template <typename T> bool DBReader<T>::open(int accessType){
                     fileSizes[index2dbfile[i]] += count * index[i].length;
                 }
                 rangeRepresentativeCounts.push_back((columns > 5) ? Util::fast_atoi<size_t>(cols[5]) : count);
-                rangeMedianMemberCounts.push_back((columns > 6) ? Util::fast_atoi<size_t>(cols[6]) : 0);
+                rangeSeedMemberCounts.push_back((columns > 6) ? Util::fast_atoi<size_t>(cols[6]) : 0);
                 size += count;
                 dataSize += count * index[i].length;
                 maxSeqLen = std::max(maxSeqLen, index[i].length);
@@ -528,7 +528,7 @@ template <typename T> void DBReader<T>::close(){
     localBlocks.clear();
     entryOffsetsFileNames.clear();
     rangeRepresentativeCounts.clear();
-    rangeMedianMemberCounts.clear();
+    rangeSeedMemberCounts.clear();
     idRangeTable.clear();
     idRangeShift = 0;
     decrementMemory(blockKeyOffsets.size() * sizeof(size_t));
@@ -1227,7 +1227,7 @@ template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<
             if (readRequests.empty() == false) {
                 bytes += readRequests.back().bytesToRead;
             }
-            // a local read that keeps failing is opened again from the data file, see BatchReader::retryRead
+            // retryRead reopens a failing local fd from the data file
             BatchReader::ReadRequest request = { fd, dataFileNames[index2dbfile[range]].c_str(), NULL, begin / pageSize * pageSize, 0, 0 };
             readRequests.push_back(request);
             requestFirstKeys.push_back(keys[i]);
@@ -1516,7 +1516,7 @@ template <typename T> void DBReader<T>::setLocalBlocks(const std::string &localD
 
 template <typename T> void DBReader<T>::setLocalBlock(size_t block) {
     localBlocks[block] = 1;
-    // a cached block takes the room of the local blocks from now on, freeBlocks gives it back
+    // a cached block now takes local room, freeBlocks gives it back
     const std::map<size_t, BatchReader::ReadRequest>::const_iterator cached = cachedBlocks.find(block);
     cachedLocalBlockSize += (cached != cachedBlocks.end()) ? cached->second.bytesToRead : 0;
 }
@@ -1550,7 +1550,7 @@ template <typename T> size_t DBReader<T>::getKeyBlock(size_t key) const {
     return std::upper_bound(blockKeyOffsets.begin(), blockKeyOffsets.end(), key) - blockKeyOffsets.begin() - 1;
 }
 
-// free blocks below keyEnd until neededSize fit, for a local block also the room of the local blocks
+// free blocks below keyEnd until neededSize fits, for a local block also in the local room
 template <typename T> void DBReader<T>::freeBlocks(size_t keyEnd, size_t neededSize, bool isLocal) {
     for (std::map<size_t, BatchReader::ReadRequest>::iterator cached = cachedBlocks.begin();
          cached != cachedBlocks.end() && blockKeyOffsets[cached->first + 1] <= keyEnd
@@ -2000,8 +2000,8 @@ void DBReader<T>::moveDb(const std::string &srcDbName, const std::string &dstDbN
     std::vector<std::string> files = FileUtil::findDatafiles(srcDbName.c_str());
     moveDatafiles(files, dstDbName);
 
-    // linfinity header indexes, representative bits and median member requests
-    const char *nodeSuffixes[] = { ".index", ".bits", ".median_member_requests" };
+    // linfinity header indexes, representative bits and seed member requests
+    const char *nodeSuffixes[] = { ".index", ".bits", ".seed_member_requests" };
     for (size_t i = 0; i < sizeof(nodeSuffixes) / sizeof(nodeSuffixes[0]); i++) {
         moveDatafiles(FileUtil::findDatafiles((srcDbName + nodeSuffixes[i]).c_str()), dstDbName + nodeSuffixes[i]);
     }
@@ -2020,8 +2020,8 @@ void DBReader<T>::removeDb(const std::string &databaseName){
     for (size_t i = 0; i < files.size(); ++i) {
         FileUtil::remove(files[i].c_str());
     }
-    // linfinity header indexes, representative bits and median member requests
-    const char *nodeSuffixes[] = { ".index", ".bits", ".median_member_requests" };
+    // linfinity header indexes, representative bits and seed member requests
+    const char *nodeSuffixes[] = { ".index", ".bits", ".seed_member_requests" };
     for (size_t suffix = 0; suffix < sizeof(nodeSuffixes) / sizeof(nodeSuffixes[0]); suffix++) {
         std::vector<std::string> nodeFiles = FileUtil::findDatafiles((databaseName + nodeSuffixes[suffix]).c_str());
 #pragma omp parallel for schedule(dynamic, 1)
@@ -2068,7 +2068,7 @@ void copyLinkDb(const std::string &databaseName, const std::string &outDb, DBFil
     const DBSuffix suffices[] = {
         { DBFiles::DATA_INDEX,    ".index"            },
         { DBFiles::DATA_INDEX,    ".bits"             },
-        { DBFiles::DATA_INDEX,    ".median_member_requests" },
+        { DBFiles::DATA_INDEX,    ".seed_member_requests" },
         { DBFiles::DATA_INDEX,    ".partitions"       },
         { DBFiles::DATA_DBTYPE,   ".dbtype"           },
         { DBFiles::HEADER,        "_h"                },

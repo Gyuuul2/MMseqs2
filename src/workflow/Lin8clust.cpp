@@ -15,7 +15,6 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     Parameters& par = Parameters::getInstance();
     setLinclustWorkflowDefaults(&par);
     par.clustHash = true;
-    par.diagonalMode = Parameters::DIAGONAL_MODE_UNGAPPED;
     par.PARAM_ADD_BACKTRACE.addCategory(MMseqsParameter::COMMAND_EXPERT);
     par.PARAM_ALT_ALIGNMENT.addCategory(MMseqsParameter::COMMAND_EXPERT);
     par.PARAM_ZDROP.addCategory(MMseqsParameter::COMMAND_EXPERT);
@@ -70,10 +69,15 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     par.countTableIteration = 0;
     if (par.PARAM_INCLUDE_ADJACENCY.wasSet == false && par.PARAM_NUM_ADJACENCY.wasSet == false) {
         if (nonSymetric) {
-            par.adjIteration = Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY;
+            par.adjIteration = (par.seqIdThr < 0.5f) ? 7 : Parameters::CLUST_LINEAR2_NUM_ADJACENCY;
         } else {
-            par.adjIteration = Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
+            // more adjacency to make up for no count table
+            par.adjIteration = (par.seqIdThr < 0.5f) ? 6 : 4;
         }
+    }
+    // like linclust2
+    if (par.seqIdThr >= 0.7f && par.PARAM_LINCLUST_ITERATIONS.wasSet == false) {
+        par.linclustIterations = 1;
     }
 
     // let punchHole warn before the run if it is not supported
@@ -90,8 +94,6 @@ int lin8clust(int argc, const char **argv, const Command& command) {
 
     CommandCaller cmd;
     cmd.addVariable("MERGECLU_PAR", par.createParameterString(par.mergeclusters).c_str());
-    par.subDbMode = Parameters::SUBDB_MODE_SOFT;
-    cmd.addVariable("CREATESUBDB_PAR", par.createParameterString(par.createsubdb).c_str());
     cmd.addVariable("REMOVE_TMP", par.removeTmpFiles ? "TRUE" : NULL);
     cmd.addVariable("RUNNER", par.nodeRunner.c_str());
     cmd.addVariable("CLUSTHASH", par.clustHash ? "TRUE" : NULL);
@@ -99,10 +101,21 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     cmd.addVariable("ALIGN2CLUST_PAR", par.createParameterString(par.align2clust).c_str());
     cmd.addVariable("VERBOSITY", par.createParameterString(par.onlyverbosity).c_str());
     cmd.addVariable("LINCLUST_ITERATIONS", SSTR(par.linclustIterations).c_str());
-    // second iteration: spaced k-mers, a tenth per sequence (see linclust)
+    // second iteration as in linclust
     if (par.linclustIterations > 1) {
-        par.spacedKmer = true;
-        par.kmersPerSequenceScale = 0.1;
+        if (par.PARAM_SPACED_KMER_MODE.wasSet == false) {
+            par.spacedKmer = true;
+        }
+        par.kmersPerSequenceScale.values.first += 0.1f;
+        par.kmersPerSequenceScale.values.second += 0.1f;
+        if (par.seqIdThr <= 0.5f && par.PARAM_KMER_SCORE_MODE.wasSet == false) {
+            par.kmerScoreMode = 1;
+        }
+        if (par.seqIdThr <= 0.5f && par.PARAM_SEED_MEMBER_PER_REP.wasSet == false) {
+            par.seedMemberPerRep = (par.seqIdThr < 0.5f) ? 4 : 3;
+        }
+        par.subDbMode = Parameters::SUBDB_MODE_SOFT;
+        cmd.addVariable("CREATESUBDB_PAR", par.createParameterString(par.createsubdb).c_str());
         cmd.addVariable("KMERMATCHER_PAR2", par.createParameterString(par.kmermatcher).c_str());
     }
 

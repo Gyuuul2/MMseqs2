@@ -68,6 +68,8 @@ if [ "$LINCLUST_MODULE" = "linclust2" ]; then
         if notExists "${TMP_PATH}/pref_rep.dbtype"; then
             # shellcheck disable=SC2086
             $RUNNER "$MMSEQS" kmermatcher "${TMP_PATH}/input_rep" "${TMP_PATH}/pref_rep" ${KMERMATCHER_PAR2} \
+                --filter-cludb-file "$CLUDB" \
+                --filter-seqdb-file "$SOURCE" \
                 || fail "kmermatcher (representatives) died"
         fi
 

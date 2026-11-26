@@ -119,18 +119,29 @@ int linclust(int argc, const char **argv, const Command& command) {
         Debug(Debug::INFO) << "Set cluster mode " << cluMode << ".\n";
     }
 
+    // linclust2 defaults by seq. id
+    const bool isLinclust2 = par.linclustVersion == Parameters::LINCLUST_VERSION2;
+    const bool isSetCoverLowSeqId = isLinclust2 && par.seqIdThr <= 0.5f;
     if (includeCountTableSet == false) {
-        if (nonSymetric || par.diagonalMode == Parameters::DIAGONAL_MODE_UNGAPPED) {
+        if (nonSymetric) {
             par.includeCountTable = false;
             par.countTableIteration = 0;
         } else {
             par.includeCountTable = true;
+            par.countTableIteration = isSetCoverLowSeqId ? 3 : Parameters::CLUST_LINEAR_DEFAULT_NUM_COUNT_TABLE;
         }
     }
 
     if (includeAdjacencySet == false) {
-        par.adjIteration = nonSymetric ? Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY
-                                       : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
+        if (nonSymetric) {
+            par.adjIteration = isLinclust2 ? ((par.seqIdThr < 0.5f) ? 7 : Parameters::CLUST_LINEAR2_NUM_ADJACENCY) : Parameters::CLUST_LINEAR_DEFAULT_NUM_ADJACENCY;
+        } else {
+            par.adjIteration = isSetCoverLowSeqId ? 2 : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY;
+        }
+    }
+
+    if (isLinclust2 && par.seqIdThr >= 0.7f && par.PARAM_LINCLUST_ITERATIONS.wasSet == false) {
+        par.linclustIterations = 1;
     }
 
     if (kmerSizeWasSet == false) {
@@ -152,8 +163,7 @@ int linclust(int argc, const char **argv, const Command& command) {
         EXIT(EXIT_FAILURE);
     }
 
-    if (par.linclustVersion == 2
-        && Parameters::isEqualDbtype(dbType, Parameters::DBTYPE_AMINO_ACIDS) == false) {
+    if (isLinclust2 && Parameters::isEqualDbtype(dbType, Parameters::DBTYPE_AMINO_ACIDS) == false) {
         Debug(Debug::ERROR) << "linclust version 2 clusters amino acid databases only. "
                             << "Use --linclust-version 1 for nucleotide or profile input.\n";
         EXIT(EXIT_FAILURE);
@@ -206,6 +216,8 @@ int linclust(int argc, const char **argv, const Command& command) {
         bool prevspacedKmer = par.spacedKmer;
         bool prevmaskMode = par.maskMode;
         MultiParam<NuclAA<float> > prevKmersPerSequenceScale = par.kmersPerSequenceScale;
+        int prevKmerScoreMode = par.kmerScoreMode;
+        int prevSeedMemberPerRep = par.seedMemberPerRep;
         if (par.PARAM_SPACED_KMER_MODE.wasSet == false) {
             par.spacedKmer = false;
         }
@@ -220,14 +232,26 @@ int linclust(int argc, const char **argv, const Command& command) {
         cmd.addVariable("LINCLUST_ITERATIONS", SSTR(par.linclustIterations).c_str());
 
         if (par.linclustIterations > 1) {
-            par.spacedKmer = true;
-            par.kmersPerSequenceScale = 0.1;
+            if (par.PARAM_SPACED_KMER_MODE.wasSet == false) {
+                par.spacedKmer = true;
+            }
+            par.kmersPerSequenceScale.values.first += 0.1f;
+            par.kmersPerSequenceScale.values.second += 0.1f;
+            // up to seq. id 0.5 self score k-mers and seed members
+            if (par.seqIdThr <= 0.5f && par.PARAM_KMER_SCORE_MODE.wasSet == false) {
+                par.kmerScoreMode = 1;
+            }
+            if (par.seqIdThr <= 0.5f && par.PARAM_SEED_MEMBER_PER_REP.wasSet == false) {
+                par.seedMemberPerRep = (par.seqIdThr < 0.5f) ? 4 : 3;
+            }
             cmd.addVariable("KMERMATCHER_PAR2", par.createParameterString(par.kmermatcher).c_str());
         }
 
         par.spacedKmer = prevspacedKmer;
         par.maskMode = prevmaskMode;
         par.kmersPerSequenceScale = prevKmersPerSequenceScale;
+        par.kmerScoreMode = prevKmerScoreMode;
+        par.seedMemberPerRep = prevSeedMemberPerRep;
         par.alphabetSize = alphabetSize;
     }
     float prevSeqId = par.seqIdThr;

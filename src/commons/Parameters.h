@@ -621,7 +621,7 @@ public:
     int alignerMode;
     bool kmerPosFilter;
     int kmerScoreMode;
-    int medianMemberCount;
+    int seedMemberPerRep;
     bool clustHash;
     int linclustVersion;
     int clusterVersion;
@@ -1000,7 +1000,7 @@ public:
     PARAMETER(PARAM_USE_PARALLELISM)
     PARAMETER(PARAM_NEED_WRITEBUFFER)
     PARAMETER(PARAM_KMER_SCORE_MODE)
-    PARAMETER(PARAM_MEDIAN_MEMBER_COUNT)
+    PARAMETER(PARAM_SEED_MEMBER_PER_REP)
     PARAMETER(PARAM_CLUST_HASH)
     PARAMETER(PARAM_LINCLUST_VERSION)
     PARAMETER(PARAM_CLUSTER_VERSION)

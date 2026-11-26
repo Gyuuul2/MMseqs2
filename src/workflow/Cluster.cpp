@@ -289,7 +289,30 @@ int clusteringworkflow(int argc, const char **argv, const Command& command) {
             if (par.PARAM_CLUST_HASH.wasSet == false) {
                 par.clustHash = (par.linclustVersion == Parameters::LINCLUST_VERSION2);
             }
-            cmd.addVariable("LINCLUST_PAR", par.createParameterString(par.linclustworkflow).c_str());
+            // linclust2 defaults by --min-seq-id, see Linclust.cpp
+            std::vector<MMseqsParameter*> linclustPar = par.linclustworkflow;
+            if (par.linclustVersion == Parameters::LINCLUST_VERSION2) {
+                const bool nonSymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
+                const bool isSetCoverLowSeqId = par.seqIdThr <= 0.5f;
+                if (par.PARAM_INCLUDE_ADJACENCY.wasSet == false && par.PARAM_NUM_ADJACENCY.wasSet == false) {
+                    par.adjIteration = nonSymetric ? ((par.seqIdThr < 0.5f) ? 7 : Parameters::CLUST_LINEAR2_NUM_ADJACENCY)
+                                                   : (isSetCoverLowSeqId ? 2 : Parameters::CLUST_LINEAR_SYMMETRIC_NUM_ADJACENCY);
+                }
+                if (par.PARAM_NUM_COUNTS.wasSet == false && nonSymetric == false && isSetCoverLowSeqId) {
+                    par.countTableIteration = 3;
+                }
+                if (par.PARAM_LINCLUST_ITERATIONS.wasSet == false && par.seqIdThr >= 0.7f) {
+                    par.linclustIterations = 1;
+                }
+                // let linclust2 pick its iteration 2 k-mer order and seed members
+                if (par.PARAM_KMER_SCORE_MODE.wasSet == false) {
+                    linclustPar = par.removeParameter(linclustPar, par.PARAM_KMER_SCORE_MODE);
+                }
+                if (par.PARAM_SEED_MEMBER_PER_REP.wasSet == false) {
+                    linclustPar = par.removeParameter(linclustPar, par.PARAM_SEED_MEMBER_PER_REP);
+                }
+            }
+            cmd.addVariable("LINCLUST_PAR", par.createParameterString(linclustPar).c_str());
             par.switchConsensusRep = prevSwitch;
             cmd.addVariable("PREFILTER_PAR", par.createParameterString(par.prefilter).c_str());
             // the prefilter gives every hit its best diagonal
