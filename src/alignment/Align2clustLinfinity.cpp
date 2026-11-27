@@ -3904,6 +3904,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     // seconds between two reads of the progress file of a node
     double progressSeconds = std::max(BATCH_READ_SECONDS, 2.0 * requesterCount / PROGRESS_READS_PER_SECOND);
     double listingSeconds = std::max(BATCH_READ_SECONDS, (nodes - 1.0) / PROGRESS_READS_PER_SECOND) / 4.0;
+    // only NFS needs a listing to show new files, elsewhere it costs directory locks
+    bool isDirectoryListed = FileUtil::needsDirectoryRefresh(served);
     std::vector<const char *> requestColumns(nodes + 3);
     bool isServedProgressChanged = false;
     std::vector<char> receivedEntries;
@@ -4114,7 +4116,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         }
 
         // read an owing node's progress once a listing shows a new file
-        bool isServedListed = ownRequests.empty() == false && serviceTimer.getTimediff() >= nextServedListing;
+        bool isServedListed = isDirectoryListed && ownRequests.empty() == false && serviceTimer.getTimediff() >= nextServedListing;
         if (isServedListed) {
             nextServedListing = serviceTimer.getTimediff() + listingSeconds;
             MMseqsNode::listDirectory(served, servedNames);
@@ -4307,7 +4309,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         Timer serveTimer;
         bool hasWorked = false;
         // read a requester's progress once a listing shows a new request
-        if (serviceTimer.getTimediff() >= nextRequestListing) {
+        if (isDirectoryListed && serviceTimer.getTimediff() >= nextRequestListing) {
             nextRequestListing = serviceTimer.getTimediff() + listingSeconds;
             MMseqsNode::listDirectory(requests, requestNames);
             for (size_t i = 0; i < requestNames.size(); i++) {
@@ -5908,7 +5910,7 @@ int align2clustLinfinity(Parameters &par) {
     if (isAligningNode && alignNodeCount > 1) {
         sequenceIndexes.push_back(requests + "." + SSTR(MMseqsNode::rank) + ".progress");
         sequenceIndexes.push_back(served + "." + SSTR(MMseqsNode::rank) + ".progress");
-        // request and served files share a directory each, one listing shows new files
+        // request and served files share a directory each, on NFS one listing shows new files
         const std::string exchangeDirs[] = { requests, served };
         for (size_t i = 0; i < 2; i++) {
             if (FileUtil::makeDir(exchangeDirs[i].c_str()) == false && FileUtil::directoryExists(exchangeDirs[i].c_str()) == false) {
