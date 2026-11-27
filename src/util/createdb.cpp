@@ -790,7 +790,10 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             Debug(Debug::ERROR) << "ZSTD_createCCtx() error\n";
             EXIT(EXIT_FAILURE);
         }
-        size_t spool = isSpooled ? omp_get_thread_num() : 0;
+        size_t spool = 0;
+#ifdef OPENMP
+        spool = isSpooled ? omp_get_thread_num() : 0;
+#endif
         size_t &sequenceBytes = isSpooled ? spoolBytes[spool] : exchangeBytes;
 #pragma omp for schedule(dynamic, 1)
         for (size_t i = 0; i < nodeInputSplits.size(); i++) {
