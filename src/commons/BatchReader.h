@@ -5,9 +5,7 @@
 #include <cstddef>
 #include <deque>
 #include <functional>
-#include <map>
 #include <mutex>
-#include <string>
 #include <thread>
 #include <vector>
 
@@ -100,26 +98,11 @@ public:
     BatchWriter(size_t memorySize, int maxIoThreads, int fdToDetectStorage);
     ~BatchWriter();
 
-    struct FileWrites {
-        size_t bytes;
-        double seconds;
-    };
-    struct Statistics {
-        size_t queuedBytes;
-        size_t writtenBytes;
-        size_t busyBufferCount;
-        size_t fullBufferCount;
-        size_t bufferCount;
-        size_t blockedWriterCount;
-        double blockedSeconds;
-        std::map<std::string, FileWrites> files;
-    };
-
     void write(int fd, const char *fileName, const char *data, size_t size, size_t fileOffset);
     // no caller may be in write
     void waitWrites();
-    // a waiting caller or a write thread calls report about every reportSeconds and waitWrites once at the end
-    void setReport(const std::function<void(const Statistics &)> &report, double reportSeconds);
+    // a waiting caller or a write thread calls report with the written bytes about every reportSeconds and waitWrites once at the end
+    void setReport(const std::function<void(size_t)> &report, double reportSeconds);
 
 private:
     static const size_t BUFFER_SIZE = 64 * 1024 * 1024;
@@ -157,8 +140,8 @@ private:
     std::condition_variable freeCondition;
     std::condition_variable fullCondition;
     std::vector<std::thread> writeThreads;
-    Statistics statistics;
-    std::function<void(const Statistics &)> report;
+    size_t writtenBytes;
+    std::function<void(size_t)> report;
     double reportSeconds;
     Timer reportTimer;
     bool isReporting;

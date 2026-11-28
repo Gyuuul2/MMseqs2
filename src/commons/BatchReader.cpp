@@ -330,19 +330,12 @@ const size_t BatchWriter::BUFFER_SIZE;
 
 BatchWriter::BatchWriter(size_t memorySize, int maxIoThreads, int fdToDetectStorage)
     : bufferSize(std::min(BUFFER_SIZE, std::max((size_t) 1, memorySize / 3))), currentBuffer(NULL), busyBufferCount(0), isClosing(false),
-      reportSeconds(0), isReporting(false) {
+      writtenBytes(0), reportSeconds(0), isReporting(false) {
     // each thread has a join buffer, threads take at most half
     size_t threads = std::max((size_t) 1, std::min((size_t) std::min(getStorageMaxInflightRequests(getStorageKind(fdToDetectStorage), maxIoThreads), maxIoThreads), memorySize / bufferSize / 2));
     size_t bufferCount = std::max((size_t) 2, memorySize / bufferSize - std::min(memorySize / bufferSize, threads));
     memory = new(std::nothrow) char[(bufferCount + threads) * bufferSize];
     Util::checkAllocation(memory, "Can not allocate memory in BatchWriter");
-    statistics.queuedBytes = 0;
-    statistics.writtenBytes = 0;
-    statistics.busyBufferCount = 0;
-    statistics.fullBufferCount = 0;
-    statistics.bufferCount = bufferCount;
-    statistics.blockedWriterCount = 0;
-    statistics.blockedSeconds = 0;
     buffers.resize(bufferCount);
     for (size_t i = 0; i < bufferCount; i++) {
         buffers[i].data = memory + i * bufferSize;
@@ -379,14 +372,8 @@ void BatchWriter::queueCopiedBuffer(Buffer *buffer) {
 void BatchWriter::write(int fd, const char *fileName, const char *data, size_t size, size_t fileOffset) {
     for (size_t done = 0; done < size;) {
         std::unique_lock<std::mutex> lock(bufferMutex);
-        if (currentBuffer == NULL && freeBuffers.empty()) {
-            Timer blockedTimer;
-            statistics.blockedWriterCount++;
-            while (currentBuffer == NULL && freeBuffers.empty()) {
-                wait(lock);
-            }
-            statistics.blockedWriterCount--;
-            statistics.blockedSeconds += blockedTimer.getTimediff();
+        while (currentBuffer == NULL && freeBuffers.empty()) {
+            wait(lock);
         }
         if (currentBuffer == NULL) {
             currentBuffer = freeBuffers.back();
@@ -400,7 +387,6 @@ void BatchWriter::write(int fd, const char *fileName, const char *data, size_t s
         buffer->writeRequests.push_back(request);
         buffer->size += copySize;
         buffer->activeCopyCount++;
-        statistics.queuedBytes += copySize;
         if (buffer->size == bufferSize) {
             currentBuffer = NULL;
         }
@@ -426,7 +412,7 @@ void BatchWriter::waitWrites() {
     reportIfDue(lock, true);
 }
 
-void BatchWriter::setReport(const std::function<void(const Statistics &)> &report, double reportSeconds) {
+void BatchWriter::setReport(const std::function<void(size_t)> &report, double reportSeconds) {
     std::lock_guard<std::mutex> lock(bufferMutex);
     this->report = report;
     this->reportSeconds = reportSeconds;
@@ -448,11 +434,9 @@ void BatchWriter::reportIfDue(std::unique_lock<std::mutex> &lock, bool isDue) {
     }
     isReporting = true;
     reportTimer.reset();
-    Statistics current = statistics;
-    current.busyBufferCount = busyBufferCount;
-    current.fullBufferCount = fullBuffers.size();
+    size_t bytes = writtenBytes;
     lock.unlock();
-    report(current);
+    report(bytes);
     lock.lock();
     isReporting = false;
     freeCondition.notify_all();
@@ -472,7 +456,6 @@ void BatchWriter::writeBuffers(char *joinedWrites) {
         lock.unlock();
         std::vector<WriteRequest> &writeRequests = buffer->writeRequests;
         SORT_SERIAL(writeRequests.begin(), writeRequests.end(), WriteRequest::compareByFile);
-        std::vector<std::pair<const char *, FileWrites> > fileWrites;
         // join consecutive writes
         for (size_t first = 0, last = 0; first < writeRequests.size(); first = last) {
             size_t joinedSize = 0;
@@ -486,23 +469,11 @@ void BatchWriter::writeBuffers(char *joinedWrites) {
                     memcpy(joinedWrites + joinedPos, buffer->data + writeRequests[request].bufferOffset, writeRequests[request].size);
                 }
             }
-            Timer writeTimer;
             FileUtil::pwriteAll(writeRequests[first].fd, writeRequests[first].fileName, writeData, joinedSize, writeRequests[first].fileOffset);
-            if (fileWrites.empty() || fileWrites.back().first != writeRequests[first].fileName) {
-                FileWrites none = { 0, 0 };
-                fileWrites.push_back(std::make_pair(writeRequests[first].fileName, none));
-            }
-            fileWrites.back().second.bytes += joinedSize;
-            fileWrites.back().second.seconds += writeTimer.getTimediff();
         }
         writeRequests.clear();
         lock.lock();
-        statistics.writtenBytes += buffer->size;
-        for (size_t i = 0; i < fileWrites.size(); i++) {
-            FileWrites &file = statistics.files[fileWrites[i].first];
-            file.bytes += fileWrites[i].second.bytes;
-            file.seconds += fileWrites[i].second.seconds;
-        }
+        writtenBytes += buffer->size;
         buffer->size = 0;
         freeBuffers.push_back(buffer);
         busyBufferCount--;
