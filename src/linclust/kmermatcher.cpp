@@ -190,7 +190,7 @@ std::pair<size_t, size_t> fillKmerPositionArray(KmerPositionType * kmerArray, si
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(querySeqType) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     unsigned int kmerBits = isLinfinity ? getKmerBits(subMat, par.kmerSize) : 0;
     size_t keySplitFirstKey = readChunkOffsets.front();
-    // a chunk without a representative has no k-mers
+    // skip chunks without representatives
     std::vector<size_t> readChunks;
     for (size_t i = 0; i + 1 < readChunkOffsets.size(); i++) {
         if (representativeBits == NULL

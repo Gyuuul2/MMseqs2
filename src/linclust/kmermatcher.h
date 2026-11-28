@@ -85,7 +85,7 @@ struct __attribute__((__packed__)) AdjacentData<false> {
     unsigned char get(int) const { return '\0'; }
 };
 
-// [ isWholeSequence | k-mer | adjKey | maxSeqLen - seqLen | id | pos ], whole sequence hash from adjKeyShift
+// [ isWholeSequence | k-mer | adjKey | maxSeqLen - seqLen | id | pos ]
 struct PackedKmerPosition {
     static const unsigned int WHOLE_SEQUENCE_SHIFT = 127;
     static const unsigned int RESIDUE_BITS = 5;
@@ -100,7 +100,7 @@ struct PackedKmerPosition {
     void set(size_t kmer, unsigned int adjKey, size_t seqLen, DBKeyType id, size_t pos, bool isWholeSequence) {
         value = (static_cast<uint128>(isWholeSequence) << WHOLE_SEQUENCE_SHIFT)
                 | (static_cast<uint128>(id) << idShift);
-        // linfinity records have no length and no position field
+        // linfinity records have no length and position
         if (adjKeyShift > seqLenShift) {
             value |= static_cast<uint128>(maxSeqLen - seqLen) << seqLenShift;
         }
@@ -120,7 +120,6 @@ struct PackedKmerPosition {
     size_t getSeqLen() const { return maxSeqLen - getBits(seqLenShift, adjKeyShift); }
     DBKeyType getId() const { return getBits(idShift, seqLenShift); }
     size_t getPos() const { return getBits(0, idShift); }
-    // all ones, a real position is below maxSeqLen
     static size_t getUnknownPos() { return (static_cast<size_t>(1) << idShift) - 1; }
     bool hasPos() const { return getPos() != getUnknownPos(); }
 
@@ -442,20 +441,18 @@ void setLinearFilterDefault(Parameters *p);
 size_t computeMemoryNeededLinearfilter(size_t totalKmer);
 
 extern BaseMatrix *adjSubMat;
-// iteration 2: cluster members add k-mers under the key and length of their rep
+// cluster members that add k-mers for their rep
 struct SeedMember {
     size_t memberId;
     DBKeyType repKey;
     size_t repLen;
-    // linfinity: member sequence of the key split
     const char *seqData;
     size_t seqLen;
 };
 extern std::vector<SeedMember> seedMembers;
-// linfinity send split
+// linfinity
 extern size_t sendSplitFirstKey;
 extern uint64_t *representativeBits;
-// linfinity: copies of the loaded sequences, errno of a failed write
 extern std::vector<int> sequenceCopyFds;
 extern int sequenceCopyError;
 
@@ -511,7 +508,7 @@ static void refillKmerCodeBuffer(KmerCodeReader &reader, size_t fileOffset) {
     reader.bufferPos = 0;
 }
 
-// write 8 bytes if they fit, bytes past bufferPos are rewritten later
+// bytes past bufferPos are rewritten later
 static inline void putStepBits(KmerCodeWriter &writer, uint64_t value, unsigned int bits) {
     uint64_t bitBuffer = writer.bitBuffer | ((value & ((1ULL << bits) - 1)) << writer.bitCount);
     unsigned int bitCount = writer.bitCount + bits;
@@ -568,7 +565,6 @@ static inline size_t getPrefKeySize(uint64_t key) {
     return (std::max(1u, getBitWidth(key)) + 6) / 7;
 }
 
-// up to 63 bits of whole bytes
 static inline void loadKmerCodeBytes(KmerCodeReader &reader) {
     uint64_t word = 0;
     for (unsigned int i = 0; i < sizeof(uint64_t); i++) {
@@ -621,23 +617,7 @@ static inline uint64_t getUnary(KmerCodeReader &reader) {
     return zeros + bit;
 }
 
-static inline size_t getKmerCodeBitPos(const KmerCodeReader &reader) {
-    return (reader.fileOffset + reader.bufferPos) * CHAR_BIT - reader.bitCount;
-}
-
-static inline void seekKmerCodeBits(KmerCodeReader &reader, size_t bitPos) {
-    size_t bytePos = bitPos / CHAR_BIT;
-    if (bytePos >= reader.fileOffset && bytePos - reader.fileOffset <= reader.bufferSize) {
-        reader.bufferPos = bytePos - reader.fileOffset;
-    } else {
-        refillKmerCodeBuffer(reader, bytePos);
-    }
-    reader.bitBuffer = 0;
-    reader.bitCount = 0;
-    getBits(reader, bitPos % CHAR_BIT);
-}
-
-// Elias gamma code of a value >= 1
+// value >= 1
 static inline void putEliasGamma(KmerCodeWriter &writer, size_t value) {
     unsigned int valueBits = getBitWidth(value) - 1;
     if (valueBits < 32) {
@@ -654,7 +634,7 @@ static inline size_t getEliasGamma(KmerCodeReader &reader) {
     return (1ULL << valueBits) | getBits(reader, valueBits);
 }
 
-// Rice code: value >> bits in unary, then the low bits
+// value >> bits in unary, then the low bits
 static inline void putRice(KmerCodeWriter &writer, uint64_t value, unsigned int bits) {
     uint64_t quotient = value >> bits;
     if (quotient < 64 - bits) {
