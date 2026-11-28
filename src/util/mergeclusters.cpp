@@ -47,13 +47,11 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
         std::string sortedByMember = par.db2 + "_by_member";
         std::string sortedByMemberIndex;
         if (hasSecondClu) {
-            Debug(Debug::INFO) << "Sending the pairs of " << FileUtil::baseName(par.filenames[3]) << " to the nodes of their members\n";
             sortedByMemberIndex = MMseqsNode::sendClusterPairs(par.filenames[3], false, ClusterPair::compareByMember, workKeyOffsets, sortedByMember);
         }
         std::string sortedByRep = par.db2 + "_by_rep";
         // singletons left go to <sortedByRep>.bits.<node>
         std::vector<size_t> repKeyOffsets = workKeyOffsets;
-        Debug(Debug::INFO) << "Sending the pairs of " << FileUtil::baseName(par.filenames[2]) << " to the nodes of their " << (hasSecondClu ? "final " : "") << "representatives\n";
         std::string sortedByRepIndex = MMseqsNode::sendClusterPairs(par.filenames[2], true, ClusterPair::compareByRep, workKeyOffsets, sortedByRep,
                                                                     sortedByMemberIndex, hasSecondClu ? sortedByMember : "", repBits,
                                                                     firstCluKeyOffsets, firstKey, keyCount, keepCluFiles ? NULL : &repKeyOffsets);
