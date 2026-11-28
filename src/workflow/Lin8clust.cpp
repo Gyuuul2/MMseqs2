@@ -81,18 +81,6 @@ int lin8clust(int argc, const char **argv, const Command& command) {
         Debug(Debug::INFO) << "Set linclust iterations to " << par.linclustIterations << "\n";
     }
 
-    // let punchHole warn before the run if it is not supported
-    std::string punchFile = tmpDir + "/punch_hole_check";
-    FILE *punchHandle = FileUtil::openAndDelete(punchFile.c_str(), "w");
-    std::vector<char> page(Util::getPageSize(), 0);
-    if (fwrite(page.data(), 1, page.size(), punchHandle) != page.size() || fflush(punchHandle) != 0) {
-        Debug(Debug::ERROR) << "Cannot write " << punchFile << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    FileUtil::punchHole(fileno(punchHandle), 0, page.size());
-    fclose(punchHandle);
-    FileUtil::remove(punchFile.c_str());
-
     CommandCaller cmd;
     cmd.addVariable("MERGECLU_PAR", par.createParameterString(par.mergeclusters).c_str());
     cmd.addVariable("REMOVE_TMP", par.removeTmpFiles ? "TRUE" : NULL);
