@@ -295,16 +295,12 @@ public:
     void setBlockCacheSize(size_t cacheSize);
     size_t getKeyBlock(size_t key) const;
     const std::vector<size_t> &getBlockKeyOffsets() const { return blockKeyOffsets; }
-    size_t getBlockReadSize() { return blockReadSize; }
-    size_t getKeyReadSize() { return keyReadSize; }
     // linfinity local copy
     void setLocalBlocks(const std::string &localDataFileName, const std::vector<char> &blocks);
     // not while a loaded buffer is read
     void setLocalBlock(size_t block);
     void setLocalBlockCacheSize(size_t cacheSize) { localBlockCacheSize = cacheSize; }
     bool isLocalBlock(size_t block) const { return localBlocks.empty() == false && localBlocks[block]; }
-    size_t getLocalBlockReadSize() { return localBlockReadSize; }
-    size_t getLocalKeyReadSize() { return localKeyReadSize; }
     size_t getLoadBufferSize(size_t keyBegin, size_t keyEnd);
     // range loads from copies, empty: from the data files
     void setLocalCopyFds(const std::vector<int> &fds) { localCopyFds = fds; }
@@ -709,15 +705,11 @@ private:
     std::map<size_t, BatchReader::ReadRequest> cachedBlocks;
     size_t blockCacheSize;
     size_t cachedBlockSize;
-    size_t blockReadSize;
-    size_t keyReadSize;
     std::vector<char> localBlocks;
     std::vector<int> localDataFds;
     std::vector<int> localBufferedFds;
     size_t localBlockCacheSize;
     size_t cachedLocalBlockSize;
-    size_t localBlockReadSize;
-    size_t localKeyReadSize;
     std::vector<int> localCopyFds;
     bool prepareBufferToLoad(EntryReadBuffer &bufferToLoadInto, size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys, size_t freeKeyEnd = SIZE_MAX);
 

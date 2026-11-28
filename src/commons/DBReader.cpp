@@ -34,7 +34,7 @@ threads(threads), dataMode(dataMode), dataFileName(strdup(dataFileName_)),
         totalDataSize(0), dataSize(0), lastKey(T()), closed(1), dbtype(Parameters::DBTYPE_GENERIC_DB),
         compressedBuffers(NULL), compressedBufferSizes(NULL), indexSize(0), index(NULL), id2local(NULL), local2id(NULL),
         index2dbfile(NULL), idRangeShift(0), hasBinaryIndex(false), batchReader(NULL), loadedBuffer(), prefetchBuffer(), readStepKeyEnd(0), readStepSize(0),
-        blockCacheSize(0), cachedBlockSize(0), blockReadSize(0), keyReadSize(0), localBlockCacheSize(0), cachedLocalBlockSize(0), localBlockReadSize(0), localKeyReadSize(0),
+        blockCacheSize(0), cachedBlockSize(0), localBlockCacheSize(0), cachedLocalBlockSize(0),
         dataMapped(false), accessType(0), externalData(false), didMlock(false)
 {}
 
@@ -45,8 +45,8 @@ DBReader<T>::DBReader(DBReader<T>::Index *index, size_t size, size_t dataSize, T
         size(size), dataFiles(NULL), dataSizeOffset(NULL), dataFileCnt(0), totalDataSize(0), dataSize(dataSize), lastKey(lastKey),
         maxSeqLen(maxSeqLen), closed(1), dbtype(dbType), compressedBuffers(NULL), compressedBufferSizes(NULL), indexSize(size), index(index), sortedByOffset(true),
         id2local(NULL), local2id(NULL), index2dbfile(NULL), idRangeShift(0), hasBinaryIndex(false), batchReader(NULL), loadedBuffer(), prefetchBuffer(),
-        readStepKeyEnd(0), readStepSize(0), blockCacheSize(0), cachedBlockSize(0), blockReadSize(0), keyReadSize(0), localBlockCacheSize(0), cachedLocalBlockSize(0),
-        localBlockReadSize(0), localKeyReadSize(0), dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
+        readStepKeyEnd(0), readStepSize(0), blockCacheSize(0), cachedBlockSize(0), localBlockCacheSize(0), cachedLocalBlockSize(0),
+        dataMapped(false), accessType(NOSORT), externalData(true), didMlock(false)
 {}
 
 template <typename T>
@@ -1284,9 +1284,7 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &buf
                     if (isCached) {
                         request.destination = allocateReadBuffer(request.bytesToRead);
                         cachedBlockSize += request.bytesToRead;
-                        blockReadSize += request.bytesToRead;
                         cachedLocalBlockSize += isLocal ? request.bytesToRead : 0;
-                        localBlockReadSize += isLocal ? request.bytesToRead : 0;
                         blocks.push_back(block);
                         blockReadRequests.push_back(request);
                     }
@@ -1304,16 +1302,6 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &buf
         size_t bytes;
         if (keys != NULL) {
             bytes = planKeyReadRequests(*keysToRead, readRequests, requestFirstKeys);
-            keyReadSize += bytes;
-            if (localBlocks.empty() == false) {
-                size_t block = SIZE_MAX;
-                for (size_t i = 0; i < readRequests.size(); i++) {
-                    if (block == SIZE_MAX || requestFirstKeys[i] < blockKeyOffsets[block] || requestFirstKeys[i] >= blockKeyOffsets[block + 1]) {
-                        block = getKeyBlock(requestFirstKeys[i]);
-                    }
-                    localKeyReadSize += localBlocks[block] ? readRequests[i].bytesToRead : 0;
-                }
-            }
         } else {
             bytes = planReadRequests(keyBegin, keyEnd, isReadingOffsets, readRequests, entryOffsets, clusterKeys, compressedReadRequests, requestFirstKeys);
         }

@@ -132,15 +132,8 @@ void MMseqsNode::WaitWarning::reset() {
     nextSeconds = WAIT_WARNING_SECONDS;
 }
 
-// MMSEQS_WAIT_TIMEOUT: seconds of one wait before the node stops
 void MMseqsNode::WaitWarning::check(const std::string &what) {
-    static const char *timeout = getenv("MMSEQS_WAIT_TIMEOUT");
-    const time_t now = time(NULL);
-    if (timeout != NULL && *timeout != '\0' && now - start > strtol(timeout, NULL, 10)) {
-        Debug(Debug::ERROR) << "Node " << rank << " waited more than MMSEQS_WAIT_TIMEOUT=" << timeout << " s for " << what << "\n";
-        EXIT(EXIT_FAILURE);
-    }
-    if (static_cast<size_t>(now - start) >= nextSeconds) {
+    if (static_cast<size_t>(time(NULL) - start) >= nextSeconds) {
         Debug(Debug::WARNING) << "Node " << rank << " has waited " << nextSeconds << " s for " << what << ". Long steps are normal at large scale; "
                               << "if no node makes progress, check that all nodes are running and use the same shared temporary folder\n";
         nextSeconds *= 2;

@@ -821,22 +821,6 @@ std::string FileUtil::sanitizeFilename(std::string name){
     return name;
 }
 
-bool FileUtil::isSameDbData(const std::string &firstDb, const std::string &secondDb) {
-    const std::vector<std::string> firstFiles = findDatafiles(firstDb.c_str());
-    const std::vector<std::string> secondFiles = findDatafiles(secondDb.c_str());
-    if (firstFiles.empty() || firstFiles.size() != secondFiles.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < firstFiles.size(); i++) {
-        struct stat firstStat, secondStat;
-        if (stat(firstFiles[i].c_str(), &firstStat) != 0 || stat(secondFiles[i].c_str(), &secondStat) != 0
-            || firstStat.st_dev != secondStat.st_dev || firstStat.st_ino != secondStat.st_ino) {
-            return false;
-        }
-    }
-    return true;
-}
-
 // the bytes copied at once by a thread
 static const size_t LOCAL_COPY_IO_BYTES = 64 * 1024 * 1024;
 
@@ -861,10 +845,6 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
         EXIT(EXIT_FAILURE);
     }
     const std::string localDb = localDir + "/" + baseName(db);
-    if (isSameDbData(db, localDb)) {
-        Debug(Debug::ERROR) << "Cannot copy a database onto its own data: " << localDb << "\n";
-        EXIT(EXIT_FAILURE);
-    }
     if (fileExists((localDb + ".dbtype").c_str())) {
         remove((localDb + ".dbtype").c_str());
     }

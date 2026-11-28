@@ -93,8 +93,6 @@ public:
     static void copyFile(const char *src, const char *dst);
     static void copyFile(const std::string& src, const std::string& dst);
 
-    static bool isSameDbData(const std::string &firstDb, const std::string &secondDb);
-
     // sparse copy of fileRanges while they fit, copiedBytes is the copied or reserved prefix
     static std::string copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &copiedBytes,
                                       const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges, size_t maxBytes, bool isReservingOnly = false);
