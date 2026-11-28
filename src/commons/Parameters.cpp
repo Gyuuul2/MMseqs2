@@ -28,9 +28,6 @@
 #include <omp.h>
 #endif
 
-// how long a step on several machines waits for an input that a step before it wrote on another machine
-static const int INPUT_LATENCY_SECONDS = 120;
-
 Parameters* Parameters::instance = NULL;
 
 extern const char* binary_name;
@@ -1122,8 +1119,10 @@ Parameters::Parameters():
     clusthash.push_back(&PARAM_COMPRESSED);
     clusthash.push_back(&PARAM_V);
 
+    // clusthashfast
     clusthashfast = clusthash;
     clusthashfast.push_back(&PARAM_SPLIT_MEMORY_LIMIT);
+
     // kmermatcher
     kmermatcher.push_back(&PARAM_SUB_MAT);
     kmermatcher.push_back(&PARAM_ALPH_SIZE);
@@ -2397,8 +2396,8 @@ void Parameters::checkIfDatabaseIsValid(const Command& command, int argc, const 
                     FileUtil::refreshDirectory(filenames[fileIdx]);
                     return filenames[fileIdx] != "stdin" && FileUtil::fileExists((filenames[fileIdx]).c_str()) == false && FileUtil::fileExists((filenames[fileIdx] + ".dbtype").c_str()) == false;
                 };
-                // a step on another machine may have written the input; like --latency-wait of Snakemake and exitReadTimeout of Nextflow
-                for (int second = 0; MMseqsNode::count > 1 && second < INPUT_LATENCY_SECONDS && isMissing(); second++) {
+                // wait for inputs written by another node
+                for (int second = 0; MMseqsNode::count > 1 && second < 120 && isMissing(); second++) {
                     sleep(1);
                 }
                 if (isMissing()) {

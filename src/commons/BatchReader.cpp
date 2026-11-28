@@ -282,7 +282,7 @@ void BatchReader::readWithRing(bool waitForAll) {
             sqe.opcode = IORING_OP_READ;
             sqe.fd = splitReadRequests[nextSplitReadRequest].fileToRead;
             sqe.off = splitReadRequests[nextSplitReadRequest].fileOffset;
-            sqe.addr = reinterpret_cast<unsigned long>(splitReadRequests[nextSplitReadRequest].destination);
+            sqe.addr = (unsigned long) splitReadRequests[nextSplitReadRequest].destination;
             sqe.len = splitReadRequests[nextSplitReadRequest].bytesToRead;
             sqe.flags = (splitReadRequests[nextSplitReadRequest].bytesToRead == MAX_READ_REQUEST_SIZE) ? IOSQE_ASYNC : 0;
             sqe.user_data = nextSplitReadRequest;

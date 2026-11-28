@@ -8,7 +8,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-// a pipe has no size
+// pipes have no size
 static int openInput(const char *fileName, size_t &size) {
     int fd = FileUtil::openSharedFd(fileName, O_RDONLY);
     struct stat sb;
@@ -279,7 +279,7 @@ namespace KSEQZSTD {
 KSeqZstd::KSeqZstd(const char* fileName, size_t start, size_t end) {
     file.fd = openInput(fileName, file.fileSize);
     file.fileName = fileName;
-    // a split holds the pzstd frames that start in it
+    // read the pzstd frames that start in [start, end)
     if (start > 0) {
         start = KSEQZSTD::findFrame(file.fd, fileName, file.fileSize, start, end);
     }

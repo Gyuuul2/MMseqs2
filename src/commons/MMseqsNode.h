@@ -50,9 +50,7 @@ public:
         return (count > 1) ? 1 : 0;
     }
 
-    // warn and go on in the shared folder
     static void reportUnusableLocalTmp(const std::string &problem);
-    // empty if --local-tmp is usable
     static std::string getLocalTmpProblem(const Parameters &par);
 
     class WaitWarning {
@@ -68,14 +66,11 @@ public:
 
     static void publishRunFile(const std::string &file, const std::string &content);
     static std::string waitForRunFile(const std::string &file);
-    // false while the file holds no content of this run
     static bool readRunFile(const std::string &file, std::string &content);
     static void waitForRunFilesChange(const std::string &prefix, std::string &content);
     static std::string gatherRunFiles(const std::string &prefix);
-    // empty if the directory cannot be opened
     static void listDirectory(const std::string &directory, std::vector<std::string> &names);
 
-    // polled by other nodes, on NFS renamed into place and reopened per read
     struct PolledFile {
         PolledFile() : fd(-1), isModeKnown(false), isOpenedPerRead(false) {}
         explicit PolledFile(const std::string &file) : file(file), fd(-1), isModeKnown(false), isOpenedPerRead(false) {}
@@ -83,11 +78,9 @@ public:
         PolledFile &operator=(const PolledFile &) = delete;
         ~PolledFile();
         void publish(const std::string &content);
-        // false while the file holds no complete record of this run
         bool read(std::string &content);
         // 0 while missing or on a transient error
         size_t read(char *data, size_t size, size_t offset);
-        // decide once, never switch modes later
         void decideMode();
 
         std::string file;
@@ -123,11 +116,9 @@ public:
     static void addPhaseSeconds(std::string &content, const std::string &phase, double seconds);
     // kept for writeNodeLog
     static void printPhaseValues(const std::string &values);
-    // the master writes the kept values of all nodes to <file>.nodes.log
     static void writeNodeLog(const std::string &file);
-    // one step of a Debug::Progress(100) per percent of total
+    // for a Debug::Progress(100)
     static void printProgress(Debug::Progress &progress, size_t before, size_t after, size_t total);
-    // one decimal like df -h: 512B, 68.3M, 1.9T
     static std::string formatBytes(size_t bytes);
 
     class WorkQueue {
@@ -168,7 +159,7 @@ public:
         ClusterPair previous;
     };
 
-    // varint delta runs from every slice offset and cut, both become encoded offsets
+    // sliceOffsets and cuts become encoded offsets
     static void encodeExchangeRecords(const char *records, std::vector<size_t> &sliceOffsets, std::vector<size_t> &cuts, size_t skipBegin, size_t skipEnd,
                                       bool isClusterPair, bool (*compare)(const ClusterPair &, const ClusterPair &), std::vector<std::vector<char> > &sliceRecords);
 
@@ -239,14 +230,12 @@ public:
                                         std::vector<size_t> *balancedKeyOffsets = NULL);
     static void removeExchanges(const std::string &prefix, const std::string &lastExchange, const std::vector<std::string> &exchanges, std::string phaseValues = "");
     static size_t findSplitEnd(DBReader<DBKeyType> &cluDb, size_t splitBegin, size_t splitOffset, size_t splitSize, size_t splitEntries, size_t entryEnd);
-    // createsubdb asks kmermatcher for seed member sequences
     static std::string getSeedMemberRequestsFile(const std::string &db, size_t node);
 
     static void readKeyBits(int fd, const std::string &fileName, size_t fileOffset, size_t fileFirstKey, size_t from, size_t to, size_t firstKey, uint64_t *bits);
     static uint64_t *readRepresentativeBits(const std::string &db, const std::vector<size_t> &fileKeyOffsets, size_t firstKey, size_t keyCount);
     static void writeRepresentativeBits(const std::string &db, DBReader<DBKeyType> &seqDbr, const uint64_t *bits, size_t firstKey, size_t keyCount,
                                         const std::vector<size_t> &rangeSeedMemberCounts = std::vector<size_t>());
-    // master joins the index rows of all nodes
     static void gatherRepresentativeIndex(const std::string &db);
 
     static std::vector<size_t> getClusterKeyOffsets(const std::string &barrierFile, const std::string &clu, size_t keyCount, const std::string &firstKeySource = "");

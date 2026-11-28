@@ -101,7 +101,7 @@ public:
     void write(int fd, const char *fileName, const char *data, size_t size, size_t fileOffset);
     // no caller may be in write
     void waitWrites();
-    // a waiting caller or a write thread calls report with the written bytes about every reportSeconds and waitWrites once at the end
+    // waiting callers or write threads call report about every reportSeconds, waitWrites at the end
     void setReport(const std::function<void(size_t)> &report, double reportSeconds);
 
 private:

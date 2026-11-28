@@ -118,7 +118,6 @@ bool FileUtil::hasFailedTooLong(time_t &failedSince, unsigned int &attempts) {
     return attempts >= 100 && now - failedSince >= 60;
 }
 
-// false once it failed 100 times and for 60 s
 bool FileUtil::waitBeforeRetry(const char *file, const char *error, time_t &failedSince, unsigned int &attempts) {
     if (hasFailedTooLong(failedSince, attempts)) {
         return false;
@@ -132,7 +131,6 @@ bool FileUtil::waitBeforeRetry(const char *file, const char *error, time_t &fail
     return true;
 }
 
-// EIO, ESTALE or a name that NFS caches as missing
 bool FileUtil::canRetryRead(const std::string &file, int error, time_t &failedSince, unsigned int &attempts) {
     bool isCachedMissing = error == ENOENT && FileUtil::needsDirectoryRefresh(file);
     return (FileUtil::isTransientError(error) || isCachedMissing) && FileUtil::waitBeforeRetry(file.c_str(), strerror(error), failedSince, attempts);
@@ -180,7 +178,6 @@ int FileUtil::openListedFile(const std::string &file, int flags) {
     return fd;
 }
 
-// retry EIO, ESTALE and an NFS name cached as missing
 int FileUtil::openSharedFd(const std::string &file, int flags, size_t *size) {
     time_t failedSince = 0;
     unsigned int attempts = 0;
@@ -215,7 +212,7 @@ FILE *FileUtil::openSharedFile(const std::string &file, const char *mode) {
     return handle;
 }
 
-// a missing name returns false at once
+// missing names return false at once
 bool FileUtil::statSharedFile(const std::string &file, struct stat *sb) {
     time_t failedSince = 0;
     unsigned int attempts = 0;
@@ -402,11 +399,11 @@ void FileUtil::publishFile(const std::string &file, const std::string &content) 
     }
 }
 
-// NFS caches that a name is missing; Lustre, GPFS and local file systems are coherent across machines, unknown storage counts as NFS
+// NFS caches missing names, unknown storage counts as NFS
 bool FileUtil::needsDirectoryRefresh(const std::string &file) {
     static std::mutex directoriesMutex;
     static std::map<std::string, bool> directories;
-    const std::string directory = dirName(file);
+    std::string directory = dirName(file);
     std::lock_guard<std::mutex> lock(directoriesMutex);
     std::map<std::string, bool>::const_iterator it = directories.find(directory);
     if (it != directories.end()) {
@@ -414,11 +411,11 @@ bool FileUtil::needsDirectoryRefresh(const std::string &file) {
     }
     bool needsRefresh = true;
 #ifdef __linux__
-    const int fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    int fd = open(directory.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd < 0) {
         return true;
     }
-    const StorageKind storage = getStorageKind(fd);
+    StorageKind storage = getStorageKind(fd);
     close(fd);
     needsRefresh = storage == STORAGE_NFS || storage == STORAGE_UNKNOWN;
 #endif
@@ -426,7 +423,7 @@ bool FileUtil::needsDirectoryRefresh(const std::string &file) {
     return needsRefresh;
 }
 
-// opening a directory asks an NFS server for its state, so a name that this machine found missing before another machine wrote it is looked up again
+// opening a directory makes NFS look up missing names again
 void FileUtil::refreshDirectory(const std::string &file) {
     if (needsDirectoryRefresh(file) == false) {
         return;
@@ -821,7 +818,6 @@ std::string FileUtil::sanitizeFilename(std::string name){
     return name;
 }
 
-// the bytes copied at once by a thread
 static const size_t LOCAL_COPY_IO_BYTES = 64 * 1024 * 1024;
 
 int FileUtil::copyRange(int sourceFd, const char *sourceName, int copyFd, char *buffer, size_t bytes, size_t offset) {
@@ -835,7 +831,7 @@ int FileUtil::copyRange(int sourceFd, const char *sourceName, int copyFd, char *
 
 std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &copiedBytes,
                                      const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges, size_t maxBytes, bool isReservingOnly) {
-    const std::vector<std::string> dataFiles = findDatafiles(db.c_str());
+    std::vector<std::string> dataFiles = findDatafiles(db.c_str());
     if (dataFiles.empty()) {
         Debug(Debug::ERROR) << "No datafile could be found for " << db << "\n";
         EXIT(EXIT_FAILURE);
@@ -844,7 +840,7 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
         Debug(Debug::ERROR) << "Cannot create " << localDir << "\n";
         EXIT(EXIT_FAILURE);
     }
-    const std::string localDb = localDir + "/" + baseName(db);
+    std::string localDb = localDir + "/" + baseName(db);
     if (fileExists((localDb + ".dbtype").c_str())) {
         remove((localDb + ".dbtype").c_str());
     }
@@ -863,9 +859,9 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
     }
     std::vector<int> sourceFds(dataFiles.size());
     std::vector<int> copyFds(dataFiles.size());
-    const size_t firstCopy = copies.size();
+    size_t firstCopy = copies.size();
     for (size_t i = 0; i < dataFiles.size(); i++) {
-        // the copy keeps the suffix of the data file, so DBReader finds it next to localDb
+        // keep the suffix of the data file
         copies.push_back(localDb + dataFiles[i].substr(db.size()));
         sourceFds[i] = ::open(dataFiles[i].c_str(), O_RDONLY | O_CLOEXEC);
         copyFds[i] = ::open(copies.back().c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
@@ -875,7 +871,7 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
         }
     }
     // before reserving, publishFile exits on a full device
-    const std::string dbtype = readFile(db + ".dbtype");
+    std::string dbtype = readFile(db + ".dbtype");
     if (dbtype.size() != sizeof(int)) {
         Debug(Debug::ERROR) << "Invalid database type file: " << db << ".dbtype\n";
         EXIT(EXIT_FAILURE);
@@ -887,12 +883,12 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
     size_t chunkCount = 0;
     for (; chunkCount < chunks.size() && chunkBytes[chunkCount] <= maxBytes - totalBytes; chunkCount++) {
 #ifdef __linux__
-        const int fd = copyFds[chunks[chunkCount].first];
+        int fd = copyFds[chunks[chunkCount].first];
         int failed;
         do {
             failed = fallocate(fd, 0, chunks[chunkCount].second, chunkBytes[chunkCount]);
         } while (failed != 0 && errno == EINTR);
-        const int reserveError = errno;
+        int reserveError = errno;
         if (failed != 0 && reserveError != EOPNOTSUPP && reserveError != ENOSYS) {
             std::string copyEnd;
             MMseqsNode::addPhaseValue(copyEnd, "Local tmp", "cannot reserve " + copies[firstCopy + chunks[chunkCount].first] + " at offset " + SSTR(chunks[chunkCount].second) + ": " + strerror(reserveError)
@@ -908,7 +904,7 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
     // without fallocate the first chunk on a full device ends the copy
     size_t failedChunk = chunks.size();
     // up to 64 large reads from shared storage
-    const int copyThreads = std::max(1, std::min(std::min(threads, 64), (int) chunks.size()));
+    int copyThreads = std::max(1, std::min(std::min(threads, 64), (int) chunks.size()));
 #pragma omp parallel num_threads(copyThreads)
     {
         std::vector<char> buffer(chunks.empty() ? 0 : LOCAL_COPY_IO_BYTES);
@@ -917,8 +913,8 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
             if (i > __atomic_load_n(&failedChunk, __ATOMIC_RELAXED)) {
                 continue;
             }
-            const size_t file = chunks[i].first;
-            const int writeError = copyRange(sourceFds[file], dataFiles[file].c_str(), copyFds[file], buffer.data(), chunkBytes[i], chunks[i].second);
+            size_t file = chunks[i].first;
+            int writeError = copyRange(sourceFds[file], dataFiles[file].c_str(), copyFds[file], buffer.data(), chunkBytes[i], chunks[i].second);
             if (writeError == ENOSPC || writeError == EDQUOT) {
                 std::string copyEnd;
                 MMseqsNode::addPhaseValue(copyEnd, "Local tmp", "cannot write " + copies[firstCopy + file] + " at offset " + SSTR(chunks[i].second) + ": " + strerror(writeError) + ", the copy ends there");
@@ -938,7 +934,7 @@ std::string FileUtil::copyToLocalDir(const std::string &db, const std::string &l
             totalBytes += chunkBytes[i];
         }
         for (size_t file = chunks[failedChunk].first; file < dataFiles.size(); file++) {
-            const size_t keptBytes = (file == chunks[failedChunk].first) ? chunks[failedChunk].second : 0;
+            size_t keptBytes = (file == chunks[failedChunk].first) ? chunks[failedChunk].second : 0;
             if (ftruncate(copyFds[file], keptBytes) != 0 || ftruncate(copyFds[file], fileBytes[file]) != 0) {
                 Debug(Debug::ERROR) << "Cannot truncate " << copies[firstCopy + file] << "\n";
                 EXIT(EXIT_FAILURE);

@@ -50,20 +50,19 @@ public:
     static bool statSharedFile(const std::string &file, struct stat *sb = NULL);
     static std::string readFile(const std::string &file);
 
-    // ESTALE or EIO from NFS, a later try can succeed
     static bool isTransientError(int error) {
         return error == EIO || error == ESTALE;
     }
     // bytes done, fewer after an error or end of file (error 0)
     static size_t tryPreadAll(int fd, char *data, size_t size, size_t offset, int &readError);
     static size_t tryPwriteAll(int fd, const char *data, size_t size, size_t offset, int &writeError);
-    // a readError of 0 or less is an end of file
+    // readError <= 0 is an end of file
     static bool waitBeforeReadRetry(int fd, const char *fileName, int readError, const char *reason, time_t &failedSince, unsigned int &attempts);
     static void preadAll(int fd, const char *fileName, char *data, size_t size, size_t offset);
     // for pread/pwrite only, the file position starts at 0 again
     static void reopenFile(int fd, const char *fileName);
     static void pwriteAll(int fd, const char *fileName, const char *data, size_t size, size_t offset);
-    // free the disk blocks of a read range, fd open for writing
+    // fd open for writing
     static void punchHole(int fd, size_t offset, size_t size);
     static const size_t PUNCH_HOLE_ALIGNMENT = 1024 * 1024;
     // whole aligned blocks only, the edges may belong to other readers
@@ -71,7 +70,6 @@ public:
 
     static std::string dirName(const std::string &file);
 
-    // whether polls for a file that another machine writes in the directory of file need refreshDirectory and the other NFS workarounds
     static bool needsDirectoryRefresh(const std::string &file);
     static void refreshDirectory(const std::string &file);
 
@@ -93,7 +91,7 @@ public:
     static void copyFile(const char *src, const char *dst);
     static void copyFile(const std::string& src, const std::string& dst);
 
-    // sparse copy of fileRanges while they fit, copiedBytes is the copied or reserved prefix
+    // copiedBytes is the copied or reserved prefix
     static std::string copyToLocalDir(const std::string &db, const std::string &localDir, int threads, std::vector<std::string> &copies, size_t &copiedBytes,
                                       const std::vector<std::vector<std::pair<size_t, size_t> > > &fileRanges, size_t maxBytes, bool isReservingOnly = false);
 
@@ -116,7 +114,7 @@ public:
 
     static void fixRlimitNoFile();
 
-    // stdio, logs and readers callers do not count
+    // stdio, logs and readers the callers do not count
     static const size_t UNCOUNTED_OPEN_FILES = 64;
 
     static void checkRlimitNoFile(size_t minOpenFiles);

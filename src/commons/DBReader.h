@@ -287,10 +287,10 @@ public:
     void loadData(size_t keyBegin, size_t keyEnd);
     void prefetchData(size_t keyBegin, size_t keyEnd);
     void startLoadData(size_t keyBegin, size_t keyEnd, size_t readSize);
-    // returns the end of the keys read so far
+    // end of the keys read so far
     size_t waitForLoadedData();
     size_t getPrefetchBufferSize(size_t keyBegin, size_t keyEnd);
-    // blocks below freeKeyEnd and the first key may be freed, local blocks over their room below the first key too
+    // may free cached blocks below freeKeyEnd and the first key
     void loadData(const std::vector<DBKeyType> &keys, size_t freeKeyEnd = SIZE_MAX);
     void setBlockCacheSize(size_t cacheSize);
     size_t getKeyBlock(size_t key) const;
@@ -302,11 +302,9 @@ public:
     void setLocalBlockCacheSize(size_t cacheSize) { localBlockCacheSize = cacheSize; }
     bool isLocalBlock(size_t block) const { return localBlocks.empty() == false && localBlocks[block]; }
     size_t getLoadBufferSize(size_t keyBegin, size_t keyEnd);
-    // range loads from copies, empty: from the data files
     void setLocalCopyFds(const std::vector<int> &fds) { localCopyFds = fds; }
     // 0 or the errno of the failed write
     int writeLoadedData(const std::vector<int> &fds);
-    // false unless the cache holds [offset, offset + size)
     bool copyCachedBlockData(size_t block, size_t offset, size_t size, char *data) const;
     bool isCachedBlock(size_t block) const { return cachedBlocks.find(block) != cachedBlocks.end(); }
 
@@ -326,7 +324,7 @@ public:
     void readData(size_t offset, size_t bytes, char *destination);
     int getBufferedFd() const { return bufferedFds[0]; }
     char *getDataFromLoadedBuffer(size_t key);
-    // where the last key was found, valid until the next load
+    // valid until the next load
     struct LoadedBufferCursor {
         LoadedBufferCursor() : range(SIZE_MAX), block(SIZE_MAX), cachedBlock(NULL), requestEnd(SIZE_MAX) {}
         size_t range;
@@ -582,7 +580,6 @@ public:
     std::vector<size_t> getEvenNodeKeyOffsets(size_t nodeCount);
     std::vector<size_t> getSplitKeyOffsets(size_t keyBegin, size_t keyEnd, size_t splitSize, size_t keySize);
     size_t findIdRange(size_t id);
-    // the first id after the range
     size_t getRangeEndId(size_t range);
     // range SIZE_MAX searches from the start
     size_t getSeqLenFromRange(size_t &range, size_t id);
@@ -590,7 +587,7 @@ public:
     size_t getRangeRepresentativeCount(size_t range) const {
         return rangeRepresentativeCounts[range];
     }
-    // reps with a seed member, seventh column of a createsubdb subset
+    // seventh index column of a createsubdb subset
     size_t getRangeSeedMemberCount(size_t range) const {
         return rangeSeedMemberCounts[range];
     }
@@ -605,7 +602,6 @@ private:
     size_t planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys);
     void loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys, size_t freeKeyEnd = SIZE_MAX);
     void decompressLoadedBuffer();
-    // offset of a key in its data file
     size_t getKeyOffset(size_t range, size_t key);
     char *allocateReadBuffer(size_t bytes);
 
@@ -658,13 +654,13 @@ private:
     DBLocalId * id2local;
     DBLocalId * local2id;
 
-    // linfinity: data file of each length range
+    // linfinity: data file of each range
     unsigned int * index2dbfile;
     // header offsets or binary cluster index, their fds follow the data fds
     std::vector<std::string> entryOffsetsFileNames;
     std::vector<size_t> rangeRepresentativeCounts;
     std::vector<size_t> rangeSeedMemberCounts;
-    // bsearch result of every 2^idRangeShift-th key, findIdRange searches between two
+    // range of every 2^idRangeShift-th key
     std::vector<size_t> idRangeTable;
     size_t idRangeShift;
     // uint64 (key, offset) pairs in <clu>.index.<node>
