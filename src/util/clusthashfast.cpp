@@ -64,8 +64,6 @@ static size_t findRepresentative(const std::vector<std::string> &repSeqs, const 
 }
 
 static const size_t WRITE_SEQS_PER_THREAD = 1024 * 1024;
-static const size_t LARGE_HASH_GROUP_SIZE = 4096;
-static const size_t REP_CANDIDATES_PER_PASS = 64;
 
 static size_t findHashStart(const HashEntry *hashIdPairs, size_t pos, size_t end) {
     if (pos == 0) {
@@ -378,7 +376,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     }
 
     size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
-    // linfinity: one representative bit per key
     size_t bitWords = isLinfinity ? (localKeyCount + 63) / 64 : 0;
     uint64_t *representativeBits = new(std::nothrow) uint64_t[bitWords]();
     Util::checkAllocation(representativeBits, "Can not allocate representative bit memory");
@@ -410,7 +407,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             size_t chunkBufferBytes = 2 * reader.getLoadBufferSize(nodeLengthRanges[i].startKey, nodeLengthRanges[i].startKey + readChunkSeqCount);
             size_t keptBytes = isLinfinity ? (lengthSeqCount / 64 + 1) * sizeof(MemberBits) : lengthSeqCount / 4;
             size_t hashBytes = hashEntryBytes + (isLinfinity ? nodeLengthRanges[i].entryLength - 2 : 0);
-            // pairs to write a split length in key order
             size_t pairBytes = isLinfinity ? lengthSeqCount * sizeof(ClusterPair) : 0;
             if ((isLinfinity && readChunkSeqCount == 0) || splitMemoryLimit <= keptBytes + chunkBufferBytes + pairBytes + hashBytes) {
                 Debug(Debug::ERROR) << "Not enough memory to hash " << lengthSeqCount << " sequences. Memory limit: " << splitMemoryLimit
@@ -432,7 +428,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     size_t allocatedHashEntryCount = 0;
 
     std::vector<size_t> threadOffsets(par.threads + 1);
-    // more tasks than threads for large hash groups
     std::vector<size_t> taskOffsets(par.threads * 16 + 1);
     std::vector<std::string> threadClusterText(par.threads);
     // (representative id, offset) per entry
@@ -513,14 +508,14 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             if (candidateCount > copyBatchOffsets.back()) {
                 copyBatchOffsets.push_back(candidateCount);
             }
-            batchSeqs = reinterpret_cast<char *>(hashIdPairs + candidateCount);
+            batchSeqs = (char *) (hashIdPairs + candidateCount);
         }
 
         if (isLargeLength && canStoreHashIdPairs == false) {
             // copy the sequences of a hash range after its hashIdPairs
             size_t maxRangeSeqCount = hashedSeqCapacity * sizeof(HashEntry) / (sizeof(HashEntry) + length);
             hashRanges = setupHashRanges(reader, &subMat, par.maxSeqLen, splitFirstKey, splitSeqCount, readChunkSeqCount, maxRangeSeqCount);
-            batchSeqs = isCopyingSeqs ? reinterpret_cast<char *>(hashIdPairs + maxRangeSeqCount) : NULL;
+            batchSeqs = isCopyingSeqs ? (char *) (hashIdPairs + maxRangeSeqCount) : NULL;
         } else if (isLargeLength == false) {
             // hash while the rest of the split is read
             reader.startLoadData(splitFirstKey, splitFirstKey + splitSeqCount, readChunkBytes);
@@ -558,7 +553,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     hashedSeqCount = fillHashRange(reader, &subMat, par.maxSeqLen, splitFirstKey, splitSeqCount, readChunkSeqCount, hashRanges[range], hashIdPairs, memberBits);
                 }
                 SORT_PARALLEL(hashIdPairs, hashIdPairs + hashedSeqCount, HashEntry::compareByHashAndId);
-                // linfinity singletons only set their bit
                 if (isLinfinity) {
                     hashedSeqCount = removeSingletons(hashIdPairs, hashedSeqCount, representativeBits, localFirstKey, taskOffsets);
                 }
@@ -572,9 +566,9 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             std::vector<std::pair<size_t, size_t>> largeGroups;
 #pragma omp parallel for schedule(dynamic, 1) num_threads(par.threads)
             for (size_t task = 0; task < taskOffsets.size() - 1; task++) {
-                unsigned int thread = 0;
+                unsigned int thread_idx = 0;
 #ifdef OPENMP
-                thread = static_cast<unsigned int>(omp_get_thread_num());
+                thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
                 size_t taskEnd = taskOffsets[task + 1];
                 std::string repSeqCopy;
@@ -583,7 +577,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     while (hashGroupEnd < taskEnd && rangeHashIdPairs[hashGroupEnd].hash == rangeHashIdPairs[hashGroupBegin].hash) {
                         hashGroupEnd++;
                     }
-                    if (hashGroupEnd - hashGroupBegin > LARGE_HASH_GROUP_SIZE) {
+                    if (hashGroupEnd - hashGroupBegin > 4096) {
 #pragma omp critical
                         {
                             largeGroups.emplace_back(hashGroupBegin, hashGroupEnd);
@@ -591,7 +585,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                         hashGroupBegin = hashGroupEnd;
                         continue;
                     }
-                    // the first id is already smallest; find the smallest unassigned id after swaps
+                    // the first id is the smallest, swaps break the id order
                     for (size_t i = hashGroupBegin; i < hashGroupEnd;) {
                         if (i > hashGroupBegin) {
                             std::iter_swap(rangeHashIdPairs + i, std::min_element(rangeHashIdPairs + i, rangeHashIdPairs + hashGroupEnd, HashEntry::compareById));
@@ -602,7 +596,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                             break;
                         }
                         unsigned int repLength = isCopyingSeqs ? length : reader.getSeqLen(repId);
-                        const char *repSeq = (batchSeqs == NULL) ? reader.getData(repId, thread) : batchSeqs + getMemberIndex(memberBits, repId - splitFirstKey) * length;
+                        const char *repSeq = (batchSeqs == NULL) ? reader.getData(repId, thread_idx) : batchSeqs + getMemberIndex(memberBits, repId - splitFirstKey) * length;
                         if (isCopyingRepSeq) {
                             repSeqCopy.assign(repSeq, repLength);
                             repSeq = repSeqCopy.data();
@@ -612,7 +606,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                             if (isCopyingSeqs == false && reader.getSeqLen(memberId) != repLength) {
                                 continue;
                             }
-                            const char *memberSeq = (batchSeqs == NULL) ? reader.getData(memberId, thread) : batchSeqs + getMemberIndex(memberBits, memberId - splitFirstKey) * length;
+                            const char *memberSeq = (batchSeqs == NULL) ? reader.getData(memberId, thread_idx) : batchSeqs + getMemberIndex(memberBits, memberId - splitFirstKey) * length;
                             unsigned int distance = DistanceCalculator::computeInverseHammingDistance(repSeq, memberSeq, repLength);
                             if (static_cast<float>(distance) / static_cast<float>(repLength) >= par.seqIdThr) {
                                 std::swap(rangeHashIdPairs[i], rangeHashIdPairs[j]);
@@ -625,7 +619,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             }
 
             // pick representatives serially, assign the rest in parallel
-            std::sort(largeGroups.begin(), largeGroups.end());
+            SORT_SERIAL(largeGroups.begin(), largeGroups.end());
             std::vector<char> assigned;
             std::vector<DBLocalId> reps;
             std::vector<std::string> repSeqs;
@@ -636,7 +630,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                 for (size_t i = begin; i < end;) {
                     reps.clear();
                     repSeqs.clear();
-                    for (size_t candidates = 0; i < end && candidates < REP_CANDIDATES_PER_PASS; i++) {
+                    for (size_t candidates = 0; i < end && candidates < 64; i++) {
                         if (assigned[i - begin]) {
                             continue;
                         }
@@ -653,16 +647,16 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     }
 #pragma omp parallel for schedule(dynamic, 100) num_threads(par.threads)
                     for (size_t j = i; j < end; j++) {
-                        unsigned int thread = 0;
+                        unsigned int thread_idx = 0;
 #ifdef OPENMP
-                        thread = static_cast<unsigned int>(omp_get_thread_num());
+                        thread_idx = static_cast<unsigned int>(omp_get_thread_num());
 #endif
                         if (assigned[j - begin]) {
                             continue;
                         }
                         DBLocalId id = rangeHashIdPairs[j].id;
                         size_t seqLength = isCopyingSeqs ? length : reader.getSeqLen(id);
-                        const char *seq = (batchSeqs == NULL) ? reader.getData(id, thread) : batchSeqs + getMemberIndex(memberBits, id - splitFirstKey) * length;
+                        const char *seq = (batchSeqs == NULL) ? reader.getData(id, thread_idx) : batchSeqs + getMemberIndex(memberBits, id - splitFirstKey) * length;
                         size_t rep = findRepresentative(repSeqs, seq, seqLength, par.seqIdThr);
                         if (rep < repSeqs.size()) {
                             rangeHashIdPairs[j].hash = reps[rep];
@@ -761,7 +755,6 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
                     size_t endPair = std::lower_bound(splitPairs, splitPairs + splitPairCount, endRep, ClusterPair::compareByRep) - splitPairs;
                     while (pair < endPair) {
                         DBKeyType repKey = splitPairs[pair].repKey;
-                        // singletons only have their bit
                         if (pair + 1 == endPair || splitPairs[pair + 1].repKey != repKey) {
                             pair++;
                             continue;

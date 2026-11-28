@@ -8,7 +8,7 @@ notExists() {
    [ ! -f "$1" ]
 }
 
-# rm -f of many node files, printf is a shell builtin and does not hit ARG_MAX
+# printf is a builtin and does not hit ARG_MAX
 removeFiles() {
     printf '%s\0' "$@" | xargs -0 rm -f
 }

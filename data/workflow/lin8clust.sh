@@ -4,7 +4,7 @@ fail() {
     exit 1
 }
 
-# true if none of the files exists, pass later outputs too
+# true if none of the files exists
 notExists() {
     for FILE in "$@"; do
         [ -f "$FILE" ] && return 1
@@ -12,19 +12,17 @@ notExists() {
     return 0
 }
 
-# also check the refinement outputs with two iterations
 notExistsBeforeRefinement() {
     notExists "$@" || return 1
     [ "$LINCLUST_ITERATIONS" -ge 2 ] || return 0
     notExists "${TMP_PATH}/clu_merged.dbtype" "${TMP_PATH}/input_rep.dbtype" "${TMP_PATH}/pref_rep.dbtype" "${TMP_PATH}/clu_rep.dbtype"
 }
 
-# rm -f of many node files, printf is a shell builtin and does not hit ARG_MAX
+# printf is a builtin and does not hit ARG_MAX
 removeFiles() {
     printf '%s\0' "$@" | xargs -0 rm -f
 }
 
-# data and index files of a linfinity cluster DB, one per node
 removeClusterDb() {
     removeFiles "$1" "$1.dbtype" "$1.index" "$1.index."[0-9] "$1.index."[0-9][0-9] "$1.index."[0-9][0-9][0-9] "$1."[0-9] "$1."[0-9][0-9] "$1."[0-9][0-9][0-9]
 }
@@ -48,7 +46,7 @@ if [ -n "$CLUSTHASH" ] || [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
 else
     CLUDB="$2"
 fi
-# a finished step is skipped but keeps its number
+# skipped steps keep their number
 STEP=0
 STEPS=2
 if [ -n "$CLUSTHASH" ]; then
@@ -194,7 +192,6 @@ if [ "$LINCLUST_ITERATIONS" -ge 2 ]; then
     fi
 fi
 
-# wait for the background rmdb
 for PID in $PIDS; do
     wait "$PID"
 done

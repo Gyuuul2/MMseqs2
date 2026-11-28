@@ -35,7 +35,7 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     par.filenames.pop_back();
     par.filenames.push_back(tmpDir);
 
-    int dbType = FileUtil::parseDbType(par.db1.c_str());
+    const int dbType = FileUtil::parseDbType(par.db1.c_str());
     if ((DBReader<DBKeyType>::getExtendedDbtype(dbType) & Parameters::DBTYPE_EXTENDED_LINFINITY) == 0) {
         Debug(Debug::ERROR) << "lin8clust clusters linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ") only. "
                             << "Use createdb --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << " or easy-lin8clust.\n";
@@ -47,7 +47,7 @@ int lin8clust(int argc, const char **argv, const Command& command) {
         EXIT(EXIT_FAILURE);
     }
 
-    bool nonSymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
+    const bool nonSymetric = (par.covMode == Parameters::COV_MODE_TARGET || par.covMode == Parameters::COV_MODE_QUERY);
     if (par.PARAM_CLUSTER_MODE.wasSet == false) {
         if (nonSymetric) {
             par.clusteringMode = Parameters::GREEDY_MEM;

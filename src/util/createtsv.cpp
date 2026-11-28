@@ -98,7 +98,7 @@ static size_t writeMemberAccessions(MemberAccession *memberAccessions, size_t ac
     size_t ownBegin = nodeOffsets[MMseqsNode::rank];
     size_t ownEnd = (nodeOffsets[MMseqsNode::rank + 1] - ownBegin <= ownBytesLimit) ? nodeOffsets[MMseqsNode::rank + 1] : ownBegin;
 
-    // index lines per thread group, so receivers scan on all threads
+    // one index line per thread group
     int indexLines = std::max(1, threads / static_cast<int>(MMseqsNode::count));
     std::vector<char *> ownRecords(indexLines, NULL);
     std::vector<size_t> ownRecordBytes(indexLines, 0);

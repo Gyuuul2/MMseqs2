@@ -18,7 +18,6 @@ int result2flat(int argc, const char **argv, const Command &command) {
     Parameters &par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db1.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
-    // linfinity: every node writes <out>.<node>
     std::string nodeSuffix = isLinfinity ? "." + SSTR(MMseqsNode::rank) : "";
 
     DBReader<DBKeyType> querydb_header(par.hdr1.c_str(), isLinfinity ? (par.db1 + ".file_keys").c_str() : par.hdr1Index.c_str(), par.threads, DBReader<DBKeyType>::USE_INDEX|DBReader<DBKeyType>::USE_DATA|DBReader<DBKeyType>::USE_LINFINITY);
@@ -42,7 +41,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
     std::string fastaFile = par.db4 + nodeSuffix;
     FILE *fastaFP = isLinfinity ? FileUtil::openAndDelete(fastaFile.c_str(), "w") : fopen(fastaFile.c_str(), "w");
 
-    // linfinity: splits of the node file keys whose sequences and names fit
+    // splits of the node keys whose sequences and names fit
     std::vector<size_t> splitKeyOffsets;
     std::vector<size_t> cluKeyOffsets;
     Timer timer;
@@ -137,7 +136,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
                         buffer.append(headerStr);
                         buffer.push_back('\n');
 
-                        // linfinity: sequence with newline, without null byte
+                        // sequence with newline, without the null byte
                         if (isLinfinity) {
                             buffer.append(seqDbr.getData(key, thread_idx), seqDbr.getSeqLen(key) + 1);
                             continue;

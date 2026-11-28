@@ -744,7 +744,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     std::vector<FILE *> spoolHandles(1, exchangeHandle);
     if (nodeReason.empty()) {
         Debug(Debug::INFO) << "Keeping the read sequences in --local-tmp " << par.localTmp << " instead of the shared temporary folder\n";
-        // one spool per thread next to its input file, writes to one ext4 inode serialize
+        // one spool per thread, writes to one ext4 inode serialize
         FileUtil::checkRlimitNoFile(FileUtil::UNCOUNTED_OPEN_FILES + 2 * threadCnt);
         spoolFiles.assign(threadCnt, par.localTmp + "/" + FileUtil::baseName(dataFile) + "_sent_sequences." + SSTR(MMseqsNode::rank) + ".XXXXXX");
         spoolHandles.assign(threadCnt, NULL);
@@ -1027,7 +1027,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
     }
 
-    // a page needs one writer, so the node of db.<file> writes every page that is not inside the run of one other node
+    // one writer per page, the node of db.<file> writes the run edges of other nodes
     size_t pageSize = Util::getPageSize();
     std::vector<SequenceRun> sentRuns;
     std::vector<SequenceRun> edgeRuns;
@@ -1194,11 +1194,12 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
 
         // half for reader buffers, an eighth for writes
         size_t rowSize = sizeof(SentLengthRow) + (DATA_FILE_TYPE_COUNT + 1) * sizeof(std::pair<size_t, size_t>);
-        if (receivedRowCount * rowSize >= static_cast<size_t>(memoryLimit * 0.95)) {
-            Debug(Debug::ERROR) << "createdb needs more than " << receivedRowCount * rowSize << " bytes of memory for the " << receivedRowCount << " received length rows, but has " << static_cast<size_t>(memoryLimit * 0.95) << " bytes. Run on more nodes or with more memory\n";
+        size_t usableMemory = static_cast<size_t>(memoryLimit * 0.95);
+        if (receivedRowCount * rowSize >= usableMemory) {
+            Debug(Debug::ERROR) << "createdb needs more than " << receivedRowCount * rowSize << " bytes of memory for the " << receivedRowCount << " received length rows, but has " << usableMemory << " bytes. Run on more nodes or with more memory\n";
             EXIT(EXIT_FAILURE);
         }
-        size_t receiveMemory = static_cast<size_t>(memoryLimit * 0.95) - receivedRowCount * rowSize;
+        size_t receiveMemory = usableMemory - receivedRowCount * rowSize;
         size_t readerBufferSize = receiveMemory / 2;
         size_t writeBufferSize = receiveMemory / 8;
         size_t frameSize = 1024 * 1024;
@@ -1216,7 +1217,6 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             Util::checkAllocation(writeBuffer, "Can not allocate write buffer memory in createdb");
         }
 
-        // --compress-headers
         size_t maxCompressedSize = ZSTD_compressBound(frameSize);
         FILE *tmpHeaderFile = NULL;
         char *compressedFrames = NULL;
@@ -1322,7 +1322,6 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     compressSeconds += compressTimer.getTimediff();
                 } else {
                     SORT_SERIAL(compressionUnits.begin(), compressionUnits.end());
-                    // merge adjacent compression units
                     for (size_t i = 0; i < compressionUnits.size(); i++) {
                         if (writes.empty() == false && writes.back().first + writes.back().second == compressionUnits[i].first
                             && writes.back().second + compressionUnits[i].second <= threadWriteSize) {
@@ -1396,7 +1395,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the other nodes to send the sequences on shared pages", waitSeconds);
             FileUtil::removeSharedFile(exchangeFile);
 
-            // write the edges of the runs of other nodes, one read per node and chunk
+            // write the run edges of other nodes, one read per node and chunk
             size_t chunkSize = std::max(2 * pageSize, writeBufferSize / par.threads);
             std::vector<size_t> chunkOffsets(1, 0);
             std::vector<FILE *> edgeFiles(MMseqsNode::count, NULL);

@@ -18,9 +18,9 @@ int createsubdb(int argc, const char **argv, const Command& command) {
     Parameters& par = Parameters::getInstance();
     par.parseParameters(argc, argv, command, true, 0, 0);
 
-    // linfinity: entry keys become representative bits and seed member requests
     const bool isLinfinity = DBReader<DBKeyType>::getExtendedDbtype(FileUtil::parseDbType(par.db2.c_str())) & Parameters::DBTYPE_EXTENDED_LINFINITY;
     if (isLinfinity) {
+        // entry keys become representative bits and seed member requests
         DBReader<DBKeyType> reader(par.db2.c_str(), par.db2Index.c_str(), 1, DBReader<DBKeyType>::USE_INDEX | DBReader<DBKeyType>::USE_LINFINITY);
         reader.open(DBReader<DBKeyType>::NOSORT);
         std::vector<size_t> fileKeyOffsets = reader.getFileKeyOffsets(MMseqsNode::count);
@@ -78,7 +78,7 @@ int createsubdb(int argc, const char **argv, const Command& command) {
                                 members.push_back(key);
                             }
                         }
-                        // key order is length order, as in the standard kmermatcher
+                        // key order is length order
                         size_t memberCount = std::min(members.size(), membersPerCluster);
                         std::vector<DBKeyType>::iterator unranked = members.begin();
                         for (size_t m = 0; m < membersPerCluster; m++) {
