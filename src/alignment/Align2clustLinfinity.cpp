@@ -641,37 +641,6 @@ static std::string formatSeconds(double seconds) {
     return buffer;
 }
 
-// lock wait and hold times, kept under the mutex itself
-struct TimedMutex {
-    std::mutex mutex;
-    double waitSeconds = 0;
-    double holdSeconds = 0;
-    size_t lockCount = 0;
-    std::atomic<size_t> failedTryLockCount{0};
-    Timer holdTimer;
-
-    void lock() {
-        Timer waitTimer;
-        mutex.lock();
-        waitSeconds += waitTimer.getTimediff();
-        lockCount++;
-        holdTimer.reset();
-    }
-    bool try_lock() {
-        if (mutex.try_lock() == false) {
-            failedTryLockCount.fetch_add(1, std::memory_order_relaxed);
-            return false;
-        }
-        lockCount++;
-        holdTimer.reset();
-        return true;
-    }
-    void unlock() {
-        holdSeconds += holdTimer.getTimediff();
-        mutex.unlock();
-    }
-};
-
 static std::string formatRatio(size_t size, size_t total) {
     char buffer[32];
     snprintf(buffer, sizeof(buffer), "%.3f", static_cast<double>(size) / std::max<size_t>(1, total));
@@ -3131,8 +3100,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     std::vector<DBKeyType> prefilterTargets[3];
     size_t prefilterRecordPos[3] = { 0, 0, 0 };
     size_t prefilterBuffer = 0;
-    TimedMutex prefilterBufferMutex;
-    std::condition_variable_any prefilterBufferCondition;
+    std::mutex prefilterBufferMutex;
+    std::condition_variable prefilterBufferCondition;
     size_t filledPrefilterBufferCount = 0;
     size_t usedPrefilterBufferCount = 0;
     double prefilterWaitSeconds = 0;
@@ -3379,23 +3348,23 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         return (data != NULL && data[0] != '\0') ? data : NULL;
     };
 
-    TimedMutex serviceMutex;
-    std::condition_variable_any serviceCondition;
+    std::mutex serviceMutex;
+    std::condition_variable serviceCondition;
     // I/O threads sleep until it changes
     uint64_t ioWork = 0;
     std::atomic<double> alignedCellsPerSecond(0);
     // aligning seconds in flight: shortest of the last three round trips
     std::atomic<double> fetchAheadSeconds(MIN_FETCH_AHEAD_SECONDS);
     double roundTrips[3] = { 0, 0, 0 };
-    TimedMutex prefilterFillMutex;
+    std::mutex prefilterFillMutex;
     std::atomic<bool> isPrefilterDone(false);
     // waiting main thread gets the fill mutex but for read steps
     std::atomic<bool> isPrefilterWaited(false);
-    std::condition_variable_any prefilterReadCondition;
+    std::condition_variable prefilterReadCondition;
     // fill buffer n once n - 1 is in use, a waiting main thread finishes it
     // prefilter reader issues and waits for every pref read
     const auto fillNextPrefilterBuffer = [&](bool isWaiting, bool isPrefilterReader) {
-        std::unique_lock<TimedMutex> taskLock(prefilterFillMutex, std::defer_lock);
+        std::unique_lock<std::mutex> taskLock(prefilterFillMutex, std::defer_lock);
         if (isWaiting) {
             isPrefilterWaited = true;
             taskLock.lock();
@@ -3411,7 +3380,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         }
         size_t next;
         {
-            std::lock_guard<TimedMutex> lock(prefilterBufferMutex);
+            std::lock_guard<std::mutex> lock(prefilterBufferMutex);
             if (usedPrefilterBufferCount < filledPrefilterBufferCount) {
                 return false;
             }
@@ -3423,7 +3392,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             if (isPrefilterReader == false && prefilterReader.isReadStepNext()) {
                 isPrefilterWaited = true;
                 {
-                    std::lock_guard<TimedMutex> lock(serviceMutex);
+                    std::lock_guard<std::mutex> lock(serviceMutex);
                     ioWork++;
                 }
                 serviceCondition.notify_all();
@@ -3438,7 +3407,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         if (isFilled) {
             bool isLast = prefilterRecords[next % 3].empty();
             {
-                std::lock_guard<TimedMutex> lock(prefilterBufferMutex);
+                std::lock_guard<std::mutex> lock(prefilterBufferMutex);
                 filledPrefilterBufferCount = next + 1;
             }
             isPrefilterDone = isLast;
@@ -3448,7 +3417,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         taskLock.unlock();
         if (isHanded) {
             {
-                std::lock_guard<TimedMutex> lock(serviceMutex);
+                std::lock_guard<std::mutex> lock(serviceMutex);
                 ioWork++;
             }
             serviceCondition.notify_all();
@@ -3463,13 +3432,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             Timer waitTimer;
             // waiting thread finishes the next buffer with its idle team
             fillNextPrefilterBuffer(true, ioThreadCount == 0);
-            std::unique_lock<TimedMutex> lock(prefilterBufferMutex);
+            std::unique_lock<std::mutex> lock(prefilterBufferMutex);
             prefilterBufferCondition.wait(lock, [&]() { return filledPrefilterBufferCount > usedPrefilterBufferCount; });
             prefilterBuffer = usedPrefilterBufferCount++ % 3;
             lock.unlock();
             prefilterBufferCondition.notify_all();
             {
-                std::lock_guard<TimedMutex> serviceLock(serviceMutex);
+                std::lock_guard<std::mutex> serviceLock(serviceMutex);
                 ioWork++;
             }
             serviceCondition.notify_all();
@@ -3692,9 +3661,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     double batchReadSeconds = 0;
     double batchReadPeriod = MIN_READ_SECONDS;
 
-    TimedMutex acceptedMutex;
-    TimedMutex publishMutex;
-    TimedMutex assignedKeysMutex;
+    std::mutex acceptedMutex;
+    std::mutex publishMutex;
+    std::mutex assignedKeysMutex;
     std::vector<size_t> batchOffsets;
     std::vector<unsigned int> batchFirstTargets;
     std::vector<size_t> recordAlignmentCells;
@@ -3715,17 +3684,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     std::vector<MemberAligners *> threadMemberAligners(par.threads, NULL);
     double waitSeconds = 0;
     double sequenceWaitSeconds = 0;
-    // held by an I/O thread, owed by other nodes, other
-    double sequenceWaitParts[3] = { 0, 0, 0 };
-    int teamReceiveState = 2;
-    // [0] I/O threads, [1] aligning team
-    double receiveSeconds[2] = { 0, 0 };
-    size_t receiveCalls[2] = { 0, 0 };
-    double serveSeconds[2] = { 0, 0 };
-    size_t serveCalls[2] = { 0, 0 };
-    double servePackSeconds = 0;
-    double serveWriteSeconds = 0;
-    const std::thread::id alignThreadId = std::this_thread::get_id();
     double alignedCells = 0;
     double alignSeconds = 0;
     // wall time of the lookups, not thread time
@@ -3746,7 +3704,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     size_t maxAheadSize = std::max<size_t>(1, getStepWords(masterMemoryLimit) / nodes) * sizeof(uint64_t);
     bool isWaitingForMaster = false;
     // one load of seqDbr at a time
-    TimedMutex sourceMutex;
+    std::mutex sourceMutex;
     // shared by copies from cached blocks outside sourceMutex, exclusive by a load
     std::shared_timed_mutex cachedBlockMutex;
     std::vector<DBKeyType> loadKeys;
@@ -3786,7 +3744,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                 }
                 loadSize += entrySize;
             }
-            std::unique_lock<TimedMutex> sourceLock(sourceMutex);
+            std::unique_lock<std::mutex> sourceLock(sourceMutex);
             if (copyKeyBegin == SIZE_MAX) {
                 copyKeyBegins.push_back(keys[loadFirst]);
             } else {
@@ -3817,7 +3775,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                 // keys still to load ascend in each copy and fetch
                 size_t freeKeyEnd = *std::min_element(copyKeyBegins.begin(), copyKeyBegins.end());
                 {
-                    std::lock_guard<TimedMutex> lock(serviceMutex);
+                    std::lock_guard<std::mutex> lock(serviceMutex);
                     freeKeyEnd = std::min(freeKeyEnd, *std::min_element(fetchKeyBegins.begin(), fetchKeyBegins.end()));
                     for (size_t i = 0; i < ownKeyFetches.size(); i++) {
                         const FetchedSequences &queued = *ownKeyFetches[i];
@@ -3865,7 +3823,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             }
         }
         if (copyKeyBegin != SIZE_MAX) {
-            std::lock_guard<TimedMutex> sourceLock(sourceMutex);
+            std::lock_guard<std::mutex> sourceLock(sourceMutex);
             copyKeyBegins.erase(std::find(copyKeyBegins.begin(), copyKeyBegins.end(), copyKeyBegin));
         }
     };
@@ -3983,7 +3941,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         size_t doneRepKey = publishedDoneRepKey.load();
         std::string value = SSTR(std::min(doneRepKey, orderKeyEnd) * 100 / orderKeyEnd) + "% aligned (representative order key " + SSTR(doneRepKey) + " of " + SSTR(orderKeyEnd) + ")";
         {
-            std::lock_guard<TimedMutex> lock(serviceMutex);
+            std::lock_guard<std::mutex> lock(serviceMutex);
             value += ", waited " + formatSeconds(sequenceWaitSeconds) + " for sequences and " + formatSeconds(waitSeconds) + " for the master";
         }
         std::string status;
@@ -3998,8 +3956,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         std::atomic<size_t> next;
         size_t users;
     };
-    TimedMutex sharedLoopMutex;
-    std::condition_variable_any sharedLoopCondition;
+    std::mutex sharedLoopMutex;
+    std::condition_variable sharedLoopCondition;
     std::vector<SharedLoop *> sharedLoops;
     const auto runLoopChunks = [&](SharedLoop &loop) {
 #pragma omp parallel
@@ -4017,23 +3975,23 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         loop.next = 0;
         loop.users = 0;
         {
-            std::lock_guard<TimedMutex> lock(sharedLoopMutex);
+            std::lock_guard<std::mutex> lock(sharedLoopMutex);
             sharedLoops.push_back(&loop);
         }
         {
-            std::lock_guard<TimedMutex> lock(serviceMutex);
+            std::lock_guard<std::mutex> lock(serviceMutex);
             ioWork++;
         }
         serviceCondition.notify_all();
         runLoopChunks(loop);
-        std::unique_lock<TimedMutex> lock(sharedLoopMutex);
+        std::unique_lock<std::mutex> lock(sharedLoopMutex);
         sharedLoops.erase(std::find(sharedLoops.begin(), sharedLoops.end(), &loop));
         sharedLoopCondition.wait(lock, [&]() { return loop.users == 0; });
     };
     const auto joinSharedLoop = [&]() {
         SharedLoop *loop = NULL;
         {
-            std::lock_guard<TimedMutex> lock(sharedLoopMutex);
+            std::lock_guard<std::mutex> lock(sharedLoopMutex);
             for (size_t i = 0; i < sharedLoops.size() && loop == NULL; i++) {
                 if (sharedLoops[i]->next < sharedLoops[i]->count) {
                     loop = sharedLoops[i];
@@ -4046,31 +4004,26 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         }
         runLoopChunks(*loop);
         {
-            std::lock_guard<TimedMutex> lock(sharedLoopMutex);
+            std::lock_guard<std::mutex> lock(sharedLoopMutex);
             loop->users--;
         }
         sharedLoopCondition.notify_all();
         return true;
     };
 
-    TimedMutex receiveMutex;
-    TimedMutex serveMutex;
+    std::mutex receiveMutex;
+    std::mutex serveMutex;
     // pass over own requests and their served pieces
     const auto receiveSequences = [&]() {
-        bool isTeam = std::this_thread::get_id() == alignThreadId;
-        std::unique_lock<TimedMutex> taskLock(receiveMutex, std::try_to_lock);
+        std::unique_lock<std::mutex> taskLock(receiveMutex, std::try_to_lock);
         if (taskLock.owns_lock() == false) {
-            if (isTeam) {
-                teamReceiveState = 0;
-            }
             return false;
         }
-        Timer receiveTimer;
         bool hasWorked = false;
         // keep the bits of the served keys current
         time_t passTime = time(NULL);
         if (passTime - assignedKeysReadTime >= READ_SECONDS) {
-            std::unique_lock<TimedMutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
+            std::unique_lock<std::mutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
             if (assignedKeysLock.owns_lock()) {
                 readAssignedKeys(false);
                 assignedKeysReadTime = passTime;
@@ -4084,7 +4037,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             FetchedSequences *nextRequest = NULL;
             size_t nextAcceptedSize = 0;
             {
-                std::lock_guard<TimedMutex> lock(serviceMutex);
+                std::lock_guard<std::mutex> lock(serviceMutex);
                 if (handedOffFetches.empty() == false) {
                     nextRequest = handedOffFetches.front();
                     nextAcceptedSize = nextRequest->acceptedSize;
@@ -4097,7 +4050,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             // fetch without records and pending pairs logs nothing, never waits
             bool canWait = isLast == false && (nextRequest->end > nextRequest->begin || nextRequest->pendingPairCount > 0);
             {
-                std::lock_guard<TimedMutex> assignedKeysLock(assignedKeysMutex);
+                std::lock_guard<std::mutex> assignedKeysLock(assignedKeysMutex);
                 size_t repKey = std::min(nextRequest->firstPendingRepKey, getFirstRepKey(*nextRequest));
                 isGated = canWait && repKey > clusteredOrderKey && nextAcceptedSize >= clusteredAcceptedSize + maxAheadSize;
                 if (isGated && serviceTimer.getTimediff() >= nextGateRead) {
@@ -4107,7 +4060,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                 }
             }
             {
-                std::lock_guard<TimedMutex> lock(serviceMutex);
+                std::lock_guard<std::mutex> lock(serviceMutex);
                 isWaitingForMaster = isGated;
                 if (isGated == false) {
                     handedOffFetches.pop_front();
@@ -4307,7 +4260,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         // fetch goes to the aligners once its request is received
         while (requestedFetches.empty() == false && (ownRequests.empty() || ownRequests.front().sequences != requestedFetches.front())) {
             {
-                std::lock_guard<TimedMutex> lock(serviceMutex);
+                std::lock_guard<std::mutex> lock(serviceMutex);
                 requestedFetches.front()->isReady = true;
             }
             serviceCondition.notify_all();
@@ -4317,7 +4270,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
 
         bool isExchangeDone;
         {
-            std::lock_guard<TimedMutex> lock(serviceMutex);
+            std::lock_guard<std::mutex> lock(serviceMutex);
             isReceiveDone = isLastRequested && ownRequests.empty() && requestedFetches.empty();
             isImportUrgent = requestedFetches.empty() == false || isGated;
             isExchangeDone = isReceiveDone && isServeDone;
@@ -4334,22 +4287,15 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             waitWarning.check(requestedFetches.empty() == false ? served + " of other nodes" : (isGated ? assignedKeysLog : requests + " of other nodes"));
         }
         seenExportPassCount = exportPasses;
-        receiveSeconds[isTeam] += receiveTimer.getTimediff();
-        receiveCalls[isTeam]++;
-        if (isTeam) {
-            teamReceiveState = (hasWorked == false && ownRequests.empty() == false) ? 1 : 2;
-        }
         return hasWorked;
     };
 
     // pass over the requests of the other nodes
     const auto serveSequences = [&]() {
-        std::unique_lock<TimedMutex> taskLock(serveMutex, std::try_to_lock);
+        std::unique_lock<std::mutex> taskLock(serveMutex, std::try_to_lock);
         if (taskLock.owns_lock() == false) {
             return false;
         }
-        bool isTeam = std::this_thread::get_id() == alignThreadId;
-        Timer serveTimer;
         bool hasWorked = false;
         // read a requester's progress once a listing shows a new request
         if (isDirectoryListed && serviceTimer.getTimediff() >= nextRequestListing) {
@@ -4366,7 +4312,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         }
 
         // piece a pass for each requesting node
-        Timer packTimer;
         bool isServing = false;
         size_t passEntrySize = 0;
         size_t passKeyCount = 0;
@@ -4421,7 +4366,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                     requester.pieces.resize(keptPieces);
                     requester.isDone = isLast && received == count;
                     if (requester.isDone) {
-                        std::lock_guard<TimedMutex> lock(serviceMutex);
+                        std::lock_guard<std::mutex> lock(serviceMutex);
                         fetchKeyBegins[node] = SIZE_MAX;
                     }
                 }
@@ -4439,7 +4384,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                 size_t codeBegin = requester.openRequests[request + 2];
                 size_t codeEnd = requester.openRequests[request + 3];
                 if (codeBegin == codeEnd) {
-                    std::lock_guard<TimedMutex> lock(serviceMutex);
+                    std::lock_guard<std::mutex> lock(serviceMutex);
                     fetchKeyBegins[node] = SIZE_MAX;
                     requester.servedCount++;
                     continue;
@@ -4530,7 +4475,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                     servedFileData[pieceOffset + byte] = static_cast<char>(bits);
                 }
                 if (requester.piece == 0 && keyCount > 0) {
-                    std::lock_guard<TimedMutex> lock(serviceMutex);
+                    std::lock_guard<std::mutex> lock(serviceMutex);
                     fetchKeyBegins[node] = keys[0];
                 }
                 rawKeys.clear();
@@ -4574,9 +4519,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         }
         firstRequester = (deferredRequester == UINT_MAX) ? firstRequester : deferredRequester;
 
-        servePackSeconds += packTimer.getTimediff();
         if (passPieces.empty() == false) {
-            Timer writeTimer;
             // idle aligning team joins the chunk writes, header last once all are done
             std::string servedFile = getServedFile(rank, servedFileCount);
             FILE *file = FileUtil::openAndDelete(servedFile.c_str(), "w");
@@ -4595,7 +4538,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             servedFileData.clear();
             servedFileCount++;
             isServedProgressChanged = true;
-            serveWriteSeconds += writeTimer.getTimediff();
         }
 
         // pieces not yet deleted, per requester
@@ -4614,10 +4556,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         if (hasWorked) {
             exportPassCount++;
         }
-        serveSeconds[isTeam] += serveTimer.getTimediff();
-        serveCalls[isTeam]++;
         {
-            std::lock_guard<TimedMutex> lock(serviceMutex);
+            std::lock_guard<std::mutex> lock(serviceMutex);
             if (isServing || isServeDone) {
                 return hasWorked;
             }
@@ -4628,29 +4568,28 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         return hasWorked;
     };
 
-    TimedMutex ownKeyCopyMutex;
+    std::mutex ownKeyCopyMutex;
     // own keys not copied ahead, copied by the idle aligning team
     const auto copyOwnKeys = [&](FetchedSequences &sequences) {
         Timer copyTimer;
         {
-            std::lock_guard<TimedMutex> lock(serviceMutex);
+            std::lock_guard<std::mutex> lock(serviceMutex);
             ownKeyFetches.erase(std::remove(ownKeyFetches.begin(), ownKeyFetches.end(), &sequences), ownKeyFetches.end());
         }
         size_t ownKey;
         {
             // chunk copied ahead ends before the fetch aligns
-            std::lock_guard<TimedMutex> copyLock(ownKeyCopyMutex);
+            std::lock_guard<std::mutex> copyLock(ownKeyCopyMutex);
             ownKey = sequences.ownKeyCopyEnd;
         }
         size_t ownKeyEnd = sequences.fetchSourceKeyOffsets[rank + 1];
         copyEntries(sequences.keys.data() + ownKey, ownKeyEnd - ownKey, sequences.entryOffsets.data() + ownKey, sequences.entries, NULL, maxFetchSize);
         // aligning team waits for these sequences too
         sequenceWaitSeconds += copyTimer.getTimediff();
-        sequenceWaitParts[2] += copyTimer.getTimediff();
     };
     // copy own keys of the next block of the queued fetches
     const auto copyOwnKeysAhead = [&]() {
-        std::unique_lock<TimedMutex> taskLock(ownKeyCopyMutex, std::try_to_lock);
+        std::unique_lock<std::mutex> taskLock(ownKeyCopyMutex, std::try_to_lock);
         if (taskLock.owns_lock() == false) {
             return false;
         }
@@ -4658,7 +4597,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         size_t first = 0;
         size_t end = 0;
         {
-            std::lock_guard<TimedMutex> lock(serviceMutex);
+            std::lock_guard<std::mutex> lock(serviceMutex);
             while (ownKeyFetches.empty() == false && sequences == NULL) {
                 FetchedSequences &front = *ownKeyFetches.front();
                 size_t ownKeyEnd = front.fetchSourceKeyOffsets[rank + 1];
@@ -4681,14 +4620,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         return true;
     };
 
-    TimedMutex blockCopyMutex;
+    std::mutex blockCopyMutex;
     int blockCopyError = 0;
     double blockCopySeconds = 0;
     size_t cachedCopySize = 0;
-    TimedMutex clusterMutex;
+    std::mutex clusterMutex;
     // clustering step of a single node
     const auto clusterStep = [&]() {
-        std::unique_lock<TimedMutex> taskLock(clusterMutex, std::try_to_lock);
+        std::unique_lock<std::mutex> taskLock(clusterMutex, std::try_to_lock);
         return taskLock.owns_lock() && clustering != NULL && clustering->step() == AcceptedPairClustering::STEP_WORKED;
     };
     // work the waiting main thread needs, else work other nodes need
@@ -4699,7 +4638,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         for (unsigned int polls = 0;;) {
             uint64_t seenWork;
             {
-                std::lock_guard<TimedMutex> lock(serviceMutex);
+                std::lock_guard<std::mutex> lock(serviceMutex);
                 if (isAligningDone && isReceiveDone && isServeDone && isPrefilterDone && (memberExchange == NULL || (memberExchange->isServed() && memberExchange->isPreloaded()))
                     && (clustering == NULL || clustering->isDone)) {
                     return;
@@ -4717,7 +4656,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             hasWorked |= fillNextPrefilterBuffer(false, isPrefilterReader);
             // copy the next reserved block, used once complete, a write error ends the copies
             if (hasWorked == false) {
-                std::unique_lock<TimedMutex> copyLock(blockCopyMutex, std::try_to_lock);
+                std::unique_lock<std::mutex> copyLock(blockCopyMutex, std::try_to_lock);
                 if (copyLock.owns_lock() && copiedBlockCount != reservedBlockCount && blockCopyError == 0) {
                     Timer copyTimer;
                     size_t file = servedBlockCopy.blockFiles[copiedBlockCount];
@@ -4727,7 +4666,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                     // copy a cached block from memory, a waiting load waits for this copy at most
                     bool isCached = false;
                     {
-                        std::unique_lock<TimedMutex> sourceLock(sourceMutex, std::try_to_lock);
+                        std::unique_lock<std::mutex> sourceLock(sourceMutex, std::try_to_lock);
                         isCached = sourceLock.owns_lock() && seqDbr.copyCachedBlockData(servedBlockCopy.blocks[copiedBlockCount], begin, bytes, blockCopyBuffer.data());
                     }
                     int writeError = 0;
@@ -4739,7 +4678,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                     if (blockCopyError == 0) {
                         cachedCopySize += isCached ? bytes : 0;
                         // load plans and reads its blocks under sourceMutex
-                        std::lock_guard<TimedMutex> sourceLock(sourceMutex);
+                        std::lock_guard<std::mutex> sourceLock(sourceMutex);
                         seqDbr.setLocalBlock(servedBlockCopy.blocks[copiedBlockCount]);
                         copiedBlockCount++;
                     } else {
@@ -4754,7 +4693,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                 continue;
             }
             // sleep 10 ms doubling to 20 ms if others may wait, 160 ms if a fetch waits, else 1.28 s
-            std::unique_lock<TimedMutex> lock(serviceMutex);
+            std::unique_lock<std::mutex> lock(serviceMutex);
             unsigned int maxShift = (alignNodeCount > 1 || (memberExchange != NULL && memberExchange->isServed() == false)) ? 1 : (isImportUrgent ? 4 : 7);
             // idle clustering step is due again after its sleep
             unsigned int clusterSleep = (clustering != NULL && clustering->isDone == false) ? clustering->idleMicroseconds.load() : UINT_MAX;
@@ -4763,7 +4702,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     };
 
     const auto waitForSequences = [&](FetchedSequences &fetched, size_t doneRepOrderKey) {
-        std::unique_lock<TimedMutex> lock(serviceMutex);
+        std::unique_lock<std::mutex> lock(serviceMutex);
         if (fetched.isReady) {
             return;
         }
@@ -4779,17 +4718,14 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         // later fetch at the gate is no wait for the master
         bool waitsForMaster = isWaitingForMaster && handedOffFetches.empty() == false && handedOffFetches.front() == &fetched;
         for (unsigned int polls = 0; fetched.isReady == false;) {
-            Timer pollTimer;
             uint64_t seenWork = ioWork;
             lock.unlock();
-            teamReceiveState = 2;
             // run the work it waits for, else work others wait for
             bool hasWorked = runWaitTasks();
             lock.lock();
             if (hasWorked == false) {
                 serviceCondition.wait_for(lock, std::chrono::microseconds(10000u << std::min(polls++, 1u)), [&]() { return fetched.isReady || ioWork != seenWork; });
             }
-            sequenceWaitParts[teamReceiveState] += waitsForMaster ? 0 : pollTimer.getTimediff();
         }
         (waitsForMaster ? waitSeconds : sequenceWaitSeconds) += waitTimer.getTimediff();
     };
@@ -4819,7 +4755,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     }
     if (isAligningNode) {
         {
-            std::lock_guard<TimedMutex> lock(serviceMutex);
+            std::lock_guard<std::mutex> lock(serviceMutex);
             currentSequences.acceptedSize = acceptedSize;
             handedOffFetches.push_back(&currentSequences);
             ioWork++;
@@ -4836,31 +4772,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     double maxFetchAheadSeconds = 0;
     double fetchAheadSecondsSum = 0;
     size_t alignThreadCount = par.threads - ioThreadCount;
-    // [0] target alignments, [1] member checks; busy = each thread until the end of its share
-    double regionSeconds[2] = { 0, 0 };
-    double regionBusySeconds[2] = { 0, 0 };
-    double regionThreadSeconds[2] = { 0, 0 };
-    std::vector<double> threadBusySeconds(par.threads, 0);
-    int regionThreadCount = 1;
-    const auto addRegionTime = [&](size_t region, double seconds) {
-        regionSeconds[region] += seconds;
-        regionThreadSeconds[region] += regionThreadCount * seconds;
-        for (int thread = 0; thread < par.threads; thread++) {
-            regionBusySeconds[region] += threadBusySeconds[thread];
-            threadBusySeconds[thread] = 0;
-        }
-    };
-    double fetchPlanSeconds = 0;
-    double batchPlanSeconds = 0;
-    double memberCheckPlanSeconds = 0;
-    double checkedPairSeconds = 0;
-    double memberPlanSeconds = 0;
-    double publishSeconds = 0;
-    double ownKeyCopySeconds = 0;
-    double loopWaitSeconds = 0;
-    Timer loopTimer;
     while (currentSequences.isLast == false) {
-        Timer stepTimer;
         // fetch ahead within fetchAheadSeconds, memory and the current buffer
         for (;;) {
             bool isFirstAhead = fetchesInFlight.empty();
@@ -4900,7 +4812,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             }
             // next buffer must be filled, its next fill refills the one before current's
             if (isFirstAhead == false && prefilterRecordPos[prefilterBuffer] == prefilterRecords[prefilterBuffer].size() && prefilterRecords[prefilterBuffer].empty() == false) {
-                std::lock_guard<TimedMutex> lock(prefilterBufferMutex);
+                std::lock_guard<std::mutex> lock(prefilterBufferMutex);
                 if (filledPrefilterBufferCount <= usedPrefilterBufferCount || currentSequences.prefilterBufferNumber + 1 < usedPrefilterBufferCount) {
                     break;
                 }
@@ -4909,7 +4821,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             idleFetches.pop_back();
             selectRecordKeys(selected, currentSequences);
             {
-                std::lock_guard<TimedMutex> lock(serviceMutex);
+                std::lock_guard<std::mutex> lock(serviceMutex);
                 // reused slot holds the state of its last fetch
                 selected.isReady = false;
                 selected.acceptedSize = acceptedSize;
@@ -4925,7 +4837,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         maxFetchAheadSeconds = std::max(maxFetchAheadSeconds, fetchAheadSeconds.load());
         fetchAheadSecondsSum += fetchAheadSeconds.load();
         FetchedSequences &nextSequences = *fetchesInFlight.front();
-        fetchPlanSeconds += stepTimer.getTimediff();
         Timer alignTimer;
         size_t nextRepKey = getFirstRepKey(nextSequences);
         const std::vector<RepTargetsRecord> &records = prefilterRecords[currentSequences.prefilterBuffer];
@@ -4991,23 +4902,18 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         batchDone.assign(batchCount, 0);
         batchPairs.assign(batchCount, std::vector<ClusterPair>());
         size_t firstUnfinishedBatch = 0;
-        batchPlanSeconds += alignTimer.getTimediff();
-        Timer regionTimer;
 #pragma omp parallel
         {
             unsigned int thread_idx = 0;
 #ifdef OPENMP
             thread_idx = static_cast<unsigned int>(omp_get_thread_num());
-            if (thread_idx == 0) {
-                regionThreadCount = omp_get_num_threads();
-            }
 #endif
             alignmentThread = thread_idx;
             std::vector<ClusterPair> pairs;
-#pragma omp for schedule(dynamic, 1) nowait
+#pragma omp for schedule(dynamic, 1)
             for (size_t batch = 0; batch < batchCount; batch++) {
                 {
-                    std::unique_lock<TimedMutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
+                    std::unique_lock<std::mutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
                     if (assignedKeysLock.owns_lock() && assignedKeysTimer.getTimediff() - lastBatchReadTime >= batchReadPeriod) {
                         Timer readTimer;
                         readAssignedKeys(false);
@@ -5092,9 +4998,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                 bool needsKeyRead = false;
                 size_t doneRepOrderKey = 0;
                 size_t doneSize = 0;
-                std::unique_lock<TimedMutex> publishLock(publishMutex, std::defer_lock);
+                std::unique_lock<std::mutex> publishLock(publishMutex, std::defer_lock);
                 {
-                    std::lock_guard<TimedMutex> lock(acceptedMutex);
+                    std::lock_guard<std::mutex> lock(acceptedMutex);
                     batchPairs[batch].swap(pairs);
                     batchDone[batch] = 1;
                     if (memberDbr == NULL) {
@@ -5122,26 +5028,23 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                     publishLock.unlock();
                 }
                 if (needsKeyRead) {
-                    std::unique_lock<TimedMutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
+                    std::unique_lock<std::mutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
                     if (assignedKeysLock.owns_lock()) {
                         readAssignedKeys(true);
                         lastBatchReadTime = assignedKeysTimer.getTimediff();
                     }
                 }
             }
-            threadBusySeconds[thread_idx] = regionTimer.getTimediff();
             // aligners stay, their batch buffers go
             if (threadTargetAligners[thread_idx] != NULL) {
                 threadTargetAligners[thread_idx]->swipeTargets.release();
             }
         }
-        addRegionTime(0, regionTimer.getTimediff());
 
         if (memberDbr != NULL) {
-            stepTimer.reset();
             // pairs assigned by now skip their member checks
             {
-                std::unique_lock<TimedMutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
+                std::unique_lock<std::mutex> assignedKeysLock(assignedKeysMutex, std::try_to_lock);
                 if (assignedKeysLock.owns_lock()) {
                     readAssignedKeys(false);
                 }
@@ -5187,21 +5090,16 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                 }
             }
             size_t memberBatchCount = batchRepOffsets.size() - 1;
-            memberCheckPlanSeconds += stepTimer.getTimediff();
-            regionTimer.reset();
 #pragma omp parallel
             {
                 unsigned int thread_idx = 0;
 #ifdef OPENMP
                 thread_idx = static_cast<unsigned int>(omp_get_thread_num());
-                if (thread_idx == 0) {
-                    regionThreadCount = omp_get_num_threads();
-                }
 #endif
                 alignmentThread = thread_idx;
                 std::vector<size_t> repMemberCheckOffsets;
                 std::vector<DBKeyType> repKeys;
-#pragma omp for schedule(dynamic, 1) nowait
+#pragma omp for schedule(dynamic, 1)
                 for (size_t batch = 0; batch < memberBatchCount; batch++) {
                     if (threadMemberAligners[thread_idx] == NULL) {
                         threadMemberAligners[thread_idx] = new MemberAligners(par, scoring, maxMemberSeqLen, isSwipeEnabled);
@@ -5246,15 +5144,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                         }
                     }
                 }
-                threadBusySeconds[thread_idx] = regionTimer.getTimediff();
                 if (threadMemberAligners[thread_idx] != NULL) {
                     threadMemberAligners[thread_idx]->memberChecks.release();
                     threadMemberAligners[thread_idx]->swipeMembers.release();
                     threadMemberAligners[thread_idx]->memberTargets.release();
                 }
             }
-            addRegionTime(1, regionTimer.getTimediff());
-            stepTimer.reset();
             // pair passes with its last part if no part failed, parts span fetches
             size_t acceptedCount = 0;
             for (size_t i = 0; i < pairCount; i++) {
@@ -5284,7 +5179,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                 pendingMemberOffsets[i] -= checkedMembers;
             }
 
-            checkedPairSeconds += stepTimer.getTimediff();
             // accepted pairs wait for a later fetch behind earlier ones
             Timer memberLookupTimer;
             receiveMembers();
@@ -5498,8 +5392,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                 }
             }
             memberLookupSeconds += memberLookupTimer.getTimediff();
-            memberPlanSeconds += memberLookupTimer.getTimediff();
-            stepTimer.reset();
             if (publishThread.joinable()) {
                 publishThread.join();
             }
@@ -5507,10 +5399,9 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             publishedSize = acceptedSize;
             publishTime = startTimer.getTimediff();
             if (nextRepKey < orderKeyEnd) {
-                std::lock_guard<TimedMutex> assignedKeysLock(assignedKeysMutex);
+                std::lock_guard<std::mutex> assignedKeysLock(assignedKeysMutex);
                 readAssignedKeys(true);
             }
-            publishSeconds += stepTimer.getTimediff();
         }
         double fetchAlignSeconds = alignTimer.getTimediff();
         alignedCells += static_cast<double>(fetchAlignmentCells);
@@ -5526,17 +5417,12 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         alignedFetchCount++;
 
         // reps of pending pairs are not done
-        stepTimer.reset();
         copyOwnKeys(nextSequences);
-        ownKeyCopySeconds += stepTimer.getTimediff();
-        stepTimer.reset();
         waitForSequences(nextSequences, getFirstUndoneRepKey(nextRepKey));
-        loopWaitSeconds += stepTimer.getTimediff();
         std::swap(currentSequences, nextSequences);
         fetchesInFlight.pop_front();
         idleFetches.push_back(&nextSequences);
     }
-    double loopSeconds = loopTimer.getTimediff();
     for (int thread = 0; thread < par.threads; thread++) {
         delete threadTargetAligners[thread];
         delete threadMemberAligners[thread];
@@ -5556,11 +5442,11 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     size_t alignedCopiedBlockCount = 0;
     if (isAligningNode) {
         {
-            std::lock_guard<TimedMutex> sourceLock(sourceMutex);
+            std::lock_guard<std::mutex> sourceLock(sourceMutex);
             alignedCopiedBlockCount = copiedBlockCount;
         }
         {
-            std::lock_guard<TimedMutex> lock(serviceMutex);
+            std::lock_guard<std::mutex> lock(serviceMutex);
             isAligningDone = true;
             fetchKeyBegins[rank] = SIZE_MAX;
             ioWork++;
@@ -5569,7 +5455,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         runIoLoop(ioThreadCount == 0);
         // I/O threads may sleep before they see the end
         {
-            std::lock_guard<TimedMutex> lock(serviceMutex);
+            std::lock_guard<std::mutex> lock(serviceMutex);
             ioWork++;
         }
         serviceCondition.notify_all();
@@ -5636,46 +5522,10 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     if (isAligningNode) {
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the master", waitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences", sequenceWaitSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences while an I/O thread receives", sequenceWaitParts[0]);
-        MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences served by other nodes", sequenceWaitParts[1]);
-        MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences otherwise", sequenceWaitParts[2]);
-        MMseqsNode::addPhaseValue(phaseValues, "Receiving sequences", formatSeconds(receiveSeconds[0]) + " in " + SSTR(receiveCalls[0]) + " calls on I/O threads, "
-                                  + formatSeconds(receiveSeconds[1]) + " in " + SSTR(receiveCalls[1]) + " calls on the aligning team");
-        MMseqsNode::addPhaseValue(phaseValues, "Serving sequences", formatSeconds(serveSeconds[0]) + " in " + SSTR(serveCalls[0]) + " calls on I/O threads, "
-                                  + formatSeconds(serveSeconds[1]) + " in " + SSTR(serveCalls[1]) + " calls on the aligning team, "
-                                  + formatSeconds(servePackSeconds) + " packing, " + formatSeconds(serveWriteSeconds) + " writing");
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the candidate pairs", prefilterWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "computing alignments", alignSeconds);
         MMseqsNode::addPhaseValue(phaseValues, "Sequences fetched ahead", "at most " + formatSeconds(maxFetchAheadSeconds) + ", mean " + formatSeconds(fetchAheadSecondsSum / std::max<size_t>(1, alignedFetchCount)) + " of aligning");
         MMseqsNode::addPhaseSeconds(phaseValues, "fetching the first sequences", firstFetchSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "the aligning loop", loopSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "planning the fetches in the aligning loop", fetchPlanSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "planning the alignment batches", batchPlanSeconds);
-        const char *regionNames[2] = { "aligning the targets", "checking the cluster members" };
-        for (size_t region = 0; region < 2; region++) {
-            MMseqsNode::addPhaseSeconds(phaseValues, regionNames[region], regionSeconds[region]);
-            char idle[32];
-            snprintf(idle, sizeof(idle), "%.1f %%", 100.0 * (regionThreadSeconds[region] - regionBusySeconds[region]) / std::max(regionThreadSeconds[region], 1e-9));
-            MMseqsNode::addPhaseValue(phaseValues, std::string("Threads ") + regionNames[region], formatSeconds(regionBusySeconds[region]) + " busy of " + formatSeconds(regionThreadSeconds[region])
-                                      + " thread time, " + idle + " idle");
-        }
-        MMseqsNode::addPhaseSeconds(phaseValues, "planning the member checks", memberCheckPlanSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "logging the checked pairs", checkedPairSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "planning the members of the accepted pairs", memberPlanSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "publishing and reading the assigned keys after the member checks", publishSeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "copying the own keys in the aligning loop", ownKeyCopySeconds);
-        MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences in the aligning loop with its publish", loopWaitSeconds);
-        const std::pair<const char *, TimedMutex *> mutexes[] = { { "serviceMutex", &serviceMutex }, { "sourceMutex", &sourceMutex }, { "sharedLoopMutex", &sharedLoopMutex },
-                                                                { "receiveMutex", &receiveMutex }, { "serveMutex", &serveMutex }, { "acceptedMutex", &acceptedMutex },
-                                                                { "publishMutex", &publishMutex }, { "assignedKeysMutex", &assignedKeysMutex }, { "clusterMutex", &clusterMutex },
-                                                                { "ownKeyCopyMutex", &ownKeyCopyMutex }, { "blockCopyMutex", &blockCopyMutex },
-                                                                { "prefilterBufferMutex", &prefilterBufferMutex }, { "prefilterFillMutex", &prefilterFillMutex } };
-        for (size_t i = 0; i < sizeof(mutexes) / sizeof(mutexes[0]); i++) {
-            TimedMutex &m = *mutexes[i].second;
-            char times[128];
-            snprintf(times, sizeof(times), "%.3f s waiting in lock, %.3f s held, %zu locks, %zu failed try_lock", m.waitSeconds, m.holdSeconds, m.lockCount, m.failedTryLockCount.load());
-            MMseqsNode::addPhaseValue(phaseValues, std::string("Lock ") + mutexes[i].first, times);
-        }
     }
     MMseqsNode::addPhaseValue(phaseValues, "Accepted pairs published", SSTR(publishCount) + " times, " + SSTR(static_cast<size_t>(1e6 * publishCostSeconds / std::max<size_t>(1, publishCount))) + " us each on average with the log flush");
     if (memberLookup != NULL) {
