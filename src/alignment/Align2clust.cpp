@@ -114,10 +114,10 @@ static void printCrash(int sig) {
     char *p = Itoa::i32toa_sse2(sig, appendText(line, "align2clust: signal ")) - 1;
     p = Itoa::u32toa_sse2(MMseqsNode::rank, appendText(p, " (node ")) - 1;
     if (trace.stage == AlignmentTrace::NOT_ALIGNING) {
-        p = appendText(p, ") not aligning");
+        p = appendText(p, "), no alignment on this thread yet");
     } else {
         p = Itoa::i32toa_sse2(alignmentThread, appendText(p, ", thread ")) - 1;
-        p = Itoa::u64toa_sse2(trace.repKey, appendText(p, ") aligning rep key ")) - 1;
+        p = Itoa::u64toa_sse2(trace.repKey, appendText(p, "), last alignment of this thread: rep key ")) - 1;
         p = Itoa::i32toa_sse2(trace.repLength, appendText(p, " (length ")) - 1;
         p = Itoa::u64toa_sse2(trace.targetKey, appendText(p, ") with target key ")) - 1;
         p = Itoa::i32toa_sse2(trace.targetLength, appendText(p, " (length ")) - 1;
