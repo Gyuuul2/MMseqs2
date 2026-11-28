@@ -225,6 +225,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
         MMseqsNode::addPhaseSeconds(phaseValues, "formatting sequences", formatSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "writing sequences", writeSeconds + closeSeconds);
         MMseqsNode::printPhaseValues(phaseValues);
+        MMseqsNode::writeNodeLog(par.db3 + "_fasta");
         seqDbr.close();
     } else {
         targetdb_header.close();

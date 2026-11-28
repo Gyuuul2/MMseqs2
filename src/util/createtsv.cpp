@@ -391,6 +391,7 @@ int createtsv(int argc, const char **argv, const Command &command) {
         exchanges.push_back(sortedByMember);
         exchanges.push_back(sortedByRep);
         MMseqsNode::removeExchanges(sortedByRep, sortedByRep, exchanges, phaseValues);
+        MMseqsNode::writeNodeLog(par.db3 + "_tsv");
         return EXIT_SUCCESS;
     }
 

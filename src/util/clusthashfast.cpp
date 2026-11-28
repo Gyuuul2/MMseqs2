@@ -805,6 +805,7 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
             MMseqsNode::addPhaseTime(phaseValues, "waiting for the other nodes to write their lists of representatives", timer);
         }
         MMseqsNode::printPhaseValues(phaseValues);
+        MMseqsNode::writeNodeLog(par.db2);
     } else {
         // unsorted only if a length was split into hash ranges
         resultWriter.close(false, needsSort);

@@ -290,7 +290,8 @@ public:
     // returns the end of the keys read so far
     size_t waitForLoadedData();
     size_t getPrefetchBufferSize(size_t keyBegin, size_t keyEnd);
-    void loadData(const std::vector<DBKeyType> &keys);
+    // blocks below freeKeyEnd and the first key may be freed, local blocks over their room below the first key too
+    void loadData(const std::vector<DBKeyType> &keys, size_t freeKeyEnd = SIZE_MAX);
     void setBlockCacheSize(size_t cacheSize);
     size_t getKeyBlock(size_t key) const;
     const std::vector<size_t> &getBlockKeyOffsets() const { return blockKeyOffsets; }
@@ -311,6 +312,7 @@ public:
     int writeLoadedData(const std::vector<int> &fds);
     // false unless the cache holds [offset, offset + size)
     bool copyCachedBlockData(size_t block, size_t offset, size_t size, char *data) const;
+    bool isCachedBlock(size_t block) const { return cachedBlocks.find(block) != cachedBlocks.end(); }
 
     // linfinity headers
     size_t getNamesSize(size_t keyBegin, size_t keyEnd);
@@ -605,7 +607,7 @@ private:
                             std::vector<size_t> &entryOffsets, std::vector<size_t> &keys,
                             std::vector<BatchReader::ReadRequest> &compressedReadRequests, std::vector<size_t> &requestFirstKeys);
     size_t planKeyReadRequests(const std::vector<DBKeyType> &keys, std::vector<BatchReader::ReadRequest> &readRequests, std::vector<size_t> &requestFirstKeys);
-    void loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
+    void loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys, size_t freeKeyEnd = SIZE_MAX);
     void decompressLoadedBuffer();
     // offset of a key in its data file
     size_t getKeyOffset(size_t range, size_t key);
@@ -702,7 +704,7 @@ private:
 
     // block cache
     void cacheBlocks(EntryReadBuffer &buffer);
-    void freeBlocks(size_t keyEnd, size_t neededSize, bool isLocal = false);
+    void freeBlocks(size_t keyEnd, size_t neededSize, bool isLocal = false, size_t loadKey = 0);
     std::vector<size_t> blockKeyOffsets;
     std::map<size_t, BatchReader::ReadRequest> cachedBlocks;
     size_t blockCacheSize;
@@ -717,7 +719,7 @@ private:
     size_t localBlockReadSize;
     size_t localKeyReadSize;
     std::vector<int> localCopyFds;
-    bool prepareBufferToLoad(EntryReadBuffer &bufferToLoadInto, size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys);
+    bool prepareBufferToLoad(EntryReadBuffer &bufferToLoadInto, size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys, size_t freeKeyEnd = SIZE_MAX);
 
     bool dataMapped;
     int accessType;

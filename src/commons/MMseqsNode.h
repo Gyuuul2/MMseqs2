@@ -2,6 +2,7 @@
 #define MMSEQS_NODE_H
 
 #include "IndexTypes.h"
+#include "Debug.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -108,6 +109,8 @@ public:
     static FILE *createExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber);
     static void writeExchangeFile(const std::string &fileName, uint64_t exchangeFileNumber, const char *data, size_t size, const std::string &indexFile,
                                   const std::vector<uint64_t> &line, int threads);
+    static void finishExchangeFile(FILE *file, const std::string &fileName, uint64_t exchangeFileNumber, size_t size, const std::string &indexFile,
+                                   const std::vector<uint64_t> &line);
     static int tryOpenExchangeFile(const std::string &file, size_t expectedSize, uint64_t expectedNumber,
                                    size_t &observedSize, uint64_t &observedNumber, int &lastError, int openFlags = 0);
     static int waitForExchangeFile(const std::string &file, size_t size, uint64_t exchangeFileNumber);
@@ -118,9 +121,12 @@ public:
     static void addPhaseValue(std::string &content, const std::string &name, const std::string &value);
     static void addPhaseTime(std::string &content, const std::string &phase, Timer &timer);
     static void addPhaseSeconds(std::string &content, const std::string &phase, double seconds);
+    // kept for writeNodeLog
     static void printPhaseValues(const std::string &values);
-    // time left at every tenth of total, on all nodes
-    static void printProgress(const std::string &name, size_t before, size_t after, size_t total, Timer &timer);
+    // the master writes the kept values of all nodes to <file>.nodes.log
+    static void writeNodeLog(const std::string &file);
+    // one step of a Debug::Progress(100) per percent of total
+    static void printProgress(Debug::Progress &progress, size_t before, size_t after, size_t total);
     // one decimal like df -h: 512B, 68.3M, 1.9T
     static std::string formatBytes(size_t bytes);
 
@@ -129,13 +135,15 @@ public:
         WorkQueue(const std::string &name, size_t itemCount);
         size_t takeNextItem();
         void removeTakenItemFiles();
+        size_t getItemCount(size_t node) const;
 
     private:
         bool takeItem(size_t item);
+        size_t getItem(size_t node, size_t round) const;
 
         const std::string name;
         const size_t itemCount;
-        size_t nextItem;
+        size_t nextRound;
         std::vector<size_t> itemsLeft;
         size_t nextNode;
     };

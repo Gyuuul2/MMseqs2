@@ -1503,7 +1503,7 @@ static std::string sendFingerprints(Parameters &par, DBReader<DBKeyType> &seqDbr
     std::vector<size_t> rowBits(pref.hashRangeCount);
     pref.sendSplitKeySplitOffsets.assign(1, 0);
     std::vector<KeySplit> ownKeySplits;
-    Timer timer;
+    Debug::Progress progress(100);
     size_t ownSendSplits = (exchange.sendSplitCount + MMseqsNode::count - 1 - MMseqsNode::rank) / MMseqsNode::count;
     for (size_t sendSplit = sendQueue.takeNextItem(); sendSplit < exchange.sendSplitCount; sendSplit = sendQueue.takeNextItem()) {
         setSendSplit(par, exchange, sendSplit);
@@ -1562,8 +1562,10 @@ static std::string sendFingerprints(Parameters &par, DBReader<DBKeyType> &seqDbr
             });
         }
         pref.sendSplitKeySplitOffsets.push_back(ownKeySplits.size());
-        MMseqsNode::printProgress("Sending k-mer hashes", pref.sendSplits.size() - 1, pref.sendSplits.size(), ownSendSplits, timer);
+        MMseqsNode::printProgress(progress, pref.sendSplits.size() - 1, pref.sendSplits.size(), ownSendSplits);
     }
+    // other nodes may have taken some of the own send splits
+    MMseqsNode::printProgress(progress, pref.sendSplits.size(), ownSendSplits, ownSendSplits);
     seqDbr.releaseDataPages();
     batchWriter.waitWrites();
     return publishPrefExchangeWriters(pref, writers, sentSize) + keySplitLines;
@@ -2071,7 +2073,7 @@ static void storeNeededGroups(const Parameters &par, const KmerExchange &exchang
 template <typename T, bool includeAdjacency, typename L>
 static std::string sendCandidates(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, KeySplitPref &pref,
                                   const std::vector<std::vector<PrefExchangeFile> > &markGroups, size_t &sentSize) {
-    Timer timer;
+    Debug::Progress progress(100);
     std::vector<PrefExchangeWriter> writers = createPrefExchangeWriters(par.db2 + ".candidates", pref.hashRangeGroups);
     BatchWriter batchWriter(exchange.writeBehindSize, par.threads, fileno(writers[0].file));
     AnswerGroupParts markParts(par.db2 + ".marks", MARK_FILES, markGroups);
@@ -2128,7 +2130,7 @@ static std::string sendCandidates(Parameters &par, DBReader<DBKeyType> &seqDbr, 
                 delete[] pref.keptKeySplits[ownKeySplit].kmers;
                 pref.keptKeySplits[ownKeySplit].kmers = NULL;
             }
-            MMseqsNode::printProgress("Sending shared k-mers", ownKeySplit, ownKeySplit + 1, pref.neededGroups.size(), timer);
+            MMseqsNode::printProgress(progress, ownKeySplit, ownKeySplit + 1, pref.neededGroups.size());
         }
     }
     pref.keptSize = 0;
@@ -2390,7 +2392,7 @@ static bool reserveMarkedFingerprints(KeySplitPref &pref, size_t bound, size_t m
 static std::string answerHashRanges(const Parameters &par, const KmerExchange &exchange, KeySplitPref &pref, size_t sentKind, const std::string &sentPrefix,
                                     const std::vector<std::vector<PrefExchangeFile> > &sentGroups, const std::string &answerPrefix, bool isPickingReps, size_t &receivedSize,
                                     size_t &passCount) {
-    Timer timer;
+    Debug::Progress progress(100);
     size_t memoryLimit = exchange.keySplitMemoryLimit - std::min(exchange.keySplitMemoryLimit, getHeldMemory(pref));
     size_t firstHashRange = pref.hashRangeNodeOffsets[MMseqsNode::rank];
     size_t ownHashRanges = pref.hashRangeNodeOffsets[MMseqsNode::rank + 1] - firstHashRange;
@@ -2518,7 +2520,6 @@ static std::string answerHashRanges(const Parameters &par, const KmerExchange &e
     if (isPickingReps == false && markedMemoryLimit == 0 && pref.localExchange.nodes != 1) {
         marked.isKeeping = false;
     }
-    const std::string progressName = isPickingReps ? "Picking representatives" : "Marking shared k-mer hashes";
     passCount = passOffsets.size() - 1;
     size_t answeredHashRanges = 0;
     for (size_t pass = 0; pass + 1 < passOffsets.size(); pass++) {
@@ -2685,7 +2686,7 @@ static std::string answerHashRanges(const Parameters &par, const KmerExchange &e
                     markedSizes[slot] = markedWriter.bufferPos;
                 }
                 size_t answered = __sync_add_and_fetch(&answeredHashRanges, 1);
-                MMseqsNode::printProgress(progressName, answered - 1, answered, ownHashRanges, timer);
+                MMseqsNode::printProgress(progress, answered - 1, answered, ownHashRanges);
             }
             if (isKeepingMarked) {
                 size_t blockStart = marked.rowOffsets.back();
@@ -2921,7 +2922,7 @@ template <typename T, bool includeAdjacency, typename L>
 static std::string writeKeySplitPrefs(Parameters &par, DBReader<DBKeyType> &seqDbr, BaseMatrix *subMat, const KmerExchange &exchange, KeySplitPref &pref,
                                   const std::vector<std::vector<PrefExchangeFile> > &markGroups, const std::vector<std::vector<PrefExchangeFile> > &repGroups,
                                   size_t &prefSize, size_t &pairCount, size_t &sortedPairCount, size_t &repSplitCount) {
-    Timer timer;
+    Debug::Progress progress(100);
     PrefExchangeWriter countWriter(getPrefExchangeName(par.db2 + ".piece_counts", MMseqsNode::rank, 0));
     AnswerGroupParts repParts(par.db2 + ".reps", REP_FILES, repGroups);
     countKeySplitAnswers(par, pref, repParts);
@@ -3353,7 +3354,7 @@ static std::string writeKeySplitPrefs(Parameters &par, DBReader<DBKeyType> &seqD
         pendingIndexName = par.db2 + ".index." + SSTR(pref.keySplitFiles[keySplitIndex]);
         pendingDataSize = dataSize;
         pendingIndexData.swap(indexData);
-        MMseqsNode::printProgress("Writing candidate pairs", order, order + 1, keySplitOrder.size(), timer);
+        MMseqsNode::printProgress(progress, order, order + 1, keySplitOrder.size());
     }
     closePendingPrefFile();
     delete[] repAnswers;
@@ -3366,7 +3367,7 @@ static std::string writeKeySplitPrefs(Parameters &par, DBReader<DBKeyType> &seqD
 }
 
 static std::string writeSizeClasses(const Parameters &par, const KmerExchange &exchange, KeySplitPref &pref, const std::vector<PrefExchangeFile> &countFiles, size_t &classSize) {
-    Timer timer;
+    Debug::Progress progress(100);
     std::string prefix = par.db2 + ".piece_counts";
     size_t firstPartition = pref.partitionNodeOffsets[MMseqsNode::rank];
     size_t ownPartitions = pref.partitionNodeOffsets[MMseqsNode::rank + 1] - firstPartition;
@@ -3511,7 +3512,7 @@ static std::string writeSizeClasses(const Parameters &par, const KmerExchange &e
             rows += SSTR(pref.partitionFirstKeys[firstPartition + passFirst + partition]) + "\t" + SSTR(firstPartition + passFirst + partition) + "\t" + SSTR(partitionPrefSizes[partition]) + "\t" + SSTR(partitionCosts[partition])
                     + "\t" + SSTR(MMseqsNode::rank) + "\n";
         }
-        MMseqsNode::printProgress("Counting the candidate pairs of each representative", passFirst, passEnd, ownPartitions, timer);
+        MMseqsNode::printProgress(progress, passFirst, passEnd, ownPartitions);
     }
     batchWriter.waitWrites();
     classSize = 0;
@@ -3890,6 +3891,7 @@ static void kmermatcherKeySplitPref(Parameters &par, DBReader<DBKeyType> &seqDbr
 // read the requests for the members in the own data file, write their sequences in rep order
 static void serveSeedMembers(const Parameters &par, DBReader<DBKeyType> &seqDbr, const KmerExchange &exchange, std::string &values) {
     Timer timer;
+    Debug::Progress progress(100);
     std::vector<int> requestFds(MMseqsNode::count);
     std::vector<size_t> flushCounts(MMseqsNode::count);
     std::vector<std::vector<size_t> > columns(MMseqsNode::count);
@@ -3996,7 +3998,7 @@ static void serveSeedMembers(const Parameters &par, DBReader<DBKeyType> &seqDbr,
                     memcpy(data + requests[i].repKey, seqData, seqDbr.getSeqLenFromRange(cursor.range, requests[i].memberKey));
                 }
             }
-            MMseqsNode::printProgress("Sending cluster members", batchBegin, batchEnd, requestCount, timer);
+            MMseqsNode::printProgress(progress, batchBegin, batchEnd, requestCount);
         }
         if (fwrite(data, 1, dataSize, served) != dataSize || fwrite(pairs.data(), sizeof(uint64_t), pairs.size(), served) != pairs.size()) {
             Debug(Debug::ERROR) << "Cannot write " << servedFile << "\n";

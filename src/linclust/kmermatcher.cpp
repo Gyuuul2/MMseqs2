@@ -2242,6 +2242,7 @@ int kmermatcherInner(Parameters& par, DBReader<DBKeyType>& seqDbr) {
                                         par.kmersPerSequenceScale.values.nucleotide() : par.kmersPerSequenceScale.values.aminoacid();
     if (isLinfinity) {
         kmermatcherLinfinity<T, includeAdjacency, L>(par, seqDbr, subMat, memoryLimit);
+        MMseqsNode::writeNodeLog(par.db2);
     } else {
         size_t totalKmers = computeKmerCount(seqDbr, par.kmerSize, par.kmersPerSequence, kmersPerSequenceScale);
         for (size_t i = 0; i < seedMembers.size(); i++) {

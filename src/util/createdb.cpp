@@ -760,6 +760,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     size_t readBytes = 0;
     size_t memoryLimit = Util::computeMemory(par.splitMemoryLimit);
     size_t entryBufferBytes = static_cast<size_t>(memoryLimit * 0.95) / (2 * threadCnt);
+    Debug::Progress progress(100);
 #pragma omp parallel num_threads(threadCnt) reduction(+:emptySequenceCount)
     {
         char *buffer = new(std::nothrow) char[entryBufferBytes];
@@ -823,7 +824,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             size_t readEnd;
 #pragma omp atomic capture
             readEnd = readBytes += splitBytes;
-            MMseqsNode::printProgress("Input read", readEnd - splitBytes, readEnd, inputBytes, timer);
+            MMseqsNode::printProgress(progress, readEnd - splitBytes, readEnd, inputBytes);
         }
         Util::releasePages(buffer, entryBufferBytes);
         Util::releasePages(sortedBuffer, entryBufferBytes);
@@ -1235,6 +1236,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
             outputBytes += (isSpooled && fileType == SEQUENCE_DATA) ? sentSequenceSize : dataFileBytes[fileType * MMseqsNode::count + MMseqsNode::rank];
         }
         size_t writtenBytes = 0;
+        Debug::Progress writeProgress(100);
         for (size_t fileType = 0; fileType < DATA_FILE_TYPE_COUNT; fileType++) {
             size_t fileTypeBegin = writtenBytes;
             size_t fileTypeBytes = (isSpooled && fileType == SEQUENCE_DATA) ? sentSequenceSize : dataFileBytes[fileType * MMseqsNode::count + MMseqsNode::rank];
@@ -1345,7 +1347,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
                     writeBufferBegin = nextOffset;
                 }
                 size_t writtenEnd = fileTypeBegin + std::min(writeBufferBegin, fileTypeBytes);
-                MMseqsNode::printProgress("Database writes", writtenBytes, writtenEnd, outputBytes, timer);
+                MMseqsNode::printProgress(writeProgress, writtenBytes, writtenEnd, outputBytes);
                 writtenBytes = writtenEnd;
             }
         }
@@ -1448,6 +1450,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         exchanges.push_back(edges);
     }
     MMseqsNode::removeExchanges(dataFile, exchanges.back(), exchanges, phaseValues);
+    MMseqsNode::writeNodeLog(dataFile);
 
     if (MMseqsNode::isMaster()) {
         FileUtil::removeSharedFile(dataFile + ".local_tmp");

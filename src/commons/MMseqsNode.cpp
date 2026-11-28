@@ -15,8 +15,8 @@
 #include <cstring>
 #include <algorithm>
 #include <cstdlib>
-#include <iostream>
 #include <map>
+#include <mutex>
 #include <dirent.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -34,6 +34,8 @@ static bool isRunIdMissing = false;
 static size_t sentExchangeSize = 0;
 static size_t sentOtherNodeExchangeSize = 0;
 static std::map<std::string, std::vector<std::pair<char *, size_t> > > ownExchangeRecords;
+static std::string nodeLog;
+static std::mutex nodeLogMutex;
 static const unsigned int MAX_READ_POLLS = 400;
 
 void MMseqsNode::init() {
@@ -65,6 +67,11 @@ void MMseqsNode::init() {
     if (count == 0 || rank >= count) {
         Debug(Debug::ERROR) << "Invalid node rank " << rank << " for " << count << " nodes\n";
         EXIT(EXIT_FAILURE);
+    }
+    if (isMaster() == false) {
+        Parameters &par = Parameters::getInstance();
+        par.verbosity = Debug::ERROR;
+        Debug::setDebugLevel(Debug::ERROR);
     }
 }
 
@@ -464,6 +471,11 @@ void MMseqsNode::writeExchangeFile(const std::string &fileName, uint64_t exchang
     for (size_t offset = 0; offset < size; offset += BatchReader::MAX_READ_REQUEST_SIZE) {
         FileUtil::pwriteAll(fileno(file), fileName.c_str(), data + offset, std::min(BatchReader::MAX_READ_REQUEST_SIZE, size - offset), EXCHANGE_FILE_HEADER_BYTES + offset);
     }
+    finishExchangeFile(file, fileName, exchangeFileNumber, size, indexFile, line);
+}
+
+void MMseqsNode::finishExchangeFile(FILE *file, const std::string &fileName, uint64_t exchangeFileNumber, size_t size, const std::string &indexFile,
+                                    const std::vector<uint64_t> &line) {
     // header last, a reader that sees it finds no hole
     ExchangeFileHeader header = { getExchangeFileMagic(), exchangeFileNumber };
     FileUtil::pwriteAll(fileno(file), fileName.c_str(), (const char *) &header, sizeof(header), 0);
@@ -556,30 +568,33 @@ void MMseqsNode::addPhaseSeconds(std::string &content, const std::string &phase,
 }
 
 void MMseqsNode::printPhaseValues(const std::string &values) {
-    if (Parameters::getInstance().verbosity < Debug::INFO) {
-        return;
-    }
-    std::string prefix = (count > 1) ? "[node " + SSTR(rank) + "] " : "";
-    std::string output;
+    std::string lines;
     for (char *line = (char *) values.c_str(); *line != '\0'; line = Util::skipLine(line)) {
         const char *columns[3];
         Util::getFieldsOfLine(line, columns, 3);
-        output += prefix;
-        output.append(columns[0], columns[1] - 1);
-        output += ": ";
-        output.append(columns[2], strchr(columns[2], '\n'));
-        output += '\n';
+        lines += "node " + SSTR(rank) + "\t";
+        lines.append(columns[0], columns[1] - 1);
+        lines += ": ";
+        lines.append(columns[2], strchr(columns[2], '\n'));
+        lines += '\n';
     }
-    std::cout << output;
+    std::lock_guard<std::mutex> lock(nodeLogMutex);
+    nodeLog += lines;
 }
 
-void MMseqsNode::printProgress(const std::string &name, size_t before, size_t after, size_t total, Timer &timer) {
-    if (total > 0 && after <= total && after * 10 / total > before * 10 / total) {
-        double seconds = timer.getTimediff();
-        std::string progress;
-        addPhaseValue(progress, name, SSTR(after * 100 / total) + "% after " + SSTR(static_cast<size_t>(seconds)) + " s"
-                                      + ((after < total) ? ", about " + SSTR(static_cast<size_t>(seconds * (total - after) / after)) + " s left" : ""));
-        printPhaseValues(progress);
+void MMseqsNode::writeNodeLog(const std::string &file) {
+    publishRunFile(file + ".nodes.log." + SSTR(rank), nodeLog);
+    nodeLog.clear();
+    if (isMaster()) {
+        FileUtil::publishFile(file + ".nodes.log", gatherRunFiles(file + ".nodes.log."));
+    }
+}
+
+void MMseqsNode::printProgress(Debug::Progress &progress, size_t before, size_t after, size_t total) {
+    size_t from = std::min(before, total) * 100 / std::max(total, (size_t) 1);
+    size_t to = std::min(after, total) * 100 / std::max(total, (size_t) 1);
+    for (size_t step = from; step < to; step++) {
+        progress.updateProgress();
     }
 }
 
@@ -599,12 +614,21 @@ std::string MMseqsNode::formatBytes(size_t bytes) {
     return buffer;
 }
 
-MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextItem(rank), itemsLeft(count, 0), nextNode((rank + 1) % count) {
+MMseqsNode::WorkQueue::WorkQueue(const std::string &name, size_t itemCount) : name(name), itemCount(itemCount), nextRound(0), itemsLeft(count, 0), nextNode((rank + 1) % count) {
     for (size_t node = 0; node < count; node++) {
-        if (node != rank && node < itemCount) {
-            itemsLeft[node] = (itemCount - 1 - node) / count + 1;
+        if (node != rank) {
+            itemsLeft[node] = getItemCount(node);
         }
     }
+}
+
+size_t MMseqsNode::WorkQueue::getItemCount(size_t node) const {
+    return itemCount / count + (getItem(node, itemCount / count) < itemCount);
+}
+
+// dealt back and forth, so no node always gets the last item of a round
+size_t MMseqsNode::WorkQueue::getItem(size_t node, size_t round) const {
+    return round * count + ((round % 2 == 0) ? node : count - 1 - node);
 }
 
 bool MMseqsNode::WorkQueue::takeItem(size_t item) {
@@ -621,10 +645,9 @@ bool MMseqsNode::WorkQueue::takeItem(size_t item) {
 }
 
 size_t MMseqsNode::WorkQueue::takeNextItem() {
-    for (; nextItem < itemCount; nextItem += count) {
-        if (takeItem(nextItem)) {
-            nextItem += count;
-            return nextItem - count;
+    for (; getItem(rank, nextRound) < itemCount; nextRound++) {
+        if (takeItem(getItem(rank, nextRound))) {
+            return getItem(rank, nextRound++);
         }
     }
     for (size_t emptyNodes = 0; emptyNodes < count;) {
@@ -636,8 +659,8 @@ size_t MMseqsNode::WorkQueue::takeNextItem() {
         }
         emptyNodes = 0;
         itemsLeft[node]--;
-        if (takeItem(node + itemsLeft[node] * count)) {
-            return node + itemsLeft[node] * count;
+        if (takeItem(getItem(node, itemsLeft[node]))) {
+            return getItem(node, itemsLeft[node]);
         }
         itemsLeft[node] = 0;
     }
@@ -645,8 +668,8 @@ size_t MMseqsNode::WorkQueue::takeNextItem() {
 }
 
 void MMseqsNode::WorkQueue::removeTakenItemFiles() {
-    for (size_t item = rank; item < itemCount; item += count) {
-        FileUtil::removeSharedFile(name + "." + SSTR(item));
+    for (size_t round = 0; getItem(rank, round) < itemCount; round++) {
+        FileUtil::removeSharedFile(name + "." + SSTR(getItem(rank, round)));
     }
 }
 

@@ -3005,10 +3005,7 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         Timer publishTimer;
         publishCount++;
         MMseqsNode::publishLog(acceptedHandle, acceptedFile, acceptedProgress, repKey, bytes);
-        size_t previousRepKey = publishedDoneRepKey.exchange(repKey);
-        if (isAligningNode) {
-            MMseqsNode::printProgress("Aligning the candidate pairs", previousRepKey, repKey, orderKeyEnd, startTimer);
-        }
+        publishedDoneRepKey.store(repKey);
         publishCostSeconds += publishTimer.getTimediff();
         publishPeriod.store(std::min<double>(PUBLISH_SECONDS, std::max(MIN_PUBLISH_SECONDS, LOG_COST_FACTOR * publishCostSeconds / publishCount)));
     };
@@ -5975,6 +5972,7 @@ int align2clustLinfinity(Parameters &par) {
     delete[] singletonBits;
     MMseqsNode::addPhaseTime(phaseValues, "writing the clusters", phaseValueTimer);
     MMseqsNode::removeExchanges(par.db3, clusterPairs, std::vector<std::string>(1, clusterPairs), phaseValues);
+    MMseqsNode::writeNodeLog(par.db3);
     if (MMseqsNode::isMaster()) {
         // every node is done with both logs
         MMseqsNode::removeLog(assignedKeysLog);

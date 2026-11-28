@@ -354,9 +354,11 @@ template <typename T> bool DBReader<T>::open(int accessType){
 
         batchReader = new BatchReader(threads, dataFds[0]);
         if (entryOffsetsFileNames.empty()) {
-            Debug(Debug::INFO) << "Reading " << dataFileName << " from " << getStorageName(batchReader->getStorage()) << ", up to " << batchReader->getMaxInflightRequests()
-                               << " reads at once (" << (batchReader->usesIoUring() ? "io_uring" : "pread") << ")"
-                               << ((directFiles > 0) ? ", " + SSTR(directFiles) + " of " + SSTR(dataFds.size()) + " files without the page cache (O_DIRECT)" : "") << "\n";
+            std::string reading;
+            MMseqsNode::addPhaseValue(reading, "Reading", std::string(dataFileName) + " from " + getStorageName(batchReader->getStorage()) + ", up to " + SSTR(batchReader->getMaxInflightRequests())
+                                      + " reads at once (" + (batchReader->usesIoUring() ? "io_uring" : "pread") + ")"
+                                      + ((directFiles > 0) ? ", " + SSTR(directFiles) + " of " + SSTR(dataFds.size()) + " files without the page cache (O_DIRECT)" : ""));
+            MMseqsNode::printPhaseValues(reading);
         }
 
         if (isCompressed(dbtype) == COMPRESSED) {
@@ -1242,7 +1244,7 @@ template <typename T> size_t DBReader<T>::planKeyReadRequests(const std::vector<
     return bytes;
 }
 
-template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &bufferToLoadInto, size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys) {
+template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &bufferToLoadInto, size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys, size_t freeKeyEnd) {
     std::vector<BatchReader::ReadRequest> readRequests;
     // reuse the vectors of the buffer
     std::vector<size_t> entryOffsets;
@@ -1262,9 +1264,8 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &buf
         size_t block = SIZE_MAX;
         bool isCached = false;
         for (size_t i = 0; i < keys->size(); i++) {
-            size_t keyBlock = getKeyBlock((*keys)[i]);
-            if (keyBlock != block) {
-                block = keyBlock;
+            if (block == SIZE_MAX || (*keys)[i] < blockKeyOffsets[block] || (*keys)[i] >= blockKeyOffsets[block + 1]) {
+                block = getKeyBlock((*keys)[i]);
                 isCached = cachedBlocks.count(block) > 0;
                 if (isCached == false) {
                     readRequests.clear();
@@ -1275,7 +1276,7 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &buf
                         request.fileToRead = localDataFds[index2dbfile[findIdRange(blockKeyOffsets[block])]];
                     }
                     if (isLocal == false || request.bytesToRead <= localBlockCacheSize) {
-                        freeBlocks(std::min(loadedBuffer.keyBegin, static_cast<size_t>(keys->front())), request.bytesToRead, isLocal);
+                        freeBlocks(std::min(freeKeyEnd, static_cast<size_t>(keys->front())), request.bytesToRead, isLocal, keys->front());
                     }
                     // local blocks leave the cache room for the other blocks
                     isCached = request.bytesToRead <= blockCacheSize - cachedBlockSize
@@ -1305,8 +1306,12 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &buf
             bytes = planKeyReadRequests(*keysToRead, readRequests, requestFirstKeys);
             keyReadSize += bytes;
             if (localBlocks.empty() == false) {
+                size_t block = SIZE_MAX;
                 for (size_t i = 0; i < readRequests.size(); i++) {
-                    localKeyReadSize += localBlocks[getKeyBlock(requestFirstKeys[i])] ? readRequests[i].bytesToRead : 0;
+                    if (block == SIZE_MAX || requestFirstKeys[i] < blockKeyOffsets[block] || requestFirstKeys[i] >= blockKeyOffsets[block + 1]) {
+                        block = getKeyBlock(requestFirstKeys[i]);
+                    }
+                    localKeyReadSize += localBlocks[block] ? readRequests[i].bytesToRead : 0;
                 }
             }
         } else {
@@ -1354,12 +1359,12 @@ template <typename T> bool DBReader<T>::prepareBufferToLoad(EntryReadBuffer &buf
     return true;
 }
 
-template <typename T> void DBReader<T>::loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys) {
+template <typename T> void DBReader<T>::loadKeys(size_t keyBegin, size_t keyEnd, const std::vector<DBKeyType> *keys, size_t freeKeyEnd) {
     if (keys == NULL && prefetchBuffer.isPrefetched && prefetchBuffer.keyBegin == keyBegin && prefetchBuffer.keyEnd == keyEnd) {
         batchReader->waitAsyncRead();
         prefetchBuffer.isPrefetched = false;
         std::swap(loadedBuffer, prefetchBuffer);
-    } else if (prepareBufferToLoad(loadedBuffer, keyBegin, keyEnd, keys)) {
+    } else if (prepareBufferToLoad(loadedBuffer, keyBegin, keyEnd, keys, freeKeyEnd)) {
         batchReader->readSync(frameOffsets.empty() ? loadedBuffer.readRequests : loadedBuffer.compressedReadRequests);
     }
     cacheBlocks(loadedBuffer);
@@ -1441,9 +1446,9 @@ template <typename T> size_t DBReader<T>::getPrefetchBufferSize(size_t keyBegin,
     return loadedBuffer.allocatedSize + std::max(prefetchBuffer.allocatedSize, getLoadBufferSize(keyBegin, keyEnd));
 }
 
-template <typename T> void DBReader<T>::loadData(const std::vector<DBKeyType> &keys) {
+template <typename T> void DBReader<T>::loadData(const std::vector<DBKeyType> &keys, size_t freeKeyEnd) {
     if (keys.empty() == false) {
-        loadKeys(keys.front(), keys.back() + 1, &keys);
+        loadKeys(keys.front(), keys.back() + 1, &keys, freeKeyEnd);
     }
 }
 
@@ -1550,10 +1555,12 @@ template <typename T> size_t DBReader<T>::getKeyBlock(size_t key) const {
     return std::upper_bound(blockKeyOffsets.begin(), blockKeyOffsets.end(), key) - blockKeyOffsets.begin() - 1;
 }
 
-// free blocks below keyEnd until neededSize fits, for a local block also in the local room
-template <typename T> void DBReader<T>::freeBlocks(size_t keyEnd, size_t neededSize, bool isLocal) {
+// free blocks below keyEnd, for a shared block also local blocks over their room below loadKey, until neededSize fits, for a local block also in the local room
+template <typename T> void DBReader<T>::freeBlocks(size_t keyEnd, size_t neededSize, bool isLocal, size_t loadKey) {
     for (std::map<size_t, BatchReader::ReadRequest>::iterator cached = cachedBlocks.begin();
-         cached != cachedBlocks.end() && blockKeyOffsets[cached->first + 1] <= keyEnd
+         cached != cachedBlocks.end()
+         && (blockKeyOffsets[cached->first + 1] <= keyEnd
+             || (isLocal == false && cachedLocalBlockSize > localBlockCacheSize && isLocalBlock(cached->first) && blockKeyOffsets[cached->first + 1] <= loadKey))
          && (neededSize > blockCacheSize - cachedBlockSize
              || (isLocal && neededSize > localBlockCacheSize - std::min(localBlockCacheSize, cachedLocalBlockSize)));) {
         free(cached->second.destination);

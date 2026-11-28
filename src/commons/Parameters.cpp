@@ -2190,9 +2190,8 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
         }
     }
 
-    if (MMseqsMPI::isMaster()) {
-        // the other linfinity nodes print warnings, errors and their own lines (MMseqsNode::printPhaseValues)
-        Debug::setDebugLevel(MMseqsNode::isMaster() ? verbosity : std::min(verbosity, static_cast<int>(Debug::WARNING)));
+    if (MMseqsMPI::isMaster() && MMseqsNode::isMaster()) {
+        Debug::setDebugLevel(verbosity);
     }
 
 #ifdef OPENMP

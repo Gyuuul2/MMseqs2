@@ -80,6 +80,7 @@ int mergeclusters(int argc, const char **argv, const Command &command) {
             exchanges.push_back(sortedByMember);
         }
         MMseqsNode::removeExchanges(par.db2, sortedByRep, exchanges, phaseValues);
+        MMseqsNode::writeNodeLog(par.db2);
         if (hasRepBits) {
             FileUtil::remove((sortedByRep + ".bits." + SSTR(MMseqsNode::rank)).c_str());
         }

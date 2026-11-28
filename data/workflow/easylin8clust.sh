@@ -54,6 +54,7 @@ if [ -n "${REMOVE_TMP}" ]; then
     "$MMSEQS" rmdb "${TMP_PATH}/input_h" ${VERBOSITY_PAR}
     # shellcheck disable=SC2086
     "$MMSEQS" rmdb "${TMP_PATH}/clu" ${VERBOSITY_PAR}
-    rm -rf "${TMP_PATH}/clu_tmp"
+    # keep the .nodes.log files of the clustering steps
+    find "${TMP_PATH}/clu_tmp" ! -type d ! -name '*.nodes.log' -exec rm -f {} +
     rm -f "${TMP_PATH}/easylin8clust.sh"
 fi
