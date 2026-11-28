@@ -1083,17 +1083,15 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
         }
     }
 
-    if (MMseqsNode::isMaster()) {
-        size_t seqSize = 0;
-        size_t headerSize = 0;
-        for (unsigned int file = 0; file < MMseqsNode::count; file++) {
-            seqSize += dataFileBytes[SEQUENCE_DATA * MMseqsNode::count + file];
-            headerSize += dataFileBytes[HEADER_DATA * MMseqsNode::count + file];
-        }
-        Debug(Debug::INFO) << "Writing the database" << (par.compressHeaders ? " and compressing the headers" : "") << ": " << key << " sequences of " << globalHistogram.size()
-                           << " lengths, " << MMseqsNode::formatBytes(seqSize) << " of sequences and " << MMseqsNode::formatBytes(headerSize) << " of headers in "
-                           << MMseqsNode::count << " files\n";
+    size_t seqSize = 0;
+    size_t headerSize = 0;
+    for (unsigned int file = 0; file < MMseqsNode::count; file++) {
+        seqSize += dataFileBytes[SEQUENCE_DATA * MMseqsNode::count + file];
+        headerSize += dataFileBytes[HEADER_DATA * MMseqsNode::count + file];
     }
+    Debug(Debug::INFO) << "Writing the database" << (par.compressHeaders ? " and compressing the headers" : "") << ": " << key << " sequences of " << globalHistogram.size()
+                       << " lengths, " << MMseqsNode::formatBytes(seqSize) << " of sequences and " << MMseqsNode::formatBytes(headerSize) << " of headers in "
+                       << MMseqsNode::count << " files\n";
 
     // receive the compression units of this node
     double compressSeconds = 0;

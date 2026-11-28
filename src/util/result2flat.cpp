@@ -85,7 +85,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
     double writeSeconds = 0;
     Debug::Progress progress(splitCount);
     for (size_t split = 0; split < splitCount; split++) {
-        if (isLinfinity && MMseqsNode::isMaster()) {
+        if (isLinfinity) {
             progress.updateProgress();
         }
         size_t splitEnd = isLinfinity ? 0 : dbr_data.getSize();
