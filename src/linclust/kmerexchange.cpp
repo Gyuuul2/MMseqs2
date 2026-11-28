@@ -3401,7 +3401,8 @@ static std::string writeKeySplitPrefs(Parameters &par, DBReader<DBKeyType> &seqD
                     writer.isOpen = keySplitWriter.isOpen;
                     writer.prevRep = keySplitWriter.prevRep;
                 } else {
-                    writer.nextPartition = getRepPartition(pref, taskReps[task]);
+                    // the task before ends at the first partition that starts at this rep
+                    writer.nextPartition = std::lower_bound(pref.partitionFirstKeys.begin(), pref.partitionFirstKeys.end(), static_cast<size_t>(taskReps[task])) - pref.partitionFirstKeys.begin();
                     writer.isOpen = false;
                     writer.prevRep = taskReps[task];
                 }
