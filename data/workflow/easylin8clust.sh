@@ -8,12 +8,17 @@ notExists() {
    [ ! -f "$1" ]
 }
 
+# rm -f of many node files, printf is a shell builtin and does not hit ARG_MAX
+removeFiles() {
+    printf '%s\0' "$@" | xargs -0 rm -f
+}
+
 # end all tasks of a srun step if one fails
 export SLURM_KILL_BAD_EXIT=1
 
 if notExists "${TMP_PATH}/input.dbtype"; then
     echo "Step 1 of 4: convert the input sequences into a database (createdb)"
-    rm -f "${TMP_PATH}/input" "${TMP_PATH}/input."* "${TMP_PATH}/input_h"* "${TMP_PATH}/input_sent_"*
+    removeFiles "${TMP_PATH}/input" "${TMP_PATH}/input."* "${TMP_PATH}/input_h"* "${TMP_PATH}/input_sent_"*
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" createdb "$@" "${TMP_PATH}/input" ${CREATEDB_PAR} \
         || fail "createdb died"
@@ -29,7 +34,7 @@ fi
 # a killed step can leave some node files, mark finished steps
 if notExists "${TMP_PATH}/createtsv.done"; then
     echo "Step 3 of 4: write the cluster table (createtsv)"
-    rm -f "${RESULTS}_cluster.tsv".* "${TMP_PATH}/clu_tsv"*
+    removeFiles "${RESULTS}_cluster.tsv".* "${TMP_PATH}/clu_tsv"*
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" createtsv "${TMP_PATH}/input" "${TMP_PATH}/input" "${TMP_PATH}/clu" "${RESULTS}_cluster.tsv" ${CREATETSV_PAR} \
         || fail "createtsv died"
@@ -38,7 +43,7 @@ fi
 
 if notExists "${TMP_PATH}/result2flat.done"; then
     echo "Step 4 of 4: write the representative sequences (result2flat)"
-    rm -f "${RESULTS}_rep_seq.fasta".* "${TMP_PATH}/clu_fasta"*
+    removeFiles "${RESULTS}_rep_seq.fasta".* "${TMP_PATH}/clu_fasta"*
     # shellcheck disable=SC2086
     $RUNNER "$MMSEQS" result2flat "${TMP_PATH}/input" "${TMP_PATH}/input" "${TMP_PATH}/clu" "${RESULTS}_rep_seq.fasta" ${RESULT2FLAT_PAR} \
         || fail "result2flat died"
