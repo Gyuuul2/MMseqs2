@@ -641,12 +641,6 @@ static std::string formatSeconds(double seconds) {
     return buffer;
 }
 
-static std::string formatRatio(size_t size, size_t total) {
-    char buffer[32];
-    snprintf(buffer, sizeof(buffer), "%.3f", static_cast<double>(size) / std::max<size_t>(1, total));
-    return buffer;
-}
-
 // prefilter buffer records [begin, end) and their entries
 struct FetchedSequences {
     FetchedSequences() : prefilterBuffer(0), prefilterBufferNumber(0), begin(0), end(0), targetCount(0), pendingPairCount(0), firstPendingRepKey(0), plannedSize(0),
@@ -3161,7 +3155,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     }
 
     double coverableBytesSum = 0;
-    size_t maxCoverableSize = 0;
     for (size_t range = 0; range < rangeCount; range++) {
         float repLength = static_cast<float>(index[range].length - 2);
         const auto isCovered = [&](const DBReader<DBKeyType>::Index &coveredRange) {
@@ -3172,7 +3165,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         size_t coveredEnd = std::partition_point(index + range, index + rangeCount, isCovered) - index;
         size_t keyEnd = (range + 1 < rangeCount) ? static_cast<size_t>(index[range + 1].id) : dbSize;
         coverableBytesSum += static_cast<double>(keyEnd - index[range].id) * (nodeRangeByteOffsets[coveredEnd] - nodeRangeByteOffsets[coveredFirst]);
-        maxCoverableSize = std::max(maxCoverableSize, nodeRangeByteOffsets[coveredEnd] - nodeRangeByteOffsets[coveredFirst]);
     }
     double coverableSize = coverableBytesSum / std::max((size_t) 1, dbSize);
     size_t averageEntrySize = std::max<size_t>(1, sequenceSize / std::max<size_t>(1, dbSize));
@@ -3711,11 +3703,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     size_t servedFileCount = 0;
     size_t servedSize = 0;
     size_t servedEntrySize = 0;
-    // served own keys longer than the representative this node aligns
-    size_t servedBehindKeyCount = 0;
-    size_t servedBehindSize = 0;
-    // own blocks that a load touched, under sourceMutex
-    std::vector<bool> isOwnBlockTouched(blockKeyOffsets.size() - 1, false);
     // next key of each copy in progress, under sourceMutex
     std::vector<size_t> copyKeyBegins;
     // first key from this node of each node's newest fetch, the next fetch sweeps from about there, under serviceMutex
@@ -3757,14 +3744,13 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                     loadKeys.push_back(keys[i]);
                 }
             }
-            size_t touchedBlock = SIZE_MAX;
+            size_t block = SIZE_MAX;
             bool isCached = true;
             for (size_t i = 0; i < loadKeys.size(); i++) {
-                size_t block = touchedBlock;
-                if (getKeyAlignNode(seqDbr, loadKeys[i], &touchedBlock) == rank) {
-                    isOwnBlockTouched[touchedBlock] = true;
+                if (block == SIZE_MAX || loadKeys[i] < blockKeyOffsets[block] || loadKeys[i] >= blockKeyOffsets[block + 1]) {
+                    block = seqDbr.getKeyBlock(loadKeys[i]);
+                    isCached = isCached && seqDbr.isCachedBlock(block);
                 }
-                isCached = isCached && (touchedBlock == block || seqDbr.isCachedBlock(touchedBlock));
             }
             // cached keys need no load, cached blocks are freed only by a load
             std::shared_lock<std::shared_timed_mutex> cachedCopyLock(cachedBlockMutex, std::defer_lock);
@@ -4491,16 +4477,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                 copyEntries(rawKeys.data(), rawKeys.size(), requestOffsets.data(), servedFileData.data() + pieceOffset + pieceSize, NULL, BatchReader::MAX_READ_REQUEST_SIZE);
                 pieceSize += requestOffsets[rawKeys.size()];
                 size_t entryRange = SIZE_MAX;
-                size_t frontierKey = publishedDoneRepKey.load() % paddedDbSize;
-                size_t frontierRange = SIZE_MAX;
-                size_t frontierLength = (frontierKey < dbSize) ? seqDbr.getSeqLenFromRange(frontierRange, frontierKey) : 0;
                 for (size_t j = 0; j < keyCount; j++) {
-                    size_t entrySize = isAssigned(keys[j]) ? 0 : seqDbr.getSeqLenFromRange(entryRange, keys[j]) + 2;
-                    servedEntrySize += entrySize;
-                    if (entrySize > frontierLength + 2) {
-                        servedBehindKeyCount++;
-                        servedBehindSize += entrySize;
-                    }
+                    servedEntrySize += isAssigned(keys[j]) ? 0 : seqDbr.getSeqLenFromRange(entryRange, keys[j]) + 2;
                 }
                 ServedPiece piece = { requester.servedCount, requester.piece, servedFileCount, 0, pieceOffset, pieceSize, keyCount };
                 passPieces.push_back(std::make_pair(node, piece));
@@ -4623,7 +4601,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     std::mutex blockCopyMutex;
     int blockCopyError = 0;
     double blockCopySeconds = 0;
-    size_t cachedCopySize = 0;
     std::mutex clusterMutex;
     // clustering step of a single node
     const auto clusterStep = [&]() {
@@ -4676,7 +4653,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
                         blockCopyError = (writeError != 0) ? writeError : EIO;
                     }
                     if (blockCopyError == 0) {
-                        cachedCopySize += isCached ? bytes : 0;
                         // load plans and reads its blocks under sourceMutex
                         std::lock_guard<std::mutex> sourceLock(sourceMutex);
                         seqDbr.setLocalBlock(servedBlockCopy.blocks[copiedBlockCount]);
@@ -4765,12 +4741,8 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         waitForSequences(currentSequences, getFirstRepKey(currentSequences));
     }
 
-    double firstFetchSeconds = startTimer.getTimediff();
-    size_t alignedFetchCount = 0;
     // planned bytes per aligning second of the last planned fetch
     double plannedBytesPerSecond = 0;
-    double maxFetchAheadSeconds = 0;
-    double fetchAheadSecondsSum = 0;
     size_t alignThreadCount = par.threads - ioThreadCount;
     while (currentSequences.isLast == false) {
         // fetch ahead within fetchAheadSeconds, memory and the current buffer
@@ -4834,8 +4806,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             serviceCondition.notify_all();
             fetchesInFlight.push_back(&selected);
         }
-        maxFetchAheadSeconds = std::max(maxFetchAheadSeconds, fetchAheadSeconds.load());
-        fetchAheadSecondsSum += fetchAheadSeconds.load();
         FetchedSequences &nextSequences = *fetchesInFlight.front();
         Timer alignTimer;
         size_t nextRepKey = getFirstRepKey(nextSequences);
@@ -5414,8 +5384,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
             fetchBytesLimit = std::min(fetchBytesLimit, maxFetchBytesLimit);
         }
 
-        alignedFetchCount++;
-
         // reps of pending pairs are not done
         copyOwnKeys(nextSequences);
         waitForSequences(nextSequences, getFirstUndoneRepKey(nextRepKey));
@@ -5473,34 +5441,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     for (size_t page = 0; page < assignedPages.size(); page++) {
         delete[] assignedPages[page];
     }
-    MMseqsNode::addPhaseValue(phaseValues, "Sequence data read in blocks", MMseqsNode::formatBytes(seqDbr.getBlockReadSize()));
-    MMseqsNode::addPhaseValue(phaseValues, "Sequence data read one at a time", MMseqsNode::formatBytes(seqDbr.getKeyReadSize()));
-    MMseqsNode::addPhaseValue(phaseValues, "Sequence data read from --local-tmp in blocks", MMseqsNode::formatBytes(seqDbr.getLocalBlockReadSize()));
-    MMseqsNode::addPhaseValue(phaseValues, "Sequence data read from --local-tmp one at a time", MMseqsNode::formatBytes(seqDbr.getLocalKeyReadSize()));
-    if (isAligningNode) {
-        size_t sharedKeyReadSize = seqDbr.getKeyReadSize() - seqDbr.getLocalKeyReadSize();
-        MMseqsNode::addPhaseValue(phaseValues, "Sequence data read one at a time from the shared folder", MMseqsNode::formatBytes(sharedKeyReadSize) + ", "
-                                  + formatRatio(sharedKeyReadSize, servedSequenceSize) + " times the " + MMseqsNode::formatBytes(servedSequenceSize) + " of sequences of this node");
-        size_t ownBlockCount = 0;
-        size_t touchedBlockCount = 0;
-        size_t touchedSize = 0;
-        for (size_t block = 0; block + 1 < blockKeyOffsets.size(); block++) {
-            ownBlockCount += getBlockAlignNode(block) == rank;
-            if (isOwnBlockTouched[block] == false) {
-                continue;
-            }
-            touchedBlockCount++;
-            for (size_t range = seqDbr.findIdRange(blockKeyOffsets[block]); range < rangeCount && static_cast<size_t>(index[range].id) < blockKeyOffsets[block + 1]; range++) {
-                size_t keyEnd = (range + 1 < rangeCount) ? static_cast<size_t>(index[range + 1].id) : dbSize;
-                touchedSize += (std::min(keyEnd, blockKeyOffsets[block + 1]) - std::max(static_cast<size_t>(index[range].id), blockKeyOffsets[block])) * index[range].length;
-            }
-        }
-        MMseqsNode::addPhaseValue(phaseValues, "Blocks of this node loaded", SSTR(touchedBlockCount) + " of " + SSTR(ownBlockCount) + " with " + MMseqsNode::formatBytes(touchedSize) + ", "
-                                  + formatRatio(touchedSize, servedSequenceSize) + " of the sequences of this node");
-        MMseqsNode::addPhaseValue(phaseValues, "Largest length range of one representative", MMseqsNode::formatBytes(maxCoverableSize) + " of the sequences of this node");
-        MMseqsNode::addPhaseValue(phaseValues, "Sequences served that are longer than the representative this node aligns",
-                                  SSTR(servedBehindKeyCount) + " with " + MMseqsNode::formatBytes(servedBehindSize));
-    }
     for (size_t i = 0; i < blockCopyFds.size(); i++) {
         if (blockCopyFds[i] < 0) {
             continue;
@@ -5514,7 +5454,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
     if (ioThreadCount > 0 && reservedBlockCount > 0) {
         MMseqsNode::addPhaseValue(phaseValues, "Copy to --local-tmp", SSTR(alignedCopiedBlockCount) + " of " + SSTR(reservedBlockCount) + " reserved blocks copied while aligning, "
                                   + SSTR(copiedBlockCount - alignedCopiedBlockCount) + " after aligning, in " + formatSeconds(blockCopySeconds)
-                                  + ", " + MMseqsNode::formatBytes(cachedCopySize) + " from the block cache"
                                   + ((blockCopyError != 0) ? std::string(", the copies ended at a write error: ") + strerror(blockCopyError) : ""));
     }
     // master still finds key nodes in seqDbr blocks
@@ -5524,8 +5463,6 @@ static void alignRepTargets(Parameters &par, DBReader<DBKeyType> &seqDbr, Target
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the sequences", sequenceWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "waiting for the candidate pairs", prefilterWaitSeconds);
         MMseqsNode::addPhaseSeconds(phaseValues, "computing alignments", alignSeconds);
-        MMseqsNode::addPhaseValue(phaseValues, "Sequences fetched ahead", "at most " + formatSeconds(maxFetchAheadSeconds) + ", mean " + formatSeconds(fetchAheadSecondsSum / std::max<size_t>(1, alignedFetchCount)) + " of aligning");
-        MMseqsNode::addPhaseSeconds(phaseValues, "fetching the first sequences", firstFetchSeconds);
     }
     MMseqsNode::addPhaseValue(phaseValues, "Accepted pairs published", SSTR(publishCount) + " times, " + SSTR(static_cast<size_t>(1e6 * publishCostSeconds / std::max<size_t>(1, publishCount))) + " us each on average with the log flush");
     if (memberLookup != NULL) {
@@ -6113,8 +6050,6 @@ int align2clustLinfinity(Parameters &par) {
     rmdir(served.c_str());
     MMseqsNode::addPhaseTime(phaseValues, "sending the cluster pairs", phaseValueTimer);
     if (memberDbr != NULL) {
-        MMseqsNode::addPhaseValue(phaseValues, "Member sequence data read in blocks", MMseqsNode::formatBytes(memberDbr->getBlockReadSize()));
-        MMseqsNode::addPhaseValue(phaseValues, "Member sequence data read one at a time", MMseqsNode::formatBytes(memberDbr->getKeyReadSize()));
         memberDbr->close();
         delete memberDbr;
     }
