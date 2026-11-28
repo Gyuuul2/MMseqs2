@@ -28,7 +28,6 @@ public:
     void alignBanded(size_t count, const unsigned char *const *targets, const int *targetLengths, const int *diagonals,
                      s_align *aligns, std::string *backtraces, const int *columnEnds, const int *minScores);
 
-    // frees the buffers that grow with the batches; the next batch allocates them again
     void release();
 
 private:
@@ -106,7 +105,6 @@ public:
 
     size_t addQuery(const Sequence *query, const int16_t *queryBias);
     void clearQueries();
-    // frees the buffers that grow with the batches; the next batch allocates them again
     void release();
 
     void extendBanded(size_t count, const size_t *queryIds, const unsigned char *const *targets, const int *targetLengths, const int *seedQueries,

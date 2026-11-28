@@ -48,7 +48,6 @@ typedef std::atomic<DBLocalId> ClusterAssignment;
 struct AlignmentScoring {
     BaseMatrix *subMat;
     SubstitutionMatrix::FastMatrix fastMatrix;
-    // min ungapped score per column for a gapped alignment
     float scorePerColThreshold;
     EvalueComputation evaluer;
 
@@ -61,7 +60,7 @@ struct AlignmentScoring {
     }
 };
 
-// last pair a thread aligns, printed on a crash
+// printed on a crash
 struct AlignmentTrace {
     enum Stage { NOT_ALIGNING, UNGAPPED, GAPPED, SWIPE, MEMBER_CHECK };
     Stage stage;
@@ -73,7 +72,7 @@ struct AlignmentTrace {
 extern thread_local AlignmentTrace alignmentTrace;
 extern thread_local int alignmentThread;
 
-// member alignments in SWIPE lanes, per thread
+// SWIPE member alignments
 struct SwipeBatch {
     SwipeAligner aligner;
     EvalueComputation &evaluer;
@@ -89,7 +88,6 @@ struct SwipeBatch {
     std::vector<s_align> aligns;
     std::vector<std::string> backtraces;
     std::vector<size_t> entries;
-    // alignClusterMembers
     std::vector<size_t> gapped;
 
     SwipeBatch(const Parameters &par, BaseMatrix *subMat, EvalueComputation &evaluer, size_t maxSeqLen)
@@ -107,7 +105,6 @@ struct SwipeBatch {
         lengths.clear();
     }
 
-    // linfinity keeps the aligner over the fetches, but not the buffers of its largest batch
     void release() {
         std::vector<unsigned char>().swap(sequences);
         std::vector<size_t>().swap(offsets);
@@ -130,7 +127,7 @@ struct SwipeBatch {
         lengths.push_back(sequence.L);
     }
 
-    // start in 16 bit lanes, most members saturate 8 bit
+    // start in 16 bit, most members saturate 8 bit
     void select(size_t count) {
         targets.resize(count);
         diagonals.resize(count);
@@ -149,7 +146,7 @@ struct SwipeBatch {
     }
 };
 
-// targets for the SWIPE extensions, per thread
+// SWIPE target extensions
 struct SwipeTargets {
     SwipeExtender extender;
     EvalueComputation &evaluer;
@@ -157,7 +154,6 @@ struct SwipeTargets {
     bool isQueryInitialized;
     size_t queryId;
     std::vector<DBKeyType> repKeys;
-    // reps of a batch, one after the other
     std::vector<char> repSeqData;
     std::vector<size_t> repOffsets;
     std::vector<int> repLengths;
@@ -221,7 +217,6 @@ struct SwipeTargets {
         seedTargets.clear();
     }
 
-    // linfinity keeps the extender over the fetches, but not the buffers of its largest batch
     void release() {
         clearTargets();
         std::vector<DBKeyType>().swap(repKeys);
@@ -255,13 +250,12 @@ struct MemberCheck {
     size_t targetId;
     short startDiagonal;
     std::vector<DBKeyType> memberKeys;
-    // linfinity: fetched entries of memberKeys
+    // filled by linfinity
     std::vector<const char *> memberData;
     std::vector<size_t> order;
     std::vector<size_t> memberIds;
     std::vector<int> lengths;
     std::vector<std::string> records;
-    // filled by prepareMemberChecks unless a part of a pair brings those of the whole pair
     std::vector<unsigned char> isLaneMember;
     size_t nextMember;
     bool isPassing;
@@ -294,7 +288,6 @@ struct MemberChecks {
         return check;
     }
 
-    // addCheck keeps the buffers of the largest checks, linfinity frees them after each fetch
     void release() {
         std::vector<MemberCheck>().swap(checks);
         checkCount = 0;
@@ -328,7 +321,6 @@ bool alignTarget(const Parameters &par, BlockAligner &blockAligner, bool &blockA
 bool doSwipeExtensionsPass(const Parameters &par, SwipeTargets &swipeTargets, size_t i);
 int align2clustLinfinity(Parameters &par);
 
-// skip the targets assigned since they were queued
 template <typename Assigned>
 void alignTargetsSwipe(const Parameters &par, SwipeTargets &swipeTargets, const Assigned &isAssigned, std::vector<ClusterPair> &pairs) {
     int32_t xDrop = (MIN_SIZE * par.gapExtend.values.aminoacid() + par.gapOpen.values.aminoacid());
@@ -397,7 +389,6 @@ void alignTargetsSwipe(const Parameters &par, SwipeTargets &swipeTargets, const 
     }
 }
 
-// the gapped members of all reps share the extension lanes
 template <typename MapRep>
 void alignMemberChecksSwipe(const Parameters &par, BlockAligner &blockAligner, Matcher &matcher, Sequence &query, Sequence &element, DBReader<DBKeyType> *cluSeqDbr,
                             unsigned int swMode, unsigned int threadIdx, MemberChecks &memberChecks, const std::vector<size_t> &repMemberCheckOffsets,

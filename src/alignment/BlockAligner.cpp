@@ -13,7 +13,7 @@
 
 #include <algorithm>
 
-// computeBestDiagonal: one lane per diagonal, 8-bit first, a group reruns in 16 bits if a lane may have saturated; the group width is the same on every ISA
+// computeBestDiagonal: one lane per diagonal, same group width on every ISA
 static const int DIAG_GROUP = 6 * 2 * SSE_VECSIZE_INT;
 static const int DIAG_MAX_STEP = 8;
 static const int DIAG_MIN_SCORE = -2;
@@ -107,12 +107,12 @@ BlockAligner::~BlockAligner() {
 void BlockAligner::initQuery(Sequence* query){
     setQuery(query);
     computeQueryCompBias();
-    // the alignments only read the first queryLength positions of these buffers
+    // only the first queryLength positions are read
     std::reverse_copy(queryNumSeq, queryNumSeq + queryLength, queryRevNumSeq);
     std::reverse_copy(queryCompBias, queryCompBias + queryLength, queryCompBiasRev);
 }
 
-// the ungapped alignment only reads the query and its composition bias, so it can skip the reverse of initQuery
+// initQuery without the reverse copies, enough for ungappedAlign
 void BlockAligner::setQuery(Sequence* query){
     currentQuery = query;
     querySeq = query->getSeqData();
@@ -126,7 +126,7 @@ const int16_t* BlockAligner::getQueryCompBias(){
     return queryCompBias;
 }
 
-// keep the bias while the same rep (Sequence, db key, length) is set again
+// reuse the bias while the same query is set again
 void BlockAligner::computeQueryCompBias(){
     if (compBiasQuery == currentQuery && compBiasQueryKey == currentQuery->getDbKey() && compBiasQueryLength == queryLength) {
         return;
@@ -268,7 +268,6 @@ BlockAligner::UngappedAln_res BlockAligner::hammingDistance(
     );
 }
 
-
 template <typename T, int VectorCount = (DIAG_GROUP + VECSIZE_INT * 4 / sizeof(T) - 1) / (VECSIZE_INT * 4 / sizeof(T))>
 static void computeDiagonalMaxScores(const T* queryProfile, const unsigned char* dbSequence, size_t profileStride, int j, int dbEnd, T* maxScores) {
     const int vectorSize = VECSIZE_INT * 4 / sizeof(T);
@@ -281,7 +280,7 @@ static void computeDiagonalMaxScores(const T* queryProfile, const unsigned char*
         for (int k = 0; k < DIAG_MAX_STEP; k++) {
             const T* profileRow = queryProfile + dbSequence[j + k] * profileStride + j + k;
             for (int c = 0; c < vectorCount; c++) {
-                const simd_int vP = simdi_loadu((const simd_int*) (profileRow + c * vectorSize));
+                simd_int vP = simdi_loadu((const simd_int*) (profileRow + c * vectorSize));
                 vScore[c] = (sizeof(T) == 1) ? simdi8_adds(vScore[c], vP) : simdi16_adds(vScore[c], vP);
             }
         }
@@ -292,7 +291,7 @@ static void computeDiagonalMaxScores(const T* queryProfile, const unsigned char*
     for (; j < dbEnd; j++) {
         const T* profileRow = queryProfile + dbSequence[j] * profileStride + j;
         for (int c = 0; c < vectorCount; c++) {
-            const simd_int vP = simdi_loadu((const simd_int*) (profileRow + c * vectorSize));
+            simd_int vP = simdi_loadu((const simd_int*) (profileRow + c * vectorSize));
             vScore[c] = (sizeof(T) == 1) ? simdi8_adds(vScore[c], vP) : simdi16_adds(vScore[c], vP);
             vMaxScore[c] = (sizeof(T) == 1) ? simdi8_max(vMaxScore[c], vScore[c]) : simdi16_max(vMaxScore[c], vScore[c]);
         }
@@ -315,8 +314,8 @@ static void computeDiagonalMaxScoresTwoGroups(const int8_t* queryProfile, const 
     for (int lane = 0; lane < vectorSize; lane++) {
         secondGroupBytes[lane] = (lane >= DIAG_GROUP % vectorSize) ? -1 : 0;
     }
-    const simd_int secondGroupMask = simdi_loadu(reinterpret_cast<const simd_int *>(secondGroupBytes));
-    const int lastBlockEndSecond = j + std::max(0, dbEndSecond - j) / DIAG_MAX_STEP * DIAG_MAX_STEP;
+    simd_int secondGroupMask = simdi_loadu((const simd_int*) secondGroupBytes);
+    int lastBlockEndSecond = j + std::max(0, dbEndSecond - j) / DIAG_MAX_STEP * DIAG_MAX_STEP;
     for (; j + DIAG_MAX_STEP <= lastBlockEndSecond; j += DIAG_MAX_STEP) {
         for (int k = 0; k < DIAG_MAX_STEP; k++) {
             const int8_t* profileRow = queryProfile + dbSequence[j + k] * profileStride + j + k;
@@ -338,7 +337,7 @@ static void computeDiagonalMaxScoresTwoGroups(const int8_t* queryProfile, const 
                 if ((c + 1) * vectorSize <= DIAG_GROUP) {
                     continue;
                 }
-                const simd_int candidate = simdi8_max(vMaxScore[c], vScore[c]);
+                simd_int candidate = simdi8_max(vMaxScore[c], vScore[c]);
                 vMaxScore[c] = (c * vectorSize < DIAG_GROUP)
                     ? simdi8_blend(vMaxScore[c], candidate, secondGroupMask)
                     : candidate;
@@ -364,7 +363,7 @@ unsigned short BlockAligner::computeBestDiagonal(Sequence* currentTarget, int mi
     if (isDiagProfileStale) {
         // locals, since the int8_t stores may alias the members
         const unsigned char* querySeq = queryNumSeq;
-        const int queryLen = queryLength;
+        int queryLen = queryLength;
         diagProfileStride = queryLen + 4 * DIAG_GROUP;
         for (int a = 0; a < subMat->alphabetSize; a++) {
             const int8_t* subScores = diagSubMatrix + a * subMat->alphabetSize;
@@ -379,34 +378,34 @@ unsigned short BlockAligner::computeBestDiagonal(Sequence* currentTarget, int mi
         isDiagWordProfileStale = true;
     }
     const unsigned char* dbSequence = currentTarget->numSequence;
-    const int dbLength = currentTarget->L;
-    const int endDiag = std::min(maxDiag + 1, queryLength);
+    int dbLength = currentTarget->L;
+    int endDiag = std::min(maxDiag + 1, queryLength);
     int64_t maxScore = -1;
     int maxDiagonal = 0;
     int8_t maxScoresByte[2 * DIAG_GROUP + VECSIZE_INT * 4];
     int16_t maxScoresWord[DIAG_GROUP + VECSIZE_INT * 2];
     for (int d0 = std::max(minDiag, -(dbLength - 1)); d0 < endDiag;) {
-        // profileRow[j + lane] subScores query position d0 + j + lane against dbSequence[j]
-        const int dbStart = std::max(0, -(d0 + DIAG_GROUP - 1));
-        const int dbEnd = std::min(dbLength, queryLength - d0);
-        const int dbStartSecond = std::max(0, -(d0 + 2 * DIAG_GROUP - 1));
-        const bool twoGroups = (d0 + DIAG_GROUP < endDiag) && ((dbStart - dbStartSecond) % DIAG_MAX_STEP == 0);
+        // lane k scores query position d0 + j + k against dbSequence[j]
+        int dbStart = std::max(0, -(d0 + DIAG_GROUP - 1));
+        int dbEnd = std::min(dbLength, queryLength - d0);
+        int dbStartSecond = std::max(0, -(d0 + 2 * DIAG_GROUP - 1));
+        bool twoGroups = (d0 + DIAG_GROUP < endDiag) && ((dbStart - dbStartSecond) % DIAG_MAX_STEP == 0);
         if (twoGroups) {
-            const int dbEndSecond = std::min(dbLength, queryLength - d0 - DIAG_GROUP);
+            int dbEndSecond = std::min(dbLength, queryLength - d0 - DIAG_GROUP);
             computeDiagonalMaxScoresTwoGroups(diagProfileByte + 2 * DIAG_GROUP + d0, dbSequence, diagProfileStride, dbStartSecond, dbEndSecond, dbEnd, maxScoresByte);
         } else {
             computeDiagonalMaxScores<int8_t>(diagProfileByte + 2 * DIAG_GROUP + d0, dbSequence, diagProfileStride, dbStart, dbEnd, maxScoresByte);
         }
         for (int group = 0; group < (twoGroups ? 2 : 1); group++, d0 += DIAG_GROUP) {
             const int8_t* groupMaxScores = maxScoresByte + group * DIAG_GROUP;
-            const int diagonalCount = std::min(DIAG_GROUP, endDiag - d0);
-            const int groupDbBegin = std::max(0, -(d0 + DIAG_GROUP - 1));
-            const int groupDbEnd = std::min(dbLength, queryLength - d0);
+            int diagonalCount = std::min(DIAG_GROUP, endDiag - d0);
+            int groupDbBegin = std::max(0, -(d0 + DIAG_GROUP - 1));
+            int groupDbEnd = std::min(dbLength, queryLength - d0);
             int8_t groupMaxScore = -128;
             for (int k = 0; k < diagonalCount; k++) {
                 groupMaxScore = std::max(groupMaxScore, groupMaxScores[k]);
             }
-            // a lane below DIAG_BYTE_SATURATED never saturated, so the first lane with the group maximum is the best of the group
+            // no lane saturated, the first maximum is the best
             if (groupMaxScore < DIAG_BYTE_SATURATED) {
                 if (groupMaxScore + 128 > maxScore) {
                     maxScore = groupMaxScore + 128;
@@ -414,7 +413,7 @@ unsigned short BlockAligner::computeBestDiagonal(Sequence* currentTarget, int mi
                 }
                 continue;
             }
-            // only the 16 bit vectors of the saturated lanes rerun, in one pass if there are several
+            // rerun the saturated vectors in 16 bit, at once if several
             const int wordLanes = VECSIZE_INT * 2;
             unsigned int saturatedVectors = 0;
             for (int k = 0; k < diagonalCount; k++) {
@@ -440,15 +439,15 @@ unsigned short BlockAligner::computeBestDiagonal(Sequence* currentTarget, int mi
             for (int k = 0; k < diagonalCount; k++) {
                 int64_t score = static_cast<int>(maxScoresWord[k]) + 32768;
                 if (maxScoresWord[k] >= DIAG_WORD_SATURATED) {
-                    const int tailBegin = groupDbBegin + (groupDbEnd - groupDbBegin) / DIAG_MAX_STEP * DIAG_MAX_STEP;
+                    int tailBegin = groupDbBegin + (groupDbEnd - groupDbBegin) / DIAG_MAX_STEP * DIAG_MAX_STEP;
                     int64_t wideScore = 0;
                     score = 0;
                     for (int j = groupDbBegin; j < groupDbEnd; j++) {
-                        const int queryPosition = d0 + k + j;
-                        const int residueScore = (queryPosition < 0 || queryPosition >= queryLength)
+                        int queryPosition = d0 + k + j;
+                        int residueScore = (queryPosition < 0 || queryPosition >= queryLength)
                             ? DIAG_MIN_SCORE
                             : diagSubMatrix[dbSequence[j] * subMat->alphabetSize + queryNumSeq[queryPosition]];
-                        wideScore = std::max<int64_t>(0, wideScore + residueScore);
+                        wideScore = std::max((int64_t) 0, wideScore + residueScore);
                         if ((j - groupDbBegin + 1) % DIAG_MAX_STEP == 0 || j >= tailBegin) {
                             score = std::max(score, wideScore);
                         }

@@ -31,10 +31,8 @@
 struct ClusterResult {
     size_t sequenceIdx;
     DBLocalId representativeId;
-    // bound of a set that the workers finish
     size_t prefSize;
     std::vector<DBLocalId> memberIds;
-    // extended once the set may be the largest
     std::vector<SwipeSeed> swipeSeeds;
 };
 
@@ -81,7 +79,7 @@ static std::atomic<size_t> currentProcessPosition(0);
 static size_t currentPrefSize = 0;
 static bool allCalculationsDone = false;
 static size_t clusterResultCount = 0;
-// set cover sets with extensions left, by bound (memberIds + swipeSeeds)
+// set cover sets with extensions left, by size bound
 static std::vector<std::vector<ClusterResult>> deferredSets;
 static std::vector<size_t> unfinishedSetCounts;
 static size_t finishBound = 0;
@@ -159,7 +157,7 @@ static void compactSetCoverMemberPool(std::vector<SetCoverCandidate> &candidates
     if (memberPool.empty() || deadMembers < 16 * 1024 * 1024 / sizeof(DBLocalId) || deadMembers * 4 <= memberPool.size()) {
         return;
     }
-    std::sort(candidates.begin(), candidates.end(), SetCoverCandidate::compareByMemberOffset);
+    SORT_SERIAL(candidates.begin(), candidates.end(), SetCoverCandidate::compareByMemberOffset);
     size_t newOffset = 0;
     for (SetCoverCandidate &candidate : candidates) {
         if (candidate.memberOffset != newOffset) {
@@ -172,7 +170,6 @@ static void compactSetCoverMemberPool(std::vector<SetCoverCandidate> &candidates
     std::make_heap(candidates.begin(), candidates.end(), SetCoverComparator());
 }
 
-// assign the largest sets above maxSetSize, a set that lost members goes back
 static void assignSetCoverCandidates(std::vector<SetCoverCandidate> &candidates, std::vector<DBLocalId> &memberPool, size_t &liveMemberCount, size_t maxSetSize,
                                      ClusterAssignment *assignedCluster) {
     while (candidates.empty() == false && candidates.front().memberCount > maxSetSize) {
@@ -193,6 +190,7 @@ static void assignSetCoverCandidates(std::vector<SetCoverCandidate> &candidates,
         if (valid <= 1) {
             continue;
         }
+        // a set that lost members goes back
         if (valid != candidate.memberCount) {
             candidate.memberCount = valid;
             liveMemberCount += valid;
@@ -316,7 +314,6 @@ AlignmentScoring::AlignmentScoring(const Parameters &par, size_t dbResidues)
                                              par.seqIdThr, par.covThr, 0.98)),
       evaluer(dbResidues, subMat, par.gapOpen.values.aminoacid(), par.gapExtend.values.aminoacid()) {}
 
-// false if no diagonal can reach the required overlap
 static bool canBeCoveredOnDiagonals(const Parameters &par, int queryLength, int targetLength, int &minDiag, int &maxDiag) {
     int diagBand = std::max(queryLength, targetLength) + targetLength;
     if (par.covMode == Parameters::COV_MODE_BIDIRECTIONAL) {
@@ -329,7 +326,6 @@ static bool canBeCoveredOnDiagonals(const Parameters &par, int queryLength, int 
     return minDiag <= maxDiag;
 }
 
-// the other members of the cluster of targetKey
 static void getClusterMembers(DBReader<DBKeyType> *cluDbr, DBKeyType targetKey, unsigned int threadIdx, std::vector<DBKeyType> &memberKeys) {
     memberKeys.clear();
     char buffer[1024];
@@ -406,7 +402,6 @@ static bool findMatchSeed(const char *querySequence, const char *targetSequence,
     return false;
 }
 
-// the lane members share the SWIPE lanes, the others go to the scalar aligner
 void alignMembersSwipe(const Parameters &par, Matcher &matcher, bool &matcherInitialized, MemberChecks &memberChecks, Sequence &query, Sequence &element,
                        DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer) {
     SwipeBatch &swipeMembers = *memberChecks.swipeMembers;
@@ -486,7 +481,7 @@ bool canCoverMember(const Parameters &par, int queryLength, int memberLength) {
            && (par.diagonalMode != Parameters::DIAGONAL_MODE_UNGAPPED || canBeCoveredOnDiagonals(par, queryLength, memberLength, minDiag, maxDiag));
 }
 
-// the members of a check align in rounds of 1, 2, 4, ... in the order of prepareMemberChecks, and the rounds of 4 members at least share the SWIPE lanes
+// rounds of at least 4 members share the SWIPE lanes
 bool isSwipeLaneMember(size_t position, size_t memberCount) {
     size_t roundSize = 1;
     while (2 * roundSize - 1 <= position) {
@@ -495,7 +490,6 @@ bool isSwipeLaneMember(size_t position, size_t memberCount) {
     return std::min(roundSize, memberCount - (roundSize - 1)) >= 4;
 }
 
-// most different lengths first
 void prepareMemberChecks(const Parameters &par, Sequence &query, DBReader<DBKeyType> *cluSeqDbr, bool withRecords, MemberChecks &memberChecks, size_t checkBegin, size_t checkEnd) {
     int queryLength = query.L;
     for (size_t g = checkBegin; g < checkEnd; g++) {
@@ -517,6 +511,7 @@ void prepareMemberChecks(const Parameters &par, Sequence &query, DBReader<DBKeyT
         if (check.isPassing == false) {
             continue;
         }
+        // most different lengths first
         const std::vector<int> &memberLengths = check.lengths;
         std::stable_sort(check.order.begin(), check.order.end(), [&memberLengths, queryLength](size_t first, size_t second) {
             return std::abs(memberLengths[first] - queryLength) > std::abs(memberLengths[second] - queryLength);
@@ -633,7 +628,6 @@ bool alignNextMembers(const Parameters &par, BlockAligner &blockAligner, Matcher
     return hasOpenCheck;
 }
 
-// with SWIPE in rounds of 1, 2, 4, ... members
 void alignClusterMembers(const Parameters &par, BlockAligner &blockAligner, Matcher &matcher, bool &matcherInitialized, Sequence &query, Sequence &element,
                          DBReader<DBKeyType> *cluSeqDbr, unsigned int swMode, unsigned int threadIdx, bool withRecords, char *alnLineBuffer,
                          MemberChecks &memberChecks) {
@@ -979,7 +973,7 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             keyCount += __builtin_popcountll(keyBits[i].keyMask);
         }
     }
-    const auto getSeqId = [&](DBKeyType key) -> size_t {
+    const auto getSeqId = [&](DBKeyType key) {
         if (keyBits == NULL) {
             return seqDbr->getId(key);
         }
@@ -1037,11 +1031,10 @@ int doAlign2clust(Parameters &par, DBWriter &resultWriter, DBReader<DBKeyType> &
             for (size_t i = 0; i < dbSize; i++) {
                 lengthOrder[i] = static_cast<DBLocalId>(i);
             }
-            DBReader<DBKeyType> *order = seqDbr;
             SORT_PARALLEL(lengthOrder, lengthOrder + dbSize,
-                          [order](DBLocalId first, DBLocalId second) {
-                              size_t firstLen = order->getSeqLen(first);
-                              size_t secondLen = order->getSeqLen(second);
+                          [seqDbr](DBLocalId first, DBLocalId second) {
+                              size_t firstLen = seqDbr->getSeqLen(first);
+                              size_t secondLen = seqDbr->getSeqLen(second);
                               if (firstLen != secondLen) {
                                   return firstLen > secondLen;
                               }

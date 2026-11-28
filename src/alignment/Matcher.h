@@ -153,8 +153,7 @@ public:
 
     ~Matcher();
 
-    // run SSE2 parallelized Smith-Waterman alignment calculation and traceback, from the forward pass result if given,
-    // with the word pass first if the byte pass is expected to overflow
+    // run SSE2 parallelized Smith-Waterman alignment calculation and traceback
     result_t getSWResult(Sequence* dbSeq, const int diagonal, bool isReverse, const int covMode, const float covThr, const double evalThr,
                          unsigned int alignmentMode, unsigned int seqIdMode, bool isIdentical, bool wrappedScoring=false, const s_align *forward=NULL,
                          bool isWordFirst=false);

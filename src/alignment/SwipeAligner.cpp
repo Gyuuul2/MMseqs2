@@ -72,7 +72,7 @@ static inline void setLaneValue(simd_int *v, int lane, T value) {
 // as SubstitutionMatrix::calcLocalAaBiasCorrection
 static const int BIAS_WINDOW_SIZE = 40;
 
-// float part of SubstitutionMatrix::calcLocalAaBiasCorrection, not inlined so that the table and the window ends use the same instructions
+// float part of calcLocalAaBiasCorrection, noinline so the table and the window ends round the same
 __attribute__((noinline)) static int8_t computeLetterBias(const BaseMatrix *subMat, const short *subMatRow, int sumSubScores, int windowLength, float scale) {
     float deltaS_i = (float) sumSubScores;
     deltaS_i /= -1.0 * static_cast<float>(windowLength);
@@ -83,7 +83,7 @@ __attribute__((noinline)) static int8_t computeLetterBias(const BaseMatrix *subM
     return static_cast<int8_t>((compositionBias < 0.0) ? compositionBias - 0.5 : compositionBias + 0.5);
 }
 
-// bias of a letter with a full window for each sum of the scores of the other letters
+// full window bias for each score sum of the other letters
 void SwipeAligner::fillBiasTable(const BaseMatrix *subMat, float scale, std::vector<int8_t> &biasTable, std::vector<int> &biasTableOffsets) {
     const int otherLetters = BIAS_WINDOW_SIZE - 1;
     biasTableOffsets.resize(subMat->alphabetSize);

@@ -44,7 +44,7 @@ public:
         Sequence* target,
         const unsigned short diagonal
     );
-    // heuristic best ungapped diagonal (queryPos - dbPos); clips below -2 and samples every eight residues
+    // heuristic best ungapped diagonal (queryPos - dbPos)
     unsigned short computeBestDiagonal(Sequence* target, int minDiag, int maxDiag);
     BlockAligner::UngappedAln_res hammingDistance(
         Sequence* target, const unsigned short diagonal);
@@ -153,7 +153,7 @@ private:
     int compBiasQueryLength;
     void computeQueryCompBias();
 
-    // computeBestDiagonal: 8-bit query profile, its 16-bit copy only for saturated groups
+    // computeBestDiagonal
     int8_t* diagSubMatrix;
     int16_t* diagProfileWord;
     int8_t* diagProfileByte;
