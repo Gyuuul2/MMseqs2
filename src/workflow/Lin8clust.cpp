@@ -78,6 +78,7 @@ int lin8clust(int argc, const char **argv, const Command& command) {
     // like linclust2
     if (par.seqIdThr >= 0.7f && par.PARAM_LINCLUST_ITERATIONS.wasSet == false) {
         par.linclustIterations = 1;
+        Debug(Debug::INFO) << "Set linclust iterations to " << par.linclustIterations << "\n";
     }
 
     // let punchHole warn before the run if it is not supported

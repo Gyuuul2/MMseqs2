@@ -350,8 +350,10 @@ int clusthashfast(int argc, const char **argv, const Command &command) {
     size_t localKeyCount = nodeLengthRanges.back().startKey - localFirstKey;
 
     if (isLinfinity && par.compressed) {
-        Debug(Debug::WARNING) << "Compressed output cannot be combined with linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
-        Debug(Debug::WARNING) << "We recompute with --compressed 0\n";
+        if (MMseqsNode::isMaster()) {
+            Debug(Debug::WARNING) << "Compressed output cannot be combined with linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
+            Debug(Debug::WARNING) << "We recompute with --compressed 0\n";
+        }
         par.compressed = 0;
     }
 

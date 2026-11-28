@@ -3773,9 +3773,11 @@ static void kmermatcherKeySplitPref(Parameters &par, DBReader<DBKeyType> &seqDbr
     marked.fd = -1;
     marked.name = par.localTmp + "/" + FileUtil::baseName(par.db2) + ".marked_fingerprints." + SSTR(MMseqsNode::rank);
     printStep(exchange, 1, "send the k-mer hashes of each sequence batch to the nodes that own their hash range");
-    std::string layout;
-    MMseqsNode::addPhaseValue(layout, "Layout", "about " + SSTR(totalKmerCount) + " k-mers, " + SSTR(exchange.sendSplitCount) + " parts of the database, " + SSTR(pref.hashRangeCount) + " hash ranges");
-    MMseqsNode::printPhaseValues(layout);
+    if (MMseqsNode::isMaster()) {
+        std::string layout;
+        MMseqsNode::addPhaseValue(layout, "Layout", "about " + SSTR(totalKmerCount) + " k-mers, " + SSTR(exchange.sendSplitCount) + " parts of the database, " + SSTR(pref.hashRangeCount) + " hash ranges");
+        MMseqsNode::printPhaseValues(layout);
+    }
 
     // remove a file after the barrier past its last read
     BackgroundRemoval removal;

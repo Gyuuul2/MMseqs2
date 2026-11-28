@@ -1637,8 +1637,10 @@ int createdb(int argc, const char **argv, const Command& command) {
     }
 
     if ((par.maskMode == 1 || par.maskNrepeats > 0) && par.createdbMode != Parameters::SEQUENCE_SPLIT_MODE_GPU) {
-        Debug(Debug::WARNING) << "Masking can only be used with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_GPU << "\n";
-        Debug(Debug::WARNING) << "We recompute with --mask 0 or --mask-n-repeat 0\n";
+        if (MMseqsNode::isMaster()) {
+            Debug(Debug::WARNING) << "Masking can only be used with --createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_GPU << "\n";
+            Debug(Debug::WARNING) << "We recompute with --mask 0 or --mask-n-repeat 0\n";
+        }
         par.maskMode = false;
         par.maskNrepeats = 0;
     }
@@ -1646,8 +1648,10 @@ int createdb(int argc, const char **argv, const Command& command) {
     const unsigned int shuffleSplits = par.shuffleDatabase ? 32 : 1;
     if ((par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_SOFT || par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH)
         && par.compressed) {
-        Debug(Debug::WARNING) << "Compressed database cannot be combined with --createdb-mode " << par.createdbMode << "\n";
-        Debug(Debug::WARNING) << "We recompute with --compressed 0\n";
+        if (MMseqsNode::isMaster()) {
+            Debug(Debug::WARNING) << "Compressed database cannot be combined with --createdb-mode " << par.createdbMode << "\n";
+            Debug(Debug::WARNING) << "We recompute with --compressed 0\n";
+        }
         par.compressed = 0;
     }
 
@@ -1660,12 +1664,14 @@ int createdb(int argc, const char **argv, const Command& command) {
     }
 
     if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH && par.identifierOffset != 0) {
-        Debug(Debug::WARNING) << "Identifier offset cannot be combined with --createdb-mode " << par.createdbMode << "\n";
-        Debug(Debug::WARNING) << "We recompute with --id-offset 0\n";
+        if (MMseqsNode::isMaster()) {
+            Debug(Debug::WARNING) << "Identifier offset cannot be combined with --createdb-mode " << par.createdbMode << "\n";
+            Debug(Debug::WARNING) << "We recompute with --id-offset 0\n";
+        }
         par.identifierOffset = 0;
     }
 
-    if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH && par.dbType == 2) {
+    if (par.createdbMode == Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH && par.dbType == 2 && MMseqsNode::isMaster()) {
         Debug(Debug::WARNING) << "Nucleotide database cannot be combined with --createdb-mode " << par.createdbMode << "\n";
         Debug(Debug::WARNING) << "We write an amino acid database instead\n";
     }

@@ -69,6 +69,7 @@ int result2flat(int argc, const char **argv, const Command &command) {
                 splitKeyOffsets.push_back(keyEnd);
             }
         }
+        Debug(Debug::INFO) << "Writing the representative sequences to " << par.db4 << ".<node>, one file per node\n";
     }
     size_t splitCount = isLinfinity ? splitKeyOffsets.size() - 1 : 1;
 

@@ -268,9 +268,11 @@ static float parsePrecisionLib(const std::string &scoreFile, double targetSeqid,
         }
     }
     
-    Debug(Debug::WARNING) << "Can not find any score per column for coverage "
-                          << targetCov << " and sequence identity " << targetSeqid 
-                          << ". No hit will be filtered.\n";
+    if (MMseqsNode::isMaster()) {
+        Debug(Debug::WARNING) << "Can not find any score per column for coverage "
+                              << targetCov << " and sequence identity " << targetSeqid
+                              << ". No hit will be filtered.\n";
+    }
     return 0;
 }
 
@@ -1453,13 +1455,17 @@ int align2clust(int argc, const char **argv, const Command &command) {
             EXIT(EXIT_FAILURE);
         }
         if (par.compressed) {
-            Debug(Debug::WARNING) << "--compressed cannot be combined with linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
-            Debug(Debug::WARNING) << "We recompute with --compressed 0\n";
+            if (MMseqsNode::isMaster()) {
+                Debug(Debug::WARNING) << "--compressed cannot be combined with linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
+                Debug(Debug::WARNING) << "We recompute with --compressed 0\n";
+            }
             par.compressed = 0;
         }
         if (par.includeAlignFiles) {
-            Debug(Debug::WARNING) << "--include-align-files cannot be combined with linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
-            Debug(Debug::WARNING) << "We recompute with --include-align-files 0\n";
+            if (MMseqsNode::isMaster()) {
+                Debug(Debug::WARNING) << "--include-align-files cannot be combined with linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
+                Debug(Debug::WARNING) << "We recompute with --include-align-files 0\n";
+            }
             par.includeAlignFiles = false;
         }
         par.diagonalMode = Parameters::DIAGONAL_MODE_UNGAPPED;

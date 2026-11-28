@@ -2190,8 +2190,8 @@ void Parameters::parseParameters(int argc, const char *pargv[], const Command &c
         }
     }
 
-    if (MMseqsMPI::isMaster() && MMseqsNode::isMaster()) {
-        Debug::setDebugLevel(verbosity);
+    if (MMseqsMPI::isMaster()) {
+        Debug::setDebugLevel(MMseqsNode::isMaster() ? verbosity : std::min(verbosity, static_cast<int>(Debug::WARNING)));
     }
 
 #ifdef OPENMP

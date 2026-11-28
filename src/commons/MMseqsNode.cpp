@@ -68,9 +68,8 @@ void MMseqsNode::init() {
         Debug(Debug::ERROR) << "Invalid node rank " << rank << " for " << count << " nodes\n";
         EXIT(EXIT_FAILURE);
     }
+    // errors only until parseParameters, which allows warnings
     if (isMaster() == false) {
-        Parameters &par = Parameters::getInstance();
-        par.verbosity = Debug::ERROR;
         Debug::setDebugLevel(Debug::ERROR);
     }
 }

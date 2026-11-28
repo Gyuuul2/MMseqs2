@@ -2481,7 +2481,7 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
     }
     
     if (isLinfinity) {
-        if (par.includeCountTable && par.PARAM_INCLUDE_COUNTTABLE.wasSet) {
+        if (par.includeCountTable && par.PARAM_INCLUDE_COUNTTABLE.wasSet && MMseqsNode::isMaster()) {
             Debug(Debug::WARNING) << "--include-count-table cannot be combined with linfinity databases (--createdb-mode " << Parameters::SEQUENCE_SPLIT_MODE_LINFINITY_LENGTH << ")\n";
             Debug(Debug::WARNING) << "We recompute with --include-count-table 0\n";
         }
@@ -2492,12 +2492,12 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
 
     const bool withoutDiagonal = isLinfinity || (par.linclustVersion == Parameters::LINCLUST_VERSION2 && Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_AMINO_ACIDS));
     if (withoutDiagonal) {
-        if (par.includeOnlyExtendable && par.PARAM_INCLUDE_ONLY_EXTENDABLE.wasSet) {
+        if (par.includeOnlyExtendable && par.PARAM_INCLUDE_ONLY_EXTENDABLE.wasSet && MMseqsNode::isMaster()) {
             Debug(Debug::WARNING) << "--include-only-extendable cannot be combined with --linclust-version 2 on amino acid databases\n";
             Debug(Debug::WARNING) << "We recompute with --include-only-extendable 0\n";
         }
         par.includeOnlyExtendable = false;
-        if (par.PARAM_WEIGHT_FILE.wasSet) {
+        if (par.PARAM_WEIGHT_FILE.wasSet && MMseqsNode::isMaster()) {
             Debug(Debug::WARNING) << "--weights cannot be combined with --linclust-version 2 on amino acid databases and is ignored\n";
         }
         par.needWriteBuffer = false;
