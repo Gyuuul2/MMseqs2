@@ -2438,20 +2438,16 @@ int kmermatcher(int argc, const char **argv, const Command &command) {
         && par.seqIdThr < 0.5) {
         par.alphabetSize = 11;
     }
-    if (MMseqsNode::isMaster()) {
-        Debug(Debug::INFO) << "k-mer length " << par.kmerSize
-                           << ", alphabet size " << ((Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES))
-                                                     ? par.alphabetSize.values.nucleotide()
-                                                     : par.alphabetSize.values.aminoacid())
-                           << ", k-mers per sequence " << par.kmersPerSequence << "\n";
-    }
+    Debug(Debug::INFO) << "k-mer length " << par.kmerSize
+                       << ", alphabet size " << ((Parameters::isEqualDbtype(querySeqType, Parameters::DBTYPE_NUCLEOTIDES))
+                                                 ? par.alphabetSize.values.nucleotide()
+                                                 : par.alphabetSize.values.aminoacid())
+                       << ", k-mers per sequence " << par.kmersPerSequence << "\n";
     if (isLinfinity == false) {
         std::vector<MMseqsParameter *> *params = command.params;
         par.printParameters(command.cmd, argc, argv, *params);
     }
-    if (MMseqsNode::isMaster()) {
-        Debug(Debug::INFO) << "Database size: " << seqDbr.getSize() << " type: " << seqDbr.getDbTypeName() << "\n";
-    }
+    Debug(Debug::INFO) << "Database size: " << seqDbr.getSize() << " type: " << seqDbr.getDbTypeName() << "\n";
 
     
     if (par.includeCountTable || par.includeAdjacency) {

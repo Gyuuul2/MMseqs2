@@ -2488,7 +2488,7 @@ void Parameters::checkIfDatabaseIsValid(const Command& command, int argc, const 
 
 void Parameters::printParameters(const std::string &module, int argc, const char* pargv[],
                                  const std::vector<MMseqsParameter*> &par){
-    if (Debug::debugLevel < Debug::INFO || MMseqsNode::isMaster() == false) {
+    if (Debug::debugLevel < Debug::INFO) {
         return;
     }
 

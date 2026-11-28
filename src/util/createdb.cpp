@@ -743,9 +743,7 @@ static int createdbLinfinity(Parameters &par, const std::vector<std::string> &fi
     std::vector<std::string> spoolFiles(1, exchangeFile);
     std::vector<FILE *> spoolHandles(1, exchangeHandle);
     if (nodeReason.empty()) {
-        if (MMseqsNode::isMaster()) {
-            Debug(Debug::INFO) << "Keeping the read sequences in --local-tmp " << par.localTmp << " instead of the shared temporary folder\n";
-        }
+        Debug(Debug::INFO) << "Keeping the read sequences in --local-tmp " << par.localTmp << " instead of the shared temporary folder\n";
         // one spool per thread next to its input file, writes to one ext4 inode serialize
         FileUtil::checkRlimitNoFile(FileUtil::UNCOUNTED_OPEN_FILES + 2 * threadCnt);
         spoolFiles.assign(threadCnt, par.localTmp + "/" + FileUtil::baseName(dataFile) + "_sent_sequences." + SSTR(MMseqsNode::rank) + ".XXXXXX");

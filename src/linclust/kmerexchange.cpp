@@ -3624,9 +3624,7 @@ static std::string writeSizeClasses(const Parameters &par, const KmerExchange &e
 
 // step 0 serves the seed members and only runs if there are some
 static void printStep(const KmerExchange &exchange, size_t step, const std::string &description) {
-    if (MMseqsNode::isMaster()) {
-        Debug(Debug::INFO) << "kmermatcher step " << step + exchange.hasSeedMembers << " of " << 6 + exchange.hasSeedMembers << ": " << description << "\n";
-    }
+    Debug(Debug::INFO) << "kmermatcher step " << step + exchange.hasSeedMembers << " of " << 6 + exchange.hasSeedMembers << ": " << description << "\n";
 }
 
 template <typename T, bool includeAdjacency, typename L>
